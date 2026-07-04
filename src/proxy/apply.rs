@@ -279,7 +279,93 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(xff) = resolved.value("forwardedFor") {
         set_header(&mut parts.headers, "x-forwarded-for", xff);
     }
+    if let Some(cs) = resolved.value("reqCharset") {
+        set_charset(&mut parts.headers, cs);
+    }
+    if let Some(origin) = resolved.value("reqCors") {
+        if !origin.is_empty() {
+            set_header(&mut parts.headers, "origin", origin);
+        }
+    }
     apply_req_cookies(&mut parts.headers, resolved);
+    apply_deletes(&mut parts.headers, resolved, true);
+}
+
+/// Apply `delete://` keys for one side. Keys are `scope.name` (or a bare header
+/// name); values may list several keys separated by `|`, `,`, or whitespace.
+/// Ported from `parseDelProps` / `parseDelReqBody` in the original util.
+fn apply_deletes(headers: &mut HeaderMap, resolved: &Resolved, request_side: bool) {
+    for value in collect_values(resolved, "delete") {
+        for key in value.split(['|', ',', ' ', '\t']) {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let (scope, name) = key.split_once('.').unwrap_or(("header", key));
+            match (request_side, scope) {
+                (true, "reqHeaders") | (true, "header") => remove_header(headers, name),
+                (false, "resHeaders") | (false, "header") => remove_header(headers, name),
+                (true, "reqCookies") => remove_cookie(headers, name),
+                (false, "resType") => {
+                    headers.remove(hyper::header::CONTENT_TYPE);
+                }
+                (false, "resCharset") => strip_charset(headers),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn remove_header(headers: &mut HeaderMap, name: &str) {
+    if let Ok(n) = HeaderName::from_bytes(name.as_bytes()) {
+        headers.remove(&n);
+    }
+}
+
+/// Remove a single cookie from the request `Cookie` header.
+fn remove_cookie(headers: &mut HeaderMap, name: &str) {
+    let Some(cur) = headers
+        .get(hyper::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return;
+    };
+    let kept: Vec<&str> = cur
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|kv| kv.split_once('=').map(|(k, _)| k.trim() != name).unwrap_or(true))
+        .collect();
+    if kept.is_empty() {
+        headers.remove(hyper::header::COOKIE);
+    } else if let Ok(v) = HeaderValue::from_str(&kept.join("; ")) {
+        headers.insert(hyper::header::COOKIE, v);
+    }
+}
+
+/// Set the charset parameter on the `Content-Type` header (whistle's setCharset).
+fn set_charset(headers: &mut HeaderMap, charset: &str) {
+    let base = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "text/plain".to_string());
+    if let Ok(v) = HeaderValue::from_str(&format!("{base}; charset={charset}")) {
+        headers.insert(hyper::header::CONTENT_TYPE, v);
+    }
+}
+
+/// Drop the charset parameter from `Content-Type` (delete://resCharset).
+fn strip_charset(headers: &mut HeaderMap) {
+    if let Some(base) = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_string())
+    {
+        if let Ok(v) = HeaderValue::from_str(&base) {
+            headers.insert(hyper::header::CONTENT_TYPE, v);
+        }
+    }
 }
 
 /// Milliseconds to delay before forwarding the request (`reqDelay`).
@@ -334,7 +420,11 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
         };
         set_header(&mut parts.headers, "content-disposition", &disp);
     }
+    if let Some(cs) = resolved.value("resCharset") {
+        set_charset(&mut parts.headers, cs);
+    }
     apply_res_cookies(&mut parts.headers, resolved);
+    apply_deletes(&mut parts.headers, resolved, false);
 }
 
 /// Body operators for a side, keyed by prefix (`req`/`res`): `*Body` (replace),
@@ -774,6 +864,37 @@ mod tests {
         assert!(out.contains("b=3"));
         assert!(out.contains("a=2"));
         assert!(!out.contains("a=1"));
+    }
+
+    #[test]
+    fn delete_headers_and_cookies() {
+        let resolved = resolve(
+            "example.com delete://x-req|reqCookies.sid\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        h.insert("x-req", "1".parse().unwrap());
+        h.insert("x-keep", "2".parse().unwrap());
+        h.insert(hyper::header::COOKIE, "sid=abc; keep=1".parse().unwrap());
+        apply_deletes(&mut h, &resolved, true);
+        assert!(h.get("x-req").is_none());
+        assert!(h.get("x-keep").is_some());
+        let c = h.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
+        assert!(!c.contains("sid="));
+        assert!(c.contains("keep=1"));
+    }
+
+    #[test]
+    fn charset_set_and_strip() {
+        let mut h = HeaderMap::new();
+        h.insert(hyper::header::CONTENT_TYPE, "text/html".parse().unwrap());
+        set_charset(&mut h, "utf-8");
+        assert_eq!(
+            h.get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        strip_charset(&mut h);
+        assert_eq!(h.get(hyper::header::CONTENT_TYPE).unwrap(), "text/html");
     }
 
     #[test]

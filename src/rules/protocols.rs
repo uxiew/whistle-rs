@@ -114,6 +114,7 @@ pub const MULTI_MATCH: &[&str] = &[
     "params",
     "urlParams",
     "ignore",
+    "delete",
 ];
 
 /// Returns true if `name` is a protocol whistle recognises.
