@@ -176,6 +176,19 @@ cdn.example.com    resType://application/javascript
 example.com/404    replaceStatus://200
 ```
 
+### Cookies
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `reqCookies` | `name=value`, bare `name` (delete), or `{json}` | Merge into the request `Cookie` header. Accumulates across lines. |
+| `resCookies` | `name=value`, bare `name` (expire), or `{json}` | Append `Set-Cookie` headers. Accumulates across lines. |
+
+```
+example.com   reqCookies://sid=abc
+example.com   reqCookies://tracking          # bare name deletes it from the request
+example.com   resCookies://theme=dark
+```
+
 > `statusCode` is dual-purpose, matching whistle: when there is no upstream request it
 > mocks the response; combined with a forwarded request it replaces the status.
 
@@ -248,7 +261,7 @@ example.com/old/*    redirect://https://example.com/new/
   `https2http-proxy`, `http2https-proxy`), `pac`, `weinre`, `plugin`, body rewriting
   (`reqBody`, `resBody`, `reqReplace`, `resReplace`, `*Prepend`, `*Append`,
   `css/html/js*`), `resScript`/`frameScript`, `filter`/`ignore`,
-  `reqCookies`/`resCookies`, `attachment`, `forwardedFor`, delays (`reqDelay`,
+  `attachment`, `forwardedFor`, delays (`reqDelay`,
   `resDelay`) and speeds (`reqSpeed`, `resSpeed`), `cache`, `cipher`, `sniCallback`.
   Adding runtime behaviour means extending `src/proxy/apply.rs`.
 - **Simplified vs. upstream.** whistle's `filter://`/`ignore://` inline conditions,

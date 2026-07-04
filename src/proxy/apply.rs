@@ -175,6 +175,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(ct) = resolved.value("reqType") {
         set_header(&mut parts.headers, "content-type", ct);
     }
+    apply_req_cookies(&mut parts.headers, resolved);
 }
 
 /// Apply response-side operators (status replacement, headers) in place.
@@ -199,6 +200,103 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
     if let Some(cors) = resolved.value("resCors") {
         // Minimal CORS: `*` or an explicit origin.
         set_header(&mut parts.headers, "access-control-allow-origin", cors);
+    }
+    apply_res_cookies(&mut parts.headers, resolved);
+}
+
+/// Collect every value for a protocol (multi-match list plus any single).
+fn collect_values<'a>(resolved: &'a Resolved, protocol: &str) -> Vec<&'a str> {
+    let mut out: Vec<&str> = resolved.all(protocol).iter().map(|o| o.value.as_str()).collect();
+    if let Some(op) = resolved.get(protocol) {
+        out.push(op.value.as_str());
+    }
+    out
+}
+
+/// Parse `name=value` / bare `name` (delete) / `{json}` into (name, value?) pairs.
+/// A `None` value means "delete this cookie".
+fn parse_cookie_ops(value: &str) -> Vec<(String, Option<String>)> {
+    let value = value.trim();
+    let mut out = Vec::new();
+    if value.starts_with('{') {
+        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
+            for (k, v) in map {
+                let val = match v {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) if s.is_empty() => None,
+                    serde_json::Value::String(s) => Some(s),
+                    other => Some(other.to_string()),
+                };
+                out.push((k, val));
+            }
+            return out;
+        }
+    }
+    if let Some(i) = value.find('=') {
+        let name = value[..i].trim().to_string();
+        let val = value[i + 1..].trim();
+        out.push((name, if val.is_empty() { None } else { Some(val.to_string()) }));
+    } else if !value.is_empty() {
+        out.push((value.to_string(), None));
+    }
+    out
+}
+
+/// Merge `reqCookies` operators into the request `Cookie` header.
+fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
+    let ops = collect_values(resolved, "reqCookies");
+    if ops.is_empty() {
+        return;
+    }
+    // Existing cookies as an ordered list.
+    let mut cookies: Vec<(String, String)> = headers
+        .get(hyper::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(|c| {
+            c.split(';')
+                .filter_map(|kv| {
+                    let (k, v) = kv.trim().split_once('=')?;
+                    Some((k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for value in ops {
+        for (name, val) in parse_cookie_ops(value) {
+            cookies.retain(|(k, _)| *k != name);
+            if let Some(v) = val {
+                cookies.push((name, v));
+            }
+        }
+    }
+
+    if cookies.is_empty() {
+        headers.remove(hyper::header::COOKIE);
+    } else {
+        let joined = cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if let Ok(v) = HeaderValue::from_str(&joined) {
+            headers.insert(hyper::header::COOKIE, v);
+        }
+    }
+}
+
+/// Emit `Set-Cookie` headers for `resCookies` operators.
+fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
+    for value in collect_values(resolved, "resCookies") {
+        for (name, val) in parse_cookie_ops(value) {
+            let sc = match val {
+                Some(v) => format!("{name}={v}"),
+                None => format!("{name}=; Max-Age=0"),
+            };
+            if let Ok(v) = HeaderValue::from_str(&sc) {
+                headers.append(hyper::header::SET_COOKIE, v);
+            }
+        }
     }
 }
 
@@ -249,5 +347,52 @@ fn set_header(headers: &mut HeaderMap, name: &str, value: &str) {
     }
     if let Ok(v) = HeaderValue::from_str(value) {
         headers.insert(name, v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::RuleManager;
+
+    fn resolve(rules: &str, url: &str) -> Resolved {
+        let mut m = RuleManager::new();
+        m.set_text(rules);
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let info = build_req_info("GET", scheme, host, if scheme == "https" { 443 } else { 80 }, path);
+        m.resolve(&info)
+    }
+
+    #[test]
+    fn req_cookies_merge_and_delete() {
+        let resolved = resolve(
+            "example.com reqCookies://a=1\nexample.com reqCookies://b=2\nexample.com reqCookies://old\n",
+            "http://example.com/",
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(hyper::header::COOKIE, "old=x; keep=y".parse().unwrap());
+        apply_req_cookies(&mut headers, &resolved);
+        let cookie = headers.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
+        assert!(cookie.contains("keep=y"));
+        assert!(cookie.contains("a=1"));
+        assert!(cookie.contains("b=2"));
+        assert!(!cookie.contains("old="));
+    }
+
+    #[test]
+    fn res_cookies_set() {
+        let resolved = resolve("example.com resCookies://sid=abc\n", "http://example.com/");
+        let mut headers = HeaderMap::new();
+        apply_res_cookies(&mut headers, &resolved);
+        let vals: Vec<_> = headers
+            .get_all(hyper::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert!(vals.iter().any(|v| v == "sid=abc"));
     }
 }

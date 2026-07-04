@@ -158,14 +158,14 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 - Rules engine: comments, hosts shorthand, regex/wildcard/prefix/dot patterns,
   `$`-important precedence, multi-match accumulation
 - Operators applied at runtime: `host` (+ `:port`), `reqHeaders`, `resHeaders`,
-  `reqType`/`resType`, `resCors`, `ua`, `referer`, `method`, `redirect`/`location`,
-  `statusCode`/`replaceStatus`, `file`/`rawfile`
+  `reqCookies`, `resCookies`, `reqType`/`resType`, `resCors`, `ua`, `referer`,
+  `method`, `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
 rule files load; wiring them into `src/proxy/apply.rs` is the next step): upstream
 proxying (`proxy`/`*-proxy`/`socks`), `pac`, `weinre`, `plugin`, body rewriting
 (`reqBody`/`resBody`/`*Replace`/`*Prepend`/`*Append`), `resScript`/`frameScript`,
-`filter`/`ignore`, `reqCookies`/`resCookies`, `attachment`, delays/speeds.
+`filter`/`ignore`, `attachment`, delays/speeds.
 
 **Not ported** (large standalone subsystems): the web UI (React + CGI under `biz/`),
 the plugin subprocess system, weinre, WebSocket frame inspection, SOCKS server,
