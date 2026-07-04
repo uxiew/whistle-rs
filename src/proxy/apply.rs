@@ -21,6 +21,8 @@ pub fn build_req_info(
     host: &str,
     port: u16,
     path: &str,
+    headers: &HeaderMap,
+    client_ip: Option<String>,
 ) -> ReqInfo {
     let host = host.to_ascii_lowercase();
     let default_port = if scheme == "https" || scheme == "wss" {
@@ -33,6 +35,10 @@ pub fn build_req_info(
     } else {
         format!("{scheme}://{host}:{port}{path}")
     };
+    let hdrs = headers
+        .iter()
+        .map(|(n, v)| (n.as_str().to_ascii_lowercase(), v.to_str().unwrap_or("").to_string()))
+        .collect();
     ReqInfo {
         method: method.to_string(),
         scheme: scheme.to_string(),
@@ -40,6 +46,8 @@ pub fn build_req_info(
         port,
         path: path.to_string(),
         full_url,
+        headers: hdrs,
+        client_ip,
     }
 }
 
@@ -579,7 +587,15 @@ mod tests {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
-        let info = build_req_info("GET", scheme, host, if scheme == "https" { 443 } else { 80 }, path);
+        let info = build_req_info(
+            "GET",
+            scheme,
+            host,
+            if scheme == "https" { 443 } else { 80 },
+            path,
+            &HeaderMap::new(),
+            None,
+        );
         m.resolve(&info)
     }
 

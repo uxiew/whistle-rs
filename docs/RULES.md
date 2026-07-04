@@ -166,6 +166,26 @@ example.com        params://debug=1&trace=on
 > Note the `/regex/` convention: since paths start with `/`, write literals without
 > surrounding slashes (`urlReplace://old=new`) and reserve `/…/` for regexes.
 
+### Filter conditions
+
+`filter`/`includeFilter` add an extra condition a request must satisfy for the rule
+to apply; `excludeFilter` skips the rule when the condition holds. Several filters on
+one line are ANDed.
+
+| Form | Meaning |
+|------|---------|
+| `filter://m:GET` (or `method:`) | request method |
+| `filter://host:example.com` | request host (exact) |
+| `filter://h:name=value` (or `header:`) | request header equals; `h:name` = presence |
+| `filter://i:1.2.3.4` (or `ip:`, `clientIp:`) | client IP |
+| `filter://<regex>` | regex over the full request URL |
+
+```
+example.com   host://10.0.0.1   filter://m:POST        # only POST requests
+example.com   resHeaders://x-a=1   excludeFilter://i:127.0.0.1   # skip localhost
+.example.com  host://5.5.5.5   filter://h:x-canary=1   # only tagged requests
+```
+
 ### Disabling operators
 
 | Operator | Value | Effect |

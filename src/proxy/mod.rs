@@ -8,7 +8,7 @@ pub mod body;
 pub mod upstream;
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -68,11 +68,12 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
         };
         stream.set_nodelay(true).ok();
         let state = state.clone();
+        let peer_ip = peer.ip();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let service = service_fn(move |req| {
                 let state = state.clone();
-                async move { top_level(state, req).await }
+                async move { top_level(state, req, peer_ip).await }
             });
             if let Err(err) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -89,19 +90,21 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
 async fn top_level(
     state: Arc<AppState>,
     req: Request<Incoming>,
+    peer: IpAddr,
 ) -> Result<Response<DynBody>, Infallible> {
+    let client_ip = Some(peer.to_string());
     if req.method() == hyper::Method::CONNECT {
-        return Ok(handle_connect(state, req));
+        return Ok(handle_connect(state, req, peer));
     }
     // Absolute-form URI => proxied request. Origin-form => a direct hit on us.
     if req.uri().authority().is_some() {
-        return Ok(guard(serve(state, req, Origin::Forward).await));
+        return Ok(guard(serve(state, req, Origin::Forward, client_ip).await));
     }
     Ok(local_ui(&state, req))
 }
 
 /// Handle a CONNECT: acknowledge, then intercept the tunnel with MITM.
-fn handle_connect(state: Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+fn handle_connect(state: Arc<AppState>, req: Request<Incoming>, peer: IpAddr) -> Response<DynBody> {
     let Some((host, port)) = authority_host_port(req.uri()) else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -112,7 +115,7 @@ fn handle_connect(state: Arc<AppState>, req: Request<Incoming>) -> Response<DynB
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
-                if let Err(err) = mitm_serve(state, upgraded, host, port).await {
+                if let Err(err) = mitm_serve(state, upgraded, host, port, peer).await {
                     tracing::debug!("mitm error: {err}");
                 }
             }
@@ -132,6 +135,7 @@ async fn mitm_serve(
     upgraded: hyper::upgrade::Upgraded,
     host: String,
     port: u16,
+    peer: IpAddr,
 ) -> Result<()> {
     let acceptor = state.ca.acceptor_for(&host)?;
     let tls = acceptor.accept(TokioIo::new(upgraded)).await?;
@@ -143,7 +147,8 @@ async fn mitm_serve(
             host: host.clone(),
             port,
         };
-        async move { Ok::<_, Infallible>(guard(serve(state, req, origin).await)) }
+        let client_ip = Some(peer.to_string());
+        async move { Ok::<_, Infallible>(guard(serve(state, req, origin, client_ip).await)) }
     });
 
     hyper::server::conn::http1::Builder::new()
@@ -172,6 +177,7 @@ async fn serve(
     state: Arc<AppState>,
     req: Request<Incoming>,
     origin: Origin,
+    client_ip: Option<String>,
 ) -> Result<Response<DynBody>> {
     // Derive scheme/host/port/path for matching.
     let (scheme, host, port, path) = match &origin {
@@ -198,7 +204,15 @@ async fn serve(
         }
     };
 
-    let info = apply::build_req_info(req.method().as_str(), &scheme, &host, port, &path);
+    let info = apply::build_req_info(
+        req.method().as_str(),
+        &scheme,
+        &host,
+        port,
+        &path,
+        req.headers(),
+        client_ip.clone(),
+    );
     let resolved = state.rules.read().unwrap().resolve(&info);
 
     // Short-circuit rules (redirect, mocked status, file) skip the upstream.

@@ -10,10 +10,17 @@
 //! * single-value protocols use first-match-wins (respecting importance)
 //! * multi-match protocols accumulate every matching value in order
 
-use super::{Pattern, ReqInfo, Resolved, Rule, protocols};
+use super::{Cond, Filter, Pattern, ReqInfo, Resolved, Rule, protocols};
 
-/// Does `rule`'s pattern match `req`?
+/// Does `rule`'s pattern (and all its filter conditions) match `req`?
 pub fn matches(rule: &Rule, req: &ReqInfo) -> bool {
+    if !pattern_matches(rule, req) {
+        return false;
+    }
+    filters_match(&rule.filters, req)
+}
+
+fn pattern_matches(rule: &Rule, req: &ReqInfo) -> bool {
     match &rule.pattern {
         Pattern::Any => true,
         Pattern::Regex(re) => re.is_match(&req.full_url),
@@ -42,6 +49,38 @@ pub fn matches(rule: &Rule, req: &ReqInfo) -> bool {
                 return false;
             }
             true
+        }
+    }
+}
+
+/// Every include filter must hold; no exclude filter may hold.
+fn filters_match(filters: &[Filter], req: &ReqInfo) -> bool {
+    for f in filters {
+        let held = cond_holds(&f.cond, req);
+        if f.exclude {
+            if held {
+                return false;
+            }
+        } else if !held {
+            return false;
+        }
+    }
+    true
+}
+
+fn cond_holds(cond: &Cond, req: &ReqInfo) -> bool {
+    match cond {
+        Cond::Method(m) => req.method.eq_ignore_ascii_case(m),
+        Cond::Host(h) => req.host == *h,
+        Cond::ClientIp(ip) => req.client_ip.as_deref() == Some(ip.as_str()),
+        Cond::Url(re) => re.is_match(&req.full_url),
+        Cond::Header { name, value } => {
+            let found = req.headers.iter().find(|(n, _)| n == name);
+            match (found, value) {
+                (Some((_, v)), Some(expect)) => v.eq_ignore_ascii_case(expect),
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
         }
     }
 }
@@ -141,6 +180,7 @@ mod tests {
             port,
             path,
             full_url: url.to_string(),
+            ..Default::default()
         }
     }
 
@@ -202,6 +242,44 @@ mod tests {
         m.set_text("example.com host://1.1.1.1\n$example.com host://2.2.2.2\n");
         let r = m.resolve(&req("http://example.com/"));
         assert_eq!(r.value("host"), Some("2.2.2.2"));
+    }
+
+    #[test]
+    fn filter_method_include() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com host://1.1.1.1 filter://m:POST\n");
+        let mut r = req("http://example.com/");
+        assert!(m.resolve(&r).value("host").is_none()); // GET
+        r.method = "POST".into();
+        assert!(m.resolve(&r).value("host").is_some());
+    }
+
+    #[test]
+    fn exclude_filter_method() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com host://1.1.1.1 excludeFilter://m:GET\n");
+        let r = req("http://example.com/"); // GET => excluded
+        assert!(m.resolve(&r).value("host").is_none());
+    }
+
+    #[test]
+    fn header_filter() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com host://1.1.1.1 filter://h:x-env=prod\n");
+        let mut r = req("http://example.com/");
+        assert!(m.resolve(&r).value("host").is_none());
+        r.headers.push(("x-env".into(), "prod".into()));
+        assert!(m.resolve(&r).value("host").is_some());
+    }
+
+    #[test]
+    fn client_ip_filter() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com host://1.1.1.1 filter://i:10.0.0.5\n");
+        let mut r = req("http://example.com/");
+        assert!(m.resolve(&r).value("host").is_none());
+        r.client_ip = Some("10.0.0.5".into());
+        assert!(m.resolve(&r).value("host").is_some());
     }
 
     #[test]

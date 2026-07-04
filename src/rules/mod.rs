@@ -59,10 +59,35 @@ pub struct Rule {
     pub raw_line: String,
     /// `$`-prefixed exact/important patterns win over normal ones.
     pub important: bool,
+    /// Extra `filter`/`includeFilter`/`excludeFilter` conditions.
+    pub filters: Vec<Filter>,
+}
+
+/// A `filter`/`includeFilter`/`excludeFilter` match condition on a rule.
+#[derive(Debug, Clone)]
+pub struct Filter {
+    /// `excludeFilter://` negates: the rule is skipped when the condition holds.
+    pub exclude: bool,
+    pub cond: Cond,
+}
+
+/// What a [`Filter`] tests.
+#[derive(Debug, Clone)]
+pub enum Cond {
+    /// `m:GET` — request method (case-insensitive).
+    Method(String),
+    /// `host:example.com` — request host (exact, case-insensitive).
+    Host(String),
+    /// `h:name[=value]` — request header presence or exact value.
+    Header { name: String, value: Option<String> },
+    /// `i:1.2.3.4` — client IP.
+    ClientIp(String),
+    /// Fallback: a regex tested against the full request URL.
+    Url(Regex),
 }
 
 /// Parsed request facts the matcher needs. Built by the proxy layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReqInfo {
     pub method: String,
     pub scheme: String,
@@ -73,6 +98,10 @@ pub struct ReqInfo {
     pub path: String,
     /// `scheme://host[:port]/path` used for regex/prefix matching.
     pub full_url: String,
+    /// Request headers as (lowercased-name, value) pairs, for filter conditions.
+    pub headers: Vec<(String, String)>,
+    /// Client IP, if known, for `filter://i:` conditions.
+    pub client_ip: Option<String>,
 }
 
 /// The winning operators for a request, keyed by protocol.
@@ -183,8 +212,18 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Option<Rule> {
 
     let important = pattern_tok.starts_with('$');
     let pattern = parse_pattern(pattern_tok)?;
-    let ops: Vec<RuleOp> = op_toks.iter().filter_map(|t| parse_op(t)).collect();
-    if ops.is_empty() {
+
+    // Separate filter conditions from ordinary operators.
+    let mut ops: Vec<RuleOp> = Vec::new();
+    let mut filters: Vec<Filter> = Vec::new();
+    for t in &op_toks {
+        if let Some(f) = parse_filter(t) {
+            filters.push(f);
+        } else if let Some(op) = parse_op(t) {
+            ops.push(op);
+        }
+    }
+    if ops.is_empty() && filters.is_empty() {
         return None;
     }
     Some(Rule {
@@ -192,7 +231,43 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Option<Rule> {
         ops,
         raw_line: raw_line.to_string(),
         important,
+        filters,
     })
+}
+
+/// Parse a `filter://` / `includeFilter://` / `excludeFilter://` token.
+fn parse_filter(tok: &str) -> Option<Filter> {
+    let (proto, spec) = split_protocol(tok)?;
+    let exclude = match proto {
+        "filter" | "includeFilter" => false,
+        "excludeFilter" => true,
+        _ => return None,
+    };
+    let cond = if let Some(v) = spec.strip_prefix("m:").or_else(|| spec.strip_prefix("method:")) {
+        Cond::Method(v.to_string())
+    } else if let Some(v) = spec.strip_prefix("host:") {
+        Cond::Host(v.to_lowercase())
+    } else if let Some(v) = spec
+        .strip_prefix("i:")
+        .or_else(|| spec.strip_prefix("ip:"))
+        .or_else(|| spec.strip_prefix("clientIp:"))
+    {
+        Cond::ClientIp(v.to_string())
+    } else if let Some(v) = spec.strip_prefix("h:").or_else(|| spec.strip_prefix("header:")) {
+        let (name, value) = match v.split_once('=') {
+            Some((n, val)) => (n.to_lowercase(), Some(val.to_string())),
+            None => (v.to_lowercase(), None),
+        };
+        Cond::Header { name, value }
+    } else {
+        // Fallback: treat as a regex over the full URL.
+        let body = spec.trim_matches('/');
+        match Regex::new(body) {
+            Ok(re) => Cond::Url(re),
+            Err(_) => return None,
+        }
+    };
+    Some(Filter { exclude, cond })
 }
 
 /// Heuristic: does this token read as a match pattern (vs. an operator)?
