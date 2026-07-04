@@ -208,6 +208,7 @@ textarea{{width:100%;height:60vh;font-family:ui-monospace,Menlo,monospace;font-s
 <nav>
   <button id="tab-net" class="active" onclick="show('net')">Network</button>
   <button id="tab-rules" onclick="show('rules')">Rules</button>
+  <button id="tab-values" onclick="show('values')">Values</button>
 </nav>
 <main>
   <section id="net">
@@ -227,15 +228,24 @@ textarea{{width:100%;height:60vh;font-family:ui-monospace,Menlo,monospace;font-s
     <textarea id="editor" spellcheck="false" placeholder="pattern operator1 operator2 ..."></textarea>
     <p class="hint">One rule per line. See the docs for the full syntax.</p>
   </section>
+  <section id="values" class="hidden">
+    <div class="bar">
+      <button onclick="saveValues()">Save</button>
+      <span class="hint" id="valstatus"></span>
+    </div>
+    <textarea id="valeditor" spellcheck="false" placeholder='{{"name":"content"}}'></textarea>
+    <p class="hint">A JSON object of named values. Reference them with <code>{{name}}</code> in rules.</p>
+  </section>
 </main>
 <script>
 var esc=function(s){{return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}};
 function show(t){{
-  document.getElementById('net').classList.toggle('hidden',t!=='net');
-  document.getElementById('rules').classList.toggle('hidden',t!=='rules');
-  document.getElementById('tab-net').classList.toggle('active',t==='net');
-  document.getElementById('tab-rules').classList.toggle('active',t==='rules');
+  ['net','rules','values'].forEach(function(x){{
+    document.getElementById(x).classList.toggle('hidden',x!==t);
+    document.getElementById('tab-'+x).classList.toggle('active',x===t);
+  }});
   if(t==='rules') loadRules();
+  if(t==='values') loadValues();
 }}
 function loadNet(){{
   fetch('/sessions.json').then(function(r){{return r.json()}}).then(function(list){{
@@ -257,6 +267,18 @@ function saveRules(){{
   fetch('/api/rules',{{method:'POST',body:txt}}).then(function(r){{return r.json()}}).then(function(j){{
     document.getElementById('rulestatus').textContent='Saved · '+j.rules+' rules active';
   }}).catch(function(){{document.getElementById('rulestatus').textContent='Save failed'}});
+}}
+function loadValues(){{
+  fetch('/api/values').then(function(r){{return r.json()}}).then(function(v){{
+    document.getElementById('valeditor').value=JSON.stringify(v,null,2);
+  }});
+}}
+function saveValues(){{
+  var txt=document.getElementById('valeditor').value;
+  try{{JSON.parse(txt);}}catch(e){{document.getElementById('valstatus').textContent='Invalid JSON';return;}}
+  fetch('/api/values',{{method:'POST',body:txt}}).then(function(r){{return r.json()}}).then(function(){{
+    document.getElementById('valstatus').textContent='Saved';
+  }}).catch(function(){{document.getElementById('valstatus').textContent='Save failed'}});
 }}
 loadNet();
 setInterval(function(){{if(document.getElementById('auto').checked && !document.getElementById('net').classList.contains('hidden')) loadNet();}},2000);
