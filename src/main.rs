@@ -28,6 +28,11 @@ struct Cli {
     #[arg(long)]
     socks_port: Option<u16>,
 
+    /// Register a plugin server as `name=host:port` (repeatable). Routes
+    /// `plugin://name` rules to that server.
+    #[arg(long = "plugin", value_name = "NAME=HOST:PORT")]
+    plugins: Vec<String>,
+
     /// Path to a whistle rules file to load at startup.
     #[arg(short = 'r', long)]
     rules: Option<PathBuf>,
@@ -71,11 +76,21 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&storage_dir)
         .with_context(|| format!("creating storage dir {}", storage_dir.display()))?;
 
+    let mut plugins = std::collections::HashMap::new();
+    for spec in &cli.plugins {
+        if let Some((name, addr)) = spec.split_once('=') {
+            plugins.insert(name.trim().to_string(), addr.trim().to_string());
+        } else {
+            anyhow::bail!("invalid --plugin '{spec}', expected name=host:port");
+        }
+    }
+
     let config = Config {
         port: cli.port,
         host: cli.host,
         storage_dir,
         socks_port: cli.socks_port,
+        plugins,
         ..Config::default()
     };
 

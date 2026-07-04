@@ -2,6 +2,7 @@
 //! the Rust core currently honours). Values mirror whistle's defaults so the CLI
 //! behaves the same way from the user's point of view.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,8 @@ pub struct Config {
     pub rules: Option<String>,
     /// Optional inbound SOCKS5 port (whistle's `socksPort`).
     pub socks_port: Option<u16>,
+    /// Registered plugin servers: name → `host:port` (whistle plugin servers).
+    pub plugins: HashMap<String, String>,
 }
 
 impl Config {
@@ -61,6 +64,7 @@ impl Default for Config {
             intercept_https: true,
             rules: None,
             socks_port: None,
+            plugins: HashMap::new(),
         }
     }
 }

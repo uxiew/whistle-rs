@@ -367,7 +367,17 @@ async fn serve(
         return serve_upgrade(req, &info, &resolved, &scheme, &host, port).await;
     }
 
-    let target = apply::resolve_target(&info, &resolved);
+    let mut target = apply::resolve_target(&info, &resolved);
+
+    // A matched, registered plugin server handles the request instead of the
+    // origin: route to the plugin over HTTP with x-whistle-* context headers.
+    let plugin = apply::resolve_plugin(&resolved, &state.config.plugins);
+    if let Some((_, phost, pport)) = &plugin {
+        target.connect_host = phost.clone();
+        target.connect_port = *pport;
+        target.tls = false;
+        target.proxy = None;
+    }
 
     // Rewrite to origin-form + apply request-side rules.
     let (mut parts, incoming) = req.into_parts();
@@ -376,6 +386,11 @@ async fn serve(
     ensure_host_header(&mut parts.headers, &host, port, &scheme);
     parts.headers.remove("proxy-connection");
     apply::apply_request(&mut parts, &resolved);
+    if let Some((name, _, _)) = &plugin {
+        set_header_raw(&mut parts.headers, "x-whistle-plugin", name);
+        set_header_raw(&mut parts.headers, "x-whistle-req-url", &info.full_url);
+        set_header_raw(&mut parts.headers, "x-whistle-req-method", &info.method);
+    }
 
     // Buffer + transform the request body only when a body/speed operator applies.
     let req_speed = apply::req_speed_kbps(&resolved);

@@ -240,6 +240,27 @@ api.test      auth://admin:secret
 api.test      forwardedFor://203.0.113.7
 ```
 
+### Plugins
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `plugin` | `name[/extra]` | Route the request to a registered plugin server |
+
+Register plugin servers on the command line (repeatable):
+
+```bash
+whistle-rs --plugin echo=127.0.0.1:9300 --plugin mock=127.0.0.1:9400
+```
+
+The matched request is forwarded to the plugin over HTTP with context headers
+`x-whistle-plugin`, `x-whistle-req-url`, and `x-whistle-req-method`; the plugin's
+response is relayed back. (whistle's Node subprocess plugin loader is not ported;
+plugins here are any HTTP server.)
+
+```
+api.example.com   plugin://mock
+```
+
 ### Scripting
 
 | Operator | Value | Effect |

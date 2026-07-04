@@ -142,6 +142,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 | `-p, --port <PORT>` | Proxy port | `8899` |
 | `-H, --host <IP>` | Bind address | all interfaces (`0.0.0.0`) |
 | `--socks-port <PORT>` | Also run an inbound SOCKS5 server | off |
+| `--plugin <NAME=HOST:PORT>` | Register a plugin server (repeatable) | — |
 | `-r, --rules <FILE>` | Rules file to load at startup | — |
 | `--rule <TEXT>` | Inline rules, applied after `--rules` | — |
 | `--dir <DIR>` | Storage dir (root CA etc.) | `~/.whistle-rs` |
@@ -181,7 +182,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`, `resScript` (JS)
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
-rule files load): `weinre`, `plugin`, `frameScript`.
+rule files load): `weinre`, `frameScript`.
 
 **Not ported** (large standalone subsystems): whistle's original React web UI (`biz/`)
 is replaced by a lightweight built-in UI; the plugin subprocess system, weinre,

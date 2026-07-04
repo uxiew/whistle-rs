@@ -104,6 +104,29 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
     }
 }
 
+/// If a matched `plugin://name` refers to a registered plugin server, return
+/// `(name, host, port)` to route the request there.
+pub fn resolve_plugin(
+    resolved: &Resolved,
+    plugins: &std::collections::HashMap<String, String>,
+) -> Option<(String, String, u16)> {
+    for op in resolved.all("plugin") {
+        // Value is `name` or `name/extra`; the plugin name is the first segment.
+        let name = op.value.split(['/', '?']).next().unwrap_or("").trim();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(addr) = plugins.get(name) {
+            let (h, p) = match addr.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
+                None => (addr.clone(), 80),
+            };
+            return Some((name.to_string(), h, p));
+        }
+    }
+    None
+}
+
 /// Parse a PAC `FindProxyForURL` return value into a proxy (first usable entry).
 /// `DIRECT` (or no proxy entry) yields `None` → connect directly.
 fn parse_pac_result(result: &str) -> Option<super::upstream::ProxyConfig> {
