@@ -85,7 +85,8 @@ For a device on your LAN, use your machine's IP instead of `127.0.0.1` and make 
 the port is reachable.
 
 Open <http://127.0.0.1:8899/> directly (not through the proxy) to see the status page,
-which lists recent captured traffic. `GET /sessions.json` returns the same data as JSON.
+which lists recent captured traffic. `GET /sessions.json` returns the same data as JSON,
+and `GET /proxy.pac` serves a PAC file that auto-configures a client to use this proxy.
 
 ## Intercepting HTTPS
 

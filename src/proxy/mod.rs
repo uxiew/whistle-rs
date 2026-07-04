@@ -498,6 +498,37 @@ fn local_ui(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> 
             .unwrap();
     }
 
+    // PAC file so clients can auto-configure to use this proxy.
+    if path == "/proxy.pac" || path == "/pac" {
+        let host = req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}",
+                    state
+                        .config
+                        .host
+                        .map(|h| h.to_string())
+                        .unwrap_or_else(|| "127.0.0.1".to_string()),
+                    state.config.port
+                )
+            });
+        let pac = format!(
+            "function FindProxyForURL(url, host) {{\n  return \"PROXY {host}\";\n}}\n"
+        );
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                hyper::header::CONTENT_TYPE,
+                "application/x-ns-proxy-autoconfig",
+            )
+            .body(body::full(Bytes::from(pac)))
+            .unwrap();
+    }
+
     // Captured traffic as JSON (most-recent first).
     if path == "/sessions.json" {
         let sessions: Vec<Session> = {
