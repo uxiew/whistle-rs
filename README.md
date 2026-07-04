@@ -172,7 +172,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
 rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`,
 `weinre`, `plugin`, `resScript`/`frameScript`, `filter`/`includeFilter`/`excludeFilter`
-conditions, `attachment`, `reqSpeed`/`resSpeed`.
+conditions, `reqSpeed`/`resSpeed`.
 
 **Not ported** (large standalone subsystems): the web UI (React + CGI under `biz/`),
 the plugin subprocess system, weinre, WebSocket frame inspection/logging, an inbound

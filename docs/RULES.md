@@ -233,6 +233,7 @@ slow.example.com   resDelay://1000
 | `resHeaders` | `name=value`, `name:value`, or `{json}` | Set/replace response headers (empty value deletes). Accumulates across lines. |
 | `resType` | MIME type | Set the response `Content-Type` |
 | `resCors` | origin or `*` | Set `Access-Control-Allow-Origin` |
+| `attachment` | filename | Force download via `Content-Disposition: attachment` |
 
 ```
 example.com        resHeaders://x-mitm=intercepted

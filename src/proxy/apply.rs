@@ -247,6 +247,15 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
         // Minimal CORS: `*` or an explicit origin.
         set_header(&mut parts.headers, "access-control-allow-origin", cors);
     }
+    if let Some(name) = resolved.value("attachment") {
+        // Force a download; `attachment://` with no name still sets the disposition.
+        let disp = if name.is_empty() {
+            "attachment".to_string()
+        } else {
+            format!("attachment; filename=\"{}\"", name.replace('"', ""))
+        };
+        set_header(&mut parts.headers, "content-disposition", &disp);
+    }
     apply_res_cookies(&mut parts.headers, resolved);
 }
 
