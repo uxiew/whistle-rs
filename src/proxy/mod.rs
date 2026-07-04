@@ -7,6 +7,7 @@ pub mod apply;
 pub mod body;
 pub mod socks;
 pub mod upstream;
+pub mod webui;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -166,7 +167,7 @@ async fn top_level(
     if req.uri().authority().is_some() {
         return Ok(guard(serve(state, req, Origin::Forward, client_ip).await));
     }
-    Ok(local_ui(&state, req))
+    Ok(webui::handle(&state, req).await)
 }
 
 /// Handle a CONNECT: acknowledge, then intercept the tunnel with MITM.
@@ -476,136 +477,6 @@ async fn serve_upgrade(
 
     // Relay the 101 (with Sec-WebSocket-Accept etc.) so the client handshake completes.
     Ok(Response::from_parts(p, body::empty()))
-}
-
-/// The built-in page served when a browser hits the proxy port directly.
-fn local_ui(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
-    let path = req.uri().path();
-    if path == "/rootCA.crt" || path == "/rootca.crt" {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                hyper::header::CONTENT_TYPE,
-                "application/x-x509-ca-cert",
-            )
-            .header(
-                hyper::header::CONTENT_DISPOSITION,
-                "attachment; filename=\"whistle-rs-rootCA.crt\"",
-            )
-            .body(body::full(Bytes::from(
-                state.ca.root_cert_pem().to_string(),
-            )))
-            .unwrap();
-    }
-
-    // PAC file so clients can auto-configure to use this proxy.
-    if path == "/proxy.pac" || path == "/pac" {
-        let host = req
-            .headers()
-            .get(hyper::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                format!(
-                    "{}:{}",
-                    state
-                        .config
-                        .host
-                        .map(|h| h.to_string())
-                        .unwrap_or_else(|| "127.0.0.1".to_string()),
-                    state.config.port
-                )
-            });
-        let pac = format!(
-            "function FindProxyForURL(url, host) {{\n  return \"PROXY {host}\";\n}}\n"
-        );
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                hyper::header::CONTENT_TYPE,
-                "application/x-ns-proxy-autoconfig",
-            )
-            .body(body::full(Bytes::from(pac)))
-            .unwrap();
-    }
-
-    // Captured traffic as JSON (most-recent first).
-    if path == "/sessions.json" {
-        let sessions: Vec<Session> = {
-            let q = state.sessions.lock().unwrap();
-            q.iter().rev().cloned().collect()
-        };
-        let body = serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".into());
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(body::full(Bytes::from(body)))
-            .unwrap();
-    }
-
-    let rule_count = state.rules.read().unwrap().len();
-    let rows = recent_sessions_html(state);
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>whistle-rs</title>\
-<style>body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:960px;margin:40px auto;padding:0 16px;color:#222}}\
-code{{background:#f4f4f4;padding:2px 6px;border-radius:4px}}a{{color:#2d7ff9}}\
-table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}}\
-th,td{{text-align:left;padding:4px 8px;border-bottom:1px solid #eee;white-space:nowrap}}\
-td.url{{white-space:normal;word-break:break-all}}.s2{{color:#2e7d32}}.s3{{color:#0277bd}}.s4,.s5{{color:#c62828}}</style></head><body>\
-<h1>whistle-rs</h1><p>HTTP/HTTPS debugging proxy (Rust port) — v{version}.</p>\
-<p><b>{count}</b> rules loaded.</p>\
-<h2>Setup</h2><ol>\
-<li>Point your client's HTTP &amp; HTTPS proxy at <code>{host}:{port}</code>.</li>\
-<li>To intercept HTTPS, install the root CA: <a href=\"/rootCA.crt\">download rootCA.crt</a> and trust it.</li>\
-</ol>\
-<h2>Recent traffic <a href=\"/sessions.json\" style=\"font-size:13px\">(JSON)</a></h2>\
-<table><thead><tr><th>#</th><th>Method</th><th>Status</th><th>URL</th><th>Target</th><th>ms</th></tr></thead>\
-<tbody>{rows}</tbody></table>\
-<p style=\"color:#888;font-size:12px\">Showing up to {max} most-recent transactions (in memory). Reload to refresh.</p>\
-</body></html>",
-        version = crate::config::VERSION,
-        count = rule_count,
-        host = state.config.host.map(|h| h.to_string()).unwrap_or_else(|| "127.0.0.1".to_string()),
-        port = state.config.port,
-        rows = rows,
-        max = MAX_SESSIONS,
-    );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(body::full(Bytes::from(html)))
-        .unwrap()
-}
-
-/// Render the recent-sessions table rows (most-recent first).
-fn recent_sessions_html(state: &Arc<AppState>) -> String {
-    let q = state.sessions.lock().unwrap();
-    if q.is_empty() {
-        return "<tr><td colspan=6 style=\"color:#888\">No traffic captured yet.</td></tr>".into();
-    }
-    let mut out = String::new();
-    for s in q.iter().rev().take(200) {
-        let cls = format!("s{}", s.status / 100);
-        out.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td class=\"url\">{}</td><td>{}</td><td>{}</td></tr>",
-            s.id,
-            html_escape(&s.method),
-            cls,
-            s.status,
-            html_escape(&s.url),
-            html_escape(&s.target),
-            s.duration_ms,
-        ));
-    }
-    out
-}
-
-/// Minimal HTML-escaping for values placed into the status table.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// Ensure a correct `Host` header for the upstream request.

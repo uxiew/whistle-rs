@@ -129,11 +129,16 @@ impl Resolved {
 #[derive(Debug, Default)]
 pub struct RuleManager {
     rules: Vec<Rule>,
+    /// The raw source text (so the UI can display/edit it).
+    source: String,
 }
 
 impl RuleManager {
     pub fn new() -> Self {
-        RuleManager { rules: Vec::new() }
+        RuleManager {
+            rules: Vec::new(),
+            source: String::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -144,14 +149,24 @@ impl RuleManager {
         self.rules.is_empty()
     }
 
+    /// The current rules source text.
+    pub fn text(&self) -> &str {
+        &self.source
+    }
+
     /// Replace all rules with those parsed from `text` (whistle rules DSL).
     pub fn set_text(&mut self, text: &str) {
         self.rules = parse_text(text);
+        self.source = text.to_string();
     }
 
     /// Append rules parsed from `text`.
     pub fn append_text(&mut self, text: &str) {
         self.rules.extend(parse_text(text));
+        if !self.source.is_empty() && !self.source.ends_with('\n') {
+            self.source.push('\n');
+        }
+        self.source.push_str(text);
     }
 
     /// Resolve the winning operators for a request. See [`matcher`].

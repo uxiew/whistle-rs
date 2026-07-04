@@ -39,9 +39,9 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 - **Request/response rewriting** — headers, cookies, body (replace/prepend/append/
   regex), URL/query, user-agent, method, content-type, CORS, auth, delays, status
   replacement, redirects, and local file serving.
-- **Traffic capture** — recent transactions are recorded in memory and shown on the
-  status page, with a `/sessions.json` endpoint for tooling.
-- **Built-in status page** with a one-click root-CA download.
+- **Web UI** — a self-contained page (open the proxy host in a browser) with a live
+  Network view and an editable Rules panel; rules changes apply immediately.
+- **Traffic capture** — recent transactions recorded in memory; `/sessions.json` feed.
 - Single static binary, no C toolchain needed to build (pinned `ring` TLS provider).
 
 ## Install & build
@@ -181,9 +181,9 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`,
 `weinre`, `plugin`, `resScript`/`frameScript`.
 
-**Not ported** (large standalone subsystems): the web UI (React + CGI under `biz/`),
-the plugin subprocess system, weinre, WebSocket frame inspection/logging,
-HTTP/2, and a persistent data/session capture store (an in-memory capture is included).
+**Not ported** (large standalone subsystems): whistle's original React web UI (`biz/`)
+is replaced by a lightweight built-in UI; the plugin subprocess system, weinre,
+WebSocket frame inspection/logging, and a persistent capture store remain future work.
 
 See [`docs/RULES.md#compatibility-notes`](docs/RULES.md#compatibility-notes) for the
 operator-level detail.
