@@ -427,12 +427,25 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
     apply_deletes(&mut parts.headers, resolved, false);
 }
 
+/// Content-type-specific body operator prefixes (`css`/`html`/`js`).
+const TYPED_BODY_PREFIXES: &[&str] = &["css", "html", "js"];
+
 /// Body operators for a side, keyed by prefix (`req`/`res`): `*Body` (replace),
 /// `*Replace` (substring/`/regex/` substitute), `*Prepend`, `*Append`.
 fn body_ops_present(resolved: &Resolved, prefix: &str) -> bool {
-    ["Body", "Replace", "Prepend", "Append"]
+    let generic = ["Body", "Replace", "Prepend", "Append"]
         .iter()
-        .any(|s| resolved.value(&format!("{prefix}{s}")).is_some())
+        .any(|s| resolved.value(&format!("{prefix}{s}")).is_some());
+    if generic {
+        return true;
+    }
+    // css/html/js typed ops only exist on the response side.
+    prefix == "res"
+        && TYPED_BODY_PREFIXES.iter().any(|k| {
+            ["Body", "Prepend", "Append"]
+                .iter()
+                .any(|s| resolved.value(&format!("{k}{s}")).is_some())
+        })
 }
 
 /// True if any request-body operator applies (so the body must be buffered).
@@ -447,16 +460,22 @@ pub fn wants_res_body(resolved: &Resolved) -> bool {
 
 /// Transform a buffered request body per the resolved operators.
 pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
-    transform_body(body, resolved, "req")
+    transform_body(body, resolved, "req", None)
 }
 
-/// Transform a buffered response body per the resolved operators.
-pub fn transform_res_body(body: Bytes, resolved: &Resolved) -> Bytes {
-    transform_body(body, resolved, "res")
+/// Transform a buffered response body; `content_type` gates css/html/js ops.
+pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option<&str>) -> Bytes {
+    transform_body(body, resolved, "res", content_type)
 }
 
-/// Apply `*Body` → `*Replace` → `*Prepend` → `*Append` in that order.
-fn transform_body(body: Bytes, resolved: &Resolved, prefix: &str) -> Bytes {
+/// Apply `*Body` → `*Replace` → `*Prepend` → `*Append`, then content-type-specific
+/// (`css`/`html`/`js`) `Body`/`Prepend`/`Append` for the response.
+fn transform_body(
+    body: Bytes,
+    resolved: &Resolved,
+    prefix: &str,
+    content_type: Option<&str>,
+) -> Bytes {
     let mut data: Vec<u8> = match resolved.value(&format!("{prefix}Body")) {
         Some(new) => new.as_bytes().to_vec(),
         None => body.to_vec(),
@@ -473,7 +492,38 @@ fn transform_body(body: Bytes, resolved: &Resolved, prefix: &str) -> Bytes {
     if let Some(app) = resolved.value(&format!("{prefix}Append")) {
         data.extend_from_slice(app.as_bytes());
     }
+
+    // Content-type-specific ops (cssBody/htmlPrepend/jsAppend, …).
+    if prefix == "res" {
+        if let Some(kind) = content_type.and_then(typed_body_kind) {
+            if let Some(new) = resolved.value(&format!("{kind}Body")) {
+                data = new.as_bytes().to_vec();
+            }
+            if let Some(pre) = resolved.value(&format!("{kind}Prepend")) {
+                let mut v = pre.as_bytes().to_vec();
+                v.extend_from_slice(&data);
+                data = v;
+            }
+            if let Some(app) = resolved.value(&format!("{kind}Append")) {
+                data.extend_from_slice(app.as_bytes());
+            }
+        }
+    }
     Bytes::from(data)
+}
+
+/// Map a content type to a typed-body prefix (`html`/`css`/`js`).
+fn typed_body_kind(content_type: &str) -> Option<&'static str> {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.contains("html") {
+        Some("html")
+    } else if ct.contains("css") {
+        Some("css")
+    } else if ct.contains("javascript") || ct.contains("ecmascript") {
+        Some("js")
+    } else {
+        None
+    }
 }
 
 /// `*Replace` on a body: `from=to`, literal or `/regex/[i]`. Binary bodies untouched.
@@ -779,7 +829,7 @@ mod tests {
     fn res_body_replaced() {
         let resolved = resolve("example.com/x resBody://NEW\n", "http://example.com/x");
         assert!(wants_res_body(&resolved));
-        let out = transform_res_body(Bytes::from_static(b"OLD"), &resolved);
+        let out = transform_res_body(Bytes::from_static(b"OLD"), &resolved, None);
         assert_eq!(&out[..], b"NEW");
     }
 
@@ -790,14 +840,14 @@ mod tests {
             "http://example.com/x",
         );
         assert!(wants_res_body(&resolved));
-        let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved);
+        let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved, None);
         assert_eq!(&out[..], b"<!--top-->a bar b<!--end-->");
     }
 
     #[test]
     fn res_body_regex_replace() {
         let resolved = resolve("example.com/x resReplace:///\\d+/=N\n", "http://example.com/x");
-        let out = transform_res_body(Bytes::from_static(b"id=123 and 45"), &resolved);
+        let out = transform_res_body(Bytes::from_static(b"id=123 and 45"), &resolved, None);
         assert_eq!(&out[..], b"id=N and N");
     }
 

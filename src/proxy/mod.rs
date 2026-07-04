@@ -442,7 +442,12 @@ async fn serve(
         || weinre.is_some()
     {
         let bytes = body.collect().await?.to_bytes();
-        let mut new = apply::transform_res_body(bytes, &resolved);
+        let ct = parts
+            .headers
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let mut new = apply::transform_res_body(bytes, &resolved, ct.as_deref());
             if let Some(src) = &res_script {
                 let hv: Vec<(String, String)> = parts
                     .headers
