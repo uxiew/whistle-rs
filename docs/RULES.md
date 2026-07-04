@@ -189,6 +189,22 @@ example.com   reqCookies://tracking          # bare name deletes it from the req
 example.com   resCookies://theme=dark
 ```
 
+### Body
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `reqBody` | replacement text | Replace the entire request body |
+| `resBody` | replacement text | Replace the entire response body |
+
+When a body operator applies, whistle-rs buffers that body, replaces it, and
+recomputes `Content-Length` (dropping any `Transfer-Encoding`). Requests/responses
+without a body operator are streamed through untouched.
+
+```
+api.example.com/echo   reqBody://{"mocked":true}
+example.com/app.js     resBody://console.log('patched')
+```
+
 > `statusCode` is dual-purpose, matching whistle: when there is no upstream request it
 > mocks the response; combined with a forwarded request it replaces the status.
 
@@ -259,7 +275,7 @@ example.com/old/*    redirect://https://example.com/new/
   correctly (so mixed rule files work), but do not change traffic yet: upstream
   proxying (`proxy`, `http-proxy`, `https-proxy`, `socks`, `internal-proxy`,
   `https2http-proxy`, `http2https-proxy`), `pac`, `weinre`, `plugin`, body rewriting
-  (`reqBody`, `resBody`, `reqReplace`, `resReplace`, `*Prepend`, `*Append`,
+  (`reqReplace`, `resReplace`, `*Prepend`, `*Append`,
   `css/html/js*`), `resScript`/`frameScript`, `filter`/`ignore`,
   `attachment`, `forwardedFor`, delays (`reqDelay`,
   `resDelay`) and speeds (`reqSpeed`, `resSpeed`), `cache`, `cipher`, `sniCallback`.

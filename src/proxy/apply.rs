@@ -204,6 +204,38 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
     apply_res_cookies(&mut parts.headers, resolved);
 }
 
+/// True if any request-body operator applies (so the body must be buffered).
+pub fn wants_req_body(resolved: &Resolved) -> bool {
+    resolved.value("reqBody").is_some()
+}
+
+/// True if any response-body operator applies (so the body must be buffered).
+pub fn wants_res_body(resolved: &Resolved) -> bool {
+    resolved.value("resBody").is_some()
+}
+
+/// Transform a buffered request body per the resolved operators.
+pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
+    if let Some(new) = resolved.value("reqBody") {
+        return Bytes::from(new.to_string());
+    }
+    body
+}
+
+/// Transform a buffered response body per the resolved operators.
+pub fn transform_res_body(body: Bytes, resolved: &Resolved) -> Bytes {
+    if let Some(new) = resolved.value("resBody") {
+        return Bytes::from(new.to_string());
+    }
+    body
+}
+
+/// Remove length/encoding headers so hyper recomputes them for a rewritten body.
+pub fn strip_length_headers(headers: &mut HeaderMap) {
+    headers.remove(hyper::header::CONTENT_LENGTH);
+    headers.remove(hyper::header::TRANSFER_ENCODING);
+}
+
 /// Collect every value for a protocol (multi-match list plus any single).
 fn collect_values<'a>(resolved: &'a Resolved, protocol: &str) -> Vec<&'a str> {
     let mut out: Vec<&str> = resolved.all(protocol).iter().map(|o| o.value.as_str()).collect();
@@ -381,6 +413,24 @@ mod tests {
         assert!(cookie.contains("a=1"));
         assert!(cookie.contains("b=2"));
         assert!(!cookie.contains("old="));
+    }
+
+    #[test]
+    fn res_body_replaced() {
+        let resolved = resolve("example.com/x resBody://NEW\n", "http://example.com/x");
+        assert!(wants_res_body(&resolved));
+        let out = transform_res_body(Bytes::from_static(b"OLD"), &resolved);
+        assert_eq!(&out[..], b"NEW");
+    }
+
+    #[test]
+    fn req_body_replaced_only_when_present() {
+        let none = resolve("example.com host://1.1.1.1\n", "http://example.com/");
+        assert!(!wants_req_body(&none));
+        let some = resolve("example.com reqBody://HELLO\n", "http://example.com/");
+        assert!(wants_req_body(&some));
+        let out = transform_req_body(Bytes::from_static(b"orig"), &some);
+        assert_eq!(&out[..], b"HELLO");
     }
 
     #[test]

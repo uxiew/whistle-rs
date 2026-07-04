@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
@@ -213,7 +214,17 @@ async fn serve(
     ensure_host_header(&mut parts.headers, &host, port, &scheme);
     parts.headers.remove("proxy-connection");
     apply::apply_request(&mut parts, &resolved);
-    let out_req = Request::from_parts(parts, incoming);
+
+    // Buffer + transform the request body only when a body operator applies.
+    let req_body: DynBody = if apply::wants_req_body(&resolved) {
+        let bytes = incoming.collect().await?.to_bytes();
+        let new = apply::transform_req_body(bytes, &resolved);
+        apply::strip_length_headers(&mut parts.headers);
+        body::full(new)
+    } else {
+        body::from_incoming(incoming)
+    };
+    let out_req = Request::from_parts(parts, req_body);
 
     tracing::info!(
         "{} {} -> {}:{} ({})",
@@ -229,7 +240,16 @@ async fn serve(
     // Apply response-side rules.
     let (mut parts, body) = upstream_resp.into_parts();
     apply::apply_response(&mut parts, &resolved);
-    Ok(Response::from_parts(parts, body::from_incoming(body)))
+
+    let res_body: DynBody = if apply::wants_res_body(&resolved) {
+        let bytes = body.collect().await?.to_bytes();
+        let new = apply::transform_res_body(bytes, &resolved);
+        apply::strip_length_headers(&mut parts.headers);
+        body::full(new)
+    } else {
+        body::from_incoming(body)
+    };
+    Ok(Response::from_parts(parts, res_body))
 }
 
 /// The built-in page served when a browser hits the proxy port directly.

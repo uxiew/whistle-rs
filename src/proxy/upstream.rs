@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+
+use super::body::DynBody;
 use once_cell::sync::Lazy;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
@@ -41,7 +43,7 @@ static CLIENT_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
 
 /// Forward `req` to `target` and return the upstream response (body still
 /// streaming). The request URI must already be origin-form with a `Host` header.
-pub async fn forward(target: &Target, req: Request<Incoming>) -> Result<Response<Incoming>> {
+pub async fn forward(target: &Target, req: Request<DynBody>) -> Result<Response<Incoming>> {
     let tcp = TcpStream::connect((target.connect_host.as_str(), target.connect_port))
         .await
         .with_context(|| {
@@ -67,7 +69,7 @@ pub async fn forward(target: &Target, req: Request<Incoming>) -> Result<Response
 }
 
 /// Drive one HTTP/1.1 request/response over an established connection.
-async fn send<I>(io: I, req: Request<Incoming>) -> Result<Response<Incoming>>
+async fn send<I>(io: I, req: Request<DynBody>) -> Result<Response<Incoming>>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
