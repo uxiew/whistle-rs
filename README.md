@@ -179,14 +179,17 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `reqCookies`, `resCookies`, `reqType`/`resType`, `resCors`, `ua`, `referer`,
   `method`, `urlReplace`/`params`, body rewriting (`*Body`/`*Replace`/`*Prepend`/`*Append`),
   `auth`, `forwardedFor`, `attachment`, `reqDelay`/`resDelay`, `reqSpeed`/`resSpeed`,
-  `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`, `resScript` (JS)
+  `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`,
+  `resScript`/`frameScript` (JS), `plugin`, `weinre`
+- Web UI with live Network view + editable Rules; `/sessions.json`, `/proxy.pac`
 
-**Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
-the common ones are all applied.
+Essentially the whole whistle rule-operator set is now applied at runtime.
 
-**Not ported** (large standalone subsystems): whistle's original React web UI (`biz/`)
-is replaced by a lightweight built-in UI; the Node plugin subprocess loader, the weinre inspector server (script injection IS supported),
-WebSocket frame inspection/logging, and a persistent capture store remain future work. (End-to-end HTTP/2 interception is supported.)
+**Simplified vs. the original** (functional, but not a byte-for-byte port): whistle's
+React web UI (`biz/`) is replaced by a lightweight built-in UI; plugins are external
+HTTP servers rather than the Node subprocess loader; weinre is script-injection only
+(the inspector server is external); the traffic capture is in-memory (not persisted);
+WebSocket frame *inspection/logging* (beyond `frameScript`) is not surfaced.
 
 See [`docs/RULES.md#compatibility-notes`](docs/RULES.md#compatibility-notes) for the
 operator-level detail.

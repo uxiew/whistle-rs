@@ -106,9 +106,8 @@ $example.com   host://2.2.2.2      # this one wins
 ## Operators
 
 An operator is `protocol://value`. whistle-rs recognises the **full whistle protocol
-list** at parse time (so rule files load without error), but only the operators below
-have runtime behaviour today. The rest are resolved and exposed on the matched rule
-set, ready to be wired up — see [Compatibility notes](#compatibility-notes).
+list** at parse time, and applies essentially all of the common operators at runtime
+(see [Compatibility notes](#compatibility-notes) for the few exceptions).
 
 ### Shorthands
 
@@ -449,16 +448,19 @@ example.com/old/*    redirect://https://example.com/new/
 
 ## Compatibility notes
 
-- **Parsed but not yet applied at runtime.** These operators load and resolve
-  correctly (so mixed rule files work), but do not change traffic yet: `https2http-proxy`, `http2https-proxy`, `pac`, `weinre`, `plugin`, body rewriting
-  (`css/html/js*`), URL `params`/`urlParams`, `resScript`/`frameScript`, `filter`/`ignore`,
-  `attachment`, speeds (`reqSpeed`, `resSpeed`), `cache`, `cipher`, `sniCallback`.
-  Adding runtime behaviour means extending `src/proxy/apply.rs`.
-- **Simplified vs. upstream.** whistle's `filter://`/`ignore://` inline conditions,
-  template variables (`${…}`), plugin variables (`%name=…`), value references
-  (`{key}`), and the full `lineProps` system are not implemented. Patterns and
-  operators outside the forms documented above may parse but will not behave exactly
-  as in upstream whistle.
+- **Applied at runtime:** essentially the whole common operator set documented above,
+  including `host`, header/cookie/body/URL rewriting, `redirect`/`file`/`statusCode`,
+  delays/speeds, `auth`/`forwardedFor`/`attachment`, upstream `proxy`/`socks`/`pac`,
+  `filter`/`ignore` conditions, `resScript`/`frameScript`, `plugin`, and `weinre`.
+- **Parsed but with no distinct runtime effect yet:** `https2http-proxy`/
+  `http2https-proxy` (scheme-converting proxies), the `css/html/js*` content-type
+  body shorthands (use `resBody`/`resReplace`/`resPrepend`/`resAppend`), `cache`,
+  `cipher`, `sniCallback`, `trailers`, `rule`/`rulesFile`, `style`.
+- **Simplified vs. upstream.** whistle's template variables (`${…}`), plugin
+  variables (`%name=…`), value references (`{key}`), the full `lineProps` system, and
+  the Node-subprocess plugin loader are not implemented (plugins here are external
+  HTTP servers). Patterns/operators outside the documented forms may parse but not
+  behave exactly as in upstream whistle.
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.
