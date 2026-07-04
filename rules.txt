@@ -1,0 +1,7 @@
+# whistle-rs example rules — see README.md
+# map a domain to a local dev server (hosts shorthand)
+test.local            127.0.0.1:9099
+# redirect (short-circuits before contacting upstream)
+example.dev/go        redirect://http://test.local/landing
+# inject a response header on intercepted traffic (http + https)
+example.com           resHeaders://x-mitm=intercepted
