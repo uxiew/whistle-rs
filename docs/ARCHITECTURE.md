@@ -28,6 +28,9 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split), upstream HTTP/SOCKS proxies |
 | `src/proxy/apply.rs` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations |
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
+| `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
+| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + `frameScript` tunnel |
+| `src/proxy/webui.rs` | `biz/webui` | Built-in web UI + `/api/rules`, `/sessions.json`, PAC |
 | `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
 | `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
 
@@ -176,5 +179,9 @@ whistle-rs/
         ├── mod.rs
         ├── apply.rs
         ├── upstream.rs
+        ├── socks.rs       # inbound SOCKS5 server
+        ├── script.rs      # JS engine (resScript/frameScript/pac)
+        ├── ws.rs          # WebSocket frame codec + frameScript tunnel
+        ├── webui.rs       # built-in web UI + API
         └── body.rs
 ```
