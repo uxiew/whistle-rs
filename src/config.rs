@@ -35,6 +35,9 @@ pub struct Config {
     pub socks_port: Option<u16>,
     /// Registered plugin servers: name → `host:port` (whistle plugin servers).
     pub plugins: HashMap<String, String>,
+    /// Named values (whistle's Values store): name → content. Referenced by
+    /// `{name}` in operator values and by `rule://name`.
+    pub values: HashMap<String, String>,
 }
 
 impl Config {
@@ -65,6 +68,7 @@ impl Default for Config {
             rules: None,
             socks_port: None,
             plugins: HashMap::new(),
+            values: HashMap::new(),
         }
     }
 }

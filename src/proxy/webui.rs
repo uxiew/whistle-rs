@@ -23,6 +23,8 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         (_, "/sessions.json") => sessions_json(state),
         ("GET", "/api/rules") => rules_get(state),
         ("POST", "/api/rules") => rules_post(state, req).await,
+        ("GET", "/api/values") => values_get(state),
+        ("POST", "/api/values") => values_post(state, req).await,
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -115,6 +117,42 @@ async fn rules_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(format!("{{\"ok\":true,\"rules\":{count}}}"))))
         .unwrap()
+}
+
+fn values_get(state: &Arc<AppState>) -> Response<DynBody> {
+    let values = state.values.read().unwrap().clone();
+    let body = serde_json::to_string(&values).unwrap_or_else(|_| "{}".into());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body)))
+        .unwrap()
+}
+
+async fn values_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let body = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(body::full(Bytes::from_static(b"could not read body")))
+                .unwrap();
+        }
+    };
+    match serde_json::from_slice::<std::collections::HashMap<String, String>>(&body) {
+        Ok(map) => {
+            *state.values.write().unwrap() = map;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(body::full(Bytes::from_static(b"{\"ok\":true}")))
+                .unwrap()
+        }
+        Err(_) => Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(body::full(Bytes::from_static(b"expected a JSON object")))
+            .unwrap(),
+    }
 }
 
 fn html_ok(html: String) -> Response<DynBody> {

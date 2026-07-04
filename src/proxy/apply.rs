@@ -10,9 +10,11 @@ use hyper::http::request;
 use hyper::http::response;
 use hyper::{HeaderMap, Response, StatusCode};
 
+use std::collections::HashMap;
+
 use super::body::{self, DynBody};
 use super::upstream::{ProxyKind, Target, parse_proxy};
-use crate::rules::{ReqInfo, Resolved};
+use crate::rules::{ReqInfo, Resolved, RuleManager};
 
 /// Build the request facts the matcher needs.
 pub fn build_req_info(
@@ -48,6 +50,58 @@ pub fn build_req_info(
         full_url,
         headers: hdrs,
         client_ip,
+    }
+}
+
+/// Replace operator values of the form `{name}` with the named value's content
+/// (whistle's Values store references).
+pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, String>) {
+    fn sub(value: &mut String, values: &HashMap<String, String>) {
+        if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            if let Some(content) = values.get(name) {
+                *value = content.clone();
+            }
+        }
+    }
+    for op in resolved.single.values_mut() {
+        sub(&mut op.value, values);
+    }
+    for list in resolved.multi.values_mut() {
+        for op in list {
+            sub(&mut op.value, values);
+        }
+    }
+}
+
+/// Merge additional rules referenced by `rule://name` (from the values store) and
+/// `rulesFile://path` (from disk): resolve them against `info` and fill in any
+/// operators not already set.
+pub fn merge_included_rules(
+    resolved: &mut Resolved,
+    info: &ReqInfo,
+    values: &HashMap<String, String>,
+) {
+    let mut texts: Vec<String> = Vec::new();
+    if let Some(name) = resolved.value("rule") {
+        if let Some(content) = values.get(name) {
+            texts.push(content.clone());
+        }
+    }
+    if let Some(path) = resolved.value("rulesFile") {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            texts.push(content);
+        }
+    }
+    for text in texts {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(&text);
+        let sub = mgr.resolve(info);
+        for (k, v) in sub.single {
+            resolved.single.entry(k).or_insert(v);
+        }
+        for (k, mut vs) in sub.multi {
+            resolved.multi.entry(k).or_default().append(&mut vs);
+        }
     }
 }
 

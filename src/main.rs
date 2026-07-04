@@ -33,6 +33,11 @@ struct Cli {
     #[arg(long = "plugin", value_name = "NAME=HOST:PORT")]
     plugins: Vec<String>,
 
+    /// Define a named value as `name=content` (repeatable). Referenced by
+    /// `{name}` in operator values and by `rule://name`.
+    #[arg(long = "value", value_name = "NAME=CONTENT")]
+    values: Vec<String>,
+
     /// Path to a whistle rules file to load at startup.
     #[arg(short = 'r', long)]
     rules: Option<PathBuf>,
@@ -85,12 +90,22 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut values = std::collections::HashMap::new();
+    for spec in &cli.values {
+        if let Some((name, content)) = spec.split_once('=') {
+            values.insert(name.trim().to_string(), content.to_string());
+        } else {
+            anyhow::bail!("invalid --value '{spec}', expected name=content");
+        }
+    }
+
     let config = Config {
         port: cli.port,
         host: cli.host,
         storage_dir,
         socks_port: cli.socks_port,
         plugins,
+        values,
         ..Config::default()
     };
 

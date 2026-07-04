@@ -40,6 +40,8 @@ pub struct AppState {
     pub config: Config,
     pub rules: RwLock<RuleManager>,
     pub ca: Arc<CertAuthority>,
+    /// Named values store (name → content), editable via the UI.
+    pub values: RwLock<std::collections::HashMap<String, String>>,
     /// Bounded ring buffer of recent transactions (whistle's session capture).
     pub sessions: Mutex<VecDeque<Session>>,
     next_id: AtomicU64,
@@ -48,10 +50,12 @@ pub struct AppState {
 impl AppState {
     /// Construct fresh server state.
     pub fn new(config: Config, rules: RuleManager, ca: Arc<CertAuthority>) -> Self {
+        let values = RwLock::new(config.values.clone());
         AppState {
             config,
             rules: RwLock::new(rules),
             ca,
+            values,
             sessions: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
         }
@@ -351,7 +355,13 @@ async fn serve(
         req.headers(),
         client_ip.clone(),
     );
-    let resolved = state.rules.read().unwrap().resolve(&info);
+    let mut resolved = state.rules.read().unwrap().resolve(&info);
+    {
+        let values = state.values.read().unwrap();
+        apply::substitute_values(&mut resolved, &values);
+        apply::merge_included_rules(&mut resolved, &info, &values);
+        apply::substitute_values(&mut resolved, &values);
+    }
     let started = Instant::now();
     let time_ms = now_ms();
 
