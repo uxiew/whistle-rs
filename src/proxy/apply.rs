@@ -11,7 +11,7 @@ use hyper::http::response;
 use hyper::{HeaderMap, Response, StatusCode};
 
 use super::body::{self, DynBody};
-use super::upstream::Target;
+use super::upstream::{ProxyKind, Target, parse_proxy};
 use crate::rules::{ReqInfo, Resolved};
 
 /// Build the request facts the matcher needs.
@@ -58,11 +58,34 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
         }
     }
 
+    // First matching proxy operator wins (socks > https-proxy > http-proxy > proxy).
+    let proxy = resolved
+        .value("socks")
+        .and_then(|v| parse_proxy(ProxyKind::Socks, v))
+        .or_else(|| {
+            resolved
+                .value("https-proxy")
+                .and_then(|v| parse_proxy(ProxyKind::Https, v))
+        })
+        .or_else(|| {
+            resolved
+                .value("http-proxy")
+                .and_then(|v| parse_proxy(ProxyKind::Http, v))
+        })
+        .or_else(|| resolved.value("proxy").and_then(|v| parse_proxy(ProxyKind::Http, v)))
+        .or_else(|| {
+            resolved
+                .value("internal-proxy")
+                .and_then(|v| parse_proxy(ProxyKind::Http, v))
+        });
+
     Target {
         connect_host,
         connect_port,
         tls: info.scheme == "https" || info.scheme == "wss",
         sni: info.host.clone(),
+        request_port: info.port,
+        proxy,
     }
 }
 

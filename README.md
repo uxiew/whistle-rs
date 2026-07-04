@@ -157,6 +157,8 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 - Root CA generation, persistence, and `/rootCA.crt` download
 - Rules engine: comments, hosts shorthand, regex/wildcard/prefix/dot patterns,
   `$`-important precedence, multi-match accumulation
+- Upstream routing: `proxy`/`http-proxy`/`https-proxy`/`internal-proxy` (HTTP proxy)
+  and `socks` (SOCKS5)
 - Operators applied at runtime: `host` (+ `:port`), `reqHeaders`, `resHeaders`,
   `reqCookies`, `resCookies`, `reqType`/`resType`, `resCors`, `ua`, `referer`,
   `method`, `urlReplace`/`params`, body rewriting (`*Body`/`*Replace`/`*Prepend`/`*Append`),
@@ -164,8 +166,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
-rule files load; wiring them into `src/proxy/apply.rs` is the next step): upstream
-proxying (`proxy`/`*-proxy`/`socks`), `pac`, `weinre`, `plugin`, `resScript`/`frameScript`,
+rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`, `weinre`, `plugin`, `resScript`/`frameScript`,
 `filter`/`ignore`, `attachment`, delays/speeds.
 
 **Not ported** (large standalone subsystems): the web UI (React + CGI under `biz/`),

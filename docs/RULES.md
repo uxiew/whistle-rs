@@ -129,6 +129,27 @@ api.example.com   host://127.0.0.1:9000
 .example.com      host://:8443            # same host, force port 8443
 ```
 
+### Upstream proxy
+
+Route the forwarded request through another proxy. The credential form
+`user:pass@host:port` is supported; the port defaults to 80 (http), 443 (https),
+or 1080 (socks).
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `proxy` / `http-proxy` / `internal-proxy` | `[user:pass@]host:port` | Route via an HTTP proxy (absolute-form for http, CONNECT for https) |
+| `https-proxy` | `[user:pass@]host:port` | Same, but the connection to the proxy is TLS |
+| `socks` | `[user:pass@]host:port` | Route via a SOCKS5 proxy |
+
+```
+example.com        proxy://127.0.0.1:8888
+.internal.corp     http-proxy://user:pass@10.0.0.1:3128
+secure.example.com socks://127.0.0.1:1080
+```
+
+Precedence when several are present: `socks` > `https-proxy` > `http-proxy` >
+`proxy` > `internal-proxy`.
+
 ### URL rewriting
 
 | Operator | Value | Effect |
@@ -312,9 +333,7 @@ example.com/old/*    redirect://https://example.com/new/
 ## Compatibility notes
 
 - **Parsed but not yet applied at runtime.** These operators load and resolve
-  correctly (so mixed rule files work), but do not change traffic yet: upstream
-  proxying (`proxy`, `http-proxy`, `https-proxy`, `socks`, `internal-proxy`,
-  `https2http-proxy`, `http2https-proxy`), `pac`, `weinre`, `plugin`, body rewriting
+  correctly (so mixed rule files work), but do not change traffic yet: `https2http-proxy`, `http2https-proxy`, `pac`, `weinre`, `plugin`, body rewriting
   (`css/html/js*`), URL `params`/`urlParams`, `resScript`/`frameScript`, `filter`/`ignore`,
   `attachment`, speeds (`reqSpeed`, `resSpeed`), `cache`, `cipher`, `sniCallback`.
   Adding runtime behaviour means extending `src/proxy/apply.rs`.
