@@ -9,7 +9,7 @@ documentation see <https://wproxy.org>.
 - [Operators](#operators)
 - [Precedence](#precedence)
 - [Cookbook](#cookbook)
-- [Compatibility notes](#compatibility-notes)
+- [Operator coverage](#operator-coverage)
 
 ---
 
@@ -107,7 +107,7 @@ $example.com   host://2.2.2.2      # this one wins
 
 An operator is `protocol://value`. whistle-rs recognises the **full whistle protocol
 list** at parse time, and applies essentially all of the common operators at runtime
-(see [Compatibility notes](#compatibility-notes) for the few exceptions).
+(see [Operator coverage](#operator-coverage) for the exceptions).
 
 ### Shorthands
 
@@ -227,8 +227,11 @@ example.com/app.js     file:///Users/me/dev/app.js
 | `referer` | URL | Set the `Referer` header |
 | `method` | HTTP method | Override the request method |
 | `reqType` | MIME type | Set the request `Content-Type` |
+| `reqCharset` | charset | Set the charset on the request `Content-Type` |
+| `reqCors` | origin | Set the request `Origin` header |
 | `auth` | `user:pass` | Add an HTTP Basic `Authorization` header |
 | `forwardedFor` | IP | Set the `X-Forwarded-For` header |
+| `reqWrite` | file path | Append the request body to a file |
 
 ```
 example.com   reqHeaders://x-token=abc
@@ -335,14 +338,32 @@ slow.example.com   resSpeed://20        # ~20 KB/s download
 | `replaceStatus` / `statusCode` | status number | Replace the upstream response status |
 | `resHeaders` | `name=value`, `name:value`, or `{json}` | Set/replace response headers (empty value deletes). Accumulates across lines. |
 | `resType` | MIME type | Set the response `Content-Type` |
+| `resCharset` | charset | Set the charset on the response `Content-Type` |
 | `resCors` | origin or `*` | Set `Access-Control-Allow-Origin` |
 | `attachment` | filename | Force download via `Content-Disposition: attachment` |
+| `cache` | `no`/`no-store`/seconds/`keep` | Set `Cache-Control` (`keep` leaves it) |
+| `resWrite` | file path | Append the response body to a file |
 
 ```
 example.com        resHeaders://x-mitm=intercepted
 example.com/api    resCors://*
 cdn.example.com    resType://application/javascript
 example.com/404    replaceStatus://200
+example.com        cache://no
+```
+
+### Deleting
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `delete` | `scope.name` or bare `name` (`\|`/`,`-separated) | Remove headers/cookies/type/charset |
+
+Scopes: `reqHeaders`/`resHeaders` (a bare name deletes the header on that side),
+`reqCookies`, `resType`, `resCharset`.
+
+```
+example.com   delete://server|x-powered-by
+example.com   delete://reqCookies.tracking
 ```
 
 ### Cookies
@@ -366,6 +387,9 @@ example.com   resCookies://theme=dark
 | `reqReplace` / `resReplace` | `from=to` (or `/regex/[i]=to`) | Substitute inside the body |
 | `reqPrepend` / `resPrepend` | text | Insert at the start of the body |
 | `reqAppend` / `resAppend` | text | Insert at the end of the body |
+| `cssBody`/`cssPrepend`/`cssAppend` | text | Body ops applied only to CSS responses |
+| `htmlBody`/`htmlPrepend`/`htmlAppend` | text | Body ops applied only to HTML responses |
+| `jsBody`/`jsPrepend`/`jsAppend` | text | Body ops applied only to JavaScript responses |
 
 When any body operator applies, whistle-rs buffers that body, transforms it, and
 recomputes `Content-Length` (dropping any `Transfer-Encoding`). Operators apply in
@@ -446,21 +470,48 @@ example.com/old/*    redirect://https://example.com/new/
 
 ---
 
-## Compatibility notes
+## Operator coverage
 
-- **Applied at runtime:** essentially the whole common operator set documented above,
-  including `host`, header/cookie/body/URL rewriting, `redirect`/`file`/`statusCode`,
-  delays/speeds, `auth`/`forwardedFor`/`attachment`, upstream `proxy`/`socks`/`pac`,
-  `filter`/`ignore` conditions, `resScript`/`frameScript`, `plugin`, and `weinre`.
-- **Parsed but with no distinct runtime effect yet:** `https2http-proxy`/
-  `http2https-proxy` (scheme-converting proxies), the `css/html/js*` content-type
-  body shorthands (use `resBody`/`resReplace`/`resPrepend`/`resAppend`), `cache`,
-  `cipher`, `sniCallback`, `trailers`, `rule`/`rulesFile`, `style`.
-- **Simplified vs. upstream.** whistle's template variables (`${…}`), plugin
-  variables (`%name=…`), value references (`{key}`), the full `lineProps` system, and
-  the Node-subprocess plugin loader are not implemented (plugins here are external
-  HTTP servers). Patterns/operators outside the documented forms may parse but not
-  behave exactly as in upstream whistle.
+Every operator in whistle's registry (`_original/lib/rules/protocols.js`) and its
+status in whistle-rs. **55 of 73 are applied at runtime**; the rest parse and resolve
+(so mixed rule files load) but have no distinct effect.
+
+### Applied at runtime
+
+| Category | Operators |
+|----------|-----------|
+| Routing / upstream | `host`, `proxy`, `http-proxy`, `https-proxy`, `internal-proxy`, `socks`, `pac` |
+| Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite` |
+| Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite` |
+| Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` |
+| Short-circuit | `redirect`, `location`, `file`, `rawfile` (`statusCode` mock) |
+| Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete` |
+| Scripting / extend | `resScript`, `frameScript`, `plugin`, `weinre` |
+
+### Parsed but not applied (18)
+
+| Operator(s) | Why / note |
+|-------------|-----------|
+| `enable`, `disable` | Dozens of feature flags tied to whistle-specific internals; recognised but inert |
+| `headerReplace` | Regex-in-JSON header rewriting; use `resHeaders`/`reqReplace` instead |
+| `rule`, `rulesFile` | Reference/include other named rule sets (no named-rule registry) |
+| `pipe` | Stream through a pipe plugin server (like `plugin`, but streaming) |
+| `resMerge` | Deep-merge a JSON object into the response body |
+| `responseFor` | Attach another URL's response as headers |
+| `trailers` | HTTP trailer headers |
+| `reqWriteRaw`, `resWriteRaw` | Write the *raw* message (with headers) to a file — only the body variants `reqWrite`/`resWrite` are implemented |
+| `https2http-proxy`, `http2https-proxy` | Scheme-converting upstream proxies (use `proxy`/`https-proxy`) |
+| `cipher`, `sniCallback` | TLS cipher/SNI hooks (managed by rustls) |
+| `log` | Named log channel; traffic is captured via the built-in log instead |
+| `G`, `style` | Global-rule marker / UI display hint — no traffic effect |
+
+### Simplified vs. upstream
+
+whistle's template variables (`${…}`), plugin variables (`%name=…`), value references
+(`{key}`), the full `lineProps` system, and the Node-subprocess plugin loader are not
+implemented (plugins here are external HTTP servers). `resCors` sets
+`Access-Control-Allow-Origin` (not the full CORS header set). Patterns/operators
+outside the documented forms may parse but not behave exactly as in upstream whistle.
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.
