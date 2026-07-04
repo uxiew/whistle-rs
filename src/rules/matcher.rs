@@ -88,7 +88,29 @@ pub fn resolve(rules: &[Rule], req: &ReqInfo) -> Resolved {
         }
     }
 
+    apply_ignores(&mut resolved);
     resolved
+}
+
+/// `ignore://<proto>[,<proto>…]` removes those protocols from the resolved set;
+/// `ignore://all` clears everything. Ported from whistle's `ignore` handling.
+fn apply_ignores(resolved: &mut Resolved) {
+    let ignores = resolved.multi.remove("ignore").unwrap_or_default();
+    for op in ignores {
+        for name in op.value.split(['|', ',', ' ']) {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if name == "all" {
+                resolved.single.clear();
+                resolved.multi.clear();
+                return;
+            }
+            resolved.single.remove(name);
+            resolved.multi.remove(name);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +202,23 @@ mod tests {
         m.set_text("example.com host://1.1.1.1\n$example.com host://2.2.2.2\n");
         let r = m.resolve(&req("http://example.com/"));
         assert_eq!(r.value("host"), Some("2.2.2.2"));
+    }
+
+    #[test]
+    fn ignore_drops_protocol() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com host://1.2.3.4\nexample.com ignore://host\n");
+        let r = m.resolve(&req("http://example.com/"));
+        assert!(r.value("host").is_none());
+    }
+
+    #[test]
+    fn ignore_all_clears_everything() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com host://1.2.3.4\nexample.com resHeaders://x=1\nexample.com ignore://all\n");
+        let r = m.resolve(&req("http://example.com/"));
+        assert!(r.value("host").is_none());
+        assert!(r.all("resHeaders").is_empty());
     }
 
     #[test]

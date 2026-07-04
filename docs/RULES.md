@@ -166,6 +166,18 @@ example.com        params://debug=1&trace=on
 > Note the `/regex/` convention: since paths start with `/`, write literals without
 > surrounding slashes (`urlReplace://old=new`) and reserve `/…/` for regexes.
 
+### Disabling operators
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `ignore` | protocol name(s), or `all` | Drop those operators from the resolved set for matching requests |
+
+```
+.example.com   host://10.0.0.1
+static.example.com   ignore://host        # this host keeps its real destination
+example.com/health   ignore://all         # bypass every rule for this path
+```
+
 ### Short-circuit (no upstream request is made)
 
 | Operator | Value | Effect |
