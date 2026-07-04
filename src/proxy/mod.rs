@@ -460,12 +460,14 @@ async fn serve(
     let weinre = resolved.value("weinre").map(|s| s.to_string());
     let res_write = apply::res_write_path(&resolved);
     let res_write_raw = apply::res_write_raw_path(&resolved);
+    let trailers = apply::build_trailers(&resolved);
     let res_body: DynBody = if apply::wants_res_body(&resolved)
         || res_speed.is_some()
         || res_script.is_some()
         || weinre.is_some()
         || res_write.is_some()
         || res_write_raw.is_some()
+        || !trailers.is_empty()
     {
         let bytes = body.collect().await?.to_bytes();
         let ct = parts
@@ -522,9 +524,21 @@ async fn serve(
                 write_raw_file(path, &head, &new);
             }
             apply::strip_length_headers(&mut parts.headers);
-            match res_speed {
-                Some(kbps) => body::throttled(new, kbps),
-                None => body::full(new),
+            if !trailers.is_empty() {
+                // Trailers need chunked transfer; ensure HTTP/1.1 (upstream may be 1.0).
+                parts.version = hyper::Version::HTTP_11;
+                let names = trailers
+                    .keys()
+                    .map(|k| k.as_str().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                set_header_raw(&mut parts.headers, "trailer", &names);
+                body::with_trailers(new, trailers)
+            } else {
+                match res_speed {
+                    Some(kbps) => body::throttled(new, kbps),
+                    None => body::full(new),
+                }
             }
         } else {
             body::from_incoming(body)

@@ -481,6 +481,15 @@ pub fn res_write_raw_path(resolved: &Resolved) -> Option<String> {
     resolved.value("resWriteRaw").map(str::to_string)
 }
 
+/// Build the response trailer headers from `trailers://` operators.
+pub fn build_trailers(resolved: &Resolved) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    for value in collect_values(resolved, "trailers") {
+        apply_header_value(&mut h, value);
+    }
+    h
+}
+
 /// Content-type-specific body operator prefixes (`css`/`html`/`js`).
 const TYPED_BODY_PREFIXES: &[&str] = &["css", "html", "js"];
 

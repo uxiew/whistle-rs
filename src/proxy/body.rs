@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
+use hyper::HeaderMap;
 use hyper::body::{Body, Frame, Incoming};
 
 /// Uniform response body used throughout the proxy.
@@ -47,6 +48,42 @@ pub fn throttled<T: Into<Bytes>>(data: T, kb_per_sec: f64) -> DynBody {
     }
     .map_err(|never| match never {})
     .boxed()
+}
+
+/// An in-memory body that emits `data` then a trailers frame (`trailers://`).
+pub fn with_trailers<T: Into<Bytes>>(data: T, trailers: HeaderMap) -> DynBody {
+    TrailersBody {
+        data: Some(data.into()),
+        trailers: Some(trailers),
+    }
+    .map_err(|never| match never {})
+    .boxed()
+}
+
+struct TrailersBody {
+    data: Option<Bytes>,
+    trailers: Option<HeaderMap>,
+}
+
+impl Body for TrailersBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(data) = this.data.take() {
+            if !data.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+        }
+        if let Some(trailers) = this.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
+        Poll::Ready(None)
+    }
 }
 
 /// Body impl that paces chunk delivery (see [`throttled`]).
