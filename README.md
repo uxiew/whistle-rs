@@ -28,12 +28,15 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 - **HTTP forward proxy** — standard absolute-form proxying.
 - **HTTPS MITM** — `CONNECT` interception with per-host certificates signed on the fly
   by a locally generated, persisted root CA.
+- **WebSocket** — `ws://` and (via MITM) `wss://` upgrades are tunnelled end-to-end.
+- **Upstream proxies** — route through another HTTP/HTTPS proxy or a SOCKS5 proxy.
 - **Rules engine** — whistle's rule syntax: domain/prefix, leading-dot subdomain,
   wildcard, and regex patterns; `$`-important precedence; multi-match accumulation.
 - **Destination override** (`host://`) that rewrites the target IP/port while keeping
   the original `Host` header and TLS SNI — the defining behaviour of a debug proxy.
-- **Request/response rewriting** — headers, user-agent, method, content-type, CORS,
-  status replacement, redirects, and local file serving.
+- **Request/response rewriting** — headers, cookies, body (replace/prepend/append/
+  regex), URL/query, user-agent, method, content-type, CORS, auth, delays, status
+  replacement, redirects, and local file serving.
 - **Built-in status page** with a one-click root-CA download.
 - Single static binary, no C toolchain needed to build (pinned `ring` TLS provider).
 
@@ -154,9 +157,10 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 **Fully working (verified end-to-end):**
 
 - HTTP forward proxy; CONNECT tunnelling with HTTPS MITM + dynamic per-host certs
+- WebSocket (`ws://`/`wss://`) upgrade tunnelling
 - Root CA generation, persistence, and `/rootCA.crt` download
 - Rules engine: comments, hosts shorthand, regex/wildcard/prefix/dot patterns,
-  `$`-important precedence, multi-match accumulation
+  `$`-important precedence, multi-match accumulation, `ignore://`
 - Upstream routing: `proxy`/`http-proxy`/`https-proxy`/`internal-proxy` (HTTP proxy)
   and `socks` (SOCKS5)
 - Operators applied at runtime: `host` (+ `:port`), `reqHeaders`, `resHeaders`,
@@ -166,12 +170,13 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
-rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`, `weinre`, `plugin`, `resScript`/`frameScript`,
-`filter`/`ignore`, `attachment`, delays/speeds.
+rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`,
+`weinre`, `plugin`, `resScript`/`frameScript`, `filter`/`includeFilter`/`excludeFilter`
+conditions, `attachment`, `reqSpeed`/`resSpeed`.
 
 **Not ported** (large standalone subsystems): the web UI (React + CGI under `biz/`),
-the plugin subprocess system, weinre, WebSocket frame inspection, SOCKS server,
-HTTP/2, and the data/session capture store.
+the plugin subprocess system, weinre, WebSocket frame inspection/logging, an inbound
+SOCKS server, HTTP/2, and the data/session capture store.
 
 See [`docs/RULES.md#compatibility-notes`](docs/RULES.md#compatibility-notes) for the
 operator-level detail.

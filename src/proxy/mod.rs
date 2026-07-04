@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 
 use crate::ca::CertAuthority;
 use crate::config::Config;
-use crate::rules::RuleManager;
+use crate::rules::{ReqInfo, Resolved, RuleManager};
 use body::DynBody;
 
 /// Shared server state.
@@ -148,6 +148,7 @@ async fn mitm_serve(
 
     hyper::server::conn::http1::Builder::new()
         .serve_connection(io, service)
+        .with_upgrades()
         .await?;
     Ok(())
 }
@@ -206,6 +207,11 @@ async fn serve(
         return Ok(resp);
     }
 
+    // WebSocket / other protocol upgrades are tunnelled after a 101.
+    if is_upgrade(&req) {
+        return serve_upgrade(req, &info, &resolved, &scheme, &host, port).await;
+    }
+
     let target = apply::resolve_target(&info, &resolved);
 
     // Rewrite to origin-form + apply request-side rules.
@@ -259,6 +265,74 @@ async fn serve(
         body::from_incoming(body)
     };
     Ok(Response::from_parts(parts, res_body))
+}
+
+/// True if the request asks to upgrade the protocol (e.g. a WebSocket handshake).
+fn is_upgrade(req: &Request<Incoming>) -> bool {
+    let headers = req.headers();
+    let conn_upgrade = headers
+        .get(hyper::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("upgrade"))
+        .unwrap_or(false);
+    conn_upgrade && headers.contains_key(hyper::header::UPGRADE)
+}
+
+/// Forward an upgrade handshake and, on `101`, tunnel bytes both ways.
+/// This is how WebSocket (`ws://`/`wss://`) traffic is proxied.
+async fn serve_upgrade(
+    mut req: Request<Incoming>,
+    info: &ReqInfo,
+    resolved: &Resolved,
+    scheme: &str,
+    host: &str,
+    port: u16,
+) -> Result<Response<DynBody>> {
+    let target = apply::resolve_target(info, resolved);
+    let client_upgrade = hyper::upgrade::on(&mut req);
+
+    // Build the upstream handshake request (upgrades carry no body).
+    let (mut parts, _body) = req.into_parts();
+    let new_path = apply::rewrite_path(&info.path, resolved);
+    parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
+    ensure_host_header(&mut parts.headers, host, port, scheme);
+    parts.headers.remove("proxy-connection");
+    apply::apply_request(&mut parts, resolved);
+    let out_req = Request::from_parts(parts, body::empty());
+
+    tracing::info!(
+        "{} {} -> upgrade {}:{}",
+        info.method,
+        info.full_url,
+        target.connect_host,
+        target.connect_port
+    );
+
+    let mut resp = upstream::forward(&target, out_req).await?;
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        // Upstream declined the upgrade; relay its response verbatim.
+        let (p, b) = resp.into_parts();
+        return Ok(Response::from_parts(p, body::from_incoming(b)));
+    }
+
+    let upstream_upgrade = hyper::upgrade::on(&mut resp);
+    let (p, _b) = resp.into_parts();
+
+    tokio::spawn(async move {
+        match tokio::try_join!(client_upgrade, upstream_upgrade) {
+            Ok((client_io, upstream_io)) => {
+                let mut c = TokioIo::new(client_io);
+                let mut u = TokioIo::new(upstream_io);
+                if let Err(err) = tokio::io::copy_bidirectional(&mut c, &mut u).await {
+                    tracing::debug!("ws tunnel closed: {err}");
+                }
+            }
+            Err(err) => tracing::debug!("ws upgrade failed: {err}"),
+        }
+    });
+
+    // Relay the 101 (with Sec-WebSocket-Accept etc.) so the client handshake completes.
+    Ok(Response::from_parts(p, body::empty()))
 }
 
 /// The built-in page served when a browser hits the proxy port directly.

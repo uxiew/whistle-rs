@@ -208,8 +208,10 @@ where
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
         .context("upstream handshake")?;
+    // `with_upgrades()` keeps the connection usable for protocol upgrades
+    // (WebSocket); a plain `conn.await` tears the socket down on 101.
     tokio::spawn(async move {
-        if let Err(err) = conn.await {
+        if let Err(err) = conn.with_upgrades().await {
             tracing::debug!("upstream connection error: {err}");
         }
     });
