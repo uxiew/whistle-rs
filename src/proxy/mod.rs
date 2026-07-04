@@ -9,6 +9,7 @@ pub mod script;
 pub mod socks;
 pub mod upstream;
 pub mod webui;
+pub mod ws;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -527,6 +528,7 @@ async fn serve_upgrade(
     port: u16,
 ) -> Result<Response<DynBody>> {
     let target = apply::resolve_target(info, resolved);
+    let frame_script = resolved.value("frameScript").and_then(script::load_script);
     let client_upgrade = hyper::upgrade::on(&mut req);
 
     // Build the upstream handshake request (upgrades carry no body).
@@ -559,10 +561,17 @@ async fn serve_upgrade(
     tokio::spawn(async move {
         match tokio::try_join!(client_upgrade, upstream_upgrade) {
             Ok((client_io, upstream_io)) => {
-                let mut c = TokioIo::new(client_io);
-                let mut u = TokioIo::new(upstream_io);
-                if let Err(err) = tokio::io::copy_bidirectional(&mut c, &mut u).await {
-                    tracing::debug!("ws tunnel closed: {err}");
+                let c = TokioIo::new(client_io);
+                let u = TokioIo::new(upstream_io);
+                if let Some(src) = frame_script {
+                    // Frame-aware tunnel: run the script on each text frame.
+                    ws::scripted_tunnel(c, u, src).await;
+                } else {
+                    let mut c = c;
+                    let mut u = u;
+                    if let Err(err) = tokio::io::copy_bidirectional(&mut c, &mut u).await {
+                        tracing::debug!("ws tunnel closed: {err}");
+                    }
                 }
             }
             Err(err) => tracing::debug!("ws upgrade failed: {err}"),

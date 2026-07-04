@@ -266,6 +266,7 @@ api.example.com   plugin://mock
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `resScript` | path to a `.js` file (or inline JS) | Run JavaScript against the response |
+| `frameScript` | path to a `.js` file (or inline JS) | Run JavaScript on each WebSocket text frame |
 
 The script runs in an embedded JS engine with a global `ctx`:
 
@@ -281,6 +282,18 @@ script error leaves the response unchanged.
 
 ```
 example.com   resScript:///abs/path/patch.js
+```
+
+`frameScript` runs on each WebSocket text frame with
+`ctx = { direction: 'send'|'receive', frame: { data } }`; assign `ctx.frame.data`
+to rewrite the frame:
+
+```js
+if (ctx.direction === 'send') ctx.frame.data = ctx.frame.data.toUpperCase();
+```
+
+```
+chat.example.com   frameScript:///abs/path/frame.js
 ```
 
 ### weinre (HTML debug injection)

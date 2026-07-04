@@ -182,7 +182,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`, `resScript` (JS)
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
-rule files load): `frameScript` (WebSocket frame scripting).
+the common ones are all applied.
 
 **Not ported** (large standalone subsystems): whistle's original React web UI (`biz/`)
 is replaced by a lightweight built-in UI; the Node plugin subprocess loader, the weinre inspector server (script injection IS supported),

@@ -300,6 +300,18 @@ mod tests {
     }
 
     #[test]
+    fn url_scheme_pattern_not_treated_as_operator() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("http://example.com/api host://1.1.1.1\n");
+        assert_eq!(m.len(), 1);
+        let r = m.resolve(&req("http://example.com/api/x"));
+        assert_eq!(r.value("host"), Some("1.1.1.1"));
+        // https request should not match an http:// pattern
+        let r2 = m.resolve(&req("https://example.com/api/x"));
+        assert!(r2.value("host").is_none());
+    }
+
+    #[test]
     fn host_suffix_pattern() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text(".example.com host://5.5.5.5\n");

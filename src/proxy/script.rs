@@ -95,6 +95,26 @@ pub fn run_res_script(
     })
 }
 
+/// Run a `frameScript` against one WebSocket text frame, returning the
+/// (possibly rewritten) payload. `direction` is `"send"` or `"receive"`.
+pub fn run_frame_script(src: &str, direction: &str, data: &str) -> Option<String> {
+    let mut ctx = Context::default();
+    let ctx_json = json!({ "direction": direction, "frame": { "data": data } });
+    let jsval = boa_engine::JsValue::from_json(&ctx_json, &mut ctx).ok()?;
+    ctx.global_object()
+        .set(js_string!("ctx"), jsval, false, &mut ctx)
+        .ok()?;
+    if ctx.eval(Source::from_bytes(src.as_bytes())).is_err() {
+        return None;
+    }
+    let ctx_val = ctx.global_object().get(js_string!("ctx"), &mut ctx).ok()?;
+    let out = ctx_val.to_json(&mut ctx).ok()??;
+    out.get("frame")?
+        .get("data")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
 /// Evaluate a PAC file's `FindProxyForURL(url, host)` and return its result
 /// string (e.g. `"PROXY 127.0.0.1:8888"`, `"SOCKS ..."`, or `"DIRECT"`).
 pub fn eval_pac(pac_src: &str, url: &str, host: &str) -> Option<String> {

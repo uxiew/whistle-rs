@@ -84,8 +84,6 @@ pub const PROTOCOLS: &[&str] = &[
     "redirect",
     "location",
     "statusCode",
-    "https",
-    "http",
     "socks",
     "http-proxy",
     "https-proxy",
