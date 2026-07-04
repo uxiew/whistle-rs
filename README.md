@@ -182,10 +182,10 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`, `resScript` (JS)
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
-rule files load): `weinre`, `frameScript`.
+rule files load): `frameScript` (WebSocket frame scripting).
 
 **Not ported** (large standalone subsystems): whistle's original React web UI (`biz/`)
-is replaced by a lightweight built-in UI; the plugin subprocess system, weinre,
+is replaced by a lightweight built-in UI; the Node plugin subprocess loader, the weinre inspector server (script injection IS supported),
 WebSocket frame inspection/logging, and a persistent capture store remain future work. (End-to-end HTTP/2 interception is supported.)
 
 See [`docs/RULES.md#compatibility-notes`](docs/RULES.md#compatibility-notes) for the

@@ -434,10 +434,14 @@ async fn serve(
     let res_script = resolved
         .value("resScript")
         .and_then(script::load_script);
-    let res_body: DynBody =
-        if apply::wants_res_body(&resolved) || res_speed.is_some() || res_script.is_some() {
-            let bytes = body.collect().await?.to_bytes();
-            let mut new = apply::transform_res_body(bytes, &resolved);
+    let weinre = resolved.value("weinre").map(|s| s.to_string());
+    let res_body: DynBody = if apply::wants_res_body(&resolved)
+        || res_speed.is_some()
+        || res_script.is_some()
+        || weinre.is_some()
+    {
+        let bytes = body.collect().await?.to_bytes();
+        let mut new = apply::transform_res_body(bytes, &resolved);
             if let Some(src) = &res_script {
                 let hv: Vec<(String, String)> = parts
                     .headers
@@ -464,6 +468,14 @@ async fn serve(
                     if let Some(b) = r.body {
                         new = Bytes::from(b);
                     }
+                }
+            }
+            // weinre: inject a debug <script> into HTML responses.
+            if let Some(id) = &weinre {
+                if is_html(&parts.headers) {
+                    let src = weinre_src(id, &state.config);
+                    let tag = format!("<script src=\"{src}\"></script>");
+                    new = inject_into_html(&new, &tag);
                 }
             }
             apply::strip_length_headers(&mut parts.headers);
@@ -559,6 +571,64 @@ async fn serve_upgrade(
 
     // Relay the 101 (with Sec-WebSocket-Accept etc.) so the client handshake completes.
     Ok(Response::from_parts(p, body::empty()))
+}
+
+/// True if the response declares an HTML content type.
+fn is_html(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+}
+
+/// Build the weinre target-script URL. If `id` is already a URL/path use it as-is;
+/// otherwise build the conventional weinre target URL served on the proxy host.
+fn weinre_src(id: &str, config: &Config) -> String {
+    let id = id.trim();
+    if id.contains("://") || id.starts_with('/') {
+        return id.to_string();
+    }
+    let host = config
+        .host
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let anchor = if id.is_empty() {
+        String::new()
+    } else {
+        format!("#{id}")
+    };
+    format!(
+        "//{host}:{port}/weinre/target/target-script-min.js{anchor}",
+        port = config.port
+    )
+}
+
+/// Inject `tag` into HTML: before `</head>`, else after `<body>`, else prepend.
+fn inject_into_html(body: &Bytes, tag: &str) -> Bytes {
+    let text = String::from_utf8_lossy(body);
+    let lower = text.to_ascii_lowercase();
+    if let Some(i) = lower.find("</head>") {
+        let mut out = String::with_capacity(text.len() + tag.len());
+        out.push_str(&text[..i]);
+        out.push_str(tag);
+        out.push_str(&text[i..]);
+        return Bytes::from(out);
+    }
+    if let Some(i) = lower.find("<body") {
+        if let Some(close) = text[i..].find('>') {
+            let pos = i + close + 1;
+            let mut out = String::with_capacity(text.len() + tag.len());
+            out.push_str(&text[..pos]);
+            out.push_str(tag);
+            out.push_str(&text[pos..]);
+            return Bytes::from(out);
+        }
+    }
+    let mut out = String::with_capacity(text.len() + tag.len());
+    out.push_str(tag);
+    out.push_str(&text);
+    Bytes::from(out)
 }
 
 /// Set/replace a header (empty value deletes); used by response scripts.

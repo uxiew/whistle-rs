@@ -283,6 +283,21 @@ script error leaves the response unchanged.
 example.com   resScript:///abs/path/patch.js
 ```
 
+### weinre (HTML debug injection)
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `weinre` | id, or a script URL/path | Inject a weinre `<script>` into HTML responses |
+
+Injected before `</head>` (or after `<body>`). A plain id builds the conventional
+`//host:port/weinre/target/target-script-min.js#id` URL; a URL/path value is used
+verbatim. The weinre inspector server itself is external (not bundled).
+
+```
+.example.com   weinre://mysession
+example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
+```
+
 ### Delays & throttling
 
 | Operator | Value | Effect |
