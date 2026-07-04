@@ -80,6 +80,14 @@ pub struct Session {
     /// Where the request was sent (or "short-circuit").
     pub target: String,
     pub duration_ms: u128,
+    /// `log://` channel labels attached to this request (whistle's log tags).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<String>,
+}
+
+/// Collect `log://` channel labels for a resolved request.
+fn log_labels(resolved: &Resolved) -> Vec<String> {
+    resolved.all("log").iter().map(|o| o.value.clone()).collect()
 }
 
 /// Milliseconds since the Unix epoch (best-effort).
@@ -359,6 +367,7 @@ async fn serve(
             client_ip: client_ip.clone(),
             target: "short-circuit".to_string(),
             duration_ms: started.elapsed().as_millis(),
+            log: log_labels(&resolved),
         });
         return Ok(resp);
     }
@@ -534,6 +543,7 @@ async fn serve(
         client_ip: client_ip.clone(),
         target: target_desc,
         duration_ms: started.elapsed().as_millis(),
+            log: log_labels(&resolved),
     });
 
     Ok(Response::from_parts(parts, res_body))

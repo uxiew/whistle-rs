@@ -473,22 +473,26 @@ example.com/old/*    redirect://https://example.com/new/
 ## Operator coverage
 
 Every operator in whistle's registry (`_original/lib/rules/protocols.js`) and its
-status in whistle-rs. **55 of 73 are applied at runtime**; the rest parse and resolve
+status in whistle-rs. **61 of 73 are applied at runtime**; the rest parse and resolve
 (so mixed rule files load) but have no distinct effect.
 
 ### Applied at runtime
 
 | Category | Operators |
 |----------|-----------|
-| Routing / upstream | `host`, `proxy`, `http-proxy`, `https-proxy`, `internal-proxy`, `socks`, `pac` |
-| Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite` |
-| Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite` |
+| Routing / upstream | `host`, `proxy`, `http-proxy`, `https-proxy`, `internal-proxy`, `https2http-proxy`, `http2https-proxy`, `socks`, `pac` |
+| Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw` |
+| Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw` |
 | Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` |
 | Short-circuit | `redirect`, `location`, `file`, `rawfile` (`statusCode` mock) |
-| Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete` |
+| Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log` |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `weinre` |
 
-### Parsed but not applied (18)
+`https2http-proxy`/`http2https-proxy` resolve as HTTP proxies (the scheme conversion
+itself is approximated). `log://` labels are attached to each captured session
+(visible in `/sessions.json`).
+
+### Parsed but not applied (12)
 
 | Operator(s) | Why / note |
 |-------------|-----------|
@@ -496,13 +500,9 @@ status in whistle-rs. **55 of 73 are applied at runtime**; the rest parse and re
 | `headerReplace` | Regex-in-JSON header rewriting; use `resHeaders`/`reqReplace` instead |
 | `rule`, `rulesFile` | Reference/include other named rule sets (no named-rule registry) |
 | `pipe` | Stream through a pipe plugin server (like `plugin`, but streaming) |
-| `resMerge` | Deep-merge a JSON object into the response body |
 | `responseFor` | Attach another URL's response as headers |
 | `trailers` | HTTP trailer headers |
-| `reqWriteRaw`, `resWriteRaw` | Write the *raw* message (with headers) to a file — only the body variants `reqWrite`/`resWrite` are implemented |
-| `https2http-proxy`, `http2https-proxy` | Scheme-converting upstream proxies (use `proxy`/`https-proxy`) |
 | `cipher`, `sniCallback` | TLS cipher/SNI hooks (managed by rustls) |
-| `log` | Named log channel; traffic is captured via the built-in log instead |
 | `G`, `style` | Global-rule marker / UI display hint — no traffic effect |
 
 ### Simplified vs. upstream

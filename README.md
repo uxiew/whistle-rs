@@ -175,18 +175,18 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `filter`/`includeFilter`/`excludeFilter` conditions (method/host/header/clientIp/URL)
 - Upstream routing: `proxy`/`http-proxy`/`https-proxy`/`internal-proxy` (HTTP proxy)
   and `socks` (SOCKS5); `pac` (evaluate PAC to pick the proxy)
-- Operators applied at runtime: **55 of whistle's 73 registry operators** — headers,
-  cookies, `delete`, charset, body rewriting (generic + `css`/`html`/`js`), URL/query,
-  `ua`/`referer`/`method`/`auth`/`forwardedFor`, delays/speeds, `cache`, `attachment`,
-  `redirect`/`file`/`statusCode`, `reqWrite`/`resWrite`, `resScript`/`frameScript`,
-  `plugin`, `weinre`. See the full mapping in
+- Operators applied at runtime: **61 of whistle's 73 registry operators** — headers,
+  cookies, `delete`, charset, body rewriting (generic + `css`/`html`/`js` + `resMerge`),
+  URL/query, `ua`/`referer`/`method`/`auth`/`forwardedFor`, delays/speeds, `cache`,
+  `attachment`, `redirect`/`file`/`statusCode`, `reqWrite`/`resWrite`(`Raw`), `log`,
+  `resScript`/`frameScript`, `plugin`, `weinre`. Full mapping in
   [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage).
 - Web UI with live Network view + editable Rules; `/sessions.json`, `/proxy.pac`
 
-The remaining 18 operators (feature flags `enable`/`disable`, `headerReplace`,
-`resMerge`, `responseFor`, `pipe`, `trailers`, `*WriteRaw`, `cipher`/`sniCallback`,
-`rule`/`rulesFile`, `https2http-proxy`/`http2https-proxy`, `log`, `G`/`style`) parse
-and resolve but have no distinct runtime effect — see the coverage table.
+The remaining 12 operators (feature flags `enable`/`disable`, `headerReplace`,
+`responseFor`, `pipe`, `trailers`, `cipher`/`sniCallback`, `rule`/`rulesFile`,
+`G`/`style`) parse and resolve but have no distinct runtime effect — see the coverage
+table for the reason each is out of scope.
 
 **Simplified vs. the original** (functional, but not a byte-for-byte port): whistle's
 React web UI (`biz/`) is replaced by a lightweight built-in UI; plugins are external
