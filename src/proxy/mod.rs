@@ -8,9 +8,12 @@ pub mod body;
 pub mod socks;
 pub mod upstream;
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -26,11 +29,62 @@ use crate::config::Config;
 use crate::rules::{ReqInfo, Resolved, RuleManager};
 use body::DynBody;
 
+/// Maximum number of captured transactions kept in memory.
+const MAX_SESSIONS: usize = 500;
+
 /// Shared server state.
 pub struct AppState {
     pub config: Config,
     pub rules: RwLock<RuleManager>,
     pub ca: Arc<CertAuthority>,
+    /// Bounded ring buffer of recent transactions (whistle's session capture).
+    pub sessions: Mutex<VecDeque<Session>>,
+    next_id: AtomicU64,
+}
+
+impl AppState {
+    /// Construct fresh server state.
+    pub fn new(config: Config, rules: RuleManager, ca: Arc<CertAuthority>) -> Self {
+        AppState {
+            config,
+            rules: RwLock::new(rules),
+            ca,
+            sessions: Mutex::new(VecDeque::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn record(&self, mut session: Session) {
+        session.id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut q = self.sessions.lock().unwrap();
+        if q.len() >= MAX_SESSIONS {
+            q.pop_front();
+        }
+        q.push_back(session);
+    }
+}
+
+/// One captured request/response transaction.
+#[derive(Clone, serde::Serialize)]
+pub struct Session {
+    pub id: u64,
+    /// Unix time in milliseconds when the request was received.
+    pub time_ms: u128,
+    pub method: String,
+    pub url: String,
+    pub status: u16,
+    pub client_ip: Option<String>,
+    /// Where the request was sent (or "short-circuit").
+    pub target: String,
+    pub duration_ms: u128,
+}
+
+/// Milliseconds since the Unix epoch (best-effort).
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// Where a request originated, which decides how we derive its target.
@@ -253,10 +307,22 @@ async fn serve(
         client_ip.clone(),
     );
     let resolved = state.rules.read().unwrap().resolve(&info);
+    let started = Instant::now();
+    let time_ms = now_ms();
 
     // Short-circuit rules (redirect, mocked status, file) skip the upstream.
     if let Some(resp) = apply::short_circuit(&info, &resolved) {
         tracing::info!("{} {} -> short-circuit", info.method, info.full_url);
+        state.record(Session {
+            id: 0,
+            time_ms,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            status: resp.status().as_u16(),
+            client_ip: client_ip.clone(),
+            target: "short-circuit".to_string(),
+            duration_ms: started.elapsed().as_millis(),
+        });
         return Ok(resp);
     }
 
@@ -325,6 +391,22 @@ async fn serve(
     } else {
         body::from_incoming(body)
     };
+
+    let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
+    if target.proxy.is_some() {
+        target_desc.push_str(" (via proxy)");
+    }
+    state.record(Session {
+        id: 0,
+        time_ms,
+        method: info.method.clone(),
+        url: info.full_url.clone(),
+        status: parts.status.as_u16(),
+        client_ip: client_ip.clone(),
+        target: target_desc,
+        duration_ms: started.elapsed().as_millis(),
+    });
+
     Ok(Response::from_parts(parts, res_body))
 }
 
@@ -416,27 +498,83 @@ fn local_ui(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> 
             .unwrap();
     }
 
+    // Captured traffic as JSON (most-recent first).
+    if path == "/sessions.json" {
+        let sessions: Vec<Session> = {
+            let q = state.sessions.lock().unwrap();
+            q.iter().rev().cloned().collect()
+        };
+        let body = serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".into());
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(body::full(Bytes::from(body)))
+            .unwrap();
+    }
+
     let rule_count = state.rules.read().unwrap().len();
+    let rows = recent_sessions_html(state);
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>whistle-rs</title>\
-<style>body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:680px;margin:40px auto;padding:0 16px;color:#222}}\
-code{{background:#f4f4f4;padding:2px 6px;border-radius:4px}}a{{color:#2d7ff9}}</style></head><body>\
+<style>body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:960px;margin:40px auto;padding:0 16px;color:#222}}\
+code{{background:#f4f4f4;padding:2px 6px;border-radius:4px}}a{{color:#2d7ff9}}\
+table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}}\
+th,td{{text-align:left;padding:4px 8px;border-bottom:1px solid #eee;white-space:nowrap}}\
+td.url{{white-space:normal;word-break:break-all}}.s2{{color:#2e7d32}}.s3{{color:#0277bd}}.s4,.s5{{color:#c62828}}</style></head><body>\
 <h1>whistle-rs</h1><p>HTTP/HTTPS debugging proxy (Rust port) — v{version}.</p>\
 <p><b>{count}</b> rules loaded.</p>\
 <h2>Setup</h2><ol>\
 <li>Point your client's HTTP &amp; HTTPS proxy at <code>{host}:{port}</code>.</li>\
 <li>To intercept HTTPS, install the root CA: <a href=\"/rootCA.crt\">download rootCA.crt</a> and trust it.</li>\
-</ol></body></html>",
+</ol>\
+<h2>Recent traffic <a href=\"/sessions.json\" style=\"font-size:13px\">(JSON)</a></h2>\
+<table><thead><tr><th>#</th><th>Method</th><th>Status</th><th>URL</th><th>Target</th><th>ms</th></tr></thead>\
+<tbody>{rows}</tbody></table>\
+<p style=\"color:#888;font-size:12px\">Showing up to {max} most-recent transactions (in memory). Reload to refresh.</p>\
+</body></html>",
         version = crate::config::VERSION,
         count = rule_count,
         host = state.config.host.map(|h| h.to_string()).unwrap_or_else(|| "127.0.0.1".to_string()),
         port = state.config.port,
+        rows = rows,
+        max = MAX_SESSIONS,
     );
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(body::full(Bytes::from(html)))
         .unwrap()
+}
+
+/// Render the recent-sessions table rows (most-recent first).
+fn recent_sessions_html(state: &Arc<AppState>) -> String {
+    let q = state.sessions.lock().unwrap();
+    if q.is_empty() {
+        return "<tr><td colspan=6 style=\"color:#888\">No traffic captured yet.</td></tr>".into();
+    }
+    let mut out = String::new();
+    for s in q.iter().rev().take(200) {
+        let cls = format!("s{}", s.status / 100);
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td class=\"url\">{}</td><td>{}</td><td>{}</td></tr>",
+            s.id,
+            html_escape(&s.method),
+            cls,
+            s.status,
+            html_escape(&s.url),
+            html_escape(&s.target),
+            s.duration_ms,
+        ));
+    }
+    out
+}
+
+/// Minimal HTML-escaping for values placed into the status table.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Ensure a correct `Host` header for the upstream request.

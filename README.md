@@ -39,6 +39,8 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 - **Request/response rewriting** — headers, cookies, body (replace/prepend/append/
   regex), URL/query, user-agent, method, content-type, CORS, auth, delays, status
   replacement, redirects, and local file serving.
+- **Traffic capture** — recent transactions are recorded in memory and shown on the
+  status page, with a `/sessions.json` endpoint for tooling.
 - **Built-in status page** with a one-click root-CA download.
 - Single static binary, no C toolchain needed to build (pinned `ring` TLS provider).
 
@@ -82,7 +84,8 @@ export http_proxy=http://127.0.0.1:8899 https_proxy=http://127.0.0.1:8899
 For a device on your LAN, use your machine's IP instead of `127.0.0.1` and make sure
 the port is reachable.
 
-Open <http://127.0.0.1:8899/> directly (not through the proxy) to see the status page.
+Open <http://127.0.0.1:8899/> directly (not through the proxy) to see the status page,
+which lists recent captured traffic. `GET /sessions.json` returns the same data as JSON.
 
 ## Intercepting HTTPS
 
@@ -179,7 +182,7 @@ rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`,
 
 **Not ported** (large standalone subsystems): the web UI (React + CGI under `biz/`),
 the plugin subprocess system, weinre, WebSocket frame inspection/logging,
-HTTP/2, and the data/session capture store.
+HTTP/2, and a persistent data/session capture store (an in-memory capture is included).
 
 See [`docs/RULES.md#compatibility-notes`](docs/RULES.md#compatibility-notes) for the
 operator-level detail.

@@ -3,7 +3,7 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -93,11 +93,7 @@ async fn main() -> Result<()> {
 
     let ca = CertAuthority::load_or_create(&config).context("initialising root CA")?;
 
-    let state = Arc::new(AppState {
-        config,
-        rules: RwLock::new(manager),
-        ca,
-    });
+    let state = Arc::new(AppState::new(config, manager, ca));
 
     proxy::run(state).await
 }
