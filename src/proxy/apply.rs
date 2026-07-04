@@ -175,7 +175,30 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(ct) = resolved.value("reqType") {
         set_header(&mut parts.headers, "content-type", ct);
     }
+    if let Some(auth) = resolved.value("auth") {
+        // `auth://user:pass` → HTTP Basic Authorization header.
+        if !auth.is_empty() {
+            let token = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                auth.as_bytes(),
+            );
+            set_header(&mut parts.headers, "authorization", &format!("Basic {token}"));
+        }
+    }
+    if let Some(xff) = resolved.value("forwardedFor") {
+        set_header(&mut parts.headers, "x-forwarded-for", xff);
+    }
     apply_req_cookies(&mut parts.headers, resolved);
+}
+
+/// Milliseconds to delay before forwarding the request (`reqDelay`).
+pub fn req_delay_ms(resolved: &Resolved) -> Option<u64> {
+    resolved.value("reqDelay").and_then(|v| v.trim().parse().ok())
+}
+
+/// Milliseconds to delay before returning the response (`resDelay`).
+pub fn res_delay_ms(resolved: &Resolved) -> Option<u64> {
+    resolved.value("resDelay").and_then(|v| v.trim().parse().ok())
 }
 
 /// Apply response-side operators (status replacement, headers) in place.
@@ -578,6 +601,33 @@ mod tests {
         assert!(wants_req_body(&some));
         let out = transform_req_body(Bytes::from_static(b"orig"), &some);
         assert_eq!(&out[..], b"HELLO");
+    }
+
+    #[test]
+    fn auth_and_forwarded_for() {
+        let resolved = resolve(
+            "example.com auth://user:pass\nexample.com forwardedFor://9.9.9.9\n",
+            "http://example.com/",
+        );
+        let mut parts = hyper::Request::builder()
+            .uri("http://example.com/")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        apply_request(&mut parts, &resolved);
+        assert_eq!(
+            parts.headers.get("authorization").unwrap(),
+            "Basic dXNlcjpwYXNz"
+        );
+        assert_eq!(parts.headers.get("x-forwarded-for").unwrap(), "9.9.9.9");
+    }
+
+    #[test]
+    fn delay_parsing() {
+        let resolved = resolve("example.com reqDelay://250\nexample.com resDelay://40\n", "http://example.com/");
+        assert_eq!(req_delay_ms(&resolved), Some(250));
+        assert_eq!(res_delay_ms(&resolved), Some(40));
     }
 
     #[test]

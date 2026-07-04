@@ -227,6 +227,10 @@ async fn serve(
     };
     let out_req = Request::from_parts(parts, req_body);
 
+    if let Some(ms) = apply::req_delay_ms(&resolved) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
     tracing::info!(
         "{} {} -> {}:{} ({})",
         info.method,
@@ -237,6 +241,10 @@ async fn serve(
     );
 
     let upstream_resp = upstream::forward(&target, out_req).await?;
+
+    if let Some(ms) = apply::res_delay_ms(&resolved) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
 
     // Apply response-side rules.
     let (mut parts, body) = upstream_resp.into_parts();

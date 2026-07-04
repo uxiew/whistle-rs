@@ -160,6 +160,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 - Operators applied at runtime: `host` (+ `:port`), `reqHeaders`, `resHeaders`,
   `reqCookies`, `resCookies`, `reqType`/`resType`, `resCors`, `ua`, `referer`,
   `method`, `urlReplace`/`params`, body rewriting (`*Body`/`*Replace`/`*Prepend`/`*Append`),
+  `auth`, `forwardedFor`, `reqDelay`/`resDelay`,
   `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed

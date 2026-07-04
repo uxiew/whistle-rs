@@ -168,12 +168,28 @@ example.com/app.js     file:///Users/me/dev/app.js
 | `referer` | URL | Set the `Referer` header |
 | `method` | HTTP method | Override the request method |
 | `reqType` | MIME type | Set the request `Content-Type` |
+| `auth` | `user:pass` | Add an HTTP Basic `Authorization` header |
+| `forwardedFor` | IP | Set the `X-Forwarded-For` header |
 
 ```
 example.com   reqHeaders://x-token=abc
 example.com   reqHeaders://{"x-a":"1","x-b":"2"}
 example.com   ua://MyBot/1.0
 api.test/*    method://POST
+api.test      auth://admin:secret
+api.test      forwardedFor://203.0.113.7
+```
+
+### Delays
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `reqDelay` | milliseconds | Wait before forwarding the request |
+| `resDelay` | milliseconds | Wait before returning the response |
+
+```
+slow.example.com   reqDelay://500
+slow.example.com   resDelay://1000
 ```
 
 ### Response rewriting
@@ -300,8 +316,7 @@ example.com/old/*    redirect://https://example.com/new/
   proxying (`proxy`, `http-proxy`, `https-proxy`, `socks`, `internal-proxy`,
   `https2http-proxy`, `http2https-proxy`), `pac`, `weinre`, `plugin`, body rewriting
   (`css/html/js*`), URL `params`/`urlParams`, `resScript`/`frameScript`, `filter`/`ignore`,
-  `attachment`, `forwardedFor`, delays (`reqDelay`,
-  `resDelay`) and speeds (`reqSpeed`, `resSpeed`), `cache`, `cipher`, `sniCallback`.
+  `attachment`, speeds (`reqSpeed`, `resSpeed`), `cache`, `cipher`, `sniCallback`.
   Adding runtime behaviour means extending `src/proxy/apply.rs`.
 - **Simplified vs. upstream.** whistle's `filter://`/`ignore://` inline conditions,
   template variables (`${…}`), plugin variables (`%name=…`), value references
