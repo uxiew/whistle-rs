@@ -204,30 +204,81 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
     apply_res_cookies(&mut parts.headers, resolved);
 }
 
+/// Body operators for a side, keyed by prefix (`req`/`res`): `*Body` (replace),
+/// `*Replace` (substring/`/regex/` substitute), `*Prepend`, `*Append`.
+fn body_ops_present(resolved: &Resolved, prefix: &str) -> bool {
+    ["Body", "Replace", "Prepend", "Append"]
+        .iter()
+        .any(|s| resolved.value(&format!("{prefix}{s}")).is_some())
+}
+
 /// True if any request-body operator applies (so the body must be buffered).
 pub fn wants_req_body(resolved: &Resolved) -> bool {
-    resolved.value("reqBody").is_some()
+    body_ops_present(resolved, "req")
 }
 
 /// True if any response-body operator applies (so the body must be buffered).
 pub fn wants_res_body(resolved: &Resolved) -> bool {
-    resolved.value("resBody").is_some()
+    body_ops_present(resolved, "res")
 }
 
 /// Transform a buffered request body per the resolved operators.
 pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
-    if let Some(new) = resolved.value("reqBody") {
-        return Bytes::from(new.to_string());
-    }
-    body
+    transform_body(body, resolved, "req")
 }
 
 /// Transform a buffered response body per the resolved operators.
 pub fn transform_res_body(body: Bytes, resolved: &Resolved) -> Bytes {
-    if let Some(new) = resolved.value("resBody") {
-        return Bytes::from(new.to_string());
+    transform_body(body, resolved, "res")
+}
+
+/// Apply `*Body` → `*Replace` → `*Prepend` → `*Append` in that order.
+fn transform_body(body: Bytes, resolved: &Resolved, prefix: &str) -> Bytes {
+    let mut data: Vec<u8> = match resolved.value(&format!("{prefix}Body")) {
+        Some(new) => new.as_bytes().to_vec(),
+        None => body.to_vec(),
+    };
+
+    if let Some(spec) = resolved.value(&format!("{prefix}Replace")) {
+        data = apply_body_replace(data, spec);
     }
-    body
+    if let Some(pre) = resolved.value(&format!("{prefix}Prepend")) {
+        let mut v = pre.as_bytes().to_vec();
+        v.extend_from_slice(&data);
+        data = v;
+    }
+    if let Some(app) = resolved.value(&format!("{prefix}Append")) {
+        data.extend_from_slice(app.as_bytes());
+    }
+    Bytes::from(data)
+}
+
+/// `*Replace` value is `from=to`; if `from` is `/regex/[i]` a regex substitution is
+/// used, otherwise a literal replace-all of `from` with `to`.
+fn apply_body_replace(data: Vec<u8>, spec: &str) -> Vec<u8> {
+    let Some((from, to)) = spec.split_once('=') else {
+        return data;
+    };
+    let Ok(text) = String::from_utf8(data.clone()) else {
+        return data; // not UTF-8 text; leave binary body untouched
+    };
+    if from.starts_with('/') && from.len() > 1 {
+        if let Some(end) = from.rfind('/') {
+            if end > 0 {
+                let body = &from[1..end];
+                let flags = &from[end + 1..];
+                let pat = if flags.contains('i') {
+                    format!("(?i){body}")
+                } else {
+                    body.to_string()
+                };
+                if let Ok(re) = regex::Regex::new(&pat) {
+                    return re.replace_all(&text, to).into_owned().into_bytes();
+                }
+            }
+        }
+    }
+    text.replace(from, to).into_bytes()
 }
 
 /// Remove length/encoding headers so hyper recomputes them for a rewritten body.
@@ -421,6 +472,24 @@ mod tests {
         assert!(wants_res_body(&resolved));
         let out = transform_res_body(Bytes::from_static(b"OLD"), &resolved);
         assert_eq!(&out[..], b"NEW");
+    }
+
+    #[test]
+    fn res_body_prepend_append_replace() {
+        let resolved = resolve(
+            "example.com/x resPrepend://<!--top-->\nexample.com/x resAppend://<!--end-->\nexample.com/x resReplace://foo=bar\n",
+            "http://example.com/x",
+        );
+        assert!(wants_res_body(&resolved));
+        let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved);
+        assert_eq!(&out[..], b"<!--top-->a bar b<!--end-->");
+    }
+
+    #[test]
+    fn res_body_regex_replace() {
+        let resolved = resolve("example.com/x resReplace:///\\d+/=N\n", "http://example.com/x");
+        let out = transform_res_body(Bytes::from_static(b"id=123 and 45"), &resolved);
+        assert_eq!(&out[..], b"id=N and N");
     }
 
     #[test]

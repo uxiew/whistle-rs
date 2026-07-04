@@ -193,16 +193,24 @@ example.com   resCookies://theme=dark
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `reqBody` | replacement text | Replace the entire request body |
-| `resBody` | replacement text | Replace the entire response body |
+| `reqBody` / `resBody` | replacement text | Replace the entire body |
+| `reqReplace` / `resReplace` | `from=to` (or `/regex/[i]=to`) | Substitute inside the body |
+| `reqPrepend` / `resPrepend` | text | Insert at the start of the body |
+| `reqAppend` / `resAppend` | text | Insert at the end of the body |
 
-When a body operator applies, whistle-rs buffers that body, replaces it, and
-recomputes `Content-Length` (dropping any `Transfer-Encoding`). Requests/responses
-without a body operator are streamed through untouched.
+When any body operator applies, whistle-rs buffers that body, transforms it, and
+recomputes `Content-Length` (dropping any `Transfer-Encoding`). Operators apply in
+the order **Body → Replace → Prepend → Append**. Requests/responses without a body
+operator are streamed through untouched. `*Replace` on a non-UTF-8 (binary) body is a
+no-op.
 
 ```
 api.example.com/echo   reqBody://{"mocked":true}
 example.com/app.js     resBody://console.log('patched')
+example.com            resReplace://http://=https://
+example.com            resReplace:///v\d+/=vX          # regex form
+example.com/page       resPrepend://<!-- via whistle-rs -->
+example.com/page       resAppend://<script src="/inject.js"></script>
 ```
 
 > `statusCode` is dual-purpose, matching whistle: when there is no upstream request it
@@ -275,8 +283,7 @@ example.com/old/*    redirect://https://example.com/new/
   correctly (so mixed rule files work), but do not change traffic yet: upstream
   proxying (`proxy`, `http-proxy`, `https-proxy`, `socks`, `internal-proxy`,
   `https2http-proxy`, `http2https-proxy`), `pac`, `weinre`, `plugin`, body rewriting
-  (`reqReplace`, `resReplace`, `*Prepend`, `*Append`,
-  `css/html/js*`), `resScript`/`frameScript`, `filter`/`ignore`,
+  (`css/html/js*`), `resScript`/`frameScript`, `filter`/`ignore`,
   `attachment`, `forwardedFor`, delays (`reqDelay`,
   `resDelay`) and speeds (`reqSpeed`, `resSpeed`), `cache`, `cipher`, `sniCallback`.
   Adding runtime behaviour means extending `src/proxy/apply.rs`.
