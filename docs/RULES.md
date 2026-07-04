@@ -313,6 +313,33 @@ verbatim. The weinre inspector server itself is external (not bundled).
 example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 ```
 
+### Flags, includes & values
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `enable` | flag(s) | Turn on a behaviour: `abort` (drop the request), `cors` (permissive CORS response) |
+| `disable` | flag(s) | `cache` (`no-store`), `keepAlive` (`Connection: close`) |
+| `trailers` | `name=value` / `{json}` | Emit HTTP response trailer headers (forces chunked) |
+| `headerReplace` | `{"<scope>.<name>:<regex>":"<repl>"}` | Regex-rewrite a header value (`req`/`res` scope) |
+| `responseFor` | a URL | Prefetch the URL; annotate the request with `x-whistle-response-for-*` |
+| `rule` | value name | Include the named value's rules and apply them too |
+| `rulesFile` | file path | Include rules from a file and apply them too |
+| `pipe` | plugin name | Route through a registered server (like `plugin`) |
+
+`{name}` anywhere in an operator value is replaced with the content of the named value
+(from `--value name=…` or the web UI's Values panel).
+
+```
+api.example.com     enable://cors
+slow.example.com    enable://abort
+static.example.com  disable://cache
+example.com         trailers://x-checksum=abc123
+example.com         headerReplace://{"resH.set-cookie:Domain=[^;]+":"Domain=example.com"}
+page.example.com    responseFor://http://auth.internal/verify
+example.com         resBody://{mockJson}        # {mockJson} from the values store
+example.com         rulesFile:///etc/whistle/extra.rules
+```
+
 ### Delays & throttling
 
 | Operator | Value | Effect |
@@ -473,45 +500,45 @@ example.com/old/*    redirect://https://example.com/new/
 ## Operator coverage
 
 Every operator in whistle's registry (`_original/lib/rules/protocols.js`) and its
-status in whistle-rs. **61 of 73 are applied at runtime**; the rest parse and resolve
-(so mixed rule files load) but have no distinct effect.
+status in whistle-rs. **69 of 73 are applied at runtime**; the remaining 4 parse and
+resolve (so mixed rule files load) but have no distinct effect.
 
 ### Applied at runtime
 
 | Category | Operators |
 |----------|-----------|
 | Routing / upstream | `host`, `proxy`, `http-proxy`, `https-proxy`, `internal-proxy`, `https2http-proxy`, `http2https-proxy`, `socks`, `pac` |
-| Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw` |
-| Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw` |
+| Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw`, `responseFor` |
+| Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw`, `trailers`, `headerReplace` |
 | Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` |
-| Short-circuit | `redirect`, `location`, `file`, `rawfile` (`statusCode` mock) |
-| Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log` |
-| Scripting / extend | `resScript`, `frameScript`, `plugin`, `weinre` |
+| Short-circuit / flags | `redirect`, `location`, `file`, `rawfile`, `statusCode` mock, `enable`, `disable` |
+| Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
+| Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
-`https2http-proxy`/`http2https-proxy` resolve as HTTP proxies (the scheme conversion
-itself is approximated). `log://` labels are attached to each captured session
-(visible in `/sessions.json`).
+Notes: `https2http-proxy`/`http2https-proxy` resolve as HTTP proxies (scheme
+conversion approximated); `enable`/`disable` apply a curated flag set
+(`abort`, `cors`, `cache`, `keepAlive` — others are inert); `pipe` routes to a
+registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
+extra rules from the values store / a file; `{name}` in any operator value is
+substituted from the values store.
 
-### Parsed but not applied (12)
+### Parsed but not applied (4)
 
 | Operator(s) | Why / note |
 |-------------|-----------|
-| `enable`, `disable` | Dozens of feature flags tied to whistle-specific internals; recognised but inert |
-| `headerReplace` | Regex-in-JSON header rewriting; use `resHeaders`/`reqReplace` instead |
-| `rule`, `rulesFile` | Reference/include other named rule sets (no named-rule registry) |
-| `pipe` | Stream through a pipe plugin server (like `plugin`, but streaming) |
-| `responseFor` | Attach another URL's response as headers |
-| `trailers` | HTTP trailer headers |
-| `cipher`, `sniCallback` | TLS cipher/SNI hooks (managed by rustls) |
-| `G`, `style` | Global-rule marker / UI display hint — no traffic effect |
+| `cipher` | Per-rule TLS cipher-suite selection — the MITM acceptor is built at SNI time, before rule resolution |
+| `sniCallback` | JS hook at SNI time to choose the certificate — same architectural constraint |
+| `G` | Global-rule marker (a rule-precedence concept, not a per-request traffic effect) |
+| `style` | Rule colour in whistle's rule list — the built-in UI is a plain editor with no per-rule rendering |
 
 ### Simplified vs. upstream
 
-whistle's template variables (`${…}`), plugin variables (`%name=…`), value references
-(`{key}`), the full `lineProps` system, and the Node-subprocess plugin loader are not
-implemented (plugins here are external HTTP servers). `resCors` sets
-`Access-Control-Allow-Origin` (not the full CORS header set). Patterns/operators
-outside the documented forms may parse but not behave exactly as in upstream whistle.
+whistle's template variables (`${…}`), plugin variables (`%name=…`), the full
+`lineProps` system, and the Node-subprocess plugin loader are not implemented
+(plugins/pipes here are external HTTP servers). `resCors`/`enable://cors` set a
+permissive `Access-Control-Allow-Origin` (not the full negotiated CORS set).
+Patterns/operators outside the documented forms may parse but not behave exactly as
+in upstream whistle.
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.
