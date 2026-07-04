@@ -210,7 +210,8 @@ async fn serve(
 
     // Rewrite to origin-form + apply request-side rules.
     let (mut parts, incoming) = req.into_parts();
-    parts.uri = Uri::try_from(info.path.as_str()).unwrap_or(parts.uri);
+    let new_path = apply::rewrite_path(&info.path, &resolved);
+    parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, &host, port, &scheme);
     parts.headers.remove("proxy-connection");
     apply::apply_request(&mut parts, &resolved);

@@ -253,14 +253,19 @@ fn transform_body(body: Bytes, resolved: &Resolved, prefix: &str) -> Bytes {
     Bytes::from(data)
 }
 
-/// `*Replace` value is `from=to`; if `from` is `/regex/[i]` a regex substitution is
-/// used, otherwise a literal replace-all of `from` with `to`.
+/// `*Replace` on a body: `from=to`, literal or `/regex/[i]`. Binary bodies untouched.
 fn apply_body_replace(data: Vec<u8>, spec: &str) -> Vec<u8> {
+    match String::from_utf8(data) {
+        Ok(text) => apply_str_replace(&text, spec).into_bytes(),
+        Err(e) => e.into_bytes(), // not UTF-8 text; leave binary body untouched
+    }
+}
+
+/// Substitute `from=to` in `text`. If `from` is `/regex/[i]`, use a regex; else a
+/// literal replace-all. Shared by body `*Replace` and `urlReplace`.
+fn apply_str_replace(text: &str, spec: &str) -> String {
     let Some((from, to)) = spec.split_once('=') else {
-        return data;
-    };
-    let Ok(text) = String::from_utf8(data.clone()) else {
-        return data; // not UTF-8 text; leave binary body untouched
+        return text.to_string();
     };
     if from.starts_with('/') && from.len() > 1 {
         if let Some(end) = from.rfind('/') {
@@ -273,12 +278,85 @@ fn apply_body_replace(data: Vec<u8>, spec: &str) -> Vec<u8> {
                     body.to_string()
                 };
                 if let Ok(re) = regex::Regex::new(&pat) {
-                    return re.replace_all(&text, to).into_owned().into_bytes();
+                    return re.replace_all(text, to).into_owned();
                 }
             }
         }
     }
-    text.replace(from, to).into_bytes()
+    text.replace(from, to)
+}
+
+/// Rewrite the request path+query per `urlReplace`, `params`, and `urlParams`.
+pub fn rewrite_path(path: &str, resolved: &Resolved) -> String {
+    let mut p = path.to_string();
+    if let Some(spec) = resolved.value("urlReplace") {
+        p = apply_str_replace(&p, spec);
+    }
+    let mut params: Vec<(String, String)> = Vec::new();
+    for key in ["params", "urlParams"] {
+        for v in collect_values(resolved, key) {
+            params.extend(parse_query_pairs(v));
+        }
+    }
+    if !params.is_empty() {
+        p = merge_query(&p, &params);
+    }
+    p
+}
+
+/// Parse `k=v&k2=v2` or `{json}` into query pairs.
+fn parse_query_pairs(value: &str) -> Vec<(String, String)> {
+    let value = value.trim();
+    if value.starts_with('{') {
+        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
+            return map
+                .into_iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (k, val)
+                })
+                .collect();
+        }
+    }
+    value
+        .split('&')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Merge `params` into the query string of `path`, overriding same-named keys.
+fn merge_query(path: &str, params: &[(String, String)]) -> String {
+    let (base, query) = match path.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => (path, ""),
+    };
+    let mut pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect();
+    for (k, v) in params {
+        pairs.retain(|(ek, _)| ek != k);
+        pairs.push((k.clone(), v.clone()));
+    }
+    if pairs.is_empty() {
+        return base.to_string();
+    }
+    let q = pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{q}")
 }
 
 /// Remove length/encoding headers so hyper recomputes them for a rewritten body.
@@ -500,6 +578,27 @@ mod tests {
         assert!(wants_req_body(&some));
         let out = transform_req_body(Bytes::from_static(b"orig"), &some);
         assert_eq!(&out[..], b"HELLO");
+    }
+
+    #[test]
+    fn url_replace_and_params() {
+        let resolved = resolve(
+            "example.com/api urlReplace://v1=v2\nexample.com/api params://token=abc\n",
+            "http://example.com/api/v1/users?a=1",
+        );
+        let out = rewrite_path("/api/v1/users?a=1", &resolved);
+        assert!(out.starts_with("/api/v2/users?"));
+        assert!(out.contains("a=1"));
+        assert!(out.contains("token=abc"));
+    }
+
+    #[test]
+    fn params_override_existing_key() {
+        let resolved = resolve("example.com params://a=2\n", "http://example.com/p?a=1&b=3");
+        let out = rewrite_path("/p?a=1&b=3", &resolved);
+        assert!(out.contains("b=3"));
+        assert!(out.contains("a=2"));
+        assert!(!out.contains("a=1"));
     }
 
     #[test]

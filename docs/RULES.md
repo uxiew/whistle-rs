@@ -129,6 +129,22 @@ api.example.com   host://127.0.0.1:9000
 .example.com      host://:8443            # same host, force port 8443
 ```
 
+### URL rewriting
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `urlReplace` | `from=to` (or `/regex/[i]=to`) | Substitute inside the request path+query |
+| `params` / `urlParams` | `k=v&k2=v2` or `{json}` | Add/override query params (accumulates) |
+
+```
+example.com/api    urlReplace://v1=v2                 # /api/v1/x -> /api/v2/x
+example.com/api    urlReplace:///users\/\d+/=/users/me # regex form
+example.com        params://debug=1&trace=on
+```
+
+> Note the `/regex/` convention: since paths start with `/`, write literals without
+> surrounding slashes (`urlReplace://old=new`) and reserve `/…/` for regexes.
+
 ### Short-circuit (no upstream request is made)
 
 | Operator | Value | Effect |
@@ -283,7 +299,7 @@ example.com/old/*    redirect://https://example.com/new/
   correctly (so mixed rule files work), but do not change traffic yet: upstream
   proxying (`proxy`, `http-proxy`, `https-proxy`, `socks`, `internal-proxy`,
   `https2http-proxy`, `http2https-proxy`), `pac`, `weinre`, `plugin`, body rewriting
-  (`css/html/js*`), `resScript`/`frameScript`, `filter`/`ignore`,
+  (`css/html/js*`), URL `params`/`urlParams`, `resScript`/`frameScript`, `filter`/`ignore`,
   `attachment`, `forwardedFor`, delays (`reqDelay`,
   `resDelay`) and speeds (`reqSpeed`, `resSpeed`), `cache`, `cipher`, `sniCallback`.
   Adding runtime behaviour means extending `src/proxy/apply.rs`.

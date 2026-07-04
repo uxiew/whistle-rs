@@ -159,7 +159,8 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `$`-important precedence, multi-match accumulation
 - Operators applied at runtime: `host` (+ `:port`), `reqHeaders`, `resHeaders`,
   `reqCookies`, `resCookies`, `reqType`/`resType`, `resCors`, `ua`, `referer`,
-  `method`, `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`
+  `method`, `urlReplace`/`params`, body rewriting (`*Body`/`*Replace`/`*Prepend`/`*Append`),
+  `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
 rule files load; wiring them into `src/proxy/apply.rs` is the next step): upstream
