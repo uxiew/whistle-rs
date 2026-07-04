@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use bytes::Bytes;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response, Uri};
 use hyper_util::rt::TokioIo;
@@ -331,6 +333,42 @@ async fn socks5_connect(
     let mut skip = vec![0u8; addr_len + 2];
     s.read_exact(&mut skip).await?;
     Ok(s)
+}
+
+/// Fetch a URL with a simple GET and return `(status, body)`. Used by
+/// `responseFor` to prefetch another request's response.
+pub async fn simple_get(url: &str) -> Result<(u16, Bytes)> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("bad url {url}"))?;
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let tls = scheme.eq_ignore_ascii_case("https");
+    let default_port = if tls { 443 } else { 80 };
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+            (h.to_string(), p.parse().unwrap_or(default_port))
+        }
+        _ => (host_port.to_string(), default_port),
+    };
+    let target = Target {
+        connect_host: host.clone(),
+        connect_port: port,
+        tls,
+        sni: host.clone(),
+        request_port: port,
+        proxy: None,
+    };
+    let req = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", &host)
+        .body(super::body::empty())
+        .context("building responseFor request")?;
+    let resp = forward(&target, req).await?;
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await?.to_bytes();
+    Ok((status, bytes))
 }
 
 /// Build a `Basic <base64>` credential string.

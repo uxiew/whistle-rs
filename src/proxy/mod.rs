@@ -407,6 +407,18 @@ async fn serve(
         set_header_raw(&mut parts.headers, "x-whistle-req-url", &info.full_url);
         set_header_raw(&mut parts.headers, "x-whistle-req-method", &info.method);
     }
+    // responseFor: prefetch another URL and annotate this request with its result.
+    if let Some(url) = resolved.value("responseFor") {
+        if let Ok((status, body)) = upstream::simple_get(url).await {
+            set_header_raw(&mut parts.headers, "x-whistle-response-for-url", url);
+            set_header_raw(&mut parts.headers, "x-whistle-response-for-status", &status.to_string());
+            set_header_raw(
+                &mut parts.headers,
+                "x-whistle-response-for-length",
+                &body.len().to_string(),
+            );
+        }
+    }
 
     // Buffer + transform the request body only when a body/speed/write operator applies.
     let req_speed = apply::req_speed_kbps(&resolved);
