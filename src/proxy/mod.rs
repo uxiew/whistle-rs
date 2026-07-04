@@ -393,19 +393,24 @@ async fn serve(
         set_header_raw(&mut parts.headers, "x-whistle-req-method", &info.method);
     }
 
-    // Buffer + transform the request body only when a body/speed operator applies.
+    // Buffer + transform the request body only when a body/speed/write operator applies.
     let req_speed = apply::req_speed_kbps(&resolved);
-    let req_body: DynBody = if apply::wants_req_body(&resolved) || req_speed.is_some() {
-        let bytes = incoming.collect().await?.to_bytes();
-        let new = apply::transform_req_body(bytes, &resolved);
-        apply::strip_length_headers(&mut parts.headers);
-        match req_speed {
-            Some(kbps) => body::throttled(new, kbps),
-            None => body::full(new),
-        }
-    } else {
-        body::from_incoming(incoming)
-    };
+    let req_write = apply::req_write_path(&resolved);
+    let req_body: DynBody =
+        if apply::wants_req_body(&resolved) || req_speed.is_some() || req_write.is_some() {
+            let bytes = incoming.collect().await?.to_bytes();
+            let new = apply::transform_req_body(bytes, &resolved);
+            if let Some(path) = &req_write {
+                write_body_file(path, &new);
+            }
+            apply::strip_length_headers(&mut parts.headers);
+            match req_speed {
+                Some(kbps) => body::throttled(new, kbps),
+                None => body::full(new),
+            }
+        } else {
+            body::from_incoming(incoming)
+        };
     let out_req = Request::from_parts(parts, req_body);
 
     if let Some(ms) = apply::req_delay_ms(&resolved) {
@@ -436,10 +441,12 @@ async fn serve(
         .value("resScript")
         .and_then(script::load_script);
     let weinre = resolved.value("weinre").map(|s| s.to_string());
+    let res_write = apply::res_write_path(&resolved);
     let res_body: DynBody = if apply::wants_res_body(&resolved)
         || res_speed.is_some()
         || res_script.is_some()
         || weinre.is_some()
+        || res_write.is_some()
     {
         let bytes = body.collect().await?.to_bytes();
         let ct = parts
@@ -483,6 +490,9 @@ async fn serve(
                     let tag = format!("<script src=\"{src}\"></script>");
                     new = inject_into_html(&new, &tag);
                 }
+            }
+            if let Some(path) = &res_write {
+                write_body_file(path, &new);
             }
             apply::strip_length_headers(&mut parts.headers);
             match res_speed {
@@ -585,6 +595,19 @@ async fn serve_upgrade(
 
     // Relay the 101 (with Sec-WebSocket-Accept etc.) so the client handshake completes.
     Ok(Response::from_parts(p, body::empty()))
+}
+
+/// Append a captured body to a file (`reqWrite`/`resWrite`). Best-effort.
+fn write_body_file(path: &str, data: &Bytes) {
+    use std::io::Write;
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(data) {
+                tracing::debug!("write body to {path} failed: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("open {path} for write failed: {e}"),
+    }
 }
 
 /// True if the response declares an HTML content type.

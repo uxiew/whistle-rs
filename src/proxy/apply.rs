@@ -423,8 +423,45 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
     if let Some(cs) = resolved.value("resCharset") {
         set_charset(&mut parts.headers, cs);
     }
+    if let Some(cc) = cache_control(resolved.value("cache")) {
+        set_header(&mut parts.headers, "cache-control", &cc);
+    }
     apply_res_cookies(&mut parts.headers, resolved);
     apply_deletes(&mut parts.headers, resolved, false);
+}
+
+/// Map a `cache://` value to a `Cache-Control` header. `no`/`no-cache`/negative →
+/// no-cache, `no-store` → no-store, a number → max-age, `reserve`/`keep` → leave
+/// the upstream header untouched. Ported from res.js cache handling.
+fn cache_control(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    if v.is_empty() || v == "reserve" || v == "keep" {
+        return None;
+    }
+    let lower = v.to_ascii_lowercase();
+    if lower.contains("no-store") {
+        return Some("no-store".to_string());
+    }
+    if let Ok(n) = v.parse::<i64>() {
+        if n < 0 {
+            return Some("no-cache".to_string());
+        }
+        return Some(format!("max-age={n}"));
+    }
+    if lower == "no" || lower == "off" || lower == "no-cache" {
+        return Some("no-cache".to_string());
+    }
+    Some(v.to_string())
+}
+
+/// File path to append the request body to (`reqWrite`).
+pub fn req_write_path(resolved: &Resolved) -> Option<String> {
+    resolved.value("reqWrite").map(str::to_string)
+}
+
+/// File path to append the response body to (`resWrite`).
+pub fn res_write_path(resolved: &Resolved) -> Option<String> {
+    resolved.value("resWrite").map(str::to_string)
 }
 
 /// Content-type-specific body operator prefixes (`css`/`html`/`js`).
