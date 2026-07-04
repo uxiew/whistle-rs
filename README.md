@@ -30,6 +30,8 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   by a locally generated, persisted root CA.
 - **WebSocket** — `ws://` and (via MITM) `wss://` upgrades are tunnelled end-to-end.
 - **Upstream proxies** — route through another HTTP/HTTPS proxy or a SOCKS5 proxy.
+- **Inbound SOCKS5 server** — accept SOCKS5 clients (`--socks-port`) into the same
+  interception pipeline, auto-detecting TLS vs. plain HTTP.
 - **Rules engine** — whistle's rule syntax: domain/prefix, leading-dot subdomain,
   wildcard, and regex patterns; `$`-important precedence; multi-match accumulation.
 - **Destination override** (`host://`) that rewrites the target IP/port while keeping
@@ -133,6 +135,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 |------|---------|---------|
 | `-p, --port <PORT>` | Proxy port | `8899` |
 | `-H, --host <IP>` | Bind address | all interfaces (`0.0.0.0`) |
+| `--socks-port <PORT>` | Also run an inbound SOCKS5 server | off |
 | `-r, --rules <FILE>` | Rules file to load at startup | — |
 | `--rule <TEXT>` | Inline rules, applied after `--rules` | — |
 | `--dir <DIR>` | Storage dir (root CA etc.) | `~/.whistle-rs` |
@@ -175,8 +178,8 @@ rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`,
 `weinre`, `plugin`, `resScript`/`frameScript`.
 
 **Not ported** (large standalone subsystems): the web UI (React + CGI under `biz/`),
-the plugin subprocess system, weinre, WebSocket frame inspection/logging, an inbound
-SOCKS server, HTTP/2, and the data/session capture store.
+the plugin subprocess system, weinre, WebSocket frame inspection/logging,
+HTTP/2, and the data/session capture store.
 
 See [`docs/RULES.md#compatibility-notes`](docs/RULES.md#compatibility-notes) for the
 operator-level detail.

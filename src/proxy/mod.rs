@@ -5,6 +5,7 @@
 
 pub mod apply;
 pub mod body;
+pub mod socks;
 pub mod upstream;
 
 use std::convert::Infallible;
@@ -37,8 +38,9 @@ pub struct AppState {
 enum Origin {
     /// A normal absolute-form forward-proxy request.
     Forward,
-    /// A request seen inside an intercepted CONNECT tunnel.
-    Mitm { host: String, port: u16 },
+    /// A request seen inside an intercepted tunnel (CONNECT or SOCKS). `tls`
+    /// indicates the tunnel was TLS-decrypted (scheme https) vs. plain (http).
+    Mitm { host: String, port: u16, tls: bool },
 }
 
 /// Start the proxy and serve until the process exits.
@@ -57,6 +59,16 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
         state.config.root_ca_cert_path().display(),
         addr
     );
+
+    // Optional inbound SOCKS5 server.
+    if let Some(socks_port) = state.config.socks_port {
+        let socks_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = socks::run(socks_state, socks_port).await {
+                tracing::error!("SOCKS server error: {e}");
+            }
+        });
+    }
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -115,7 +127,10 @@ fn handle_connect(state: Arc<AppState>, req: Request<Incoming>, peer: IpAddr) ->
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
-                if let Err(err) = mitm_serve(state, upgraded, host, port, peer).await {
+                // A CONNECT tunnel is (almost always) TLS; intercept it.
+                if let Err(err) =
+                    serve_tunnel(state, TokioIo::new(upgraded), host, port, peer, true).await
+                {
                     tracing::debug!("mitm error: {err}");
                 }
             }
@@ -129,23 +144,46 @@ fn handle_connect(state: Arc<AppState>, req: Request<Incoming>, peer: IpAddr) ->
         .unwrap()
 }
 
-/// TLS-accept the intercepted tunnel and serve HTTP over it.
-async fn mitm_serve(
+/// Serve HTTP over an intercepted tunnel stream, optionally TLS-decrypting first.
+/// Shared by CONNECT interception and the SOCKS server.
+pub(crate) async fn serve_tunnel<S>(
     state: Arc<AppState>,
-    upgraded: hyper::upgrade::Upgraded,
+    stream: S,
     host: String,
     port: u16,
     peer: IpAddr,
-) -> Result<()> {
-    let acceptor = state.ca.acceptor_for(&host)?;
-    let tls = acceptor.accept(TokioIo::new(upgraded)).await?;
-    let io = TokioIo::new(tls);
+    tls: bool,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    if tls {
+        let acceptor = state.ca.acceptor_for(&host)?;
+        let tls_stream = acceptor.accept(stream).await?;
+        serve_intercepted(state, TokioIo::new(tls_stream), host, port, peer, true).await
+    } else {
+        serve_intercepted(state, TokioIo::new(stream), host, port, peer, false).await
+    }
+}
 
+/// Run the HTTP/1.1 server over an already-prepared tunnel IO.
+async fn serve_intercepted<I>(
+    state: Arc<AppState>,
+    io: I,
+    host: String,
+    port: u16,
+    peer: IpAddr,
+    tls: bool,
+) -> Result<()>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
     let service = service_fn(move |req| {
         let state = state.clone();
         let origin = Origin::Mitm {
             host: host.clone(),
             port,
+            tls,
         };
         let client_ip = Some(peer.to_string());
         async move { Ok::<_, Infallible>(guard(serve(state, req, origin, client_ip).await)) }
@@ -194,13 +232,14 @@ async fn serve(
                 .unwrap_or_else(|| "/".to_string());
             (scheme, host, port, path)
         }
-        Origin::Mitm { host, port } => {
+        Origin::Mitm { host, port, tls } => {
             let path = req
                 .uri()
                 .path_and_query()
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string());
-            ("https".to_string(), host.clone(), *port, path)
+            let scheme = if *tls { "https" } else { "http" };
+            (scheme.to_string(), host.clone(), *port, path)
         }
     };
 

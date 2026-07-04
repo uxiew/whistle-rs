@@ -24,6 +24,10 @@ struct Cli {
     #[arg(short = 'H', long)]
     host: Option<IpAddr>,
 
+    /// Also run an inbound SOCKS5 server on this port.
+    #[arg(long)]
+    socks_port: Option<u16>,
+
     /// Path to a whistle rules file to load at startup.
     #[arg(short = 'r', long)]
     rules: Option<PathBuf>,
@@ -71,6 +75,7 @@ async fn main() -> Result<()> {
         port: cli.port,
         host: cli.host,
         storage_dir,
+        socks_port: cli.socks_port,
         ..Config::default()
     };
 

@@ -30,6 +30,8 @@ pub struct Config {
     /// Inline rules text loaded at startup (`-r`/`--rules`), whistle's
     /// `config.rules`.
     pub rules: Option<String>,
+    /// Optional inbound SOCKS5 port (whistle's `socksPort`).
+    pub socks_port: Option<u16>,
 }
 
 impl Config {
@@ -58,6 +60,7 @@ impl Default for Config {
             storage_dir: base.join(DATA_DIRNAME),
             intercept_https: true,
             rules: None,
+            socks_port: None,
         }
     }
 }
