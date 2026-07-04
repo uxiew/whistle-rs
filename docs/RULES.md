@@ -148,7 +148,14 @@ secure.example.com socks://127.0.0.1:1080
 ```
 
 Precedence when several are present: `socks` > `https-proxy` > `http-proxy` >
-`proxy` > `internal-proxy`.
+`proxy` > `internal-proxy` > `pac`.
+
+`pac://<file>` evaluates a PAC file's `FindProxyForURL(url, host)` to pick the proxy
+(`PROXY host:port`, `HTTPS ...`, `SOCKS ...`, or `DIRECT`):
+
+```
+.corp.example.com   pac:///etc/whistle/corp.pac
+```
 
 ### URL rewriting
 

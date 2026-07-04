@@ -85,6 +85,13 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
             resolved
                 .value("internal-proxy")
                 .and_then(|v| parse_proxy(ProxyKind::Http, v))
+        })
+        // `pac://<file>` picks the proxy by evaluating FindProxyForURL.
+        .or_else(|| {
+            let pac_val = resolved.value("pac")?;
+            let src = crate::proxy::script::load_script(pac_val)?;
+            let result = crate::proxy::script::eval_pac(&src, &info.full_url, &info.host)?;
+            parse_pac_result(&result)
         });
 
     Target {
@@ -95,6 +102,36 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
         request_port: info.port,
         proxy,
     }
+}
+
+/// Parse a PAC `FindProxyForURL` return value into a proxy (first usable entry).
+/// `DIRECT` (or no proxy entry) yields `None` → connect directly.
+fn parse_pac_result(result: &str) -> Option<super::upstream::ProxyConfig> {
+    for entry in result.split(';') {
+        let mut it = entry.split_whitespace();
+        let kind = it.next().unwrap_or("").to_ascii_uppercase();
+        let hostport = it.next().unwrap_or("");
+        match kind.as_str() {
+            "DIRECT" => return None,
+            "PROXY" | "HTTP" => {
+                if let Some(p) = parse_proxy(ProxyKind::Http, hostport) {
+                    return Some(p);
+                }
+            }
+            "HTTPS" => {
+                if let Some(p) = parse_proxy(ProxyKind::Https, hostport) {
+                    return Some(p);
+                }
+            }
+            "SOCKS" | "SOCKS5" => {
+                if let Some(p) = parse_proxy(ProxyKind::Socks, hostport) {
+                    return Some(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Parse a `host` operator value (`ip`, `ip:port`, `host:port`, `:port`).
