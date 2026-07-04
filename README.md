@@ -28,6 +28,8 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 - **HTTP forward proxy** — standard absolute-form proxying.
 - **HTTPS MITM** — `CONNECT` interception with per-host certificates signed on the fly
   by a locally generated, persisted root CA.
+- **HTTP/2** — intercepted TLS connections negotiate `h2` via ALPN and are served
+  over HTTP/2 (upstream stays HTTP/1.1; hyper translates), falling back to HTTP/1.1.
 - **WebSocket** — `ws://` and (via MITM) `wss://` upgrades are tunnelled end-to-end.
 - **Upstream proxies** — route through another HTTP/HTTPS proxy or a SOCKS5 proxy.
 - **Inbound SOCKS5 server** — accept SOCKS5 clients (`--socks-port`) into the same
@@ -164,6 +166,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 **Fully working (verified end-to-end):**
 
 - HTTP forward proxy; CONNECT tunnelling with HTTPS MITM + dynamic per-host certs
+- HTTP/2 interception (ALPN h2) with HTTP/1.1 fallback
 - WebSocket (`ws://`/`wss://`) upgrade tunnelling
 - Root CA generation, persistence, and `/rootCA.crt` download
 - Rules engine: comments, hosts shorthand, regex/wildcard/prefix/dot patterns,
@@ -182,7 +185,7 @@ rule files load): `weinre`, `plugin`, `frameScript`.
 
 **Not ported** (large standalone subsystems): whistle's original React web UI (`biz/`)
 is replaced by a lightweight built-in UI; the plugin subprocess system, weinre,
-WebSocket frame inspection/logging, and a persistent capture store remain future work.
+WebSocket frame inspection/logging, and a persistent capture store remain future work. (End-to-end HTTP/2 interception is supported.)
 
 See [`docs/RULES.md#compatibility-notes`](docs/RULES.md#compatibility-notes) for the
 operator-level detail.

@@ -91,7 +91,8 @@ impl CertAuthority {
             .with_no_client_auth()
             .with_single_cert(chain, key)
             .context("building server config for intercepted host")?;
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // Offer HTTP/2 and HTTP/1.1; the negotiated protocol is checked after accept.
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(TlsAcceptor::from(Arc::new(cfg)))
     }
 

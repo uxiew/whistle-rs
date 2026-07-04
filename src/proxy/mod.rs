@@ -216,10 +216,44 @@ where
     if tls {
         let acceptor = state.ca.acceptor_for(&host)?;
         let tls_stream = acceptor.accept(stream).await?;
-        serve_intercepted(state, TokioIo::new(tls_stream), host, port, peer, true).await
+        let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        if is_h2 {
+            serve_intercepted_h2(state, TokioIo::new(tls_stream), host, port, peer).await
+        } else {
+            serve_intercepted(state, TokioIo::new(tls_stream), host, port, peer, true).await
+        }
     } else {
         serve_intercepted(state, TokioIo::new(stream), host, port, peer, false).await
     }
+}
+
+/// Serve an intercepted HTTP/2 connection (ALPN negotiated `h2`). Upstream
+/// forwarding stays HTTP/1.1 — hyper translates request/response between them.
+async fn serve_intercepted_h2<I>(
+    state: Arc<AppState>,
+    io: I,
+    host: String,
+    port: u16,
+    peer: IpAddr,
+) -> Result<()>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req| {
+        let state = state.clone();
+        let origin = Origin::Mitm {
+            host: host.clone(),
+            port,
+            tls: true,
+        };
+        let client_ip = Some(peer.to_string());
+        async move { Ok::<_, Infallible>(guard(serve(state, req, origin, client_ip).await)) }
+    });
+
+    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+        .serve_connection(io, service)
+        .await?;
+    Ok(())
 }
 
 /// Run the HTTP/1.1 server over an already-prepared tunnel IO.
