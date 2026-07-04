@@ -24,10 +24,11 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/rules/mod.rs` | `lib/rules/rules.js` | Line parsing, pattern kinds, operator parsing |
 | `src/rules/matcher.rs` | `lib/rules/rules.js` (`resolveRules`) | Match a request, resolve per-protocol winners |
 | `src/ca.rs` | `lib/https/ca.js` | Root CA generation/persistence, per-host leaf signing |
-| `src/proxy/mod.rs` | `lib/index.js`, `lib/tunnel.js` | Server, forward proxy, CONNECT + MITM, status page |
-| `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split) |
+| `src/proxy/mod.rs` | `lib/index.js`, `lib/tunnel.js` | Server, forward proxy, CONNECT + MITM, WebSocket, capture log, status page/PAC |
+| `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split), upstream HTTP/SOCKS proxies |
 | `src/proxy/apply.rs` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations |
-| `src/proxy/body.rs` | — | Unified boxed response-body type |
+| `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
+| `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
 | `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
 
 ## Request lifecycle
