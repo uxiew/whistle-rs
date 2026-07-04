@@ -5,6 +5,7 @@
 
 pub mod apply;
 pub mod body;
+pub mod script;
 pub mod socks;
 pub mod upstream;
 pub mod webui;
@@ -381,17 +382,49 @@ async fn serve(
     apply::apply_response(&mut parts, &resolved);
 
     let res_speed = apply::res_speed_kbps(&resolved);
-    let res_body: DynBody = if apply::wants_res_body(&resolved) || res_speed.is_some() {
-        let bytes = body.collect().await?.to_bytes();
-        let new = apply::transform_res_body(bytes, &resolved);
-        apply::strip_length_headers(&mut parts.headers);
-        match res_speed {
-            Some(kbps) => body::throttled(new, kbps),
-            None => body::full(new),
-        }
-    } else {
-        body::from_incoming(body)
-    };
+    let res_script = resolved
+        .value("resScript")
+        .and_then(script::load_script);
+    let res_body: DynBody =
+        if apply::wants_res_body(&resolved) || res_speed.is_some() || res_script.is_some() {
+            let bytes = body.collect().await?.to_bytes();
+            let mut new = apply::transform_res_body(bytes, &resolved);
+            if let Some(src) = &res_script {
+                let hv: Vec<(String, String)> = parts
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
+                let body_str = String::from_utf8_lossy(&new).into_owned();
+                if let Some(r) = script::run_res_script(
+                    src,
+                    &info.method,
+                    &info.full_url,
+                    parts.status.as_u16(),
+                    &hv,
+                    &body_str,
+                ) {
+                    if let Some(st) = r.status {
+                        if let Ok(s) = StatusCode::from_u16(st) {
+                            parts.status = s;
+                        }
+                    }
+                    for (k, v) in r.headers {
+                        set_header_raw(&mut parts.headers, &k, &v);
+                    }
+                    if let Some(b) = r.body {
+                        new = Bytes::from(b);
+                    }
+                }
+            }
+            apply::strip_length_headers(&mut parts.headers);
+            match res_speed {
+                Some(kbps) => body::throttled(new, kbps),
+                None => body::full(new),
+            }
+        } else {
+            body::from_incoming(body)
+        };
 
     let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
     if target.proxy.is_some() {
@@ -477,6 +510,18 @@ async fn serve_upgrade(
 
     // Relay the 101 (with Sec-WebSocket-Accept etc.) so the client handshake completes.
     Ok(Response::from_parts(p, body::empty()))
+}
+
+/// Set/replace a header (empty value deletes); used by response scripts.
+fn set_header_raw(headers: &mut hyper::HeaderMap, name: &str, value: &str) {
+    let Ok(name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
+        return;
+    };
+    if value.is_empty() {
+        headers.remove(&name);
+    } else if let Ok(v) = hyper::header::HeaderValue::from_str(value) {
+        headers.insert(name, v);
+    }
 }
 
 /// Ensure a correct `Host` header for the upstream request.

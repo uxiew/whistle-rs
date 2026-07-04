@@ -233,6 +233,28 @@ api.test      auth://admin:secret
 api.test      forwardedFor://203.0.113.7
 ```
 
+### Scripting
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `resScript` | path to a `.js` file (or inline JS) | Run JavaScript against the response |
+
+The script runs in an embedded JS engine with a global `ctx`:
+
+```js
+// ctx = { req: { method, url }, res: { statusCode, headers, body } }
+ctx.res.headers['x-scripted'] = 'yes';
+ctx.res.body = ctx.res.body.replace(/foo/g, 'bar');
+if (ctx.req.url.indexOf('/admin') >= 0) ctx.res.statusCode = 403;
+```
+
+Changed `ctx.res.statusCode`, `ctx.res.headers`, and `ctx.res.body` are applied. A
+script error leaves the response unchanged.
+
+```
+example.com   resScript:///abs/path/patch.js
+```
+
 ### Delays & throttling
 
 | Operator | Value | Effect |

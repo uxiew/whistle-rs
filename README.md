@@ -175,11 +175,10 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `reqCookies`, `resCookies`, `reqType`/`resType`, `resCors`, `ua`, `referer`,
   `method`, `urlReplace`/`params`, body rewriting (`*Body`/`*Replace`/`*Prepend`/`*Append`),
   `auth`, `forwardedFor`, `attachment`, `reqDelay`/`resDelay`, `reqSpeed`/`resSpeed`,
-  `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`
+  `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`, `resScript` (JS)
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
-rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`,
-`weinre`, `plugin`, `resScript`/`frameScript`.
+rule files load): `pac` (see below), `weinre`, `plugin`, `frameScript`.
 
 **Not ported** (large standalone subsystems): whistle's original React web UI (`biz/`)
 is replaced by a lightweight built-in UI; the plugin subprocess system, weinre,
