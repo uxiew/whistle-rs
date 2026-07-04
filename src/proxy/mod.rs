@@ -396,21 +396,29 @@ async fn serve(
     // Buffer + transform the request body only when a body/speed/write operator applies.
     let req_speed = apply::req_speed_kbps(&resolved);
     let req_write = apply::req_write_path(&resolved);
-    let req_body: DynBody =
-        if apply::wants_req_body(&resolved) || req_speed.is_some() || req_write.is_some() {
-            let bytes = incoming.collect().await?.to_bytes();
-            let new = apply::transform_req_body(bytes, &resolved);
-            if let Some(path) = &req_write {
-                write_body_file(path, &new);
-            }
-            apply::strip_length_headers(&mut parts.headers);
-            match req_speed {
-                Some(kbps) => body::throttled(new, kbps),
-                None => body::full(new),
-            }
-        } else {
-            body::from_incoming(incoming)
-        };
+    let req_write_raw = apply::req_write_raw_path(&resolved);
+    let req_body: DynBody = if apply::wants_req_body(&resolved)
+        || req_speed.is_some()
+        || req_write.is_some()
+        || req_write_raw.is_some()
+    {
+        let bytes = incoming.collect().await?.to_bytes();
+        let new = apply::transform_req_body(bytes, &resolved);
+        if let Some(path) = &req_write {
+            write_body_file(path, &new);
+        }
+        if let Some(path) = &req_write_raw {
+            let head = format!("{} {} HTTP/1.1\r\n{}", parts.method, parts.uri, header_dump(&parts.headers));
+            write_raw_file(path, &head, &new);
+        }
+        apply::strip_length_headers(&mut parts.headers);
+        match req_speed {
+            Some(kbps) => body::throttled(new, kbps),
+            None => body::full(new),
+        }
+    } else {
+        body::from_incoming(incoming)
+    };
     let out_req = Request::from_parts(parts, req_body);
 
     if let Some(ms) = apply::req_delay_ms(&resolved) {
@@ -442,11 +450,13 @@ async fn serve(
         .and_then(script::load_script);
     let weinre = resolved.value("weinre").map(|s| s.to_string());
     let res_write = apply::res_write_path(&resolved);
+    let res_write_raw = apply::res_write_raw_path(&resolved);
     let res_body: DynBody = if apply::wants_res_body(&resolved)
         || res_speed.is_some()
         || res_script.is_some()
         || weinre.is_some()
         || res_write.is_some()
+        || res_write_raw.is_some()
     {
         let bytes = body.collect().await?.to_bytes();
         let ct = parts
@@ -493,6 +503,14 @@ async fn serve(
             }
             if let Some(path) = &res_write {
                 write_body_file(path, &new);
+            }
+            if let Some(path) = &res_write_raw {
+                let head = format!(
+                    "HTTP/1.1 {}\r\n{}",
+                    parts.status,
+                    header_dump(&parts.headers)
+                );
+                write_raw_file(path, &head, &new);
             }
             apply::strip_length_headers(&mut parts.headers);
             match res_speed {
@@ -607,6 +625,32 @@ fn write_body_file(path: &str, data: &Bytes) {
             }
         }
         Err(e) => tracing::debug!("open {path} for write failed: {e}"),
+    }
+}
+
+/// Serialise headers as `name: value\r\n` lines.
+fn header_dump(headers: &hyper::HeaderMap) -> String {
+    let mut out = String::new();
+    for (name, value) in headers {
+        out.push_str(name.as_str());
+        out.push_str(": ");
+        out.push_str(value.to_str().unwrap_or(""));
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// Append a raw message (head + blank line + body + separator) to a file.
+fn write_raw_file(path: &str, head: &str, body: &Bytes) {
+    use std::io::Write;
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            let _ = f.write_all(head.as_bytes());
+            let _ = f.write_all(b"\r\n");
+            let _ = f.write_all(body);
+            let _ = f.write_all(b"\r\n\r\n");
+        }
+        Err(e) => tracing::debug!("open {path} for raw write failed: {e}"),
     }
 }
 

@@ -86,6 +86,13 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
                 .value("internal-proxy")
                 .and_then(|v| parse_proxy(ProxyKind::Http, v))
         })
+        // Scheme-converting proxies are treated as HTTP proxies (approximation).
+        .or_else(|| {
+            resolved
+                .value("https2http-proxy")
+                .or_else(|| resolved.value("http2https-proxy"))
+                .and_then(|v| parse_proxy(ProxyKind::Http, v))
+        })
         // `pac://<file>` picks the proxy by evaluating FindProxyForURL.
         .or_else(|| {
             let pac_val = resolved.value("pac")?;
@@ -464,6 +471,16 @@ pub fn res_write_path(resolved: &Resolved) -> Option<String> {
     resolved.value("resWrite").map(str::to_string)
 }
 
+/// File path to append the raw request (head + body) to (`reqWriteRaw`).
+pub fn req_write_raw_path(resolved: &Resolved) -> Option<String> {
+    resolved.value("reqWriteRaw").map(str::to_string)
+}
+
+/// File path to append the raw response (head + body) to (`resWriteRaw`).
+pub fn res_write_raw_path(resolved: &Resolved) -> Option<String> {
+    resolved.value("resWriteRaw").map(str::to_string)
+}
+
 /// Content-type-specific body operator prefixes (`css`/`html`/`js`).
 const TYPED_BODY_PREFIXES: &[&str] = &["css", "html", "js"];
 
@@ -476,6 +493,9 @@ fn body_ops_present(resolved: &Resolved, prefix: &str) -> bool {
     if generic {
         return true;
     }
+    if prefix == "res" && resolved.value("resMerge").is_some() {
+        return true;
+    }
     // css/html/js typed ops only exist on the response side.
     prefix == "res"
         && TYPED_BODY_PREFIXES.iter().any(|k| {
@@ -483,6 +503,19 @@ fn body_ops_present(resolved: &Resolved, prefix: &str) -> bool {
                 .iter()
                 .any(|s| resolved.value(&format!("{k}{s}")).is_some())
         })
+}
+
+/// Deep-merge `patch` (a JSON object) into `target`; objects merge recursively,
+/// other values are overwritten. Ported from whistle's `resMerge`.
+fn json_deep_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (target, patch) {
+        (serde_json::Value::Object(t), serde_json::Value::Object(p)) => {
+            for (k, v) in p {
+                json_deep_merge(t.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (t, p) => *t = p.clone(),
+    }
 }
 
 /// True if any request-body operator applies (so the body must be buffered).
@@ -528,6 +561,21 @@ fn transform_body(
     }
     if let Some(app) = resolved.value(&format!("{prefix}Append")) {
         data.extend_from_slice(app.as_bytes());
+    }
+
+    // resMerge: deep-merge a JSON patch into a JSON response body.
+    if prefix == "res" {
+        if let Some(patch_src) = resolved.value("resMerge") {
+            if let (Ok(mut base), Ok(patch)) = (
+                serde_json::from_slice::<serde_json::Value>(&data),
+                serde_json::from_str::<serde_json::Value>(patch_src),
+            ) {
+                json_deep_merge(&mut base, &patch);
+                if let Ok(s) = serde_json::to_vec(&base) {
+                    data = s;
+                }
+            }
+        }
     }
 
     // Content-type-specific ops (cssBody/htmlPrepend/jsAppend, …).
@@ -879,6 +927,24 @@ mod tests {
         assert!(wants_res_body(&resolved));
         let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved, None);
         assert_eq!(&out[..], b"<!--top-->a bar b<!--end-->");
+    }
+
+    #[test]
+    fn res_merge_json_deep() {
+        let resolved = resolve(
+            "example.com/x resMerge://{\"a\":2,\"c\":{\"d\":1}}\n",
+            "http://example.com/x",
+        );
+        let out = transform_res_body(
+            Bytes::from_static(br#"{"a":1,"b":1,"c":{"e":2}}"#),
+            &resolved,
+            Some("application/json"),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["a"], 2); // overwritten
+        assert_eq!(v["b"], 1); // kept
+        assert_eq!(v["c"]["d"], 1); // added
+        assert_eq!(v["c"]["e"], 2); // kept (deep merge)
     }
 
     #[test]
