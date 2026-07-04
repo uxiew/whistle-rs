@@ -116,6 +116,8 @@ pub const MULTI_MATCH: &[&str] = &[
     "ignore",
     "delete",
     "headerReplace",
+    "enable",
+    "disable",
 ];
 
 /// Returns true if `name` is a protocol whistle recognises.

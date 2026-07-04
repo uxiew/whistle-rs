@@ -355,6 +355,12 @@ async fn serve(
     let started = Instant::now();
     let time_ms = now_ms();
 
+    // enable://abort drops the request without contacting upstream.
+    if apply::is_aborted(&resolved) {
+        tracing::info!("{} {} -> aborted", info.method, info.full_url);
+        return Err(anyhow::anyhow!("aborted by enable://abort"));
+    }
+
     // Short-circuit rules (redirect, mocked status, file) skip the upstream.
     if let Some(resp) = apply::short_circuit(&info, &resolved) {
         tracing::info!("{} {} -> short-circuit", info.method, info.full_url);

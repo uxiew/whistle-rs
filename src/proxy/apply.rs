@@ -111,6 +111,36 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
     }
 }
 
+/// Collect flag names from `enable`/`disable` operators (split on `,`/`|`/space).
+fn flag_set(resolved: &Resolved, protocol: &str) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for v in collect_values(resolved, protocol) {
+        for f in v.split([',', '|', ' ']) {
+            let f = f.trim();
+            if !f.is_empty() {
+                set.insert(f.to_string());
+            }
+        }
+    }
+    set
+}
+
+/// `enable://` flags for a request.
+pub fn enabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> {
+    flag_set(resolved, "enable")
+}
+
+/// `disable://` flags for a request.
+pub fn disabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> {
+    flag_set(resolved, "disable")
+}
+
+/// True if the request should be aborted (`enable://abort`/`abortReq`/`abortRes`).
+pub fn is_aborted(resolved: &Resolved) -> bool {
+    let e = enabled_flags(resolved);
+    e.contains("abort") || e.contains("abortReq") || e.contains("abortRes")
+}
+
 /// If a matched `plugin://name` refers to a registered plugin server, return
 /// `(name, host, port)` to route the request there.
 pub fn resolve_plugin(
@@ -483,6 +513,21 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
     apply_res_cookies(&mut parts.headers, resolved);
     apply_deletes(&mut parts.headers, resolved, false);
     apply_header_replace(&mut parts.headers, resolved, false);
+
+    // enable/disable flags with response-side effects.
+    let en = enabled_flags(resolved);
+    let dis = disabled_flags(resolved);
+    if en.contains("cors") {
+        set_header(&mut parts.headers, "access-control-allow-origin", "*");
+        set_header(&mut parts.headers, "access-control-allow-methods", "*");
+        set_header(&mut parts.headers, "access-control-allow-headers", "*");
+    }
+    if dis.contains("cache") {
+        set_header(&mut parts.headers, "cache-control", "no-store");
+    }
+    if dis.contains("keepAlive") || dis.contains("keepalive") {
+        set_header(&mut parts.headers, "connection", "close");
+    }
 }
 
 /// Map a `cache://` value to a `Cache-Control` header. `no`/`no-cache`/negative →
