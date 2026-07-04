@@ -296,6 +296,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     }
     apply_req_cookies(&mut parts.headers, resolved);
     apply_deletes(&mut parts.headers, resolved, true);
+    apply_header_replace(&mut parts.headers, resolved, true);
 }
 
 /// Apply `delete://` keys for one side. Keys are `scope.name` (or a bare header
@@ -326,6 +327,52 @@ fn apply_deletes(headers: &mut HeaderMap, resolved: &Resolved, request_side: boo
 fn remove_header(headers: &mut HeaderMap, name: &str) {
     if let Ok(n) = HeaderName::from_bytes(name.as_bytes()) {
         headers.remove(&n);
+    }
+}
+
+/// Apply `headerReplace://` operators for one side. Value is a JSON object
+/// `{"<scope>.<name>:<pattern>": "<replacement>"}` where scope is `req`/`reqH`/
+/// `reqHeaders` (request) or `res`/`resH`/`resHeaders` (response); the pattern is
+/// a regex applied to that header's value. Ported from `parseHeaderReplace`.
+fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, request_side: bool) {
+    for value in collect_values(resolved, "headerReplace") {
+        let value = value.trim();
+        let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+        else {
+            continue;
+        };
+        for (key, repl) in map {
+            let repl = repl.as_str().unwrap_or("");
+            let Some((scope, rest)) = key.split_once('.') else {
+                continue;
+            };
+            let (name, pattern) = rest.split_once(':').unwrap_or((rest, ""));
+            let is_req = matches!(scope, "req" | "reqH" | "reqHeaders");
+            let is_res = matches!(scope, "res" | "resH" | "resHeaders");
+            if (request_side && !is_req) || (!request_side && !is_res) {
+                continue;
+            }
+            let name = name.trim();
+            if let Some(cur) = headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+            {
+                let new = regex_replace(&cur, pattern, repl);
+                set_header(headers, name, &new);
+            }
+        }
+    }
+}
+
+/// Regex `replace_all` (falls back to literal replace if the pattern is invalid).
+fn regex_replace(text: &str, pattern: &str, repl: &str) -> String {
+    if pattern.is_empty() {
+        return text.to_string();
+    }
+    match regex::Regex::new(pattern) {
+        Ok(re) => re.replace_all(text, repl).into_owned(),
+        Err(_) => text.replace(pattern, repl),
     }
 }
 
@@ -435,6 +482,7 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
     }
     apply_res_cookies(&mut parts.headers, resolved);
     apply_deletes(&mut parts.headers, resolved, false);
+    apply_header_replace(&mut parts.headers, resolved, false);
 }
 
 /// Map a `cache://` value to a `Cache-Control` header. `no`/`no-cache`/negative →
@@ -1044,6 +1092,18 @@ mod tests {
         let c = h.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
         assert!(!c.contains("sid="));
         assert!(c.contains("keep=1"));
+    }
+
+    #[test]
+    fn header_replace_regex() {
+        let resolved = resolve(
+            "example.com headerReplace://{\"resH.x-foo:ba.\":\"XX\"}\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        h.insert("x-foo", "bar-baz".parse().unwrap());
+        apply_header_replace(&mut h, &resolved, false);
+        assert_eq!(h.get("x-foo").unwrap(), "XX-XX");
     }
 
     #[test]
