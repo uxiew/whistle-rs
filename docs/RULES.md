@@ -233,17 +233,23 @@ api.test      auth://admin:secret
 api.test      forwardedFor://203.0.113.7
 ```
 
-### Delays
+### Delays & throttling
 
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `reqDelay` | milliseconds | Wait before forwarding the request |
 | `resDelay` | milliseconds | Wait before returning the response |
+| `reqSpeed` | KB/s | Cap request-body upload throughput |
+| `resSpeed` | KB/s | Cap response-body download throughput |
 
 ```
 slow.example.com   reqDelay://500
 slow.example.com   resDelay://1000
+slow.example.com   resSpeed://20        # ~20 KB/s download
 ```
+
+> A speed cap buffers the body and re-emits it in paced chunks, so it forces a
+> known-length body to chunked transfer.
 
 ### Response rewriting
 

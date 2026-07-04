@@ -232,6 +232,16 @@ pub fn res_delay_ms(resolved: &Resolved) -> Option<u64> {
     resolved.value("resDelay").and_then(|v| v.trim().parse().ok())
 }
 
+/// Request-body throughput cap in KB/s (`reqSpeed`).
+pub fn req_speed_kbps(resolved: &Resolved) -> Option<f64> {
+    resolved.value("reqSpeed").and_then(|v| v.trim().parse().ok())
+}
+
+/// Response-body throughput cap in KB/s (`resSpeed`).
+pub fn res_speed_kbps(resolved: &Resolved) -> Option<f64> {
+    resolved.value("resSpeed").and_then(|v| v.trim().parse().ok())
+}
+
 /// Apply response-side operators (status replacement, headers) in place.
 pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
     if let Some(code) = resolved
@@ -676,6 +686,13 @@ mod tests {
         let resolved = resolve("example.com reqDelay://250\nexample.com resDelay://40\n", "http://example.com/");
         assert_eq!(req_delay_ms(&resolved), Some(250));
         assert_eq!(res_delay_ms(&resolved), Some(40));
+    }
+
+    #[test]
+    fn speed_parsing() {
+        let resolved = resolve("example.com reqSpeed://16\nexample.com resSpeed://20\n", "http://example.com/");
+        assert_eq!(req_speed_kbps(&resolved), Some(16.0));
+        assert_eq!(res_speed_kbps(&resolved), Some(20.0));
     }
 
     #[test]

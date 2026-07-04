@@ -236,12 +236,16 @@ async fn serve(
     parts.headers.remove("proxy-connection");
     apply::apply_request(&mut parts, &resolved);
 
-    // Buffer + transform the request body only when a body operator applies.
-    let req_body: DynBody = if apply::wants_req_body(&resolved) {
+    // Buffer + transform the request body only when a body/speed operator applies.
+    let req_speed = apply::req_speed_kbps(&resolved);
+    let req_body: DynBody = if apply::wants_req_body(&resolved) || req_speed.is_some() {
         let bytes = incoming.collect().await?.to_bytes();
         let new = apply::transform_req_body(bytes, &resolved);
         apply::strip_length_headers(&mut parts.headers);
-        body::full(new)
+        match req_speed {
+            Some(kbps) => body::throttled(new, kbps),
+            None => body::full(new),
+        }
     } else {
         body::from_incoming(incoming)
     };
@@ -270,11 +274,15 @@ async fn serve(
     let (mut parts, body) = upstream_resp.into_parts();
     apply::apply_response(&mut parts, &resolved);
 
-    let res_body: DynBody = if apply::wants_res_body(&resolved) {
+    let res_speed = apply::res_speed_kbps(&resolved);
+    let res_body: DynBody = if apply::wants_res_body(&resolved) || res_speed.is_some() {
         let bytes = body.collect().await?.to_bytes();
         let new = apply::transform_res_body(bytes, &resolved);
         apply::strip_length_headers(&mut parts.headers);
-        body::full(new)
+        match res_speed {
+            Some(kbps) => body::throttled(new, kbps),
+            None => body::full(new),
+        }
     } else {
         body::from_incoming(body)
     };

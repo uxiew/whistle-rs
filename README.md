@@ -167,12 +167,12 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 - Operators applied at runtime: `host` (+ `:port`), `reqHeaders`, `resHeaders`,
   `reqCookies`, `resCookies`, `reqType`/`resType`, `resCors`, `ua`, `referer`,
   `method`, `urlReplace`/`params`, body rewriting (`*Body`/`*Replace`/`*Prepend`/`*Append`),
-  `auth`, `forwardedFor`, `reqDelay`/`resDelay`,
+  `auth`, `forwardedFor`, `attachment`, `reqDelay`/`resDelay`, `reqSpeed`/`resSpeed`,
   `redirect`/`location`, `statusCode`/`replaceStatus`, `file`/`rawfile`
 
 **Parsed & resolved but not yet applied** (they round-trip through the engine so mixed
 rule files load; wiring them into `src/proxy/apply.rs` is the next step): `pac`,
-`weinre`, `plugin`, `resScript`/`frameScript`, `reqSpeed`/`resSpeed`.
+`weinre`, `plugin`, `resScript`/`frameScript`.
 
 **Not ported** (large standalone subsystems): the web UI (React + CGI under `biz/`),
 the plugin subprocess system, weinre, WebSocket frame inspection/logging, an inbound
