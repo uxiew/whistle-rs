@@ -201,18 +201,22 @@ pub fn resolve_plugin(
     resolved: &Resolved,
     plugins: &std::collections::HashMap<String, String>,
 ) -> Option<(String, String, u16)> {
-    for op in resolved.all("plugin") {
-        // Value is `name` or `name/extra`; the plugin name is the first segment.
-        let name = op.value.split(['/', '?']).next().unwrap_or("").trim();
-        if name.is_empty() {
-            continue;
-        }
-        if let Some(addr) = plugins.get(name) {
-            let (h, p) = match addr.rsplit_once(':') {
-                Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
-                None => (addr.clone(), 80),
-            };
-            return Some((name.to_string(), h, p));
+    // `pipe://name` routes to a registered server too (streaming is approximated
+    // as full plugin routing).
+    for proto in ["plugin", "pipe"] {
+        for op in resolved.all(proto) {
+            // Value is `name` or `name/extra`; the plugin name is the first segment.
+            let name = op.value.split(['/', '?']).next().unwrap_or("").trim();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(addr) = plugins.get(name) {
+                let (h, p) = match addr.rsplit_once(':') {
+                    Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
+                    None => (addr.clone(), 80),
+                };
+                return Some((name.to_string(), h, p));
+            }
         }
     }
     None
