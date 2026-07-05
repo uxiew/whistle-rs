@@ -30,7 +30,8 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   by a locally generated, persisted root CA.
 - **HTTP/2** — intercepted TLS connections negotiate `h2` via ALPN and are served
   over HTTP/2 (upstream stays HTTP/1.1; hyper translates), falling back to HTTP/1.1.
-- **WebSocket** — `ws://` and (via MITM) `wss://` upgrades are tunnelled end-to-end.
+- **WebSocket** — `ws://` and (via MITM) `wss://` upgrades are tunnelled end-to-end,
+  with every frame captured and surfaced in the Network view.
 - **Upstream proxies** — route through another HTTP/HTTPS proxy or a SOCKS5 proxy.
 - **Inbound SOCKS5 server** — accept SOCKS5 clients (`--socks-port`) into the same
   interception pipeline, auto-detecting TLS vs. plain HTTP.
@@ -176,26 +177,28 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `filter`/`includeFilter`/`excludeFilter` conditions (method/host/header/clientIp/URL)
 - Upstream routing: `proxy`/`http-proxy`/`https-proxy`/`internal-proxy` (HTTP proxy)
   and `socks` (SOCKS5); `pac` (evaluate PAC to pick the proxy)
-- Operators applied at runtime: **69 of whistle's 73 registry operators** — headers,
+- Operators applied at runtime: **70 of whistle's 73 registry operators** — headers,
   cookies, `delete`, charset, body rewriting (generic + `css`/`html`/`js` + `resMerge`),
   `trailers`, `headerReplace`, URL/query, `ua`/`referer`/`method`/`auth`/`forwardedFor`,
   delays/speeds, `cache`, `attachment`, `redirect`/`file`/`statusCode`,
   `enable`/`disable` flags, `reqWrite`/`resWrite`(`Raw`), `responseFor`, `log`,
-  `resScript`/`frameScript`, `plugin`/`pipe`, `weinre`, `rule`/`rulesFile` includes,
-  and `{name}` value references. Full mapping in
+  `cipher` (upstream TLS version pin), `resScript`/`frameScript`, `plugin`/`pipe`,
+  `weinre`, `rule`/`rulesFile` includes, and `{name}` value references. Full mapping in
   [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage).
+- WebSocket frame capture — `ws://`/`wss://` connections appear in the Network view
+  (status `101`) and every frame (both directions) is recorded; `/frames.json`.
 - Web UI with live Network view + editable Rules & Values; `/sessions.json`, `/proxy.pac`
 
-Only **4** operators remain unimplemented — `cipher`/`sniCallback` (per-rule TLS
-internals, fixed at SNI time before rule resolution), `G` (global-rule marker), and
-`style` (rule colour in the UI) — each documented with its reason in the coverage
-table.
+Only **3** operators remain unimplemented — `sniCallback` (MITM cert hook fixed at
+SNI time before rule resolution, needing the Node plugin loader), `G` (global-rule
+marker), and `style` (rule colour in the UI) — each documented with its reason in the
+coverage table.
 
 **Simplified vs. the original** (functional, but not a byte-for-byte port): whistle's
 React web UI (`biz/`) is replaced by a lightweight built-in UI; plugins are external
 HTTP servers rather than the Node subprocess loader; weinre is script-injection only
-(the inspector server is external); the traffic capture is in-memory (not persisted);
-WebSocket frame *inspection/logging* (beyond `frameScript`) is not surfaced.
+(the inspector server is external); the traffic capture (including WebSocket frames)
+is in-memory (not persisted).
 
 See [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage) for the
 operator-level detail.

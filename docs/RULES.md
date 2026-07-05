@@ -500,7 +500,7 @@ example.com/old/*    redirect://https://example.com/new/
 ## Operator coverage
 
 Every operator in whistle's registry (`_original/lib/rules/protocols.js`) and its
-status in whistle-rs. **69 of 73 are applied at runtime**; the remaining 4 parse and
+status in whistle-rs. **70 of 73 are applied at runtime**; the remaining 3 parse and
 resolve (so mixed rule files load) but have no distinct effect.
 
 ### Applied at runtime
@@ -513,6 +513,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` |
 | Short-circuit / flags | `redirect`, `location`, `file`, `rawfile`, `statusCode` mock, `enable`, `disable` |
 | Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
+| TLS | `cipher` (upstream TLS version pin) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
 Notes: `https2http-proxy`/`http2https-proxy` resolve as HTTP proxies (scheme
@@ -520,14 +521,20 @@ conversion approximated); `enable`/`disable` apply a curated flag set
 (`abort`, `cors`, `cache`, `keepAlive` — others are inert); `pipe` routes to a
 registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
 extra rules from the values store / a file; `{name}` in any operator value is
-substituted from the values store.
+substituted from the values store. `cipher` honours the portable part of Node's TLS
+options — `minVersion`/`maxVersion`/`secureProtocol` (or a bare `cipher://TLSv1.2`
+token) pin the **upstream** TLS protocol version; rustls exposes TLS 1.2 / 1.3 only,
+so OpenSSL cipher-suite strings and older-than-1.2 pins are not honoured.
 
-### Parsed but not applied (4)
+WebSocket frames are captured too: every intercepted `ws://`/`wss://` connection is
+recorded as a session (status `101`) and each frame (both directions) is surfaced —
+click the connection in the Network view, or fetch `/frames.json?id=<session>`.
+
+### Parsed but not applied (3)
 
 | Operator(s) | Why / note |
 |-------------|-----------|
-| `cipher` | Per-rule TLS cipher-suite selection — the MITM acceptor is built at SNI time, before rule resolution |
-| `sniCallback` | JS hook at SNI time to choose the certificate — same architectural constraint |
+| `sniCallback` | JS hook at SNI time to choose the MITM certificate — resolved before per-request rules, and needs the Node plugin loader |
 | `G` | Global-rule marker (a rule-precedence concept, not a per-request traffic effect) |
 | `style` | Rule colour in whistle's rule list — the built-in UI is a plain editor with no per-rule rendering |
 
