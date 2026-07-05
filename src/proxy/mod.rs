@@ -5,6 +5,7 @@
 
 pub mod apply;
 pub mod body;
+pub mod persist;
 pub mod script;
 pub mod socks;
 pub mod upstream;
@@ -33,7 +34,7 @@ use crate::rules::{ReqInfo, Resolved, RuleManager};
 use body::DynBody;
 
 /// Maximum number of captured transactions kept in memory.
-const MAX_SESSIONS: usize = 500;
+pub const MAX_SESSIONS: usize = 500;
 
 /// Maximum number of captured WebSocket frames kept in memory (across all
 /// connections). Whistle surfaces every frame; we keep a bounded ring buffer.
@@ -53,6 +54,8 @@ pub struct AppState {
     /// Bounded ring buffer of captured WebSocket frames, keyed by session id.
     pub ws_frames: Mutex<VecDeque<WsFrame>>,
     next_id: AtomicU64,
+    /// Optional session persistence (JSONL on disk).
+    session_store: Option<persist::SessionStore>,
 }
 
 impl AppState {
@@ -84,7 +87,19 @@ impl AppState {
             sessions: Mutex::new(VecDeque::new()),
             ws_frames: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
+            session_store: None,
         }
+    }
+
+    /// Attach a session store for persistence. Must be called after the
+    /// tokio runtime is available (store spawns a background task).
+    pub fn enable_persistence(&mut self, store: persist::SessionStore) {
+        self.session_store = Some(store);
+    }
+
+    /// Set the next session ID counter (used after loading history).
+    pub fn set_next_id(&self, id: u64) {
+        self.next_id.store(id, Ordering::Relaxed);
     }
 
     /// Record a transaction, assigning it an id which is returned so callers
@@ -92,6 +107,10 @@ impl AppState {
     fn record(&self, mut session: Session) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         session.id = id;
+        // Persist to disk before inserting into the in-memory ring buffer.
+        if let Some(store) = &self.session_store {
+            store.persist(&session);
+        }
         let mut q = self.sessions.lock().unwrap();
         if q.len() >= MAX_SESSIONS {
             q.pop_front();
@@ -242,7 +261,7 @@ impl Capture {
     }
 
     /// A capture already populated from a fully-buffered body.
-    fn from_bytes(
+    pub(crate) fn from_bytes(
         bytes: &[u8],
         content_type: Option<String>,
         content_encoding: Option<&str>,

@@ -40,6 +40,10 @@ pub struct Config {
     pub values: HashMap<String, String>,
     /// Max bytes of each captured body kept for the inspection preview.
     pub body_preview_cap: usize,
+    /// Whether to persist captured sessions to disk (JSONL).
+    pub persist_sessions: bool,
+    /// Number of days of session JSONL files to retain.
+    pub persist_days: u32,
 }
 
 impl Config {
@@ -55,6 +59,11 @@ impl Config {
     /// Path of the persisted root CA private key (PEM).
     pub fn root_ca_key_path(&self) -> PathBuf {
         self.storage_dir.join("certs").join("root.key")
+    }
+
+    /// Directory for persisted session JSONL files.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.storage_dir.join("sessions")
     }
 }
 
@@ -72,9 +81,14 @@ impl Default for Config {
             plugins: HashMap::new(),
             values: HashMap::new(),
             body_preview_cap: DEFAULT_BODY_PREVIEW_CAP,
+            persist_sessions: true,
+            persist_days: DEFAULT_PERSIST_DAYS,
         }
     }
 }
 
 /// Default preview cap: 16 KB of each body kept for inspection.
 pub const DEFAULT_BODY_PREVIEW_CAP: usize = 16 * 1024;
+
+/// Default number of days to retain persisted session files.
+pub const DEFAULT_PERSIST_DAYS: u32 = 7;

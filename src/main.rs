@@ -60,6 +60,14 @@ struct Cli {
     #[arg(long, default_value_t = whistle_rs::config::DEFAULT_BODY_PREVIEW_CAP)]
     body_preview_limit: usize,
 
+    /// Disable session persistence to disk.
+    #[arg(long)]
+    no_persist: bool,
+
+    /// Days of session history to retain on disk.
+    #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_DAYS)]
+    persist_days: u32,
+
     /// Verbose (debug) logging.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -117,6 +125,8 @@ async fn main() -> Result<()> {
         plugins,
         values,
         body_preview_cap: cli.body_preview_limit,
+        persist_sessions: !cli.no_persist,
+        persist_days: cli.persist_days,
         ..Config::default()
     };
 
@@ -180,7 +190,32 @@ async fn main() -> Result<()> {
     }
     tracing::info!("plugins: {}", registry.names().join(", "));
 
-    let state = Arc::new(AppState::with_plugins(config, manager, ca, registry));
+    let mut state = AppState::with_plugins(config, manager, ca, registry);
+
+    // Session persistence: load history and enable runtime writes.
+    if state.config.persist_sessions {
+        let sessions_dir = state.config.sessions_dir();
+        let loaded = whistle_rs::proxy::persist::SessionStore::load(
+            &sessions_dir,
+            whistle_rs::proxy::MAX_SESSIONS,
+        );
+        if !loaded.is_empty() {
+            let max_id = loaded.iter().map(|s| s.id).max().unwrap_or(0);
+            let mut q = state.sessions.lock().unwrap();
+            for s in loaded {
+                q.push_back(s);
+            }
+            state.set_next_id(max_id + 1);
+            tracing::info!("loaded {} sessions from disk", q.len());
+        }
+        let store = whistle_rs::proxy::persist::SessionStore::new(
+            sessions_dir,
+            state.config.persist_days,
+        );
+        state.enable_persistence(store);
+    }
+
+    let state = Arc::new(state);
 
     // Keep the spawned Node plugin processes alive for the server's lifetime.
     let _children = children;
