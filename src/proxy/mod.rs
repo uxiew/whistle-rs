@@ -397,10 +397,12 @@ fn guard(result: Result<Response<DynBody>>) -> Response<DynBody> {
     match result {
         Ok(resp) => resp,
         Err(err) => {
-            tracing::debug!("request failed: {err}");
+            // `{err:#}` includes the full anyhow context chain (e.g. the
+            // underlying rustls reason behind "upstream TLS handshake").
+            tracing::debug!("request failed: {err:#}");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(body::full(Bytes::from(format!("whistle-rs: {err}"))))
+                .body(body::full(Bytes::from(format!("whistle-rs: {err:#}"))))
                 .unwrap()
         }
     }

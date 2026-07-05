@@ -162,7 +162,63 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
         sni: info.host.clone(),
         request_port: info.port,
         proxy,
+        tls_versions: resolved
+            .value("cipher")
+            .map(parse_cipher_versions)
+            .unwrap_or_default(),
     }
+}
+
+/// Parse a `cipher://` value into an upstream TLS version constraint.
+///
+/// Whistle's `cipher` operator carries Node TLS options as JSON (`minVersion`,
+/// `maxVersion`, `secureProtocol`, `ciphers`, …). rustls exposes TLS 1.2 and 1.3
+/// only and cannot take OpenSSL cipher strings, so we honour the portable part:
+/// the min/max protocol version. Accepts either a JSON object or a bare version
+/// token (`cipher://TLSv1.2`). Older pins clamp to the nearest supported version.
+fn parse_cipher_versions(value: &str) -> super::upstream::TlsVersions {
+    use super::upstream::TlsVersions;
+    let value = value.trim();
+    let (mut min, mut max) = (None, None);
+    if value.starts_with('{') {
+        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
+            let get = |k: &str| map.get(k).and_then(|v| v.as_str()).map(str::to_string);
+            min = get("minVersion");
+            max = get("maxVersion");
+            // secureProtocol pins a single version (e.g. "TLSv1_2_method").
+            if let Some(sp) = get("secureProtocol") {
+                min = Some(sp.clone());
+                max = Some(sp);
+            }
+        }
+    } else if !value.is_empty() {
+        // A bare token pins exactly that version.
+        min = Some(value.to_string());
+        max = Some(value.to_string());
+    }
+    let is13 = |s: &Option<String>| s.as_deref().map(cipher_is_13).unwrap_or(false);
+    let is12 = |s: &Option<String>| s.as_deref().map(cipher_is_12).unwrap_or(false);
+    if is13(&min) {
+        TlsVersions::Only13 // min 1.3 ⇒ 1.3 only
+    } else if is12(&max) || (max.is_none() && is12(&min)) {
+        TlsVersions::Only12 // capped at 1.2 (or the bare `TLSv1.2` token)
+    } else if is13(&max) && min.is_none() {
+        TlsVersions::Only13
+    } else {
+        TlsVersions::Default
+    }
+}
+
+/// True if a version token names TLS 1.3.
+fn cipher_is_13(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
+    s.contains("1.3") || s.contains("1_3")
+}
+
+/// True if a version token names TLS 1.2 (or an older version we clamp up to 1.2).
+fn cipher_is_12(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
+    s.contains("1.2") || s.contains("1_2") || s.contains("1.1") || s.contains("1_1")
 }
 
 /// Collect flag names from `enable`/`disable` operators (split on `,`/`|`/space).
@@ -1220,6 +1276,39 @@ mod tests {
         );
         strip_charset(&mut h);
         assert_eq!(h.get(hyper::header::CONTENT_TYPE).unwrap(), "text/html");
+    }
+
+    #[test]
+    fn cipher_maps_to_tls_versions() {
+        use super::super::upstream::TlsVersions;
+        assert_eq!(parse_cipher_versions("TLSv1.2"), TlsVersions::Only12);
+        assert_eq!(parse_cipher_versions("TLSv1.3"), TlsVersions::Only13);
+        assert_eq!(
+            parse_cipher_versions("{\"maxVersion\":\"TLSv1.2\"}"),
+            TlsVersions::Only12
+        );
+        assert_eq!(
+            parse_cipher_versions("{\"minVersion\":\"TLSv1.3\"}"),
+            TlsVersions::Only13
+        );
+        assert_eq!(
+            parse_cipher_versions("{\"secureProtocol\":\"TLSv1_2_method\"}"),
+            TlsVersions::Only12
+        );
+        // An OpenSSL cipher string carries no version pin → default (1.2+1.3).
+        assert_eq!(
+            parse_cipher_versions("{\"ciphers\":\"ECDHE-RSA-AES128-GCM-SHA256\"}"),
+            TlsVersions::Default
+        );
+    }
+
+    #[test]
+    fn cipher_sets_target_tls_versions() {
+        use super::super::upstream::TlsVersions;
+        let resolved = resolve("example.com cipher://TLSv1.2\n", "https://example.com/");
+        let info = build_req_info("GET", "https", "example.com", 443, "/", &HeaderMap::new(), None);
+        let target = resolve_target(&info, &resolved);
+        assert_eq!(target.tls_versions, TlsVersions::Only12);
     }
 
     #[test]

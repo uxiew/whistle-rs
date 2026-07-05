@@ -50,6 +50,20 @@ pub struct ProxyConfig {
     pub auth: Option<(String, String)>,
 }
 
+/// Which TLS protocol versions to offer on the upstream (origin) handshake.
+/// Derived from the `cipher` operator's `minVersion`/`maxVersion`. rustls
+/// supports TLS 1.2 and 1.3 only, so older pins are clamped to the nearest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsVersions {
+    /// Offer both TLS 1.2 and 1.3 (the shared default config).
+    #[default]
+    Default,
+    /// Pin to TLS 1.2 only.
+    Only12,
+    /// Pin to TLS 1.3 only.
+    Only13,
+}
+
 /// Where and how to reach the upstream.
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -64,17 +78,37 @@ pub struct Target {
     pub request_port: u16,
     /// Optional upstream proxy to route through.
     pub proxy: Option<ProxyConfig>,
+    /// TLS version constraint for the origin handshake (`cipher` operator).
+    pub tls_versions: TlsVersions,
 }
 
-/// Shared rustls client config trusting the webpki root store.
-static CLIENT_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+fn build_client_config(versions: &[&'static rustls::SupportedProtocolVersion]) -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg = ClientConfig::builder()
+    let cfg = ClientConfig::builder_with_protocol_versions(versions)
         .with_root_certificates(roots)
         .with_no_client_auth();
     Arc::new(cfg)
-});
+}
+
+/// Shared rustls client config trusting the webpki root store (TLS 1.2 + 1.3).
+static CLIENT_CONFIG: Lazy<Arc<ClientConfig>> =
+    Lazy::new(|| build_client_config(rustls::ALL_VERSIONS));
+/// TLS-1.2-only client config (`cipher` pin).
+static CLIENT_CONFIG_12: Lazy<Arc<ClientConfig>> =
+    Lazy::new(|| build_client_config(&[&rustls::version::TLS12]));
+/// TLS-1.3-only client config (`cipher` pin).
+static CLIENT_CONFIG_13: Lazy<Arc<ClientConfig>> =
+    Lazy::new(|| build_client_config(&[&rustls::version::TLS13]));
+
+/// Pick the origin TLS config for a target's version constraint.
+fn client_config_for(versions: TlsVersions) -> Arc<ClientConfig> {
+    match versions {
+        TlsVersions::Default => CLIENT_CONFIG.clone(),
+        TlsVersions::Only12 => CLIENT_CONFIG_12.clone(),
+        TlsVersions::Only13 => CLIENT_CONFIG_13.clone(),
+    }
+}
 
 /// A type-erased async stream so direct/proxied/TLS paths share one signature.
 trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -189,7 +223,7 @@ async fn origin_stream(target: &Target) -> Result<BoxedIo> {
     };
 
     if target.tls {
-        let connector = TlsConnector::from(CLIENT_CONFIG.clone());
+        let connector = TlsConnector::from(client_config_for(target.tls_versions));
         let server_name = ServerName::try_from(target.sni.clone())
             .map_err(|_| anyhow!("invalid SNI host {}", target.sni))?;
         let tls = connector
@@ -358,6 +392,7 @@ pub async fn simple_get(url: &str) -> Result<(u16, Bytes)> {
         sni: host.clone(),
         request_port: port,
         proxy: None,
+        tls_versions: TlsVersions::Default,
     };
     let req = Request::builder()
         .method("GET")
