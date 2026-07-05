@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
         registry.register_remote(name, addr);
     }
     let mut children = Vec::new();
+    let mut node_ports = Vec::new();
     for spec in &cli.node_plugins {
         let (name, path) = spec
             .split_once('=')
@@ -150,8 +151,18 @@ async fn main() -> Result<()> {
             .spawn()
             .with_context(|| format!("spawning node plugin '{name}' ({path})"))?;
         children.push(child);
+        node_ports.push((name.to_string(), port));
         registry.register_remote(name, &format!("127.0.0.1:{port}"));
         tracing::info!("spawned node plugin '{name}' -> node {path} on 127.0.0.1:{port}");
+    }
+    // Wait for spawned plugins to start listening so early requests don't miss
+    // them (best-effort, ~5s cap per plugin).
+    for (name, port) in &node_ports {
+        if wait_for_port(*port, std::time::Duration::from_secs(5)).await {
+            tracing::info!("node plugin '{name}' ready on 127.0.0.1:{port}");
+        } else {
+            tracing::warn!("node plugin '{name}' not ready after 5s (continuing)");
+        }
     }
     tracing::info!("plugins: {}", registry.names().join(", "));
 
@@ -166,4 +177,16 @@ async fn main() -> Result<()> {
 fn free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
+}
+
+/// Poll `127.0.0.1:port` until it accepts a connection or `timeout` elapses.
+async fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
 }
