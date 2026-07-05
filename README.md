@@ -48,8 +48,9 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   Network view and an editable Rules panel; rules changes apply immediately.
 - **Traffic inspection** — each transaction records its request/response headers and a
   bounded body preview (captured via a streaming tee, so chunked/SSE responses are
-  inspectable without breaking streaming); expand any row in the UI, or fetch
-  `/sessions.json` (summary) and `/session.json?id=` (detail).
+  inspectable without breaking streaming; `gzip`/`deflate`/`br` bodies are decoded for
+  the preview). Expand/filter rows in the UI, fetch `/sessions.json` + `/session.json?id=`,
+  or export everything as a HAR file (`/sessions.har`).
 - Single static binary, no C toolchain needed to build (pinned `ring` TLS provider).
 
 ## Install & build
@@ -154,6 +155,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 | `-r, --rules <FILE>` | Rules file to load at startup | — |
 | `--rule <TEXT>` | Inline rules, applied after `--rules` | — |
 | `--dir <DIR>` | Storage dir (root CA etc.) | `~/.whistle-rs` |
+| `--body-preview-limit <BYTES>` | Max captured body bytes kept per transaction | `16384` |
 | `-v, --verbose` | Debug logging (per-request decisions) | off |
 | `-h, --help` / `-V, --version` | Help / version | — |
 
@@ -200,9 +202,11 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage).
 - WebSocket frame capture — `ws://`/`wss://` connections appear in the Network view
   (status `101`) and every frame (both directions) is recorded; `/frames.json`.
-- Web UI with live Network view (expandable per-transaction headers + body previews,
-  and per-connection WebSocket frames) + editable Rules & Values; `/sessions.json`,
-  `/session.json?id=`, `/frames.json`, `/proxy.pac`
+- Web UI with live Network view (filter/search, expandable per-transaction headers +
+  decoded body previews, and per-connection WebSocket frames) + editable Rules & Values;
+  `/sessions.json`, `/session.json?id=`, `/frames.json`, `/sessions.har` (HAR export),
+  `/proxy.pac`
+- `@`-includes (pull rules from a URL/file) and `${port}`/`${version}` config variables
 
 Only **3** operators remain unimplemented — `sniCallback` (MITM cert hook fixed at
 SNI time before rule resolution, needing the Node plugin loader), `G` (global-rule

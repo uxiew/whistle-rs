@@ -44,8 +44,9 @@ CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
 - **请求/响应改写** —— 头、Cookie、Body（替换/前插/追加/正则）、URL/查询串、
   User-Agent、方法、Content-Type、CORS、鉴权、延迟、状态码替换、重定向、本地文件服务。
 - **流量检查** —— 每条事务记录请求/响应头与有界的 Body 预览（通过流式 tee 抓取，
-  因此分块 / SSE 响应也可查看且不破坏流式传输）；在界面展开任意一行，或访问
-  `/sessions.json`（摘要）与 `/session.json?id=`（详情）。
+  因此分块 / SSE 响应也可查看且不破坏流式传输；`gzip`/`deflate`/`br` 压缩体会被解码后
+  预览）。可在界面展开/过滤，或访问 `/sessions.json`、`/session.json?id=`，也可导出为
+  HAR 文件（`/sessions.har`）。
 - **Web 界面** —— 自包含单页（浏览器直接访问代理地址即可打开），含实时网络视图、
   可编辑的规则面板与 Values 面板；规则改动即时生效。
 - **单一静态二进制**，构建无需 C 工具链（固定使用 `ring` TLS provider）。
@@ -148,6 +149,7 @@ $example.com          host://2.2.2.2
 | `-r, --rules <FILE>` | 启动时加载的规则文件 | —— |
 | `--rule <TEXT>` | 内联规则，在 `--rules` 之后应用 | —— |
 | `--dir <DIR>` | 存储目录（根 CA 等） | `~/.whistle-rs` |
+| `--body-preview-limit <BYTES>` | 每条事务保留的 Body 预览上限字节数 | `16384` |
 | `-v, --verbose` | 调试日志（逐请求决策） | 关闭 |
 | `-h, --help` / `-V, --version` | 帮助 / 版本 | —— |
 
@@ -188,8 +190,10 @@ $example.com          host://2.2.2.2
   `skip`、`tlsOptions`、`pathReplace`、`reqMerge` 等），均归一化到规范名。
   完整映射见 [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage)。
 - 流量检查：逐事务的请求/响应头 + Body 预览
-- Web 界面：实时网络视图（可展开查看头 + Body 预览、以及逐连接的 WebSocket 帧）+
-  可编辑的规则与 Values；`/sessions.json`、`/session.json?id=`、`/frames.json`、`/proxy.pac`
+- Web 界面：实时网络视图（过滤/搜索、可展开查看头 + 解码后的 Body 预览、逐连接的
+  WebSocket 帧）+ 可编辑的规则与 Values；`/sessions.json`、`/session.json?id=`、
+  `/frames.json`、`/sessions.har`（HAR 导出）、`/proxy.pac`
+- `@`-includes（从 URL/文件引入规则）与 `${port}`/`${version}` 配置变量
 
 仅剩 **3** 个算子未实现 —— `sniCallback`（MITM 证书回调，在规则解析前的 SNI 阶段固定，
 且依赖 Node 插件加载器）、`G`（全局规则标记）、`style`（界面里的规则颜色）—— 每个都在

@@ -2,82 +2,74 @@
 
 [English README](../README.md) · [简体中文 README](../README.zh-CN.md)
 
-本文件诚实记录 **whistle-rs 相对原版 whistle 仍未对齐的部分**，以及后续计划。
-核心的「代理服务器 + 规则 DSL 引擎」已完整实现并端到端验证；下面列出的都是原版中
-**有意简化或尚未移植**的更大子系统与少数边缘算子。
+本文件诚实记录 **whistle-rs 相对原版 whistle 的对齐进度**：已完成的工作，以及仍
+**有意简化 / 尚未移植 / 架构受限**的更大子系统与少数边缘算子。
 
-> 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层与本地文件/模板家族；
-> 单元测试 38 项全绿、构建 0 警告。已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、
-> WebSocket（含逐帧抓取）、上游代理、流量检查（头 + Body 预览）、`cipher` TLS 版本固定。
-
----
-
-## 已知差距一览
-
-| 领域 | 当前状态 | 影响 | 优先级 |
-|------|----------|------|--------|
-| 插件运行时（Rust + Node） | ✅ 已实现统一插件系统（`server`/`rulesServer` 钩子），见 [`PLUGINS.md`](PLUGINS.md) | —— | 完成 |
-| 现成 npm `whistle.*` 插件兼容 | ✗ 需移植 whistle 的 Node 对象插件加载器 | 中 | ⭐⭐ |
-| 插件/模板变量（`${…}`、`%name`、`G`/`@`） | 未实现 | 中 | ⭐⭐ |
-| dust / handlebars 模板引擎 | 以 `{name}` 简单替换近似 | 低-中 | ⭐⭐ |
-| 流量持久化 | 仅内存（有界环形缓冲） | 中 | ⭐⭐ |
-| 响应体解码（gzip/br）用于查看 | 压缩 Body 以二进制展示 | 中 | ⭐⭐ |
-| weinre 完整支持 | 仅脚本注入，inspector 在外部 | 低 | ⭐ |
-| `sniCallback` 算子 | 未实现（SNI 阶段 + 依赖插件） | 低 | ⭐ |
-| 其余代理变体 | `internal-http-proxy`/`internal-https-proxy`、`x`/`xs` 前缀代理 | 低 | ⭐ |
-| `locationHref` 算子 | 未实现（客户端注入式跳转） | 低 | ⭐ |
-| `style` / `G` 算子 | 解析但不产生流量效果 | 无 | —— |
-| React Web 前端（`biz/`） | 由轻量内建 UI 替代 | 视需求 | ⭐ |
+> 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族、
+> `@`-includes、`${port}/${version}` 配置变量；单元测试 **52** 项全绿、构建 0 警告。
+> 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
+> 统一插件系统（Rust + Node）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
+> HAR 导出、`cipher` TLS 版本固定。
 
 ---
 
-## 分阶段计划
+## 已完成（本轮）
 
-### 第一阶段：插件运行时 ✅（已完成核心）
+| 领域 | 状态 |
+|------|------|
+| 统一插件系统（Rust 进程内 + Node 子进程 + 远程） | ✅ `server`/`rulesServer` 钩子、二进制响应体、就绪等待 |
+| `@`-includes（从 URL / 文件引入规则） | ✅ 加载时解析 |
+| `${port}` / `${version}` 配置变量 | ✅ |
+| 响应体解码（gzip / deflate / brotli）用于查看 | ✅ 流式解码，界限 16 KB，不影响转发 |
+| HAR 1.2 导出（`/sessions.har` + UI 下载） | ✅ |
+| Web UI 过滤/搜索 | ✅ 按 URL/方法/状态/目标 |
+| Body 预览上限可配置（`--body-preview-limit`） | ✅ |
+| `internal-http-proxy` / `internal-https-proxy` | ✅ |
+| `x`/`xs` 前缀代理变体 | ✅ 以基础代理近似 |
+| `locationHref` 算子 | ✅ HTML 注入跳转脚本 |
 
-已实现**统一插件系统**（见 [`PLUGINS.md`](PLUGINS.md)）：一个插件可注入 whistle 规则
-（`rulesServer` 钩子）和/或直接返回响应（`server` 钩子），由 `plugin://name` 触发。
-两种运行时共用同一契约：
+---
 
-- [x] **Rust 进程内插件**（`RustPlugin` trait），内置 `echo`/`tag` 示例。
-- [x] **Node/远程插件**：JSON-over-HTTP 协议 + 零依赖 Node 辅助库。
-- [x] whistle-rs **拉起并管理 Node 子进程**（`--node-plugin name=path.js`，自动分配端口）。
-- [x] 插件返回的**规则**合并进解析结果；返回的**响应**短路上游。
+## 仍未对齐 / 后续计划
 
-仍待办（提升兼容性/能力）：
+### 大型子系统（多天工作量）
 
-- [ ] **现成 npm `whistle.*` 插件兼容**：移植 whistle 基于 Node `req`/`res` 对象装饰的
-      完整插件加载器（`server`/`rulesServer` 之外的 API）。
-- [ ] 向插件传递**请求体**、以及远程响应的**二进制 Body**。
-- [ ] 更多钩子：`reqRead`/`resRead`（流式读写）、`uiServer`/`statsServer`、`auth`。
-- [ ] `pipe://` 的真正流式管道（当前与 `plugin://` 同为整体分发）。
+- [ ] **现成 npm `whistle.*` 插件兼容加载器** —— 原版插件 API 基于对 Node `req`/`res`
+      对象的装饰（`setRules`/`request`/`writeHead` 等约 2000 行加载器），并非简单的 HTTP
+      头协议。要原样运行现有 npm 插件需移植这层加载器。当前的统一插件系统覆盖了最常用的
+      `server`/`rulesServer` 能力（用 Rust 或按约定的 Node 协议编写），但不直接兼容任意
+      `npm i whistle.xxx`。**这是投入产出比最高的下一块大工作。**
+- [ ] **更多插件钩子**：`reqRead`/`resRead`（请求/响应体流式读写）、`uiServer`/
+      `statsServer`（插件自带 UI/统计页）、`auth`、`sniCallback`。
+- [ ] **`pipe://` 真正的流式管道** —— 当前与 `plugin://` 同为整体分发；真正的 pipe 需要
+      把 Body 边流边过插件（依赖 `reqRead`/`resRead`）。
+- [ ] **向插件传递请求体** —— 需要在插件分发前缓冲请求体并重构下游 Body 类型（对核心
+      serve 管线是侵入式改动）；当前只传 方法/URL/头/客户端 IP/param。
 
-### 第二阶段：变量与模板系统
+### 观测与持久化
 
-- [ ] 插件变量与模板变量：`${expr}`、`%name`、`@`/`G` 全局值解析。
-- [ ] 将 `tpl`/`dust`/`jsonp` 从「简单 `{name}` 替换」升级为对齐 whistle 的模板语义
-      （dust.js / handlebars 行为，或明确记录取舍）。
-- [ ] `lineProps` 系统（whistle 规则行级属性）。
+- [ ] **流量落盘持久化**（重启可回放） —— HAR 导出已覆盖「按需导出」；实时落盘需处理
+      Body 流式完成时机。
+- [ ] **请求重放**（`/replay?id=N` 重新走一遍规则管线）—— 需要把捕获的请求合成回 serve 管线。
+- [ ] 规则的导入/导出与分组管理。
 
-### 第三阶段：观测与持久化
+### 模板与变量（原版本身很窄）
 
-- [ ] 流量抓取持久化到磁盘（可回放、可导出 HAR）。
-- [ ] 查看时解码响应体（gzip / brotli / deflate），文本正确呈现。
-- [ ] Body 预览上限可配置（当前固定 16 KB）。
-- [ ] 更丰富的 Web UI：按域名/状态过滤、搜索、请求重放、导入/导出规则。
+- [ ] `tpl`/`dust`/`jsonp` 升级为完整 dust.js / handlebars 语义（当前为 `{name}` 简单替换）。
+- [ ] `{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量（与插件运行时耦合）。
+- [ ] `lineProps`（whistle 规则行级属性系统）。
 
-### 第四阶段：TLS 与代理补全
+### 架构受限（rustls / MITM 时序）
 
-- [ ] `sniCallback`：在 SNI 阶段用插件选择 MITM 证书（需第一阶段的插件运行时）。
-- [ ] `cipher` 扩展：在 rustls 能力范围内支持更多 TLS 选项（目前仅版本固定）。
-- [ ] 代理变体：`internal-http-proxy`/`internal-https-proxy` 与 `x`/`xs` 前缀代理。
-- [ ] `locationHref`（HTML 响应中注入跳转脚本）。
+- [ ] **`sniCallback`** —— 在 TLS SNI 阶段用插件选证书。我们的 MITM acceptor 在 SNI 阶段
+      按域名构建，早于按请求的规则解析，且需插件运行时在该时点介入；当前架构下不可达。
+- [ ] **`cipher` 扩展** —— rustls 只暴露 TLS 1.2/1.3、不接受 OpenSSL cipher 字符串，故只支持
+      版本固定（已实现），无法完整对齐 Node 的 TLS 选项。
 
-### 持续项
+### 非功能项
 
-- [ ] 补齐单元/集成测试，尤其是插件协议与模板系统。
-- [ ] 性能剖析（大响应体、并发连接下的 tee 抓取开销）。
-- [ ] 清理既有 clippy 风格提示（`collapsible_if` 等，来自较新版工具链）。
+- [ ] 性能剖析（大响应体、并发连接下 tee 抓取开销）。
+- [ ] 清理较新工具链带来的 clippy 风格提示（`collapsible_if` 等）。
 
 ---
 
@@ -85,13 +77,15 @@
 
 - **逐字节复刻 React 前端** —— 内建轻量 UI 已覆盖核心检查/编辑需求；除非有明确诉求，
   不重写 `biz/webui`。
-- **绑定 Node.js 运行时** —— 项目目标是单一静态二进制；Node 子进程插件加载器（若做）
-  将是可选特性，而非硬依赖。
+- **硬绑定 Node.js 运行时** —— 项目目标是单一静态二进制；Node 子进程插件加载器（含未来的
+  npm 兼容层）将是可选特性，而非硬依赖。
+- **`G` / `style` 算子的「流量效果」** —— `G` 是全局插件变量基础设施、`style` 是规则列表
+  配色，二者都不是逐请求的流量算子；保持「解析但不产生效果」。
 
 ---
 
 ## 参与
 
-任何一个阶段都可以独立推进。若要优先某一项，**Node 插件运行时（第一阶段）** 是解锁
-whistle 生态、投入产出比最高的一块。相关模块地图见
-[`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖细节见 [`RULES.md`](RULES.md)。
+若要优先某一项，**npm `whistle.*` 插件兼容加载器** 是解锁现有 whistle 生态、投入产出比
+最高的下一块大工作。模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖细节见
+[`RULES.md`](RULES.md)，插件编写见 [`PLUGINS.md`](PLUGINS.md)。

@@ -507,15 +507,19 @@ resolve (so mixed rule files load) but have no distinct effect.
 
 | Category | Operators |
 |----------|-----------|
-| Routing / upstream | `host`, `proxy`, `http-proxy`, `https-proxy`, `internal-proxy`, `https2http-proxy`, `http2https-proxy`, `socks`, `pac` |
+| Routing / upstream | `host`, `proxy`, `http-proxy`, `https-proxy`, `internal-proxy`, `internal-http-proxy`, `internal-https-proxy`, `https2http-proxy`, `http2https-proxy`, `socks`, `pac`, and `x`/`xs`-prefixed proxy variants |
 | Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw`, `responseFor` |
 | Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw`, `trailers`, `headerReplace` |
 | Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` |
-| Short-circuit / flags | `redirect`, `location`, `statusCode` mock, `enable`, `disable` |
+| Short-circuit / flags | `redirect`, `location`, `locationHref`, `statusCode` mock, `enable`, `disable` |
 | Local file / template | `file`, `rawfile`, `tpl`, `jsonp`, `dust`, and their `x`/`xs` fallback variants (`xfile`, `xrawfile`, …) |
 | Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
 | TLS | `cipher` (upstream TLS version pin) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
+
+**Rule-file features:** a line `@<url>` or `@<file>` includes rules fetched/read from
+that source at load time; `${port}` and `${version}` in operator values are substituted
+(case-insensitive); `locationHref://` injects a client-side redirect into HTML responses.
 
 **Alias operators** are normalised to their canonical form, so all of these work too:
 `hosts→host`, `xhost→host`, `html→htmlAppend`, `js→jsAppend`, `css→cssAppend`,
