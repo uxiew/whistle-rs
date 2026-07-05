@@ -17,6 +17,8 @@ pub const PROTOCOLS: &[&str] = &[
     "https2http-proxy",
     "http2https-proxy",
     "internal-proxy",
+    "internal-http-proxy",
+    "internal-https-proxy",
     "pac",
     "filter",
     "ignore",
@@ -83,6 +85,7 @@ pub const PROTOCOLS: &[&str] = &[
     // Common aliases / additional operators handled by the core.
     "redirect",
     "location",
+    "locationHref",
     "statusCode",
     "socks",
     "http-proxy",
@@ -140,6 +143,13 @@ pub fn canonical(name: &str) -> Option<&'static str> {
         "resRules" => "resScript",
         "ruleFile" | "ruleScript" | "rulesScript" | "reqScript" | "reqRules" => "rulesFile",
         "P" => "G",
+        // `x`-prefixed proxy variants (whistle's tunnel proxies) are approximated
+        // by their base proxy — the transparent-tunnel nuance is not replicated.
+        "xproxy" => "proxy",
+        "xhttp-proxy" => "http-proxy",
+        "xhttps-proxy" => "https-proxy",
+        "xsocks" => "socks",
+        "xinternal-proxy" => "internal-proxy",
         _ => return None,
     })
 }

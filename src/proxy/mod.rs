@@ -795,6 +795,7 @@ async fn serve(
         .value("resScript")
         .and_then(script::load_script);
     let weinre = resolved.value("weinre").map(|s| s.to_string());
+    let location_href = resolved.value("locationHref").map(|s| s.to_string());
     let res_write = apply::res_write_path(&resolved);
     let res_write_raw = apply::res_write_raw_path(&resolved);
     let trailers = apply::build_trailers(&resolved);
@@ -808,6 +809,7 @@ async fn serve(
         || res_speed.is_some()
         || res_script.is_some()
         || weinre.is_some()
+        || location_href.is_some()
         || res_write.is_some()
         || res_write_raw.is_some()
         || !trailers.is_empty()
@@ -847,6 +849,14 @@ async fn serve(
                 if is_html(&parts.headers) {
                     let src = weinre_src(id, &state.config);
                     let tag = format!("<script src=\"{src}\"></script>");
+                    new = inject_into_html(&new, &tag);
+                }
+            }
+            // locationHref: inject a client-side redirect into HTML responses.
+            if let Some(url) = &location_href {
+                if is_html(&parts.headers) {
+                    let safe = url.replace('\\', "\\\\").replace('\'', "\\'");
+                    let tag = format!("<script>location.href='{safe}'</script>");
                     new = inject_into_html(&new, &tag);
                 }
             }

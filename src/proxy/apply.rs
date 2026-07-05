@@ -171,7 +171,13 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
         .or_else(|| resolved.value("proxy").and_then(|v| parse_proxy(ProxyKind::Http, v)))
         .or_else(|| {
             resolved
+                .value("internal-https-proxy")
+                .and_then(|v| parse_proxy(ProxyKind::Https, v))
+        })
+        .or_else(|| {
+            resolved
                 .value("internal-proxy")
+                .or_else(|| resolved.value("internal-http-proxy"))
                 .and_then(|v| parse_proxy(ProxyKind::Http, v))
         })
         // Scheme-converting proxies are treated as HTTP proxies (approximation).
@@ -1438,6 +1444,27 @@ mod tests {
         }
         assert!(!is_file_protocol("host"));
         assert!(!is_file_protocol("xhost"));
+    }
+
+    #[test]
+    fn proxy_variants_resolve() {
+        use super::super::upstream::ProxyKind;
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+
+        let r = resolve("a.com internal-https-proxy://1.2.3.4:8080\n", "http://a.com/");
+        let p = resolve_target(&info, &r).proxy.expect("internal-https-proxy");
+        assert_eq!(p.kind, ProxyKind::Https);
+        assert_eq!(p.port, 8080);
+
+        let r2 = resolve("a.com internal-http-proxy://1.2.3.4:8081\n", "http://a.com/");
+        let p2 = resolve_target(&info, &r2).proxy.expect("internal-http-proxy");
+        assert_eq!(p2.kind, ProxyKind::Http);
+
+        // `xproxy` is an alias of `proxy`.
+        let r3 = resolve("a.com xproxy://5.6.7.8:3128\n", "http://a.com/");
+        let p3 = resolve_target(&info, &r3).proxy.expect("xproxy");
+        assert_eq!(p3.kind, ProxyKind::Http);
+        assert_eq!(p3.port, 3128);
     }
 
     #[test]
