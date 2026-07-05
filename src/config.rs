@@ -38,6 +38,8 @@ pub struct Config {
     /// Named values (whistle's Values store): name → content. Referenced by
     /// `{name}` in operator values and by `rule://name`.
     pub values: HashMap<String, String>,
+    /// Max bytes of each captured body kept for the inspection preview.
+    pub body_preview_cap: usize,
 }
 
 impl Config {
@@ -69,6 +71,10 @@ impl Default for Config {
             socks_port: None,
             plugins: HashMap::new(),
             values: HashMap::new(),
+            body_preview_cap: DEFAULT_BODY_PREVIEW_CAP,
         }
     }
 }
+
+/// Default preview cap: 16 KB of each body kept for inspection.
+pub const DEFAULT_BODY_PREVIEW_CAP: usize = 16 * 1024;

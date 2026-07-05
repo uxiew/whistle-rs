@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long)]
     dir: Option<PathBuf>,
 
+    /// Max bytes of each captured body kept for the inspection preview.
+    #[arg(long, default_value_t = whistle_rs::config::DEFAULT_BODY_PREVIEW_CAP)]
+    body_preview_limit: usize,
+
     /// Verbose (debug) logging.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -112,6 +116,7 @@ async fn main() -> Result<()> {
         socks_port: cli.socks_port,
         plugins,
         values,
+        body_preview_cap: cli.body_preview_limit,
         ..Config::default()
     };
 
