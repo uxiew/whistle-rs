@@ -73,6 +73,46 @@ pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, Strin
     }
 }
 
+/// Substitute whistle config variables `${port}` / `${version}` (case-insensitive)
+/// anywhere in operator values. Ported from `CONFIG_VAR_RE` in the original util.
+pub fn substitute_config_vars(resolved: &mut Resolved, port: u16, version: &str) {
+    let port = port.to_string();
+    let sub = |value: &mut String| {
+        if !value.contains("${") {
+            return;
+        }
+        *value = replace_ci(value, "${port}", &port);
+        *value = replace_ci(value, "${version}", version);
+    };
+    for op in resolved.single.values_mut() {
+        sub(&mut op.value);
+    }
+    for list in resolved.multi.values_mut() {
+        for op in list {
+            sub(&mut op.value);
+        }
+    }
+}
+
+/// Case-insensitive replace-all of `needle` with `repl`. `needle` is matched
+/// ignoring ASCII case; the replacement is inserted verbatim.
+fn replace_ci(haystack: &str, needle: &str, repl: &str) -> String {
+    let hay_lower = haystack.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut last = 0;
+    let mut from = 0;
+    while let Some(pos) = hay_lower[from..].find(&needle_lower) {
+        let abs = from + pos;
+        out.push_str(&haystack[last..abs]);
+        out.push_str(repl);
+        last = abs + needle_lower.len();
+        from = last;
+    }
+    out.push_str(&haystack[last..]);
+    out
+}
+
 /// Merge additional rules referenced by `rule://name` (from the values store) and
 /// `rulesFile://path` (from disk): resolve them against `info` and fill in any
 /// operators not already set.
@@ -1444,6 +1484,17 @@ mod tests {
         }
         assert!(!is_file_protocol("host"));
         assert!(!is_file_protocol("xhost"));
+    }
+
+    #[test]
+    fn config_vars_substituted() {
+        let mut r = resolve(
+            "a.com ua://agent-${port}\na.com resType://type-${VERSION}\n",
+            "http://a.com/",
+        );
+        substitute_config_vars(&mut r, 8899, "1.2.3");
+        assert_eq!(r.value("ua"), Some("agent-8899"));
+        assert_eq!(r.value("resType"), Some("type-1.2.3"));
     }
 
     #[test]

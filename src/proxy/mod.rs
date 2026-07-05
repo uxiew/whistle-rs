@@ -761,6 +761,7 @@ async fn serve(
         apply::merge_included_rules(&mut resolved, &info, &values);
         apply::substitute_values(&mut resolved, &values);
     }
+    apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
     let started = Instant::now();
     let time_ms = now_ms();
 
