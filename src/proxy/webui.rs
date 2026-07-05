@@ -28,6 +28,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/rules") => rules_post(state, req).await,
         ("GET", "/api/values") => values_get(state),
         ("POST", "/api/values") => values_post(state, req).await,
+        ("POST", "/api/replay") => replay_session(state, req).await,
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -322,6 +323,109 @@ async fn values_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<
     }
 }
 
+/// Replay a captured session by re-sending it through the proxy's own port.
+/// Accepts `{ "id": N }` or `{ "ids": [N, M, ...] }` (batch, max 100).
+async fn replay_session(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let body = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(body::full(Bytes::from_static(b"could not read body")))
+                .unwrap();
+        }
+    };
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(body::full(Bytes::from_static(b"invalid JSON")))
+                .unwrap();
+        }
+    };
+    let ids: Vec<u64> = if let Some(id) = payload.get("id").and_then(|v| v.as_u64()) {
+        vec![id]
+    } else if let Some(arr) = payload.get("ids").and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|v| v.as_u64())
+            .take(100)
+            .collect()
+    } else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(body::full(Bytes::from_static(
+                b"{\"error\":\"expected id or ids\"}",
+            )))
+            .unwrap();
+    };
+
+    // Collect the sessions to replay while holding the lock briefly.
+    let sessions: Vec<Session> = {
+        let q = state.sessions.lock().unwrap();
+        ids.iter()
+            .filter_map(|id| q.iter().find(|s| s.id == *id).cloned())
+            .collect()
+    };
+    if sessions.is_empty() {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(body::full(Bytes::from_static(
+                b"{\"replayed\":0,\"error\":\"no matching sessions\"}",
+            )))
+            .unwrap();
+    }
+
+    let port = state.config.port;
+    let replayed = sessions.len();
+    // Fire-and-forget: spawn tasks that send requests through the proxy.
+    for sess in sessions {
+        tokio::spawn(async move {
+            if let Err(e) = do_replay(port, &sess).await {
+                tracing::warn!("replay id={} failed: {e}", sess.id);
+            }
+        });
+    }
+    let body_text = format!("{{\"replayed\":{replayed}}}");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body_text)))
+        .unwrap()
+}
+
+/// Send a captured session's request through the proxy's own port so it flows
+/// through the full rule-matching + forwarding pipeline again.
+async fn do_replay(
+    proxy_port: u16,
+    sess: &Session,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::net::TcpStream;
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::spawn(conn);
+
+    let method: hyper::Method = sess.method.parse().unwrap_or(hyper::Method::GET);
+    let uri: hyper::Uri = sess.url.parse().unwrap_or_else(|_| "/".parse().unwrap());
+    let mut builder = hyper::Request::builder().method(method).uri(uri);
+    for (name, value) in &sess.req_headers {
+        if let (Ok(n), Ok(v)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(n, v);
+        }
+    }
+    let req = builder
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let _resp = sender.send_request(req).await?;
+    Ok(())
+}
+
+
 fn html_ok(html: String) -> Response<DynBody> {
     Response::builder()
         .status(StatusCode::OK)
@@ -385,6 +489,8 @@ pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32v
 .frm .op{{width:80px;color:var(--muted)}}
 .frm .len{{width:64px;color:var(--muted);text-align:right}}
 .frm .pv{{flex:1;white-space:pre;overflow:hidden;text-overflow:ellipsis}}
+.rbtn{{background:none;border:1px solid var(--line);color:var(--muted);padding:1px 6px;border-radius:4px;cursor:pointer;font-size:12px;line-height:1}}
+.rbtn:hover{{color:var(--accent);border-color:var(--accent)}}
 </style></head><body>
 <header>
   <h1>whistle-rs</h1><span class="hint">v{version} · proxy {host}:{port}</span>
@@ -406,7 +512,7 @@ pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32v
       <label class="hint"><input type="checkbox" id="auto" checked> auto-refresh</label>
       <span class="hint" id="netcount"></span>
     </div>
-    <table><thead><tr><th>#</th><th>Method</th><th>Status</th><th>URL</th><th>Target</th><th>ms</th></tr></thead>
+    <table><thead><tr><th>#</th><th>Method</th><th>Status</th><th>URL</th><th>Target</th><th>ms</th><th></th></tr></thead>
     <tbody id="rows"></tbody></table>
   </section>
   <section id="rules" class="hidden">
@@ -455,8 +561,8 @@ function loadNet(){{
       var row='<tr class="row" onclick="toggle('+s.id+')"><td>'+s.id+
         '</td><td>'+esc(s.method)+'</td><td class="'+cls+'">'+s.status+
         tag+'</td><td class="url">'+esc(s.url)+
-        '</td><td>'+esc(s.target)+'</td><td>'+s.duration_ms+'</td></tr>';
-      row+='<tr class="det hidden" id="det'+s.id+'"><td colspan="6">'+
+        '</td><td>'+esc(s.target)+'</td><td>'+s.duration_ms+'</td><td><button class="rbtn" onclick="replayReq('+s.id+',event)" title="Replay">↻</button></td></tr>';
+      row+='<tr class="det hidden" id="det'+s.id+'"><td colspan="7">'+
         '<div class="detail" id="dt'+s.id+'">click the row to load…</div></td></tr>';
       return row;
     }}).join('');
@@ -528,6 +634,12 @@ function saveValues(){{
   fetch('/api/values',{{method:'POST',body:txt}}).then(function(r){{return r.json()}}).then(function(){{
     document.getElementById('valstatus').textContent='Saved';
   }}).catch(function(){{document.getElementById('valstatus').textContent='Save failed'}});
+}}
+function replayReq(id,e){{
+  e.stopPropagation();
+  fetch('/api/replay',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}}).then(function(r){{return r.json()}}).then(function(j){{
+    if(j.replayed) setTimeout(loadNet,500);
+  }}).catch(function(){{}});
 }}
 loadNet();
 setInterval(function(){{if(document.getElementById('auto').checked && !document.getElementById('net').classList.contains('hidden')) loadNet();}},2000);
