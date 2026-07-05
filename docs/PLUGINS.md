@@ -150,7 +150,7 @@ whistle-rs → 插件：`POST /`
 - `rules` 与 `response` **均可选**。
 - `rules`：一段 whistle 规则文本，合并进本次请求的规则集（对请求/响应生效）。
 - `response`：直接短路上游请求；`headers` 支持对象 `{k:v}` 或数组 `[[k,v]…]`；
-  `body` 为字符串（当前不支持二进制 Body）。
+  `body` 为字符串，二进制 Body 用 `bodyBase64`（base64 编码）。
 - 非 200 响应、连接失败或 JSON 解析失败都按「无操作」处理，不影响正常代理。
 
 ---
@@ -158,7 +158,6 @@ whistle-rs → 插件：`POST /`
 ## 局限与后续
 
 - 目前不向插件传递**请求体**（仅方法/URL/头/客户端 IP/param）；mock 与规则注入不受影响。
-- 远程响应 `body` 仅字符串（无二进制）。
 - 未实现的钩子：`reqRead`/`resRead`（流式读写）、`uiServer`/`statsServer`、`auth`、
   `sniCallback` 等；以及原版基于 Node 对象装饰的完整插件 API。
 - 现成 npm `whistle.xxx` 插件的直接兼容需要移植 whistle 的插件加载器，属后续计划

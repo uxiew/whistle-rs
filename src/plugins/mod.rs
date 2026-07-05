@@ -134,13 +134,18 @@ fn parse_remote_result(bytes: &[u8]) -> PluginResult {
             .and_then(|s| s.as_u64())
             .unwrap_or(200) as u16;
         let headers = parse_headers_value(r.get("headers"));
-        let body = r
-            .get("body")
-            .map(|b| match b {
-                serde_json::Value::String(s) => s.clone().into_bytes(),
-                other => other.to_string().into_bytes(),
-            })
-            .unwrap_or_default();
+        // `bodyBase64` carries binary bodies; `body` is a UTF-8 string.
+        let body = if let Some(b64) = r.get("bodyBase64").and_then(|b| b.as_str()) {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                .unwrap_or_default()
+        } else {
+            r.get("body")
+                .map(|b| match b {
+                    serde_json::Value::String(s) => s.clone().into_bytes(),
+                    other => other.to_string().into_bytes(),
+                })
+                .unwrap_or_default()
+        };
         PluginResp {
             status,
             headers,
@@ -292,6 +297,15 @@ mod tests {
         assert_eq!(resp.status, 201);
         assert_eq!(resp.body, b"hi");
         assert!(resp.headers.iter().any(|(k, v)| k == "content-type" && v == "text/plain"));
+    }
+
+    #[test]
+    fn remote_result_binary_body() {
+        // base64("\x00\x01\x02\xff") = "AAEC/w=="
+        let json = br#"{"response":{"statusCode":200,"bodyBase64":"AAEC/w=="}}"#;
+        let r = parse_remote_result(json);
+        let resp = r.response.unwrap();
+        assert_eq!(resp.body, vec![0u8, 1, 2, 255]);
     }
 
     #[test]
