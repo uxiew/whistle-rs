@@ -330,8 +330,10 @@ fn is_host_shorthand(tok: &str) -> bool {
 fn parse_op(tok: &str) -> Option<RuleOp> {
     if let Some((proto, rest)) = split_protocol(tok) {
         if protocols::is_protocol(proto) {
+            // Normalise alias protocols (e.g. `hosts` → `host`) to canonical names.
+            let canon = protocols::canonical(proto).unwrap_or(proto);
             return Some(RuleOp {
-                protocol: proto.to_string(),
+                protocol: canon.to_string(),
                 value: rest.to_string(),
                 raw: tok.to_string(),
             });

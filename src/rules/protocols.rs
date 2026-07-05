@@ -121,9 +121,32 @@ pub const MULTI_MATCH: &[&str] = &[
     "pipe",
 ];
 
-/// Returns true if `name` is a protocol whistle recognises.
+/// Alias protocol names → their canonical operator (`aliasProtocols` in the
+/// original `protocols.js`). Rules may use either the alias or the canonical
+/// name; we normalise to the canonical name at parse time so the apply layer
+/// only ever deals with one spelling.
+pub fn canonical(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "hosts" | "xhost" => "host",
+        "html" => "htmlAppend",
+        "js" => "jsAppend",
+        "css" => "cssAppend",
+        "download" => "attachment",
+        "status" => "statusCode",
+        "skip" => "ignore",
+        "tlsOptions" => "cipher",
+        "pathReplace" => "urlReplace",
+        "reqMerge" => "params",
+        "resRules" => "resScript",
+        "ruleFile" | "ruleScript" | "rulesScript" | "reqScript" | "reqRules" => "rulesFile",
+        "P" => "G",
+        _ => return None,
+    })
+}
+
+/// Returns true if `name` is a protocol whistle recognises (canonical or alias).
 pub fn is_protocol(name: &str) -> bool {
-    PROTOCOLS.contains(&name)
+    PROTOCOLS.contains(&name) || canonical(name).is_some()
 }
 
 /// Returns true if this protocol keeps every matching value (see [`MULTI_MATCH`]).

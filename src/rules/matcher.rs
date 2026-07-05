@@ -209,6 +209,32 @@ mod tests {
     }
 
     #[test]
+    fn alias_protocols_normalise_to_canonical() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text(
+            "a.com hosts://10.0.0.1:9000\n\
+             b.com html://<!--x-->\n\
+             c.com status://404\n\
+             d.com download://f.bin\n\
+             e.com tlsOptions://TLSv1.2\n\
+             f.com resType://text/plain skip://resType\n\
+             g.com pathReplace://a=b\n\
+             h.com reqMerge://k=v\n",
+        );
+        assert_eq!(m.resolve(&req("http://a.com/")).value("host"), Some("10.0.0.1:9000"));
+        assert_eq!(m.resolve(&req("http://b.com/")).value("htmlAppend"), Some("<!--x-->"));
+        assert_eq!(m.resolve(&req("http://c.com/")).value("statusCode"), Some("404"));
+        assert_eq!(m.resolve(&req("http://d.com/")).value("attachment"), Some("f.bin"));
+        assert_eq!(m.resolve(&req("http://e.com/")).value("cipher"), Some("TLSv1.2"));
+        // `skip` is an alias of `ignore`: it should drop the resType operator.
+        assert_eq!(m.resolve(&req("http://f.com/")).value("resType"), None);
+        assert_eq!(m.resolve(&req("http://g.com/")).value("urlReplace"), Some("a=b"));
+        // `params` is multi-match, so it accumulates in the list.
+        let h = m.resolve(&req("http://h.com/"));
+        assert!(h.all("params").iter().any(|o| o.value == "k=v"));
+    }
+
+    #[test]
     fn regex_pattern_matches_url() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("/\\.js$/ resType://application/javascript\n");
