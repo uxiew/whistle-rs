@@ -1,5 +1,7 @@
 # whistle-rs
 
+**English** · [简体中文](README.zh-CN.md) · [路线图 / Roadmap](docs/ROADMAP.md)
+
 A Rust port of the **core** of [whistle](https://wproxy.org) — an HTTP / HTTPS /
 WebSocket debugging proxy. It implements the load-bearing heart of whistle: the
 **rules DSL engine**, the **proxy server** (HTTP forward proxy + CONNECT tunnelling +
@@ -161,6 +163,8 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 | [`docs/RULES.md`](docs/RULES.md) | Complete rule syntax: patterns, operators, precedence, cookbook, compatibility |
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | Downloading, installing & trusting the root CA on every platform |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module map, request lifecycle, and how to extend the proxy |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Future plans and the subsystems still simplified vs. upstream |
+| [`README.zh-CN.md`](README.zh-CN.md) | 简体中文说明文档 |
 
 ## Scope: what's ported vs. stubbed
 
