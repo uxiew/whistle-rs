@@ -21,6 +21,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         (_, "/rootCA.crt") | (_, "/rootca.crt") => root_ca(state),
         (_, "/proxy.pac") | (_, "/pac") => pac(state, &req),
         (_, "/sessions.json") => sessions_json(state),
+        (_, "/sessions.har") => sessions_har(state),
         (_, "/session.json") => session_detail_json(state, &req),
         (_, "/frames.json") => frames_json(state, &req),
         ("GET", "/api/rules") => rules_get(state),
@@ -103,6 +104,101 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body)))
+        .unwrap()
+}
+
+/// Export captured traffic as a HAR 1.2 file (importable into DevTools etc.).
+fn sessions_har(state: &Arc<AppState>) -> Response<DynBody> {
+    let sessions: Vec<Session> = {
+        let q = state.sessions.lock().unwrap();
+        q.iter().cloned().collect()
+    };
+    let har_headers = |pairs: &[(String, String)]| -> Vec<serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(n, v)| serde_json::json!({ "name": n, "value": v }))
+            .collect()
+    };
+    let mime_of = |pairs: &[(String, String)]| -> String {
+        pairs
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "application/octet-stream".to_string())
+    };
+
+    let entries: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            let (req_len, _, req_text) = s
+                .req_body
+                .as_ref()
+                .map(|c| c.snapshot())
+                .unwrap_or((0, false, String::new()));
+            let (res_len, _, res_text) = s
+                .res_body
+                .as_ref()
+                .map(|c| c.snapshot())
+                .unwrap_or((0, false, String::new()));
+            let post_data = if req_len > 0 {
+                serde_json::json!({ "mimeType": mime_of(&s.req_headers), "text": req_text })
+            } else {
+                serde_json::Value::Null
+            };
+            serde_json::json!({
+                "startedDateTime": super::iso8601_utc(s.time_ms),
+                "time": s.duration_ms,
+                "request": {
+                    "method": s.method,
+                    "url": s.url,
+                    "httpVersion": "HTTP/1.1",
+                    "cookies": [],
+                    "headers": har_headers(&s.req_headers),
+                    "queryString": [],
+                    "postData": post_data,
+                    "headersSize": -1,
+                    "bodySize": req_len,
+                },
+                "response": {
+                    "status": s.status,
+                    "statusText": "",
+                    "httpVersion": "HTTP/1.1",
+                    "cookies": [],
+                    "headers": har_headers(&s.res_headers),
+                    "content": {
+                        "size": res_len,
+                        "mimeType": mime_of(&s.res_headers),
+                        "text": res_text,
+                    },
+                    "redirectURL": "",
+                    "headersSize": -1,
+                    "bodySize": res_len,
+                },
+                "cache": {},
+                "timings": { "send": 0, "wait": s.duration_ms, "receive": 0 },
+                "serverIPAddress": "",
+                "_target": s.target,
+                "_clientIp": s.client_ip,
+            })
+        })
+        .collect();
+
+    let har = serde_json::json!({
+        "log": {
+            "version": "1.2",
+            "creator": { "name": "whistle-rs", "version": crate::config::VERSION },
+            "entries": entries,
+        }
+    });
+    let body = serde_json::to_string(&har).unwrap_or_else(|_| "{}".into());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(
+            hyper::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"whistle-rs.har\"",
+        )
         .body(body::full(Bytes::from(body)))
         .unwrap()
 }
@@ -294,6 +390,7 @@ pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32v
   <span class="sp"></span>
   <a href="/rootCA.crt">rootCA.crt</a>
   <a href="/proxy.pac">proxy.pac</a>
+  <a href="/sessions.har" download>HAR</a>
 </header>
 <nav>
   <button id="tab-net" class="active" onclick="show('net')">Network</button>
