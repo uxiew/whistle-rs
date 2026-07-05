@@ -44,7 +44,10 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   replacement, redirects, and local file serving.
 - **Web UI** — a self-contained page (open the proxy host in a browser) with a live
   Network view and an editable Rules panel; rules changes apply immediately.
-- **Traffic capture** — recent transactions recorded in memory; `/sessions.json` feed.
+- **Traffic inspection** — each transaction records its request/response headers and a
+  bounded body preview (captured via a streaming tee, so chunked/SSE responses are
+  inspectable without breaking streaming); expand any row in the UI, or fetch
+  `/sessions.json` (summary) and `/session.json?id=` (detail).
 - Single static binary, no C toolchain needed to build (pinned `ring` TLS provider).
 
 ## Install & build
@@ -187,7 +190,9 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage).
 - WebSocket frame capture — `ws://`/`wss://` connections appear in the Network view
   (status `101`) and every frame (both directions) is recorded; `/frames.json`.
-- Web UI with live Network view + editable Rules & Values; `/sessions.json`, `/proxy.pac`
+- Web UI with live Network view (expandable per-transaction headers + body previews,
+  and per-connection WebSocket frames) + editable Rules & Values; `/sessions.json`,
+  `/session.json?id=`, `/frames.json`, `/proxy.pac`
 
 Only **3** operators remain unimplemented — `sniCallback` (MITM cert hook fixed at
 SNI time before rule resolution, needing the Node plugin loader), `G` (global-rule
@@ -197,8 +202,9 @@ coverage table.
 **Simplified vs. the original** (functional, but not a byte-for-byte port): whistle's
 React web UI (`biz/`) is replaced by a lightweight built-in UI; plugins are external
 HTTP servers rather than the Node subprocess loader; weinre is script-injection only
-(the inspector server is external); the traffic capture (including WebSocket frames)
-is in-memory (not persisted).
+(the inspector server is external); the traffic capture (headers, bodies, and
+WebSocket frames) is in-memory (not persisted), body previews are bounded to 16 KB,
+and compressed bodies are shown as binary rather than decoded.
 
 See [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage) for the
 operator-level detail.

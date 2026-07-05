@@ -30,7 +30,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
 | `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
 | `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + capturing/`frameScript` tunnel |
-| `src/proxy/webui.rs` | `biz/webui` | Built-in web UI + `/api/rules`, `/sessions.json`, PAC |
+| `src/proxy/webui.rs` | `biz/webui` | Built-in web UI + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
 | `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
 | `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
 
