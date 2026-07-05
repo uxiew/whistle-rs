@@ -115,17 +115,26 @@ async fn main() -> Result<()> {
         ..Config::default()
     };
 
-    // Load rules.
-    let mut manager = RuleManager::new();
+    // Load rules (resolving `@url` / `@file` includes first).
+    let mut rules_text = String::new();
+    let mut base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(path) = &cli.rules {
-        let text = std::fs::read_to_string(path)
+        rules_text = std::fs::read_to_string(path)
             .with_context(|| format!("reading rules file {}", path.display()))?;
-        manager.set_text(&text);
-        tracing::info!("loaded {} rules from {}", manager.len(), path.display());
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                base_dir = parent.to_path_buf();
+            }
+        }
     }
     if let Some(inline) = &cli.rule {
-        manager.append_text(inline);
+        rules_text.push('\n');
+        rules_text.push_str(inline);
     }
+    let rules_text = expand_at_includes(&rules_text, &base_dir).await;
+    let mut manager = RuleManager::new();
+    manager.set_text(&rules_text);
+    tracing::info!("loaded {} rules", manager.len());
 
     let ca = CertAuthority::load_or_create(&config).context("initialising root CA")?;
 
@@ -177,6 +186,58 @@ async fn main() -> Result<()> {
 fn free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
+}
+
+/// Expand whistle `@` includes: a line `@<url|file>` is replaced by the rules
+/// fetched from that URL or read from that file (one level, best-effort).
+/// Ported from `REMOTE_RULES_RE` in the original util.
+async fn expand_at_includes(text: &str, base: &std::path::Path) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let target = trimmed
+            .strip_prefix('@')
+            .map(|r| r.trim().trim_matches('`').trim());
+        match target {
+            Some(t) if !t.is_empty() && !t.starts_with('#') => match fetch_include(t, base).await {
+                Some(rules) => {
+                    tracing::info!("included rules from @{t}");
+                    out.push_str(rules.trim_end());
+                    out.push('\n');
+                }
+                None => tracing::warn!("could not resolve @{t}"),
+            },
+            _ => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Fetch the rules text for one `@` include (http(s) URL or local file path).
+async fn fetch_include(target: &str, base: &std::path::Path) -> Option<String> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let (status, bytes) = whistle_rs::proxy::upstream::simple_get(target).await.ok()?;
+        return (status == 200).then(|| String::from_utf8_lossy(&bytes).into_owned());
+    }
+    if target.starts_with("whistle.") {
+        tracing::warn!("@{target}: plugin-provided rules are not supported yet");
+        return None;
+    }
+    // Local path: absolute, ~-home, or relative to the rules file's directory.
+    let path = if let Some(rest) = target.strip_prefix("~/") {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(rest)
+    } else {
+        let p = PathBuf::from(target);
+        if p.is_absolute() {
+            p
+        } else {
+            base.join(p)
+        }
+    };
+    std::fs::read_to_string(path).ok()
 }
 
 /// Poll `127.0.0.1:port` until it accepts a connection or `timeout` elapses.
