@@ -35,6 +35,10 @@ use body::DynBody;
 /// Maximum number of captured transactions kept in memory.
 const MAX_SESSIONS: usize = 500;
 
+/// Maximum number of captured WebSocket frames kept in memory (across all
+/// connections). Whistle surfaces every frame; we keep a bounded ring buffer.
+const MAX_FRAMES: usize = 2000;
+
 /// Shared server state.
 pub struct AppState {
     pub config: Config,
@@ -44,6 +48,8 @@ pub struct AppState {
     pub values: RwLock<std::collections::HashMap<String, String>>,
     /// Bounded ring buffer of recent transactions (whistle's session capture).
     pub sessions: Mutex<VecDeque<Session>>,
+    /// Bounded ring buffer of captured WebSocket frames, keyed by session id.
+    pub ws_frames: Mutex<VecDeque<WsFrame>>,
     next_id: AtomicU64,
 }
 
@@ -57,17 +63,31 @@ impl AppState {
             ca,
             values,
             sessions: Mutex::new(VecDeque::new()),
+            ws_frames: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
         }
     }
 
-    fn record(&self, mut session: Session) {
-        session.id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    /// Record a transaction, assigning it an id which is returned so callers
+    /// (e.g. WebSocket tunnels) can correlate later frames with it.
+    fn record(&self, mut session: Session) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        session.id = id;
         let mut q = self.sessions.lock().unwrap();
         if q.len() >= MAX_SESSIONS {
             q.pop_front();
         }
         q.push_back(session);
+        id
+    }
+
+    /// Record one captured WebSocket frame in the bounded ring buffer.
+    pub fn record_frame(&self, frame: WsFrame) {
+        let mut q = self.ws_frames.lock().unwrap();
+        if q.len() >= MAX_FRAMES {
+            q.pop_front();
+        }
+        q.push_back(frame);
     }
 }
 
@@ -87,6 +107,79 @@ pub struct Session {
     /// `log://` channel labels attached to this request (whistle's log tags).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<String>,
+}
+
+/// One captured WebSocket frame, as surfaced in the Network view.
+#[derive(Clone, serde::Serialize)]
+pub struct WsFrame {
+    /// Id of the [`Session`] this frame belongs to.
+    pub session: u64,
+    /// Unix time in milliseconds when the frame was seen.
+    pub time_ms: u128,
+    /// `"send"` (client→server) or `"receive"` (server→client).
+    pub dir: &'static str,
+    /// Frame type: `text`, `binary`, `close`, `ping`, `pong`, `continuation`.
+    pub opcode: &'static str,
+    /// Payload length in bytes.
+    pub len: usize,
+    /// A short preview: UTF-8 text (truncated) for text frames, else hex.
+    pub preview: String,
+}
+
+impl WsFrame {
+    /// Build a frame record, deriving the opcode name and a bounded preview.
+    fn new(session: u64, dir: &'static str, opcode: u8, payload: &[u8]) -> Self {
+        let name = match opcode {
+            0x0 => "continuation",
+            0x1 => "text",
+            0x2 => "binary",
+            0x8 => "close",
+            0x9 => "ping",
+            0xa => "pong",
+            _ => "unknown",
+        };
+        // Text/continuation → UTF-8 preview; everything else → hex.
+        let preview = if opcode == 0x1 || opcode == 0x0 {
+            match std::str::from_utf8(payload) {
+                Ok(s) => truncate_preview(s),
+                Err(_) => hex_preview(payload),
+            }
+        } else {
+            hex_preview(payload)
+        };
+        WsFrame {
+            session,
+            time_ms: now_ms(),
+            dir,
+            opcode: name,
+            len: payload.len(),
+            preview,
+        }
+    }
+}
+
+/// Truncate a text preview to a sane length for the UI feed.
+fn truncate_preview(s: &str) -> String {
+    const MAX: usize = 512;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(MAX).collect();
+        format!("{cut}… (+{} bytes)", s.len() - cut.len())
+    }
+}
+
+/// Hex-encode the first 64 bytes of a binary/control payload.
+fn hex_preview(payload: &[u8]) -> String {
+    const MAX: usize = 64;
+    let mut out = String::with_capacity(MAX * 2);
+    for b in payload.iter().take(MAX) {
+        out.push_str(&format!("{b:02x}"));
+    }
+    if payload.len() > MAX {
+        out.push_str(&format!("… (+{} bytes)", payload.len() - MAX));
+    }
+    out
 }
 
 /// Collect `log://` channel labels for a resolved request.
@@ -390,7 +483,10 @@ async fn serve(
 
     // WebSocket / other protocol upgrades are tunnelled after a 101.
     if is_upgrade(&req) {
-        return serve_upgrade(req, &info, &resolved, &scheme, &host, port).await;
+        return serve_upgrade(
+            &state, req, &info, &resolved, &scheme, &host, port, client_ip, time_ms, started,
+        )
+        .await;
     }
 
     let mut target = apply::resolve_target(&info, &resolved);
@@ -602,18 +698,36 @@ fn is_upgrade(req: &Request<Incoming>) -> bool {
     conn_upgrade && headers.contains_key(hyper::header::UPGRADE)
 }
 
+/// True if the upgrade handshake targets the WebSocket protocol (as opposed to
+/// some other `Upgrade:` protocol we should tunnel opaquely).
+fn is_websocket(req: &Request<Incoming>) -> bool {
+    req.headers()
+        .get(hyper::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+}
+
 /// Forward an upgrade handshake and, on `101`, tunnel bytes both ways.
-/// This is how WebSocket (`ws://`/`wss://`) traffic is proxied.
+/// This is how WebSocket (`ws://`/`wss://`) traffic is proxied. WebSocket
+/// upgrades are tunnelled frame-by-frame so each frame is captured; any other
+/// `Upgrade:` protocol is tunnelled as an opaque byte stream.
+#[allow(clippy::too_many_arguments)]
 async fn serve_upgrade(
+    state: &Arc<AppState>,
     mut req: Request<Incoming>,
     info: &ReqInfo,
     resolved: &Resolved,
     scheme: &str,
     host: &str,
     port: u16,
+    client_ip: Option<String>,
+    time_ms: u128,
+    started: Instant,
 ) -> Result<Response<DynBody>> {
     let target = apply::resolve_target(info, resolved);
     let frame_script = resolved.value("frameScript").and_then(script::load_script);
+    let websocket = is_websocket(&req);
     let client_upgrade = hyper::upgrade::on(&mut req);
 
     // Build the upstream handshake request (upgrades carry no body).
@@ -634,6 +748,23 @@ async fn serve_upgrade(
     );
 
     let mut resp = upstream::forward(&target, out_req).await?;
+
+    let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
+    if target.proxy.is_some() {
+        target_desc.push_str(" (via proxy)");
+    }
+    let session_id = state.record(Session {
+        id: 0,
+        time_ms,
+        method: info.method.clone(),
+        url: info.full_url.clone(),
+        status: resp.status().as_u16(),
+        client_ip: client_ip.clone(),
+        target: target_desc,
+        duration_ms: started.elapsed().as_millis(),
+        log: log_labels(resolved),
+    });
+
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
         // Upstream declined the upgrade; relay its response verbatim.
         let (p, b) = resp.into_parts();
@@ -642,24 +773,27 @@ async fn serve_upgrade(
 
     let upstream_upgrade = hyper::upgrade::on(&mut resp);
     let (p, _b) = resp.into_parts();
+    let state = state.clone();
 
     tokio::spawn(async move {
         match tokio::try_join!(client_upgrade, upstream_upgrade) {
             Ok((client_io, upstream_io)) => {
                 let c = TokioIo::new(client_io);
                 let u = TokioIo::new(upstream_io);
-                if let Some(src) = frame_script {
-                    // Frame-aware tunnel: run the script on each text frame.
-                    ws::scripted_tunnel(c, u, src).await;
+                if websocket {
+                    // Frame-aware tunnel: capture every frame (and run the
+                    // script on text frames when a frameScript rule matched).
+                    ws::capturing_tunnel(c, u, frame_script, state, session_id).await;
                 } else {
+                    // Non-WebSocket upgrade: opaque byte passthrough.
                     let mut c = c;
                     let mut u = u;
                     if let Err(err) = tokio::io::copy_bidirectional(&mut c, &mut u).await {
-                        tracing::debug!("ws tunnel closed: {err}");
+                        tracing::debug!("upgrade tunnel closed: {err}");
                     }
                 }
             }
-            Err(err) => tracing::debug!("ws upgrade failed: {err}"),
+            Err(err) => tracing::debug!("upgrade failed: {err}"),
         }
     });
 

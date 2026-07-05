@@ -12,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use super::body::{self, DynBody};
-use super::{AppState, Session};
+use super::{AppState, Session, WsFrame};
 
 /// Route a direct (non-proxied) request to the UI / API.
 pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
@@ -21,6 +21,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         (_, "/rootCA.crt") | (_, "/rootca.crt") => root_ca(state),
         (_, "/proxy.pac") | (_, "/pac") => pac(state, &req),
         (_, "/sessions.json") => sessions_json(state),
+        (_, "/frames.json") => frames_json(state, &req),
         ("GET", "/api/rules") => rules_get(state),
         ("POST", "/api/rules") => rules_post(state, req).await,
         ("GET", "/api/values") => values_get(state),
@@ -79,6 +80,34 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
         q.iter().rev().cloned().collect()
     };
     let body = serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".into());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body)))
+        .unwrap()
+}
+
+/// Captured WebSocket frames as JSON. `?id=<session>` filters to one
+/// connection; otherwise every buffered frame (newest first) is returned.
+fn frames_json(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let want: Option<u64> = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("id="))
+                .map(|v| v.to_string())
+        })
+        .and_then(|v| v.parse().ok());
+    let frames: Vec<WsFrame> = {
+        let q = state.ws_frames.lock().unwrap();
+        q.iter()
+            .rev()
+            .filter(|f| want.map(|id| f.session == id).unwrap_or(true))
+            .cloned()
+            .collect()
+    };
+    let body = serde_json::to_string(&frames).unwrap_or_else(|_| "[]".into());
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/json")
@@ -198,6 +227,17 @@ textarea{{width:100%;height:60vh;font-family:ui-monospace,Menlo,monospace;font-s
 .bar button{{background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer}}
 .hint{{color:var(--muted);font-size:12px}}
 .hidden{{display:none}}
+tr.ws{{cursor:pointer}}
+tr.ws:hover td{{background:var(--code)}}
+.wsbadge{{font-size:10px;background:var(--accent);color:#fff;border-radius:3px;padding:0 4px;margin-left:4px}}
+.frames{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:40vh;overflow:auto;background:var(--code);border-radius:6px;padding:6px}}
+.frm{{display:flex;gap:8px;padding:2px 4px;border-bottom:1px solid var(--line);white-space:nowrap}}
+.frm .arw{{width:56px}}
+.frm.send .arw{{color:#3b8fd6}}
+.frm.receive .arw{{color:#2e9d4f}}
+.frm .op{{width:80px;color:var(--muted)}}
+.frm .len{{width:64px;color:var(--muted);text-align:right}}
+.frm .pv{{flex:1;white-space:pre;overflow:hidden;text-overflow:ellipsis}}
 </style></head><body>
 <header>
   <h1>whistle-rs</h1><span class="hint">v{version} · proxy {host}:{port}</span>
@@ -247,13 +287,44 @@ function show(t){{
   if(t==='rules') loadRules();
   if(t==='values') loadValues();
 }}
+var openFrames={{}};
 function loadNet(){{
   fetch('/sessions.json').then(function(r){{return r.json()}}).then(function(list){{
     document.getElementById('netcount').textContent=list.length+' captured';
     document.getElementById('rows').innerHTML=list.map(function(s){{
       var cls='s'+Math.floor(s.status/100);
-      return '<tr><td>'+s.id+'</td><td>'+esc(s.method)+'</td><td class="'+cls+'">'+s.status+
-        '</td><td class="url">'+esc(s.url)+'</td><td>'+esc(s.target)+'</td><td>'+s.duration_ms+'</td></tr>';
+      var ws=s.status===101;
+      var row='<tr'+(ws?' class="ws" onclick="toggleFrames('+s.id+')"':'')+'><td>'+s.id+
+        '</td><td>'+esc(s.method)+'</td><td class="'+cls+'">'+s.status+
+        (ws?'<span class="wsbadge">WS</span>':'')+'</td><td class="url">'+esc(s.url)+
+        '</td><td>'+esc(s.target)+'</td><td>'+s.duration_ms+'</td></tr>';
+      if(ws) row+='<tr class="det hidden" id="det'+s.id+'"><td colspan="6">'+
+        '<div class="frames" id="fr'+s.id+'">click the row to load frames…</div></td></tr>';
+      return row;
+    }}).join('');
+    Object.keys(openFrames).forEach(renderFrameState);
+  }});
+}}
+function toggleFrames(id){{
+  if(openFrames[id]) delete openFrames[id]; else openFrames[id]=true;
+  renderFrameState(id);
+}}
+function renderFrameState(id){{
+  var det=document.getElementById('det'+id);
+  if(!det) return;
+  var open=!!openFrames[id];
+  det.classList.toggle('hidden',!open);
+  if(open) loadFrames(id);
+}}
+function loadFrames(id){{
+  fetch('/frames.json?id='+id).then(function(r){{return r.json()}}).then(function(list){{
+    var box=document.getElementById('fr'+id);
+    if(!box) return;
+    if(!list.length){{box.textContent='no frames captured yet';return;}}
+    box.innerHTML=list.slice().reverse().map(function(f){{
+      var arrow=f.dir==='send'?'▲ send':'▼ recv';
+      return '<div class="frm '+f.dir+'"><span class="arw">'+arrow+'</span><span class="op">'+
+        esc(f.opcode)+'</span><span class="len">'+f.len+'B</span><span class="pv">'+esc(f.preview)+'</span></div>';
     }}).join('');
   }});
 }}

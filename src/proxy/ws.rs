@@ -1,12 +1,17 @@
-//! Minimal WebSocket frame codec + a scripted tunnel for `frameScript`.
+//! Minimal WebSocket frame codec + a frame-aware capturing tunnel.
 //!
-//! When a `frameScript` rule matches a WebSocket upgrade, the raw byte tunnel is
-//! replaced by a frame-aware pump: each text frame's payload is passed through
-//! the script (which may rewrite it) before being re-encoded and forwarded.
+//! Every intercepted WebSocket upgrade is tunnelled frame-by-frame so each
+//! frame can be captured for the Network view (whistle surfaces every frame).
+//! When a `frameScript` rule also matches, each text frame's payload is passed
+//! through the script (which may rewrite it) before being re-encoded and
+//! forwarded.
 
 use std::io;
+use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::proxy::{AppState, WsFrame};
 
 /// A decoded WebSocket frame (control/data), payload already unmasked.
 pub struct Frame {
@@ -91,21 +96,33 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     w.flush().await
 }
 
-/// Frame-aware bidirectional tunnel that runs `script` on each text frame.
-pub async fn scripted_tunnel<A, B>(client: A, upstream: B, script: String)
-where
+/// Frame-aware bidirectional tunnel: captures every frame into `state` under
+/// `session`, and (if `script` is set) runs it on each text frame.
+pub async fn capturing_tunnel<A, B>(
+    client: A,
+    upstream: B,
+    script: Option<String>,
+    state: Arc<AppState>,
+    session: u64,
+) where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
-    let up = tokio::spawn(pump(cr, uw, true, script.clone()));
-    let down = tokio::spawn(pump(ur, cw, false, script));
+    let up = tokio::spawn(pump(cr, uw, true, script.clone(), state.clone(), session));
+    let down = tokio::spawn(pump(ur, cw, false, script, state, session));
     let _ = tokio::join!(up, down);
 }
 
-async fn pump<R, W>(mut r: R, mut w: W, to_server: bool, script: String)
-where
+async fn pump<R, W>(
+    mut r: R,
+    mut w: W,
+    to_server: bool,
+    script: Option<String>,
+    state: Arc<AppState>,
+    session: u64,
+) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
@@ -118,14 +135,18 @@ where
         let mut payload = frame.payload;
         if frame.opcode == 0x1 {
             // Text frame: allow the script to rewrite it.
-            if let Ok(text) = String::from_utf8(payload.clone()) {
-                if let Some(new) =
-                    crate::proxy::script::run_frame_script(&script, direction, &text)
-                {
-                    payload = new.into_bytes();
+            if let Some(script) = &script {
+                if let Ok(text) = String::from_utf8(payload.clone()) {
+                    if let Some(new) =
+                        crate::proxy::script::run_frame_script(script, direction, &text)
+                    {
+                        payload = new.into_bytes();
+                    }
                 }
             }
         }
+        // Capture the (possibly rewritten) frame for the Network view.
+        state.record_frame(WsFrame::new(session, direction, frame.opcode, &payload));
         if write_frame(&mut w, frame.fin, frame.opcode, &payload, to_server)
             .await
             .is_err()
