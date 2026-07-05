@@ -113,26 +113,100 @@ impl AppState {
 /// Longest body prefix retained for the inspection preview (per body).
 pub const BODY_PREVIEW_CAP: usize = 16 * 1024;
 
+/// A streaming decompressor for the capture preview. It decodes `Content-Encoding`
+/// so the preview shows readable text; the *proxied* body is never touched.
+enum BodyDecoder {
+    /// No (or unknown) encoding — bytes stored verbatim.
+    Identity,
+    Gzip(flate2::write::GzDecoder<Vec<u8>>),
+    Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
+    Brotli(Box<brotli::DecompressorWriter<Vec<u8>>>),
+    /// A decode error occurred — stop decoding this body.
+    Failed,
+}
+
+impl Default for BodyDecoder {
+    fn default() -> Self {
+        BodyDecoder::Identity
+    }
+}
+
+/// Build a decoder for a `Content-Encoding` value (identity for none/unknown).
+fn make_decoder(encoding: Option<&str>) -> BodyDecoder {
+    // Take the first token of e.g. "gzip" / "br" / "gzip, chunked".
+    let enc = encoding
+        .map(|e| e.split(',').next().unwrap_or("").trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match enc.as_str() {
+        "gzip" | "x-gzip" => BodyDecoder::Gzip(flate2::write::GzDecoder::new(Vec::new())),
+        "deflate" => BodyDecoder::Deflate(flate2::write::ZlibDecoder::new(Vec::new())),
+        "br" => BodyDecoder::Brotli(Box::new(brotli::DecompressorWriter::new(Vec::new(), 4096))),
+        _ => BodyDecoder::Identity,
+    }
+}
+
+/// Feed compressed `bytes` to a `Write` decoder, then copy any newly-decoded
+/// output (beyond what's already in `data`) into `data`, bounded to the cap.
+/// Returns false on a decode error.
+fn drain_decoder<D>(dec: &mut D, get_ref: impl Fn(&D) -> &[u8], bytes: &[u8], data: &mut Vec<u8>) -> bool
+where
+    D: std::io::Write,
+{
+    if dec.write_all(bytes).is_err() {
+        return false;
+    }
+    let _ = dec.flush();
+    let out = get_ref(dec);
+    if out.len() > data.len() {
+        let room = BODY_PREVIEW_CAP.saturating_sub(data.len());
+        let new = &out[data.len()..];
+        let take = room.min(new.len());
+        data.extend_from_slice(&new[..take]);
+    }
+    true
+}
+
 /// Mutable capture state for one body, filled as the body streams past.
-/// Memory is bounded to [`BODY_PREVIEW_CAP`]; `total` still counts every byte.
+/// Memory is bounded to [`BODY_PREVIEW_CAP`]; `total` still counts every raw byte.
 #[derive(Default)]
 pub struct CaptureState {
-    /// Body prefix (≤ [`BODY_PREVIEW_CAP`] bytes) kept for the preview.
+    /// Decoded body prefix (≤ [`BODY_PREVIEW_CAP`] bytes) kept for the preview.
     data: Vec<u8>,
-    /// Total bytes observed (may exceed `data.len()`).
+    /// Total raw bytes observed (may exceed `data.len()`).
     total: usize,
     /// The body's Content-Type, for text-vs-binary rendering.
     content_type: Option<String>,
+    /// Streaming decoder for the body's Content-Encoding.
+    decoder: BodyDecoder,
 }
 
 impl CaptureState {
-    /// Record `bytes` flowing through, keeping only the bounded prefix.
+    /// Record raw `bytes` flowing through, decoding into a bounded preview.
     fn append(&mut self, bytes: &[u8]) {
         self.total += bytes.len();
-        if self.data.len() < BODY_PREVIEW_CAP {
-            let room = BODY_PREVIEW_CAP - self.data.len();
-            let take = room.min(bytes.len());
-            self.data.extend_from_slice(&bytes[..take]);
+        if self.data.len() >= BODY_PREVIEW_CAP {
+            return; // preview already full — stop decoding/copying
+        }
+        let mut failed = false;
+        match &mut self.decoder {
+            BodyDecoder::Identity => {
+                let room = BODY_PREVIEW_CAP - self.data.len();
+                let take = room.min(bytes.len());
+                self.data.extend_from_slice(&bytes[..take]);
+            }
+            BodyDecoder::Failed => {}
+            BodyDecoder::Gzip(d) => {
+                failed = !drain_decoder(d, |d| d.get_ref(), bytes, &mut self.data)
+            }
+            BodyDecoder::Deflate(d) => {
+                failed = !drain_decoder(d, |d| d.get_ref(), bytes, &mut self.data)
+            }
+            BodyDecoder::Brotli(d) => {
+                failed = !drain_decoder(d.as_mut(), |d| d.get_ref(), bytes, &mut self.data)
+            }
+        }
+        if failed {
+            self.decoder = BodyDecoder::Failed;
         }
     }
 }
@@ -143,17 +217,18 @@ impl CaptureState {
 pub struct Capture(Arc<Mutex<CaptureState>>);
 
 impl Capture {
-    /// A fresh, empty capture for a body of the given content type.
-    pub fn new(content_type: Option<String>) -> Self {
+    /// A fresh, empty capture for a body of the given content type/encoding.
+    pub fn new(content_type: Option<String>, content_encoding: Option<&str>) -> Self {
         Capture(Arc::new(Mutex::new(CaptureState {
             content_type,
+            decoder: make_decoder(content_encoding),
             ..Default::default()
         })))
     }
 
     /// A capture already populated from a fully-buffered body.
-    fn from_bytes(bytes: &[u8], content_type: Option<String>) -> Self {
-        let c = Capture::new(content_type);
+    fn from_bytes(bytes: &[u8], content_type: Option<String>, content_encoding: Option<&str>) -> Self {
+        let c = Capture::new(content_type, content_encoding);
         c.0.lock().unwrap().append(bytes);
         c
     }
@@ -173,7 +248,10 @@ impl serde::Serialize for Capture {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let st = self.0.lock().unwrap();
-        let truncated = st.total > st.data.len();
+        // Preview is truncated if it hit the cap, or (uncompressed) there are
+        // more raw bytes than we kept.
+        let truncated = st.data.len() >= BODY_PREVIEW_CAP
+            || (matches!(st.decoder, BodyDecoder::Identity) && st.total > st.data.len());
         let text = if is_textual(st.content_type.as_deref()) {
             String::from_utf8_lossy(&st.data).into_owned()
         } else {
@@ -205,6 +283,67 @@ fn is_textual(content_type: Option<&str>) -> bool {
     }
 }
 
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn preview(data: Vec<u8>, ct: &str, enc: &str) -> (usize, bool, String) {
+        let cap = Capture::new(Some(ct.into()), Some(enc));
+        cap.append(&data);
+        let v = serde_json::to_value(&cap).unwrap();
+        (
+            v["len"].as_u64().unwrap() as usize,
+            v["truncated"].as_bool().unwrap(),
+            v["text"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[test]
+    fn gzip_preview_decoded() {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b"{\"hi\":\"gzipped\"}").unwrap();
+        let gz = e.finish().unwrap();
+        let (len, _, text) = preview(gz.clone(), "application/json", "gzip");
+        assert_eq!(len, gz.len()); // len = wire (compressed) bytes
+        assert_eq!(text, "{\"hi\":\"gzipped\"}");
+    }
+
+    #[test]
+    fn deflate_preview_decoded() {
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b"deflated-body").unwrap();
+        let df = e.finish().unwrap();
+        let (_, _, text) = preview(df, "text/plain", "deflate");
+        assert_eq!(text, "deflated-body");
+    }
+
+    #[test]
+    fn brotli_preview_decoded() {
+        let mut out = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+            w.write_all(b"brotli-body-text").unwrap();
+        }
+        let (_, _, text) = preview(out, "text/plain", "br");
+        assert_eq!(text, "brotli-body-text");
+    }
+
+    #[test]
+    fn unknown_encoding_shows_binary() {
+        let (_, _, text) = preview(vec![0u8, 159, 146, 150], "application/octet-stream", "zstd");
+        assert!(text.starts_with("[binary"), "got {text}");
+    }
+
+    #[test]
+    fn identity_text_passthrough() {
+        let (len, trunc, text) = preview(b"plain body".to_vec(), "text/plain", "identity");
+        assert_eq!(len, 10);
+        assert!(!trunc);
+        assert_eq!(text, "plain body");
+    }
+}
+
 /// One captured request/response transaction.
 #[derive(Clone, Default, serde::Serialize)]
 pub struct Session {
@@ -233,6 +372,14 @@ pub struct Session {
     /// Response body preview (filled as the body streams), if captured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub res_body: Option<Capture>,
+}
+
+/// Read a single header as an owned string, if present and valid UTF-8.
+fn header_str(headers: &hyper::HeaderMap, name: hyper::header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 /// Collect header name/value pairs for display.
@@ -732,6 +879,7 @@ async fn serve(
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let req_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     let mut req_body_cap: Option<Capture> = None;
     let req_body: DynBody = if apply::wants_req_body(&resolved)
         || req_speed.is_some()
@@ -748,7 +896,7 @@ async fn serve(
             write_raw_file(path, &head, &new);
         }
         if !new.is_empty() {
-            req_body_cap = Some(Capture::from_bytes(&new, req_ct.clone()));
+            req_body_cap = Some(Capture::from_bytes(&new, req_ct.clone(), req_enc.as_deref()));
         }
         apply::strip_length_headers(&mut parts.headers);
         match req_speed {
@@ -757,7 +905,7 @@ async fn serve(
         }
     } else if has_request_body(&parts.headers) {
         // No transform: stream through, copying a bounded preview for inspection.
-        let cap = Capture::new(req_ct.clone());
+        let cap = Capture::new(req_ct.clone(), req_enc.as_deref());
         req_body_cap = Some(cap.clone());
         body::tee(incoming, cap)
     } else {
@@ -804,6 +952,7 @@ async fn serve(
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     let mut res_body_cap: Option<Capture> = None;
     let res_body: DynBody = if apply::wants_res_body(&resolved)
         || res_speed.is_some()
@@ -873,7 +1022,7 @@ async fn serve(
             }
             apply::strip_length_headers(&mut parts.headers);
             if !new.is_empty() {
-                res_body_cap = Some(Capture::from_bytes(&new, res_ct.clone()));
+                res_body_cap = Some(Capture::from_bytes(&new, res_ct.clone(), res_enc.as_deref()));
             }
             if !trailers.is_empty() {
                 // Trailers need chunked transfer; ensure HTTP/1.1 (upstream may be 1.0).
@@ -893,7 +1042,7 @@ async fn serve(
             }
         } else {
             // No transform: stream through, copying a bounded preview for inspection.
-            let cap = Capture::new(res_ct.clone());
+            let cap = Capture::new(res_ct.clone(), res_enc.as_deref());
             res_body_cap = Some(cap.clone());
             body::tee(body, cap)
         };
