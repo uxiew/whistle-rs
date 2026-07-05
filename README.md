@@ -186,7 +186,11 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   delays/speeds, `cache`, `attachment`, `redirect`/`file`/`statusCode`,
   `enable`/`disable` flags, `reqWrite`/`resWrite`(`Raw`), `responseFor`, `log`,
   `cipher` (upstream TLS version pin), `resScript`/`frameScript`, `plugin`/`pipe`,
-  `weinre`, `rule`/`rulesFile` includes, and `{name}` value references. Full mapping in
+  `weinre`, `rule`/`rulesFile` includes, and `{name}` value references. Plus the
+  **local-file / template family** (`file`/`rawfile`/`tpl`/`jsonp`/`dust` and their
+  `x`/`xs` fallback variants) and whistle's **alias operators** (`hosts`, `html`, `css`,
+  `js`, `download`, `status`, `skip`, `tlsOptions`, `pathReplace`, `reqMerge`, …),
+  normalised to their canonical form. Full mapping in
   [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage).
 - WebSocket frame capture — `ws://`/`wss://` connections appear in the Network view
   (status `101`) and every frame (both directions) is recorded; `/frames.json`.

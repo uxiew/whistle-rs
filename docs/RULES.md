@@ -511,10 +511,17 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw`, `responseFor` |
 | Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw`, `trailers`, `headerReplace` |
 | Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` |
-| Short-circuit / flags | `redirect`, `location`, `file`, `rawfile`, `statusCode` mock, `enable`, `disable` |
+| Short-circuit / flags | `redirect`, `location`, `statusCode` mock, `enable`, `disable` |
+| Local file / template | `file`, `rawfile`, `tpl`, `jsonp`, `dust`, and their `x`/`xs` fallback variants (`xfile`, `xrawfile`, …) |
 | Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
 | TLS | `cipher` (upstream TLS version pin) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
+
+**Alias operators** are normalised to their canonical form, so all of these work too:
+`hosts→host`, `xhost→host`, `html→htmlAppend`, `js→jsAppend`, `css→cssAppend`,
+`download→attachment`, `status→statusCode`, `skip→ignore`, `tlsOptions→cipher`,
+`pathReplace→urlReplace`, `reqMerge→params`, `resRules→resScript`,
+`ruleFile`/`ruleScript`/`rulesScript`/`reqScript`/`reqRules`→`rulesFile`, `P→G`.
 
 Notes: `https2http-proxy`/`http2https-proxy` resolve as HTTP proxies (scheme
 conversion approximated); `enable`/`disable` apply a curated flag set
@@ -525,6 +532,13 @@ substituted from the values store. `cipher` honours the portable part of Node's 
 options — `minVersion`/`maxVersion`/`secureProtocol` (or a bare `cipher://TLSv1.2`
 token) pin the **upstream** TLS protocol version; rustls exposes TLS 1.2 / 1.3 only,
 so OpenSSL cipher-suite strings and older-than-1.2 pins are not honoured.
+
+The local-file family serves from disk: `file`/`rawfile` serve bytes (`rawfile`
+parses a full HTTP response file — status line + headers + body); the `x`/`xs`
+variants (`xfile`, `xrawfile`, …) serve the file **if it exists** and otherwise fall
+through to the real server; `tpl`/`jsonp`/`dust` substitute `{name}`/`{{name}}` from
+the query (`jsonp` wraps the result in the `callback` query param). whistle's full
+dust/handlebars template engines are approximated by variable substitution.
 
 WebSocket frames are captured too: every intercepted `ws://`/`wss://` connection is
 recorded as a session (status `101`) and each frame (both directions) is surfaced —
