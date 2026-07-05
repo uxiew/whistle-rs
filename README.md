@@ -148,7 +148,8 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 | `-p, --port <PORT>` | Proxy port | `8899` |
 | `-H, --host <IP>` | Bind address | all interfaces (`0.0.0.0`) |
 | `--socks-port <PORT>` | Also run an inbound SOCKS5 server | off |
-| `--plugin <NAME=HOST:PORT>` | Register a plugin server (repeatable) | — |
+| `--plugin <NAME=HOST:PORT>` | Register a remote (Node/HTTP) plugin (repeatable) | — |
+| `--node-plugin <NAME=PATH>` | Spawn a Node plugin from a script (repeatable) | — |
 | `--value <NAME=CONTENT>` | Define a named value (repeatable); referenced by `{name}` | — |
 | `-r, --rules <FILE>` | Rules file to load at startup | — |
 | `--rule <TEXT>` | Inline rules, applied after `--rules` | — |
@@ -163,6 +164,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 | [`docs/RULES.md`](docs/RULES.md) | Complete rule syntax: patterns, operators, precedence, cookbook, compatibility |
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | Downloading, installing & trusting the root CA on every platform |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module map, request lifecycle, and how to extend the proxy |
+| [`docs/PLUGINS.md`](docs/PLUGINS.md) | Writing plugins (Rust in-process + Node subprocess), the JSON protocol |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Future plans and the subsystems still simplified vs. upstream |
 | [`README.zh-CN.md`](README.zh-CN.md) | 简体中文说明文档 |
 
@@ -207,12 +209,19 @@ SNI time before rule resolution, needing the Node plugin loader), `G` (global-ru
 marker), and `style` (rule colour in the UI) — each documented with its reason in the
 coverage table.
 
+**Plugins** run in two runtimes sharing one contract (`plugin://name`): **Rust**
+in-process plugins (the `RustPlugin` trait) and **Node/remote** plugins over a small
+JSON protocol — whistle-rs can spawn the Node process (`--node-plugin`) or point at a
+running one (`--plugin`). Plugins can inject rules and/or return a mock response. See
+[`docs/PLUGINS.md`](docs/PLUGINS.md). This covers the common `server`/`rulesServer`
+hooks, not the full Node-object plugin API, so arbitrary npm `whistle.*` packages
+don't run unchanged (a compatibility loader is on the [roadmap](docs/ROADMAP.md)).
+
 **Simplified vs. the original** (functional, but not a byte-for-byte port): whistle's
-React web UI (`biz/`) is replaced by a lightweight built-in UI; plugins are external
-HTTP servers rather than the Node subprocess loader; weinre is script-injection only
-(the inspector server is external); the traffic capture (headers, bodies, and
-WebSocket frames) is in-memory (not persisted), body previews are bounded to 16 KB,
-and compressed bodies are shown as binary rather than decoded.
+React web UI (`biz/`) is replaced by a lightweight built-in UI; weinre is
+script-injection only (the inspector server is external); the traffic capture
+(headers, bodies, and WebSocket frames) is in-memory (not persisted), body previews
+are bounded to 16 KB, and compressed bodies are shown as binary rather than decoded.
 
 See [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage) for the
 operator-level detail.

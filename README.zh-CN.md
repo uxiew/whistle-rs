@@ -142,7 +142,8 @@ $example.com          host://2.2.2.2
 | `-p, --port <PORT>` | 代理端口 | `8899` |
 | `-H, --host <IP>` | 绑定地址 | 所有网卡（`0.0.0.0`） |
 | `--socks-port <PORT>` | 额外启动内建 SOCKS5 服务 | 关闭 |
-| `--plugin <NAME=HOST:PORT>` | 注册一个插件服务（可重复） | —— |
+| `--plugin <NAME=HOST:PORT>` | 注册一个远程（Node/HTTP）插件（可重复） | —— |
+| `--node-plugin <NAME=PATH>` | 从脚本拉起一个 Node 插件（可重复） | —— |
 | `--value <NAME=CONTENT>` | 定义命名 value（可重复），规则中以 `{name}` 引用 | —— |
 | `-r, --rules <FILE>` | 启动时加载的规则文件 | —— |
 | `--rule <TEXT>` | 内联规则，在 `--rules` 之后应用 | —— |
@@ -157,6 +158,7 @@ $example.com          host://2.2.2.2
 | [`docs/RULES.md`](docs/RULES.md) | 完整规则语法：模式、算子、优先级、速查、兼容性、算子覆盖表 |
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | 在各平台下载、安装并信任根 CA |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图、请求生命周期、如何扩展代理 |
+| [`docs/PLUGINS.md`](docs/PLUGINS.md) | 编写插件（Rust 进程内 + Node 子进程）与 JSON 协议 |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | 未来计划与仍简化/未对齐的子系统 |
 
 ## 移植范围：已实现 vs. 简化
@@ -193,10 +195,16 @@ $example.com          host://2.2.2.2
 且依赖 Node 插件加载器）、`G`（全局规则标记）、`style`（界面里的规则颜色）—— 每个都在
 覆盖表中注明了原因。
 
-**相对原版的简化**（可用，但非逐字节移植）：whistle 的 React web UI（`biz/`）由一个轻量
-内建 UI 替代；插件是外部 HTTP 服务而非 Node 子进程加载器；weinre 仅做脚本注入
-（inspector 服务在外部）；流量抓取（含头、Body 与 WebSocket 帧）在内存中（不持久化），
-Body 预览上限 16 KB，压缩过的 Body 以二进制展示而不解码。
+**插件**支持两种运行时、共用同一套契约（`plugin://name`）：**Rust** 进程内插件
+（`RustPlugin` trait）与 **Node/远程**插件（小巧的 JSON 协议）—— whistle-rs 可拉起
+Node 进程（`--node-plugin`）或指向已运行的进程（`--plugin`）。插件可注入规则和/或返回
+mock 响应，详见 [`docs/PLUGINS.md`](docs/PLUGINS.md)。它覆盖了最常用的
+`server`/`rulesServer` 钩子，但不是完整的 Node 对象插件 API，因此现成的 npm `whistle.*`
+包无法原样运行（兼容加载器见[路线图](docs/ROADMAP.md)）。
+
+**相对原版的其他简化**（可用，但非逐字节移植）：whistle 的 React web UI（`biz/`）由一个
+轻量内建 UI 替代；weinre 仅做脚本注入（inspector 服务在外部）；流量抓取（含头、Body 与
+WebSocket 帧）在内存中（不持久化），Body 预览上限 16 KB，压缩过的 Body 以二进制展示而不解码。
 
 算子级别的细节见 [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage)，
 未来计划见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。

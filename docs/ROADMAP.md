@@ -16,7 +16,8 @@
 
 | 领域 | 当前状态 | 影响 | 优先级 |
 |------|----------|------|--------|
-| Node 插件运行时 | 插件是外部 HTTP 服务，仅有 `x-whistle-*` 上下文头 | 高 —— 生态多数插件跑不起来 | ⭐⭐⭐ |
+| 插件运行时（Rust + Node） | ✅ 已实现统一插件系统（`server`/`rulesServer` 钩子），见 [`PLUGINS.md`](PLUGINS.md) | —— | 完成 |
+| 现成 npm `whistle.*` 插件兼容 | ✗ 需移植 whistle 的 Node 对象插件加载器 | 中 | ⭐⭐ |
 | 插件/模板变量（`${…}`、`%name`、`G`/`@`） | 未实现 | 中 | ⭐⭐ |
 | dust / handlebars 模板引擎 | 以 `{name}` 简单替换近似 | 低-中 | ⭐⭐ |
 | 流量持久化 | 仅内存（有界环形缓冲） | 中 | ⭐⭐ |
@@ -32,17 +33,24 @@
 
 ## 分阶段计划
 
-### 第一阶段：Node 插件运行时（最高价值）
+### 第一阶段：插件运行时 ✅（已完成核心）
 
-原版 whistle 的插件通过 Node 子进程加载，实现一组约定的钩子：
-`server`、`rulesServer`、`resRules`、`reqRead`、`resRead`、`auth`、`statsServer` 等。
-当前移植只把 `plugin://name` 路由到一个外部 HTTP 服务并附带 `x-whistle-*` 头，
-覆盖不了真正的插件协议。
+已实现**统一插件系统**（见 [`PLUGINS.md`](PLUGINS.md)）：一个插件可注入 whistle 规则
+（`rulesServer` 钩子）和/或直接返回响应（`server` 钩子），由 `plugin://name` 触发。
+两种运行时共用同一契约：
 
-- [ ] 实现插件的 HTTP 协议契约（请求/响应规则服务、读写钩子的头约定）。
-- [ ] 支持插件返回**规则**（rulesServer），并合并进解析结果。
-- [ ] 支持 `pipe://` 的真正流式管道（当前近似为整体路由）。
-- [ ] （可选）Node 子进程加载器，以便直接运行现有 npm 插件包。
+- [x] **Rust 进程内插件**（`RustPlugin` trait），内置 `echo`/`tag` 示例。
+- [x] **Node/远程插件**：JSON-over-HTTP 协议 + 零依赖 Node 辅助库。
+- [x] whistle-rs **拉起并管理 Node 子进程**（`--node-plugin name=path.js`，自动分配端口）。
+- [x] 插件返回的**规则**合并进解析结果；返回的**响应**短路上游。
+
+仍待办（提升兼容性/能力）：
+
+- [ ] **现成 npm `whistle.*` 插件兼容**：移植 whistle 基于 Node `req`/`res` 对象装饰的
+      完整插件加载器（`server`/`rulesServer` 之外的 API）。
+- [ ] 向插件传递**请求体**、以及远程响应的**二进制 Body**。
+- [ ] 更多钩子：`reqRead`/`resRead`（流式读写）、`uiServer`/`statsServer`、`auth`。
+- [ ] `pipe://` 的真正流式管道（当前与 `plugin://` 同为整体分发）。
 
 ### 第二阶段：变量与模板系统
 
