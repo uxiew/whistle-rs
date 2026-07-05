@@ -144,9 +144,22 @@ pub fn canonical(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Returns true if `name` is a protocol whistle recognises (canonical or alias).
+/// The local-file / template protocol family, matched dynamically by whistle's
+/// `RULE_RE` (`/^(?:|x|xs)(?:file|rawfile|dust|tpl|jsonp):/`) rather than listed
+/// in the `protocols` array. Returns true for `file`, `rawfile`, `dust`, `tpl`,
+/// `jsonp` and their `x`/`xs` prefixed fallback variants.
+pub fn is_file_protocol(name: &str) -> bool {
+    let base = name
+        .strip_prefix("xs")
+        .or_else(|| name.strip_prefix('x'))
+        .unwrap_or(name);
+    matches!(base, "file" | "rawfile" | "dust" | "tpl" | "jsonp")
+}
+
+/// Returns true if `name` is a protocol whistle recognises (canonical, alias, or
+/// a member of the local-file/template family).
 pub fn is_protocol(name: &str) -> bool {
-    PROTOCOLS.contains(&name) || canonical(name).is_some()
+    PROTOCOLS.contains(&name) || canonical(name).is_some() || is_file_protocol(name)
 }
 
 /// Returns true if this protocol keeps every matching value (see [`MULTI_MATCH`]).

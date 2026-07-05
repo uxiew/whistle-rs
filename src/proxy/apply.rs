@@ -354,33 +354,166 @@ pub fn short_circuit(info: &ReqInfo, resolved: &Resolved) -> Option<Response<Dyn
         );
     }
 
-    if let Some(path) = resolved.value("file").or_else(|| resolved.value("rawfile")) {
-        return Some(serve_file(path, info));
+    if let Some((proto, value)) = find_file_rule(resolved) {
+        return serve_file_family(proto, value, info);
     }
 
     None
 }
 
-/// Serve a local file for `file://` rules.
-fn serve_file(path: &str, info: &ReqInfo) -> Response<DynBody> {
-    // whistle strips the protocol; here `path` is already the value part.
-    let clean = path.trim_start_matches('/');
-    let candidates = [path.to_string(), format!("/{clean}")];
-    for p in candidates {
-        if let Ok(data) = std::fs::read(&p) {
-            let ct = guess_content_type(&p);
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, ct)
-                .body(body::full(Bytes::from(data)))
-                .unwrap();
+/// The local-file / template protocols, in resolution order (base before `x`/`xs`
+/// variants doesn't matter — only one is expected per rule).
+const FILE_PROTOS: &[&str] = &[
+    "file", "rawfile", "tpl", "jsonp", "dust", "xfile", "xrawfile", "xtpl", "xjsonp", "xdust",
+    "xsfile", "xsrawfile", "xstpl", "xsjsonp", "xsdust",
+];
+
+/// Find a matched local-file/template rule (`file`/`tpl`/`xfile`/…) if any.
+fn find_file_rule<'a>(resolved: &'a Resolved) -> Option<(&'static str, &'a str)> {
+    FILE_PROTOS
+        .iter()
+        .find_map(|&p| resolved.value(p).map(|v| (p, v)))
+}
+
+/// Serve a matched file-family rule. Returns `None` only for a `x`/`xs` (cross)
+/// variant whose file is missing — that falls through to the real server.
+fn serve_file_family(proto: &str, value: &str, info: &ReqInfo) -> Option<Response<DynBody>> {
+    let raw = proto.contains("rawfile");
+    let templated = proto.ends_with("tpl") || proto.ends_with("jsonp") || proto.ends_with("dust");
+    let jsonp = proto.ends_with("jsonp");
+    let cross = proto.starts_with('x');
+
+    match read_file(value) {
+        Some(data) => Some(if raw {
+            serve_raw_http(&data)
+        } else if templated {
+            serve_template(&data, value, info, jsonp)
+        } else {
+            serve_file_bytes(data, value)
+        }),
+        None => {
+            if cross {
+                None // fall through to the real server
+            } else {
+                Some(
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(body::full(Bytes::from(format!(
+                            "whistle-rs: file not found <strong>{value}</strong>"
+                        ))))
+                        .unwrap(),
+                )
+            }
         }
     }
-    let _ = info;
+}
+
+/// Read a file, trying the value verbatim and as an absolute `/`-rooted path.
+fn read_file(path: &str) -> Option<Vec<u8>> {
+    let clean = path.trim_start_matches('/');
+    for p in [path.to_string(), format!("/{clean}")] {
+        if let Ok(data) = std::fs::read(&p) {
+            return Some(data);
+        }
+    }
+    None
+}
+
+/// Serve raw file bytes with a guessed content type (`file://`).
+fn serve_file_bytes(data: Vec<u8>, path: &str) -> Response<DynBody> {
     Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(body::full(Bytes::from_static(b"whistle-rs: file not found")))
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, guess_content_type(path))
+        .body(body::full(Bytes::from(data)))
         .unwrap()
+}
+
+/// Serve a `rawfile://`: the file is a complete HTTP response (status line +
+/// headers + blank line + body). Parse it into a real response.
+fn serve_raw_http(data: &[u8]) -> Response<DynBody> {
+    let text = String::from_utf8_lossy(data);
+    // Split head from body on the first blank line.
+    let (head, body) = match text.find("\r\n\r\n") {
+        Some(i) => (&text[..i], text[i + 4..].to_string()),
+        None => match text.find("\n\n") {
+            Some(i) => (&text[..i], text[i + 2..].to_string()),
+            None => (text.as_ref(), String::new()),
+        },
+    };
+    let mut lines = head.split(|c| c == '\n').map(|l| l.trim_end_matches('\r'));
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .and_then(|c| StatusCode::from_u16(c).ok())
+        .unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            builder = builder.header(k.trim(), v.trim());
+        }
+    }
+    builder
+        .body(body::full(Bytes::from(body)))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(body::empty())
+                .unwrap()
+        })
+}
+
+/// Serve a `tpl://`/`jsonp://`/`dust://`: substitute `{name}`/`{{name}}` in the
+/// file from the request query, and (for jsonp) wrap in a callback. Whistle's
+/// full dust/handlebars engines are approximated by simple variable substitution.
+fn serve_template(data: &[u8], path: &str, info: &ReqInfo, jsonp: bool) -> Response<DynBody> {
+    let mut body = String::from_utf8_lossy(data).into_owned();
+    let query = query_params(&info.full_url);
+    // Replace {{name}} and {name} with query values (unknown → empty).
+    let re = regex::Regex::new(r"\{\{([\w$-]+)\}\}|\{([\w$-]+)\}").unwrap();
+    body = re
+        .replace_all(&body, |caps: &regex::Captures| {
+            let name = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            query.get(name).cloned().unwrap_or_default()
+        })
+        .into_owned();
+
+    let (ct, out) = if jsonp {
+        let cb = query
+            .get("callback")
+            .or_else(|| query.get("_callback"))
+            .cloned()
+            .unwrap_or_else(|| "callback".to_string());
+        (
+            "application/javascript; charset=utf-8",
+            format!("{cb}({body})"),
+        )
+    } else {
+        (guess_content_type(path), body)
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, ct)
+        .body(body::full(Bytes::from(out)))
+        .unwrap()
+}
+
+/// Parse the query string of a full URL into a map.
+fn query_params(full_url: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(q) = full_url.split_once('?').map(|(_, q)| q) {
+        for kv in q.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    map
 }
 
 fn guess_content_type(path: &str) -> &'static str {
@@ -1276,6 +1409,28 @@ mod tests {
         );
         strip_charset(&mut h);
         assert_eq!(h.get(hyper::header::CONTENT_TYPE).unwrap(), "text/html");
+    }
+
+    #[test]
+    fn file_family_cross_falls_through() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        // xfile with a missing file → no short-circuit (proxy the real server).
+        let x = resolve("a.com xfile:///no/such/file.txt\n", "http://a.com/");
+        assert!(short_circuit(&info, &x).is_none());
+        // plain file missing → a 404 short-circuit.
+        let f = resolve("a.com file:///no/such/file.txt\n", "http://a.com/");
+        let r = short_circuit(&info, &f).expect("file:// should short-circuit");
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn file_protocol_recognised() {
+        use crate::rules::protocols::is_file_protocol;
+        for p in ["file", "rawfile", "tpl", "jsonp", "dust", "xfile", "xsrawfile", "xtpl"] {
+            assert!(is_file_protocol(p), "{p} should be a file protocol");
+        }
+        assert!(!is_file_protocol("host"));
+        assert!(!is_file_protocol("xhost"));
     }
 
     #[test]
