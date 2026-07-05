@@ -91,8 +91,103 @@ impl AppState {
     }
 }
 
+/// Longest body prefix retained for the inspection preview (per body).
+pub const BODY_PREVIEW_CAP: usize = 16 * 1024;
+
+/// Mutable capture state for one body, filled as the body streams past.
+/// Memory is bounded to [`BODY_PREVIEW_CAP`]; `total` still counts every byte.
+#[derive(Default)]
+pub struct CaptureState {
+    /// Body prefix (≤ [`BODY_PREVIEW_CAP`] bytes) kept for the preview.
+    data: Vec<u8>,
+    /// Total bytes observed (may exceed `data.len()`).
+    total: usize,
+    /// The body's Content-Type, for text-vs-binary rendering.
+    content_type: Option<String>,
+}
+
+impl CaptureState {
+    /// Record `bytes` flowing through, keeping only the bounded prefix.
+    fn append(&mut self, bytes: &[u8]) {
+        self.total += bytes.len();
+        if self.data.len() < BODY_PREVIEW_CAP {
+            let room = BODY_PREVIEW_CAP - self.data.len();
+            let take = room.min(bytes.len());
+            self.data.extend_from_slice(&bytes[..take]);
+        }
+    }
+}
+
+/// A shareable handle to a body's [`CaptureState`]. Cloning shares the state, so
+/// the copy stored in a [`Session`] sees updates made by the streaming tee.
+#[derive(Clone, Default)]
+pub struct Capture(Arc<Mutex<CaptureState>>);
+
+impl Capture {
+    /// A fresh, empty capture for a body of the given content type.
+    pub fn new(content_type: Option<String>) -> Self {
+        Capture(Arc::new(Mutex::new(CaptureState {
+            content_type,
+            ..Default::default()
+        })))
+    }
+
+    /// A capture already populated from a fully-buffered body.
+    fn from_bytes(bytes: &[u8], content_type: Option<String>) -> Self {
+        let c = Capture::new(content_type);
+        c.0.lock().unwrap().append(bytes);
+        c
+    }
+
+    /// Append streamed bytes to the shared state.
+    pub fn append(&self, bytes: &[u8]) {
+        self.0.lock().unwrap().append(bytes);
+    }
+
+    /// Total bytes seen so far.
+    fn total(&self) -> usize {
+        self.0.lock().unwrap().total
+    }
+}
+
+impl serde::Serialize for Capture {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let st = self.0.lock().unwrap();
+        let truncated = st.total > st.data.len();
+        let text = if is_textual(st.content_type.as_deref()) {
+            String::from_utf8_lossy(&st.data).into_owned()
+        } else {
+            format!("[binary, {} bytes]", st.total)
+        };
+        let mut o = s.serialize_struct("BodyCapture", 3)?;
+        o.serialize_field("len", &st.total)?;
+        o.serialize_field("truncated", &truncated)?;
+        o.serialize_field("text", &text)?;
+        o.end()
+    }
+}
+
+/// Whether a body of this content type should be previewed as text.
+fn is_textual(content_type: Option<&str>) -> bool {
+    match content_type {
+        None => true, // no type → try as text
+        Some(ct) => {
+            let ct = ct.to_ascii_lowercase();
+            ct.starts_with("text/")
+                || ct.contains("json")
+                || ct.contains("xml")
+                || ct.contains("javascript")
+                || ct.contains("ecmascript")
+                || ct.contains("html")
+                || ct.contains("css")
+                || ct.contains("urlencoded")
+        }
+    }
+}
+
 /// One captured request/response transaction.
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct Session {
     pub id: u64,
     /// Unix time in milliseconds when the request was received.
@@ -107,6 +202,32 @@ pub struct Session {
     /// `log://` channel labels attached to this request (whistle's log tags).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<String>,
+    /// Outgoing request headers (as forwarded upstream).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub req_headers: Vec<(String, String)>,
+    /// Response headers (as returned to the client).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub res_headers: Vec<(String, String)>,
+    /// Request body preview (filled as the body streams), if captured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub req_body: Option<Capture>,
+    /// Response body preview (filled as the body streams), if captured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub res_body: Option<Capture>,
+}
+
+/// Collect header name/value pairs for display.
+fn header_pairs(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect()
+}
+
+/// True if a request carries a body worth capturing.
+fn has_request_body(headers: &hyper::HeaderMap) -> bool {
+    headers.contains_key(hyper::header::CONTENT_LENGTH)
+        || headers.contains_key(hyper::header::TRANSFER_ENCODING)
 }
 
 /// One captured WebSocket frame, as surfaced in the Network view.
@@ -479,6 +600,8 @@ async fn serve(
             target: "short-circuit".to_string(),
             duration_ms: started.elapsed().as_millis(),
             log: log_labels(&resolved),
+            res_headers: header_pairs(resp.headers()),
+            ..Default::default()
         });
         return Ok(resp);
     }
@@ -532,6 +655,12 @@ async fn serve(
     let req_speed = apply::req_speed_kbps(&resolved);
     let req_write = apply::req_write_path(&resolved);
     let req_write_raw = apply::req_write_raw_path(&resolved);
+    let req_ct = parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let mut req_body_cap: Option<Capture> = None;
     let req_body: DynBody = if apply::wants_req_body(&resolved)
         || req_speed.is_some()
         || req_write.is_some()
@@ -546,14 +675,24 @@ async fn serve(
             let head = format!("{} {} HTTP/1.1\r\n{}", parts.method, parts.uri, header_dump(&parts.headers));
             write_raw_file(path, &head, &new);
         }
+        if !new.is_empty() {
+            req_body_cap = Some(Capture::from_bytes(&new, req_ct.clone()));
+        }
         apply::strip_length_headers(&mut parts.headers);
         match req_speed {
             Some(kbps) => body::throttled(new, kbps),
             None => body::full(new),
         }
+    } else if has_request_body(&parts.headers) {
+        // No transform: stream through, copying a bounded preview for inspection.
+        let cap = Capture::new(req_ct.clone());
+        req_body_cap = Some(cap.clone());
+        body::tee(incoming, cap)
     } else {
         body::from_incoming(incoming)
     };
+    // Capture the outgoing request headers (as forwarded).
+    let req_header_pairs = header_pairs(&parts.headers);
     let out_req = Request::from_parts(parts, req_body);
 
     if let Some(ms) = apply::req_delay_ms(&resolved) {
@@ -587,6 +726,12 @@ async fn serve(
     let res_write = apply::res_write_path(&resolved);
     let res_write_raw = apply::res_write_raw_path(&resolved);
     let trailers = apply::build_trailers(&resolved);
+    let res_ct = parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let mut res_body_cap: Option<Capture> = None;
     let res_body: DynBody = if apply::wants_res_body(&resolved)
         || res_speed.is_some()
         || res_script.is_some()
@@ -596,12 +741,7 @@ async fn serve(
         || !trailers.is_empty()
     {
         let bytes = body.collect().await?.to_bytes();
-        let ct = parts
-            .headers
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let mut new = apply::transform_res_body(bytes, &resolved, ct.as_deref());
+        let mut new = apply::transform_res_body(bytes, &resolved, res_ct.as_deref());
             if let Some(src) = &res_script {
                 let hv: Vec<(String, String)> = parts
                     .headers
@@ -650,6 +790,9 @@ async fn serve(
                 write_raw_file(path, &head, &new);
             }
             apply::strip_length_headers(&mut parts.headers);
+            if !new.is_empty() {
+                res_body_cap = Some(Capture::from_bytes(&new, res_ct.clone()));
+            }
             if !trailers.is_empty() {
                 // Trailers need chunked transfer; ensure HTTP/1.1 (upstream may be 1.0).
                 parts.version = hyper::Version::HTTP_11;
@@ -667,7 +810,10 @@ async fn serve(
                 }
             }
         } else {
-            body::from_incoming(body)
+            // No transform: stream through, copying a bounded preview for inspection.
+            let cap = Capture::new(res_ct.clone());
+            res_body_cap = Some(cap.clone());
+            body::tee(body, cap)
         };
 
     let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
@@ -683,7 +829,11 @@ async fn serve(
         client_ip: client_ip.clone(),
         target: target_desc,
         duration_ms: started.elapsed().as_millis(),
-            log: log_labels(&resolved),
+        log: log_labels(&resolved),
+        req_headers: req_header_pairs,
+        res_headers: header_pairs(&parts.headers),
+        req_body: req_body_cap,
+        res_body: res_body_cap,
     });
 
     Ok(Response::from_parts(parts, res_body))
@@ -765,6 +915,8 @@ async fn serve_upgrade(
         target: target_desc,
         duration_ms: started.elapsed().as_millis(),
         log: log_labels(resolved),
+        res_headers: header_pairs(resp.headers()),
+        ..Default::default()
     });
 
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {

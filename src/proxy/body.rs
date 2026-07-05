@@ -34,6 +34,53 @@ pub fn from_incoming(body: Incoming) -> DynBody {
         .boxed()
 }
 
+/// Box a forwarded upstream body while copying a bounded preview of its bytes
+/// into `capture` as they stream past. Frames are forwarded unchanged and
+/// immediately, so streaming (including SSE) is never delayed.
+pub fn tee(body: Incoming, capture: super::Capture) -> DynBody {
+    TeeBody {
+        inner: Box::pin(body),
+        capture,
+    }
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    .boxed()
+}
+
+/// Body wrapper for [`tee`]: passes frames through, recording data bytes.
+struct TeeBody {
+    inner: Pin<Box<Incoming>>,
+    capture: super::Capture,
+}
+
+impl Body for TeeBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.capture.append(data);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// A body that emits `data` in paced chunks to cap throughput at `kb_per_sec`
 /// (whistle's `reqSpeed`/`resSpeed`, in KB/s).
 pub fn throttled<T: Into<Bytes>>(data: T, kb_per_sec: f64) -> DynBody {

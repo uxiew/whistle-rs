@@ -21,6 +21,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         (_, "/rootCA.crt") | (_, "/rootca.crt") => root_ca(state),
         (_, "/proxy.pac") | (_, "/pac") => pac(state, &req),
         (_, "/sessions.json") => sessions_json(state),
+        (_, "/session.json") => session_detail_json(state, &req),
         (_, "/frames.json") => frames_json(state, &req),
         ("GET", "/api/rules") => rules_get(state),
         ("POST", "/api/rules") => rules_post(state, req).await,
@@ -74,12 +75,53 @@ fn pac(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
         .unwrap()
 }
 
+/// Lightweight session list for the polled Network view (no headers/bodies —
+/// those are fetched on demand via [`session_detail_json`]).
 fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
-    let sessions: Vec<Session> = {
+    let list: Vec<serde_json::Value> = {
         let q = state.sessions.lock().unwrap();
-        q.iter().rev().cloned().collect()
+        q.iter()
+            .rev()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "time_ms": s.time_ms,
+                    "method": s.method,
+                    "url": s.url,
+                    "status": s.status,
+                    "client_ip": s.client_ip,
+                    "target": s.target,
+                    "duration_ms": s.duration_ms,
+                    "log": s.log,
+                    "has_req_body": s.req_body.as_ref().map(|c| c.total() > 0).unwrap_or(false),
+                    "has_res_body": s.res_body.as_ref().map(|c| c.total() > 0).unwrap_or(false),
+                })
+            })
+            .collect()
     };
-    let body = serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".into());
+    let body = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body)))
+        .unwrap()
+}
+
+/// Full detail (headers + captured body previews) for one session (`?id=N`).
+fn session_detail_json(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let want: Option<u64> = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("id=")))
+        .and_then(|v| v.parse().ok());
+    let found: Option<Session> = want.and_then(|id| {
+        let q = state.sessions.lock().unwrap();
+        q.iter().find(|s| s.id == id).cloned()
+    });
+    let body = match found {
+        Some(s) => serde_json::to_string(&s).unwrap_or_else(|_| "null".into()),
+        None => "null".into(),
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/json")
@@ -227,9 +269,17 @@ textarea{{width:100%;height:60vh;font-family:ui-monospace,Menlo,monospace;font-s
 .bar button{{background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer}}
 .hint{{color:var(--muted);font-size:12px}}
 .hidden{{display:none}}
-tr.ws{{cursor:pointer}}
-tr.ws:hover td{{background:var(--code)}}
+tr.row{{cursor:pointer}}
+tr.row:hover td{{background:var(--code)}}
 .wsbadge{{font-size:10px;background:var(--accent);color:#fff;border-radius:3px;padding:0 4px;margin-left:4px}}
+.wsbadge.b{{background:var(--muted)}}
+.detail{{padding:4px 2px}}
+.grp{{margin:8px 0}}
+.grpt{{font-size:12px;font-weight:600;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.03em}}
+.hz{{display:flex;gap:8px;font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:1px 0;word-break:break-all}}
+.hk{{color:var(--accent);flex:0 0 30%;max-width:260px}}
+.hv{{flex:1;white-space:pre-wrap}}
+pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32vh;overflow:auto;background:var(--code);border-radius:6px;padding:8px;margin:0;white-space:pre-wrap;word-break:break-all}}
 .frames{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:40vh;overflow:auto;background:var(--code);border-radius:6px;padding:6px}}
 .frm{{display:flex;gap:8px;padding:2px 4px;border-bottom:1px solid var(--line);white-space:nowrap}}
 .frm .arw{{width:56px}}
@@ -287,45 +337,67 @@ function show(t){{
   if(t==='rules') loadRules();
   if(t==='values') loadValues();
 }}
-var openFrames={{}};
+var open={{}}, wsRows={{}};
 function loadNet(){{
   fetch('/sessions.json').then(function(r){{return r.json()}}).then(function(list){{
     document.getElementById('netcount').textContent=list.length+' captured';
     document.getElementById('rows').innerHTML=list.map(function(s){{
       var cls='s'+Math.floor(s.status/100);
       var ws=s.status===101;
-      var row='<tr'+(ws?' class="ws" onclick="toggleFrames('+s.id+')"':'')+'><td>'+s.id+
+      wsRows[s.id]=ws;
+      var tag=ws?'<span class="wsbadge">WS</span>':(s.has_res_body?'<span class="wsbadge b">body</span>':'');
+      var row='<tr class="row" onclick="toggle('+s.id+')"><td>'+s.id+
         '</td><td>'+esc(s.method)+'</td><td class="'+cls+'">'+s.status+
-        (ws?'<span class="wsbadge">WS</span>':'')+'</td><td class="url">'+esc(s.url)+
+        tag+'</td><td class="url">'+esc(s.url)+
         '</td><td>'+esc(s.target)+'</td><td>'+s.duration_ms+'</td></tr>';
-      if(ws) row+='<tr class="det hidden" id="det'+s.id+'"><td colspan="6">'+
-        '<div class="frames" id="fr'+s.id+'">click the row to load frames…</div></td></tr>';
+      row+='<tr class="det hidden" id="det'+s.id+'"><td colspan="6">'+
+        '<div class="detail" id="dt'+s.id+'">click the row to load…</div></td></tr>';
       return row;
     }}).join('');
-    Object.keys(openFrames).forEach(renderFrameState);
+    Object.keys(open).forEach(render);
   }});
 }}
-function toggleFrames(id){{
-  if(openFrames[id]) delete openFrames[id]; else openFrames[id]=true;
-  renderFrameState(id);
+function toggle(id){{
+  if(open[id]) delete open[id]; else open[id]=true;
+  render(id);
 }}
-function renderFrameState(id){{
+function render(id){{
   var det=document.getElementById('det'+id);
   if(!det) return;
-  var open=!!openFrames[id];
-  det.classList.toggle('hidden',!open);
-  if(open) loadFrames(id);
+  var isOpen=!!open[id];
+  det.classList.toggle('hidden',!isOpen);
+  if(isOpen){{ if(wsRows[id]) loadFrames(id); else loadDetail(id); }}
+}}
+function headerTable(title,pairs){{
+  if(!pairs||!pairs.length) return '';
+  var rows=pairs.map(function(p){{return '<div class="hz"><span class="hk">'+esc(p[0])+'</span>'+
+    '<span class="hv">'+esc(p[1])+'</span></div>';}}).join('');
+  return '<div class="grp"><div class="grpt">'+title+'</div>'+rows+'</div>';
+}}
+function bodyBlock(title,b){{
+  if(!b||!b.len) return '';
+  var note=b.truncated?' <span class="hint">('+b.len+' bytes, truncated)</span>':' <span class="hint">('+b.len+' bytes)</span>';
+  return '<div class="grp"><div class="grpt">'+title+note+'</div><pre class="body">'+esc(b.text)+'</pre></div>';
+}}
+function loadDetail(id){{
+  fetch('/session.json?id='+id).then(function(r){{return r.json()}}).then(function(s){{
+    var box=document.getElementById('dt'+id);
+    if(!box) return;
+    if(!s){{box.textContent='(no detail)';return;}}
+    box.innerHTML=headerTable('Request headers',s.req_headers)+bodyBlock('Request body',s.req_body)+
+      headerTable('Response headers',s.res_headers)+bodyBlock('Response body',s.res_body)||'(no captured detail)';
+  }});
 }}
 function loadFrames(id){{
   fetch('/frames.json?id='+id).then(function(r){{return r.json()}}).then(function(list){{
-    var box=document.getElementById('fr'+id);
+    var box=document.getElementById('dt'+id);
     if(!box) return;
     if(!list.length){{box.textContent='no frames captured yet';return;}}
-    box.innerHTML=list.slice().reverse().map(function(f){{
+    box.innerHTML='<div class="frames">'+list.slice().reverse().map(function(f){{
       var arrow=f.dir==='send'?'▲ send':'▼ recv';
       return '<div class="frm '+f.dir+'"><span class="arw">'+arrow+'</span><span class="op">'+
         esc(f.opcode)+'</span><span class="len">'+f.len+'B</span><span class="pv">'+esc(f.preview)+'</span></div>';
-    }}).join('');
+    }}).join('')+'</div>';
   }});
 }}
 function loadRules(){{
