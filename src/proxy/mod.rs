@@ -46,6 +46,8 @@ pub struct AppState {
     pub ca: Arc<CertAuthority>,
     /// Named values store (name → content), editable via the UI.
     pub values: RwLock<std::collections::HashMap<String, String>>,
+    /// Registered plugins (Rust + remote/Node), keyed by name.
+    pub plugins: crate::plugins::Plugins,
     /// Bounded ring buffer of recent transactions (whistle's session capture).
     pub sessions: Mutex<VecDeque<Session>>,
     /// Bounded ring buffer of captured WebSocket frames, keyed by session id.
@@ -54,14 +56,31 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Construct fresh server state.
+    /// Construct fresh server state with a default plugin registry (built-ins +
+    /// any `--plugin name=host:port` remotes from the config).
     pub fn new(config: Config, rules: RuleManager, ca: Arc<CertAuthority>) -> Self {
+        let mut plugins = crate::plugins::Plugins::new();
+        for (name, addr) in &config.plugins {
+            plugins.register_remote(name, addr);
+        }
+        Self::with_plugins(config, rules, ca, plugins)
+    }
+
+    /// Construct server state with a pre-built plugin registry (used when Node
+    /// plugin subprocesses have already been spawned and registered).
+    pub fn with_plugins(
+        config: Config,
+        rules: RuleManager,
+        ca: Arc<CertAuthority>,
+        plugins: crate::plugins::Plugins,
+    ) -> Self {
         let values = RwLock::new(config.values.clone());
         AppState {
             config,
             rules: RwLock::new(rules),
             ca,
             values,
+            plugins,
             sessions: Mutex::new(VecDeque::new()),
             ws_frames: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
@@ -228,6 +247,23 @@ fn header_pairs(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
 fn has_request_body(headers: &hyper::HeaderMap) -> bool {
     headers.contains_key(hyper::header::CONTENT_LENGTH)
         || headers.contains_key(hyper::header::TRANSFER_ENCODING)
+}
+
+/// Convert a plugin-produced response into a real HTTP response.
+fn plugin_response(resp: crate::plugins::PluginResp) -> Response<DynBody> {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    for (k, v) in &resp.headers {
+        builder = builder.header(k, v);
+    }
+    builder
+        .body(body::full(Bytes::from(resp.body)))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(body::empty())
+                .unwrap()
+        })
 }
 
 /// One captured WebSocket frame, as surfaced in the Network view.
@@ -581,6 +617,55 @@ async fn serve(
     let started = Instant::now();
     let time_ms = now_ms();
 
+    // Plugin hooks: a matched `plugin://name` (or `pipe://name`) may inject
+    // rules and/or return a response directly (Rust in-process or Node/remote).
+    let plugin_matches = apply::plugin_names(&resolved);
+    if !plugin_matches.is_empty() {
+        let preq_headers: Vec<(String, String)> = req
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        for (name, param) in plugin_matches {
+            if !state.plugins.contains(&name) {
+                continue;
+            }
+            let preq = crate::plugins::PluginReq {
+                method: info.method.clone(),
+                url: info.full_url.clone(),
+                headers: preq_headers.clone(),
+                client_ip: client_ip.clone(),
+                param,
+            };
+            let Some(result) = state.plugins.dispatch(&name, &preq).await else {
+                continue;
+            };
+            if let Some(rules) = result.rules {
+                apply::merge_rules_text(&mut resolved, &info, &rules);
+                let values = state.values.read().unwrap();
+                apply::substitute_values(&mut resolved, &values);
+            }
+            if let Some(resp) = result.response {
+                tracing::info!("{} {} -> plugin {name}", info.method, info.full_url);
+                let response = plugin_response(resp);
+                state.record(Session {
+                    id: 0,
+                    time_ms,
+                    method: info.method.clone(),
+                    url: info.full_url.clone(),
+                    status: response.status().as_u16(),
+                    client_ip: client_ip.clone(),
+                    target: format!("plugin:{name}"),
+                    duration_ms: started.elapsed().as_millis(),
+                    log: log_labels(&resolved),
+                    res_headers: header_pairs(response.headers()),
+                    ..Default::default()
+                });
+                return Ok(response);
+            }
+        }
+    }
+
     // enable://abort drops the request without contacting upstream.
     if apply::is_aborted(&resolved) {
         tracing::info!("{} {} -> aborted", info.method, info.full_url);
@@ -614,30 +699,17 @@ async fn serve(
         .await;
     }
 
-    let mut target = apply::resolve_target(&info, &resolved);
+    let target = apply::resolve_target(&info, &resolved);
 
-    // A matched, registered plugin server handles the request instead of the
-    // origin: route to the plugin over HTTP with x-whistle-* context headers.
-    let plugin = apply::resolve_plugin(&resolved, &state.config.plugins);
-    if let Some((_, phost, pport)) = &plugin {
-        target.connect_host = phost.clone();
-        target.connect_port = *pport;
-        target.tls = false;
-        target.proxy = None;
-    }
-
-    // Rewrite to origin-form + apply request-side rules.
+    // Rewrite to origin-form + apply request-side rules. (Plugins that wanted to
+    // handle this request already returned above; any rules they injected have
+    // been merged into `resolved`.)
     let (mut parts, incoming) = req.into_parts();
     let new_path = apply::rewrite_path(&info.path, &resolved);
     parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, &host, port, &scheme);
     parts.headers.remove("proxy-connection");
     apply::apply_request(&mut parts, &resolved);
-    if let Some((name, _, _)) = &plugin {
-        set_header_raw(&mut parts.headers, "x-whistle-plugin", name);
-        set_header_raw(&mut parts.headers, "x-whistle-req-url", &info.full_url);
-        set_header_raw(&mut parts.headers, "x-whistle-req-method", &info.method);
-    }
     // responseFor: prefetch another URL and annotate this request with its result.
     if let Some(url) = resolved.value("responseFor") {
         if let Ok((status, body)) = upstream::simple_get(url).await {

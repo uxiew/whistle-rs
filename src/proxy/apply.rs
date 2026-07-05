@@ -76,6 +76,40 @@ pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, Strin
 /// Merge additional rules referenced by `rule://name` (from the values store) and
 /// `rulesFile://path` (from disk): resolve them against `info` and fill in any
 /// operators not already set.
+/// Merge an ad-hoc rules text (e.g. produced by a plugin) into the resolved set.
+/// Existing single-match operators win; multi-match operators accumulate.
+pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str) {
+    let mut mgr = RuleManager::new();
+    mgr.set_text(text);
+    let sub = mgr.resolve(info);
+    for (k, v) in sub.single {
+        resolved.single.entry(k).or_insert(v);
+    }
+    for (k, mut vs) in sub.multi {
+        resolved.multi.entry(k).or_default().append(&mut vs);
+    }
+}
+
+/// Collect matched `plugin://`/`pipe://` rules as `(name, param)` pairs, where
+/// `param` is the `/…` suffix after the plugin name.
+pub fn plugin_names(resolved: &Resolved) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for proto in ["plugin", "pipe"] {
+        for op in resolved.all(proto) {
+            let val = op.value.trim();
+            let name = val.split(['/', '?']).next().unwrap_or("").trim();
+            if name.is_empty() {
+                continue;
+            }
+            let param = val[name.len()..].trim_start_matches('/').to_string();
+            if !out.iter().any(|(n, _): &(String, String)| n == name) {
+                out.push((name.to_string(), param));
+            }
+        }
+    }
+    out
+}
+
 pub fn merge_included_rules(
     resolved: &mut Resolved,
     info: &ReqInfo,
@@ -249,33 +283,6 @@ pub fn disabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> 
 pub fn is_aborted(resolved: &Resolved) -> bool {
     let e = enabled_flags(resolved);
     e.contains("abort") || e.contains("abortReq") || e.contains("abortRes")
-}
-
-/// If a matched `plugin://name` refers to a registered plugin server, return
-/// `(name, host, port)` to route the request there.
-pub fn resolve_plugin(
-    resolved: &Resolved,
-    plugins: &std::collections::HashMap<String, String>,
-) -> Option<(String, String, u16)> {
-    // `pipe://name` routes to a registered server too (streaming is approximated
-    // as full plugin routing).
-    for proto in ["plugin", "pipe"] {
-        for op in resolved.all(proto) {
-            // Value is `name` or `name/extra`; the plugin name is the first segment.
-            let name = op.value.split(['/', '?']).next().unwrap_or("").trim();
-            if name.is_empty() {
-                continue;
-            }
-            if let Some(addr) = plugins.get(name) {
-                let (h, p) = match addr.rsplit_once(':') {
-                    Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
-                    None => (addr.clone(), 80),
-                };
-                return Some((name.to_string(), h, p));
-            }
-        }
-    }
-    None
 }
 
 /// Parse a PAC `FindProxyForURL` return value into a proxy (first usable entry).

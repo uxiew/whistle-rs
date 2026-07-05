@@ -406,6 +406,44 @@ pub async fn simple_get(url: &str) -> Result<(u16, Bytes)> {
     Ok((status, bytes))
 }
 
+/// POST a JSON body to a URL and return `(status, body)`. Used by the plugin
+/// runtime to dispatch to remote (Node/HTTP) plugins.
+pub async fn simple_post_json(url: &str, json: &str) -> Result<(u16, Bytes)> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("bad url {url}"))?;
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let tls = scheme.eq_ignore_ascii_case("https");
+    let default_port = if tls { 443 } else { 80 };
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+            (h.to_string(), p.parse().unwrap_or(default_port))
+        }
+        _ => (host_port.to_string(), default_port),
+    };
+    let target = Target {
+        connect_host: host.clone(),
+        connect_port: port,
+        tls,
+        sni: host.clone(),
+        request_port: port,
+        proxy: None,
+        tls_versions: TlsVersions::Default,
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", &host)
+        .header("content-type", "application/json")
+        .body(super::body::full(Bytes::from(json.to_owned())))
+        .context("building plugin request")?;
+    let resp = forward(&target, req).await?;
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await?.to_bytes();
+    Ok((status, bytes))
+}
+
 /// Build a `Basic <base64>` credential string.
 fn basic_auth(user: &str, pass: &str) -> String {
     let token = base64::Engine::encode(

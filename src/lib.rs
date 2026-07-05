@@ -5,8 +5,10 @@
 //! * [`rules`] — the rules DSL: parse + match + resolve (`lib/rules/`)
 //! * [`ca`] — root CA + per-host cert signing for MITM (`lib/https/ca.js`)
 //! * [`proxy`] — the HTTP/HTTPS proxy server (`lib/index.js`, `lib/tunnel.js`)
+//! * [`plugins`] — the unified plugin system (Rust + Node runtimes) (`lib/plugins/`)
 
 pub mod ca;
 pub mod config;
+pub mod plugins;
 pub mod proxy;
 pub mod rules;

@@ -28,10 +28,16 @@ struct Cli {
     #[arg(long)]
     socks_port: Option<u16>,
 
-    /// Register a plugin server as `name=host:port` (repeatable). Routes
-    /// `plugin://name` rules to that server.
+    /// Register a remote plugin as `name=host:port` (repeatable). Routes
+    /// `plugin://name` rules to an already-running HTTP plugin (Node or any).
     #[arg(long = "plugin", value_name = "NAME=HOST:PORT")]
     plugins: Vec<String>,
+
+    /// Spawn a Node plugin as `name=path/to/plugin.js` (repeatable). whistle-rs
+    /// runs `node <path>`, assigns it a port (via `WHISTLE_RS_PLUGIN_PORT`), and
+    /// routes `plugin://name` to it.
+    #[arg(long = "node-plugin", value_name = "NAME=PATH")]
+    node_plugins: Vec<String>,
 
     /// Define a named value as `name=content` (repeatable). Referenced by
     /// `{name}` in operator values and by `rule://name`.
@@ -123,7 +129,41 @@ async fn main() -> Result<()> {
 
     let ca = CertAuthority::load_or_create(&config).context("initialising root CA")?;
 
-    let state = Arc::new(AppState::new(config, manager, ca));
+    // Build the plugin registry: built-in Rust plugins + `--plugin` remotes +
+    // spawned `--node-plugin` subprocesses.
+    let mut registry = whistle_rs::plugins::Plugins::new();
+    for (name, addr) in &config.plugins {
+        registry.register_remote(name, addr);
+    }
+    let mut children = Vec::new();
+    for spec in &cli.node_plugins {
+        let (name, path) = spec
+            .split_once('=')
+            .with_context(|| format!("invalid --node-plugin '{spec}', expected name=path.js"))?;
+        let (name, path) = (name.trim(), path.trim());
+        let port = free_port().context("allocating a port for a node plugin")?;
+        let child = tokio::process::Command::new("node")
+            .arg(path)
+            .env("WHISTLE_RS_PLUGIN_PORT", port.to_string())
+            .env("WHISTLE_RS_PLUGIN_NAME", name)
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning node plugin '{name}' ({path})"))?;
+        children.push(child);
+        registry.register_remote(name, &format!("127.0.0.1:{port}"));
+        tracing::info!("spawned node plugin '{name}' -> node {path} on 127.0.0.1:{port}");
+    }
+    tracing::info!("plugins: {}", registry.names().join(", "));
 
+    let state = Arc::new(AppState::with_plugins(config, manager, ca, registry));
+
+    // Keep the spawned Node plugin processes alive for the server's lifetime.
+    let _children = children;
     proxy::run(state).await
+}
+
+/// Grab a free TCP port on localhost (for a spawned plugin to bind).
+fn free_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
 }
