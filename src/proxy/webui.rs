@@ -362,6 +362,7 @@ td.url{{white-space:normal;word-break:break-all}}
 .s2{{color:#2e9d4f}}.s3{{color:#3b8fd6}}.s4,.s5{{color:#e05a5a}}
 textarea{{width:100%;height:60vh;font-family:ui-monospace,Menlo,monospace;font-size:13px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:10px}}
 .bar{{display:flex;gap:10px;align-items:center;margin-bottom:8px}}
+.bar input#filter{{flex:1;max-width:360px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;font-size:13px}}
 .bar button{{background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer}}
 .hint{{color:var(--muted);font-size:12px}}
 .hidden{{display:none}}
@@ -401,6 +402,7 @@ pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32v
   <section id="net">
     <div class="bar">
       <button onclick="loadNet()">Refresh</button>
+      <input id="filter" placeholder="filter: url / method / status" oninput="loadNet()">
       <label class="hint"><input type="checkbox" id="auto" checked> auto-refresh</label>
       <span class="hint" id="netcount"></span>
     </div>
@@ -436,8 +438,15 @@ function show(t){{
 }}
 var open={{}}, wsRows={{}};
 function loadNet(){{
-  fetch('/sessions.json').then(function(r){{return r.json()}}).then(function(list){{
-    document.getElementById('netcount').textContent=list.length+' captured';
+  fetch('/sessions.json').then(function(r){{return r.json()}}).then(function(all){{
+    var q=(document.getElementById('filter').value||'').toLowerCase().trim();
+    var list=q?all.filter(function(s){{
+      return (s.url||'').toLowerCase().indexOf(q)>=0
+        || (s.method||'').toLowerCase().indexOf(q)>=0
+        || String(s.status).indexOf(q)>=0
+        || (s.target||'').toLowerCase().indexOf(q)>=0;
+    }}):all;
+    document.getElementById('netcount').textContent=q?(list.length+' / '+all.length+' shown'):(all.length+' captured');
     document.getElementById('rows').innerHTML=list.map(function(s){{
       var cls='s'+Math.floor(s.status/100);
       var ws=s.status===101;
