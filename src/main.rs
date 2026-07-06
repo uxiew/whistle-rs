@@ -149,7 +149,11 @@ async fn main() -> Result<()> {
     let rules_text = expand_at_includes(&rules_text, &base_dir).await;
     let mut manager = RuleManager::new();
     manager.set_text(&rules_text);
-    tracing::info!("loaded {} rules", manager.len());
+
+    // Load any persisted rule groups from disk (added via the UI).
+    let rules_dir = config.data_dir().join("rules");
+    whistle_rs::rules::storage::load_groups(&rules_dir, &mut manager);
+    tracing::info!("loaded {} rules ({} groups)", manager.len(), manager.groups().len());
 
     let ca = CertAuthority::load_or_create(&config).context("initialising root CA")?;
 

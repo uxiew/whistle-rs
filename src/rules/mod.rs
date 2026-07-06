@@ -15,6 +15,7 @@
 
 pub mod matcher;
 pub mod protocols;
+pub mod storage;
 
 use regex::Regex;
 use std::collections::HashMap;
@@ -125,53 +126,164 @@ impl Resolved {
     }
 }
 
-/// Holds every parsed rule and answers match queries.
+/// A named group of rules that can be individually enabled/disabled.
+#[derive(Debug, Clone)]
+pub struct RuleGroup {
+    /// Display name (e.g. "default", "debug-rules", "staging").
+    pub name: String,
+    /// Raw source text of this group.
+    pub text: String,
+    /// Whether this group participates in rule resolution.
+    pub enabled: bool,
+    /// Parsed rules from `text`.
+    rules: Vec<Rule>,
+}
+
+impl RuleGroup {
+    pub fn new(name: &str, text: &str, enabled: bool) -> Self {
+        let rules = parse_text(text);
+        RuleGroup {
+            name: name.to_string(),
+            text: text.to_string(),
+            enabled,
+            rules,
+        }
+    }
+
+    /// Re-parse rules from the current text.
+    fn reparse(&mut self) {
+        self.rules = parse_text(&self.text);
+    }
+
+    /// Number of parsed rules in this group.
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+}
+
+/// Holds rule groups and answers match queries.
 #[derive(Debug, Default)]
 pub struct RuleManager {
-    rules: Vec<Rule>,
-    /// The raw source text (so the UI can display/edit it).
-    source: String,
+    /// Ordered list of rule groups. Rules from earlier groups take precedence
+    /// (first-match-wins across groups, top to bottom).
+    groups: Vec<RuleGroup>,
 }
 
 impl RuleManager {
     pub fn new() -> Self {
         RuleManager {
-            rules: Vec::new(),
-            source: String::new(),
+            groups: Vec::new(),
         }
     }
 
+    /// Total number of parsed rules across all groups.
     pub fn len(&self) -> usize {
-        self.rules.len()
+        self.groups.iter().map(|g| g.rules.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.groups.iter().all(|g| g.rules.is_empty())
     }
 
-    /// The current rules source text.
+    /// The current rules source text of the default group (backward compat).
     pub fn text(&self) -> &str {
-        &self.source
+        self.groups
+            .iter()
+            .find(|g| g.name == "default")
+            .map(|g| g.text.as_str())
+            .unwrap_or("")
     }
 
-    /// Replace all rules with those parsed from `text` (whistle rules DSL).
+    /// Replace all rules in the default group (backward compat for UI single-text editor).
     pub fn set_text(&mut self, text: &str) {
-        self.rules = parse_text(text);
-        self.source = text.to_string();
-    }
-
-    /// Append rules parsed from `text`.
-    pub fn append_text(&mut self, text: &str) {
-        self.rules.extend(parse_text(text));
-        if !self.source.is_empty() && !self.source.ends_with('\n') {
-            self.source.push('\n');
+        if let Some(g) = self.groups.iter_mut().find(|g| g.name == "default") {
+            g.text = text.to_string();
+            g.reparse();
+        } else {
+            self.groups
+                .insert(0, RuleGroup::new("default", text, true));
         }
-        self.source.push_str(text);
     }
 
-    /// Resolve the winning operators for a request. See [`matcher`].
+    /// Append rules parsed from `text` to the default group.
+    pub fn append_text(&mut self, text: &str) {
+        if let Some(g) = self.groups.iter_mut().find(|g| g.name == "default") {
+            if !g.text.is_empty() && !g.text.ends_with('\n') {
+                g.text.push('\n');
+            }
+            g.text.push_str(text);
+            g.reparse();
+        } else {
+            self.groups
+                .insert(0, RuleGroup::new("default", text, true));
+        }
+    }
+
+    /// Resolve the winning operators for a request, considering only enabled
+    /// groups. Rules from earlier groups take precedence.
     pub fn resolve(&self, req: &ReqInfo) -> Resolved {
-        matcher::resolve(&self.rules, req)
+        let all_rules: Vec<&Rule> = self
+            .groups
+            .iter()
+            .filter(|g| g.enabled)
+            .flat_map(|g| &g.rules)
+            .collect();
+        matcher::resolve_refs(&all_rules, req)
+    }
+
+    // ── Group management API ──
+
+    /// Immutable access to all groups.
+    pub fn groups(&self) -> &[RuleGroup] {
+        &self.groups
+    }
+
+    /// Add a new group (appended at the end). Returns false if name already exists.
+    pub fn add_group(&mut self, name: &str, text: &str, enabled: bool) -> bool {
+        if self.groups.iter().any(|g| g.name == name) {
+            return false;
+        }
+        self.groups.push(RuleGroup::new(name, text, enabled));
+        true
+    }
+
+    /// Remove a group by name. Returns true if found and removed.
+    pub fn remove_group(&mut self, name: &str) -> bool {
+        let before = self.groups.len();
+        self.groups.retain(|g| g.name != name);
+        self.groups.len() < before
+    }
+
+    /// Toggle a group's enabled state. Returns the new state, or None if not found.
+    pub fn toggle_group(&mut self, name: &str) -> Option<bool> {
+        self.groups.iter_mut().find(|g| g.name == name).map(|g| {
+            g.enabled = !g.enabled;
+            g.enabled
+        })
+    }
+
+    /// Update a group's text. Returns false if not found.
+    pub fn update_group(&mut self, name: &str, text: &str) -> bool {
+        if let Some(g) = self.groups.iter_mut().find(|g| g.name == name) {
+            g.text = text.to_string();
+            g.reparse();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rename a group. Returns false if old name not found or new name already exists.
+    pub fn rename_group(&mut self, old_name: &str, new_name: &str) -> bool {
+        if self.groups.iter().any(|g| g.name == new_name) {
+            return false;
+        }
+        if let Some(g) = self.groups.iter_mut().find(|g| g.name == old_name) {
+            g.name = new_name.to_string();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -447,3 +559,82 @@ fn wildcard_to_regex(tok: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    fn req(url: &str) -> ReqInfo {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host_port, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], rest[i..].to_string()),
+            None => (rest, "/".to_string()),
+        };
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
+                (h.to_string(), p.parse().unwrap())
+            }
+            _ => (
+                host_port.to_string(),
+                if scheme == "https" { 443 } else { 80 },
+            ),
+        };
+        ReqInfo {
+            method: "GET".into(),
+            scheme: scheme.into(),
+            host,
+            port,
+            path: path.clone(),
+            full_url: url.into(),
+            client_ip: None,
+            headers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn disabled_group_skipped() {
+        let mut mgr = RuleManager::new();
+        mgr.add_group("a", "example.com host://1.2.3.4", true);
+        mgr.add_group("b", "example.com host://5.6.7.8", false);
+
+        let r = mgr.resolve(&req("http://example.com/"));
+        assert_eq!(r.single.get("host").map(|o| o.value.as_str()), Some("1.2.3.4"));
+        assert_eq!(mgr.len(), 2); // both parsed
+    }
+
+    #[test]
+    fn toggle_changes_resolution() {
+        let mut mgr = RuleManager::new();
+        mgr.add_group("main", "example.com host://1.1.1.1", true);
+        assert!(mgr.resolve(&req("http://example.com/")).single.contains_key("host"));
+
+        mgr.toggle_group("main");
+        assert!(mgr.resolve(&req("http://example.com/")).single.is_empty());
+    }
+
+    #[test]
+    fn add_remove_groups() {
+        let mut mgr = RuleManager::new();
+        assert!(mgr.add_group("a", "", true));
+        assert!(!mgr.add_group("a", "", true)); // duplicate
+        assert_eq!(mgr.groups().len(), 1);
+
+        assert!(mgr.remove_group("a"));
+        assert!(!mgr.remove_group("a")); // already removed
+        assert_eq!(mgr.groups().len(), 0);
+    }
+
+    #[test]
+    fn set_text_backward_compat() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com host://1.1.1.1");
+        assert_eq!(mgr.groups().len(), 1);
+        assert_eq!(mgr.groups()[0].name, "default");
+        assert!(mgr.resolve(&req("http://example.com/")).single.contains_key("host"));
+
+        mgr.set_text("other.com host://2.2.2.2");
+        assert_eq!(mgr.groups().len(), 1);
+        assert!(mgr.resolve(&req("http://example.com/")).single.is_empty());
+    }
+}
+

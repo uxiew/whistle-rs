@@ -100,6 +100,12 @@ fn scheme_matches(pat: &str, req: &str) -> bool {
 
 /// Walk all rules and build the [`Resolved`] set for `req`.
 pub fn resolve(rules: &[Rule], req: &ReqInfo) -> Resolved {
+    let refs: Vec<&Rule> = rules.iter().collect();
+    resolve_refs(&refs, req)
+}
+
+/// Like [`resolve`] but takes borrowed rule references (for cross-group resolution).
+pub fn resolve_refs(rules: &[&Rule], req: &ReqInfo) -> Resolved {
     let mut resolved = Resolved::default();
 
     // Two passes so important rules win: first important, then normal. Within a

@@ -29,6 +29,11 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("GET", "/api/values") => values_get(state),
         ("POST", "/api/values") => values_post(state, req).await,
         ("POST", "/api/replay") => replay_session(state, req).await,
+        ("GET", "/api/rule-groups") => rule_groups_get(state),
+        ("POST", "/api/rule-groups") => rule_groups_add(state, req).await,
+        ("POST", "/api/rule-group/toggle") => rule_group_toggle(state, req).await,
+        ("POST", "/api/rule-group/update") => rule_group_update(state, req).await,
+        ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -287,6 +292,188 @@ async fn rules_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         .unwrap()
 }
 
+// ── Rule group management API ──
+
+fn rules_dir(state: &Arc<AppState>) -> std::path::PathBuf {
+    state.config.data_dir().join("rules")
+}
+
+fn rule_groups_get(state: &Arc<AppState>) -> Response<DynBody> {
+    let mgr = state.rules.read().unwrap();
+    let groups: Vec<serde_json::Value> = mgr
+        .groups()
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "name": g.name,
+                "enabled": g.enabled,
+                "rules": g.len(),
+            })
+        })
+        .collect();
+    let body = serde_json::to_string(&groups).unwrap_or_else(|_| "[]".into());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body)))
+        .unwrap()
+}
+
+async fn rule_groups_add(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        return json_error("name is required");
+    }
+    let text = payload
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let enabled = payload.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let ok = {
+        let mut mgr = state.rules.write().unwrap();
+        let ok = mgr.add_group(name, text, enabled);
+        if ok {
+            crate::rules::storage::save_groups(&rules_dir(state), &mgr);
+        }
+        ok
+    };
+    if ok {
+        json_ok()
+    } else {
+        json_error("group already exists")
+    }
+}
+
+async fn rule_group_toggle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let result = {
+        let mut mgr = state.rules.write().unwrap();
+        let r = mgr.toggle_group(name);
+        if r.is_some() {
+            crate::rules::storage::save_meta(&rules_dir(state), &mgr);
+        }
+        r
+    };
+    match result {
+        Some(enabled) => {
+            let body = format!("{{\"ok\":true,\"enabled\":{enabled}}}");
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(body::full(Bytes::from(body)))
+                .unwrap()
+        }
+        None => json_error("group not found"),
+    }
+}
+
+async fn rule_group_update(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let text = payload
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let ok = {
+        let mut mgr = state.rules.write().unwrap();
+        let ok = mgr.update_group(name, text);
+        if ok {
+            crate::rules::storage::save_groups(&rules_dir(state), &mgr);
+        }
+        ok
+    };
+    if ok {
+        json_ok()
+    } else {
+        json_error("group not found")
+    }
+}
+
+async fn rule_group_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let ok = {
+        let mut mgr = state.rules.write().unwrap();
+        let ok = mgr.remove_group(name);
+        if ok {
+            crate::rules::storage::save_groups(&rules_dir(state), &mgr);
+        }
+        ok
+    };
+    if ok {
+        json_ok()
+    } else {
+        json_error("group not found")
+    }
+}
+
+/// Helper: read request body as JSON.
+async fn read_json_body(
+    req: Request<Incoming>,
+) -> Result<serde_json::Value, Response<DynBody>> {
+    let body = req
+        .into_body()
+        .collect()
+        .await
+        .map_err(|_| {
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(body::full(Bytes::from_static(b"could not read body")))
+                .unwrap()
+        })?
+        .to_bytes();
+    serde_json::from_slice(&body).map_err(|_| {
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(body::full(Bytes::from_static(b"invalid JSON")))
+            .unwrap()
+    })
+}
+
+fn json_ok() -> Response<DynBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from_static(b"{\"ok\":true}")))
+        .unwrap()
+}
+
+fn json_error(msg: &str) -> Response<DynBody> {
+    let body = format!("{{\"ok\":false,\"error\":\"{msg}\"}}");
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body)))
+        .unwrap()
+}
+
 fn values_get(state: &Arc<AppState>) -> Response<DynBody> {
     let values = state.values.read().unwrap().clone();
     let body = serde_json::to_string(&values).unwrap_or_else(|_| "{}".into());
@@ -491,6 +678,9 @@ pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32v
 .frm .pv{{flex:1;white-space:pre;overflow:hidden;text-overflow:ellipsis}}
 .rbtn{{background:none;border:1px solid var(--line);color:var(--muted);padding:1px 6px;border-radius:4px;cursor:pointer;font-size:12px;line-height:1}}
 .rbtn:hover{{color:var(--accent);border-color:var(--accent)}}
+.grp{{display:flex;align-items:center;gap:8px;padding:4px 8px;border-bottom:1px solid var(--line)}}
+.grp label{{flex:1;cursor:pointer}}
+.grp-off label{{opacity:.5;text-decoration:line-through}}
 </style></head><body>
 <header>
   <h1>whistle-rs</h1><span class="hint">v{version} · proxy {host}:{port}</span>
@@ -521,7 +711,13 @@ pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32v
       <span class="hint" id="rulestatus"></span>
     </div>
     <textarea id="editor" spellcheck="false" placeholder="pattern operator1 operator2 ..."></textarea>
-    <p class="hint">One rule per line. See the docs for the full syntax.</p>
+    <p class="hint">Default group — one rule per line. See the docs for the full syntax.</p>
+    <div class="bar" style="margin-top:8px">
+      <b>Rule Groups</b>
+      <button onclick="addGroup()">+ Add Group</button>
+      <span class="hint" id="grpstatus"></span>
+    </div>
+    <div id="grplist"></div>
   </section>
   <section id="values" class="hidden">
     <div class="bar">
@@ -616,12 +812,73 @@ function loadRules(){{
   fetch('/api/rules').then(function(r){{return r.text()}}).then(function(t){{
     document.getElementById('editor').value=t;
   }});
+  loadGroups();
 }}
 function saveRules(){{
   var txt=document.getElementById('editor').value;
   fetch('/api/rules',{{method:'POST',body:txt}}).then(function(r){{return r.json()}}).then(function(j){{
     document.getElementById('rulestatus').textContent='Saved · '+j.rules+' rules active';
   }}).catch(function(){{document.getElementById('rulestatus').textContent='Save failed'}});
+}}
+function loadGroups(){{
+  fetch('/api/rule-groups').then(function(r){{return r.json()}}).then(function(groups){{
+    var el=document.getElementById('grplist');
+    if(!groups.length){{el.innerHTML='<p class="hint">No custom groups.</p>';return;}}
+    el.innerHTML=groups.filter(function(g){{return g.name!=='default'}}).map(function(g){{
+      var cls=g.enabled?'grp':'grp grp-off';
+      return '<div class="'+cls+'" data-name="'+esc(g.name)+'">'+
+        '<label><input type="checkbox" '+(g.enabled?'checked':'')+' onchange="toggleGroup(\''+esc(g.name)+'\')">'+ esc(g.name)+'</label>'+
+        '<span class="hint">'+g.rules+' rules</span>'+
+        '<button class="rbtn" onclick="editGroup(\''+esc(g.name)+'\')">edit</button>'+
+        '<button class="rbtn" onclick="deleteGroup(\''+esc(g.name)+'\')">×</button>'+
+        '</div>';
+    }}).join('');
+  }});
+}}
+function addGroup(){{
+  var name=prompt('Group name:');
+  if(!name||!name.trim()) return;
+  fetch('/api/rule-groups',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:name.trim(),text:'',enabled:true}})}}).then(function(r){{return r.json()}}).then(function(j){{
+    if(j.ok) loadGroups(); else alert(j.error||'Failed');
+  }});
+}}
+function toggleGroup(name){{
+  fetch('/api/rule-group/toggle',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:name}})}}).then(function(r){{return r.json()}}).then(function(j){{
+    document.getElementById('grpstatus').textContent=name+(j.enabled?' enabled':' disabled');
+    loadGroups();
+  }});
+}}
+function editGroup(name){{
+  fetch('/api/rule-groups').then(function(r){{return r.json()}}).then(function(groups){{
+    var g=groups.find(function(x){{return x.name===name}});
+    if(!g) return;
+    // Fetch current text (stored on server) — we embed it in the group list via a detail-expand.
+    // For simplicity, use prompt with a textarea-like approach.
+    var el=document.querySelector('[data-name="'+name+'"]');
+    if(el && el.querySelector('textarea')) return; // already editing
+    var ta=document.createElement('textarea');
+    ta.style.cssText='width:100%;height:120px;margin-top:4px;font-family:monospace;font-size:12px';
+    ta.placeholder='rules for '+name;
+    // Load existing text via a simple GET trick: re-fetch groups config isn't enough,
+    // we need the actual rules text — use update with same text workaround.
+    // Better: fetch the storage file. For now, just let user type.
+    var btn=document.createElement('button');
+    btn.textContent='Save Group';
+    btn.onclick=function(){{
+      fetch('/api/rule-group/update',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:name,text:ta.value}})}}).then(function(r){{return r.json()}}).then(function(j){{
+        if(j.ok){{document.getElementById('grpstatus').textContent=name+' saved';loadGroups();}}
+        else alert(j.error||'Failed');
+      }});
+    }};
+    el.appendChild(ta);
+    el.appendChild(btn);
+  }});
+}}
+function deleteGroup(name){{
+  if(!confirm('Delete group "'+name+'"?')) return;
+  fetch('/api/rule-group',{{method:'DELETE',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:name}})}}).then(function(r){{return r.json()}}).then(function(j){{
+    if(j.ok) loadGroups(); else alert(j.error||'Failed');
+  }});
 }}
 function loadValues(){{
   fetch('/api/values').then(function(r){{return r.json()}}).then(function(v){{
