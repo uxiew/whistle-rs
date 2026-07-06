@@ -51,6 +51,13 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   inspectable without breaking streaming; `gzip`/`deflate`/`br` bodies are decoded for
   the preview). Expand/filter rows in the UI, fetch `/sessions.json` + `/session.json?id=`,
   or export everything as a HAR file (`/sessions.har`).
+- **Session persistence** — captured traffic is written to JSONL files with daily
+  rotation; sessions survive restarts and load automatically. Configurable with
+  `--no-persist` and `--persist-days`.
+- **Request replay** — re-send a captured request through the proxy pipeline via
+  `POST /api/replay` or the ↻ button in the Network view.
+- **Rule groups** — manage multiple named rule sets from the UI; each group can be
+  independently enabled/disabled. Groups persist to `storage_dir/rules/`.
 - Single static binary, no C toolchain needed to build (pinned `ring` TLS provider).
 
 ## Install & build
@@ -156,6 +163,8 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 | `--rule <TEXT>` | Inline rules, applied after `--rules` | — |
 | `--dir <DIR>` | Storage dir (root CA etc.) | `~/.whistle-rs` |
 | `--body-preview-limit <BYTES>` | Max captured body bytes kept per transaction | `16384` |
+| `--no-persist` | Disable session persistence (in-memory only) | persist on |
+| `--persist-days <N>` | Days of session history to retain on disk | `7` |
 | `-v, --verbose` | Debug logging (per-request decisions) | off |
 | `-h, --help` / `-V, --version` | Help / version | — |
 

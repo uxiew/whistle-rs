@@ -6,10 +6,10 @@
 **有意简化 / 尚未移植 / 架构受限**的更大子系统与少数边缘算子。
 
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族、
-> `@`-includes、`${port}/${version}` 配置变量；单元测试 **52** 项全绿、构建 0 警告。
+> `@`-includes、`${port}/${version}` 配置变量；单元测试 **60** 项全绿、构建 0 警告。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 统一插件系统（Rust + Node）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
-> HAR 导出、`cipher` TLS 版本固定。
+> HAR 导出、`cipher` TLS 版本固定、流量落盘持久化、请求重放、规则分组管理。
 
 ---
 
@@ -27,6 +27,9 @@
 | `internal-http-proxy` / `internal-https-proxy` | ✅ |
 | `x`/`xs` 前缀代理变体 | ✅ 以基础代理近似 |
 | `locationHref` 算子 | ✅ HTML 注入跳转脚本 |
+| 流量落盘持久化 | ✅ JSONL 追加写入 + 每日轮转 + 启动恢复 (`--no-persist` / `--persist-days`) |
+| 请求重放 | ✅ `POST /api/replay` self-loopback + UI ↻ 按钮 |
+| 规则分组管理 | ✅ 多组 CRUD + toggle + 持久化到 `storage_dir/rules/` |
 
 ---
 
@@ -48,10 +51,9 @@
 
 ### 观测与持久化
 
-- [ ] **流量落盘持久化**（重启可回放） —— HAR 导出已覆盖「按需导出」；实时落盘需处理
-      Body 流式完成时机。
-- [ ] **请求重放**（`/replay?id=N` 重新走一遍规则管线）—— 需要把捕获的请求合成回 serve 管线。
-- [ ] 规则的导入/导出与分组管理。
+- [x] ~~**流量落盘持久化**~~ → 已完成（JSONL + 每日轮转 + 启动回加载）
+- [x] ~~**请求重放**~~ → 已完成（self-loopback 通过代理自身端口）
+- [x] ~~规则的导入/导出与分组管理~~ → 已完成（多组 CRUD + UI toggle/edit/delete）
 
 ### 模板与变量（原版本身很窄）
 
