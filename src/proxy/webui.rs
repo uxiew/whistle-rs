@@ -33,6 +33,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/rule-groups") => rule_groups_add(state, req).await,
         ("POST", "/api/rule-group/toggle") => rule_group_toggle(state, req).await,
         ("POST", "/api/rule-group/update") => rule_group_update(state, req).await,
+        ("GET", "/api/rule-group") => rule_group_get(state, &req),
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => Response::builder()
@@ -317,6 +318,34 @@ fn rule_groups_get(state: &Arc<AppState>) -> Response<DynBody> {
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(body)))
         .unwrap()
+}
+
+fn rule_group_get(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let name = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|p| p.strip_prefix("name="))
+                .map(|v| v.replace("%20", " ").replace("+", " "))
+        })
+        .unwrap_or_default();
+    let mgr = state.rules.read().unwrap();
+    if let Some(g) = mgr.groups().iter().find(|g| g.name == name) {
+        let body = serde_json::json!({
+            "name": g.name,
+            "text": g.text,
+            "enabled": g.enabled,
+            "rules": g.len(),
+        });
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(body::full(Bytes::from(body.to_string())))
+            .unwrap()
+    } else {
+        json_error("group not found")
+    }
 }
 
 async fn rule_groups_add(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
@@ -849,19 +878,15 @@ function toggleGroup(name){{
   }});
 }}
 function editGroup(name){{
-  fetch('/api/rule-groups').then(function(r){{return r.json()}}).then(function(groups){{
-    var g=groups.find(function(x){{return x.name===name}});
-    if(!g) return;
-    // Fetch current text (stored on server) — we embed it in the group list via a detail-expand.
-    // For simplicity, use prompt with a textarea-like approach.
-    var el=document.querySelector('[data-name="'+name+'"]');
-    if(el && el.querySelector('textarea')) return; // already editing
+  var el=document.querySelector('[data-name="'+name+'"]');
+  if(!el) return;
+  if(el.querySelector('textarea')) return; // already editing
+  fetch('/api/rule-group?name='+encodeURIComponent(name)).then(function(r){{return r.json()}}).then(function(g){{
+    if(!g.name) return;
     var ta=document.createElement('textarea');
     ta.style.cssText='width:100%;height:120px;margin-top:4px;font-family:monospace;font-size:12px';
     ta.placeholder='rules for '+name;
-    // Load existing text via a simple GET trick: re-fetch groups config isn't enough,
-    // we need the actual rules text — use update with same text workaround.
-    // Better: fetch the storage file. For now, just let user type.
+    ta.value=g.text||'';
     var btn=document.createElement('button');
     btn.textContent='Save Group';
     btn.onclick=function(){{
