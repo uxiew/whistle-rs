@@ -35,6 +35,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/rule-group/update") => rule_group_update(state, req).await,
         ("GET", "/api/rule-group") => rule_group_get(state, &req),
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
+        ("POST", "/api/sessions/clear") => sessions_clear(state),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -503,6 +504,12 @@ fn json_error(msg: &str) -> Response<DynBody> {
         .unwrap()
 }
 
+fn sessions_clear(state: &Arc<AppState>) -> Response<DynBody> {
+    state.clear_sessions();
+    tracing::info!("sessions cleared via UI");
+    json_ok()
+}
+
 fn values_get(state: &Arc<AppState>) -> Response<DynBody> {
     let values = state.values.read().unwrap().clone();
     let body = serde_json::to_string(&values).unwrap_or_else(|_| "{}".into());
@@ -727,6 +734,7 @@ pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32v
   <section id="net">
     <div class="bar">
       <button onclick="loadNet()">Refresh</button>
+      <button onclick="clearSessions()">Clear</button>
       <input id="filter" placeholder="filter: url / method / status" oninput="loadNet()">
       <label class="hint"><input type="checkbox" id="auto" checked> auto-refresh</label>
       <span class="hint" id="netcount"></span>
@@ -922,6 +930,13 @@ function replayReq(id,e){{
   fetch('/api/replay',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}}).then(function(r){{return r.json()}}).then(function(j){{
     if(j.replayed) setTimeout(loadNet,500);
   }}).catch(function(){{}});
+}}
+function clearSessions(){{
+  if(!confirm('Clear all captured sessions?')) return;
+  fetch('/api/sessions/clear',{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(){{
+    loadNet();
+    document.getElementById('netcount').textContent='cleared';
+  }});
 }}
 loadNet();
 setInterval(function(){{if(document.getElementById('auto').checked && !document.getElementById('net').classList.contains('hidden')) loadNet();}},2000);

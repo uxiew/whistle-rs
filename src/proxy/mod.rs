@@ -119,6 +119,12 @@ impl AppState {
         id
     }
 
+    /// Clear all in-memory sessions and WebSocket frames.
+    pub fn clear_sessions(&self) {
+        self.sessions.lock().unwrap().clear();
+        self.ws_frames.lock().unwrap().clear();
+    }
+
     /// Record one captured WebSocket frame in the bounded ring buffer.
     pub fn record_frame(&self, frame: WsFrame) {
         let mut q = self.ws_frames.lock().unwrap();
