@@ -11,6 +11,10 @@ use hyper::http::response;
 use hyper::{HeaderMap, Response, StatusCode};
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use once_cell::sync::Lazy;
 
 use super::body::{self, DynBody};
 use super::upstream::{ProxyKind, Target, parse_proxy};
@@ -377,7 +381,11 @@ fn parse_host_value(value: &str, _default_port: u16) -> (Option<String>, Option<
 
 /// Short-circuit responses produced without contacting upstream:
 /// `redirect`/`location`, mocked `statusCode`, and `file`.
-pub fn short_circuit(info: &ReqInfo, resolved: &Resolved) -> Option<Response<DynBody>> {
+pub fn short_circuit(
+    info: &ReqInfo,
+    resolved: &Resolved,
+    env: super::template::ProxyEnv<'_>,
+) -> Option<Response<DynBody>> {
     if let Some(url) = resolved
         .value("redirect")
         .or_else(|| resolved.value("location"))
@@ -408,7 +416,7 @@ pub fn short_circuit(info: &ReqInfo, resolved: &Resolved) -> Option<Response<Dyn
     }
 
     if let Some((proto, value)) = find_file_rule(resolved) {
-        return serve_file_family(proto, value, info);
+        return serve_file_family(proto, value, info, env);
     }
 
     None
@@ -430,19 +438,26 @@ fn find_file_rule<'a>(resolved: &'a Resolved) -> Option<(&'static str, &'a str)>
 
 /// Serve a matched file-family rule. Returns `None` only for a `x`/`xs` (cross)
 /// variant whose file is missing — that falls through to the real server.
-fn serve_file_family(proto: &str, value: &str, info: &ReqInfo) -> Option<Response<DynBody>> {
+fn serve_file_family(
+    proto: &str,
+    value: &str,
+    info: &ReqInfo,
+    env: super::template::ProxyEnv<'_>,
+) -> Option<Response<DynBody>> {
     let raw = proto.contains("rawfile");
+    // `tpl`, `dust` and `jsonp` are one protocol in whistle
+    // (`_original/lib/handlers/file-proxy.js:14`); none of them has any
+    // protocol-specific behaviour of its own.
     let templated = proto.ends_with("tpl") || proto.ends_with("jsonp") || proto.ends_with("dust");
-    let jsonp = proto.ends_with("jsonp");
     let cross = proto.starts_with('x');
 
     match read_file(value) {
         Some(data) => Some(if raw {
             serve_raw_http(&data)
         } else if templated {
-            serve_template(&data, value, info, jsonp)
+            serve_template(&data, value, info, env)
         } else {
-            serve_file_bytes(data, value)
+            serve_file_bytes(&data, value, info)
         }),
         None => {
             if cross {
@@ -462,23 +477,93 @@ fn serve_file_family(proto: &str, value: &str, info: &ReqInfo) -> Option<Respons
     }
 }
 
+/// Cached file contents, valid only while the file's mtime and length are
+/// unchanged. Mock files are edited constantly during development, so the
+/// cache must never be able to serve a stale body.
+struct CachedFile {
+    mtime: std::time::SystemTime,
+    len: u64,
+    data: Arc<Vec<u8>>,
+}
+
+/// Files at or below this size are cached; larger ones are streamed from disk
+/// every time so a big fixture cannot pin memory.
+const MAX_CACHED_FILE: u64 = 1 << 20;
+
+/// Cap on distinct cached paths. Rule files reference a handful of mocks, so a
+/// small map suffices; on overflow we clear rather than track recency.
+const MAX_CACHE_ENTRIES: usize = 64;
+
+static FILE_CACHE: Lazy<Mutex<HashMap<PathBuf, CachedFile>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 /// Read a file, trying the value verbatim and as an absolute `/`-rooted path.
-fn read_file(path: &str) -> Option<Vec<u8>> {
+///
+/// Every call still `stat`s the file, so an edit is picked up immediately; only
+/// the read of an unchanged file is skipped. The one gap is a rewrite that both
+/// preserves the byte length *and* lands within the filesystem's mtime
+/// resolution of the previous one — a second-granularity filesystem can then
+/// serve the previous body once.
+///
+/// No sandboxing: `file://` exists to serve arbitrary local paths on the
+/// developer's own machine, and the original imposes no restriction on absolute
+/// paths either (its only check, `existsUpPath` in
+/// `_original/lib/util/index.js:1847`, guards root-*relative* rule paths, a
+/// feature whistle-rs does not implement).
+fn read_file(path: &str) -> Option<Arc<Vec<u8>>> {
     let clean = path.trim_start_matches('/');
-    for p in [path.to_string(), format!("/{clean}")] {
-        if let Ok(data) = std::fs::read(&p) {
+    for candidate in [path.to_string(), format!("/{clean}")] {
+        if let Some(data) = read_cached(Path::new(&candidate)) {
             return Some(data);
         }
     }
     None
 }
 
+/// Read one path through the mtime-keyed cache.
+fn read_cached(path: &Path) -> Option<Arc<Vec<u8>>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
+    let mtime = meta.modified().ok();
+
+    // A file we cannot stat for mtime is never cached — correctness first.
+    if let (Some(mtime), true) = (mtime, len <= MAX_CACHED_FILE) {
+        if let Ok(mut cache) = FILE_CACHE.lock() {
+            if let Some(hit) = cache.get(path) {
+                if hit.mtime == mtime && hit.len == len {
+                    return Some(Arc::clone(&hit.data));
+                }
+            }
+            let data = Arc::new(std::fs::read(path).ok()?);
+            if cache.len() >= MAX_CACHE_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(
+                path.to_path_buf(),
+                CachedFile {
+                    mtime,
+                    len,
+                    data: Arc::clone(&data),
+                },
+            );
+            return Some(data);
+        }
+    }
+    std::fs::read(path).ok().map(Arc::new)
+}
+
 /// Serve raw file bytes with a guessed content type (`file://`).
-fn serve_file_bytes(data: Vec<u8>, path: &str) -> Response<DynBody> {
+fn serve_file_bytes(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> {
     Response::builder()
         .status(StatusCode::OK)
-        .header(hyper::header::CONTENT_TYPE, guess_content_type(path))
-        .body(body::full(Bytes::from(data)))
+        .header(
+            hyper::header::CONTENT_TYPE,
+            content_type_for(path, &info.full_url),
+        )
+        .body(body::full(Bytes::copy_from_slice(data)))
         .unwrap()
 }
 
@@ -520,69 +605,65 @@ fn serve_raw_http(data: &[u8]) -> Response<DynBody> {
 /// Serve a `tpl://`/`jsonp://`/`dust://`: substitute `{name}`/`{{name}}` in the
 /// file from the request query, and (for jsonp) wrap in a callback. Whistle's
 /// full dust/handlebars engines are approximated by simple variable substitution.
-fn serve_template(data: &[u8], path: &str, info: &ReqInfo, jsonp: bool) -> Response<DynBody> {
-    let mut body = String::from_utf8_lossy(data).into_owned();
-    let query = query_params(&info.full_url);
-    // Replace {{name}} and {name} with query values (unknown → empty).
-    let re = regex::Regex::new(r"\{\{([\w$-]+)\}\}|\{([\w$-]+)\}").unwrap();
-    body = re
-        .replace_all(&body, |caps: &regex::Captures| {
-            let name = caps
-                .get(1)
-                .or_else(|| caps.get(2))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-            query.get(name).cloned().unwrap_or_default()
-        })
-        .into_owned();
-
-    let (ct, out) = if jsonp {
-        let cb = query
-            .get("callback")
-            .or_else(|| query.get("_callback"))
-            .cloned()
-            .unwrap_or_else(|| "callback".to_string());
-        (
-            "application/javascript; charset=utf-8",
-            format!("{cb}({body})"),
-        )
-    } else {
-        (guess_content_type(path), body)
-    };
+fn serve_template(
+    data: &[u8],
+    path: &str,
+    info: &ReqInfo,
+    env: super::template::ProxyEnv<'_>,
+) -> Response<DynBody> {
+    let rendered = super::template::render(&String::from_utf8_lossy(data), info, env);
     Response::builder()
         .status(StatusCode::OK)
-        .header(hyper::header::CONTENT_TYPE, ct)
-        .body(body::full(Bytes::from(out)))
+        .header(
+            hyper::header::CONTENT_TYPE,
+            content_type_for(path, &info.full_url),
+        )
+        .body(body::full(Bytes::from(rendered)))
         .unwrap()
 }
 
-/// Parse the query string of a full URL into a map.
-fn query_params(full_url: &str) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    if let Some(q) = full_url.split_once('?').map(|(_, q)| q) {
-        for kv in q.split('&') {
-            if let Some((k, v)) = kv.split_once('=') {
-                map.insert(k.to_string(), v.to_string());
-            }
+/// Content type for a served file, following whistle's fallback chain
+/// (`_original/lib/handlers/file-proxy.js:255-258`): the file's own extension
+/// first, then the *request URL's* extension, then `text/html`.
+///
+/// That second step is what makes `example.com/a.json file:///tmp/mock` serve
+/// JSON even though the mock file has no extension.
+fn content_type_for(path: &str, full_url: &str) -> &'static str {
+    match content_type_of_ext(path) {
+        Some(ct) => ct,
+        // Strip query/fragment before looking at the URL's extension.
+        None => {
+            let pure = full_url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(full_url);
+            content_type_of_ext(pure).unwrap_or("text/html; charset=utf-8")
         }
     }
-    map
 }
 
-fn guess_content_type(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("");
-    match ext {
+/// Map a path's extension to a content type, or `None` when there is no
+/// extension in the final path segment.
+fn content_type_of_ext(path: &str) -> Option<&'static str> {
+    let last = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let ext = last.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "js" | "mjs" => "application/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "json" => "application/json; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
+        "webp" => "image/webp",
         "svg" => "image/svg+xml",
-        "txt" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
-    }
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        "txt" | "text" => "text/plain; charset=utf-8",
+        _ => return None,
+    })
 }
 
 /// Apply request-side operators (headers, method, ua, referer) in place.
@@ -1276,6 +1357,11 @@ mod tests {
     use super::*;
     use crate::rules::RuleManager;
 
+    /// Proxy facts for tests that reach the template engine.
+    fn test_env() -> super::super::template::ProxyEnv<'static> {
+        super::super::template::ProxyEnv { host: "", port: 8899, version: "9.9.9" }
+    }
+
     fn resolve(rules: &str, url: &str) -> Resolved {
         let mut m = RuleManager::new();
         m.set_text(rules);
@@ -1469,10 +1555,10 @@ mod tests {
         let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
         // xfile with a missing file → no short-circuit (proxy the real server).
         let x = resolve("a.com xfile:///no/such/file.txt\n", "http://a.com/");
-        assert!(short_circuit(&info, &x).is_none());
+        assert!(short_circuit(&info, &x, test_env()).is_none());
         // plain file missing → a 404 short-circuit.
         let f = resolve("a.com file:///no/such/file.txt\n", "http://a.com/");
-        let r = short_circuit(&info, &f).expect("file:// should short-circuit");
+        let r = short_circuit(&info, &f, test_env()).expect("file:// should short-circuit");
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 

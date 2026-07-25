@@ -8,6 +8,7 @@ pub mod body;
 pub mod persist;
 pub mod script;
 pub mod socks;
+pub mod template;
 pub mod upstream;
 pub mod webui;
 pub mod ws;
@@ -957,7 +958,15 @@ async fn serve(
     }
 
     // Short-circuit rules (redirect, mocked status, file) skip the upstream.
-    if let Some(resp) = apply::short_circuit(&info, &resolved) {
+    // `${host}` is whistle's own bind address, empty when bound to all
+    // interfaces — see ProxyEnv.
+    let bind_host = state.config.host.map(|h| h.to_string()).unwrap_or_default();
+    let proxy_env = template::ProxyEnv {
+        host: &bind_host,
+        port: state.config.port,
+        version: crate::config::VERSION,
+    };
+    if let Some(resp) = apply::short_circuit(&info, &resolved, proxy_env) {
         tracing::info!("{} {} -> short-circuit", info.method, info.full_url);
         state.record(Session {
             id: 0,
