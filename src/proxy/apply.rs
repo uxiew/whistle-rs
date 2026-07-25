@@ -432,17 +432,19 @@ fn find_file_rule<'a>(resolved: &'a Resolved) -> Option<(&'static str, &'a str)>
 /// variant whose file is missing — that falls through to the real server.
 fn serve_file_family(proto: &str, value: &str, info: &ReqInfo) -> Option<Response<DynBody>> {
     let raw = proto.contains("rawfile");
+    // `tpl`, `dust` and `jsonp` are one protocol in whistle
+    // (`_original/lib/handlers/file-proxy.js:14`); none of them has any
+    // protocol-specific behaviour of its own.
     let templated = proto.ends_with("tpl") || proto.ends_with("jsonp") || proto.ends_with("dust");
-    let jsonp = proto.ends_with("jsonp");
     let cross = proto.starts_with('x');
 
     match read_file(value) {
         Some(data) => Some(if raw {
             serve_raw_http(&data)
         } else if templated {
-            serve_template(&data, value, info, jsonp)
+            serve_template(&data, value, info)
         } else {
-            serve_file_bytes(data, value)
+            serve_file_bytes(&data, value, info)
         }),
         None => {
             if cross {
@@ -462,23 +464,93 @@ fn serve_file_family(proto: &str, value: &str, info: &ReqInfo) -> Option<Respons
     }
 }
 
+/// Cached file contents, valid only while the file's mtime and length are
+/// unchanged. Mock files are edited constantly during development, so the
+/// cache must never be able to serve a stale body.
+struct CachedFile {
+    mtime: std::time::SystemTime,
+    len: u64,
+    data: Arc<Vec<u8>>,
+}
+
+/// Files at or below this size are cached; larger ones are streamed from disk
+/// every time so a big fixture cannot pin memory.
+const MAX_CACHED_FILE: u64 = 1 << 20;
+
+/// Cap on distinct cached paths. Rule files reference a handful of mocks, so a
+/// small map suffices; on overflow we clear rather than track recency.
+const MAX_CACHE_ENTRIES: usize = 64;
+
+static FILE_CACHE: Lazy<Mutex<HashMap<PathBuf, CachedFile>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 /// Read a file, trying the value verbatim and as an absolute `/`-rooted path.
-fn read_file(path: &str) -> Option<Vec<u8>> {
+///
+/// Every call still `stat`s the file, so an edit is picked up immediately; only
+/// the read of an unchanged file is skipped. The one gap is a rewrite that both
+/// preserves the byte length *and* lands within the filesystem's mtime
+/// resolution of the previous one — a second-granularity filesystem can then
+/// serve the previous body once.
+///
+/// No sandboxing: `file://` exists to serve arbitrary local paths on the
+/// developer's own machine, and the original imposes no restriction on absolute
+/// paths either (its only check, `existsUpPath` in
+/// `_original/lib/util/index.js:1847`, guards root-*relative* rule paths, a
+/// feature whistle-rs does not implement).
+fn read_file(path: &str) -> Option<Arc<Vec<u8>>> {
     let clean = path.trim_start_matches('/');
-    for p in [path.to_string(), format!("/{clean}")] {
-        if let Ok(data) = std::fs::read(&p) {
+    for candidate in [path.to_string(), format!("/{clean}")] {
+        if let Some(data) = read_cached(Path::new(&candidate)) {
             return Some(data);
         }
     }
     None
 }
 
+/// Read one path through the mtime-keyed cache.
+fn read_cached(path: &Path) -> Option<Arc<Vec<u8>>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
+    let mtime = meta.modified().ok();
+
+    // A file we cannot stat for mtime is never cached — correctness first.
+    if let (Some(mtime), true) = (mtime, len <= MAX_CACHED_FILE) {
+        if let Ok(mut cache) = FILE_CACHE.lock() {
+            if let Some(hit) = cache.get(path) {
+                if hit.mtime == mtime && hit.len == len {
+                    return Some(Arc::clone(&hit.data));
+                }
+            }
+            let data = Arc::new(std::fs::read(path).ok()?);
+            if cache.len() >= MAX_CACHE_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(
+                path.to_path_buf(),
+                CachedFile {
+                    mtime,
+                    len,
+                    data: Arc::clone(&data),
+                },
+            );
+            return Some(data);
+        }
+    }
+    std::fs::read(path).ok().map(Arc::new)
+}
+
 /// Serve raw file bytes with a guessed content type (`file://`).
-fn serve_file_bytes(data: Vec<u8>, path: &str) -> Response<DynBody> {
+fn serve_file_bytes(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> {
     Response::builder()
         .status(StatusCode::OK)
-        .header(hyper::header::CONTENT_TYPE, guess_content_type(path))
-        .body(body::full(Bytes::from(data)))
+        .header(
+            hyper::header::CONTENT_TYPE,
+            content_type_for(path, &info.full_url),
+        )
+        .body(body::full(Bytes::copy_from_slice(data)))
         .unwrap()
 }
 

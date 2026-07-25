@@ -8,6 +8,7 @@ pub mod body;
 pub mod persist;
 pub mod script;
 pub mod socks;
+pub mod template;
 pub mod upstream;
 pub mod webui;
 pub mod ws;
