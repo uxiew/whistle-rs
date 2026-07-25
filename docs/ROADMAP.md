@@ -7,7 +7,7 @@
 
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
-> 单元测试 **389** 项全绿、构建 0 警告。
+> 单元测试 **390** 项全绿、构建 0 警告。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
 > HAR 导出、`cipher` TLS 版本固定、流量落盘持久化、请求重放、规则分组管理。
@@ -26,7 +26,7 @@
 | Web UI 过滤/搜索 | ✅ 按 URL/方法/状态/目标 |
 | Body 预览上限可配置（`--body-preview-limit`） | ✅ |
 | `internal-http-proxy` / `internal-https-proxy` | ✅ |
-| `x`/`xs` 前缀代理变体 | ✅ 以基础代理近似 |
+| `x`/`xs` 前缀代理变体 | ✅ 全部九个拼写都识别（按 `PROXY_RE` 的 `x?` 推导） |
 | `locationHref` 算子 | ✅ HTML 注入跳转脚本 |
 | 流量落盘持久化 | ✅ JSONL 追加写入 + 每日轮转 + 启动恢复 (`--no-persist` / `--persist-days`) |
 | 请求重放 | ✅ `POST /api/replay` self-loopback + UI ↻ 按钮 |
@@ -107,6 +107,12 @@
 - [x] ~~**`pac://` 远程抓取与辅助函数缺失**~~ → 已修。另**刻意偏离上游**：
       PAC 抛错时返回 502 而非静默直连 —— 抛错的脚本没有说「走直连」，它什么都没说。
 - [x] ~~**空 `proxy://` 静默直连**~~ → 已修：无法兑现的代理规则返回 502。
+- [x] ~~四个 `x` 拼写完全不被识别~~ → 已修（本轮）。`canonical()` 手写列表漏了
+      `xinternal-http-proxy` / `xinternal-https-proxy` / `xhttps2http-proxy` /
+      `xhttp2https-proxy`；不能规范化的名字在本移植里**根本不算协议**
+      （`is_protocol` 要查 `canonical`），因此这四条规则不产生任何代理算子、请求**直连**
+      —— **失败开放**，已实测（改前 200 直连，改后按规则走代理）。现按上游 `PROXY_RE`
+      的 `x?` 前缀从 `UPSTREAM_PROXY_PROTOCOLS` 推导，不再手写。
 - [ ] 失败关闭若干：`x`/`xs` 代理失败时不回退直连、代理 URL 的 `?host=` 被忽略、
       `internal-*` 未走 whistle 间的 `x-whistle-https-request` 握手、`proxyTunnel` 未实现、
       代理选择按固定协议优先级而非规则顺序。

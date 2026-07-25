@@ -1130,10 +1130,13 @@ Notes: `http2https-proxy`/`https2http-proxy` and the `internal-*` family do
 convert the origin scheme, and the stripped-TLS hop carries whistle's
 `x-whistle-https-request` marker (see [Upstream proxy](#upstream-proxy)); what is
 still missing from the `internal-*` family is the rest of whistle's
-whistle-to-whistle handshake — the client-id and intercept-policy headers. The
-`x`-prefixed variants (`xproxy://`, `xsocks://`, …) are aliases of their base
-proxy: upstream falls back to a **direct** connection when the proxy fails, this
-port does not and returns 502. `enable`/`disable` apply a curated flag set (see the
+whistle-to-whistle handshake — the client-id and intercept-policy headers. **Every** upstream-proxy name also accepts an `x` prefix — `xproxy`, `xsocks`,
+`xhttp-proxy`, `xhttps-proxy`, `xinternal-proxy`, `xinternal-http-proxy`,
+`xinternal-https-proxy`, `xhttps2http-proxy`, `xhttp2https-proxy` — which is
+upstream's one optional `x?` over the whole family (`PROXY_RE`,
+`_original/lib/rules/rules.js:37-38`) and is parsed here as an alias of the base
+name. Upstream falls back to a **direct** connection when such a proxy fails;
+this port does not and returns 502. `enable`/`disable` apply a curated flag set (see the
 [Flags](#flags-includes--values) table — others are inert); `pipe` routes to a
 registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
 extra rules from the values store / a file; `{name}` in any operator value is

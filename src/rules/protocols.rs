@@ -275,15 +275,30 @@ pub fn canonical(name: &str) -> Option<&'static str> {
         "resRules" => "resScript",
         "ruleFile" | "ruleScript" | "rulesScript" | "reqScript" | "reqRules" => "rulesFile",
         "P" => "G",
-        // `x`-prefixed proxy variants (whistle's tunnel proxies) are approximated
-        // by their base proxy — the transparent-tunnel nuance is not replicated.
-        "xproxy" => "proxy",
-        "xhttp-proxy" => "http-proxy",
-        "xhttps-proxy" => "https-proxy",
-        "xsocks" => "socks",
-        "xinternal-proxy" => "internal-proxy",
-        _ => return None,
+        // Every upstream-proxy name may carry an `x` prefix, which upstream
+        // strips in one place — `PROXY_RE`'s optional `x?`, whose capture group
+        // is the base name (`_original/lib/rules/rules.js:37-38`). Folding the
+        // prefix here does not lose it: `RuleOp::raw` keeps the token exactly as
+        // written, which is where the apply layer reads the `x` back to decide
+        // what the prefix *means* for this proxy.
+        //
+        // Derived from `UPSTREAM_PROXY_PROTOCOLS` rather than spelled out, so a
+        // name added to that list cannot end up recognised in its bare form and
+        // unrecognised in its `x` one — which is how four of them
+        // (`xinternal-http-proxy`, `xinternal-https-proxy`, `xhttps2http-proxy`,
+        // `xhttp2https-proxy`) came to configure nothing at all.
+        _ => return name.strip_prefix('x').and_then(x_proxy_base),
     })
+}
+
+/// The upstream-proxy protocol `base` names, when it is one — the `x`-stripped
+/// half of [`canonical`]. Returns the `'static` spelling from
+/// [`UPSTREAM_PROXY_PROTOCOLS`] so the canonical name outlives the input.
+fn x_proxy_base(base: &str) -> Option<&'static str> {
+    UPSTREAM_PROXY_PROTOCOLS
+        .iter()
+        .copied()
+        .find(|proto| *proto == base)
 }
 
 /// The local-file / template protocol family, matched dynamically by whistle's
@@ -321,6 +336,41 @@ mod tests {
             assert!(is_protocol(name), "{name} is not a known protocol");
             assert!(canonical(name).is_none(), "{name} should be canonical");
         }
+    }
+
+    /// **Every** upstream-proxy name has an `x`-prefixed spelling upstream, in
+    /// one regexp with an optional `x?` (`PROXY_RE`,
+    /// `_original/lib/rules/rules.js:37-38`).
+    ///
+    /// Four of them used to be missing from the hand-written list this replaced
+    /// — `xinternal-http-proxy`, `xinternal-https-proxy`, `xhttps2http-proxy`,
+    /// `xhttp2https-proxy` — and a name that does not canonicalise is not a
+    /// protocol at all here (`is_protocol` consults `canonical`), so those rules
+    /// produced no proxy operator and the request went **direct**.
+    #[test]
+    fn every_proxy_protocol_has_an_x_spelling() {
+        for name in UPSTREAM_PROXY_PROTOCOLS {
+            let x = format!("x{name}");
+            assert_eq!(canonical(&x), Some(*name), "{x}");
+            assert!(is_protocol(&x), "{x} is not a known protocol");
+        }
+        // The four the list used to miss, spelled out so a regression names
+        // itself rather than hiding inside the loop above.
+        for (x, base) in [
+            ("xinternal-http-proxy", "internal-http-proxy"),
+            ("xinternal-https-proxy", "internal-https-proxy"),
+            ("xhttps2http-proxy", "https2http-proxy"),
+            ("xhttp2https-proxy", "http2https-proxy"),
+        ] {
+            assert_eq!(canonical(x), Some(base), "{x}");
+        }
+        // The `x` fold reaches proxies only: it must not invent a protocol out
+        // of any other name that happens to start with one.
+        for name in ["xyz", "xfile", "x", "xhtml", "xstatus"] {
+            assert_ne!(canonical(name), Some("proxy"), "{name}");
+        }
+        // `xhost` keeps its own explicit arm — `host` is not a proxy.
+        assert_eq!(canonical("xhost"), Some("host"));
     }
 
     /// The tool protocols are part of the response phase upstream
