@@ -20,8 +20,16 @@ pub fn matches(rule: &Rule, req: &ReqInfo) -> bool {
     filters_match(&rule.filters, req)
 }
 
+/// Does the rule's pattern accept `req`? `!`-prefixed patterns invert the
+/// answer — and only the pattern's: whistle applies `not` to the pattern test
+/// alone, leaving the filter conditions to hold as written
+/// (`_original/lib/rules/rules.js:994-998`).
 fn pattern_matches(rule: &Rule, req: &ReqInfo) -> bool {
-    match &rule.pattern {
+    pattern_accepts(&rule.pattern, req) != rule.negate
+}
+
+fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
+    match pattern {
         Pattern::Any => true,
         Pattern::Regex(re) => re.is_match(&req.full_url),
         Pattern::Prefix {

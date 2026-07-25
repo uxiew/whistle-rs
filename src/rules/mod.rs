@@ -196,6 +196,10 @@ pub struct Rule {
     pub raw_line: String,
     /// `$`-prefixed exact/important patterns win over normal ones.
     pub important: bool,
+    /// `!`-prefixed pattern: the rule applies to every request the pattern does
+    /// *not* match (`NON_RE`, `_original/lib/rules/rules.js:19`; the inversion
+    /// itself is at `rules.js:994-998`).
+    pub negate: bool,
     /// Extra `filter`/`includeFilter`/`excludeFilter` conditions.
     pub filters: Vec<Filter>,
     /// `lineProps://…` declared on this line (also mirrored onto every op).
@@ -595,11 +599,13 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
     pattern_toks
         .into_iter()
         .filter_map(|tok| {
+            let parsed = parse_pattern(tok)?;
             Some(Rule {
-                pattern: parse_pattern(tok)?,
+                pattern: parsed.pattern,
                 ops: ops.clone(),
                 raw_line: raw_line.to_string(),
-                important: tok.starts_with('$'),
+                important: parsed.important,
+                negate: parsed.negate,
                 filters: filters.clone(),
                 props: props.clone(),
             })
@@ -660,7 +666,10 @@ fn parse_filter(tok: &str) -> Option<Filter> {
 
 /// Heuristic: does this token read as a match pattern (vs. an operator)?
 fn looks_like_pattern(tok: &str) -> bool {
-    let t = tok.strip_prefix('$').unwrap_or(tok);
+    // Both pattern prefixes have to come off first, or `!/re/` and `!:8080`
+    // would not be recognised for what they are.
+    let t = tok.strip_prefix('!').unwrap_or(tok);
+    let t = t.strip_prefix('$').unwrap_or(t);
     if t.starts_with('/') || t.starts_with(':') {
         return true; // regexp or port pattern
     }
@@ -755,15 +764,43 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
     None
 }
 
-/// Parse a pattern token into a [`Pattern`].
-fn parse_pattern(tok: &str) -> Option<Pattern> {
-    // Port pattern: `:8080` scopes the rule to one port. Tested before the `$`
-    // prefix is peeled off, matching `PORT_PATTERN_RE`
-    // (`_original/lib/rules/rules.js:71`), which does not allow one.
+/// A pattern token after its `!` / `$` prefixes have been peeled off.
+struct ParsedPattern {
+    pattern: Pattern,
+    /// `$` — this port's important-rule shorthand. (Upstream spells importance
+    /// `lineProps://important` and uses `$` for exact-URL matching, so its
+    /// `!$url` "negative exact" form has no equivalent here.)
+    important: bool,
+    /// `!` — invert the pattern test.
+    negate: bool,
+}
+
+/// Parse a pattern token into a [`Pattern`] plus its prefix modifiers.
+///
+/// The order mirrors `parseRule` (`_original/lib/rules/rules.js:1235-1252`),
+/// whose `// 位置不能变` comment marks exactly this: `!` comes off first, the
+/// port-pattern test runs on what is left — so `!:8080` is a *negated* port
+/// pattern while `$:8080` is not a port pattern at all — and only then is the
+/// `$` prefix handled.
+fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
+    let (negate, tok) = match tok.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, tok),
+    };
+    let done = |pattern, important| {
+        Some(ParsedPattern {
+            pattern,
+            important,
+            negate,
+        })
+    };
+
+    // Port pattern: `:8080` scopes the rule to one port.
     if let Some(re) = port_pattern(tok) {
-        return Some(Pattern::Regex(re));
+        return done(Pattern::Regex(re), false);
     }
 
+    let important = tok.starts_with('$');
     let tok = tok.strip_prefix('$').unwrap_or(tok);
 
     // Regexp pattern: /body/flags
@@ -778,22 +815,32 @@ fn parse_pattern(tok: &str) -> Option<Pattern> {
                 }
                 pat.push_str(body);
                 if let Ok(re) = Regex::new(&pat) {
-                    return Some(Pattern::Regex(re));
+                    return done(Pattern::Regex(re), important);
                 }
             }
         }
+    }
+
+    // Everything below is a literal pattern, and whistle refuses to negate
+    // those: `parseWildcard` bails out for a negated wildcard
+    // (`rules.js:1171-1173`) and a negated plain pattern falls into the
+    // `else if (not) return;` at `rules.js:1266`. Dropping the rule — rather
+    // than inventing an inversion the original does not have — keeps a rules
+    // file behaving the same in both implementations.
+    if negate {
+        return None;
     }
 
     // Wildcard pattern → regex.
     if tok.contains('*') {
         let re = wildcard_to_regex(tok);
         if let Ok(re) = Regex::new(&re) {
-            return Some(Pattern::Regex(re));
+            return done(Pattern::Regex(re), important);
         }
     }
 
     // Scheme/host/path prefix.
-    Some(parse_prefix(tok))
+    done(parse_prefix(tok), important)
 }
 
 /// Compile a `:8080`-style port pattern.
@@ -1166,6 +1213,8 @@ mod pattern_tests {
         mgr.resolve(&req(url)).value("host").is_some()
     }
 
+    // ── `:port` patterns ──
+
     /// `:8080` scopes a rule to one port, on any host. It used to reach the
     /// prefix parser, which dropped the port and left an empty host — i.e. a
     /// pattern that quietly matched **every** request.
@@ -1187,6 +1236,20 @@ mod pattern_tests {
         assert!(hits(":80 host://1.1.1.1", "http://any.test:80/"));
     }
 
+    /// `!:8080` is recognised as *both* a port pattern and a negation — the
+    /// ordering upstream marks with `// 位置不能变`.
+    #[test]
+    fn negated_port_pattern() {
+        let text = "!:8080 host://1.1.1.1";
+        assert!(!hits(text, "http://any.test:8080/"));
+        assert!(hits(text, "http://any.test/"));
+        // …and it must not be mistaken for a `host:port` operator.
+        let rules = parse_text("!:8080 statusCode://418");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].ops.len(), 1);
+        assert_eq!(rules[0].ops[0].protocol, "statusCode");
+    }
+
     /// A port written into an ordinary pattern scopes it just the same —
     /// upstream matches the pattern as a literal prefix of the URL, port
     /// included.
@@ -1206,6 +1269,62 @@ mod pattern_tests {
     fn unparsable_port_does_not_widen_the_pattern() {
         assert!(!hits("example.test:99999 host://1.1.1.1", "http://example.test/"));
         assert!(!hits(": host://1.1.1.1", "http://example.test/"));
+    }
+
+    // ── `!` negation ──
+
+    /// `!/re/` matches every request the regexp does not
+    /// (`_original/lib/rules/rules.js:994-998`).
+    #[test]
+    fn negated_regexp_inverts_the_match() {
+        let text = "!/example\\.test/ host://1.1.1.1";
+        assert!(!hits(text, "http://example.test/"));
+        assert!(hits(text, "http://other.test/"));
+    }
+
+    /// Only the *pattern* test is inverted: filter conditions still have to
+    /// hold as written.
+    #[test]
+    fn negation_leaves_filters_alone() {
+        let text = "!/example\\.test/ host://1.1.1.1 filter://m:POST";
+        assert!(!hits(text, "http://other.test/"), "GET fails the filter");
+
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        let post = |url: &str| {
+            let mut r = req(url);
+            r.method = "POST".into();
+            r
+        };
+        assert!(mgr.resolve(&post("http://other.test/")).value("host").is_some());
+        assert!(
+            mgr.resolve(&post("http://example.test/")).value("host").is_none(),
+            "the negated pattern still excludes example.test"
+        );
+    }
+
+    /// Upstream refuses to negate a literal pattern: `parseWildcard` bails out
+    /// for a negated wildcard (`rules.js:1171-1173`) and a negated plain
+    /// pattern hits `else if (not) return;` (`rules.js:1266`). Both drop the
+    /// rule, so this port drops it too rather than inventing an inversion.
+    #[test]
+    fn literal_patterns_cannot_be_negated() {
+        assert!(parse_text("!example.test host://1.1.1.1").is_empty());
+        assert!(parse_text("!*.example.test host://1.1.1.1").is_empty());
+        // Other patterns on the same line are unaffected.
+        let rules = parse_text("!example.test other.test host://1.1.1.1");
+        assert_eq!(rules.len(), 1);
+        assert!(hits("!example.test other.test host://1.1.1.1", "http://other.test/"));
+    }
+
+    /// The `$` important shorthand still works, and survives a `!` in front.
+    #[test]
+    fn important_prefix_after_negation() {
+        let rules = parse_text("$example.test host://1.1.1.1");
+        assert!(rules[0].is_important());
+        assert!(!rules[0].negate);
+        // `!$…` parses as negate + important; being literal, it is dropped.
+        assert!(parse_text("!$example.test host://1.1.1.1").is_empty());
     }
 }
 
