@@ -463,7 +463,7 @@ fn serve_file_family(
             serve_file_bytes(&data, &path, info)
         }),
         // A cross (`x`/`xs`) rule falls through to the real server instead —
-        // including when the path was refused (`file-proxy.js:305-309`).
+        // including when the path was refused (`file-proxy.js:298-303`).
         None if cross => None,
         None => Some(
             Response::builder()

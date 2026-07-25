@@ -279,7 +279,7 @@ Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写
 |----------|------|
 | 路径先 `decodeURIComponent`，并截掉 `?`/`#` 之后的部分（`decodePath`，`util/index.js:1403-1418`） | 未实现。上游需要它是因为目录规则会把请求路径拼到值后面，whistle-rs 不拼；代价是 `file:///tmp/a%20b.json` 这种写法目前不会解码 |
 | 从 values 存储 / 远程 URL / 插件 key 解析文件 | 未实现 |
-| `file://` 的 Range 请求（206 + `content-range`，`file-proxy.js:102,160-172`） | 未实现，整份文件以 200 返回。Range 是可选的，客户端会自行处理；另外上游 `parseRange` 对 `bytes=-500` 这类后缀区间算错（`util/index.js:3358-3366`），复刻与否都需要额外决策 |
+| `file://` 的 Range 请求（206 + `content-range`，`file-proxy.js:102,166-176`） | 未实现，整份文件以 200 返回。Range 是可选的，客户端会自行处理；另外上游 `parseRange` 对 `bytes=-500` 这类后缀区间算错（`util/index.js:3364-3368`），复刻与否都需要额外决策 |
 | `rawfile://` 的**内联值**形式会删掉 `content-encoding`（`file-proxy.js:71-73`） | 无法触发：whistle-rs 的规则解析器不支持 `<...>` 内联值，文件族的值永远是路径 |
 
 ### 文件缓存
