@@ -186,6 +186,24 @@ one line are ANDed.
 | `filter://i:1.2.3.4` (or `ip:`, `clientIp:`) | client IP |
 | `filter://<regex>` | regex over the full request URL |
 
+**Divergences from upstream — a whistle rules file will not behave identically here.**
+Upstream's documented condition syntax is in `_original/docs/docs/rules/filters.md`;
+these are the differences, all verified against a running proxy:
+
+| Upstream | Here | Effect |
+|---|---|---|
+| `reqH.<key>:<pattern>` | `h:<key>=<value>` | Upstream's spelling falls through to the URL-regex fallback and **silently never matches** |
+| `resH.<key>:<pattern>` | — | Response headers aren't available at match time; not ported |
+| `s:<pattern>` | — | Response status; not ported |
+| `b:<pattern>` | — | Request body; not ported |
+| `chance:<probability>` | — | Random sampling; silently never matches |
+| `serverIp:<pattern>` | — | Not ported |
+| `i:<pattern>` | client IP only | Upstream matches the client **or** server IP |
+| `/regexp/i` as a condition value | exact match only | e.g. `m:/^P/` is not honoured |
+
+Unknown conditions fall through to the URL-regex fallback, so an unsupported filter
+makes its rule **inert** rather than firing wrongly — it fails closed, but silently.
+
 ```
 example.com   host://10.0.0.1   filter://m:POST        # only POST requests
 example.com   resHeaders://x-a=1   excludeFilter://i:127.0.0.1   # skip localhost
