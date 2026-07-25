@@ -301,6 +301,29 @@ pub fn resolve_refs(rules: &[&Rule], req: &ReqInfo) -> Resolved {
 /// suggest — is evaluated in the main scan loop for every protocol, not just the
 /// proxy family.
 pub fn resolve_refs_scoped(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> Resolved {
+    resolve_walk(rules, req, is_internal_req, true)
+}
+
+/// Like [`resolve_refs_scoped`] for a rule set that is resolved *once*: nothing
+/// is withheld, because no response phase will follow to supply it.
+///
+/// This is how rules that arrive mid-request are resolved — a plugin's, or a
+/// `rule://` / `rulesFile://` include. They are merged into the request's
+/// resolved set and then forgotten, so a response-phase operator withheld from
+/// them would never come back. Their response conditions fail closed instead,
+/// which is where the whole subsystem sat before the response phase existed.
+pub fn resolve_refs_once(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> Resolved {
+    resolve_walk(rules, req, is_internal_req, false)
+}
+
+/// The resolution walk. `defer_res_phase` withholds the operators a second pass
+/// will resolve; see [`resolve_response_ops`].
+fn resolve_walk(
+    rules: &[&Rule],
+    req: &ReqInfo,
+    is_internal_req: bool,
+    defer_res_phase: bool,
+) -> Resolved {
     let mut resolved = Resolved::default();
 
     // Two passes so important rules win: first important, then normal. Within a
@@ -316,9 +339,9 @@ pub fn resolve_refs_scoped(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool
             }
             // A line whose filters ask about the response has not said anything
             // about the response *yet*. Its response-phase operators are left
-            // for [`resolve_response_refs`], which is where upstream decides
+            // for [`resolve_response_ops`], which is where upstream decides
             // them too; everything else on the line applies now.
-            let defer_res = rule.needs_response_phase(req);
+            let defer_res = defer_res_phase && rule.needs_response_phase(req);
             for op in &rule.ops {
                 if defer_res && protocols::is_res_phase(&op.protocol) {
                     continue;
@@ -1480,6 +1503,29 @@ mod response_phase_tests {
         let mut bare = req("http://example.com/");
         bare.res = Some(res(200));
         assert!(mgr.resolve_response(&bare, false).is_some());
+    }
+
+    /// Rules that arrive mid-request — a plugin's, a `rule://` include — are
+    /// resolved once and then forgotten, so nothing may be withheld from them:
+    /// there is no second pass that would hand it back.
+    ///
+    /// The response condition fails closed there, as it did before the response
+    /// phase existed. Withholding instead would silently *lose* the operator.
+    #[test]
+    fn a_single_pass_resolution_withholds_nothing() {
+        let text = "example.com resHeaders://x-hit=1 excludeFilter://s:404\n";
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        let r = req("http://example.com/");
+        assert_eq!(
+            mgr.resolve_once(&r, false).value("resHeaders"),
+            Some("x-hit=1"),
+            "the exclude filter is inert, so the operator applies"
+        );
+        assert!(
+            mgr.resolve(&r).value("resHeaders").is_none(),
+            "the two-phase resolution waits for the response instead"
+        );
     }
 
     /// A rule that already applied keeps applying: a response condition on one

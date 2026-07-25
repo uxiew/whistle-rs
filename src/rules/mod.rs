@@ -821,6 +821,13 @@ impl RuleManager {
         matcher::resolve_refs_scoped(&rules, req, is_internal_req)
     }
 
+    /// Resolve everything in one pass, for a rule set that gets no second one —
+    /// see [`matcher::resolve_refs_once`].
+    pub fn resolve_once(&self, req: &ReqInfo, is_internal_req: bool) -> Resolved {
+        let rules: Vec<&Rule> = self.enabled_rules().map(|(_, rule)| rule).collect();
+        matcher::resolve_refs_once(&rules, req, is_internal_req)
+    }
+
     /// Could *any* enabled rule need a second, response-phase resolution?
     ///
     /// Answered from a flag each group precomputes when it parses, so the

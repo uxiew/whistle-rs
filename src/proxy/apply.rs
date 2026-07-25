@@ -158,7 +158,7 @@ fn replace_ci(haystack: &str, needle: &str, repl: &str) -> String {
 pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str, is_internal_req: bool) {
     let mut mgr = RuleManager::new();
     mgr.set_text(text);
-    merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+    merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
 }
 
 /// Fold a resolution of *another* rules text into `resolved`: existing
@@ -204,7 +204,7 @@ pub fn merge_included_rules(
     for text in texts {
         let mut mgr = RuleManager::new();
         mgr.set_text(&text);
-        merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+        merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
     }
 }
 
