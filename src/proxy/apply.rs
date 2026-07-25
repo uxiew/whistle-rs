@@ -167,43 +167,51 @@ pub fn merge_included_rules(
     }
 }
 
-/// Upstream-proxy operators in the order whistle prefers them, with the proxy
-/// kind each implies. Scheme-converting proxies are treated as plain HTTP
-/// proxies — this port does not implement the scheme flip.
-const PROXY_PROTOS: &[(&str, ProxyKind)] = &[
-    ("socks", ProxyKind::Socks),
-    ("https-proxy", ProxyKind::Https),
-    ("http-proxy", ProxyKind::Http),
-    ("proxy", ProxyKind::Http),
-    ("internal-https-proxy", ProxyKind::Https),
-    ("internal-proxy", ProxyKind::Http),
-    ("internal-http-proxy", ProxyKind::Http),
-    ("https2http-proxy", ProxyKind::Http),
-    ("http2https-proxy", ProxyKind::Http),
-];
+/// How to reach the proxy each upstream-proxy operator names.
+///
+/// Only the transport differs here. The scheme conversions the names promise
+/// are separate: `http2https-proxy` is handled in [`resolve_target`], and the
+/// `internal-*` family's whistle-to-whistle handshake is not implemented.
+fn proxy_kind(proto: &str) -> ProxyKind {
+    match proto {
+        "socks" => ProxyKind::Socks,
+        "https-proxy" | "internal-https-proxy" => ProxyKind::Https,
+        _ => ProxyKind::Http,
+    }
+}
 
 /// The protocol of the matched upstream-proxy rule, if one matched at all.
 /// Cheap on purpose: it answers "is there a proxy rule?" without parsing the
 /// value or evaluating a PAC script.
 fn matched_proxy_proto(resolved: &Resolved) -> Option<&'static str> {
-    PROXY_PROTOS
+    crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS
         .iter()
-        .map(|&(proto, _)| proto)
+        .copied()
         .find(|proto| resolved.value(proto).is_some())
 }
 
 /// The winning upstream proxy, with the protocol that supplied it so its line
 /// properties can be read back.
+///
+/// Note the fall-through: a proxy operator whose value is not a usable address
+/// is skipped, and the request ends up going direct. whistle commits to a proxy
+/// the moment its rule matches and only discovers the bad address at connect
+/// time (`_original/lib/inspectors/res.js:281-289`), so it fails the request
+/// instead. Saying so needs a `Target` that can hold "pinned to an unusable
+/// proxy", which `Option<ProxyConfig>` cannot.
 fn find_proxy(
     info: &ReqInfo,
     resolved: &Resolved,
 ) -> Option<(&'static str, super::upstream::ProxyConfig)> {
-    let direct = PROXY_PROTOS.iter().find_map(|&(proto, kind)| {
-        // A proxy URL may carry whistle's own query flags (`?proxyHost`), which
-        // are not part of the address.
-        let value = proxy_address(resolved.value(proto)?);
-        Some((proto, parse_proxy(kind, value)?))
-    });
+    let direct = crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS
+        .iter()
+        .copied()
+        .find_map(|proto| {
+            // A proxy URL may carry whistle's own query flags (`?proxyHost`),
+            // which are not part of the address.
+            let value = proxy_address(resolved.value(proto)?);
+            Some((proto, parse_proxy(proxy_kind(proto), value)?))
+        });
     if direct.is_some() {
         return direct;
     }
@@ -283,17 +291,30 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
         }
     }
 
-    let proxy = find_proxy(info, resolved)
-        .filter(|(proto, _)| proxy_survives_host(resolved, proto, host_rule.is_some()))
-        .map(|(_, cfg)| cfg);
+    let winner = find_proxy(info, resolved)
+        .filter(|(proto, _)| proxy_survives_host(resolved, proto, host_rule.is_some()));
+
+    // `http2https-proxy://` reaches the origin over TLS even when the request
+    // arrived as plain http: upstream rewrites the scheme before deciding how to
+    // make the hop (`options.protocol = 'https:'`,
+    // `_original/lib/inspectors/res.js:235-237`), which in turn forces a CONNECT
+    // tunnel instead of an absolute-form request. Without this the request
+    // travels in cleartext to an origin the rule said to encrypt to.
+    //
+    // Upstream guards the rewrite with `if (!hostIp)`, but `hostIp` is set only
+    // when the proxy *lost* to a `host://` rule — whenever a proxy survives to
+    // be used it is unset (`getProxy` calls back with no arguments on that path,
+    // `_original/lib/rules/index.js:242-246`) — so the guard never fires here.
+    let scheme_is_tls = info.scheme == "https" || info.scheme == "wss";
+    let upgrades_scheme = matches!(&winner, Some((proto, _)) if *proto == "http2https-proxy");
 
     Target {
         connect_host,
         connect_port,
-        tls: info.scheme == "https" || info.scheme == "wss",
+        tls: scheme_is_tls || upgrades_scheme,
         sni: info.host.clone(),
         request_port: info.port,
-        proxy,
+        proxy: winner.map(|(_, cfg)| cfg),
         tls_versions: resolved
             .value("cipher")
             .map(parse_cipher_versions)
@@ -3456,6 +3477,37 @@ mod tests {
         let p3 = resolve_target(&info, &r3).proxy.expect("xproxy");
         assert_eq!(p3.kind, ProxyKind::Http);
         assert_eq!(p3.port, 3128);
+    }
+
+    /// `http2https-proxy://` encrypts the origin hop even for an `http://`
+    /// request (`_original/lib/inspectors/res.js:235-237`). Getting this wrong
+    /// sends in cleartext what the rule asked to encrypt.
+    #[test]
+    fn http2https_proxy_upgrades_the_origin_hop_to_tls() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+
+        let r = resolve("a.com http2https-proxy://1.2.3.4:8080\n", "http://a.com/");
+        let t = resolve_target(&info, &r);
+        assert!(t.proxy.is_some(), "the proxy itself still applies");
+        assert!(t.tls, "the origin hop is TLS despite the http request");
+
+        // The sibling conversions do not touch the origin scheme.
+        for proto in ["https2http-proxy", "http-proxy", "proxy", "internal-proxy"] {
+            let r = resolve(&format!("a.com {proto}://1.2.3.4:8080\n"), "http://a.com/");
+            assert!(
+                !resolve_target(&info, &r).tls,
+                "{proto} must leave an http origin as http"
+            );
+        }
+
+        // And a proxy that lost to `host://` cannot upgrade anything.
+        let r = resolve(
+            "a.com http2https-proxy://1.2.3.4:8080\na.com host://10.0.0.9\n",
+            "http://a.com/",
+        );
+        let t = resolve_target(&info, &r);
+        assert!(t.proxy.is_none(), "host:// wins by default");
+        assert!(!t.tls, "no proxy survived, so no scheme upgrade");
     }
 
     #[test]
