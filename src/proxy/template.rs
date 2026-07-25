@@ -14,7 +14,9 @@
 //! 2. **Built-in variables** (`_original/lib/rules/rules.js:715` `resolveTplVar`)
 //!    — `${name}`, `${name.key}`, `${{name}}` (URI-encoded) and `$${name}` (raw,
 //!    undecoded) are resolved against a *fixed whitelist* of request facts.
-//!    Names outside the whitelist are left untouched.
+//!    Names outside the whitelist are left untouched. A resolved value can be
+//!    post-processed by a `.replace(pattern,replacement)` modifier
+//!    (`rules.js:725-752`).
 //!
 //! Both passes only run when the body contains something shaped like `{...}`
 //! (`VAR_RE = /\{\S+\}/`, `file-proxy.js:15,360`), so a template with no
@@ -76,10 +78,24 @@ static TPL_VAR: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
-/// A `.replace(...)` suffix on a variable key, e.g. `${url.replace(/a/,b)}`.
-/// whistle applies the replacement (`rules.js:81,720`); whistle-rs does not,
-/// and leaves such placeholders untouched rather than mis-rendering them.
-static REPLACE_SUFFIX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(?:^|\.)replace\(.+\)$").unwrap());
+/// whistle's `REPLACE_PATTERN_RE` (`rules.js:81`): a `.replace(...)` suffix on a
+/// variable key, e.g. `${url.replace(/a/g,b)}`. The suffix is a modifier on the
+/// resolved *value*, not part of the key.
+static REPLACE_SUFFIX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(^|\.)replace\((.+)\)$").unwrap());
+
+/// whistle's `ORIG_REG_EXP` (`_original/lib/util/index.js:610`): the `/…/flags`
+/// spelling that turns a replace pattern into a real regular expression.
+static JS_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/(.+)/([igmu]{0,4})$").unwrap());
+
+/// whistle's `SUB_MATCH_RE` (`rules.js:16`): does a replacement reference the
+/// match at all? Only then does whistle use its own expander instead of
+/// JavaScript's native one (`rules.js:746-751`).
+static HAS_SUB_MATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$[&\d]").unwrap());
+
+/// whistle's back-reference token (`replace-pattern-transform.js:6`), minus its
+/// `^` alternative: `(^|\\{0,2})` and `(\\{0,2})` accept the same text at every
+/// position, because the backslash run may be empty.
+static SUB_MATCH: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\\{0,2})(\$\$?(b)?[&\d])").unwrap());
 
 /// Render a template body against the current request.
 ///
@@ -158,10 +174,18 @@ fn interpolate_vars(body: &str, info: &ReqInfo, query: &Query, env: ProxyEnv<'_>
                 return all.to_string();
             }
             let name = &caps[3];
-            let key = caps.get(4).map(|m| m.as_str());
+            // A trailing `.replace(...)` modifies the value, so it has to come
+            // off the key before the variable is resolved (`rules.js:725-733`).
+            let (key, modifier) = match split_modifier(caps.get(4).map(|m| m.as_str())) {
+                Modifier::Parsed(key, modifier) => (key, modifier),
+                Modifier::Unsupported => return all.to_string(),
+            };
             let Some(mut value) = resolve_var(info, query, raw, name, key, env) else {
                 return all.to_string();
             };
+            if let Some(modifier) = modifier {
+                value = modifier.apply(value);
+            }
             if encode && !value.is_empty() {
                 value = encode_uri_component(&value);
             }
@@ -176,9 +200,8 @@ fn interpolate_vars(body: &str, info: &ReqInfo, query: &Query, env: ProxyEnv<'_>
 
 /// Resolve one whitelisted variable.
 ///
-/// `None` means "leave the placeholder in the output": either whistle-rs has no
-/// data source for the name (config-derived variables, `${whistle.*}`) or the
-/// key uses a feature that is not implemented (`.replace(...)`).
+/// `None` means "leave the placeholder in the output": whistle-rs has no data
+/// source for the name (client identity, `${whistle.*}` plugin values).
 fn resolve_var(
     info: &ReqInfo,
     query: &Query,
@@ -187,9 +210,6 @@ fn resolve_var(
     key: Option<&str>,
     env: ProxyEnv<'_>,
 ) -> Option<String> {
-    if key.is_some_and(|k| REPLACE_SUFFIX.is_match(k)) {
-        return None;
-    }
     let lname = name.to_ascii_lowercase();
     if let Some(n) = random_int_bounds(&lname) {
         return Some(n.to_string());
@@ -301,6 +321,285 @@ fn random_int_bounds(lname: &str) -> Option<u64> {
         return Some(0);
     }
     Some(min + next_random_u64() % (max + 1))
+}
+
+// ---------------------------------------------------------------------------
+// The `.replace(pattern,replacement)` modifier
+// ---------------------------------------------------------------------------
+
+/// What splitting a `.replace(...)` suffix off a variable key produced.
+enum Modifier<'a> {
+    /// The key with the suffix removed — `None` once nothing is left, which is
+    /// how whistle's falsy `''` behaves — and the modifier, when one was written.
+    Parsed(Option<&'a str>, Option<Replace>),
+    /// A `/…/flags` pattern JavaScript accepts and the `regex` crate does not
+    /// (look-around, back-references). The placeholder is then left verbatim
+    /// rather than rendered with the modifier silently dropped.
+    Unsupported,
+}
+
+/// Split a trailing `.replace(pattern,replacement)` off a variable key.
+fn split_modifier(key: Option<&str>) -> Modifier<'_> {
+    let Some(key) = key else {
+        return Modifier::Parsed(None, None);
+    };
+    let Some(caps) = REPLACE_SUFFIX.captures(key) else {
+        return Modifier::Parsed(Some(key), None);
+    };
+    // The suffix is anchored at the end, so what precedes the match is the key
+    // (`key.substring(0, key.length - 9 - dot.length - pattern.length)`,
+    // `rules.js:729`).
+    let rest = &key[..caps.get(0).expect("group 0 always exists").start()];
+    match Replace::parse(&caps[2]) {
+        Some(replace) => Modifier::Parsed((!rest.is_empty()).then_some(rest), Some(replace)),
+        None => Modifier::Unsupported,
+    }
+}
+
+/// A parsed `.replace(pattern,replacement)` modifier (`rules.js:725-752`).
+struct Replace {
+    /// The search pattern, commas unescaped. An *empty* pattern is meaningful:
+    /// the modifier then supplies a default value instead of replacing anything.
+    pattern: String,
+    replacement: String,
+    /// Set when the pattern was written as `/…/flags`.
+    regex: Option<Regex>,
+    /// The `g` flag — replace every match rather than only the first.
+    global: bool,
+}
+
+impl Replace {
+    /// Parse the raw text between `replace(` and `)`.
+    ///
+    /// `None` means the pattern is a regex whistle-rs cannot compile; see
+    /// [`Modifier::Unsupported`].
+    fn parse(arg: &str) -> Option<Replace> {
+        // Pattern and replacement are separated by the first *unescaped* comma.
+        // whistle parks escaped commas on control characters while it splits
+        // (`COMMA1_RE`/`COMMA2_RE` and `resetComma`, `rules.js:711-713,730-736`),
+        // so `\,` survives as a literal comma and `\\,` as a literal `\,`.
+        let mut pattern = arg.to_string();
+        let mut replacement = String::new();
+        if pattern.contains(',') {
+            let escaped = pattern.replace("\\\\,", "\n").replace("\\,", "\r");
+            pattern = match escaped.split_once(',') {
+                Some((p, r)) => {
+                    replacement = reset_comma(r);
+                    reset_comma(p)
+                }
+                None => reset_comma(&escaped),
+            };
+        }
+
+        let mut regex = None;
+        let mut global = false;
+        if let Some(caps) = JS_REGEX.captures(&pattern) {
+            let flags = &caps[2];
+            // Repeated flags make `new RegExp` throw, and whistle's
+            // `toOriginalRegExp` then returns null — i.e. a literal replace of
+            // the `/…/` text itself (`util/index.js:623-631`).
+            let repeated = flags
+                .char_indices()
+                .any(|(i, c)| flags[..i].contains(c));
+            if !repeated {
+                let mut inline = String::new();
+                if flags.contains('i') {
+                    inline.push('i');
+                }
+                if flags.contains('m') {
+                    inline.push('m');
+                }
+                // `u` needs no translation: the `regex` crate is Unicode-aware
+                // by default.
+                let source = match inline.is_empty() {
+                    true => caps[1].to_string(),
+                    false => format!("(?{inline}){}", &caps[1]),
+                };
+                regex = Some(Regex::new(&source).ok()?);
+                global = flags.contains('g');
+            }
+        }
+        Some(Replace {
+            pattern,
+            replacement,
+            regex,
+            global,
+        })
+    }
+
+    /// Apply the modifier to a resolved variable value.
+    fn apply(&self, value: String) -> String {
+        // `val = pattern ? val : val || replacement` (`rules.js:744-746`): with
+        // an empty pattern the modifier stops replacing and becomes a *default*,
+        // which is how `${query.x.replace(,fallback)}` is written.
+        if self.pattern.is_empty() {
+            return match value.is_empty() {
+                true => self.replacement.clone(),
+                false => value,
+            };
+        }
+        if value.is_empty() {
+            return value;
+        }
+        match &self.regex {
+            // whistle only routes through its own expander when the replacement
+            // actually references the match (`rules.js:746-751`).
+            Some(re) if HAS_SUB_MATCH.is_match(&self.replacement) => {
+                self.replace_with(re, &value, expand_sub_match)
+            }
+            Some(re) => self.replace_with(re, &value, expand_native),
+            // A plain substring pattern goes through `String.prototype.replace`,
+            // which rewrites only the first occurrence and has no capture groups.
+            None => match value.find(&self.pattern) {
+                Some(at) => {
+                    let end = at + self.pattern.len();
+                    let parts = MatchParts {
+                        groups: vec![Some(value[at..end].to_string())],
+                        before: &value[..at],
+                        after: &value[end..],
+                    };
+                    let mut out = String::with_capacity(value.len());
+                    out.push_str(&value[..at]);
+                    out.push_str(&expand_native(&self.replacement, &parts));
+                    out.push_str(&value[end..]);
+                    out
+                }
+                None => value,
+            },
+        }
+    }
+
+    /// Run a compiled pattern over `value`, honouring the `g` flag.
+    fn replace_with(
+        &self,
+        re: &Regex,
+        value: &str,
+        expand: fn(&str, &MatchParts<'_>) -> String,
+    ) -> String {
+        let substitute = |caps: &Captures| {
+            let whole = caps.get(0).expect("group 0 always exists");
+            let parts = MatchParts {
+                groups: caps.iter().map(|g| g.map(|g| g.as_str().to_string())).collect(),
+                before: &value[..whole.start()],
+                after: &value[whole.end()..],
+            };
+            expand(&self.replacement, &parts)
+        };
+        match self.global {
+            true => re.replace_all(value, substitute).into_owned(),
+            false => re.replace(value, substitute).into_owned(),
+        }
+    }
+}
+
+/// whistle's `resetComma` (`rules.js:711-713`): put the escaped commas back,
+/// `\r` as a literal comma and `\n` as a literal `\,`.
+fn reset_comma(s: &str) -> String {
+    s.replace('\r', ",").replace('\n', "\\,")
+}
+
+/// The pieces a replacement's `$`-expansion can refer to.
+struct MatchParts<'a> {
+    /// Index 0 is the whole match, 1.. the capture groups.
+    groups: Vec<Option<String>>,
+    /// Text before the match, for ``$` ``.
+    before: &'a str,
+    /// Text after the match, for `$'`.
+    after: &'a str,
+}
+
+impl MatchParts<'_> {
+    fn group(&self, index: usize) -> &str {
+        self.groups
+            .get(index)
+            .and_then(|g| g.as_deref())
+            .unwrap_or_default()
+    }
+}
+
+/// JavaScript's native replacement-string expansion: `$$`, `$&`, ``$` ``, `$'`
+/// and `$1`..`$99`.
+///
+/// A `$n` past the last capture group stays verbatim — which is why a `$1`
+/// written against a *plain substring* pattern survives into the output.
+fn expand_native(replacement: &str, parts: &MatchParts<'_>) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut rest = replacement;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 1..];
+        let bytes = tail.as_bytes();
+        // `used` is how much of `tail` the token consumed; 0 leaves the `$`
+        // itself in the output and re-examines the rest on the next pass.
+        let (text, used): (&str, usize) = match bytes.first() {
+            Some(b'$') => ("$", 1),
+            Some(b'&') => (parts.group(0), 1),
+            Some(b'`') => (parts.before, 1),
+            Some(b'\'') => (parts.after, 1),
+            Some(d) if d.is_ascii_digit() => {
+                let two = bytes
+                    .get(1)
+                    .filter(|c| c.is_ascii_digit())
+                    .map(|c| (d - b'0') as usize * 10 + (c - b'0') as usize);
+                // The two-digit form wins only when it names a real group.
+                match two.filter(|n| parts.groups.get(*n).is_some() && *n > 0) {
+                    Some(n) => (parts.group(n), 2),
+                    None => {
+                        let n = (d - b'0') as usize;
+                        match parts.groups.get(n).is_some() && n > 0 {
+                            true => (parts.group(n), 1),
+                            false => ("$", 0),
+                        }
+                    }
+                }
+            }
+            _ => ("$", 0),
+        };
+        out.push_str(text);
+        rest = &tail[used..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// whistle's own back-reference expander (`replacePattern`,
+/// `_original/lib/util/replace-pattern-transform.js:64-90`).
+///
+/// On top of `$&` and `$0`..`$9` it understands `$$&` (URI-encode the
+/// substitution) and `\$&` (emit the token literally, `\\$&` a backslash then
+/// the value).
+fn expand_sub_match(replacement: &str, parts: &MatchParts<'_>) -> String {
+    SUB_MATCH
+        .replace_all(replacement, |caps: &Captures| {
+            let slashes = &caps[1];
+            let token = &caps[2];
+            // `$b&` selects whistle's *body* value list, which `resolveTplVar`
+            // never passes (`rules.js:750`); upstream then emits the token
+            // unchanged, and so do we.
+            if caps.get(3).is_some() {
+                return format!("{slashes}{token}");
+            }
+            // `\$&` escapes the token; `\\$&` keeps one backslash before the value.
+            if slashes == "\\" {
+                return token.to_string();
+            }
+            let prefix = match slashes {
+                "\\\\" => "\\",
+                other => other,
+            };
+            let encode = token.as_bytes().get(1) == Some(&b'$');
+            let selector = &token[if encode { 2 } else { 1 }..];
+            let index = match selector {
+                "&" => 0,
+                digit => digit.parse().unwrap_or(0),
+            };
+            let value = parts.group(index);
+            match encode && !value.is_empty() {
+                true => format!("{prefix}{}", encode_uri_component(value)),
+                false => format!("{prefix}{value}"),
+            }
+        })
+        .into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -750,9 +1049,127 @@ mod tests {
         assert_eq!(render("${host}:${port}", &req("http://x.com/?a=1", &[]), bound), "127.0.0.1:1234");
     }
 
+    // -- pass 2: the `.replace(...)` modifier -------------------------------
+
     #[test]
-    fn replace_suffix_is_left_verbatim() {
-        let body = "${url.replace(/a/,b)}";
+    fn replace_substitutes_a_plain_substring() {
+        // A string pattern goes through `String.replace`, which rewrites only
+        // the first occurrence.
+        assert_eq!(
+            render_url("${query.replace(a,Z)}", "http://x.com/?a=1&ba=2"),
+            "Z=1&ba=2"
+        );
+        assert_eq!(render_url("${method.replace(GET,PUT)}", "http://x.com/?a=1"), "PUT");
+    }
+
+    #[test]
+    fn replace_keeps_the_rest_of_the_key() {
+        // `${query.<name>.replace(...)}` must still resolve `<name>`.
+        assert_eq!(
+            render_url("${query.who.replace(world,there)}", "http://x.com/?who=hello%20world"),
+            "hello there"
+        );
+    }
+
+    #[test]
+    fn replace_accepts_a_regexp_pattern_with_flags() {
+        // `/…/flags` becomes a real regex (`toOriginalRegExp`); `g` replaces
+        // every match, `i` ignores case, and without `g` only the first.
+        assert_eq!(
+            render_url("${url.replace(/A/gi,-)}", "http://x.com/a/A?a=1"),
+            "http://x.com/-/-?-=1"
+        );
+        assert_eq!(
+            render_url("${url.replace(/a/i,-)}", "http://x.com/A/a?a=1"),
+            "http://x.com/-/a?a=1"
+        );
+    }
+
+    #[test]
+    fn replace_expands_back_references() {
+        assert_eq!(
+            render_url("${query.v.replace(/b(c)/,[$&|$1])}", "http://x.com/?v=abcd"),
+            "a[bc|c]d"
+        );
+        // `$$1` URI-encodes the group, `\$1` emits the token literally.
+        assert_eq!(
+            render_url("${query.v.replace(/(.+)/,$$1)}", "http://x.com/?v=a%2Fb"),
+            "a%2Fb"
+        );
+        assert_eq!(
+            render_url(r"${query.v.replace(/(x)/,\$1)}", "http://x.com/?v=x"),
+            "$1"
+        );
+    }
+
+    #[test]
+    fn replace_back_reference_needs_a_regexp() {
+        // With a plain substring pattern there are no capture groups, so JS
+        // leaves `$1` alone while still expanding `$&`.
+        assert_eq!(
+            render_url("${query.v.replace(b,[$&$1])}", "http://x.com/?v=abc"),
+            "a[b$1]c"
+        );
+    }
+
+    #[test]
+    fn replace_unescapes_commas() {
+        // `\,` is a literal comma inside the arguments (`resetComma`).
+        assert_eq!(
+            render_url(r"${query.v.replace(a\,b,-)}", "http://x.com/?v=1a,b2"),
+            "1-2"
+        );
+        assert_eq!(
+            render_url(r"${query.v.replace(x,a\,b)}", "http://x.com/?v=x"),
+            "a,b"
+        );
+        // `\\,` survives as a literal `\,`.
+        assert_eq!(
+            render_url(r"${query.v.replace(x,a\\,b)}", "http://x.com/?v=x"),
+            r"a\,b"
+        );
+    }
+
+    #[test]
+    fn empty_pattern_makes_the_replacement_a_default() {
+        // `val = pattern ? val : val || replacement` (rules.js:744-746).
+        assert_eq!(
+            render_url("${query.missing.replace(,fallback)}", "http://x.com/?a=1"),
+            "fallback"
+        );
+        assert_eq!(
+            render_url("${query.v.replace(,fallback)}", "http://x.com/?v=set"),
+            "set"
+        );
+        // An empty value with a *non*-empty pattern stays empty — no default.
+        assert_eq!(
+            render_url("[${query.missing.replace(a,fallback)}]", "http://x.com/?a=1"),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn replace_with_no_replacement_deletes() {
+        assert_eq!(
+            render_url("${query.v.replace(/[0-9]/g)}", "http://x.com/?v=a1b2"),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn replace_composes_with_uri_encoding() {
+        // The modifier runs before `${{...}}` encodes the result.
+        assert_eq!(
+            render_url("${{query.v.replace(b,/)}}", "http://x.com/?v=a-b"),
+            "a-%2F"
+        );
+    }
+
+    #[test]
+    fn unsupported_regexp_leaves_the_placeholder_verbatim() {
+        // Look-around has no `regex`-crate equivalent; rendering it as a no-op
+        // would silently lie about what the template did.
+        let body = "${url.replace(/(?=a)/g,-)}";
         assert_eq!(render_url(body, "http://x.com/?a=1"), body);
     }
 
