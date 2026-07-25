@@ -957,6 +957,19 @@ struct Deletions {
     drop_type: bool,
     /// `delete://resCharset` — drop the charset, keeping the media type.
     drop_charset: bool,
+    /// `delete://body` / `delete://res.body` — empty the body outright, which
+    /// also discards anything an operator meant to inject (`removeBody`,
+    /// `_original/lib/util/index.js:3592-3598`).
+    drop_body: bool,
+    /// `delete://resBody.a.b` — dotted paths to remove from a JSON body.
+    body_props: Vec<String>,
+}
+
+impl Deletions {
+    /// True when a `delete://` key on its own needs the body buffered.
+    fn touches_body(&self) -> bool {
+        self.drop_body || !self.body_props.is_empty()
+    }
 }
 
 impl Deletions {
@@ -983,10 +996,14 @@ impl Deletions {
                     if request_side {
                         del.cookies.push(name.to_string());
                     }
+                } else if let Some(path) = strip_del_scope(key, side, "B", "ody") {
+                    del.body_props.push(path.to_string());
                 } else if key == format!("{side}Type") || key == format!("{side}.type") {
                     del.drop_type = true;
                 } else if key == format!("{side}Charset") || key == format!("{side}.charset") {
                     del.drop_charset = true;
+                } else if key == "body" || key == format!("{side}.body") {
+                    del.drop_body = true;
                 }
             }
         }
@@ -1726,6 +1743,10 @@ fn body_ops_present(resolved: &Resolved, prefix: &str) -> bool {
     if generic {
         return true;
     }
+    // `delete://body` and `delete://resBody.a` rewrite the body on their own.
+    if Deletions::of(resolved, prefix == "req").touches_body() {
+        return true;
+    }
     if prefix == "res" && resolved.value("resMerge").is_some() {
         return true;
     }
@@ -1950,6 +1971,11 @@ pub fn wants_res_body(resolved: &Resolved) -> bool {
 /// `_original/lib/inspectors/req.js:129-130,573`), so a substitution *does* see
 /// what `reqPrepend`/`reqAppend` put there — the opposite of the response side.
 pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
+    // `delete://body` wipes the body *and* anything an operator meant to put
+    // around it (`removeBody`, `_original/lib/util/index.js:3592-3598`).
+    if Deletions::of(resolved, true).drop_body {
+        return Bytes::new();
+    }
     // Request bodies are never injection-gated: whistle's request transform
     // leaves `isHtml` unset, so `allowInject` lets every operator through.
     let gate = InjectionGate::plain(resolved);
@@ -1974,13 +2000,17 @@ pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
 /// substitution never sees prepended or appended content, and `resBody`
 /// discards whatever `resMerge`/`resReplace` produced.
 pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option<&str>) -> Bytes {
+    let del = Deletions::of(resolved, false);
+    if del.drop_body {
+        return Bytes::new();
+    }
     let class = content_type.and_then(res_class);
     let families = BodyFamilies::of(class);
     // The gate is built from the body as it arrived: whistle decides once, from
     // the *original* first non-whitespace byte, whether injection is allowed.
     let gate = InjectionGate::new(resolved, families.html, &body);
 
-    let mut data = apply_res_merge(body.to_vec(), resolved, class);
+    let mut data = apply_res_merge(body.to_vec(), resolved, class, &del);
     data = apply_replace(data, resolved, "resReplace", class);
 
     let injection = collect_res_injection(&gate, families);
@@ -2127,10 +2157,18 @@ impl<'a> InjectionGate<'a> {
 /// merges into the **first JSON-looking substring** rather than the whole body
 /// (`JSON_RE`, `res.js:846`), which is what lets it patch a JSONP payload
 /// without disturbing the callback wrapper.
-fn apply_res_merge(data: Vec<u8>, resolved: &Resolved, class: Option<ResClass>) -> Vec<u8> {
-    let Some(patch_src) = resolved.value("resMerge") else {
+/// `del` carries the `delete://resBody.a.b` paths, which ride the same
+/// transform and are therefore gated the same way.
+fn apply_res_merge(
+    data: Vec<u8>,
+    resolved: &Resolved,
+    class: Option<ResClass>,
+    del: &Deletions,
+) -> Vec<u8> {
+    let patch = resolved.value("resMerge");
+    if patch.is_none() && del.body_props.is_empty() {
         return data;
-    };
+    }
     let applies = matches!(
         class,
         None | Some(ResClass::Js) | Some(ResClass::Html) | Some(ResClass::Json)
@@ -2138,8 +2176,11 @@ fn apply_res_merge(data: Vec<u8>, resolved: &Resolved, class: Option<ResClass>) 
     if !applies {
         return data;
     }
-    let Ok(patch) = serde_json::from_str::<serde_json::Value>(patch_src) else {
-        return data;
+    let patch = match patch.map(serde_json::from_str::<serde_json::Value>) {
+        Some(Ok(patch)) => Some(patch),
+        // A `resMerge` that is not JSON leaves only the deletions to do.
+        Some(Err(_)) => None,
+        None => None,
     };
     let text = match String::from_utf8(data) {
         Ok(text) => text,
@@ -2148,6 +2189,10 @@ fn apply_res_merge(data: Vec<u8>, resolved: &Resolved, class: Option<ResClass>) 
     };
     // An empty body is replaced by the patch outright (`res.js:1049-1054`).
     if text.is_empty() {
+        let Some(mut patch) = patch else {
+            return Vec::new();
+        };
+        delete_json_props(&mut patch, &del.body_props);
         return serde_json::to_vec(&patch).unwrap_or_default();
     }
     // For HTML (and for a typeless response) whistle gives up unless the body
@@ -2162,11 +2207,54 @@ fn apply_res_merge(data: Vec<u8>, resolved: &Resolved, class: Option<ResClass>) 
     let Ok(mut base) = serde_json::from_str::<serde_json::Value>(&text[start..end]) else {
         return text.into_bytes();
     };
-    json_deep_merge(&mut base, &patch);
+    if let Some(patch) = &patch {
+        json_deep_merge(&mut base, patch);
+    }
+    delete_json_props(&mut base, &del.body_props);
     let Ok(merged) = serde_json::to_string(&base) else {
         return text.into_bytes();
     };
     format!("{}{merged}{}", &text[..start], &text[end..]).into_bytes()
+}
+
+/// Remove dotted paths from a JSON value (`deleteProps` →
+/// `_original/lib/util/common.js:989-1084`). A numeric segment addressing an
+/// array element splices it out. The `\.`-escaped and `a[0]` spellings upstream
+/// also accepts are not ported.
+fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
+    for path in paths {
+        let mut keys = path.split('.').map(str::trim).peekable();
+        let mut node = &mut *value;
+        while let Some(key) = keys.next() {
+            if keys.peek().is_none() {
+                match node {
+                    serde_json::Value::Object(map) => {
+                        map.remove(key);
+                    }
+                    serde_json::Value::Array(list) => {
+                        if let Ok(i) = key.parse::<usize>() {
+                            if i < list.len() {
+                                list.remove(i);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                break;
+            }
+            let next = match node {
+                serde_json::Value::Object(map) => map.get_mut(key),
+                serde_json::Value::Array(list) => {
+                    key.parse::<usize>().ok().and_then(|i| list.get_mut(i))
+                }
+                _ => None,
+            };
+            match next {
+                Some(next) => node = next,
+                None => break,
+            }
+        }
+    }
 }
 
 /// The span whistle's `JSON_RE` (`/{[\w\W]*}|\[[\w\W]*\]/`, `res.js:846`) picks
@@ -2699,6 +2787,38 @@ mod tests {
         assert_eq!(v["b"], 1); // kept
         assert_eq!(v["c"]["d"], 1); // added
         assert_eq!(v["c"]["e"], 2); // kept (deep merge)
+    }
+
+    /// `delete://` reaches the body too: a bare `body` empties it (discarding
+    /// any injection with it), and `resBody.<path>` removes a JSON property.
+    #[test]
+    fn delete_reaches_the_body() {
+        let resolved = resolve(
+            "example.com/x delete://body\nexample.com/x resAppend://tail\n",
+            "http://example.com/x",
+        );
+        assert!(wants_res_body(&resolved));
+        let out = transform_res_body(Bytes::from_static(b"keep?"), &resolved, Some("text/plain"));
+        assert_eq!(&out[..], b"");
+
+        let resolved = resolve(
+            "example.com/x delete://resBody.a&resB.c.d\n",
+            "http://example.com/x",
+        );
+        assert!(wants_res_body(&resolved));
+        let out = transform_res_body(
+            Bytes::from_static(br#"{"a":1,"b":2,"c":{"d":3,"e":4}}"#),
+            &resolved,
+            Some("application/json"),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("a").is_none() && v["c"].get("d").is_none());
+        assert_eq!((v["b"].as_i64(), v["c"]["e"].as_i64()), (Some(2), Some(4)));
+
+        // `req.body` is the request's alone.
+        let resolved = resolve("example.com/x delete://req.body\n", "http://example.com/x");
+        assert!(wants_req_body(&resolved) && !wants_res_body(&resolved));
+        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved)[..], b"");
     }
 
     /// The `/regexp/flags` form follows JavaScript's `String#replace`: without
