@@ -81,6 +81,21 @@ impl LineProps {
         }
     }
 
+    /// Build properties from explicit action names, as if a line had declared
+    /// them.
+    ///
+    /// The proxy layer folds the request-scoped `enable://safeHtml` /
+    /// `enable://strictHtml` switches into the same gate as the per-line ones —
+    /// upstream stamps them onto every injecting rule of the request
+    /// (`_original/lib/inspectors/res.js:970-987`).
+    pub fn from_actions<'a>(actions: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut props = LineProps::default();
+        for action in actions {
+            props.merge(action);
+        }
+        props
+    }
+
     /// Is `action` set on this line?
     pub fn has(&self, action: &str) -> bool {
         self.actions.contains(action)

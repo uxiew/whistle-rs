@@ -18,7 +18,7 @@ use once_cell::sync::Lazy;
 
 use super::body::{self, DynBody};
 use super::upstream::{ProxyKind, Target, parse_proxy};
-use crate::rules::{ReqInfo, Resolved, RuleManager};
+use crate::rules::{LineProps, ReqInfo, Resolved, RuleManager};
 
 /// Build the request facts the matcher needs.
 pub fn build_req_info(
@@ -1021,6 +1021,73 @@ pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option
     transform_body(body, resolved, "res", content_type)
 }
 
+/// Decides, per operator, whether its content may be injected into a response
+/// body — the `safeHtml` / `strictHtml` line properties.
+///
+/// Ported from `WhistleTransform#allowInject` + `filterHtml`
+/// (`_original/lib/util/whistle-transform.js:66-89`). Three things matter:
+///
+/// * the decision looks at the **original** upstream body, before any operator
+///   has rewritten it, and at its first non-whitespace byte only;
+/// * only HTML responses are gated — `allowInject` returns `true` immediately
+///   for anything else (`whistle-transform.js:68`), so `safeHtml` on a `jsAppend`
+///   for a JavaScript response does nothing;
+/// * the gate is **per line**: whistle marks each injected buffer with the
+///   properties of the rule line that produced it (`_original/lib/util/index.js:1375-1381`)
+///   and filters them individually, so one line may inject while another on the
+///   same request is refused.
+struct InjectionGate<'a> {
+    resolved: &'a Resolved,
+    /// The unmodified upstream body the decision is made from.
+    body: &'a [u8],
+    /// False when nothing is gated (non-HTML response, or the request side).
+    html: bool,
+    /// `enable://safeHtml` / `enable://strictHtml`, which upstream stamps onto
+    /// every injecting rule of the request (`_original/lib/inspectors/res.js:970-987`).
+    global: LineProps,
+}
+
+impl<'a> InjectionGate<'a> {
+    fn new(
+        resolved: &'a Resolved,
+        prefix: &str,
+        content_type: Option<&str>,
+        body: &'a [u8],
+    ) -> Self {
+        // Request bodies are never gated: whistle's request transform leaves
+        // `isHtml` unset, so `allowInject` lets every operator through.
+        let html = prefix == "res" && content_type.and_then(typed_body_kind) == Some("html");
+        let global = if html {
+            let enabled = enabled_flags(resolved);
+            LineProps::from_actions(
+                ["strictHtml", "safeHtml"]
+                    .into_iter()
+                    .filter(|a| enabled.contains(*a)),
+            )
+        } else {
+            LineProps::default()
+        };
+        InjectionGate {
+            resolved,
+            body,
+            html,
+            global,
+        }
+    }
+
+    /// The value of an injecting operator, unless its line (or a request-wide
+    /// `enable://`) refuses to inject it into this body.
+    fn value(&self, protocol: &str) -> Option<&'a str> {
+        let value = self.resolved.value(protocol)?;
+        if !self.html {
+            return Some(value);
+        }
+        let allowed = self.resolved.props(protocol).allows_injection(self.body)
+            && self.global.allows_injection(self.body);
+        allowed.then_some(value)
+    }
+}
+
 /// Apply `*Body` → `*Replace` → `*Prepend` → `*Append`, then content-type-specific
 /// (`css`/`html`/`js`) `Body`/`Prepend`/`Append` for the response.
 fn transform_body(
@@ -1029,7 +1096,11 @@ fn transform_body(
     prefix: &str,
     content_type: Option<&str>,
 ) -> Bytes {
-    let mut data: Vec<u8> = match resolved.value(&format!("{prefix}Body")) {
+    // Built before anything is rewritten: whistle decides once, from the body as
+    // it arrived, whether injected content is allowed at all.
+    let gate = InjectionGate::new(resolved, prefix, content_type, &body);
+
+    let mut data: Vec<u8> = match gate.value(&format!("{prefix}Body")) {
         Some(new) => new.as_bytes().to_vec(),
         None => body.to_vec(),
     };
@@ -1037,12 +1108,12 @@ fn transform_body(
     if let Some(spec) = resolved.value(&format!("{prefix}Replace")) {
         data = apply_body_replace(data, spec);
     }
-    if let Some(pre) = resolved.value(&format!("{prefix}Prepend")) {
+    if let Some(pre) = gate.value(&format!("{prefix}Prepend")) {
         let mut v = pre.as_bytes().to_vec();
         v.extend_from_slice(&data);
         data = v;
     }
-    if let Some(app) = resolved.value(&format!("{prefix}Append")) {
+    if let Some(app) = gate.value(&format!("{prefix}Append")) {
         data.extend_from_slice(app.as_bytes());
     }
 
@@ -1064,15 +1135,15 @@ fn transform_body(
     // Content-type-specific ops (cssBody/htmlPrepend/jsAppend, …).
     if prefix == "res" {
         if let Some(kind) = content_type.and_then(typed_body_kind) {
-            if let Some(new) = resolved.value(&format!("{kind}Body")) {
+            if let Some(new) = gate.value(&format!("{kind}Body")) {
                 data = new.as_bytes().to_vec();
             }
-            if let Some(pre) = resolved.value(&format!("{kind}Prepend")) {
+            if let Some(pre) = gate.value(&format!("{kind}Prepend")) {
                 let mut v = pre.as_bytes().to_vec();
                 v.extend_from_slice(&data);
                 data = v;
             }
-            if let Some(app) = resolved.value(&format!("{kind}Append")) {
+            if let Some(app) = gate.value(&format!("{kind}Append")) {
                 data.extend_from_slice(app.as_bytes());
             }
         }
@@ -1658,6 +1729,125 @@ mod tests {
         let info = build_req_info("GET", "https", "example.com", 443, "/", &HeaderMap::new(), None);
         let target = resolve_target(&info, &resolved);
         assert_eq!(target.tls_versions, TlsVersions::Only12);
+    }
+
+    // ── safeHtml / strictHtml injection gating ──
+
+    /// Body after applying the response operators of `rules` to `body`, served
+    /// as `content_type`.
+    fn inject(rules: &str, body: &'static str, content_type: &str) -> String {
+        let resolved = resolve(rules, "http://example.com/x");
+        let out = transform_res_body(
+            Bytes::from_static(body.as_bytes()),
+            &resolved,
+            Some(content_type),
+        );
+        String::from_utf8(out.to_vec()).unwrap()
+    }
+
+    const HTML: &str = "text/html; charset=utf-8";
+
+    /// Markup accepts injection whatever the line says — the decision is made
+    /// from the body's first non-whitespace byte.
+    #[test]
+    fn injection_into_markup_always_allowed() {
+        for props in ["", " lineProps://safeHtml", " lineProps://strictHtml"] {
+            let rules = format!("example.com/x htmlAppend://<!--tail-->{props}\n");
+            assert_eq!(
+                inject(&rules, "<html></html>", HTML),
+                "<html></html><!--tail-->",
+                "markup should accept injection with{props:?}"
+            );
+        }
+    }
+
+    /// `safeHtml` refuses a JSON-looking body; `strictHtml` refuses anything
+    /// that is not markup (`_original/lib/util/whistle-transform.js:66-89`).
+    #[test]
+    fn safe_and_strict_html_refuse_non_markup() {
+        let json = "{\"a\":1}";
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t-->\n", json, HTML),
+            "{\"a\":1}<!--t-->",
+            "an unguarded line still injects into JSON"
+        );
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t--> lineProps://safeHtml\n", json, HTML),
+            json
+        );
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t--> lineProps://strictHtml\n", json, HTML),
+            json
+        );
+        // Bare text is "safe" but not markup: only strictHtml refuses it.
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t--> lineProps://safeHtml\n", "hello", HTML),
+            "hello<!--t-->"
+        );
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t--> lineProps://strictHtml\n", "hello", HTML),
+            "hello"
+        );
+    }
+
+    /// The gate is per line: a guarded line is dropped while an unguarded one
+    /// on the same request still injects.
+    #[test]
+    fn gating_is_per_line() {
+        let out = inject(
+            "example.com/x htmlAppend://<!--guarded--> lineProps://safeHtml\n\
+             example.com/x htmlPrepend://<!--free-->\n",
+            "{\"a\":1}",
+            HTML,
+        );
+        assert_eq!(out, "<!--free-->{\"a\":1}");
+    }
+
+    /// Non-HTML responses are not gated at all: upstream's `allowInject`
+    /// returns before it ever looks at the properties.
+    #[test]
+    fn gating_only_applies_to_html_responses() {
+        let out = inject(
+            "example.com/x resAppend:///*t*/ lineProps://strictHtml\n",
+            "{\"a\":1}",
+            "application/json",
+        );
+        assert_eq!(out, "{\"a\":1}/*t*/");
+    }
+
+    /// The generic body operators are gated too — upstream filters
+    /// `resBody`/`resPrepend`/`resAppend` through the same list.
+    #[test]
+    fn generic_body_operators_are_gated() {
+        assert_eq!(
+            inject(
+                "example.com/x resPrepend://<!--p--> lineProps://strictHtml\n",
+                "plain text",
+                HTML
+            ),
+            "plain text"
+        );
+        assert_eq!(
+            inject(
+                "example.com/x resBody://replaced lineProps://safeHtml\n",
+                "[1,2]",
+                HTML
+            ),
+            "[1,2]",
+            "safeHtml must keep a JSON body rather than replace it"
+        );
+    }
+
+    /// `enable://strictHtml` applies the strict gate to every line of the
+    /// request (`_original/lib/inspectors/res.js:970-987`).
+    #[test]
+    fn enable_strict_html_gates_every_line() {
+        let out = inject(
+            "example.com/x htmlAppend://<!--t-->\nexample.com/x enable://strictHtml\n",
+            "hello",
+            HTML,
+        );
+        assert_eq!(out, "hello");
     }
 
     #[test]
