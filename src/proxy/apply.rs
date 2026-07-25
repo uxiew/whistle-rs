@@ -157,10 +157,71 @@ fn replace_ci(haystack: &str, needle: &str, repl: &str) -> String {
 /// `is_internal_req` carries the request's origin through, so an
 /// `internal`/`internalOnly` line inside injected rules is scoped exactly as it
 /// would be at top level.
-pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str, is_internal_req: bool) {
+///
+/// The manager is **returned, not dropped**: it holds the parsed rules the
+/// response phase resolves a second time — see [`merge_response_phase_of`].
+#[must_use = "the caller must keep this for the response phase"]
+pub fn merge_rules_text(
+    resolved: &mut Resolved,
+    info: &ReqInfo,
+    text: &str,
+    is_internal_req: bool,
+) -> RuleManager {
     let mut mgr = RuleManager::new();
     mgr.set_text(text);
-    merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
+    merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+    mgr
+}
+
+/// Resolve a rules text merged mid-request a second time, now that the response
+/// head is in, and fold what it withheld into `resolved`.
+///
+/// Upstream re-resolves exactly these managers in its response phase —
+/// `pRules` (a plugin's rules), `fRules` (the `rulesFile://` manager) and
+/// `hRules`, each through `resolveResRules(req, true)`
+/// (`_original/lib/plugins/index.js:1326-1335`). This port resolved them once,
+/// so a `resHeaders://x=1 includeFilter://s:404` inside an included file never
+/// fired.
+///
+/// The two passes are the same pair the top-level rules take, which is what
+/// makes this safe: the request pass **withheld** precisely what this resolves,
+/// so nothing is applied twice and nothing is re-decided. (Re-resolving the
+/// whole text instead would re-roll a `chance:` on it, and would discard a
+/// request-phase verdict the request has already acted on.)
+///
+/// Costs nothing when the text has no response-dependent line: `resolve_response`
+/// answers from the flags its groups precomputed, so `None` here is one
+/// comparison per merged text.
+///
+/// The managers are folded into **one** set rather than merged one at a time, so
+/// that the caller can substitute values into it and hand it to
+/// [`Resolved::merge_response_phase`] once — which is what lets an `ignore://`
+/// inside an included file reach the request phase's operators.
+pub fn response_phase_of(
+    managers: &[RuleManager],
+    info: &ReqInfo,
+    is_internal_req: bool,
+) -> Option<Resolved> {
+    let mut out: Option<Resolved> = None;
+    for mgr in managers {
+        let Some(extra) = mgr.resolve_response(info, is_internal_req) else {
+            continue;
+        };
+        let acc = out.get_or_insert_with(Resolved::default);
+        // Merged rules sort behind everything either pass of the file they were
+        // merged into resolved, in the request phase and in this one alike.
+        for (protocol, mut op) in extra.single {
+            op.order = u64::MAX;
+            acc.single.entry(protocol).or_insert(op);
+        }
+        for (protocol, ops) in extra.multi {
+            acc.multi.entry(protocol).or_default().extend(ops.into_iter().map(|mut op| {
+                op.order = u64::MAX;
+                op
+            }));
+        }
+    }
+    out
 }
 
 /// Fold a resolution of *another* rules text into `resolved`: existing
@@ -186,12 +247,16 @@ fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
 
 /// Merge the rules pulled in by `rule://<name>` (from the values store) and
 /// `rulesFile://<path>` (from disk), resolved in the request's own scope.
+///
+/// The managers are returned so the response phase can resolve them again —
+/// see [`merge_response_phase_of`].
+#[must_use = "the caller must keep these for the response phase"]
 pub fn merge_included_rules(
     resolved: &mut Resolved,
     info: &ReqInfo,
     values: &HashMap<String, String>,
     is_internal_req: bool,
-) {
+) -> Vec<RuleManager> {
     let mut texts: Vec<String> = Vec::new();
     if let Some(name) = resolved.value("rule") {
         if let Some(content) = values.get(name) {
@@ -208,11 +273,15 @@ pub fn merge_included_rules(
     if !joined.trim().is_empty() {
         texts.push(joined);
     }
-    for text in texts {
-        let mut mgr = RuleManager::new();
-        mgr.set_text(&text);
-        merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
-    }
+    texts
+        .into_iter()
+        .map(|text| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(&text);
+            merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+            mgr
+        })
+        .collect()
 }
 
 /// The `rulesFile://` operators whose contents make up the included rules text.
@@ -4304,7 +4373,7 @@ mod tests {
 
         let merged = |rules: &str| {
             let (info, mut resolved) = resolve_with_info(rules, "http://example.com/");
-            merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+            let _ = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
             let mut h = HeaderMap::new();
             apply_header_ops(&mut h, &resolved, "resHeaders");
             h
@@ -4343,8 +4412,114 @@ mod tests {
             &format!("example.com reqRules://{host_a}\nexample.com reqRules://{host_b}\n"),
             "http://example.com/",
         );
-        merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        let _ = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
         assert_eq!(resolved.value("host"), Some("1.1.1.1"));
+    }
+
+    /// Rules merged in mid-request take the same two passes the top-level rules
+    /// do: a response condition inside a `rulesFile://` include (or a plugin's
+    /// injected rules) is now answered rather than failing closed.
+    ///
+    /// Upstream re-resolves the same managers in its response phase
+    /// (`_original/lib/plugins/index.js:1326-1335`).
+    #[test]
+    fn merged_rules_get_the_response_phase_too() {
+        let fx = Fixtures::new("merged-res-phase");
+        let inc = fx.write(
+            "inc.txt",
+            b"example.com resHeaders://x-late=1 includeFilter://s:404\n\
+              example.com resHeaders://x-always=1\n",
+        );
+
+        // `merge_included_rules` + `response_phase_of` is exactly what
+        // `serve`'s two phases compose; `status` drives the second.
+        let resolve_at = |rules: &str, status: Option<u16>| {
+            let (mut info, mut resolved) = resolve_with_info(rules, "http://example.com/");
+            let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+            if let Some(status) = status {
+                info.res = Some(build_res_info(status, &HeaderMap::new(), None, None));
+                if let Some(extra) = response_phase_of(&merged, &info, false) {
+                    resolved.merge_response_phase(extra);
+                }
+            }
+            let mut h = HeaderMap::new();
+            apply_header_ops(&mut h, &resolved, "resHeaders");
+            h
+        };
+
+        let rules = format!("example.com rulesFile://{inc}\n");
+        // The unconditional line applies from the request phase on.
+        assert_eq!(resolve_at(&rules, None).get("x-always").unwrap(), "1");
+        assert!(resolve_at(&rules, None).get("x-late").is_none());
+        // The conditional one waits for the status, and then holds — or not.
+        let on_404 = resolve_at(&rules, Some(404));
+        assert_eq!(on_404.get("x-late").unwrap(), "1");
+        assert_eq!(on_404.get("x-always").unwrap(), "1");
+        assert!(resolve_at(&rules, Some(200)).get("x-late").is_none());
+
+        // The same for rules a plugin injects.
+        let (mut info, mut resolved) = resolve_with_info("example.com/x\n", "http://example.com/x");
+        let merged = vec![merge_rules_text(
+            &mut resolved,
+            &info,
+            "example.com resHeaders://x-plugin=1 includeFilter://s:500\n",
+            false,
+        )];
+        info.res = Some(build_res_info(500, &HeaderMap::new(), None, None));
+        let extra = response_phase_of(&merged, &info, false).expect("a second pass");
+        resolved.merge_response_phase(extra);
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &resolved, "resHeaders");
+        assert_eq!(h.get("x-plugin").unwrap(), "1");
+    }
+
+    /// Nothing is applied twice: the request pass withholds exactly what the
+    /// second one resolves, so a line whose *exclude* filter is inert in the
+    /// request phase does not contribute its operator in both.
+    #[test]
+    fn a_merged_rule_is_not_resolved_twice() {
+        let fx = Fixtures::new("merged-res-phase-once");
+        let inc = fx.write(
+            "inc.txt",
+            b"example.com resHeaders://x-a=1 excludeFilter://s:404\n",
+        );
+        let (mut info, mut resolved) = resolve_with_info(
+            &format!("example.com rulesFile://{inc}\n"),
+            "http://example.com/",
+        );
+        let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        assert!(
+            resolved.all("resHeaders").is_empty(),
+            "withheld until the status is known"
+        );
+        info.res = Some(build_res_info(200, &HeaderMap::new(), None, None));
+        let extra = response_phase_of(&merged, &info, false).expect("a second pass");
+        resolved.merge_response_phase(extra);
+        assert_eq!(resolved.all("resHeaders").len(), 1);
+
+        // …and the exclude filter still fires when it should.
+        let (mut info, mut resolved) = resolve_with_info(
+            &format!("example.com rulesFile://{inc}\n"),
+            "http://example.com/",
+        );
+        let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        info.res = Some(build_res_info(404, &HeaderMap::new(), None, None));
+        assert!(response_phase_of(&merged, &info, false).is_some_and(|e| e.all("resHeaders").is_empty()));
+    }
+
+    /// An included file that says nothing about the response gets no second
+    /// pass at all — the manager answers from its precomputed flags.
+    #[test]
+    fn a_merged_rule_with_no_response_condition_skips_the_second_pass() {
+        let fx = Fixtures::new("merged-res-phase-skip");
+        let inc = fx.write("inc.txt", b"example.com resHeaders://x-a=1\n");
+        let (mut info, mut resolved) = resolve_with_info(
+            &format!("example.com rulesFile://{inc}\n"),
+            "http://example.com/",
+        );
+        let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        info.res = Some(build_res_info(200, &HeaderMap::new(), None, None));
+        assert!(response_phase_of(&merged, &info, false).is_none());
     }
 
     /// `resScript` picks the first line **not** spelled `resRules://` — the only
@@ -5979,4 +6154,5 @@ mod tests {
         assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x%3BSecure");
     }
 }
+
 

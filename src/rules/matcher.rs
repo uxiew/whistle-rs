@@ -340,11 +340,16 @@ pub fn resolve_refs_scoped(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool
 /// Like [`resolve_refs_scoped`] for a rule set that is resolved *once*: nothing
 /// is withheld, because no response phase will follow to supply it.
 ///
-/// This is how rules that arrive mid-request are resolved — a plugin's, or a
-/// `rule://` / `rulesFile://` include. They are merged into the request's
-/// resolved set and then forgotten, so a response-phase operator withheld from
-/// them would never come back. Their response conditions fail closed instead,
-/// which is where the whole subsystem sat before the response phase existed.
+/// This is for a rule set the caller will not keep — the WebSocket frame plan's,
+/// which is built from a manager that is dropped immediately. A response-phase
+/// operator withheld from such a set would never come back; its response
+/// conditions fail closed instead.
+///
+/// Rules merged into a request mid-flight — a plugin's, a `rule://` or
+/// `rulesFile://` include — do **not** use this: their manager is kept and
+/// resolved again in the response phase
+/// (`crate::proxy::apply::response_phase_of`), so they take the same two-pass
+/// treatment as the top-level rules.
 pub fn resolve_refs_once(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> Resolved {
     resolve_walk(rules, req, is_internal_req, false)
 }

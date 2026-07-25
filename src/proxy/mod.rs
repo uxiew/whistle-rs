@@ -885,8 +885,22 @@ fn resolve_response_phase(
     resolved: &mut Resolved,
     res: crate::rules::ResInfo,
     is_internal_req: bool,
+    merged: &[crate::rules::RuleManager],
 ) {
     info.res = Some(res);
+    // Rules merged in mid-request get the same second pass. Upstream re-resolves
+    // its `pRules`/`fRules`/`hRules` here too
+    // (`_original/lib/plugins/index.js:1326-1335`); each manager answers from
+    // its own precomputed flags, so a text with no response-dependent line
+    // costs one comparison.
+    if let Some(mut extra) = apply::response_phase_of(merged, info, is_internal_req) {
+        {
+            let values = state.values.read().unwrap();
+            apply::substitute_values(&mut extra, &values);
+        }
+        apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
+        resolved.merge_response_phase(extra);
+    }
     let extra = {
         let rules = state.rules.read().unwrap();
         rules.resolve_response(info, is_internal_req)
@@ -1039,12 +1053,17 @@ async fn serve(
         .read()
         .unwrap()
         .resolve_scoped(&info, is_internal_req);
-    {
+    // Rules merged in mid-request — a `rule://` value, the `rulesFile://` join,
+    // and any a plugin injects below. Their parsed form is kept because the
+    // response phase resolves them a second time, exactly as it does the
+    // top-level rules (`apply::merge_response_phase_of`).
+    let mut merged_rules: Vec<crate::rules::RuleManager> = {
         let values = state.values.read().unwrap();
         apply::substitute_values(&mut resolved, &values);
-        apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
+        let managers = apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
         apply::substitute_values(&mut resolved, &values);
-    }
+        managers
+    };
     apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
     let started = Instant::now();
     let time_ms = now_ms();
@@ -1121,7 +1140,12 @@ async fn serve(
                 continue;
             };
             if let Some(rules) = result.rules {
-                apply::merge_rules_text(&mut resolved, &info, &rules, is_internal_req);
+                merged_rules.push(apply::merge_rules_text(
+                    &mut resolved,
+                    &info,
+                    &rules,
+                    is_internal_req,
+                ));
                 let values = state.values.read().unwrap();
                 apply::substitute_values(&mut resolved, &values);
             }
@@ -1177,6 +1201,7 @@ async fn serve(
             &mut resolved,
             apply::build_res_info(parts.status.as_u16(), &parts.headers, None, None),
             is_internal_req,
+            &merged_rules,
         );
         apply::apply_response_for(&mut parts, &resolved, Some(&info));
         let resp = Response::from_parts(parts, body);
@@ -1389,6 +1414,7 @@ async fn serve(
             Some(target.connect_port),
         ),
         is_internal_req,
+        &merged_rules,
     );
 
     if let Some(ms) = apply::res_delay_ms(&resolved) {

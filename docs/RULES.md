@@ -506,10 +506,19 @@ phase. A rules file that never mentions the response skips the second pass entir
 (measured at ~2 ns per response, against ~2.4 µs for a 500-rule request pass), and a
 file that does pays for those lines only — one conditional line in 500 costs ~24 ns.
 
-**Not covered by the second pass:** rules pulled in by `rule://` / `rulesFile://` and
-rules injected by a plugin are resolved once, in the request phase. Upstream
-re-resolves those managers too (`fRules`/`pRules`/`hRules` in `getResRules`).
-WebSocket and tunnelled (`CONNECT`) traffic have no response phase here either.
+**Rules merged in mid-request take both passes too.** A `rule://` value, the
+`rulesFile://` join and the rules a plugin injects are each kept in parsed form and
+resolved a second time when the head arrives — upstream re-resolves the same managers
+(`fRules`/`pRules`/`hRules` in `getResRules`,
+`_original/lib/plugins/index.js:1326-1335`). They keep their place *behind* everything
+the file that pulled them in resolved, in both passes. Cost per response: ~7 ns with
+nothing merged, ~9 ns for a merged text with no response-dependent line, ~250 ns for one
+that has one.
+
+**Not covered by the second pass:** WebSocket and tunnelled (`CONNECT`) traffic have no
+response phase here. Neither do the three paths that answer without touching the
+response operators at all — a `plugin://` that answered the request itself, a self-loop
+redirect, and an `enable://abort` — which is equally true of the top-level rules.
 
 `serverIp:` is answered when the address the request went to is known **exactly** — an
 IP-literal origin, or a `host://` override naming an address. For a named origin this
