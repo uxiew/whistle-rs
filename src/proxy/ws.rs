@@ -419,7 +419,8 @@ mod tests {
             &hyper::HeaderMap::new(),
             Some("1.2.3.4".to_string()),
         );
-        let resolved = mgr.resolve(&info);
+        // Frame rules have no response phase; resolve once, like the tunnel does.
+        let resolved = mgr.resolve_once(&info, false);
         FramePlan::new(&state.plugins, &resolved, &info)
     }
 
