@@ -102,25 +102,69 @@ pub const PROTOCOLS: &[&str] = &[
 pub const TOOL_PROTOCOLS: &[&str] = &["log", "weinre"];
 
 /// Protocols that may legitimately appear multiple times in a resolved set
-/// (`multiMatchs` in the original). We keep every matching value for these
-/// instead of first-match-wins.
+/// (`multiMatchs`, `_original/lib/rules/protocols.js:186-226`). We keep every
+/// matching value for these instead of first-match-wins.
+///
+/// Upstream keeps *both* views of such a protocol: `_rules[name]` is still the
+/// first match, and `rule.list` carries every match
+/// (`_original/lib/rules/rules.js:2240-2258`). [`crate::rules::Resolved`] does
+/// the same — [`crate::rules::Resolved::value`] reads the winner,
+/// [`crate::rules::Resolved::all`] the whole list — so listing a protocol here
+/// only ever *adds* the accumulated view.
+///
+/// How several values combine is per family and lives in `crate::proxy::apply`:
+/// the body operators CRLF-join, the `*Replace`/`*Merge` operators collapse into
+/// one JSON object, and the header-shaped ones apply in turn.
 pub const MULTI_MATCH: &[&str] = &[
+    // ── upstream's `multiMatchs`, in its order ──
+    "G",
+    "ignore",
+    "enable",
+    "filter",
+    "disable",
     "plugin",
+    "delete",
+    "style",
+    "cipher",
+    "trailers",
+    "urlParams",
+    "params",
+    "headerReplace",
     "reqHeaders",
     "resHeaders",
-    "reqCookies",
-    "resCookies",
     "reqCors",
     "resCors",
-    "trailers",
+    "reqCookies",
+    "resCookies",
+    "reqReplace",
+    "urlReplace",
+    "resReplace",
+    "resMerge",
+    "reqBody",
+    "reqPrepend",
+    "resPrepend",
+    "reqAppend",
+    "resAppend",
+    "resBody",
+    "htmlAppend",
+    "jsAppend",
+    "cssAppend",
+    "htmlBody",
+    "jsBody",
+    "cssBody",
+    "htmlPrepend",
+    "jsPrepend",
+    "cssPrepend",
+    "rulesFile",
+    "resScript",
+    // ── whistle-rs additions ──
+    // Upstream resolves both of these to a single rule (`log` is absent from
+    // `multiMatchs`; `pipe` is resolved by `resolveSingleRule`,
+    // `_original/lib/rules/rules.js:2384`). This port lets them accumulate
+    // because its own consumers are list-shaped: `log://` names a debug channel
+    // and several may be attached at once, and `pipe://` feeds the plugin
+    // matcher alongside `plugin://`.
     "log",
-    "params",
-    "urlParams",
-    "ignore",
-    "delete",
-    "headerReplace",
-    "enable",
-    "disable",
     "pipe",
 ];
 

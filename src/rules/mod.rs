@@ -392,6 +392,13 @@ pub struct ReqInfo {
 }
 
 /// The winning operators for a request, keyed by protocol.
+///
+/// A protocol lands in exactly one of the two maps, decided once by
+/// [`protocols::is_multi_match`]. The accessors below hide that split: upstream
+/// exposes a multi-match protocol *both* as its first match (`_rules[name]`,
+/// from `getRule`) and as the full list (`rule.list`, from `getRuleList`,
+/// `_original/lib/rules/rules.js:2240-2258`), so [`Resolved::get`] and
+/// [`Resolved::all`] are each total over both maps rather than one map apiece.
 #[derive(Debug, Default, Clone)]
 pub struct Resolved {
     /// First-match-wins single-value protocols.
@@ -401,26 +408,42 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The operator that won `protocol` — for a multi-match protocol, the first
+    /// entry of its list, which is upstream's `_rules[name]`.
     pub fn get(&self, protocol: &str) -> Option<&RuleOp> {
-        self.single.get(protocol)
+        self.single
+            .get(protocol)
+            .or_else(|| self.multi.get(protocol).and_then(|list| list.first()))
     }
+
+    /// The winning operator's value; see [`Resolved::get`].
     pub fn value(&self, protocol: &str) -> Option<&str> {
-        self.single.get(protocol).map(|o| o.value.as_str())
+        self.get(protocol).map(|o| o.value.as_str())
     }
+
+    /// Every operator matching `protocol`, in resolution order — important
+    /// lines first, source order within a pass. A single-match protocol yields
+    /// its one winner, so callers that accumulate need no special case.
     pub fn all(&self, protocol: &str) -> &[RuleOp] {
-        self.multi.get(protocol).map(|v| v.as_slice()).unwrap_or(&[])
+        match self.multi.get(protocol) {
+            Some(list) => list,
+            None => self
+                .single
+                .get(protocol)
+                .map(std::slice::from_ref)
+                .unwrap_or(&[]),
+        }
     }
 
     /// Line properties of the winning operator for `protocol` (empty when the
     /// protocol did not match). This is how `lineProps` stays *line*-scoped
     /// after resolution: the original consults `req.rules.<protocol>.lineProps`,
     /// i.e. the properties of the line that won that protocol — never a union
-    /// across lines.
+    /// across lines. Consumers that walk every match read each
+    /// [`RuleOp::props`] instead, since each injected value carries the
+    /// properties of the line that produced it.
     pub fn props(&self, protocol: &str) -> &LineProps {
-        self.single
-            .get(protocol)
-            .map(|o| &o.props)
-            .unwrap_or(&NO_PROPS)
+        self.get(protocol).map(|o| &o.props).unwrap_or(&NO_PROPS)
     }
 
     /// Shorthand for `props(protocol).has(action)`.

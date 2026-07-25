@@ -2529,13 +2529,9 @@ pub fn strip_length_headers(headers: &mut HeaderMap) {
     headers.remove(hyper::header::TRANSFER_ENCODING);
 }
 
-/// Collect every value for a protocol (multi-match list plus any single).
+/// Collect every value for a protocol, in resolution order.
 fn collect_values<'a>(resolved: &'a Resolved, protocol: &str) -> Vec<&'a str> {
-    let mut out: Vec<&str> = resolved.all(protocol).iter().map(|o| o.value.as_str()).collect();
-    if let Some(op) = resolved.get(protocol) {
-        out.push(op.value.as_str());
-    }
-    out
+    resolved.all(protocol).iter().map(|o| o.value.as_str()).collect()
 }
 
 /// Parse a `reqCookies`/`resCookies` value into `name` → `value` pairs.
@@ -2679,10 +2675,6 @@ fn escape_cookie(s: &str, is_name: bool) -> String {
 /// Supports `name=value`, `name:value`, and a JSON object of pairs.
 fn apply_header_ops(headers: &mut HeaderMap, resolved: &Resolved, protocol: &str) {
     for op in resolved.all(protocol) {
-        apply_header_value(headers, &op.value);
-    }
-    // Also honour a single-match instance if present.
-    if let Some(op) = resolved.get(protocol) {
         apply_header_value(headers, &op.value);
     }
 }
