@@ -873,8 +873,8 @@ where
 /// it. Same here: `res` is built from the head exactly as it arrived.
 ///
 /// Costs nothing when no rule mentions the response: the manager answers that
-/// from a flag its groups precompute, and this returns without walking a single
-/// rule. `false` says the second pass was skipped.
+/// from a list of candidate lines its groups precompute, and this returns
+/// without walking a single rule.
 ///
 /// Locking: takes the two `std::sync` read locks one after the other, never
 /// nested and never across an `.await` — there is none here, which is what lets
@@ -885,22 +885,27 @@ fn resolve_response_phase(
     resolved: &mut Resolved,
     res: crate::rules::ResInfo,
     is_internal_req: bool,
-) -> bool {
+) {
     info.res = Some(res);
     let extra = {
         let rules = state.rules.read().unwrap();
         rules.resolve_response(info, is_internal_req)
     };
     let Some(mut extra) = extra else {
-        return false;
+        return;
     };
+    tracing::debug!(
+        "{} {} -> re-resolving rules for status {}",
+        info.method,
+        info.full_url,
+        info.res.as_ref().map(|r| r.status).unwrap_or_default()
+    );
     {
         let values = state.values.read().unwrap();
         apply::substitute_values(&mut extra, &values);
     }
     apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
     resolved.merge_response_phase(extra);
-    true
 }
 
 /// The address the request actually went to, when it is known exactly.
