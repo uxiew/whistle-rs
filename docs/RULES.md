@@ -552,6 +552,42 @@ WebSocket frames are captured too: every intercepted `ws://`/`wss://` connection
 recorded as a session (status `101`) and each frame (both directions) is surfaced —
 click the connection in the Network view, or fetch `/frames.json?id=<session>`.
 
+### Multiple patterns and multi-line blocks
+
+One operator can serve several patterns on a line — the line expands to one rule
+per pattern:
+
+```
+host://127.0.0.1:8080   www.example.com  api.example.com  static.example.com
+```
+
+For longer lists, the block form keeps it readable (whistle's `line\`` syntax):
+
+```
+line`
+proxy://127.0.0.1:8080
+www.example.com
+api.example.com
+includeFilter://m:GET
+excludeFilter:///admin/
+`
+```
+
+A block is collapsed to a single logical line before parsing, so anything valid
+on one line is valid inside a block.
+
+### Comments
+
+`#` starts a comment **anywhere on a line**, not just at the start:
+
+```
+a.com  host://1.1.1.1        # this whole tail is ignored
+```
+
+This mirrors upstream exactly, including its sharp edge: a `#` inside a URL
+fragment is also treated as a comment, so `example.com/a#b file:///x` loses the
+`#b`.
+
 ### Parsed but not applied (3)
 
 | Operator(s) | Why / note |
