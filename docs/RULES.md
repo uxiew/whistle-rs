@@ -264,7 +264,7 @@ example.com/app.js     file:///Users/me/dev/app.js
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `reqHeaders` | `name=value`, `name:value`, or `{json}` | Set/replace request headers (empty value deletes). Accumulates across lines. |
+| `reqHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace request headers (empty value deletes). Accumulates across lines. |
 | `ua` | user-agent string | Set the `User-Agent` header |
 | `referer` | URL | Set the `Referer` header |
 | `method` | HTTP method | Override the request method |
@@ -277,6 +277,7 @@ example.com/app.js     file:///Users/me/dev/app.js
 
 ```
 example.com   reqHeaders://x-token=abc
+example.com   reqHeaders://x-a=1&x-b=2
 example.com   reqHeaders://{"x-a":"1","x-b":"2"}
 example.com   ua://MyBot/1.0
 api.test/*    method://POST
@@ -405,7 +406,7 @@ slow.example.com   resSpeed://20        # ~20 KB/s download
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `replaceStatus` / `statusCode` | status number | Replace the upstream response status (401/407 also send the matching auth challenge) |
-| `resHeaders` | `name=value`, `name:value`, or `{json}` | Set/replace response headers (empty value deletes). Accumulates across lines. |
+| `resHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace response headers (empty value deletes). Accumulates across lines. |
 | `resType` | MIME type or short name | Set the response `Content-Type` |
 | `resCharset` | charset | Set the charset on the response `Content-Type` |
 | `resCors` | origin, `*`, `enable`, `{json}` or `k=v&…` | Negotiate the CORS response headers |
@@ -479,12 +480,17 @@ example.com   delete://resBody.debug&resBody.internal.token
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `reqCookies` | `name=value`, bare `name` (delete), or `{json}` | Merge into the request `Cookie` header. Accumulates across lines. |
-| `resCookies` | `name=value`, bare `name` (expire), or `{json}` | Append `Set-Cookie` headers. Accumulates across lines. |
+| `reqCookies` | `name=value` pairs (`&`-separated) or `{json}` | Merge into the request `Cookie` header. Accumulates across lines. |
+| `resCookies` | `name=value` pairs (`&`-separated) or `{json}` | Set `Set-Cookie` headers. Accumulates across lines. |
+
+A name written with no `=` gets an **empty value** — it does not delete the
+cookie. To remove one, use `delete://reqCookies.<name>`. A `resCookies` entry
+**replaces** a `Set-Cookie` the response already sent under the same name rather
+than adding a second one.
 
 ```
-example.com   reqCookies://sid=abc
-example.com   reqCookies://tracking          # bare name deletes it from the request
+example.com   reqCookies://sid=abc&locale=en
+example.com   delete://reqCookies.tracking   # this is how you drop one
 example.com   resCookies://theme=dark
 ```
 
@@ -776,6 +782,8 @@ Known gaps in the operator layer, deliberately left:
   also merges them into a form, multipart or JSON request body.
 - **`delete://resCookies.x`** does not emit the expiring `Set-Cookie` upstream
   writes, and `delete://trailer.x` is not applied.
+- **A cookie declared as a JSON object** (`resCookies://{"sid":{"value":"x","httpOnly":true}}`)
+  is serialised rather than expanded into `Set-Cookie` attributes.
 - **`headerReplace`'s `$$`-prefixed URL-encoding form** and its quirk of letting an
   unprefixed key inherit the previous key's scope are not ported.
 

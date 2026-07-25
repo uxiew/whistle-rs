@@ -353,11 +353,15 @@ fn cipher_is_12(s: &str) -> bool {
     s.contains("1.2") || s.contains("1_2") || s.contains("1.1") || s.contains("1_1")
 }
 
-/// Collect flag names from `enable`/`disable` operators (split on `,`/`|`/space).
+/// Collect flag names from `enable`/`disable` operators.
+///
+/// The separators are `|` and `&` — upstream's `parseProps`
+/// (`_original/lib/util/common.js:72,98`) recognises no others, so a
+/// comma-separated list is one long flag name in both implementations.
 fn flag_set(resolved: &Resolved, protocol: &str) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for v in collect_values(resolved, protocol) {
-        for f in v.split([',', '|', ' ']) {
+        for f in v.split(['|', '&']) {
             let f = f.trim();
             if !f.is_empty() {
                 set.insert(f.to_string());
@@ -2529,50 +2533,62 @@ fn collect_values<'a>(resolved: &'a Resolved, protocol: &str) -> Vec<&'a str> {
     out
 }
 
-/// Parse `name=value` / bare `name` (delete) / `{json}` into (name, value?) pairs.
-/// A `None` value means "delete this cookie".
-fn parse_cookie_ops(value: &str) -> Vec<(String, Option<String>)> {
+/// Parse a `reqCookies`/`resCookies` value into `name` → `value` pairs.
+///
+/// Like the other JSON-shaped operators, the value is either `{json}` or a
+/// query string, so `reqCookies://a=1&b=2` is two cookies. A name with no `=`
+/// gets an **empty value** — it does not delete the cookie; that is
+/// `delete://reqCookies.<name>`.
+fn parse_cookie_ops(value: &str) -> Vec<(String, String)> {
     let value = value.trim();
-    let mut out = Vec::new();
     if value.starts_with('{') {
         if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            for (k, v) in map {
-                let val = match v {
-                    serde_json::Value::Null => None,
-                    serde_json::Value::String(s) if s.is_empty() => None,
-                    serde_json::Value::String(s) => Some(s),
-                    other => Some(other.to_string()),
-                };
-                out.push((k, val));
-            }
-            return out;
+            return map
+                .into_iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => s,
+                        serde_json::Value::Null => String::new(),
+                        // A cookie declared as an object carries attributes
+                        // upstream (`getCookieItem`); whistle-rs writes only
+                        // its serialised form.
+                        other => other.to_string(),
+                    };
+                    (k, val)
+                })
+                .collect();
         }
     }
-    if let Some(i) = value.find('=') {
-        let name = value[..i].trim().to_string();
-        let val = value[i + 1..].trim();
-        out.push((name, if val.is_empty() { None } else { Some(val.to_string()) }));
-    } else if !value.is_empty() {
-        out.push((value.to_string(), None));
-    }
-    out
+    value
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (k.trim().to_string(), v.to_string()),
+            None => (pair.trim().to_string(), String::new()),
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
 }
 
-/// Merge `reqCookies` operators into the request `Cookie` header.
+/// Merge `reqCookies` operators into the request `Cookie` header, keeping the
+/// position of a cookie the request already carried (`setReqCookies`,
+/// `_original/lib/util/index.js:3053-3092`).
 fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
     let ops = collect_values(resolved, "reqCookies");
     if ops.is_empty() {
         return;
     }
-    // Existing cookies as an ordered list.
     let mut cookies: Vec<(String, String)> = headers
         .get(hyper::header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .map(|c| {
             c.split(';')
                 .filter_map(|kv| {
-                    let (k, v) = kv.trim().split_once('=')?;
-                    Some((k.trim().to_string(), v.trim().to_string()))
+                    let kv = kv.trim();
+                    match kv.split_once('=') {
+                        Some((k, v)) => Some((k.trim().to_string(), v.to_string())),
+                        None => (!kv.is_empty()).then(|| (kv.to_string(), String::new())),
+                    }
                 })
                 .collect()
         })
@@ -2580,40 +2596,78 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
 
     for value in ops {
         for (name, val) in parse_cookie_ops(value) {
-            cookies.retain(|(k, _)| *k != name);
-            if let Some(v) = val {
-                cookies.push((name, v));
+            let name = escape_cookie(&name, true);
+            let val = escape_cookie(&val, false);
+            match cookies.iter_mut().find(|(k, _)| *k == name) {
+                Some(slot) => slot.1 = val,
+                None => cookies.push((name, val)),
             }
         }
     }
 
-    if cookies.is_empty() {
-        headers.remove(hyper::header::COOKIE);
-    } else {
-        let joined = cookies
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        if let Ok(v) = HeaderValue::from_str(&joined) {
-            headers.insert(hyper::header::COOKIE, v);
+    let joined = cookies
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    set_header(headers, "cookie", &joined);
+}
+
+/// Emit `Set-Cookie` headers for `resCookies` operators, **replacing** any the
+/// response already sent under the same name rather than adding a second one.
+fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
+    let ops = collect_values(resolved, "resCookies");
+    if ops.is_empty() {
+        return;
+    }
+    let mut existing: Vec<(String, String)> = headers
+        .get_all(hyper::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|c| {
+            let name = c.split('=').next().unwrap_or(c).to_string();
+            (name, c.to_string())
+        })
+        .collect();
+
+    for value in ops {
+        for (name, val) in parse_cookie_ops(value) {
+            let name = escape_cookie(&name, true);
+            let cookie = format!("{name}={}", escape_cookie(&val, false));
+            match existing.iter_mut().find(|(k, _)| *k == name) {
+                Some(slot) => slot.1 = cookie,
+                None => existing.push((name, cookie)),
+            }
+        }
+    }
+
+    headers.remove(hyper::header::SET_COOKIE);
+    for (_, cookie) in existing {
+        if let Ok(v) = HeaderValue::from_str(&cookie) {
+            headers.append(hyper::header::SET_COOKIE, v);
         }
     }
 }
 
-/// Emit `Set-Cookie` headers for `resCookies` operators.
-fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
-    for value in collect_values(resolved, "resCookies") {
-        for (name, val) in parse_cookie_ops(value) {
-            let sc = match val {
-                Some(v) => format!("{name}={v}"),
-                None => format!("{name}=; Max-Age=0"),
-            };
-            if let Ok(v) = HeaderValue::from_str(&sc) {
-                headers.append(hyper::header::SET_COOKIE, v);
-            }
+/// Percent-encode what may not appear in a cookie name or value
+/// (`escapeName`/`escapeValue`, `_original/lib/util/index.js:3029-3050`). A name
+/// may not carry `=` either.
+fn escape_cookie(s: &str, is_name: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let forbidden = matches!(c, '\r' | '\n' | ';' | '%')
+            || (c as u32) > 0xFF
+            || (is_name && c == '=');
+        if !forbidden {
+            out.push(c);
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        for b in c.encode_utf8(&mut buf).as_bytes() {
+            out.push_str(&format!("%{b:02X}"));
         }
     }
+    out
 }
 
 /// Apply every value of a header multi-match protocol.
@@ -2628,6 +2682,9 @@ fn apply_header_ops(headers: &mut HeaderMap, resolved: &Resolved, protocol: &str
     }
 }
 
+/// Apply one header operator value: `{json}`, or a query string of `name=value`
+/// pairs (`resHeaders://x-a=1&x-b=2` is two headers, as `parseQuery` has it).
+/// The `name:value` spelling is a whistle-rs convenience, not upstream syntax.
 fn apply_header_value(headers: &mut HeaderMap, value: &str) {
     let value = value.trim();
     if value.starts_with('{') {
@@ -2642,14 +2699,17 @@ fn apply_header_value(headers: &mut HeaderMap, value: &str) {
             return;
         }
     }
-    let (name, val) = if let Some(i) = value.find('=') {
-        (&value[..i], &value[i + 1..])
-    } else if let Some(i) = value.find(':') {
-        (&value[..i], &value[i + 1..])
-    } else {
+    if value.contains('=') {
+        for pair in value.split('&') {
+            if let Some((name, val)) = pair.split_once('=') {
+                set_header(headers, name.trim(), val.trim());
+            }
+        }
         return;
-    };
-    set_header(headers, name.trim(), val.trim());
+    }
+    if let Some((name, val)) = value.split_once(':') {
+        set_header(headers, name.trim(), val.trim());
+    }
 }
 
 /// Set (replace) a header; empty value removes it. whistle treats empty as delete.
@@ -2696,20 +2756,21 @@ mod tests {
         m.resolve(&info)
     }
 
+    /// `reqCookies` merges into the existing header: a name already present
+    /// keeps its position, a new one is appended, and a bare name sets an
+    /// **empty** value rather than deleting the cookie (that is
+    /// `delete://reqCookies.<name>`).
     #[test]
-    fn req_cookies_merge_and_delete() {
+    fn req_cookies_merge_in_place() {
         let resolved = resolve(
-            "example.com reqCookies://a=1\nexample.com reqCookies://b=2\nexample.com reqCookies://old\n",
+            "example.com reqCookies://a=1&b=2\nexample.com reqCookies://old\n",
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
         headers.insert(hyper::header::COOKIE, "old=x; keep=y".parse().unwrap());
         apply_req_cookies(&mut headers, &resolved);
         let cookie = headers.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
-        assert!(cookie.contains("keep=y"));
-        assert!(cookie.contains("a=1"));
-        assert!(cookie.contains("b=2"));
-        assert!(!cookie.contains("old="));
+        assert_eq!(cookie, "old=; keep=y; a=1; b=2");
     }
 
     #[test]
@@ -3907,6 +3968,26 @@ mod tests {
         assert_eq!(res_class("application/ecmascript"), None);
     }
 
+    /// Header operators take a `&`-separated list of pairs, like the other
+    /// JSON-shaped operators; `enable`/`disable` split on `|` and `&` only.
+    #[test]
+    fn header_and_flag_value_lists() {
+        let resolved = resolve(
+            "example.com resHeaders://x-a=1&x-b=2\nexample.com enable://p|q&r\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &resolved, "resHeaders");
+        assert_eq!(h.get("x-a").unwrap(), "1");
+        assert_eq!(h.get("x-b").unwrap(), "2");
+
+        let flags = enabled_flags(&resolved);
+        assert!(flags.contains("p") && flags.contains("q") && flags.contains("r"));
+        // A comma is not a separator upstream, so it stays part of the name.
+        let commas = resolve("example.com enable://p,q\n", "http://example.com/");
+        assert!(enabled_flags(&commas).contains("p,q"));
+    }
+
     // ── response header operators ──
 
     /// Response parts carrying `headers`, for the operator tests below.
@@ -4193,16 +4274,29 @@ mod tests {
         assert_eq!(parts.headers.get("access-control-allow-origin").unwrap(), "*");
     }
 
+    /// `resCookies` replaces a `Set-Cookie` the response already sent under the
+    /// same name instead of adding a second one (`setResCookies`).
     #[test]
-    fn res_cookies_set() {
-        let resolved = resolve("example.com resCookies://sid=abc\n", "http://example.com/");
+    fn res_cookies_replace_by_name() {
+        let resolved = resolve(
+            "example.com resCookies://sid=new&theme=dark\n",
+            "http://example.com/",
+        );
         let mut headers = HeaderMap::new();
+        headers.append(hyper::header::SET_COOKIE, "sid=old; Path=/".parse().unwrap());
+        headers.append(hyper::header::SET_COOKIE, "other=1".parse().unwrap());
         apply_res_cookies(&mut headers, &resolved);
         let vals: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
-        assert!(vals.iter().any(|v| v == "sid=abc"));
+        assert_eq!(vals, ["sid=new", "other=1", "theme=dark"]);
+
+        // A `;` in a value would end the cookie early, so it is encoded.
+        let resolved = resolve("example.com resCookies://a=x;Secure\n", "http://example.com/");
+        let mut headers = HeaderMap::new();
+        apply_res_cookies(&mut headers, &resolved);
+        assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x%3BSecure");
     }
 }
