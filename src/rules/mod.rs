@@ -224,7 +224,8 @@ impl Rule {
 /// matching exclude filter vetoes the rule.
 #[derive(Debug, Clone)]
 pub struct Filter {
-    /// `excludeFilter://` negates: the rule is skipped when the condition holds.
+    /// The rule is skipped when the condition holds. True for every filter
+    /// operator except `includeFilter://` — see [`filter_excludes`].
     pub exclude: bool,
     /// A `!` written in front of the condition's value (`m:!GET`), in front of a
     /// URL pattern (`includeFilter://!*.cdn.com`), or straight after a header
@@ -386,7 +387,7 @@ pub struct ReqInfo {
     pub full_url: String,
     /// Request headers as (lowercased-name, value) pairs, for filter conditions.
     pub headers: Vec<(String, String)>,
-    /// Client IP, if known, for `filter://i:` conditions.
+    /// Client IP, if known, for `i:` / `clientIp:` filter conditions.
     pub client_ip: Option<String>,
 }
 
@@ -718,6 +719,8 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
             // A filter whose condition does not parse is dropped, never demoted
             // to an operator named `includeFilter`.
             filters.extend(parse_filter(t));
+        } else if let Some(f) = parse_ignore_filter(t) {
+            filters.push(f);
         } else if let Some(op) = parse_op(t) {
             ops.push(op);
         }
@@ -832,15 +835,16 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
 
 /// `Some(excludes)` when `proto` is one of the filter operators.
 ///
-/// NOTE: upstream reads `filter://` as an *exclude* filter
-/// (`isInclude = matcher[1] === 'n'`, `_original/lib/rules/rules.js:1563`). This
-/// port has always treated it as an include, and its docs and examples say so;
-/// the divergence is recorded in `docs/RULES.md` rather than flipped underneath
-/// existing rules files.
+/// Only `includeFilter://` includes. whistle decides this with
+/// `isInclude = matcher[1] === 'n'` (`_original/lib/rules/rules.js:1563`), which
+/// is true for i**n**cludeFilter alone — `filter://` yields `'i'` and
+/// `ignore://` yields `'g'`, so both are *exclude* filters. This port used to
+/// read `filter://` as an include, which did not merely fail on a whistle rules
+/// file: it did the opposite of what the file asked, silently.
 fn filter_excludes(proto: &str) -> Option<bool> {
     match proto {
-        "filter" | "includeFilter" => Some(false),
-        "excludeFilter" => Some(true),
+        "includeFilter" => Some(false),
+        "filter" | "excludeFilter" => Some(true),
         _ => None,
     }
 }
@@ -869,6 +873,26 @@ fn parse_filter(tok: &str) -> Option<Filter> {
     let (cond, negate) = parse_cond(spec, pure_ok)?;
     Some(Filter {
         exclude,
+        negate,
+        cond,
+    })
+}
+
+/// `ignore://<condition>` — an exclude filter, exactly like `filter://`.
+///
+/// whistle's `ignore://` reaches `resolveMatchFilter` through the same
+/// `PROPS_FILTER_RE` (`_original/lib/rules/rules.js:57`) and, spelling `'g'` at
+/// index 1, lands in the exclude branch with it.
+///
+/// Only a *named* condition is read this way. A payload that is not one stays
+/// the `ignore://<protocol>` operator this port documents — the two can never
+/// collide, since protocol names carry no separator.
+fn parse_ignore_filter(tok: &str) -> Option<Filter> {
+    let spec = tok.strip_prefix("ignore://")?;
+    let (kind, rest) = split_cond_name(spec, false)?;
+    let (cond, negate) = build_cond(kind, rest)?;
+    Some(Filter {
+        exclude: true,
         negate,
         cond,
     })
@@ -1774,12 +1798,36 @@ mod filter_parse_tests {
         }
     }
 
-    /// `excludeFilter://` is the only spelling that excludes here.
+    /// `includeFilter://` is the only spelling that *includes*: whistle's
+    /// `isInclude = matcher[1] === 'n'` (`_original/lib/rules/rules.js:1563`) is
+    /// true for i**n**cludeFilter alone, so `filter://` (`'i'`) and `ignore://`
+    /// (`'g'`) both exclude. This port used to read `filter://` the other way,
+    /// which made a whistle rules file do the opposite of what it asked.
     #[test]
-    fn exclude_flag() {
-        assert!(cond_of("excludeFilter://m:GET").exclude);
+    fn only_include_filter_includes() {
         assert!(!cond_of("includeFilter://m:GET").exclude);
-        assert!(!cond_of("filter://m:GET").exclude);
+        assert!(cond_of("excludeFilter://m:GET").exclude);
+        assert!(cond_of("filter://m:GET").exclude);
+    }
+
+    /// `ignore://` carrying a condition is an exclude filter, like `filter://`.
+    #[test]
+    fn ignore_with_a_condition_is_a_filter() {
+        let f = cond_of("ignore://m:GET");
+        assert!(f.exclude);
+        assert!(matches!(f.cond, Cond::Method(_)));
+    }
+
+    /// …but `ignore://<protocol>` keeps its operator meaning. The two cannot
+    /// collide: a protocol name carries no separator.
+    #[test]
+    fn ignore_without_a_condition_stays_an_operator() {
+        let rules = parse_text("example.com host://1.1.1.1 ignore://host");
+        assert!(rules[0].filters.is_empty());
+        assert!(rules[0].ops.iter().any(|op| op.protocol == "ignore"));
+        assert!(parse_text("example.com host://1.1.1.1 ignore://all")[0]
+            .filters
+            .is_empty());
     }
 }
 
@@ -1893,7 +1941,7 @@ mod pattern_tests {
     /// hold as written.
     #[test]
     fn negation_leaves_filters_alone() {
-        let text = "!/example\\.test/ host://1.1.1.1 filter://m:POST";
+        let text = "!/example\\.test/ host://1.1.1.1 includeFilter://m:POST";
         assert!(!hits(text, "http://other.test/"), "GET fails the filter");
 
         let mut mgr = RuleManager::new();

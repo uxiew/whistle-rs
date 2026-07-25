@@ -206,6 +206,14 @@ syntax is `_original/docs/docs/rules/filters.md`.
 example.com   host://10.0.0.1   includeFilter://reqH.x-canary:1
 ```
 
+> ⚠️ **`includeFilter://` is the only spelling that includes.** `filter://` and
+> `ignore://<condition>` are **exclude** filters — whistle decides with
+> `isInclude = matcher[1] === 'n'` (`_original/lib/rules/rules.js:1563`), which is true
+> for i**n**cludeFilter alone. whistle-rs read `filter://` as an include until this was
+> corrected, so a rules file using it did the *opposite* of what it asked. If you have
+> `filter://` rules written against the old behaviour, they now exclude; rewrite them as
+> `includeFilter://`.
+
 **How several filters combine** (whistle's `matchExcludeFilters`,
 `_original/lib/rules/rules.js:1967`):
 
@@ -231,10 +239,12 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 | Sampling | `chance:<p>`, `chance:<n>%`, `probability:` | a random fraction of requests (`Math.random() < p`) |
 | URL | anything else | the full request URL, using the same pattern engine as a rule's own [pattern](#patterns) — regexp, wildcard or prefix |
 
-> Header values match by **containment**, like upstream's `filterHeader`
-> (`rules.js:1922`) — `reqH.content-type:json` matches `application/json`. The older
-> `h:<key>=<value>` spelling used to require equality here and now matches the same
-> way; write `reqH.<key>:/^value$/` when you need an exact value.
+> ⚠️ **Behaviour change:** header values match by **containment**, like upstream's
+> `filterHeader` (`rules.js:1922`) — `reqH.content-type:json` matches
+> `application/json`. The `h:<key>=<value>` spelling this port already had used to
+> require the value to be **equal**; it now matches by containment too, so it accepts
+> strictly more requests than before. Write `reqH.<key>:/^value$/` where you relied on
+> an exact match.
 
 A `!` inverts a condition. It goes in front of the value (`m:!GET`), straight after a
 header key (`reqH.x-tag!:v`), or in front of a URL pattern (`includeFilter://!*.cdn.com`);
@@ -276,11 +286,10 @@ exclude filter never fires, and no `!` can flip either. The subsystem fails clos
 
 | Upstream | Here | Why |
 |---|---|---|
-| `filter://…` is an **exclude** filter (`isInclude = matcher[1] === 'n'`, `rules.js:1563`) | an **include** filter | This port has always read it that way and its rules files say so; flipping it silently would invert every existing `filter://` rule. Prefer `includeFilter://`/`excludeFilter://`, which mean the same thing in both. |
 | `i:` matches the client IP, then falls back to the server IP | client IP only | The server IP does not exist yet at match time. Upstream only reaches its server-IP arm when the client IP is unknown, so the two agree in practice. |
+| `filter://<url-pattern>` with no trailing `/` is a **pattern**, not a filter | an exclude URL filter | Upstream's `PATTERN_FILTER_RE` requires the payload to end in `/` or `/i`; the bare form falls out of its filter parser and becomes another pattern for the line. Every *documented* `filter://` URL spelling is an exclude filter in both. |
 | `host:<v>` routes to proxy-host filtering | matches the request host | `host:` (with a colon) is this port's own spelling; upstream has only `host=`/`host.`, for a different job. |
 | header values are also compared against `encodeURIComponent(value)` | not compared | That arm is unreachable upstream: the haystack is lowercased while `encodeURIComponent` emits upper-case hex. |
-| `ignore://<cond>:<v>` is a filter | an `ignore://` operator | Rare; `ignore://<protocol>` keeps its documented meaning here. |
 
 A filter whose condition cannot be parsed at all (`includeFilter://`, an empty header
 key) is dropped, exactly as upstream drops it — the rule then applies without that
@@ -297,6 +306,12 @@ condition.
 static.example.com   ignore://host        # this host keeps its real destination
 example.com/health   ignore://all         # bypass every rule for this path
 ```
+
+`ignore://` followed by a **[filter condition](#filter-conditions)** rather than a
+protocol name is an *exclude filter*, not this operator — `ignore://m:POST` skips the
+rule for POST requests, exactly like `excludeFilter://m:POST`. Upstream routes both
+spellings through the same parser (`_original/lib/rules/rules.js:57`). The two readings
+cannot collide: a protocol name carries no `:`, `.` or `=`.
 
 ### Short-circuit (no upstream request is made)
 

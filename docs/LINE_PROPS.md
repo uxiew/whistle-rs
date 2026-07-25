@@ -97,7 +97,7 @@ manager.resolve_scoped(&req, is_internal);  // is_internal = true 时反转
 本移植改用固定且公开的头名 —— **`x-whistle-internal-req`**（任意非空值即可）：
 这里没有需要保护的内部服务，而固定名字才让 whistle-rs 自己的工具（以及开发者本人）
 能主动触发一条 `internal` 规则。该头在规则匹配**之前**就被摘掉，因此既不会被
-`filter://h:` 看到，也不会写进抓包记录或发到源站。
+`includeFilter://reqH.` 看到，也不会写进抓包记录或发到源站。
 
 ```console
 $ curl -x 127.0.0.1:8899 http://demo.test/api            # 客户端请求

@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn filter_method_include() {
         let mut m = crate::rules::RuleManager::new();
-        m.set_text("example.com host://1.1.1.1 filter://m:POST\n");
+        m.set_text("example.com host://1.1.1.1 includeFilter://m:POST\n");
         let mut r = req("http://example.com/");
         assert!(m.resolve(&r).value("host").is_none()); // GET
         r.method = "POST".into();
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn header_filter() {
         let mut m = crate::rules::RuleManager::new();
-        m.set_text("example.com host://1.1.1.1 filter://h:x-env=prod\n");
+        m.set_text("example.com host://1.1.1.1 includeFilter://h:x-env=prod\n");
         let mut r = req("http://example.com/");
         assert!(m.resolve(&r).value("host").is_none());
         r.headers.push(("x-env".into(), "prod".into()));
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn client_ip_filter() {
         let mut m = crate::rules::RuleManager::new();
-        m.set_text("example.com host://1.1.1.1 filter://i:10.0.0.5\n");
+        m.set_text("example.com host://1.1.1.1 includeFilter://i:10.0.0.5\n");
         let mut r = req("http://example.com/");
         assert!(m.resolve(&r).value("host").is_none());
         r.client_ip = Some("10.0.0.5".into());
@@ -506,7 +506,7 @@ mod filter_tests {
         assert!(!hits("includeFilter://reqH.x-tag:no", &tagged));
         assert!(!hits("includeFilter://reqH.x-other:yes", &tagged));
         // …and the spelling this port already had keeps working.
-        assert!(hits("filter://h:x-tag=yes", &tagged));
+        assert!(hits("includeFilter://h:x-tag=yes", &tagged));
     }
 
     /// Header values are matched by *containment*, case-insensitively — which
@@ -579,26 +579,26 @@ mod filter_tests {
     fn method_regexp() {
         let mut post = req("http://example.com/");
         post.method = "POST".into();
-        assert!(hits("filter://m:/^P/", &post));
-        assert!(!hits("filter://m:/^P/", &req("http://example.com/")));
+        assert!(hits("includeFilter://m:/^P/", &post));
+        assert!(!hits("includeFilter://m:/^P/", &req("http://example.com/")));
         // Method regexps ignore case even without the flag.
-        assert!(hits("filter://m:/^post$/", &post));
+        assert!(hits("includeFilter://m:/^post$/", &post));
     }
 
     #[test]
     fn negated_method() {
-        assert!(!hits("filter://m:!GET", &req("http://example.com/")));
+        assert!(!hits("includeFilter://m:!GET", &req("http://example.com/")));
         let mut post = req("http://example.com/");
         post.method = "POST".into();
-        assert!(hits("filter://m:!GET", &post));
+        assert!(hits("includeFilter://m:!GET", &post));
     }
 
     #[test]
     fn host_condition() {
         let r = req("http://example.com/");
-        assert!(hits("filter://host:example.com", &r));
-        assert!(hits("filter://host:/^EXAMPLE\\./i", &r));
-        assert!(!hits("filter://host:other.com", &r));
+        assert!(hits("includeFilter://host:example.com", &r));
+        assert!(hits("includeFilter://host:/^EXAMPLE\\./i", &r));
+        assert!(!hits("includeFilter://host:other.com", &r));
     }
 
     // ── IPs ──
@@ -608,17 +608,17 @@ mod filter_tests {
     #[test]
     fn ip_conditions() {
         let mut r = req("http://example.com/");
-        assert!(!hits("filter://i:10.0.0.5", &r), "unknown IP must fail closed");
-        assert!(!hits("filter://i:!10.0.0.5", &r), "…even negated");
+        assert!(!hits("includeFilter://i:10.0.0.5", &r), "unknown IP must fail closed");
+        assert!(!hits("includeFilter://i:!10.0.0.5", &r), "…even negated");
 
         r.client_ip = Some("10.0.0.5".into());
-        assert!(hits("filter://i:10.0.0.5", &r));
-        assert!(hits("filter://clientIp:10.0.0.5", &r));
+        assert!(hits("includeFilter://i:10.0.0.5", &r));
+        assert!(hits("includeFilter://clientIp:10.0.0.5", &r));
         assert!(hits("includeFilter://clientIp=10.0.0.5", &r));
-        assert!(hits("filter://i:/^10\\./", &r));
-        assert!(!hits("filter://i:10.0.0.6", &r));
+        assert!(hits("includeFilter://i:/^10\\./", &r));
+        assert!(!hits("includeFilter://i:10.0.0.6", &r));
         // A literal that is not an IP simply never equals one.
-        assert!(!hits("filter://i:localhost", &r));
+        assert!(!hits("includeFilter://i:localhost", &r));
     }
 
     // ── chance ──
@@ -675,7 +675,7 @@ mod filter_tests {
             "remoteAddress:1.2.3.4",
             "remotePort:80",
         ] {
-            assert!(!hits(&format!("filter://{cond}"), &r), "include {cond}");
+            assert!(!hits(&format!("includeFilter://{cond}"), &r), "include {cond}");
             assert!(
                 hits(&format!("excludeFilter://{cond}"), &r),
                 "exclude {cond} must not fire"
@@ -690,7 +690,7 @@ mod filter_tests {
         }
         // Negation cannot rescue an unknown answer: upstream's
         // `getFilterResult` returns `false` before it consults `not`.
-        assert!(!hits("filter://s:!200", &r));
+        assert!(!hits("includeFilter://s:!200", &r));
         assert!(!hits("includeFilter://serverIp:!1.2.3.4", &r));
         assert!(hits("excludeFilter://s:!200", &r));
     }
@@ -710,6 +710,36 @@ mod filter_tests {
             &["includeFilter://reqH.x-tag:no", "includeFilter://m:POST"],
             &tagged
         ));
+    }
+
+    /// `filter://` **excludes**, like `excludeFilter://` — `isInclude` is true
+    /// for i**n**cludeFilter alone (`_original/lib/rules/rules.js:1563`).
+    /// Reading it as an include did not make a whistle rules file fail, it made
+    /// it do the opposite of what it asked.
+    #[test]
+    fn plain_filter_excludes() {
+        let mut post = req("http://example.com/");
+        post.method = "POST".into();
+        assert!(!hits("filter://m:POST", &post), "POST is filtered out");
+        assert!(hits("filter://m:POST", &req("http://example.com/")), "GET is not");
+
+        let tagged = with_header("http://example.com/", "x-tag", "yes");
+        assert!(!hits("filter://reqH:x-tag=yes", &tagged));
+        assert!(hits("filter://reqH:x-tag=yes", &req("http://example.com/")));
+    }
+
+    /// `ignore://<condition>` excludes the same way; `ignore://<protocol>` is
+    /// untouched and still drops that protocol from the resolved set.
+    #[test]
+    fn ignore_with_a_condition_excludes() {
+        let mut post = req("http://example.com/");
+        post.method = "POST".into();
+        assert!(!hits("ignore://m:POST", &post));
+        assert!(hits("ignore://m:POST", &req("http://example.com/")));
+
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com host://1.1.1.1\nexample.com ignore://host\n");
+        assert!(mgr.resolve(&req("http://example.com/")).value("host").is_none());
     }
 
     /// A matching exclude filter vetoes the rule even when an include matched.
