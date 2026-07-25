@@ -319,6 +319,15 @@ does.
 chained.test       proxy://127.0.0.1:8888?host=10.0.0.9:8899 lineProps://proxyTunnel
 ```
 
+Both `CONNECT`s carry the same `Proxy-Authorization`, so the **second** proxy is
+shown the credential written for the first — and when the proxy URL carries no
+credential of its own, that is the *client's* own `Proxy-Authorization`, a
+credential the client aimed at whistle-rs travelling one hop further than the
+client can see. This matches whistle (`lib/util/patch.js:120-140`); every address
+involved was named by the rule, and withholding the credential would make an
+authenticated second hop silently unreachable. Point a chain at a proxy you do
+not control and this is what leaves.
+
 **When several proxy operators match**, the one written **first** wins, whatever
 its spelling. whistle files every spelling under a single `proxy` key
 (`PROXY_RE` → `protocol = 'proxy'`, `_original/lib/rules/rules.js:1286`), so

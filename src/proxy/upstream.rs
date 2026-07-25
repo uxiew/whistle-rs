@@ -789,10 +789,20 @@ const POLICY_HEADER: &str = "X-Whistle-Policy";
 /// *inside* the first tunnel and is addressed to a further proxy. It carries
 /// the same headers plus [`POLICY_HEADER`], which is what upstream's rewritten
 /// CONNECT does (`_original/lib/util/patch.js:120-140`) — including the
-/// `Proxy-Authorization`. Worth knowing: one rule names both hops and supplies
-/// one credential, so the second proxy is shown the credential written for the
-/// first. Upstream does the same, and dropping it would make an authenticated
-/// second hop unreachable.
+/// `Proxy-Authorization`. That is worth stating plainly, because there are two
+/// credentials it can be, and the second is the surprising one:
+///
+/// * the credential written into the proxy URL (`proxy://user:pass@first`) —
+///   one rule names both hops and supplies one credential, so the second proxy
+///   is shown the one written for the first;
+/// * failing that, the **client's own** `Proxy-Authorization`, via
+///   [`Hop::proxy_auth`] — a credential the client aimed at *us*, forwarded one
+///   hop further than the client can see.
+///
+/// Both are kept, matching upstream: every address involved was named by the
+/// rule its author wrote, and withholding the credential would make an
+/// authenticated second hop silently unreachable. Point a `proxyTunnel` chain at
+/// a proxy you do not control and this is what leaves.
 async fn http_connect(
     mut s: BoxedIo,
     host: &str,
