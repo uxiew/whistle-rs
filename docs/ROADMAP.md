@@ -50,8 +50,12 @@
       握手先于字节：插件应答 200 之前的任何失败都零代价（body 原样放行）。
 - [x] ~~**`pipe://` 真正的流式管道**~~ → 已完成。`pipe://` 现在选中流式钩子、支持
       `pipe://name(value)` 取值语法；指向没有流式钩子的插件时退化为 `plugin://`。
+- [x] ~~**WebSocket 帧级拦改**（原版 `wsReqRead`/`wsResRead` 一族）~~ → 已完成，见
+      [`PLUGINS.md`](PLUGINS.md#websocket-帧钩子--onwsframe)。每会话每方向一条长连接
+      （`POST /ws/frames`），逐帧一进一出；控制帧不交付，帧类型与分片结构不可改，
+      插件出错只丢钩子不丢连接。实测每帧约 20µs（p50），不挂插件的会话零开销。
 - [ ] **更多插件钩子**：`uiServer`/`statsServer`（插件自带 UI/统计页）、`auth`、
-      `sniCallback`、WebSocket 帧级拦改。
+      `sniCallback`。
 
 ### 规则解析（本轮审计修复）
 
@@ -134,8 +138,8 @@
 
 ## 参与
 
-剩下的多为增量工作。最接近「架构挡住的能力」的一项是 **WebSocket 帧级拦改** ——
-帧已经抓到并展示了，但插件还够不着；流式钩子的传输层可以复用，缺的是帧级的接线。
+剩下的多为增量工作。真正被架构挡住的只剩 **`sniCallback`** —— 它要在 TLS SNI 阶段挑证书，
+早于按请求的规则解析，当前 MITM 结构够不着。
 
 模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
 插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，

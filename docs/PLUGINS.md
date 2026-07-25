@@ -9,6 +9,7 @@ whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 - **改写请求头** —— 在规则算子之后生效，因此可以覆盖规则的结果
 - **改写响应** —— 状态码、响应头、响应体
 - **流式改写 body** —— 边收边改，全程不落内存（`pipe://`）
+- **拦改 WebSocket 帧** —— 逐帧、双向，可改写也可丢弃
 
 两种运行时实现同一套契约：
 
@@ -17,14 +18,18 @@ whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 | **JS / TS 插件** | 独立进程，通过 HTTP 协议通信。用 [`sdk/`](../sdk/) 的零依赖 SDK 编写，协议细节完全被封装 |
 | **Rust 插件** | 进程内原生插件，实现 `RustPlugin` trait，零 IPC。见 [`src/plugins/builtin.rs`](../src/plugins/builtin.rs) |
 
-钩子分两族，**由规则的协议名决定跑哪一族**：
+钩子分三族，**由规则的协议名决定跑哪一族**：
 
 | 规则 | 钩子 | body |
 |------|------|------|
 | `plugin://<name>[/<param>]` | `onRequest` / `onResponse` | 整体缓冲，需显式声明 |
 | `pipe://<name>[(<value>)]` | `pipeRequest` / `pipeResponse` | **流式，永不缓冲** |
+| 两者皆可，命中 WebSocket 时 | `onWsFrame` | 逐帧，一次一帧 |
 
 `pipe://` 指向一个没有声明任何流式钩子的插件时，退化为 `plugin://` —— 与流式钩子出现之前的语义一致，老规则不会失效。
+
+WebSocket 帧钩子**两种协议名都能触发**：一个 WebSocket 没有「缓冲 / 流式」之分可供协议名表达，
+让其中一个悄悄不生效只会变成陷阱。协议名依然决定**握手请求**（它就是个普通 HTTP 请求）跑哪一族。
 
 > 这是 whistle-rs **自研**的插件体系，不是原版 whistle 插件 API 的复刻。现成的
 > `npm i whistle.xxx` 包无法直接运行 —— 原版 API 建立在对 Node `req`/`res` 对象的
@@ -231,6 +236,169 @@ $ node timestamped-get.js http://127.0.0.1:18081/buffered 127.0.0.1:18913  # plu
 
 ---
 
+## WebSocket 帧钩子 / `onWsFrame`
+
+WebSocket 的单位既不是「一个请求」也不是「一条字节流」，而是**一帧**，所以它有自己的钩子：
+
+```js
+const { start } = require('whistle-rs/sdk/whistle-rs-plugin');
+
+start({
+  name: 'wschat',
+
+  onWsFrame(frame, ctx) {
+    if (!frame.isText) return;                      // 二进制/分片原样放行
+    if (frame.text.includes('SECRET')) return null; // 丢弃这一帧
+    return `${frame.text} [${ctx.direction}]`;      // 改写
+  },
+});
+```
+
+```
+127.0.0.1:19010   pipe://wschat
+127.0.0.1:19010   pipe://wschat(demo)     # ctx.pipeValue === 'demo'
+127.0.0.1:19010   plugin://wschat/demo    # ctx.param === 'demo'
+```
+
+完整示例见 [`examples/plugins/ws-frames.js`](../examples/plugins/ws-frames.js)；
+Rust 版本见 [`src/plugins/builtin.rs`](../src/plugins/builtin.rs) 里的 `pipe://ws-upper`。
+
+### 钩子能做什么、不能做什么
+
+| 返回值 | 结果 |
+|--------|------|
+| 不返回 / `undefined` / `true` / `frame` 本身 | 原样放行（也支持直接改 `frame.payload`） |
+| 字符串 | 按 UTF-8 编码后替换负载 |
+| `Buffer` | 逐字节替换负载 |
+| 其它对象 | JSON 序列化后替换负载 |
+| `null` / `false` | **丢弃这一帧** |
+
+**不能改的是帧的类型和分片结构**：返回值里的 opcode 与 FIN 位会被代理忽略。让插件把一个
+continuation 改成 text，或者把一条分片消息拆散，是稳定的自毁方式，而真正需要它的场景并不存在。
+
+### 帧对象
+
+| 成员 | 说明 |
+|------|------|
+| `frame.payload` | **`Buffer`**，永远是字节；可直接赋值改写 |
+| `frame.opcode` | `0x0` continuation / `0x1` text / `0x2` binary |
+| `frame.fin` | 是否是所属消息的最后一帧 |
+| `frame.direction` | `'send'`（客户端→服务端）/ `'receive'`（服务端→客户端） |
+| `frame.isText` / `isBinary` | **一整条**消息（`fin` 为真且 opcode 对应）时才为真 |
+| `frame.isFragment` | 分片：`!fin` 或 opcode 为 continuation |
+| `frame.text` | 按 UTF-8 解码 —— **显式索取**，见下 |
+| `frame.setText(s)` | 用 UTF-8 编码替换负载 |
+
+`ctx` 是**会话级**的（每个方向一个实例，活到会话结束，可以往上挂状态）：
+`ctx.id`（就是 `/frames.json` 里的会话 id）、`ctx.url` / `ctx.method`、`ctx.param`、
+`ctx.pipeValue`、`ctx.clientIp`、`ctx.headers`（握手请求头）、`ctx.direction`、`ctx.header(n)`、`ctx.query(n)`。
+
+### 二进制纪律（同一条老规矩）
+
+`frame.payload` 是 `Buffer` 而且必须一直是。`Buffer.from(buf.toString())` 会把每个非法 UTF-8
+序列换成 U+FFFD —— 8MB 的二进制帧回来会变成 15MB 的乱码。所以：
+
+- 帧交到手里就是 `Buffer`，**没有**自动解码；`frame.text` 要自己开口要；
+- `isText` 只在**完整**文本消息上为真。分片的第一帧 opcode 也是 `0x1`，但一个多字节字符可能
+  正好被切在两片之间 —— 要处理分片，就跨 `isFragment` 帧自己攒。
+
+### 哪些帧不会交给插件
+
+- **控制帧（close / ping / pong）永不交付**。它们是协议机件不是应用数据：丢一个 ping 会打断
+  保活，改一个 close 会打断关闭握手，而没有哪个正当的钩子需要这么做。它们照常被抓取展示。
+- 保留 opcode（`0x3`–`0x7`、`0xb`–`0xf`）同样不交付。
+
+**分片是交付的**（continuation 也交），带着 `fin` 和 opcode。对分片调用「丢弃」时，代理不会
+真的把这一帧删掉，而是**把它变成空负载放行** —— 删掉一片会让消息永远收不完或让后续 continuation
+变成孤儿，那是协议错误，不是「少了一条消息」。字节没了，结构还在。
+
+### 传输：一条长连接，不是一帧一次 HTTP
+
+钩子必须先给出裁决，帧才能转发（它可以改写、可以丢弃），所以**每帧一次本机往返是任何正确
+设计的下限**。能选的只是往返之外还要花什么。
+
+一帧一次 `POST` 要额外付 TCP 连接 + 请求头 + 响应头，而 WebSocket 恰恰是「很多条小消息」。
+所以每个会话**每个方向开一条长连接**（`POST /ws/frames`），活到隧道结束：每帧只多六字节记录头，
+顺序天然由流保证，插件也能在连接上挂会话级状态。
+
+代价说清楚（实测，debug 构建，Node 插件在同机 loopback，500 次串行 echo 往返 —— 每次往返
+经过两帧钩子）：
+
+```
+不挂插件            mean 0.089ms  p50 0.084ms  p95 0.124ms
+插件在跑但规则没命中  mean 0.091ms  p50 0.084ms  p95 0.131ms
+挂上帧钩子           mean 0.164ms  p50 0.129ms  p95 0.276ms
+```
+
+即**每帧约 20µs（p50）/ 37µs（mean）/ 75µs（p95）**。帧不做流水线：第 n+1 帧要等第 n 帧的
+裁决回来才交出去 —— 一个会让 WebSocket 乱序的钩子比一个慢的钩子糟糕得多。
+
+### 出错了会怎样
+
+和流式钩子不同，帧钩子**任何时候都能被放弃**：帧流始终在代理手里。插件没起来、拒绝会话、
+中途挂掉、5 秒不给裁决 —— 结果都一样：这个钩子被摘掉，之后的帧原样放行，日志里留一行 `WARN`。
+**插件永远不会弄断一条 WebSocket。**
+
+被摘掉时正在飞的那一帧会原样放行；已经交出去还没回裁决的帧则可能丢失。超时后不重试也不复用
+连接：迟到的裁决会被当成下一帧的裁决，一个错位的钩子比没有钩子更糟。
+
+### 和 `frameScript` 的关系
+
+两个都命中时，**`frameScript` 先跑，插件后跑**：`frameScript` 是规则算子，而这个代理里规则
+算子一律先于插件。于是
+
+- 插件看到的是脚本改写后的负载；
+- 插件最后返回的字节既是上线的字节，也是 Network 面板记录的字节；
+- 被丢弃的帧不会出现在 `/frames.json` —— 对端根本没见过它。
+
+多个插件命中时按规则顺序串联，后一个吃前一个的输出；第一个说「丢弃」的插件终止这条链
+（与第一个 `respond()` 终止请求钩子链同理）。
+
+### Rust 插件
+
+`RustPlugin::on_ws_frame` 默认是恒等，覆盖它即可：
+
+```rust
+fn on_ws_frame(&self, _meta: &FrameMeta, frame: &HookFrame<'_>) -> Verdict {
+    if frame.opcode != 0x1 || !frame.fin {
+        return Verdict::Keep;
+    }
+    Verdict::Replace(Bytes::from(frame.payload.to_ascii_uppercase()))
+}
+```
+
+内置的 `pipe://ws-upper` 就是这么实现的。注意它同样不解码成 `String` —— `to_ascii_uppercase`
+在字节上工作，多字节 UTF-8 因此原样穿过。
+
+### 实测
+
+一条真的 WebSocket（握手 + 掩码 + 分片都是真的）穿过代理，插件双向改写：
+
+```
+$ ./run.sh hooked
+CLIENT  handshake: HTTP/1.1 101 Switching Protocols
+CLIENT  send text "hello"
+CLIENT  got  text "echo:hello [demo → server] [demo → client]"
+CLIENT  send text "this is SECRET" (the plugin drops this one)
+CLIENT  send text "after"
+CLIENT  got  text "echo:after [demo → server] [demo → client]"
+CLIENT  SECRET reached the client: false
+CLIENT  send binary 8388608B sha=7d212b9c884f5c77
+CLIENT  got  binary 8388608B sha=7d212b9c884f5c77
+CLIENT  binary round-trip: IDENTICAL
+--- 源站看到的 ---
+SERVER  saw text   fin=true  "hello [demo → server]"
+SERVER  saw text   fin=true  "after [demo → server]"
+SERVER  saw binary fin=true  8388608B sha=7d212b9c884f5c77
+SERVER  saw text   fin=false "frag"          <- 分片原样放行
+SERVER  saw cont   fin=true  "ment"
+```
+
+`SECRET` 那一帧既没到源站也没回客户端；8MB 二进制两个方向都**长度和 sha 分毫不差**（不是
+15MB 的乱码）；分片按示例插件的选择原样穿过。不挂插件跑同一个脚本，输出与不经过代理时一致。
+
+---
+
 ## 上下文 API
 
 ### 通用（两个钩子都有）
@@ -289,6 +457,11 @@ $ node timestamped-get.js http://127.0.0.1:18081/buffered 127.0.0.1:18913  # plu
 
 一旦有 `pipe://` 插件真的接管了 body，该方向的 `content-length` 会被去掉（变换可以改变长度），后续按 chunked 传输。
 
+**WebSocket 升级请求走的是另一条路**：它在第 6 步之前就分岔了（升级没有 body，也就没有管道可接）。
+顺序变成：规则解析 → `onRequest`（握手请求也是普通请求，插件可以改握手头、注入规则、甚至直接
+应答挡掉升级）→ 转发握手 → 上游回 `101` → **隧道建立，帧钩子这时才去连插件**（因此插件的连接
+不会拖慢握手）→ 每帧 `frameScript` → 每帧 `onWsFrame`。上游没回 `101` 就不会有任何插件被连接。
+
 ---
 
 ## 错误处理
@@ -311,6 +484,7 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 | `plugin://tag[/<值>]` | 注入给请求和响应打标签的规则，演示「规则注入」 |
 | `plugin://stamp[/<值>]` | 给响应加 `x-stamped-by` 头，演示**响应钩子**且不索取 body |
 | `pipe://upper` | 把 body 逐帧转大写，演示**流式钩子**（请求、响应两个方向都接） |
+| `pipe://ws-upper` | 把 WebSocket 文本帧转大写，演示**帧钩子**（双向；二进制与分片不碰） |
 
 写一个 Rust 插件只需实现 `name` 与 `on_request`，其余方法都有默认实现 —— 以后给协议加钩子不会破坏已有插件。`pipe` 的默认实现是恒等变换。
 
@@ -330,13 +504,13 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 {
   "name": "my-plugin",
   "version": "1.0.0",
-  "hooks": ["request", "response", "pipeRequest", "pipeResponse"],
+  "hooks": ["request", "response", "pipeRequest", "pipeResponse", "wsFrame"],
   "requestBody": false,
   "responseBody": true
 }
 ```
 
-`hooks` 决定哪些端点会被调用；两个 body 开关决定是否缓冲并投递 body（只对 `request` / `response` 有意义 —— 流式钩子从不缓冲，也就无需声明）。
+`hooks` 决定哪些端点会被调用；两个 body 开关决定是否缓冲并投递 body（只对 `request` / `response` 有意义 —— 流式钩子和帧钩子从不缓冲，也就无需声明）。
 
 **不提供 `/manifest` 的插件按 v1 协议处理**：只有请求钩子，无 body，分发到 `POST /`。老插件因此无需改动即可继续工作。
 
@@ -398,6 +572,45 @@ transfer-encoding: chunked
 
 **握手先于字节**：代理在收到应答头之前不会读 body 的任何一个字节，所以上面那些失败都是零代价的。因此插件**必须在进入处理函数时立刻发出 `200` 头**（SDK 已经这么做了，包括 `flushHeaders()`），不要等第一个 chunk 到了再发。
 
+### `POST /ws/frames` —— WebSocket 帧钩子
+
+每个被隧道化的 WebSocket 会话、**每个方向**一条长连接，活到隧道结束。元信息同样是一个头，
+base64 编码的 JSON：
+
+```
+POST /ws/frames HTTP/1.1
+x-whistle-rs-ws: eyJpZCI6NDIsImRpcmVjdGlvbiI6InNlbmQiLCJ1cmwiOiJ3czovLy4uLiJ9
+transfer-encoding: chunked
+```
+
+解码后：
+
+```json
+{ "id": 42, "method": "GET", "url": "ws://…/chat", "param": "…",
+  "direction": "send", "pipeValue": "demo", "clientIp": "1.2.3.4",
+  "headers": [["origin","http://a"]] }
+```
+
+`direction` 是 `send`（客户端→服务端）或 `receive`。`pipeValue` / `clientIp` 缺省时不出现。
+
+应答 `200` 表示接管，其它任何状态码 / 连不上 / 5 秒不应答 —— 这个方向就不挂钩子，帧原样穿过。
+
+此后请求体与应答体各是一串**记录**，一帧一条，一进一出、严格有序：
+
+```
+flags:u8  opcode:u8  length:u32be  payload:length
+flags: 0x01 FIN，0x02 DROP（仅插件→代理）
+```
+
+代理**忽略**回传记录里的 opcode 与 FIN 位（见上文「不能改的是帧的类型和分片结构」），
+只取 DROP 与负载。
+
+**为什么这里要自己分帧**，而 `pipe://` 一节刚说过不该重新发明分帧？因为两者的单位不同：
+一条 body 是**一**串字节配**一**份元信息，chunked 就够了；而帧钩子要搬运**很多条消息**，
+每条都有自己的边界、opcode 和 FIN 位，而 chunk 边界不是消息边界（HTTP、hyper、Node 都不
+承诺一次写入对应一个 `'data'` 事件）。六字节、长度前缀、二进制 —— 负载逐字节穿过；换成
+JSON/base64 信封则每个二进制帧要涨三分之一，还得走一遍它最不该走的文本往返。
+
 ### 为什么是 HTTP，而不是原版的 CONNECT + transproto
 
 原版 whistle 建立管道的方式是：向插件端口发 `CONNECT`，等 `200 Connection Established`，再写一个 `'1'` 字节做确认，然后用自定义的长度前缀分帧收发 body（`'\n' + 长度 + '\n' + 负载`，EOF 是 `'\n0\n'`，见 `lib/util/transproto.js`）。
@@ -444,16 +657,28 @@ whistle-rs --plugin name=127.0.0.1:9000
 
 - **上游插件不兼容** —— 为原版 `pipe://` 写的插件（CONNECT + transproto）在这里跑不了。理由见上一节，这是取舍不是遗漏。
 - **握手之后不再有兜底** —— 插件应答 `200` 之前失败是零代价的；应答之后失败会让 body 出错（客户端看到截断的响应）。字节已经交出去了就收不回来，这是流式变换的固有代价，不是可以修的 bug。
-- **不覆盖 WebSocket / 协议升级** —— `pipe://` 只作用于普通 HTTP body。升级请求在流式钩子接线之前就走掉了，WS 帧另有一套抓取路径。
+- **不覆盖 WebSocket / 协议升级** —— `pipe://` 只作用于普通 HTTP body。升级请求在流式钩子接线之前就走掉了；WebSocket 走的是 [帧钩子](#websocket-帧钩子--onwsframe)。
 - **不覆盖短路响应** —— `file://`、`tpl://`、`redirect://` 这类不走上游的响应，以及插件 `respond()` 产生的响应，都在流式钩子之前返回，不经过管道。
 - **插件端点必须是明文 HTTP** —— 插件是本机进程；`https://` 的插件地址会被拒绝并降级（日志里有 `WARN`），而不是悄悄走错路。
 - **不搬运 trailer** —— 管道中途的 trailer 帧会被丢弃，最终的分帧由插件的输出决定。
 - **每次调用一条新连接** —— 没有连接池。本机连接的开销可以忽略，但这是实现现状而不是承诺。
 - **`(value)` 的语法只对 `pipe://` 生效** —— `plugin://` 的取值解析与之前逐字节一致，不受影响。
 
+### 帧钩子的边界
+
+- **控制帧不交付** —— close / ping / pong 与保留 opcode 只被抓取，不交给插件。理由见
+  [哪些帧不会交给插件](#哪些帧不会交给插件)，这是取舍不是遗漏。
+- **不能改帧类型与分片结构** —— 只能改负载、丢整条消息；丢一个分片会退化成「空负载放行」。
+- **不流水线** —— 一个方向上同时最多一帧在插件手里。吞吐因此受限于插件的往返延迟，
+  这是为了保住顺序而付的钱。
+- **不能凭空插入帧，也不能往另一个方向发帧** —— 钩子是「一帧进、一帧出」，不是一个 socket。
+- **不覆盖 `wss://` 的未解密流量** —— 只有被 MITM 解密的 WebSocket 才有帧可拦；纯隧道过去的
+  连接对代理是一团密文。
+- **原版插件不兼容** —— 原版的 `wsReqRead` / `wsReqWrite` / `wsResRead` / `wsResWrite`
+  建立在 CONNECT + 装饰过的 socket 上，与这里的协议无关。语义搬了，线上格式没搬。
+
 ### 其它
 
-- **WebSocket 帧级钩子** —— 帧已被抓取并展示，但插件还不能拦改。
 - **插件自带 UI / 统计页**（原版的 `uiServer` / `statsServer`）。
 - **`sniCallback`** —— 需要在 TLS SNI 阶段介入选证书，早于按请求的规则解析，当前 MITM 架构不可达。
 - **npm `whistle.*` 包兼容** —— 明确的非目标，见本文开头。
