@@ -451,30 +451,153 @@ fn serve_file_family(
     let templated = proto.ends_with("tpl") || proto.ends_with("jsonp") || proto.ends_with("dust");
     let cross = proto.starts_with('x');
 
-    match read_file(value) {
-        Some(data) => Some(if raw {
-            serve_raw_http(&data)
+    let candidates = FileCandidates::of(proto, value);
+    match candidates.read() {
+        // The *matched* path drives the content type, not the rule value: with
+        // `file:///tmp/mock/` it is `/tmp/mock/index.html` that was served.
+        Some((path, data)) => Some(if raw {
+            serve_raw_http(&data, &path, info)
         } else if templated {
-            serve_template(&data, value, info, env)
+            serve_template(&data, &path, info, env)
         } else {
-            serve_file_bytes(&data, value, info)
+            serve_file_bytes(&data, &path, info)
         }),
-        None => {
-            if cross {
-                None // fall through to the real server
-            } else {
-                Some(
-                    Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
-                        .body(body::full(Bytes::from(format!(
-                            "whistle-rs: file not found <strong>{value}</strong>"
-                        ))))
-                        .unwrap(),
-                )
+        // A cross (`x`/`xs`) rule falls through to the real server instead —
+        // including when the path was refused (`file-proxy.js:305-309`).
+        None if cross => None,
+        None => Some(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(body::full(Bytes::from(format!(
+                    "whistle-rs: file not found <strong>{}</strong>",
+                    encode_html(&candidates.blame)
+                ))))
+                .unwrap(),
+        ),
+    }
+}
+
+/// The marker whistle reports instead of a path it refused to resolve
+/// (`INVALID_PATH`, `_original/lib/handlers/file-proxy.js:29,52`).
+const INVALID_PATH: &str = "(Path contains parent directory notation '..')";
+
+/// The paths a file rule may resolve to, in the order whistle tries them.
+///
+/// A rule value is not simply a path: it can list several with `|`, name a
+/// directory, start at the home directory, and — in whistle-rs — omit the
+/// leading slash. Building the whole list up front keeps the "first one that is
+/// a file wins" rule (`readFiles`, `file-proxy.js:38-58`) a single loop, and
+/// keeps the 404 able to name what was actually tried.
+struct FileCandidates {
+    paths: Vec<String>,
+    /// What a 404 should blame: the last path the user actually wrote, or
+    /// [`INVALID_PATH`] when that entry was refused for containing `..`.
+    blame: String,
+}
+
+impl FileCandidates {
+    fn of(proto: &str, value: &str) -> FileCandidates {
+        let mut paths = Vec::new();
+        let mut blame = String::new();
+        for entry in split_paths(proto, value) {
+            let entry = expand_home(entry);
+            if has_parent_ref(&entry) {
+                // `joinPath` refuses the path outright (`util/index.js:1847-1849`)
+                // and `readFiles` reports it with a fixed marker; it contributes
+                // no candidate, so a later `|` alternative can still win.
+                blame = INVALID_PATH.to_string();
+                continue;
+            }
+            for candidate in expand_index(&entry) {
+                // whistle-rs also accepts a value whose leading slash the rule
+                // parser dropped (`file://tmp/x`), which upstream resolves
+                // against the rule file's root instead. It is a fallback, so it
+                // is tried after the path as written and never blamed in a 404.
+                let rooted = format!("/{}", candidate.trim_start_matches('/'));
+                blame = candidate.clone();
+                if rooted != candidate {
+                    paths.push(candidate);
+                }
+                paths.push(rooted);
             }
         }
+        FileCandidates { paths, blame }
     }
+
+    /// The first candidate that is a readable regular file.
+    fn read(&self) -> Option<(String, Arc<Vec<u8>>)> {
+        self.paths
+            .iter()
+            .find_map(|p| read_cached(Path::new(p)).map(|data| (p.clone(), data)))
+    }
+}
+
+/// Split a `a|b|c` multi-path value (`getFiles`, `_original/lib/rules/rules.js:290`).
+///
+/// whistle only splits when the protocol matches `FILE_PROTO_RE`
+/// (`rules.js:96`), whose `x?` prefix admits a *single* `x` — so `xsfile://` and
+/// its siblings are never split. whistle-rs reproduces the quirk rather than
+/// tidying it up: `|` is a legal character in a POSIX filename, so "fixing" it
+/// would change what an existing rule file resolves to.
+fn split_paths<'a>(proto: &str, value: &'a str) -> Vec<&'a str> {
+    match proto.starts_with("xs") {
+        true => vec![value],
+        false => value.split('|').collect(),
+    }
+}
+
+/// `~/x` (and the full-width `～/x`) start at the home directory
+/// (`getHomePath`, `_original/lib/util/common.js:557-564`). A bare `~` is left
+/// alone: upstream's `/^[~～]\//` requires the slash.
+fn expand_home(path: &str) -> String {
+    let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("～/")) else {
+        return path.to_string();
+    };
+    match dirs::home_dir() {
+        // Upstream falls back to a literal `~` when the OS has no home
+        // directory; leaving the path untouched has the same effect.
+        Some(home) => format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/')),
+        None => path.to_string(),
+    }
+}
+
+/// whistle's `UP_PATH_REGEXP` (`_original/lib/util/common.js:29`): a `..` that
+/// stands alone as a path segment. A file named `a..b` is perfectly fine.
+fn has_parent_ref(path: &str) -> bool {
+    path.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// A trailing slash means "a directory", which whistle expands into two
+/// candidates: the directory name itself, then its `index.html`
+/// (`getRuleFiles`, `_original/lib/util/index.js:1433-1437`). The first only
+/// ever wins for a *file* that happens to be named like the directory.
+fn expand_index(path: &str) -> Vec<String> {
+    match path.ends_with(['/', '\\']) {
+        true => vec![
+            path[..path.len() - 1].to_string(),
+            format!("{path}index.html"),
+        ],
+        false => vec![path.to_string()],
+    }
+}
+
+/// whistle's `encodeHtml` (`_original/lib/util/common.js:619-635`), so a path
+/// echoed into the 404 body cannot inject markup.
+fn encode_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            '`' => out.push_str("&#96;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Cached file contents, valid only while the file's mtime and length are
@@ -497,7 +620,7 @@ const MAX_CACHE_ENTRIES: usize = 64;
 static FILE_CACHE: Lazy<Mutex<HashMap<PathBuf, CachedFile>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Read a file, trying the value verbatim and as an absolute `/`-rooted path.
+/// Read one candidate path through the mtime-keyed cache.
 ///
 /// Every call still `stat`s the file, so an edit is picked up immediately; only
 /// the read of an unchanged file is skipped. The one gap is a rewrite that both
@@ -505,22 +628,9 @@ static FILE_CACHE: Lazy<Mutex<HashMap<PathBuf, CachedFile>>> =
 /// resolution of the previous one — a second-granularity filesystem can then
 /// serve the previous body once.
 ///
-/// No sandboxing: `file://` exists to serve arbitrary local paths on the
-/// developer's own machine, and the original imposes no restriction on absolute
-/// paths either (its only check, `existsUpPath` in
-/// `_original/lib/util/index.js:1847`, guards root-*relative* rule paths, a
-/// feature whistle-rs does not implement).
-fn read_file(path: &str) -> Option<Arc<Vec<u8>>> {
-    let clean = path.trim_start_matches('/');
-    for candidate in [path.to_string(), format!("/{clean}")] {
-        if let Some(data) = read_cached(Path::new(&candidate)) {
-            return Some(data);
-        }
-    }
-    None
-}
-
-/// Read one path through the mtime-keyed cache.
+/// Beyond the `..` check in [`FileCandidates`] there is no sandboxing:
+/// `file://` exists to serve arbitrary local paths on the developer's own
+/// machine, and the original imposes no restriction on absolute paths either.
 fn read_cached(path: &Path) -> Option<Arc<Vec<u8>>> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
@@ -567,19 +677,25 @@ fn serve_file_bytes(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody
         .unwrap()
 }
 
+/// How far into a `rawfile://` whistle looks for the header/body separator
+/// before giving up and serving the file as an ordinary body
+/// (`MAX_HEADERS_SIZE`, `_original/lib/handlers/file-proxy.js:13,151-158`).
+const MAX_RAW_HEADERS: usize = 256 * 1024;
+
 /// Serve a `rawfile://`: the file is a complete HTTP response (status line +
 /// headers + blank line + body). Parse it into a real response.
-fn serve_raw_http(data: &[u8]) -> Response<DynBody> {
-    let text = String::from_utf8_lossy(data);
-    // Split head from body on the first blank line.
-    let (head, body) = match text.find("\r\n\r\n") {
-        Some(i) => (&text[..i], text[i + 4..].to_string()),
-        None => match text.find("\n\n") {
-            Some(i) => (&text[..i], text[i + 2..].to_string()),
-            None => (text.as_ref(), String::new()),
-        },
+///
+/// A file with no blank line in its first [`MAX_RAW_HEADERS`] bytes is not a
+/// raw response at all, and whistle serves it verbatim rather than mistaking
+/// its first line for a status line.
+fn serve_raw_http(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> {
+    let budget = &data[..data.len().min(MAX_RAW_HEADERS)];
+    let Some((head_end, body_start)) = find_headers_sep(budget) else {
+        return serve_file_bytes(data, path, info);
     };
-    let mut lines = head.split(|c| c == '\n').map(|l| l.trim_end_matches('\r'));
+    // Only the head is text; the body stays bytes so a binary payload survives.
+    let head = String::from_utf8_lossy(&data[..head_end]);
+    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
     let status = lines
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
@@ -593,7 +709,7 @@ fn serve_raw_http(data: &[u8]) -> Response<DynBody> {
         }
     }
     builder
-        .body(body::full(Bytes::from(body)))
+        .body(body::full(Bytes::copy_from_slice(&data[body_start..])))
         .unwrap_or_else(|_| {
             Response::builder()
                 .status(StatusCode::OK)
@@ -602,9 +718,39 @@ fn serve_raw_http(data: &[u8]) -> Response<DynBody> {
         })
 }
 
-/// Serve a `tpl://`/`jsonp://`/`dust://`: substitute `{name}`/`{{name}}` in the
-/// file from the request query, and (for jsonp) wrap in a callback. Whistle's
-/// full dust/handlebars engines are approximated by simple variable substitution.
+/// Locate the blank line separating a raw response's head from its body,
+/// returning `(head_end, body_start)`.
+///
+/// whistle accepts every CR/LF spelling of a blank line
+/// (`HEADERS_SEP_RE = /(\r?\n(?:\r\n|\r|\n)|\r\r\n?)/`, `file-proxy.js:12`),
+/// because a hand-written `.http` fixture rarely has consistent line endings.
+fn find_headers_sep(data: &[u8]) -> Option<(usize, usize)> {
+    for start in 0..data.len() {
+        // `\r?\n` followed by any of `\r\n`, `\r`, `\n`.
+        let after_first = start + usize::from(data[start] == b'\r');
+        if data.get(after_first) == Some(&b'\n') {
+            let second = after_first + 1;
+            let end = match (data.get(second), data.get(second + 1)) {
+                (Some(b'\r'), Some(b'\n')) => Some(second + 2),
+                (Some(b'\r') | Some(b'\n'), _) => Some(second + 1),
+                _ => None,
+            };
+            if let Some(end) = end {
+                return Some((start, end));
+            }
+        }
+        // `\r\r\n?` — the alternative whistle tries when the first one fails.
+        if data[start] == b'\r' && data.get(start + 1) == Some(&b'\r') {
+            let end = start + if data.get(start + 2) == Some(&b'\n') { 3 } else { 2 };
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+/// Serve a `tpl://`/`jsonp://`/`dust://`: render the file through the two
+/// substitution passes in [`super::template`]. The status is always 200 and
+/// `content-length` follows from the rendered body, never the file's size.
 fn serve_template(
     data: &[u8],
     path: &str,
@@ -1649,6 +1795,257 @@ mod tests {
             parse_cipher_versions("{\"ciphers\":\"ECDHE-RSA-AES128-GCM-SHA256\"}"),
             TlsVersions::Default
         );
+    }
+
+    // -- the file family -----------------------------------------------------
+
+    /// A throwaway directory of fixtures, removed when the test ends.
+    struct Fixtures(PathBuf);
+
+    impl Fixtures {
+        fn new(tag: &str) -> Fixtures {
+            let dir = std::env::temp_dir().join(format!("whistle-rs-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create fixture dir");
+            Fixtures(dir)
+        }
+
+        /// Write a fixture and return its absolute path.
+        fn write(&self, name: &str, body: &[u8]) -> String {
+            let path = self.0.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create fixture parent");
+            }
+            std::fs::write(&path, body).expect("write fixture");
+            self.path(name)
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Fixtures {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Serve a file rule for `GET http://x.com/`, returning status, content type
+    /// and body.
+    fn serve(proto: &str, value: &str) -> Option<(u16, String, Vec<u8>)> {
+        serve_at(proto, value, "http://x.com/")
+    }
+
+    /// As [`serve`], but for an explicit request URL (the content-type fallback
+    /// and the template variables both read it).
+    fn serve_at(proto: &str, value: &str, url: &str) -> Option<(u16, String, Vec<u8>)> {
+        let (scheme, rest) = url.split_once("://").expect("absolute url");
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let info = build_req_info("GET", scheme, host, 80, path, &HeaderMap::new(), None);
+        let resp = serve_file_family(proto, value, &info, test_env())?;
+        let status = resp.status().as_u16();
+        let ctype = resp
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(async { http_body_util::BodyExt::collect(resp.into_body()).await })
+            .expect("collect body")
+            .to_bytes()
+            .to_vec();
+        Some((status, ctype, body))
+    }
+
+    #[test]
+    fn multi_path_takes_the_first_existing_file() {
+        let fx = Fixtures::new("multipath");
+        let missing = fx.path("nope.json");
+        let present = fx.write("b.json", b"{\"from\":\"b\"}");
+        let later = fx.write("c.json", b"{\"from\":\"c\"}");
+
+        let value = format!("{missing}|{present}|{later}");
+        let (status, ctype, body) = serve("file", &value).expect("served");
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "application/json; charset=utf-8");
+        assert_eq!(body, b"{\"from\":\"b\"}");
+    }
+
+    #[test]
+    fn xs_rules_never_split_on_pipe() {
+        // whistle's split regex only admits a single `x` (`rules.js:96`), so an
+        // `xs` rule treats `|` as part of the filename. Reproduced deliberately.
+        let fx = Fixtures::new("xspipe");
+        let present = fx.write("only.json", b"ok");
+        let value = format!("{}|{present}", fx.path("nope.json"));
+
+        // `xfile` splits and finds the second path…
+        assert!(serve("xfile", &value).is_some());
+        // …`xsfile` does not, so it falls through to the real server.
+        assert!(serve("xsfile", &value).is_none());
+    }
+
+    #[test]
+    fn parent_directory_paths_are_refused() {
+        let fx = Fixtures::new("uppath");
+        let target = fx.write("secret.txt", b"nope");
+        let escaped = format!("{}/sub/../secret.txt", fx.0.to_string_lossy());
+        assert!(std::path::Path::new(&target).exists());
+
+        let (status, _, body) = serve("file", &escaped).expect("served");
+        assert_eq!(status, 404);
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("(Path contains parent directory notation &#39;..&#39;)"),
+            "{body}"
+        );
+        // A `..` inside a segment is an ordinary filename, not an escape.
+        assert!(!has_parent_ref("/tmp/a..b/c"));
+        assert!(has_parent_ref("../a") && has_parent_ref("a/../b") && has_parent_ref("a/.."));
+    }
+
+    #[test]
+    fn refused_path_still_lets_a_later_alternative_win() {
+        let fx = Fixtures::new("uppath2");
+        let present = fx.write("ok.txt", b"ok");
+        let value = format!("../escape|{present}");
+        let (status, _, body) = serve("file", &value).expect("served");
+        assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
+    }
+
+    #[test]
+    fn trailing_slash_expands_to_index_html() {
+        let fx = Fixtures::new("indexhtml");
+        fx.write("site/index.html", b"<h1>home</h1>");
+        let value = format!("{}/", fx.path("site"));
+
+        let (status, ctype, body) = serve("file", &value).expect("served");
+        assert_eq!(status, 200);
+        // The content type comes from the *matched* path, not the rule value.
+        assert_eq!(ctype, "text/html; charset=utf-8");
+        assert_eq!(body, b"<h1>home</h1>");
+
+        // The directory itself is tried first, and only wins for a real file.
+        assert_eq!(
+            expand_index("/a/b/"),
+            vec!["/a/b".to_string(), "/a/b/index.html".to_string()]
+        );
+        assert_eq!(expand_index("/a/b"), vec!["/a/b".to_string()]);
+    }
+
+    #[test]
+    fn home_prefix_expands_to_the_home_directory() {
+        let home = dirs::home_dir().expect("a home directory");
+        let home = home.to_string_lossy();
+        assert_eq!(expand_home("~/mock.json"), format!("{home}/mock.json"));
+        // The full-width tilde is accepted too, a bare `~` is not.
+        assert_eq!(expand_home("～/mock.json"), format!("{home}/mock.json"));
+        assert_eq!(expand_home("~mock.json"), "~mock.json");
+        assert_eq!(expand_home("/tmp/~/x"), "/tmp/~/x");
+
+        assert!(
+            FileCandidates::of("file", "~/mock.json")
+                .paths
+                .contains(&format!("{home}/mock.json"))
+        );
+    }
+
+    #[test]
+    fn template_rules_render_the_file() {
+        let fx = Fixtures::new("tpl");
+        let path = fx.write("api.json", br#"{"cb":"{callback}","m":"${method.replace(GET,get)}"}"#);
+        let (status, ctype, body) =
+            serve_at("tpl", &path, "http://x.com/api?callback=cb1").expect("served");
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "application/json; charset=utf-8");
+        assert_eq!(String::from_utf8_lossy(&body), r#"{"cb":"cb1","m":"get"}"#);
+    }
+
+    #[test]
+    fn raw_file_parses_a_complete_response() {
+        let fx = Fixtures::new("rawfile");
+        let path = fx.write(
+            "res.http",
+            b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"nope\"}",
+        );
+        let (status, ctype, body) = serve("rawfile", &path).expect("served");
+        assert_eq!(status, 404);
+        assert_eq!(ctype, "application/json");
+        assert_eq!(body, b"{\"error\":\"nope\"}");
+    }
+
+    #[test]
+    fn raw_file_without_a_blank_line_is_served_verbatim() {
+        // No separator means it was never a raw response; whistle serves the
+        // file rather than eating its first line as a status line.
+        let fx = Fixtures::new("rawplain");
+        let path = fx.write("plain.txt", b"HTTP/1.1 200 OK\r\nnot really a response");
+        let (status, ctype, body) = serve("rawfile", &path).expect("served");
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "text/plain; charset=utf-8");
+        assert_eq!(body, b"HTTP/1.1 200 OK\r\nnot really a response");
+    }
+
+    #[test]
+    fn raw_file_keeps_a_binary_body() {
+        let fx = Fixtures::new("rawbin");
+        let mut fixture = b"HTTP/1.1 200 OK\nContent-Type: image/png\n\n".to_vec();
+        let payload = [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe];
+        fixture.extend_from_slice(&payload);
+        let path = fx.write("img.http", &fixture);
+
+        let (status, ctype, body) = serve("rawfile", &path).expect("served");
+        assert_eq!((status, ctype.as_str()), (200, "image/png"));
+        assert_eq!(body, payload, "lossy UTF-8 would have mangled these bytes");
+    }
+
+    #[test]
+    fn headers_separator_accepts_every_line_ending() {
+        // `HEADERS_SEP_RE`, file-proxy.js:12.
+        for sep in ["\r\n\r\n", "\r\n\r", "\r\n\n", "\n\r\n", "\n\r", "\n\n", "\r\r\n", "\r\r"] {
+            let data = format!("head{sep}body");
+            let (head_end, body_start) = find_headers_sep(data.as_bytes()).expect(sep);
+            assert_eq!(&data[..head_end], "head", "{sep:?}");
+            assert_eq!(&data[body_start..], "body", "{sep:?}");
+        }
+        assert_eq!(find_headers_sep(b"head\nbody"), None);
+    }
+
+    #[test]
+    fn a_separator_past_the_header_budget_is_ignored() {
+        // whistle stops looking after MAX_HEADERS_SIZE (file-proxy.js:13,151-158).
+        let mut data = vec![b'x'; MAX_RAW_HEADERS + 16];
+        data.extend_from_slice(b"\r\n\r\nbody");
+        assert!(find_headers_sep(&data[..data.len().min(MAX_RAW_HEADERS)]).is_none());
+    }
+
+    #[test]
+    fn missing_file_404s_with_an_escaped_path() {
+        let (status, ctype, body) = serve("file", "/nonexistent/<script>").expect("served");
+        assert_eq!(status, 404);
+        assert_eq!(ctype, "text/html; charset=utf-8");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("&lt;script&gt;"), "{body}");
+        assert!(!body.contains("<script>"), "{body}");
+    }
+
+    #[test]
+    fn the_file_cache_never_serves_stale_bytes() {
+        let fx = Fixtures::new("cache");
+        let path = fx.write("mock.json", b"{\"v\":1}");
+        assert_eq!(serve("file", &path).expect("served").2, b"{\"v\":1}");
+
+        // A mock edited mid-session must be picked up, even at the same length.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&path, b"{\"v\":2}").expect("rewrite fixture");
+        assert_eq!(serve("file", &path).expect("served").2, b"{\"v\":2}");
     }
 
     #[test]
