@@ -13,8 +13,11 @@ use http_body_util::{BodyExt, Full};
 use hyper::HeaderMap;
 use hyper::body::{Body, Frame, Incoming};
 
+/// The error a [`DynBody`] can fail with.
+pub type BodyError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Uniform response body used throughout the proxy.
-pub type DynBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+pub type DynBody = BoxBody<Bytes, BodyError>;
 
 /// Box an in-memory body (redirects, error pages, served files).
 pub fn full<T: Into<Bytes>>(data: T) -> DynBody {
@@ -32,6 +35,40 @@ pub fn empty() -> DynBody {
 pub fn from_incoming(body: Incoming) -> DynBody {
     body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         .boxed()
+}
+
+/// A body fed frame-by-frame from another task — the writable half of a
+/// streaming transform (see [`crate::plugins::pipe`]).
+///
+/// The channel is bounded, so a slow reader back-pressures the writer and no
+/// more than `capacity` frames are ever in flight. That bound is what lets a
+/// plugin sit in the middle of a body without the proxy buffering it: dropping
+/// the sender ends the body, and sending an `Err` fails it.
+pub fn channel(capacity: usize) -> (tokio::sync::mpsc::Sender<Result<Bytes, BodyError>>, DynBody) {
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
+    (tx, ChannelBody { rx }.boxed())
+}
+
+/// Body impl backing [`channel`].
+struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, BodyError>>,
+}
+
+impl Body for ChannelBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut().rx.poll_recv(cx) {
+            Poll::Ready(Some(Ok(data))) => Poll::Ready(Some(Ok(Frame::data(data)))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// Box a forwarded body while copying a bounded preview of its bytes into

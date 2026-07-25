@@ -1,11 +1,15 @@
 //! Built-in Rust example plugins, demonstrating each hook. They double as
 //! working references for writing native plugins.
 
+use bytes::Bytes;
+use http_body_util::BodyExt;
 use serde_json::json;
 
+use super::pipe::{Dir, PipeMeta};
 use super::{
     PluginManifest, PluginReq, PluginRes, PluginResResult, PluginResp, PluginResult, RustPlugin,
 };
+use crate::proxy::body::DynBody;
 
 /// Every built-in plugin, registered by default.
 pub fn all() -> Vec<Box<dyn RustPlugin>> {
@@ -13,6 +17,7 @@ pub fn all() -> Vec<Box<dyn RustPlugin>> {
         Box::new(EchoPlugin),
         Box::new(TagPlugin),
         Box::new(StampPlugin),
+        Box::new(UpperPlugin),
     ]
 }
 
@@ -93,6 +98,8 @@ impl RustPlugin for StampPlugin {
             on_response: true,
             request_body: false,
             response_body: false,
+            pipe_request: false,
+            pipe_response: false,
         }
     }
 
@@ -110,5 +117,40 @@ impl RustPlugin for StampPlugin {
             set_headers: vec![("x-stamped-by".to_string(), stamp.to_string())],
             ..Default::default()
         }
+    }
+}
+
+/// `pipe://upper` — uppercases a body **as it streams**, frame by frame.
+///
+/// The reference for the streaming hook: note that it never sees, or needs, the
+/// whole body. Each frame is transformed and forwarded on the spot, so an SSE
+/// stream piped through it still arrives event by event.
+struct UpperPlugin;
+
+impl RustPlugin for UpperPlugin {
+    fn name(&self) -> &str {
+        "upper"
+    }
+
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            name: self.name().to_string(),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            on_request: false,
+            on_response: false,
+            request_body: false,
+            response_body: false,
+            pipe_request: true,
+            pipe_response: true,
+        }
+    }
+
+    fn on_request(&self, _req: &PluginReq) -> PluginResult {
+        PluginResult::default()
+    }
+
+    fn pipe(&self, _dir: Dir, _meta: &PipeMeta, body: DynBody) -> DynBody {
+        body.map_frame(|frame| frame.map_data(|data| Bytes::from(data.to_ascii_uppercase())))
+            .boxed()
     }
 }
