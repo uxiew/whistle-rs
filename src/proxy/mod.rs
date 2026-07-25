@@ -1097,7 +1097,7 @@ async fn serve(
         || req_write_raw.is_some()
     {
         let bytes = collect_body(incoming).await?;
-        let new = apply::transform_req_body(bytes, &resolved);
+        let new = apply::transform_req_body(bytes, &resolved, req_ct.as_deref());
         if let Some(path) = &req_write {
             write_body_file(path, &new);
         }

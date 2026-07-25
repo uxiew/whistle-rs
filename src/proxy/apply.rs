@@ -1974,7 +1974,11 @@ pub fn wants_res_body(resolved: &Resolved) -> bool {
 /// (`handleReq` adds the transform, then `handleReplace`,
 /// `_original/lib/inspectors/req.js:129-130,573`), so a substitution *does* see
 /// what `reqPrepend`/`reqAppend` put there — the opposite of the response side.
-pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
+pub fn transform_req_body(
+    body: Bytes,
+    resolved: &Resolved,
+    content_type: Option<&str>,
+) -> Bytes {
     // `delete://body` wipes the body *and* anything an operator meant to put
     // around it (`removeBody`, `_original/lib/util/index.js:3592-3598`).
     if Deletions::of(resolved, true).drop_body {
@@ -1986,11 +1990,12 @@ pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
     let mut injection = Injection::default();
     collect_generic(&mut injection, &gate, "req");
     let data = injection.apply(body.to_vec(), false);
-    // whistle gates `reqReplace` on the *request's* content type, which this
-    // entry point is not given; `Text` is the class that never refuses, so the
-    // gap is a request with no `content-type` (or an image one) being rewritten
-    // where upstream would leave it alone.
-    Bytes::from(apply_replace(data, resolved, "reqReplace", Some(ResClass::Text)))
+    // whistle gates `reqReplace` on the request's own content type, exactly as
+    // it gates `resReplace` on the response's (`_original/lib/inspectors/req.js`
+    // mirrors `res.js:129-132`): a request with no `content-type`, or an image
+    // one, is left alone.
+    let class = content_type.and_then(res_class);
+    Bytes::from(apply_replace(data, resolved, "reqReplace", class))
 }
 
 /// Transform a buffered response body; `content_type` decides which typed-body
@@ -2879,7 +2884,7 @@ mod tests {
         // `req.body` is the request's alone.
         let resolved = resolve("example.com/x delete://req.body\n", "http://example.com/x");
         assert!(wants_req_body(&resolved) && !wants_res_body(&resolved));
-        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved)[..], b"");
+        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved, Some("text/plain"))[..], b"");
     }
 
     /// The `/regexp/flags` form follows JavaScript's `String#replace`: without
@@ -2992,7 +2997,7 @@ mod tests {
         assert!(!wants_req_body(&none));
         let some = resolve("example.com reqBody://HELLO\n", "http://example.com/");
         assert!(wants_req_body(&some));
-        let out = transform_req_body(Bytes::from_static(b"orig"), &some);
+        let out = transform_req_body(Bytes::from_static(b"orig"), &some, Some("text/plain"));
         assert_eq!(&out[..], b"HELLO");
     }
 
@@ -4276,6 +4281,34 @@ mod tests {
 
     /// `resCookies` replaces a `Set-Cookie` the response already sent under the
     /// same name instead of adding a second one (`setResCookies`).
+    /// `reqReplace` is gated on the *request's* content type, mirroring the way
+    /// `resReplace` is gated on the response's (`res.js:129-132`): a request
+    /// with no `content-type`, or an image one, is left alone.
+    #[test]
+    fn req_replace_is_gated_on_the_request_content_type() {
+        let resolved = resolve(
+            "example.com reqReplace://old=new\n",
+            "http://example.com/",
+        );
+        let body = || Bytes::from_static(b"old");
+
+        assert_eq!(
+            &transform_req_body(body(), &resolved, Some("text/plain"))[..],
+            b"new",
+            "text is rewritten"
+        );
+        assert_eq!(
+            &transform_req_body(body(), &resolved, None)[..],
+            b"old",
+            "no content-type: left alone"
+        );
+        assert_eq!(
+            &transform_req_body(body(), &resolved, Some("image/png"))[..],
+            b"old",
+            "images are left alone"
+        );
+    }
+
     #[test]
     fn res_cookies_replace_by_name() {
         let resolved = resolve(
