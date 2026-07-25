@@ -98,6 +98,35 @@ pub const PROTOCOLS: &[&str] = &[
     "xrawfile",
 ];
 
+/// Every upstream-proxy operator, in the order this port prefers them.
+///
+/// whistle files all of them under one protocol key. A `socks://` line and a
+/// `proxy://` line both land in `_rules.proxy`, and the spelling survives only
+/// inside the stored matcher (`_original/lib/rules/rules.js:1305-1310`,
+/// `:1368-1388`). Two consequences follow from that, and both are behaviour:
+///
+/// * at most one upstream proxy can be in play, so the order here is a
+///   precedence order, not a list of independent operators;
+/// * `ignore://proxy` names the *family*, so it drops whichever one matched —
+///   `util.isIgnored(filter, 'proxy')` in `resolveProxy`
+///   (`_original/lib/rules/rules.js:2419-2443`). Naming one spelling
+///   (`ignore://socks`) drops only that one.
+///
+/// This port keeps a separate key per protocol, which is why the family has to
+/// be written down. The `x`/`xs` spellings are absent because [`canonical`] has
+/// already folded them into their base protocol by the time a rule resolves.
+pub const UPSTREAM_PROXY_PROTOCOLS: &[&str] = &[
+    "socks",
+    "https-proxy",
+    "http-proxy",
+    "proxy",
+    "internal-https-proxy",
+    "internal-proxy",
+    "internal-http-proxy",
+    "https2http-proxy",
+    "http2https-proxy",
+];
+
 /// whistle's "tool" protocols (`_original/lib/rules/protocols.js:73`).
 pub const TOOL_PROTOCOLS: &[&str] = &["log", "weinre"];
 

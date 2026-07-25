@@ -285,9 +285,46 @@ fn apply_ignores(resolved: &mut Resolved) {
                 resolved.multi.clear();
                 return;
             }
+            // `xproxy`/`xsocks`/… name the same operator as their base spelling
+            // once `canonical` has folded them, so an ignore has to be folded
+            // the same way to find the key it means.
+            let name = protocols::canonical(name).unwrap_or(name);
+            if name == "proxy" {
+                ignore_upstream_proxies(resolved);
+                continue;
+            }
             resolved.single.remove(name);
             resolved.multi.remove(name);
         }
+    }
+}
+
+/// `ignore://proxy` drops **every** upstream-proxy operator, not only the one
+/// literally spelled `proxy://`.
+///
+/// whistle needs no such loop because all nine spellings share a single
+/// protocol key, so `util.isIgnored(filter, 'proxy')` sees whichever one matched
+/// (`resolveProxy`, `_original/lib/rules/rules.js:2419-2443`; see
+/// [`protocols::UPSTREAM_PROXY_PROTOCOLS`]). Naming one spelling still drops
+/// only that one, which needs no special case here: the key is the name.
+///
+/// Dropping a proxy that matched takes the PAC fallback with it. whistle returns
+/// before it would consult `resolvePacRule()` when `ignoreProxy` is set
+/// (`_original/lib/rules/index.js:171,:238-241`), so `ignore://proxy` means "go
+/// direct", not "fall through to whatever the PAC file picks". With no proxy
+/// operator matched at all there is nothing to ignore, and a `pac://` rule is
+/// still honoured — `ignore://pac` is what suppresses that one.
+fn ignore_upstream_proxies(resolved: &mut Resolved) {
+    let matched = protocols::UPSTREAM_PROXY_PROTOCOLS
+        .iter()
+        .any(|proto| resolved.get(proto).is_some());
+    for proto in protocols::UPSTREAM_PROXY_PROTOCOLS {
+        resolved.single.remove(*proto);
+        resolved.multi.remove(*proto);
+    }
+    if matched {
+        resolved.single.remove("pac");
+        resolved.multi.remove("pac");
     }
 }
 
