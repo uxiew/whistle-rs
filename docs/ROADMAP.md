@@ -7,7 +7,7 @@
 
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
-> 单元测试 **181** 项全绿、构建 0 警告。
+> 单元测试 **275** 项全绿、构建 0 警告。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
 > HAR 导出、`cipher` TLS 版本固定、流量落盘持久化、请求重放、规则分组管理。
@@ -71,6 +71,15 @@
 - [x] ~~`example.test:8080` 忽略端口~~ → `Pattern::Prefix` 现在携带 `port`，匹配时校验。
 - [x] ~~`!pattern` 取反~~ → 已支持，且与上游一致地**只作用于正则与端口 pattern**；
       上游对取反的字面量/通配 pattern 是在解析期直接丢弃的（`rules.js:1259-1268`），本移植照做。
+
+### 多值算子（本轮审计遗留）
+
+- [ ] **同名 header 的争用优先级相反** —— `reqHeaders`/`resHeaders`/`reqCookies`/
+      `resCookies`/`reqCors`/`resCors`/`trailers` 在上游走同一套 `parseRuleJson` 折叠，
+      同一个 header 名被两行指定时取**首行**的值，本移植取**末行**。指定不同 header 的
+      多行行为一致。修复所需的 `merge_line_maps` 辅助已存在。
+- [ ] `rulesFile` / `resScript` 上游会拼接/取首，本移植仍只用首行。
+- [ ] `params://` 合并进请求体（当前折叠只作用于查询串）。
 
 ### 筛选器（本轮审计发现）
 
