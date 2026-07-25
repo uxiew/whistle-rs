@@ -647,6 +647,13 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     );
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("whistle-rs listening on http://{addr}");
+
+    // Teach the forwarding layer which addresses are *us*, so a `proxy://` rule
+    // naming this proxy is refused instead of recursing into it. Registered
+    // before the first connection is accepted; see `upstream::self_loop`.
+    let mut own_ports = vec![state.config.port];
+    own_ports.extend(state.config.socks_port);
+    upstream::set_listen(state.config.host, &own_ports);
     tracing::info!(
         "root CA: {} (download at http://{}/rootCA.crt)",
         state.config.root_ca_cert_path().display(),
@@ -1049,6 +1056,43 @@ async fn serve(
     }
 
     let target = apply::resolve_target(&info, &resolved);
+
+    // A proxy rule that names this proxy would send the request back to us, be
+    // matched by the same rule, and recurse until the sockets run out. whistle
+    // answers the request from its own UI port instead of making the hop
+    // (`_original/lib/inspectors/res.js:302-316`); `upstream::forward` refuses
+    // the same hop with a "Self loop" error for every path that reaches it.
+    if let Some(addr) = upstream::self_loop(&target).await {
+        let location = format!(
+            "http://{}{}",
+            SocketAddr::new(addr.ip(), state.config.port),
+            info.path
+        );
+        tracing::warn!(
+            "{} {} -> self loop via {addr}; redirecting to {location}",
+            info.method,
+            info.full_url
+        );
+        let resp = Response::builder()
+            .status(StatusCode::FOUND)
+            .header(hyper::header::LOCATION, &location)
+            .body(body::empty())
+            .expect("static 302");
+        state.record(Session {
+            id: 0,
+            time_ms,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            status: resp.status().as_u16(),
+            client_ip: client_ip.clone(),
+            target: format!("self-loop {addr}"),
+            duration_ms: started.elapsed().as_millis(),
+            log: log_labels(&resolved),
+            res_headers: header_pairs(resp.headers()),
+            ..Default::default()
+        });
+        return Ok(resp);
+    }
 
     // Rewrite to origin-form + apply request-side rules. (Plugins that wanted to
     // handle this request already returned above; any rules they injected have
