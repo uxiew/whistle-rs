@@ -40,6 +40,22 @@
 //     },
 //   });
 //
+// Three more hooks are not about rewriting traffic at all:
+//
+//   start({
+//     name: 'gate',
+//     onAuth(ctx) {                       // decide whether a request proceeds
+//       if (!ctx.header('authorization')) { ctx.setLogin(true); return false; }
+//       ctx.setHeader('x-whistle-user', 'bob');   // identifies it downstream
+//     },
+//     onResStats(ctx) { count(ctx.statusCode); }, // told what happened; no reply
+//     onUi(req, res) { return `<h1>${count}</h1>`; }, // its own page
+//   });
+//
+// `onAuth` is the one hook whose failure is *not* forgiven: a plugin that
+// declares it and then throws, hangs or dies blocks the requests it matched.
+// A gate that admits everything when it breaks is not a gate.
+//
 // TypeScript users: see whistle-rs-plugin.d.ts. The same entry point works for
 // `export default { … }` — an ES module default export is unwrapped.
 
@@ -62,6 +78,10 @@ const HOOKS = [
   ['pipeRequest', 'pipeRequest'],
   ['pipeResponse', 'pipeResponse'],
   ['onWsFrame', 'wsFrame'],
+  ['onAuth', 'auth'],
+  ['onReqStats', 'reqStats'],
+  ['onResStats', 'resStats'],
+  ['onUi', 'ui'],
 ];
 
 function start(plugin, opts) {
@@ -105,6 +125,12 @@ function start(plugin, opts) {
       return serveWsFrames(plugin, name, req, res);
     }
 
+    // The UI subtree is the plugin's own URL space: an ordinary HTTP request
+    // with an ordinary HTTP answer, handed over with the prefix removed.
+    if (route === UI_PREFIX || route.indexOf(UI_PREFIX + '/') === 0) {
+      return serveUi(plugin, name, req, res);
+    }
+
     readBody(req, (err, raw) => {
       if (err) {
         return sendJson(res, 413, { error: String(err.message || err) });
@@ -114,6 +140,13 @@ function start(plugin, opts) {
         payload = JSON.parse(raw.toString('utf8') || '{}');
       } catch (e) {
         return sendJson(res, 400, { error: 'invalid JSON payload' });
+      }
+
+      if (route === '/auth') {
+        return serveAuth(plugin, name, payload, res);
+      }
+      if (route === '/stats') {
+        return serveStats(plugin, name, payload, res);
       }
 
       // `/` is the legacy v1 request route, kept so older plugins and manual
@@ -142,6 +175,94 @@ function start(plugin, opts) {
     console.log(`[${name}] whistle-rs plugin listening on 127.0.0.1:${bound} (hooks: ${manifest.hooks.join(', ') || 'none'})`);
   });
   return server;
+}
+
+/** Path prefix reserved for the plugin's own pages. */
+const UI_PREFIX = '/ui';
+
+// ---------------------------------------------------------------------------
+// The gate
+// ---------------------------------------------------------------------------
+
+/**
+ * Serve one auth decision.
+ *
+ * Note what happens when the hook throws: a `500`, which whistle-rs reads as
+ * "the gate failed" and turns into a `502` block. Every other hook in this SDK
+ * answers `200 {}` — "nothing to do" — when it throws, because for those the
+ * request is better off proceeding. Not here: a gate that admits a request
+ * because it crashed is worse than no gate, since it looks like one.
+ */
+function serveAuth(plugin, name, payload, res) {
+  const ctx = new AuthCtx(payload);
+  Promise.resolve()
+    .then(() => plugin.onAuth.call(plugin, ctx))
+    .then((verdict) => sendJson(res, 200, ctx._result(verdict)))
+    .catch((e) => {
+      console.error(`[${name}] onAuth threw:`, e);
+      sendJson(res, 500, { error: String((e && e.message) || e) });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+
+/**
+ * Serve one stats ping.
+ *
+ * The reply goes out first and is discarded by the proxy: nothing here can
+ * change the request, which is exactly why this hook is safe to put on one. A
+ * throwing handler is logged and forgotten.
+ */
+function serveStats(plugin, name, payload, res) {
+  const isRequest = payload.phase !== 'response';
+  const handler = isRequest ? plugin.onReqStats : plugin.onResStats;
+  sendJson(res, 200, {});
+  if (typeof handler !== 'function') return;
+  Promise.resolve()
+    .then(() => handler.call(plugin, new StatsCtx(payload)))
+    .catch((e) => console.error(`[${name}] ${isRequest ? 'onReqStats' : 'onResStats'} threw:`, e));
+}
+
+// ---------------------------------------------------------------------------
+// The plugin's own pages
+// ---------------------------------------------------------------------------
+
+/**
+ * Serve one UI request.
+ *
+ * `req.url` arrives as `/ui/<path>` and is handed over as `/<path>`, so a
+ * handler sees its own URL space and knows nothing of the prefix. The handler
+ * gets Node's own `(req, res)`; returning a string or an object is a shortcut
+ * for the common case of one page.
+ *
+ * A UI request carries no proxied-request context — it is a browser asking this
+ * plugin for a page, not part of anyone's traffic.
+ */
+function serveUi(plugin, name, req, res) {
+  if (typeof plugin.onUi !== 'function') {
+    res.writeHead(404, { 'content-length': 0 });
+    return res.end();
+  }
+  req.url = req.url.slice(UI_PREFIX.length) || '/';
+  const send = (out) => {
+    if (out === undefined || res.writableEnded || res.headersSent) return;
+    if (typeof out === 'string' || Buffer.isBuffer(out)) {
+      const body = Buffer.isBuffer(out) ? out : Buffer.from(out, 'utf8');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-length': body.length });
+      return res.end(body);
+    }
+    sendJson(res, 200, out);
+  };
+  Promise.resolve()
+    .then(() => plugin.onUi.call(plugin, req, res))
+    .then(send)
+    .catch((e) => {
+      console.error(`[${name}] onUi threw:`, e);
+      if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' });
+      if (!res.writableEnded) res.end('plugin UI error');
+    });
 }
 
 /** Header carrying the base64-encoded JSON metadata of a piped body. */
@@ -668,6 +789,120 @@ class BaseCtx {
   }
 }
 
+/**
+ * Context for the gate.
+ *
+ * Deliberately shaped like whistle's: return `false` to block, and say what the
+ * blocked client should see with `setHtml` / `setUrl` / `setRedirect` /
+ * `setLogin`. Each of those clears the others — a refusal has one outcome.
+ */
+class AuthCtx extends BaseCtx {
+  constructor(payload) {
+    super(payload);
+    this.clientIp = payload.clientIp || undefined;
+    this._page = null;
+    this._login = false;
+    this._status = null;
+    this._denied = false;
+  }
+
+  /** Block, and serve this HTML. */
+  setHtml(html) {
+    this._page = html == null ? null : { html: bodyToString(html) };
+    return this._deny();
+  }
+
+  /** Block, and serve the contents of this URL or file path. */
+  setUrl(url) {
+    this._page = url ? { url: String(url) } : null;
+    this._login = false;
+    return this._deny();
+  }
+
+  /** Alias of {@link setUrl}, as upstream has. */
+  setFile(url) {
+    return this.setUrl(url);
+  }
+
+  /** Block, and redirect there instead. */
+  setRedirect(url) {
+    this._page = url ? { redirect: String(url) } : null;
+    this._login = false;
+    return this._deny();
+  }
+
+  /** Ask the client for credentials (401, or 407 with an explicit status). */
+  setLogin(login) {
+    this._login = login !== false;
+    if (this._login) {
+      // A login box and a redirect are two different answers to one question.
+      if (this._page && (this._page.url || this._page.redirect)) this._page = null;
+      this._deny();
+    }
+    return this;
+  }
+
+  /** Status for the block. Only 3xx–5xx: a block is never a success. */
+  setStatus(code) {
+    this._status = code;
+    return this._deny();
+  }
+
+  /**
+   * Set a header on the request being admitted.
+   *
+   * Restricted to `x-whistle-*` and `proxy-authorization`, the same names
+   * whistle allows — a gate is there to identify a request, not to rewrite it.
+   * whistle-rs enforces this again on its side, so anything else is dropped
+   * whether or not this check runs.
+   */
+  setHeader(name, value) {
+    const key = String(name).toLowerCase();
+    if (typeof value !== 'string' || (key.indexOf('x-whistle-') !== 0 && key !== 'proxy-authorization')) {
+      return this;
+    }
+    return super.setHeader(key, value);
+  }
+
+  /** Alias of {@link setHeader}, as upstream has. */
+  set(name, value) {
+    return this.setHeader(name, value);
+  }
+
+  /** Mark this request as blocked (implied by every setter above). */
+  _deny() {
+    this._denied = true;
+    return this;
+  }
+
+  _result(verdict) {
+    // `return false` blocks, as upstream. Any setter also blocks, so a handler
+    // that describes a block page but forgets the `return` still blocks.
+    const allow = verdict !== false && !this._denied;
+    if (allow) {
+      const out = { allow: true };
+      if (Object.keys(this._set).length) out.setHeaders = this._set;
+      return out;
+    }
+    const out = { allow: false, login: this._login };
+    if (this._status != null) out.statusCode = this._status;
+    if (this._page) Object.assign(out, this._page);
+    return out;
+  }
+}
+
+/** Context for a stats ping: what happened, with nothing to answer. */
+class StatsCtx extends BaseCtx {
+  constructor(payload) {
+    super(payload);
+    /** `'request'` or `'response'`. */
+    this.phase = payload.phase === 'response' ? 'response' : 'request';
+    this.clientIp = payload.clientIp || undefined;
+    /** The upstream status — response phase only. */
+    this.statusCode = payload.statusCode;
+  }
+}
+
 /** Context for the request hook. */
 class RequestCtx extends BaseCtx {
   constructor(payload) {
@@ -745,6 +980,12 @@ class ResponseCtx extends BaseCtx {
     if (this._newBody !== undefined) applyBody(out, this._newBody);
     return out;
   }
+}
+
+/** Coerce a page body to text — a block page is text by construction. */
+function bodyToString(body) {
+  if (Buffer.isBuffer(body)) return body.toString('utf8');
+  return typeof body === 'string' ? body : JSON.stringify(body);
 }
 
 /**

@@ -229,6 +229,68 @@ export type WsVerdict = Buffer | string | object | boolean | null | undefined | 
 export type WsFrameHook = (frame: WsFrame, ctx: WsSession) => WsVerdict | Promise<WsVerdict>;
 
 /**
+ * Context passed to `onAuth`, the gate in front of every other request hook.
+ *
+ * Shaped like whistle's: return `false` to block, and say what the blocked
+ * client should see with one of the setters. Each setter clears the others — a
+ * refusal has exactly one outcome — and calling any of them also implies the
+ * block, so forgetting the `return false` cannot accidentally admit a request.
+ */
+export interface AuthCtx extends BaseCtx {
+  /** The client's IP, when known. */
+  readonly clientIp?: string;
+
+  /** Block, and serve this HTML. */
+  setHtml(html: string | Buffer | null): this;
+  /** Block, and serve the contents of this URL or file path. */
+  setUrl(url: string): this;
+  /** Alias of `setUrl`. */
+  setFile(url: string): this;
+  /** Block, and redirect there instead (302). */
+  setRedirect(url: string): this;
+  /** Ask the client for credentials — 401, or 407 with an explicit status. */
+  setLogin(login?: boolean): this;
+  /** Status for the block. Honoured only in 300–599: a block is never a success. */
+  setStatus(code: number): this;
+
+  /**
+   * Set a header on the request being **admitted**.
+   *
+   * Restricted to `x-whistle-*` and `proxy-authorization`; anything else is
+   * dropped, by the SDK and again by the proxy. A gate identifies a request, it
+   * does not rewrite it.
+   */
+  setHeader(name: string, value: string): this;
+  /** Alias of `setHeader`. */
+  set(name: string, value: string): this;
+}
+
+/** Context passed to the stats hooks: what happened, with nothing to answer. */
+export interface StatsCtx extends BaseCtx {
+  /** Which phase this ping reports. */
+  readonly phase: 'request' | 'response';
+  /** The client's IP, when known. */
+  readonly clientIp?: string;
+  /** The upstream status — response phase only. */
+  readonly statusCode?: number;
+}
+
+/**
+ * A UI request handler: Node's own `(req, res)`, with `/plugin/<name>` already
+ * stripped from `req.url`.
+ *
+ * Return a string or Buffer to send it as HTML, or any other value to send it
+ * as JSON; return nothing and the handler owns `res`.
+ *
+ * A UI request carries **no** proxied-request context — it is a browser asking
+ * this plugin for a page, not part of anyone's traffic.
+ */
+export type UiHook = (
+  req: import('http').IncomingMessage,
+  res: import('http').ServerResponse
+) => BodyInit | undefined | Promise<BodyInit | undefined>;
+
+/**
  * A whistle-rs plugin. Define at least one hook — which ones you define is what
  * the capability manifest advertises to the proxy.
  */
@@ -264,6 +326,30 @@ export interface Plugin {
    * the scheme to express.
    */
   onWsFrame?: WsFrameHook;
+
+  /**
+   * Decide whether a request may proceed. Runs before every other request hook,
+   * and a block stops the chain — no later plugin runs.
+   *
+   * **This hook fails closed.** If it throws, hangs, or the plugin is not
+   * reachable, the requests it matched are blocked with a `502`, not admitted.
+   * Reached by `plugin://<name>` or `pipe://<name>`.
+   */
+  onAuth?(ctx: AuthCtx): boolean | void | Promise<boolean | void>;
+
+  /**
+   * Told that a request went past, before it is forwarded. Fire-and-forget: the
+   * reply is discarded and nothing waits for it, so it cannot change anything.
+   */
+  onReqStats?(ctx: StatsCtx): void | Promise<void>;
+  /** Told how the request turned out, once the response head is back. */
+  onResStats?(ctx: StatsCtx): void | Promise<void>;
+
+  /**
+   * Serve the plugin's own pages, routed from the web UI at
+   * `http://<proxy>/plugin/<name>/`.
+   */
+  onUi?: UiHook;
 }
 
 export interface StartOptions {
