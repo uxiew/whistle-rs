@@ -11,7 +11,14 @@
 // Or run it directly with a TS-aware loader:
 //   whistle-rs --node-plugin typed=examples/plugins/typed.ts   # needs NODE_OPTIONS=--import=tsx
 
-import { start, type Plugin, type RequestCtx, type ResponseCtx } from '../../sdk/whistle-rs-plugin';
+import {
+  start,
+  transform,
+  type Plugin,
+  type PipeCtx,
+  type RequestCtx,
+  type ResponseCtx,
+} from '../../sdk/whistle-rs-plugin';
 
 interface ApiPayload {
   userId?: number;
@@ -45,6 +52,20 @@ const plugin = {
     if (ctx.statusCode >= 500) {
       ctx.setStatus(503).setBody({ error: 'upstream unavailable' });
     }
+  },
+
+  // The streaming hook, reached by `pipe://typed` rather than `plugin://typed`.
+  // It needs no body flag — nothing is buffered — and sees each chunk as it
+  // arrives. Returning the Transform is enough; the SDK wires the pipeline.
+  pipeResponse(_src, _dest, ctx: PipeCtx) {
+    let bytes = 0;
+    return transform((chunk) => {
+      bytes += chunk.length;
+      return chunk;
+    }, () => {
+      console.log(`[typed] ${ctx.url} streamed ${bytes} bytes (${ctx.pipeValue ?? 'no value'})`);
+      return undefined;
+    });
   },
 } satisfies Plugin;
 

@@ -1668,3 +1668,121 @@ fn authority_host_port(uri: &Uri) -> Option<(String, u16)> {
     let port = auth.port_u16().unwrap_or(443);
     Some((host, port))
 }
+
+#[cfg(test)]
+mod pipe_wiring_tests {
+    use super::*;
+    use crate::plugins::pipe::{Dir, PipeMeta};
+
+    /// Server state backed by a throwaway storage dir, so running the tests
+    /// never touches the developer's real `~/.whistle-rs`.
+    fn state() -> Arc<AppState> {
+        let config = Config {
+            storage_dir: std::env::temp_dir()
+                .join(format!("whistle-rs-pipe-tests-{}", std::process::id())),
+            persist_sessions: false,
+            ..Config::default()
+        };
+        let ca = CertAuthority::load_or_create(&config).expect("ca");
+        Arc::new(AppState::new(config, RuleManager::new(), ca))
+    }
+
+    fn headers_with_length() -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::CONTENT_LENGTH, "9".parse().unwrap());
+        h
+    }
+
+    /// The non-negotiable: with no streaming plugin matched, the body comes back
+    /// still lazy. Proven by sending its frames only *after* `pipe_body` has
+    /// returned — a body that had been collected could not carry them.
+    #[test]
+    fn no_pipe_plugin_leaves_the_body_streaming() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let state = state();
+            let mut headers = headers_with_length();
+            let (tx, source) = body::channel(4);
+
+            let out = pipe_body(&state, &[], Dir::Response, PipeMeta::default(), &mut headers, source).await;
+
+            // Nothing was read, so these frames still reach the client.
+            tokio::spawn(async move {
+                for part in ["not ", "buffered"] {
+                    tx.send(Ok(Bytes::from_static(part.as_bytes()))).await.ok();
+                }
+            });
+            let bytes = collect_body(out).await.expect("body");
+            assert_eq!(bytes, Bytes::from_static(b"not buffered"));
+            // And the framing headers are untouched — only a plugin that
+            // actually takes the stream may change the body's length.
+            assert_eq!(headers.get(hyper::header::CONTENT_LENGTH).unwrap(), "9");
+        });
+    }
+
+    /// A `pipe://` match whose plugin declares no streaming hook is equally
+    /// inert — the fallback to the buffered path must not disturb the body.
+    #[test]
+    fn matched_plugin_without_the_hook_is_inert() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let state = state();
+            let mut headers = headers_with_length();
+            // `stamp` serves the buffered response hook, never a streaming one.
+            let matches = vec![crate::plugins::PluginMatch {
+                name: "stamp".to_string(),
+                param: String::new(),
+                pipe_value: None,
+                via_pipe: true,
+            }];
+            let out = pipe_body(
+                &state,
+                &matches,
+                Dir::Response,
+                PipeMeta::default(),
+                &mut headers,
+                body::full("as-is"),
+            )
+            .await;
+            assert_eq!(collect_body(out).await.expect("body"), Bytes::from_static(b"as-is"));
+            assert_eq!(headers.get(hyper::header::CONTENT_LENGTH).unwrap(), "9");
+        });
+    }
+
+    /// A plugin that does take the stream transforms it and drops the length
+    /// headers, since the transform may change the body's size.
+    #[test]
+    fn pipe_plugin_takes_the_stream_and_drops_length() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let state = state();
+            let mut headers = headers_with_length();
+            let matches = vec![crate::plugins::PluginMatch {
+                name: "upper".to_string(),
+                param: String::new(),
+                pipe_value: Some("v".to_string()),
+                via_pipe: true,
+            }];
+            let out = pipe_body(
+                &state,
+                &matches,
+                Dir::Response,
+                PipeMeta::default(),
+                &mut headers,
+                body::full("shout"),
+            )
+            .await;
+            assert_eq!(collect_body(out).await.expect("body"), Bytes::from_static(b"SHOUT"));
+            assert!(headers.get(hyper::header::CONTENT_LENGTH).is_none());
+        });
+    }
+}
