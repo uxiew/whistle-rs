@@ -179,15 +179,15 @@ api.example.com   host://127.0.0.1:9000
 
 ### Upstream proxy
 
-Route the forwarded request through another proxy. The credential form
-`user:pass@host:port` is supported; the port defaults to 80 (http), 443 (https),
-or 1080 (socks).
+Route the forwarded request through another proxy. The address is
+`[user[:pass]@]host[:port]`; the port defaults to 80 (http), 443 (https) or
+1080 (socks), and an IPv6 literal may be bracketed (`[::1]:8888`) or bare.
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `proxy` / `http-proxy` / `internal-proxy` | `[user:pass@]host:port` | Route via an HTTP proxy (absolute-form for http, CONNECT for https) |
-| `https-proxy` | `[user:pass@]host:port` | Same, but the connection to the proxy is TLS |
-| `socks` | `[user:pass@]host:port` | Route via a SOCKS5 proxy |
+| `proxy` / `http-proxy` / `internal-proxy` / `internal-http-proxy` | `[user[:pass]@]host[:port]` | Route via an HTTP proxy |
+| `https-proxy` / `internal-https-proxy` | `[user[:pass]@]host[:port]` | Same, but the connection *to the proxy* is TLS |
+| `socks` | `[user[:pass]@]host[:port]` | Route via a SOCKS5 proxy |
 
 ```
 example.com        proxy://127.0.0.1:8888
@@ -195,15 +195,66 @@ example.com        proxy://127.0.0.1:8888
 secure.example.com socks://127.0.0.1:1080
 ```
 
-Precedence when several are present: `socks` > `https-proxy` > `http-proxy` >
-`proxy` > `internal-proxy` > `pac`.
+**How the hop is made.** Only a plain HTTP proxy fetching a plain HTTP origin
+sends the request in absolute-form (`GET http://host/path`); a TLS origin, a
+SOCKS proxy, an HTTPS proxy, and a `host://` override travelling with the proxy
+each open a `CONNECT` tunnel instead. The absolute-form URI names the host from
+the request's `Host` header, so a `reqHeaders://` rule that rewrote `Host` is
+honoured and a `host://` override is never handed to the upstream proxy.
 
-`pac://<file>` evaluates a PAC file's `FindProxyForURL(url, host)` to pick the proxy
-(`PROXY host:port`, `HTTPS ...`, `SOCKS ...`, or `DIRECT`):
+**What travels on the hop.** The `CONNECT` carries `Host`,
+`Proxy-Connection: keep-alive`, the client's `User-Agent`, and
+`Proxy-Authorization` — taken from the proxy URL's credential if it has one,
+otherwise from the client's own `Proxy-Authorization`. A credential without a
+password (`proxy://user@host`) is base64'd verbatim, matching whistle: it sends
+`Basic base64("user")`, not `Basic base64("user:")`. SOCKS5 splits the same
+credential at the first colon and sends an empty password. Hostnames are handed
+to the proxy unresolved (SOCKS5 address type 3), so the proxy does the DNS.
+
+If the upstream proxy is unreachable or refuses the `CONNECT`, the request
+fails with a 502 — it is never retried directly.
+
+**Combining with `host://`.** By default a matching `host://` wins outright and
+the proxy is dropped. `proxyHost` (as `lineProps://proxyHost`, as
+`enable://proxyHost`, or written into the proxy's own URL as
+`http-proxy://…?proxyHost`) keeps both: the request reaches the origin through
+the proxy, and the proxy is asked to connect to the `host://` address.
+`proxyFirst` prefers the proxy, and `proxyHostOnly` behaves as `proxyHost` but
+additionally drops the proxy when no `host://` matched.
+
+```
+pinned.test        http-proxy://127.0.0.1:8888?proxyHost
+pinned.test        host://10.0.0.9
+```
+
+Precedence when several proxy operators match: `socks` > `https-proxy` >
+`http-proxy` > `proxy` > `internal-https-proxy` > `internal-proxy` >
+`internal-http-proxy` > `https2http-proxy` > `http2https-proxy` > `pac`.
+
+#### PAC
+
+`pac://<file>` evaluates a PAC file's `FindProxyForURL(url, host)` to pick the
+proxy. The result is read left to right; the first `PROXY`/`HTTP host:port`,
+`HTTPS host:port` or `SOCKS`/`SOCKS5 host:port` entry wins, and `DIRECT` means
+connect without a proxy.
 
 ```
 .corp.example.com   pac:///etc/whistle/corp.pac
 ```
+
+Known limits of this port's PAC support — each of these **falls back to a direct
+connection**, so a rule that looks like it is routing traffic may not be:
+
+- the value must be a **local file path** (or the script itself inline). A
+  remote `pac://http://…/proxy.pac` is *not* fetched; upstream fetches and
+  caches it (`node-pac`, `_original/lib/rules/index.js:257-275`);
+- only `isPlainHostName`, `dnsDomainIs` and `shExpMatch` are provided. A script
+  calling `myIpAddress`, `isInNet`, `dnsResolve`, `isResolvable`,
+  `localHostOrDomainIs`, `dnsDomainLevels`, `weekdayRange`, `dateRange` or
+  `timeRange` throws and yields no proxy;
+- `SOCKS4` results are ignored, and a `user@` prefix on the PAC URL
+  (upstream's `_pacAuth`) is not read as a credential;
+- the script is re-read and re-evaluated on every request rather than cached.
 
 ### URL rewriting
 
@@ -825,8 +876,14 @@ that source at load time; `${port}` and `${version}` in operator values are subs
 `pathReplace→urlReplace`, `reqMerge→params`, `resRules→resScript`,
 `ruleFile`/`ruleScript`/`rulesScript`/`reqScript`/`reqRules`→`rulesFile`, `P→G`.
 
-Notes: `https2http-proxy`/`http2https-proxy` resolve as HTTP proxies (scheme
-conversion approximated); `enable`/`disable` apply a curated flag set (see the
+Notes: `https2http-proxy`/`http2https-proxy` resolve as plain HTTP proxies — the
+scheme conversion is **not** implemented, so `http2https-proxy://` does not
+upgrade an `http://` origin to TLS the way upstream does, and the
+`internal-*` family does not use whistle's whistle-to-whistle handshake
+(`x-whistle-https-request`), tunnelling with `CONNECT` instead. The `x`-prefixed
+variants (`xproxy://`, `xsocks://`, …) are aliases of their base proxy: upstream
+falls back to a **direct** connection when the proxy fails, this port does not
+and returns 502. `enable`/`disable` apply a curated flag set (see the
 [Flags](#flags-includes--values) table — others are inert); `pipe` routes to a
 registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
 extra rules from the values store / a file; `{name}` in any operator value is
@@ -834,6 +891,13 @@ substituted from the values store. `cipher` honours the portable part of Node's 
 options — `minVersion`/`maxVersion`/`secureProtocol` (or a bare `cipher://TLSv1.2`
 token) pin the **upstream** TLS protocol version; rustls exposes TLS 1.2 / 1.3 only,
 so OpenSSL cipher-suite strings and older-than-1.2 pins are not honoured.
+
+**Upstream certificate verification differs from whistle's.** whistle sets
+`rejectUnauthorized: false` by default (`_original/lib/config.js:74`) and only
+verifies when started with `--safe`, so it happily debugs origins with
+self-signed, expired or private-CA certificates. This port always verifies the
+origin (and an `https-proxy://`) against the webpki root store, so those origins
+return 502 here. There is currently no flag to relax it.
 
 The local-file family serves from disk: `file`/`rawfile` serve bytes (`rawfile`
 parses a full HTTP response file — status line + headers + body); the `x`/`xs`
