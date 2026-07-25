@@ -830,15 +830,27 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("from", CondKind::Later(Deferred::From), true, true),
 ];
 
+/// `Some(excludes)` when `proto` is one of the filter operators.
+///
+/// NOTE: upstream reads `filter://` as an *exclude* filter
+/// (`isInclude = matcher[1] === 'n'`, `_original/lib/rules/rules.js:1563`). This
+/// port has always treated it as an include, and its docs and examples say so;
+/// the divergence is recorded in `docs/RULES.md` rather than flipped underneath
+/// existing rules files.
+fn filter_excludes(proto: &str) -> Option<bool> {
+    match proto {
+        "filter" | "includeFilter" => Some(false),
+        "excludeFilter" => Some(true),
+        _ => None,
+    }
+}
+
 /// Is this token a filter condition (as opposed to an operator or a pattern)?
 ///
 /// Used by [`parse_line`] so that a filter whose condition does not parse is
 /// dropped instead of degrading into an operator named `includeFilter`.
 fn is_filter_token(tok: &str) -> bool {
-    matches!(
-        split_protocol(tok).map(|(p, _)| p),
-        Some("filter" | "includeFilter" | "excludeFilter")
-    )
+    split_protocol(tok).is_some_and(|(proto, _)| filter_excludes(proto).is_some())
 }
 
 /// Parse a `filter://` / `includeFilter://` / `excludeFilter://` token.
@@ -848,16 +860,7 @@ fn is_filter_token(tok: &str) -> bool {
 /// drops those too (`resolveMatchFilter`, `_original/lib/rules/rules.js:1556`).
 fn parse_filter(tok: &str) -> Option<Filter> {
     let (proto, spec) = split_protocol(tok)?;
-    // NOTE: upstream reads `filter://` as an *exclude* filter
-    // (`isInclude = matcher[1] === 'n'`, `_original/lib/rules/rules.js:1563`).
-    // This port has always treated it as an include, and its docs and examples
-    // say so; the divergence is recorded in `docs/RULES.md` rather than flipped
-    // underneath existing rules files.
-    let exclude = match proto {
-        "filter" | "includeFilter" => false,
-        "excludeFilter" => true,
-        _ => return None,
-    };
+    let exclude = filter_excludes(proto)?;
     // `.`/`=` separated conditions are an includeFilter/excludeFilter-only form.
     let pure_ok = proto != "filter";
     if spec.is_empty() {

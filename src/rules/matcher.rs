@@ -82,8 +82,9 @@ fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
 ///   decided;
 /// * a rule with only exclude filters applies unless one of them holds.
 ///
-/// Both loops stop early once their verdict is settled, so a `chance:` filter
-/// draws no more random numbers than upstream does.
+/// Once either verdict is settled the remaining filters of that kind are not
+/// evaluated — upstream guards its loop the same way, which matters for a
+/// `chance:` filter: it must draw no more random numbers than upstream does.
 fn filters_match(filters: &[Filter], req: &ReqInfo) -> bool {
     let mut has_include = false;
     let (mut include, mut exclude) = (false, false);
