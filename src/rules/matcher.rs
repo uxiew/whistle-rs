@@ -365,37 +365,27 @@ fn take(resolved: &mut Resolved, op: &RuleOp, order: u64) {
 ///   *request* phase's operators as well — see
 ///   [`Resolved::apply_response_ignores`].
 ///
-/// `None` says nothing was withheld for this request, so the request phase's
-/// answer is already complete.
-pub fn resolve_response_refs(
-    rules: &[&Rule],
+/// `candidates` are the rules that withheld something, each with the
+/// [`order_key`] of its line, in ascending key order — that is, the order the
+/// request pass would have visited them in. [`crate::rules::RuleManager::resolve_response`]
+/// selects them; the selection is the pass's whole cost when nothing matches.
+pub fn resolve_response_ops(
+    candidates: &[(u64, &Rule)],
     req: &ReqInfo,
     is_internal_req: bool,
-) -> Option<Resolved> {
-    // Cheap pre-scan over a precomputed flag; the walk proper only runs for the
-    // rules that actually withheld something.
-    if !rules.iter().any(|r| r.may_need_response_phase()) {
-        return None;
-    }
+) -> Resolved {
     let mut resolved = Resolved::default();
-    let mut deferred_any = false;
-    for pass_important in [true, false] {
-        for (index, rule) in rules.iter().enumerate() {
-            if rule.is_important() != pass_important || !rule.needs_response_phase(req) {
-                continue;
-            }
-            deferred_any = true;
-            if !rule.props.allows_scope(is_internal_req) || !matches(rule, req) {
-                continue;
-            }
-            for op in &rule.ops {
-                if protocols::is_res_phase(&op.protocol) || op.protocol == "ignore" {
-                    take(&mut resolved, op, order_key(index, pass_important));
-                }
+    for (order, rule) in candidates {
+        if !rule.props.allows_scope(is_internal_req) || !matches(rule, req) {
+            continue;
+        }
+        for op in &rule.ops {
+            if protocols::is_res_phase(&op.protocol) || op.protocol == "ignore" {
+                take(&mut resolved, op, *order);
             }
         }
     }
-    deferred_any.then_some(resolved)
+    resolved
 }
 
 /// `ignore://<proto>[,<proto>…]` removes those protocols from the resolved set;
@@ -1509,3 +1499,4 @@ mod response_phase_tests {
         }
     }
 }
+

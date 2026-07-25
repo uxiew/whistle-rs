@@ -705,10 +705,13 @@ pub struct RuleGroup {
     pub enabled: bool,
     /// Parsed rules from `text`.
     rules: Vec<Rule>,
-    /// Does any rule here carry response-phase operators behind a filter that
-    /// asks about the response? Computed once per parse — see
-    /// [`RuleManager::may_need_response_phase`].
-    res_phase_candidates: bool,
+    /// Indices into `rules` of the lines that carry response-phase operators
+    /// behind a filter that asks about the response.
+    ///
+    /// Kept as a list rather than a flag so the response pass costs what those
+    /// lines cost and not what the whole group costs: a rules file with a
+    /// thousand lines and one `includeFilter://s:` walks one rule.
+    res_candidates: Vec<u32>,
 }
 
 impl RuleGroup {
@@ -718,7 +721,7 @@ impl RuleGroup {
             name: name.to_string(),
             text: text.to_string(),
             enabled,
-            res_phase_candidates: rules.iter().any(Rule::may_need_response_phase),
+            res_candidates: res_candidates(&rules),
             rules,
         }
     }
@@ -726,13 +729,24 @@ impl RuleGroup {
     /// Re-parse rules from the current text.
     fn reparse(&mut self) {
         self.rules = parse_text(&self.text);
-        self.res_phase_candidates = self.rules.iter().any(Rule::may_need_response_phase);
+        self.res_candidates = res_candidates(&self.rules);
     }
 
     /// Number of parsed rules in this group.
     pub fn len(&self) -> usize {
         self.rules.len()
     }
+}
+
+/// Which of `rules` might need the response phase — see
+/// [`Rule::may_need_response_phase`] and [`RuleGroup::res_candidates`].
+fn res_candidates(rules: &[Rule]) -> Vec<u32> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.may_need_response_phase())
+        .map(|(i, _)| i as u32)
+        .collect()
 }
 
 /// Holds rule groups and answers match queries.
@@ -803,7 +817,8 @@ impl RuleManager {
     /// that the `internal`/`internalOnly` line properties can be honoured. Pass
     /// `true` for requests whistle itself issues (plugin calls, internal paths).
     pub fn resolve_scoped(&self, req: &ReqInfo, is_internal_req: bool) -> Resolved {
-        matcher::resolve_refs_scoped(&self.enabled_rules(), req, is_internal_req)
+        let rules: Vec<&Rule> = self.enabled_rules().map(|(_, rule)| rule).collect();
+        matcher::resolve_refs_scoped(&rules, req, is_internal_req)
     }
 
     /// Could *any* enabled rule need a second, response-phase resolution?
@@ -814,7 +829,7 @@ impl RuleManager {
     pub fn may_need_response_phase(&self) -> bool {
         self.groups
             .iter()
-            .any(|g| g.enabled && g.res_phase_candidates)
+            .any(|g| g.enabled && !g.res_candidates.is_empty())
     }
 
     /// Resolve the response-phase operators the request pass withheld, given a
@@ -822,26 +837,52 @@ impl RuleManager {
     ///
     /// `None` means there was nothing to do — no rule's response-phase operators
     /// were withheld for this request — and the caller can keep the request
-    /// phase's answer as it stands. See [`matcher::resolve_response_refs`] for
+    /// phase's answer as it stands. See [`matcher::resolve_response_ops`] for
     /// what the pass covers and [`Resolved::merge_response_phase`] for how the
     /// two are put back together.
+    ///
+    /// The rules are indexed the same way [`RuleManager::resolve_scoped`]
+    /// indexes them, so an operator's [`order_key`] means the same thing in
+    /// either pass. Only the lines that withheld something are collected, and
+    /// they are sorted rather than swept twice: a response pass over a large
+    /// rules file should cost what its few conditional lines cost, not what the
+    /// whole file costs.
     pub fn resolve_response(&self, req: &ReqInfo, is_internal_req: bool) -> Option<Resolved> {
         if !self.may_need_response_phase() {
             return None;
         }
-        matcher::resolve_response_refs(&self.enabled_rules(), req, is_internal_req)
+        let mut candidates: Vec<(u64, &Rule)> = Vec::new();
+        let mut base = 0;
+        for group in self.groups.iter().filter(|g| g.enabled) {
+            for &i in &group.res_candidates {
+                let rule = &group.rules[i as usize];
+                if rule.needs_response_phase(req) {
+                    candidates.push((order_key(base + i as usize, rule.is_important()), rule));
+                }
+            }
+            base += group.rules.len();
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort_by_key(|(order, _)| *order);
+        Some(matcher::resolve_response_ops(
+            &candidates,
+            req,
+            is_internal_req,
+        ))
     }
 
-    /// Every rule of every enabled group, in resolution order.
+    /// Every rule of every enabled group, with its resolution index.
     ///
-    /// Both passes build the list the same way, so a rule keeps its index — and
+    /// Both passes enumerate the same sequence, so a rule keeps its index — and
     /// therefore its [`order_key`] — across them.
-    fn enabled_rules(&self) -> Vec<&Rule> {
+    fn enabled_rules(&self) -> impl Iterator<Item = (usize, &Rule)> {
         self.groups
             .iter()
             .filter(|g| g.enabled)
             .flat_map(|g| &g.rules)
-            .collect()
+            .enumerate()
     }
 
     // ── Group management API ──
