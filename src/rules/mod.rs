@@ -177,6 +177,9 @@ pub enum Pattern {
         host: String,
         /// Leading-dot wildcard, e.g. `.example.com` matches subdomains.
         host_suffix: bool,
+        /// Explicit port written in the pattern (`example.com:8080`), which
+        /// scopes the rule to that port. `None` means "any port".
+        port: Option<u16>,
         /// Path prefix (may be empty).
         path: String,
     },
@@ -658,8 +661,8 @@ fn parse_filter(tok: &str) -> Option<Filter> {
 /// Heuristic: does this token read as a match pattern (vs. an operator)?
 fn looks_like_pattern(tok: &str) -> bool {
     let t = tok.strip_prefix('$').unwrap_or(tok);
-    if t.starts_with('/') {
-        return true; // regexp
+    if t.starts_with('/') || t.starts_with(':') {
+        return true; // regexp or port pattern
     }
     // Line properties and filters are neither pattern nor operator. Classifying
     // one as a pattern would both lose its effect and mint a rule that can
@@ -754,6 +757,13 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
 
 /// Parse a pattern token into a [`Pattern`].
 fn parse_pattern(tok: &str) -> Option<Pattern> {
+    // Port pattern: `:8080` scopes the rule to one port. Tested before the `$`
+    // prefix is peeled off, matching `PORT_PATTERN_RE`
+    // (`_original/lib/rules/rules.js:71`), which does not allow one.
+    if let Some(re) = port_pattern(tok) {
+        return Some(Pattern::Regex(re));
+    }
+
     let tok = tok.strip_prefix('$').unwrap_or(tok);
 
     // Regexp pattern: /body/flags
@@ -786,6 +796,24 @@ fn parse_pattern(tok: &str) -> Option<Pattern> {
     Some(parse_prefix(tok))
 }
 
+/// Compile a `:8080`-style port pattern.
+///
+/// `PORT_PATTERN_RE = /^!?:\d{1,5}$/` (`_original/lib/rules/rules.js:71`) and
+/// the compilation at `rules.js:1249-1252`: `^[\w]+://[^/?]+:<port>/`. Matching
+/// the URL text means the port has to be *spelled out*, so `:80` does not match
+/// `http://example.com/` in either implementation.
+///
+/// Anything less than a real port test is dangerous: this port used to fall
+/// through to the prefix parser, which dropped the port, ended up with an empty
+/// host and matched **every** request.
+fn port_pattern(tok: &str) -> Option<Regex> {
+    let digits = tok.strip_prefix(':')?;
+    if digits.is_empty() || digits.len() > 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Regex::new(&format!(r"^[\w]+://[^/?]+:{digits}/")).ok()
+}
+
 /// Build a scheme/host/path prefix pattern from a plain token.
 fn parse_prefix(tok: &str) -> Pattern {
     let (scheme, rest) = match tok.find("://") {
@@ -796,26 +824,31 @@ fn parse_prefix(tok: &str) -> Pattern {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, String::new()),
     };
-    // Strip an explicit port from the host part for matching purposes.
-    let host_no_port = host_part.rsplit_once(':').map_or(host_part, |(h, p)| {
-        if p.chars().all(|c| c.is_ascii_digit()) {
-            h
-        } else {
-            host_part
-        }
-    });
+    // An explicit port scopes the rule to that port. The original matches the
+    // pattern as a literal prefix of the request URL, port and all, so dropping
+    // it here (as this port used to) made `example.com:8080` match every port.
+    // A `:port` that is not a valid u16 is left as part of the host, which then
+    // simply never matches — better than silently widening the rule.
+    let (host_no_port, port) = match host_part.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(port) => (h, Some(port)),
+            Err(_) => (host_part, None),
+        },
+        None => (host_part, None),
+    };
     let (host_suffix, host) = if let Some(stripped) = host_no_port.strip_prefix('.') {
         (true, stripped.to_lowercase())
     } else {
         (false, host_no_port.to_lowercase())
     };
-    if host.is_empty() && path.is_empty() && scheme.is_none() {
+    if host.is_empty() && path.is_empty() && scheme.is_none() && port.is_none() {
         return Pattern::Any;
     }
     Pattern::Prefix {
         scheme,
         host,
         host_suffix,
+        port,
         path,
     }
 }
@@ -1093,6 +1126,86 @@ mod line_props_tests {
         assert!(!strict.allows_injection(b"hello"));
         // Empty body counts as markup.
         assert!(strict.allows_injection(b""));
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::*;
+
+    fn req(url: &str) -> ReqInfo {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host_port, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], rest[i..].to_string()),
+            None => (rest, "/".to_string()),
+        };
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => {
+                (h.to_string(), p.parse().unwrap())
+            }
+            _ => (
+                host_port.to_string(),
+                if scheme == "https" { 443 } else { 80 },
+            ),
+        };
+        ReqInfo {
+            method: "GET".into(),
+            scheme: scheme.into(),
+            host,
+            port,
+            path,
+            full_url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Does `text`'s rule match `url`?
+    fn hits(text: &str, url: &str) -> bool {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        mgr.resolve(&req(url)).value("host").is_some()
+    }
+
+    /// `:8080` scopes a rule to one port, on any host. It used to reach the
+    /// prefix parser, which dropped the port and left an empty host — i.e. a
+    /// pattern that quietly matched **every** request.
+    #[test]
+    fn port_pattern_matches_only_that_port() {
+        let text = ":8080 host://1.1.1.1";
+        assert!(hits(text, "http://any.test:8080/"));
+        assert!(hits(text, "https://other.test:8080/deep/path?q=1"));
+        assert!(!hits(text, "http://any.test/"), "port 80 must not match");
+        assert!(!hits(text, "http://other.test:9999/"));
+        assert!(!hits(text, "http://any.test:18080/"), "not a suffix match");
+    }
+
+    /// Like upstream, the port has to be spelled out in the URL: the compiled
+    /// pattern is `^[\w]+://[^/?]+:<port>/`, so a default port does not match.
+    #[test]
+    fn default_port_is_not_spelled_out() {
+        assert!(!hits(":80 host://1.1.1.1", "http://any.test/"));
+        assert!(hits(":80 host://1.1.1.1", "http://any.test:80/"));
+    }
+
+    /// A port written into an ordinary pattern scopes it just the same —
+    /// upstream matches the pattern as a literal prefix of the URL, port
+    /// included.
+    #[test]
+    fn explicit_port_in_a_host_pattern() {
+        let text = "example.test:8080 host://1.1.1.1";
+        assert!(hits(text, "http://example.test:8080/"));
+        assert!(!hits(text, "http://example.test/"));
+        assert!(!hits(text, "http://other.test:8080/"));
+        // A portless pattern still matches any port.
+        assert!(hits("example.test host://1.1.1.1", "http://example.test:8080/"));
+    }
+
+    /// A `:` that is not a port stays part of the host, which then matches
+    /// nothing — rather than being dropped and widening the rule.
+    #[test]
+    fn unparsable_port_does_not_widen_the_pattern() {
+        assert!(!hits("example.test:99999 host://1.1.1.1", "http://example.test/"));
+        assert!(!hits(": host://1.1.1.1", "http://example.test/"));
     }
 }
 

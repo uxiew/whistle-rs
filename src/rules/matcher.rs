@@ -28,6 +28,7 @@ fn pattern_matches(rule: &Rule, req: &ReqInfo) -> bool {
             scheme,
             host,
             host_suffix,
+            port,
             path,
         } => {
             if let Some(s) = scheme {
@@ -42,6 +43,12 @@ fn pattern_matches(rule: &Rule, req: &ReqInfo) -> bool {
                         return false;
                     }
                 } else if req.host != *host {
+                    return false;
+                }
+            }
+            // An explicit port in the pattern scopes the rule to it.
+            if let Some(p) = port {
+                if req.port != *p {
                     return false;
                 }
             }
