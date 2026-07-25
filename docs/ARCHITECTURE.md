@@ -120,8 +120,14 @@ Say you want `delete://header-name` to strip a request header.
 3. **Test** — add a unit test to `src/rules/matcher.rs` proving the operator resolves,
    and (optionally) drive it end-to-end as in the README smoke test.
 
-`Resolved` gives you three accessors: `value(proto)` (first-match single),
-`get(proto)` (the `RuleOp`), and `all(proto)` (every value, for multi-match).
+`Resolved` gives you three accessors, all of them total over single- and
+multi-match protocols alike: `get(proto)` is the winning `RuleOp` (for a
+multi-match protocol, the head of its list), `value(proto)` its value, and
+`all(proto)` every match in resolution order — important lines first, source
+order within a pass. A single-match protocol yields a one-element `all`, so a
+loop needs no special case. Which protocols accumulate is
+`rules::protocols::MULTI_MATCH`; how several values of one operator combine is
+per family and documented in [`RULES.md`](RULES.md).
 
 ## Extending: add an upstream proxy
 
