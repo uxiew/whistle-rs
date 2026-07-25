@@ -997,6 +997,43 @@ async fn serve(
     );
     // The accepted socket's port, for `clientPort:` / `remotePort:` filters.
     info.client_port = Some(peer.port());
+
+    // A `b:` filter reads the request body, so the body has to be in hand
+    // *before* the rules resolve. Whether any line asks is answered from the
+    // per-group candidate list each group precomputes; a rules file that never
+    // mentions the body costs one `is_empty()` per group and the body keeps
+    // streaming untouched.
+    //
+    // Locking: the read guard is dropped before the `.await` below — no guard
+    // may cross one here, which is also why this cannot share the acquisition
+    // with the resolution that follows.
+    let needs_req_body = {
+        let rules = state.rules.read().unwrap();
+        rules.needs_request_body(&info, is_internal_req)
+    };
+    // Normalising to `DynBody` here rather than at the plugin hook lets both
+    // reasons to buffer share one decision point.
+    let (req, prebuffered): (Request<DynBody>, Option<Bytes>) = {
+        let (parts, incoming) = req.into_parts();
+        if needs_req_body {
+            let bytes = incoming.collect().await?.to_bytes();
+            (
+                Request::from_parts(parts, body::full(bytes.clone())),
+                Some(bytes),
+            )
+        } else {
+            (
+                Request::from_parts(parts, body::from_incoming(incoming)),
+                None,
+            )
+        }
+    };
+    if let Some(bytes) = &prebuffered {
+        // Set even when empty: upstream's `req._reqBody` is a string either way,
+        // so `b:!x` holds for a request with no body rather than failing closed.
+        info.req_body = Some(String::from_utf8_lossy(bytes).into_owned());
+    }
+
     let mut resolved = state
         .rules
         .read()
@@ -1037,26 +1074,26 @@ async fn serve(
     // only assigned once a transaction is recorded, which is too late here.
     let plugin_req_id = next_plugin_req_id();
 
-    // Normalise the request body to `DynBody` so a plugin can optionally be
-    // handed it. Buffering happens *only* when a matched plugin's manifest
-    // declares `requestBody` — otherwise the body stays a lazy stream and the
-    // proxy's streaming fast path is untouched.
+    // Hand a plugin the request body if its manifest declares `requestBody`.
+    // Buffering happens *only* then — otherwise the body stays a lazy stream and
+    // the proxy's streaming fast path is untouched. A `b:` filter may already
+    // have bought the bytes above, in which case this costs nothing but the
+    // manifest lookup.
     let (req, plugin_req_body): (Request<DynBody>, Option<Bytes>) = {
-        let (parts, incoming) = req.into_parts();
         let wants_body = !plugin_matches.is_empty()
-            && has_request_body(&parts.headers)
+            && has_request_body(req.headers())
             && state.plugins.any_wants_request_body(&plugin_names).await;
-        if wants_body {
-            let bytes = incoming.collect().await?.to_bytes();
-            (
-                Request::from_parts(parts, body::full(bytes.clone())),
-                Some(bytes),
-            )
-        } else {
-            (
-                Request::from_parts(parts, body::from_incoming(incoming)),
-                None,
-            )
+        match (wants_body, prebuffered) {
+            (false, _) => (req, None),
+            (true, Some(bytes)) => (req, Some(bytes)),
+            (true, None) => {
+                let (parts, body) = req.into_parts();
+                let bytes = collect_body(body).await?;
+                (
+                    Request::from_parts(parts, body::full(bytes.clone())),
+                    Some(bytes),
+                )
+            }
         }
     };
 

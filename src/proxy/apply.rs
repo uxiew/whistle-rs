@@ -56,9 +56,11 @@ pub fn build_req_info(
         headers: hdrs,
         client_ip,
         // Set by the caller when it knows them: the client's port comes from the
-        // accepted socket, the response head only exists later.
+        // accepted socket, the response head only exists later, and the body is
+        // buffered only when a `b:` filter has asked for it.
         client_port: None,
         res: None,
+        req_body: None,
     }
 }
 
