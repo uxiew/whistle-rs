@@ -105,14 +105,31 @@ pub fn resolve(rules: &[Rule], req: &ReqInfo) -> Resolved {
 }
 
 /// Like [`resolve`] but takes borrowed rule references (for cross-group resolution).
+///
+/// Treats the request as client-originated; see [`resolve_refs_scoped`] when the
+/// origin is known.
 pub fn resolve_refs(rules: &[&Rule], req: &ReqInfo) -> Resolved {
+    resolve_refs_scoped(rules, req, false)
+}
+
+/// Like [`resolve_refs`], but aware of whether whistle itself issued the request,
+/// so the `internal` / `internalOnly` line properties can gate an entire rule
+/// line out of consideration.
+///
+/// This is the one line property that affects *matching* rather than the effect
+/// of an operator. Ported from `checkInternal`
+/// (`_original/lib/rules/rules.js:910`), which — unlike what the upstream docs
+/// suggest — is evaluated in the main scan loop for every protocol, not just the
+/// proxy family.
+pub fn resolve_refs_scoped(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> Resolved {
     let mut resolved = Resolved::default();
 
     // Two passes so important rules win: first important, then normal. Within a
-    // pass we keep first-match order.
+    // pass we keep first-match order. `is_important` folds `lineProps://important`
+    // in with this port's `$`-prefix shorthand.
     for pass_important in [true, false] {
-        for rule in rules.iter().filter(|r| r.important == pass_important) {
-            if !matches(rule, req) {
+        for rule in rules.iter().filter(|r| r.is_important() == pass_important) {
+            if !rule.props.allows_scope(is_internal_req) || !matches(rule, req) {
                 continue;
             }
             for op in &rule.ops {
