@@ -117,15 +117,16 @@ fn replace_ci(haystack: &str, needle: &str, repl: &str) -> String {
     out
 }
 
-/// Merge additional rules referenced by `rule://name` (from the values store) and
-/// `rulesFile://path` (from disk): resolve them against `info` and fill in any
-/// operators not already set.
 /// Merge an ad-hoc rules text (e.g. produced by a plugin) into the resolved set.
 /// Existing single-match operators win; multi-match operators accumulate.
-pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str) {
+///
+/// `is_internal_req` carries the request's origin through, so an
+/// `internal`/`internalOnly` line inside injected rules is scoped exactly as it
+/// would be at top level.
+pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str, is_internal_req: bool) {
     let mut mgr = RuleManager::new();
     mgr.set_text(text);
-    let sub = mgr.resolve(info);
+    let sub = mgr.resolve_scoped(info, is_internal_req);
     for (k, v) in sub.single {
         resolved.single.entry(k).or_insert(v);
     }
@@ -154,10 +155,13 @@ pub fn plugin_names(resolved: &Resolved) -> Vec<(String, String)> {
     out
 }
 
+/// Merge the rules pulled in by `rule://<name>` (from the values store) and
+/// `rulesFile://<path>` (from disk), resolved in the request's own scope.
 pub fn merge_included_rules(
     resolved: &mut Resolved,
     info: &ReqInfo,
     values: &HashMap<String, String>,
+    is_internal_req: bool,
 ) {
     let mut texts: Vec<String> = Vec::new();
     if let Some(name) = resolved.value("rule") {
@@ -173,7 +177,7 @@ pub fn merge_included_rules(
     for text in texts {
         let mut mgr = RuleManager::new();
         mgr.set_text(&text);
-        let sub = mgr.resolve(info);
+        let sub = mgr.resolve_scoped(info, is_internal_req);
         for (k, v) in sub.single {
             resolved.single.entry(k).or_insert(v);
         }
