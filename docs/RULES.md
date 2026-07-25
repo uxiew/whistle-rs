@@ -268,7 +268,7 @@ example.com/app.js     file:///Users/me/dev/app.js
 | `ua` | user-agent string | Set the `User-Agent` header |
 | `referer` | URL | Set the `Referer` header |
 | `method` | HTTP method | Override the request method |
-| `reqType` | MIME type | Set the request `Content-Type` |
+| `reqType` | MIME type or short name | Set the request `Content-Type` (`reqType://json`, `reqType://form`, …) |
 | `reqCharset` | charset | Set the charset on the request `Content-Type` |
 | `reqCors` | origin | Set the request `Origin` header |
 | `auth` | `user:pass` | Add an HTTP Basic `Authorization` header |
@@ -359,10 +359,10 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | Turn on a behaviour: `abort` (drop the request), `cors` (permissive CORS response) |
-| `disable` | flag(s) | `cache` (`no-store`), `keepAlive` (`Connection: close`) |
+| `enable` | flag(s) | `abort` (drop the request), `cors` (as `resCors://enable`), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
+| `disable` | flag(s) | `cache` (`no-cache`), `csp`, `cookies`, `doctype` (no doctype before an HTML prepend), `keepAlive` (`Connection: close`) |
 | `trailers` | `name=value` / `{json}` | Emit HTTP response trailer headers (forces chunked) |
-| `headerReplace` | `{"<scope>.<name>:<regex>":"<repl>"}` | Regex-rewrite a header value (`req`/`res` scope) |
+| `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
 | `responseFor` | a URL | Prefetch the URL; annotate the request with `x-whistle-response-for-*` |
 | `rule` | value name | Include the named value's rules and apply them too |
 | `rulesFile` | file path | Include rules from a file and apply them too |
@@ -376,7 +376,7 @@ api.example.com     enable://cors
 slow.example.com    enable://abort
 static.example.com  disable://cache
 example.com         trailers://x-checksum=abc123
-example.com         headerReplace://{"resH.set-cookie:Domain=[^;]+":"Domain=example.com"}
+example.com         headerReplace://{"resH.set-cookie:/Domain=[^;]+/":"Domain=example.com"}
 page.example.com    responseFor://http://auth.internal/verify
 example.com         resBody://{mockJson}        # {mockJson} from the values store
 example.com         rulesFile:///etc/whistle/extra.rules
@@ -404,13 +404,13 @@ slow.example.com   resSpeed://20        # ~20 KB/s download
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `replaceStatus` / `statusCode` | status number | Replace the upstream response status |
+| `replaceStatus` / `statusCode` | status number | Replace the upstream response status (401/407 also send the matching auth challenge) |
 | `resHeaders` | `name=value`, `name:value`, or `{json}` | Set/replace response headers (empty value deletes). Accumulates across lines. |
-| `resType` | MIME type | Set the response `Content-Type` |
+| `resType` | MIME type or short name | Set the response `Content-Type` |
 | `resCharset` | charset | Set the charset on the response `Content-Type` |
-| `resCors` | origin or `*` | Set `Access-Control-Allow-Origin` |
-| `attachment` | filename | Force download via `Content-Disposition: attachment` |
-| `cache` | `no`/`no-store`/seconds/`keep` | Set `Cache-Control` (`keep` leaves it) |
+| `resCors` | origin, `*`, `enable`, `{json}` or `k=v&…` | Negotiate the CORS response headers |
+| `attachment` | filename (optional) | Force download via `Content-Disposition: attachment` |
+| `cache` | `no`/`no-cache`/`no-store`/seconds/`keep` | Set `Cache-Control`, `Expires` and `Pragma` |
 | `resWrite` | file path | Append the response body to a file |
 
 ```
@@ -421,18 +421,58 @@ example.com/404    replaceStatus://200
 example.com        cache://no
 ```
 
+**`resType` / `reqType`** take a short name as well as a full MIME type:
+`resType://json` sets `application/json`, `reqType://form` sets
+`application/x-www-form-urlencoded`, and an unknown name falls back to
+`application/octet-stream`. A value with no `;` keeps the parameters already on
+the header, so `resType://json` on a `text/html; charset=gbk` response yields
+`application/json; charset=gbk`.
+
+**`cache`** accepts only a leading integer (`cache://600`, and `cache://60s` is
+60 seconds — `parseInt` semantics) or `no`/`no-cache`/`no-store`; `keep` and
+`reserve` leave the upstream headers alone, and **any other value is ignored**,
+matching upstream. Whatever it sets, it also writes `Expires` and `Pragma`.
+
+**`resCors`** mirrors whistle's negotiation rather than blanket-allowing:
+
+| Value | Effect |
+|-------|--------|
+| `*` | `Access-Control-Allow-Origin: *`, no credentials |
+| a URL | that URL's origin, plus `Access-Control-Allow-Credentials: true` |
+| `enable` / `credentials` / `use-credentials` | echo the request's own `Origin`, with credentials |
+| `{"methods":…,"headers":…,"credentials":…,"maxAge":…}` or `methods=…&maxAge=…` | set those headers explicitly |
+
+`headers` becomes `Access-Control-Expose-Headers` on a normal request and
+`Access-Control-Allow-Headers` on a preflight; on a preflight with `*`/`enable`,
+the request's own `Access-Control-Request-Headers` is echoed back. `enable://cors`
+is **not** an upstream flag — whistle-rs keeps it as an alias for
+`resCors://enable`.
+
 ### Deleting
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `delete` | `scope.name` or bare `name` (`\|`/`,`-separated) | Remove headers/cookies/type/charset |
+| `delete` | one or more keys, separated by `\|` or `&` | Remove headers, cookies, body properties, or the type/charset |
 
-Scopes: `reqHeaders`/`resHeaders` (a bare name deletes the header on that side),
-`reqCookies`, `resType`, `resCharset`.
+Keys are matched against a fixed set of spellings; **anything else is silently
+ignored**, exactly as upstream. In particular a bare `delete://server` deletes
+nothing — you need a scope.
+
+| Key | Deletes |
+|-----|---------|
+| `resHeaders.x` / `res.headers.x` / `resH.x` / `res.h.x` | that response header (case-insensitive scope) |
+| `reqHeaders.x` and the same variants | that request header |
+| `headers.x` | the header on both sides (this spelling is case-**sensitive** and must be plural) |
+| `reqCookies.x` / `cookies.x` | that cookie from the request `Cookie` header |
+| `resType` / `res.type`, `reqType` / `req.type` | the media type (a `charset` parameter survives) |
+| `resCharset` / `res.charset`, `reqCharset` / `req.charset` | the charset parameter |
+| `body`, `res.body`, `req.body` | the whole body, including anything an operator injects |
+| `resBody.a.b` / `resB.a.b`, `reqBody.a.b` | that dotted path from a JSON body |
 
 ```
-example.com   delete://server|x-powered-by
+example.com   delete://resHeaders.server|resHeaders.x-powered-by
 example.com   delete://reqCookies.tracking
+example.com   delete://resBody.debug&resBody.internal.token
 ```
 
 ### Cookies
@@ -453,27 +493,90 @@ example.com   resCookies://theme=dark
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `reqBody` / `resBody` | replacement text | Replace the entire body |
-| `reqReplace` / `resReplace` | `from=to` (or `/regex/[i]=to`) | Substitute inside the body |
+| `reqReplace` / `resReplace` | `from=to` pairs, `&`-separated | Substitute inside the body |
 | `reqPrepend` / `resPrepend` | text | Insert at the start of the body |
 | `reqAppend` / `resAppend` | text | Insert at the end of the body |
-| `cssBody`/`cssPrepend`/`cssAppend` | text | Body ops applied only to CSS responses |
-| `htmlBody`/`htmlPrepend`/`htmlAppend` | text | Body ops applied only to HTML responses |
-| `jsBody`/`jsPrepend`/`jsAppend` | text | Body ops applied only to JavaScript responses |
+| `resMerge` | `{json}` | Deep-merge a patch into a JSON response body |
+| `cssBody`/`cssPrepend`/`cssAppend` | CSS, or a URL | CSS to add to a **CSS or HTML** response |
+| `htmlBody`/`htmlPrepend`/`htmlAppend` | markup | Markup to add to an HTML response |
+| `jsBody`/`jsPrepend`/`jsAppend` | JavaScript, or a URL | JS to add to a **JS or HTML** response |
 
 When any body operator applies, whistle-rs buffers that body, transforms it, and
-recomputes `Content-Length` (dropping any `Transfer-Encoding`). Operators apply in
-the order **Body → Replace → Prepend → Append**. Requests/responses without a body
-operator are streamed through untouched. `*Replace` on a non-UTF-8 (binary) body is a
-no-op.
+recomputes `Content-Length` (dropping any `Transfer-Encoding`). Requests and
+responses without a body operator are streamed through untouched.
 
 ```
 api.example.com/echo   reqBody://{"mocked":true}
 example.com/app.js     resBody://console.log('patched')
 example.com            resReplace://http://=https://
-example.com            resReplace:///v\d+/=vX          # regex form
+example.com            resReplace:///v\d+/g=vX         # regex form
 example.com/page       resPrepend://<!-- via whistle-rs -->
-example.com/page       resAppend://<script src="/inject.js"></script>
+example.com/page       jsAppend://https://cdn.test/debug.js
 ```
+
+#### Which typed operator applies to which response
+
+`jsXxx` and `cssXxx` are **not** limited to JS and CSS responses: an HTML
+response accepts all three families, which is what makes `jsAppend://alert(1)`
+on a page work. On markup the value is wrapped before it goes in — JavaScript in
+`<script>…</script>`, CSS in `<style>…</style>` — and a value that is a bare URL
+(`https://…` or `//…`) becomes `<script src="…">` / `<link rel="stylesheet">`
+instead. Line properties on a `jsXxx` rule become attributes of the generated
+`<script>`: `crossorigin`, `anonymous`, `use-credentials`, `defer`, `async`,
+`nomodule`, `module`, `importmap`, `speculationrules`.
+
+```
+example.com/page  jsAppend://https://cdn.test/a.js  lineProps://defer|module
+```
+
+#### Order of operations
+
+Operators do **not** run in the order they are written. Matching whistle's
+pipeline, a response is transformed as:
+
+1. `resMerge` and `delete://resBody.…`
+2. `resReplace`
+3. the injection: `*Body` replaces the body, `*Prepend` goes before it and
+   `*Append` after — with the contributors of each slot in the order `res*`,
+   `css*`, `html*`, `js*`, joined by CRLF
+
+So a substitution never sees prepended or appended text, and a `*Body` discards
+whatever `resMerge`/`resReplace` produced. **The request is the other way round:**
+the injection runs first and `reqReplace` afterwards, so it *does* see the
+injected text.
+
+Two side effects come with an injection into a response, as upstream: the
+`Content-Security-Policy` headers are stripped (so the injected script is not
+blocked) and the response is made uncacheable. `enable://keepCSP` and
+`enable://keepCache` opt out of each; an explicit `cache://` also survives.
+A non-empty prepend into an **HTML** response is additionally preceded by
+`<!DOCTYPE html>`, which `disable://doctype` turns off.
+
+#### `*Replace` details
+
+The value is a list of `pattern=replacement` pairs separated by `&`
+(`resReplace://a=1&b=2` is two substitutions). A pattern spelled exactly
+`/source/flags` — flags drawn from `igmu`, at most four — is a regular
+expression; **anything else is a literal string**, replaced everywhere it
+occurs. The regexp form follows JavaScript, so without the `g` flag only the
+*first* match is replaced. `$&` and `$1`…`$9` work in the replacement, and
+`/.*/ ` or `/.+/` replaces the whole body.
+
+`resReplace` is skipped entirely for a response with no `Content-Type` or an
+image one. `*Replace` on a non-UTF-8 (binary) body is a no-op.
+
+#### `resMerge` details
+
+`resMerge` applies only to a JavaScript, HTML, JSON or `Content-Type`-less
+response. It merges into the **first JSON-looking substring** of the body rather
+than the whole body, so a JSONP payload keeps its callback wrapper:
+
+```
+api.test/jsonp   resMerge://{"ok":true}     # cb({"a":1}) → cb({"a":1,"ok":true})
+```
+
+An HTML (or typeless) body that does not *start* with `{`/`[` is left alone, and
+an empty body is replaced by the patch outright.
 
 > `statusCode` is dual-purpose, matching whistle: when there is no upstream request it
 > mocks the response; combined with a forwarded request it replaces the status.
@@ -489,11 +592,17 @@ For each request whistle-rs walks the rules and builds a resolved set:
 2. **First-match-wins** for single-value protocols (`host`, `redirect`, `ua`, …):
    the first matching rule (respecting importance) sets the value.
 3. **Accumulate** for multi-match protocols — `reqHeaders`, `resHeaders`,
-   `reqCookies`, `resCookies`, `reqCors`, `resCors`, `trailers`, `plugin`, `log` —
-   where every matching value is kept, in top-to-bottom order.
+   `reqCookies`, `resCookies`, `reqCors`, `resCors`, `trailers`, `plugin`, `log`,
+   `delete`, `params`, `urlParams`, `headerReplace`, `enable`, `disable`, `ignore`,
+   `pipe` — where every matching value is kept, in top-to-bottom order.
 
 Within a pass, rules are evaluated in **file order**, so put more specific / higher
 priority rules earlier (or mark them `$`).
+
+> whistle also accumulates the **body** operators (`resBody`, `resPrepend`,
+> `resAppend`, the `html`/`js`/`css` families, `resReplace`, `resMerge`,
+> `reqBody`, `reqPrepend`, `reqAppend`, `urlReplace`); whistle-rs keeps only the
+> first matching line of each. Write one line per body operator.
 
 ---
 
@@ -552,7 +661,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Routing / upstream | `host`, `proxy`, `http-proxy`, `https-proxy`, `internal-proxy`, `internal-http-proxy`, `internal-https-proxy`, `https2http-proxy`, `http2https-proxy`, `socks`, `pac`, and `x`/`xs`-prefixed proxy variants |
 | Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw`, `responseFor` |
 | Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw`, `trailers`, `headerReplace` |
-| Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` |
+| Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` (the JS and CSS families reach HTML responses too, wrapped as markup) |
 | Short-circuit / flags | `redirect`, `location`, `locationHref`, `statusCode` mock, `enable`, `disable` |
 | Local file / template | `file`, `rawfile`, `tpl`, `jsonp`, `dust`, and their `x`/`xs` fallback variants (`xfile`, `xrawfile`, …) |
 | Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
@@ -570,8 +679,8 @@ that source at load time; `${port}` and `${version}` in operator values are subs
 `ruleFile`/`ruleScript`/`rulesScript`/`reqScript`/`reqRules`→`rulesFile`, `P→G`.
 
 Notes: `https2http-proxy`/`http2https-proxy` resolve as HTTP proxies (scheme
-conversion approximated); `enable`/`disable` apply a curated flag set
-(`abort`, `cors`, `cache`, `keepAlive` — others are inert); `pipe` routes to a
+conversion approximated); `enable`/`disable` apply a curated flag set (see the
+[Flags](#flags-includes--values) table — others are inert); `pipe` routes to a
 registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
 extra rules from the values store / a file; `{name}` in any operator value is
 substituted from the values store. `cipher` honours the portable part of Node's TLS
@@ -644,10 +753,31 @@ whistle's plugin variables (`%name=…`) and its Node-object plugin API are not
 implemented — plugins here are external HTTP servers speaking whistle-rs's own
 protocol (see [`PLUGINS.md`](PLUGINS.md)). Template variables and `lineProps`
 *are* implemented; see [`TEMPLATES.md`](TEMPLATES.md) and
-[`LINE_PROPS.md`](LINE_PROPS.md) for exactly how far. `resCors`/`enable://cors` set a
-permissive `Access-Control-Allow-Origin` (not the full negotiated CORS set).
+[`LINE_PROPS.md`](LINE_PROPS.md) for exactly how far.
 Patterns/operators outside the documented forms may parse but not behave exactly as
 in upstream whistle.
+
+Known gaps in the operator layer, deliberately left:
+
+- **Body operators are first-match-wins here, accumulating upstream.** whistle
+  lists `resBody`, `resPrepend`, `resAppend`, the `html`/`js`/`css` families,
+  `resReplace`, `resMerge`, `reqBody`, `reqPrepend`, `reqAppend` and `urlReplace`
+  among its multi-match protocols, so several matching lines all contribute
+  (CRLF-joined for the injecting ones, applied in turn for `resReplace`, deep-merged
+  for `resMerge`). whistle-rs keeps only the first matching line of each.
+- **`attachment://` with no value** cannot derive a filename from the request URL
+  yet — it emits a bare `Content-Disposition: attachment` where upstream would say
+  `filename="report.csv"`. Give the name explicitly to be sure.
+- **`resCors` cannot echo the request's `Origin` or recognise a preflight** on the
+  live path for the same reason; the explicit forms (`*`, a URL, `methods=…`) work.
+- **Injected text is UTF-8.** whistle re-encodes it into the response's declared
+  charset; a `charset=gbk` page will see mojibake in the injected fragment.
+- **`params://` on a request body** is treated as query parameters only. whistle
+  also merges them into a form, multipart or JSON request body.
+- **`delete://resCookies.x`** does not emit the expiring `Set-Cookie` upstream
+  writes, and `delete://trailer.x` is not applied.
+- **`headerReplace`'s `$$`-prefixed URL-encoding form** and its quirk of letting an
+  unprefixed key inherit the previous key's scope are not ported.
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.
