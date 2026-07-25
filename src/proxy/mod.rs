@@ -713,12 +713,11 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
         };
         stream.set_nodelay(true).ok();
         let state = state.clone();
-        let peer_ip = peer.ip();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let service = service_fn(move |req| {
                 let state = state.clone();
-                async move { top_level(state, req, peer_ip).await }
+                async move { top_level(state, req, peer).await }
             });
             if let Err(err) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -735,21 +734,24 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
 async fn top_level(
     state: Arc<AppState>,
     req: Request<Incoming>,
-    peer: IpAddr,
+    peer: SocketAddr,
 ) -> Result<Response<DynBody>, Infallible> {
-    let client_ip = Some(peer.to_string());
     if req.method() == hyper::Method::CONNECT {
         return Ok(handle_connect(state, req, peer));
     }
     // Absolute-form URI => proxied request. Origin-form => a direct hit on us.
     if req.uri().authority().is_some() {
-        return Ok(guard(serve(state, req, Origin::Forward, client_ip).await));
+        return Ok(guard(serve(state, req, Origin::Forward, peer).await));
     }
     Ok(webui::handle(&state, req).await)
 }
 
 /// Handle a CONNECT: acknowledge, then intercept the tunnel with MITM.
-fn handle_connect(state: Arc<AppState>, req: Request<Incoming>, peer: IpAddr) -> Response<DynBody> {
+fn handle_connect(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    peer: SocketAddr,
+) -> Response<DynBody> {
     let Some((host, port)) = authority_host_port(req.uri()) else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -784,7 +786,7 @@ pub(crate) async fn serve_tunnel<S>(
     stream: S,
     host: String,
     port: u16,
-    peer: IpAddr,
+    peer: SocketAddr,
     tls: bool,
 ) -> Result<()>
 where
@@ -811,7 +813,7 @@ async fn serve_intercepted_h2<I>(
     io: I,
     host: String,
     port: u16,
-    peer: IpAddr,
+    peer: SocketAddr,
 ) -> Result<()>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -823,8 +825,7 @@ where
             port,
             tls: true,
         };
-        let client_ip = Some(peer.to_string());
-        async move { Ok::<_, Infallible>(guard(serve(state, req, origin, client_ip).await)) }
+        async move { Ok::<_, Infallible>(guard(serve(state, req, origin, peer).await)) }
     });
 
     hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -839,7 +840,7 @@ async fn serve_intercepted<I>(
     io: I,
     host: String,
     port: u16,
-    peer: IpAddr,
+    peer: SocketAddr,
     tls: bool,
 ) -> Result<()>
 where
@@ -852,8 +853,7 @@ where
             port,
             tls,
         };
-        let client_ip = Some(peer.to_string());
-        async move { Ok::<_, Infallible>(guard(serve(state, req, origin, client_ip).await)) }
+        async move { Ok::<_, Infallible>(guard(serve(state, req, origin, peer).await)) }
     });
 
     hyper::server::conn::http1::Builder::new()
@@ -861,6 +861,66 @@ where
         .with_upgrades()
         .await?;
     Ok(())
+}
+
+/// Resolve the rules a second time, now that the response head is in, and fold
+/// the result into `resolved`.
+///
+/// This is whistle's response phase (`pluginMgr.getResRules` →
+/// `rulesMgr.resolveResRules`, `_original/lib/plugins/index.js:1322-1336`),
+/// which runs for **every** response — from the origin or from a rule that
+/// answered locally — before any response operator or plugin hook has touched
+/// it. Same here: `res` is built from the head exactly as it arrived.
+///
+/// Costs nothing when no rule mentions the response: the manager answers that
+/// from a list of candidate lines its groups precompute, and this returns
+/// without walking a single rule.
+///
+/// Locking: takes the two `std::sync` read locks one after the other, never
+/// nested and never across an `.await` — there is none here, which is what lets
+/// this be called from `serve`'s future.
+fn resolve_response_phase(
+    state: &AppState,
+    info: &mut ReqInfo,
+    resolved: &mut Resolved,
+    res: crate::rules::ResInfo,
+    is_internal_req: bool,
+) {
+    info.res = Some(res);
+    let extra = {
+        let rules = state.rules.read().unwrap();
+        rules.resolve_response(info, is_internal_req)
+    };
+    let Some(mut extra) = extra else {
+        return;
+    };
+    tracing::debug!(
+        "{} {} -> re-resolving rules for status {}",
+        info.method,
+        info.full_url,
+        info.res.as_ref().map(|r| r.status).unwrap_or_default()
+    );
+    {
+        let values = state.values.read().unwrap();
+        apply::substitute_values(&mut extra, &values);
+    }
+    apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
+    resolved.merge_response_phase(extra);
+}
+
+/// The address the request actually went to, when it is known exactly.
+///
+/// `host://10.0.0.1` and an IP-literal origin give it directly. A named origin
+/// does not: this port hands the name to `TcpStream::connect` and never sees
+/// which address that picked, and asking the resolver again could answer with a
+/// different one. `serverIp:` then stays unanswerable and fails closed, rather
+/// than matching on a guess.
+fn known_server_ip(target: &upstream::Target) -> Option<String> {
+    target
+        .connect_host
+        .parse::<IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
 }
 
 /// Turn an internal error into a 502 so the service signature stays infallible.
@@ -884,8 +944,9 @@ async fn serve(
     state: Arc<AppState>,
     mut req: Request<Incoming>,
     origin: Origin,
-    client_ip: Option<String>,
+    peer: SocketAddr,
 ) -> Result<Response<DynBody>> {
+    let client_ip = Some(peer.ip().to_string());
     // Consumed before anything else looks at the headers, exactly like whistle
     // deletes its own marker on arrival: rule filters, plugins, the capture and
     // the origin server must never see it.
@@ -925,7 +986,7 @@ async fn serve(
         }
     };
 
-    let info = apply::build_req_info(
+    let mut info = apply::build_req_info(
         req.method().as_str(),
         &scheme,
         &host,
@@ -934,6 +995,8 @@ async fn serve(
         req.headers(),
         client_ip.clone(),
     );
+    // The accepted socket's port, for `clientPort:` / `remotePort:` filters.
+    info.client_port = Some(peer.port());
     let mut resolved = state
         .rules
         .read()
@@ -1068,8 +1131,16 @@ async fn serve(
         // Response-side operators apply to a mocked response too: upstream runs
         // its response inspectors over `file`/`tpl`/`redirect` responses just as
         // it does over real ones, so `resHeaders://` and friends must land here
-        // as well.
+        // as well — and so must the response-phase rules, which is why a
+        // `statusCode://404` this port answered can be filtered on with `s:404`.
         let (mut parts, body) = resp.into_parts();
+        resolve_response_phase(
+            &state,
+            &mut info,
+            &mut resolved,
+            apply::build_res_info(parts.status.as_u16(), &parts.headers, None, None),
+            is_internal_req,
+        );
         apply::apply_response_for(&mut parts, &resolved, Some(&info));
         let resp = Response::from_parts(parts, body);
         state.record(Session {
@@ -1254,12 +1325,31 @@ async fn serve(
 
     let upstream_resp = upstream::forward(&target, out_req).await?;
 
+    let (mut parts, body) = upstream_resp.into_parts();
+
+    // Response phase: rules whose filters ask about the response are resolved
+    // here, against the head as the origin sent it — before `resDelay://` (so a
+    // delay can be conditioned on the status), before any response operator, and
+    // before the plugin response hooks, which is upstream's order too
+    // (`_original/lib/inspectors/res.js:823-826`).
+    resolve_response_phase(
+        &state,
+        &mut info,
+        &mut resolved,
+        apply::build_res_info(
+            parts.status.as_u16(),
+            &parts.headers,
+            known_server_ip(&target),
+            Some(target.connect_port),
+        ),
+        is_internal_req,
+    );
+
     if let Some(ms) = apply::res_delay_ms(&resolved) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
     // Apply response-side rules.
-    let (mut parts, body) = upstream_resp.into_parts();
     apply::apply_response_for(&mut parts, &resolved, Some(&info));
 
     // Response hook, part 1: plugins that did *not* ask for the response body

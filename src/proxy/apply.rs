@@ -55,6 +55,37 @@ pub fn build_req_info(
         full_url,
         headers: hdrs,
         client_ip,
+        // Set by the caller when it knows them: the client's port comes from the
+        // accepted socket, the response head only exists later.
+        client_port: None,
+        res: None,
+    }
+}
+
+/// The response facts the second resolution pass needs.
+///
+/// Read from the response head exactly as it arrived, before any operator or
+/// plugin has touched it — upstream stamps `req.statusCode` / `req.resHeaders`
+/// from the raw upstream response too (`_original/lib/inspectors/res.js:802-806`).
+pub fn build_res_info(
+    status: u16,
+    headers: &HeaderMap,
+    server_ip: Option<String>,
+    server_port: Option<u16>,
+) -> crate::rules::ResInfo {
+    crate::rules::ResInfo {
+        status,
+        headers: headers
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_ascii_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect(),
+        server_ip,
+        server_port,
     }
 }
 
@@ -127,12 +158,27 @@ fn replace_ci(haystack: &str, needle: &str, repl: &str) -> String {
 pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str, is_internal_req: bool) {
     let mut mgr = RuleManager::new();
     mgr.set_text(text);
-    let sub = mgr.resolve_scoped(info, is_internal_req);
-    for (k, v) in sub.single {
+    merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
+}
+
+/// Fold a resolution of *another* rules text into `resolved`: existing
+/// single-match operators win, multi-match operators accumulate at the end.
+///
+/// The merged operators are stamped with the last possible [`RuleOp::order`], so
+/// the response phase — which inserts by that key — still slots its own
+/// operators in front of them, where the operators of the rules file they were
+/// merged into already are.
+fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
+    for (k, mut v) in sub.single {
+        v.order = u64::MAX;
         resolved.single.entry(k).or_insert(v);
     }
-    for (k, mut vs) in sub.multi {
-        resolved.multi.entry(k).or_default().append(&mut vs);
+    for (k, vs) in sub.multi {
+        let list = resolved.multi.entry(k).or_default();
+        list.extend(vs.into_iter().map(|mut op| {
+            op.order = u64::MAX;
+            op
+        }));
     }
 }
 
@@ -158,13 +204,7 @@ pub fn merge_included_rules(
     for text in texts {
         let mut mgr = RuleManager::new();
         mgr.set_text(&text);
-        let sub = mgr.resolve_scoped(info, is_internal_req);
-        for (k, v) in sub.single {
-            resolved.single.entry(k).or_insert(v);
-        }
-        for (k, mut vs) in sub.multi {
-            resolved.multi.entry(k).or_default().append(&mut vs);
-        }
+        merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
     }
 }
 
