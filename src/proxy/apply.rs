@@ -353,11 +353,15 @@ fn cipher_is_12(s: &str) -> bool {
     s.contains("1.2") || s.contains("1_2") || s.contains("1.1") || s.contains("1_1")
 }
 
-/// Collect flag names from `enable`/`disable` operators (split on `,`/`|`/space).
+/// Collect flag names from `enable`/`disable` operators.
+///
+/// The separators are `|` and `&` — upstream's `parseProps`
+/// (`_original/lib/util/common.js:72,98`) recognises no others, so a
+/// comma-separated list is one long flag name in both implementations.
 fn flag_set(resolved: &Resolved, protocol: &str) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for v in collect_values(resolved, protocol) {
-        for f in v.split([',', '|', ' ']) {
+        for f in v.split(['|', '&']) {
             let f = f.trim();
             if !f.is_empty() {
                 set.insert(f.to_string());
@@ -375,6 +379,13 @@ pub fn enabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> {
 /// `disable://` flags for a request.
 pub fn disabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> {
     flag_set(resolved, "disable")
+}
+
+/// `disable://<flag>` — with the escape hatch upstream gives it: an
+/// `enable://<flag>` on the same request wins (`isDisable`,
+/// `_original/lib/util/index.js:681-683`).
+fn is_disabled(resolved: &Resolved, flag: &str) -> bool {
+    disabled_flags(resolved).contains(flag) && !enabled_flags(resolved).contains(flag)
 }
 
 /// True if the request should be aborted (`enable://abort`/`abortReq`/`abortRes`).
@@ -898,7 +909,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
         }
     }
     if let Some(ct) = resolved.value("reqType") {
-        set_header(&mut parts.headers, "content-type", ct);
+        set_content_type(&mut parts.headers, ct, req_type_alias);
     }
     if let Some(auth) = resolved.value("auth") {
         // `auth://user:pass` → HTTP Basic Authorization header.
@@ -913,41 +924,125 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(xff) = resolved.value("forwardedFor") {
         set_header(&mut parts.headers, "x-forwarded-for", xff);
     }
-    if let Some(cs) = resolved.value("reqCharset") {
-        set_charset(&mut parts.headers, cs);
-    }
     if let Some(origin) = resolved.value("reqCors") {
         if !origin.is_empty() {
             set_header(&mut parts.headers, "origin", origin);
         }
     }
     apply_req_cookies(&mut parts.headers, resolved);
-    apply_deletes(&mut parts.headers, resolved, true);
+    let del = Deletions::of(resolved, true);
+    // `reqCharset` and the type/charset deletions are one operation upstream
+    // (`setCharset`, `_original/lib/inspectors/req.js:115`).
+    set_charset(
+        &mut parts.headers,
+        resolved.value("reqCharset"),
+        del.drop_type,
+        del.drop_charset,
+    );
+    apply_deletes(&mut parts.headers, &del);
     apply_header_replace(&mut parts.headers, resolved, true);
 }
 
-/// Apply `delete://` keys for one side. Keys are `scope.name` (or a bare header
-/// name); values may list several keys separated by `|`, `,`, or whitespace.
-/// Ported from `parseDelProps` / `parseDelReqBody` in the original util.
-fn apply_deletes(headers: &mut HeaderMap, resolved: &Resolved, request_side: bool) {
-    for value in collect_values(resolved, "delete") {
-        for key in value.split(['|', ',', ' ', '\t']) {
-            let key = key.trim();
-            if key.is_empty() {
-                continue;
-            }
-            let (scope, name) = key.split_once('.').unwrap_or(("header", key));
-            match (request_side, scope) {
-                (true, "reqHeaders") | (true, "header") => remove_header(headers, name),
-                (false, "resHeaders") | (false, "header") => remove_header(headers, name),
-                (true, "reqCookies") => remove_cookie(headers, name),
-                (false, "resType") => {
-                    headers.remove(hyper::header::CONTENT_TYPE);
+/// The `delete://` keys that apply to one side, already classified.
+///
+/// whistle does not take a bare name: every key is matched against a fixed set
+/// of anchored patterns (`_original/lib/util/index.js:2661-2669`) and anything
+/// unrecognised is silently ignored. `delete://server` therefore deletes
+/// nothing at all — the header spellings are `resHeaders.server`,
+/// `res.headers.server`, `resH.server` (case-insensitive) or the side-agnostic
+/// `headers.server` (case-**sensitive**, and only in the plural).
+#[derive(Default)]
+struct Deletions {
+    /// Header names to remove from this side.
+    headers: Vec<String>,
+    /// Cookie names to remove (request side only).
+    cookies: Vec<String>,
+    /// `delete://resType` — drop the media type, keeping any charset.
+    drop_type: bool,
+    /// `delete://resCharset` — drop the charset, keeping the media type.
+    drop_charset: bool,
+    /// `delete://body` / `delete://res.body` — empty the body outright, which
+    /// also discards anything an operator meant to inject (`removeBody`,
+    /// `_original/lib/util/index.js:3592-3598`).
+    drop_body: bool,
+    /// `delete://resBody.a.b` — dotted paths to remove from a JSON body.
+    body_props: Vec<String>,
+}
+
+impl Deletions {
+    /// True when a `delete://` key on its own needs the body buffered.
+    fn touches_body(&self) -> bool {
+        self.drop_body || !self.body_props.is_empty()
+    }
+}
+
+impl Deletions {
+    /// Classify every `delete://` key for one side.
+    fn of(resolved: &Resolved, request_side: bool) -> Deletions {
+        let mut del = Deletions::default();
+        let side = if request_side { "req" } else { "res" };
+        for value in collect_values(resolved, "delete") {
+            // `parseProps` splits on `|` and `&` only (`common.js:72,98`).
+            for key in value.split(['|', '&']) {
+                let key = key.trim();
+                if key.is_empty() {
+                    continue;
                 }
-                (false, "resCharset") => strip_charset(headers),
-                _ => {}
+                if let Some(name) = strip_del_scope(key, side, "H", "eaders") {
+                    del.headers.push(name.to_string());
+                } else if let Some(name) = key.strip_prefix("headers.") {
+                    del.headers.push(name.to_string());
+                } else if let Some(name) = strip_del_scope(key, side, "C", "ookies")
+                    .or_else(|| strip_del_scope(key, "", "C", "ookies"))
+                {
+                    // `cookies.x` with no side is honoured on both
+                    // (`COOKIE_RE`, `_original/lib/util/index.js:2669`).
+                    if request_side {
+                        del.cookies.push(name.to_string());
+                    }
+                } else if let Some(path) = strip_del_scope(key, side, "B", "ody") {
+                    del.body_props.push(path.to_string());
+                } else if key == format!("{side}Type") || key == format!("{side}.type") {
+                    del.drop_type = true;
+                } else if key == format!("{side}Charset") || key == format!("{side}.charset") {
+                    del.drop_charset = true;
+                } else if key == "body" || key == format!("{side}.body") {
+                    del.drop_body = true;
+                }
             }
         }
+        del
+    }
+}
+
+/// Match one of whistle's `^<side>\.?<initial>(?:<rest>s?)?\.(.+)$` delete keys
+/// (case-insensitive), returning the trailing name.
+///
+/// One regex covers `resHeaders.x`, `res.headers.x`, `resHeader.x`, `resH.x` and
+/// `res.h.x`; the same shape with `C`/`ookies` covers the cookie spellings.
+fn strip_del_scope<'a>(key: &'a str, side: &str, initial: &str, rest: &str) -> Option<&'a str> {
+    let tail = key.get(..side.len()).filter(|p| p.eq_ignore_ascii_case(side))?;
+    let mut tail = &key[tail.len()..];
+    tail = tail.strip_prefix('.').unwrap_or(tail);
+    let after_initial = tail.get(..initial.len()).filter(|c| c.eq_ignore_ascii_case(initial))?;
+    tail = &tail[after_initial.len()..];
+    // The word may be spelled out in full, with an optional plural `s`.
+    for word in [rest, &rest[..rest.len() - 1]] {
+        if let Some(t) = tail.get(..word.len()).filter(|w| w.eq_ignore_ascii_case(word)) {
+            tail = &tail[t.len()..];
+            break;
+        }
+    }
+    tail.strip_prefix('.').filter(|name| !name.is_empty())
+}
+
+/// Apply the header and cookie deletions for one side.
+fn apply_deletes(headers: &mut HeaderMap, del: &Deletions) {
+    for name in &del.headers {
+        remove_header(headers, name);
+    }
+    for name in &del.cookies {
+        remove_cookie(headers, name);
     }
 }
 
@@ -957,11 +1052,19 @@ fn remove_header(headers: &mut HeaderMap, name: &str) {
     }
 }
 
-/// Apply `headerReplace://` operators for one side. Value is a JSON object
-/// `{"<scope>.<name>:<pattern>": "<replacement>"}` where scope is `req`/`reqH`/
-/// `reqHeaders` (request) or `res`/`resH`/`resHeaders` (response); the pattern is
-/// a regex applied to that header's value. Ported from `parseHeaderReplace`.
+/// Apply `headerReplace://` operators for one side.
+///
+/// The value is a JSON object keyed `"<scope>.<name>:<pattern>"`, where the
+/// scope is exactly `req.`/`reqH.` or `res.`/`resH.` — upstream tests those four
+/// prefixes literally (`parseHeaderReplace`,
+/// `_original/lib/util/index.js:2219-2223`), so `reqHeaders.` is not one of
+/// them. The pattern follows the same rule as the body operators: `/…/flags` is
+/// a regular expression, anything else is a literal.
 fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, request_side: bool) {
+    let scopes: [&str; 2] = match request_side {
+        true => ["req.", "reqH."],
+        false => ["res.", "resH."],
+    };
     for value in collect_values(resolved, "headerReplace") {
         let value = value.trim();
         let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
@@ -970,36 +1073,30 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, request_si
         };
         for (key, repl) in map {
             let repl = repl.as_str().unwrap_or("");
-            let Some((scope, rest)) = key.split_once('.') else {
-                continue;
-            };
-            let (name, pattern) = rest.split_once(':').unwrap_or((rest, ""));
-            let is_req = matches!(scope, "req" | "reqH" | "reqHeaders");
-            let is_res = matches!(scope, "res" | "resH" | "resHeaders");
-            if (request_side && !is_req) || (!request_side && !is_res) {
+            if !scopes.iter().any(|s| key.starts_with(s)) {
                 continue;
             }
-            let name = name.trim();
+            // A key with no `:` has no pattern and is dropped: upstream slices
+            // the name up to `indexOf(':')`, which is then empty.
+            let Some(colon) = key.find(':') else {
+                continue;
+            };
+            let dot = key.find('.').map(|i| i + 1).unwrap_or(0);
+            let name = key[dot..colon].trim();
+            if name.is_empty() {
+                continue;
+            }
+            let pattern = &key[colon + 1..];
+            // An absent or empty header is left alone (`handleHeaderReplace`).
             if let Some(cur) = headers
                 .get(name)
                 .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
             {
-                let new = regex_replace(&cur, pattern, repl);
-                set_header(headers, name, &new);
+                set_header(headers, name, &replace_once_or_all(&cur, pattern, repl));
             }
         }
-    }
-}
-
-/// Regex `replace_all` (falls back to literal replace if the pattern is invalid).
-fn regex_replace(text: &str, pattern: &str, repl: &str) -> String {
-    if pattern.is_empty() {
-        return text.to_string();
-    }
-    match regex::Regex::new(pattern) {
-        Ok(re) => re.replace_all(text, repl).into_owned(),
-        Err(_) => text.replace(pattern, repl),
     }
 }
 
@@ -1023,30 +1120,119 @@ fn remove_cookie(headers: &mut HeaderMap, name: &str) {
     }
 }
 
-/// Set the charset parameter on the `Content-Type` header (whistle's setCharset).
-fn set_charset(headers: &mut HeaderMap, charset: &str) {
-    let base = headers
+/// `reqCharset`/`resCharset` and the `delete://…Type`/`…Charset` keys, which
+/// upstream resolves in one pass over `Content-Type`
+/// (`setCharset`, `_original/lib/util/index.js:3923-3944`).
+///
+/// The header is split on `;`, the media type is slot 0 and the charset slot 1;
+/// dropping the type empties slot 0 rather than removing the header, so
+/// `delete://resType` alone leaves a bare `; charset=utf-8` behind. Only when
+/// *everything* is empty is the header removed. Faithfully odd.
+fn set_charset(
+    headers: &mut HeaderMap,
+    charset: Option<&str>,
+    drop_type: bool,
+    drop_charset: bool,
+) {
+    if charset.is_none() && !drop_type && !drop_charset {
+        return;
+    }
+    let current = headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(';').next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "text/plain".to_string());
-    if let Ok(v) = HeaderValue::from_str(&format!("{base}; charset={charset}")) {
+        .unwrap_or("")
+        .trim();
+    let mut parts: Vec<String> = match current.is_empty() {
+        true => vec![String::new()],
+        false => current.split(';').map(|p| p.trim().to_string()).collect(),
+    };
+    if drop_type {
+        parts[0] = String::new();
+    }
+    if drop_charset {
+        parts.truncate(1);
+    } else if let Some(charset) = charset {
+        let value = format!("charset={charset}");
+        match parts.len() {
+            1 => parts.push(value),
+            _ => parts[1] = value,
+        }
+    }
+    let joined = parts.join("; ");
+    if joined.trim_matches(|c| c == ';' || c == ' ').is_empty() {
+        headers.remove(hyper::header::CONTENT_TYPE);
+        return;
+    }
+    if let Ok(v) = HeaderValue::from_str(&joined) {
         headers.insert(hyper::header::CONTENT_TYPE, v);
     }
 }
 
-/// Drop the charset parameter from `Content-Type` (delete://resCharset).
-fn strip_charset(headers: &mut HeaderMap) {
-    if let Some(base) = headers
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(';').next().unwrap_or("").trim().to_string())
-    {
-        if let Ok(v) = HeaderValue::from_str(&base) {
-            headers.insert(hyper::header::CONTENT_TYPE, v);
+/// Media types whistle recognises by short name, beyond what a file extension
+/// lookup gives (`REQ_TYPE`, `_original/lib/inspectors/req.js:31-40`).
+fn req_type_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "urlencoded" | "form" => "application/x-www-form-urlencoded",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "text" => "text/plain",
+        "upload" | "multipart" => "multipart/form-data",
+        "defaultType" => "application/octet-stream",
+        _ => return None,
+    })
+}
+
+/// `resType`/`reqType` — set the media type, keeping the existing parameters.
+///
+/// A value with no `/` is a short name to look up (`resType://json` →
+/// `application/json`), and a value with no `;` inherits whatever parameters
+/// the current header carries, so `resType://json` on a
+/// `text/html; charset=gbk` response yields `application/json;charset=gbk`
+/// (`getNewType`, `_original/lib/util/index.js:3946-3956`).
+fn set_content_type(headers: &mut HeaderMap, value: &str, alias: fn(&str) -> Option<&'static str>) {
+    let mut parts: Vec<String> = value.split(';').map(str::to_string).collect();
+    let name = parts[0].clone();
+    if !name.is_empty() && !name.contains('/') {
+        parts[0] = lookup_type(&name, alias).to_string();
+    }
+    let mut new_type = parts.join(";");
+    if !new_type.contains(';') {
+        if let Some(current) = headers
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .filter(|c| c.contains(';'))
+        {
+            let mut kept: Vec<String> = current.split(';').map(str::to_string).collect();
+            kept[0] = new_type;
+            new_type = kept.join(";");
         }
     }
+    set_header(headers, "content-type", &new_type);
+}
+
+/// Resolve a short type name (`lookupType`,
+/// `_original/lib/util/index.js:3664-3666`): the side-specific aliases first,
+/// then the same extension table the local-file family uses, then whistle's
+/// `application/octet-stream` default.
+fn lookup_type(name: &str, alias: fn(&str) -> Option<&'static str>) -> &'static str {
+    if name == "sse" {
+        return "text/event-stream";
+    }
+    alias(name)
+        // The extension table carries a `charset` for text types; `mime.lookup`
+        // does not, and a parameter here would block the `getNewType` merge.
+        .or_else(|| content_type_of_ext(&format!("x.{name}")).map(media_type))
+        .unwrap_or("application/octet-stream")
+}
+
+/// The media type of a `type; parameter` string.
+fn media_type(full: &'static str) -> &'static str {
+    full.split(';').next().unwrap_or(full)
+}
+
+/// The response side has no short-name aliases beyond the extension table.
+fn no_type_alias(_: &str) -> Option<&'static str> {
+    None
 }
 
 /// Milliseconds to delay before forwarding the request (`reqDelay`).
@@ -1070,7 +1256,27 @@ pub fn res_speed_kbps(resolved: &Resolved) -> Option<f64> {
 }
 
 /// Apply response-side operators (status replacement, headers) in place.
+///
+/// The `resCors` negotiation and the `attachment` filename fallback both need
+/// the request that produced this response; without it they degrade to what can
+/// be decided from the rule alone. Callers that have the request should use
+/// [`apply_response_for`].
 pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
+    apply_response_for(parts, resolved, None)
+}
+
+/// As [`apply_response`], with the request the response answers.
+///
+/// Operators are applied in whistle's order, which is not the order they are
+/// written on the line (`_original/lib/inspectors/res.js:820-950`): cookies and
+/// CORS go straight onto the upstream headers, then `resHeaders` — with `cache`
+/// and `attachment` folded into it — overwrites them, then `resType`, the
+/// charset pass, `headerReplace`, and finally the `delete://` keys.
+pub fn apply_response_for(
+    parts: &mut response::Parts,
+    resolved: &Resolved,
+    info: Option<&ReqInfo>,
+) {
     if let Some(code) = resolved
         .value("replaceStatus")
         .or_else(|| resolved.value("statusCode"))
@@ -1082,73 +1288,422 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
             .and_then(|c| StatusCode::from_u16(c).ok())
         {
             parts.status = status;
+            handle_status_code(&mut parts.headers, status);
         }
     }
-    apply_header_ops(&mut parts.headers, resolved, "resHeaders");
-    if let Some(ct) = resolved.value("resType") {
-        set_header(&mut parts.headers, "content-type", ct);
-    }
-    if let Some(cors) = resolved.value("resCors") {
-        // Minimal CORS: `*` or an explicit origin.
-        set_header(&mut parts.headers, "access-control-allow-origin", cors);
-    }
-    if let Some(name) = resolved.value("attachment") {
-        // Force a download; `attachment://` with no name still sets the disposition.
-        let disp = if name.is_empty() {
-            "attachment".to_string()
-        } else {
-            format!("attachment; filename=\"{}\"", name.replace('"', ""))
-        };
-        set_header(&mut parts.headers, "content-disposition", &disp);
-    }
-    if let Some(cs) = resolved.value("resCharset") {
-        set_charset(&mut parts.headers, cs);
-    }
-    if let Some(cc) = cache_control(resolved.value("cache")) {
-        set_header(&mut parts.headers, "cache-control", &cc);
-    }
     apply_res_cookies(&mut parts.headers, resolved);
-    apply_deletes(&mut parts.headers, resolved, false);
-    apply_header_replace(&mut parts.headers, resolved, false);
+    apply_res_cors(&mut parts.headers, resolved, info);
 
-    // enable/disable flags with response-side effects.
-    let en = enabled_flags(resolved);
+    apply_header_ops(&mut parts.headers, resolved, "resHeaders");
+    apply_cache(&mut parts.headers, resolved);
+    apply_attachment(&mut parts.headers, resolved, info);
+
+    if let Some(ct) = resolved.value("resType") {
+        set_content_type(&mut parts.headers, ct, no_type_alias);
+    }
+    let del = Deletions::of(resolved, false);
+    set_charset(
+        &mut parts.headers,
+        resolved.value("resCharset"),
+        del.drop_type,
+        del.drop_charset,
+    );
+    apply_header_replace(&mut parts.headers, resolved, false);
+    apply_deletes(&mut parts.headers, &del);
+
+    // Injected content is useless behind a CSP that forbids it, or cached for
+    // the next load; whistle strips both (`res.js:1093-1101`).
+    if injects_into_body(&parts.headers, resolved) {
+        if !enabled_flags(resolved).contains("keepCSP")
+            && !enabled_flags(resolved).contains("keepAllCSP")
+        {
+            disable_csp(&mut parts.headers);
+        }
+        if !custom_cache(resolved) && !enabled_flags(resolved).contains("keepCache") {
+            disable_res_store(&mut parts.headers);
+        }
+    }
+
+    disable_res_props(&mut parts.headers, resolved);
+}
+
+/// `disable://` flags with response-header effects (`disableResProps`,
+/// `_original/lib/util/index.js:3011-3027`), applied last so nothing can undo
+/// them. `keepAlive` is whistle-rs's own addition.
+fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
     let dis = disabled_flags(resolved);
-    if en.contains("cors") {
-        set_header(&mut parts.headers, "access-control-allow-origin", "*");
-        set_header(&mut parts.headers, "access-control-allow-methods", "*");
-        set_header(&mut parts.headers, "access-control-allow-headers", "*");
+    if ["cookie", "cookies", "resCookie", "resCookies"]
+        .iter()
+        .any(|f| dis.contains(*f))
+    {
+        headers.remove(hyper::header::SET_COOKIE);
     }
     if dis.contains("cache") {
-        set_header(&mut parts.headers, "cache-control", "no-store");
+        // `no-cache`, not the `no-store` that the injection pass writes.
+        set_header(headers, "cache-control", "no-cache");
+        set_header(headers, "expires", &http_date(-60_000_000));
+        set_header(headers, "pragma", "no-cache");
+    }
+    if dis.contains("csp") {
+        disable_csp(headers);
     }
     if dis.contains("keepAlive") || dis.contains("keepalive") {
-        set_header(&mut parts.headers, "connection", "close");
+        set_header(headers, "connection", "close");
     }
 }
 
-/// Map a `cache://` value to a `Cache-Control` header. `no`/`no-cache`/negative →
-/// no-cache, `no-store` → no-store, a number → max-age, `reserve`/`keep` → leave
-/// the upstream header untouched. Ported from res.js cache handling.
-fn cache_control(value: Option<&str>) -> Option<String> {
-    let v = value?.trim();
-    if v.is_empty() || v == "reserve" || v == "keep" {
-        return None;
+/// `resCors://…` — the response half of whistle's CORS negotiation
+/// (`setResCors`, `_original/lib/util/index.js:2923-2975`).
+///
+/// The value has four shorthand spellings before it is read as JSON or as a
+/// query string (`readRuleList`, `_original/lib/util/index.js:1346-1356`): a
+/// URL is an explicit origin, `*` is the wildcard, and `enable`/`credentials`/
+/// `use-credentials` turn on echoing the request's own `Origin` with
+/// credentials. `resCors://{"methods":"GET,POST","maxAge":600}` spells out the
+/// rest.
+///
+/// Without `info` the request-dependent half is skipped: the origin cannot be
+/// echoed and a preflight cannot be recognised.
+fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&ReqInfo>) {
+    let mut spec: HashMap<String, String> = HashMap::new();
+    for value in collect_values(resolved, "resCors") {
+        spec.extend(parse_cors(value));
     }
-    let lower = v.to_ascii_lowercase();
-    if lower.contains("no-store") {
-        return Some("no-store".to_string());
+    // whistle has no `enable://cors`; whistle-rs keeps it as an alias for
+    // `resCors://enable` so existing rule files still mean something, rather
+    // than blasting `*` at every header as it used to.
+    if spec.is_empty() && enabled_flags(resolved).contains("cors") {
+        spec.insert("enable".to_string(), "true".to_string());
     }
-    if let Ok(n) = v.parse::<i64>() {
-        if n < 0 {
-            return Some("no-cache".to_string());
+    if spec.is_empty() {
+        return;
+    }
+    let custom_origin = match spec.get("origin").map(String::as_str) {
+        Some("*") => Some("*".to_string()),
+        Some(url) if is_http_url(url) => Some(parse_origin(url)),
+        _ => None,
+    };
+    let is_enable = spec.contains_key("enable");
+    let is_star = spec.get("*").is_some_and(String::is_empty);
+    let is_options = info.is_some_and(|i| i.method.eq_ignore_ascii_case("OPTIONS"));
+
+    if custom_origin.is_some() || is_enable {
+        let origin = custom_origin.or_else(|| req_header(info, "origin").map(str::to_string));
+        if let Some(origin) = origin.filter(|o| !o.is_empty()) {
+            set_header(headers, "access-control-allow-credentials", "true");
+            set_header(headers, "access-control-allow-origin", &origin);
         }
-        return Some(format!("max-age={n}"));
+    } else if is_star {
+        set_header(headers, "access-control-allow-origin", "*");
     }
-    if lower == "no" || lower == "off" || lower == "no-cache" {
-        return Some("no-cache".to_string());
+
+    if let Some(methods) = spec.get("methods") {
+        set_header(headers, "access-control-allow-methods", methods);
     }
-    Some(v.to_string())
+    // On a preflight, `enable`/`*` fill the headers in from the request.
+    let auto = is_options && (is_star || is_enable);
+    if let Some(list) = spec.get("headers") {
+        let op = if is_options { "allow" } else { "expose" };
+        set_header(headers, &format!("access-control-{op}-headers"), list);
+    } else if auto {
+        if let Some(list) = req_header(info, "access-control-request-headers") {
+            set_header(headers, "access-control-allow-headers", list);
+        }
+    }
+    if let Some(credentials) = spec.get("credentials") {
+        set_header(headers, "access-control-allow-credentials", credentials);
+    } else if auto {
+        if let Some(method) = req_header(info, "access-control-request-method") {
+            // Singular, and not a real CORS header — upstream's typo, kept so
+            // both implementations emit the same thing.
+            set_header(headers, "access-control-allow-method", method);
+        }
+    }
+    if let Some(max_age) = spec.get("maxage") {
+        set_header(headers, "access-control-max-age", max_age);
+    }
+}
+
+/// Parse one `resCors` value into whistle's lower-cased option map.
+fn parse_cors(value: &str) -> HashMap<String, String> {
+    let trimmed = value.trim();
+    let one = |k: &str, v: &str| HashMap::from([(k.to_string(), v.to_string())]);
+    if GEN_URL_RE.is_match(trimmed) {
+        return one("origin", trimmed);
+    }
+    if trimmed == "*" {
+        return one("*", "");
+    }
+    if ["enable", "use-credentials", "usecredentials", "credentials"]
+        .contains(&trimmed.to_ascii_lowercase().as_str())
+    {
+        return one("enable", "true");
+    }
+    if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed) {
+        return map
+            .into_iter()
+            .map(|(k, v)| {
+                let v = match v {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                (k.to_ascii_lowercase(), v)
+            })
+            .collect();
+    }
+    // `parseInlineJSON`: a `key=…` value with no whitespace is a query string.
+    let inline = trimmed.split('=').next().unwrap_or("");
+    if trimmed.contains('=') && !inline.is_empty() && !inline.contains(['\\', '/']) && !trimmed.contains(char::is_whitespace)
+    {
+        return trimmed
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.to_string()))
+            .collect();
+    }
+    HashMap::new()
+}
+
+/// One request header, if the request is known. Names in [`ReqInfo`] are
+/// already lower-cased.
+fn req_header<'a>(info: Option<&'a ReqInfo>, name: &str) -> Option<&'a str> {
+    info?
+        .headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// `HTTP_RE`, `_original/lib/util/common.js:57`.
+fn is_http_url(value: &str) -> bool {
+    let rest = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"));
+    rest.is_some_and(|r| !r.starts_with(['/', '?']) && !r.is_empty())
+}
+
+/// Trim a URL down to its origin (`parseOrigin`,
+/// `_original/lib/util/index.js:2884-2896`).
+fn parse_origin(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("//") else {
+        return url.to_string();
+    };
+    match rest.find('/') {
+        Some(i) => format!("{scheme}//{}", &rest[..i]),
+        None => url.to_string(),
+    }
+}
+
+/// `replaceStatus://401`/`407` also advertise the authentication whistle's own
+/// login flow expects (`handleStatusCode`, `_original/lib/util/index.js:398-405`).
+fn handle_status_code(headers: &mut HeaderMap, status: StatusCode) {
+    match status.as_u16() {
+        401 => set_header(headers, "www-authenticate", "Basic realm=User Login"),
+        407 => set_header(headers, "proxy-authenticate", "Basic realm=User Login"),
+        _ => {}
+    }
+}
+
+/// `cache://` — `Cache-Control` plus the `Expires`/`Pragma` pair whistle always
+/// writes with it (`_original/lib/inspectors/res.js:877-897`).
+///
+/// The accepted spellings are narrow: `no`, `no-cache`, `no-store` (any case) or
+/// a leading integer. `cache://reserve`/`keep` mean "leave the upstream headers
+/// alone", and anything else — `cache://off`, say — is silently ignored rather
+/// than passed through as a header value.
+fn apply_cache(headers: &mut HeaderMap, resolved: &Resolved) {
+    let Some(value) = resolved.value("cache").map(str::trim) else {
+        return;
+    };
+    if value == "reserve" || value == "keep" {
+        return;
+    }
+    // `parseInt` reads a leading integer and ignores the rest, so `cache://60s`
+    // is a minute.
+    let max_age = parse_leading_int(value);
+    let lower = value.to_ascii_lowercase();
+    let no_cache = matches!(lower.as_str(), "no" | "no-cache" | "no-store")
+        || max_age.is_some_and(|n| n < 0);
+    if !no_cache && !max_age.is_some_and(|n| n >= 0) {
+        return;
+    }
+    let cache_control = match (no_cache, lower == "no-store") {
+        (true, true) => "no-store".to_string(),
+        (true, false) => "no-cache".to_string(),
+        (false, _) => format!("max-age={}", max_age.unwrap_or(0)),
+    };
+    set_header(headers, "cache-control", &cache_control);
+    set_header(headers, "pragma", if no_cache { "no-cache" } else { "" });
+    let offset = match no_cache {
+        true => -60_000_000,
+        false => max_age.unwrap_or(0).saturating_mul(1000),
+    };
+    set_header(headers, "expires", &http_date(offset));
+}
+
+/// The leading integer of `value`, as JavaScript's `parseInt` reads it.
+fn parse_leading_int(value: &str) -> Option<i64> {
+    let digits = value
+        .strip_prefix(['+', '-'])
+        .unwrap_or(value)
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let end = usize::from(value.starts_with(['+', '-'])) + digits;
+    value.get(..end.min(value.len()))?.parse().ok()
+}
+
+/// `cache://reserve`/`keep` and `enable://keepAllCache` mark the response's
+/// caching as deliberate, which stops the injection pass from overriding it
+/// (`req._customCache`, `_original/lib/inspectors/res.js:878-881`).
+fn custom_cache(resolved: &Resolved) -> bool {
+    if enabled_flags(resolved).contains("keepAllCache") {
+        return true;
+    }
+    match resolved.value("cache").map(str::trim) {
+        Some("reserve") | Some("keep") => true,
+        Some(value) => {
+            let lower = value.to_ascii_lowercase();
+            matches!(lower.as_str(), "no" | "no-cache" | "no-store")
+                || parse_leading_int(value).is_some()
+        }
+        None => false,
+    }
+}
+
+/// An RFC 1123 date `offset` milliseconds from now, as `Date#toGMTString`
+/// renders it.
+fn http_date(offset: i64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = now + offset / 1000;
+    let days = secs.div_euclid(86_400);
+    let time = secs.rem_euclid(86_400);
+    let (h, m, s) = (time / 3600, (time % 3600) / 60, time % 60);
+    let weekday = DAYS[(days + 4).rem_euclid(7) as usize];
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{weekday}, {day:02} {} {year} {h:02}:{m:02}:{s:02} GMT",
+        MONTHS[(month - 1) as usize]
+    )
+}
+
+/// Days since the Unix epoch → `(year, month, day)`. Howard Hinnant's
+/// `civil_from_days`, which is exact for the whole range we can produce.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (y + i64::from(m <= 2), m, d)
+}
+
+/// `attachment://[filename]` — force a download.
+///
+/// whistle always writes a filename: with no value it falls back to the last
+/// path segment of the request URL, or `index.html`
+/// (`getFilename`, `_original/lib/util/index.js:957-970`).
+fn apply_attachment(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&ReqInfo>) {
+    let Some(value) = resolved.value("attachment") else {
+        return;
+    };
+    let name = match value.is_empty() {
+        false => value.to_string(),
+        true => info.map(|i| url_filename(&i.full_url)).unwrap_or_default(),
+    };
+    let disposition = match name.is_empty() {
+        // Without the request there is no fallback name to compute; a bare
+        // `attachment` still forces the download.
+        true => "attachment".to_string(),
+        false => format!("attachment; filename=\"{}\"", encode_non_latin1(&name)),
+    };
+    set_header(headers, "content-disposition", &disposition);
+}
+
+/// The filename whistle derives from a URL: the last path segment, ignoring
+/// query and fragment, or `index.html` when there is none.
+fn url_filename(url: &str) -> String {
+    let pure = url.split(['?', '#']).next().unwrap_or(url).trim();
+    // `getPath` drops the scheme, so the host counts as a segment: a URL with no
+    // `/` after it has no filename at all.
+    let after_scheme = pure.split_once("://").map(|(_, rest)| rest).unwrap_or(pure);
+    match after_scheme.rsplit_once('/') {
+        Some((_, name)) if !name.is_empty() => name.to_string(),
+        _ => "index.html".to_string(),
+    }
+}
+
+/// Percent-encode whitespace and everything outside Latin-1, which is all a
+/// header value may not carry (`encodeNonLatin1Char`,
+/// `_original/lib/util/common.js:1516,1534-1539`).
+fn encode_non_latin1(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if !c.is_whitespace() && (c as u32) <= 0xFF {
+            out.push(c);
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        for b in c.encode_utf8(&mut buf).as_bytes() {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Would any operator write into this response's body?
+///
+/// Upstream asks the same question *before* the `safeHtml`/`strictHtml` gate
+/// runs — it looks only at whether a rule produced content
+/// (`_original/lib/inspectors/res.js:1093`) — so a refused injection still
+/// costs the response its CSP and its cacheability.
+fn injects_into_body(headers: &HeaderMap, resolved: &Resolved) -> bool {
+    let class = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(res_class);
+    let families = BodyFamilies::of(class);
+    ["Body", "Prepend", "Append"].iter().any(|slot| {
+        resolved.value(&format!("res{slot}")).is_some()
+            || (families.html && resolved.value(&format!("html{slot}")).is_some())
+            || (families.js && resolved.value(&format!("js{slot}")).is_some())
+            || (families.css && resolved.value(&format!("css{slot}")).is_some())
+    })
+}
+
+/// Drop every spelling of the Content-Security-Policy header
+/// (`disableCSP`, `_original/lib/util/index.js:738-744`).
+fn disable_csp(headers: &mut HeaderMap) {
+    for name in [
+        "content-security-policy",
+        "content-security-policy-report-only",
+        "x-content-security-policy",
+        "x-content-security-policy-report-only",
+        "x-webkit-csp",
+    ] {
+        remove_header(headers, name);
+    }
+}
+
+/// Make the response uncacheable (`disableResStore`,
+/// `_original/lib/util/index.js:986-991`). The `tag` header it also deletes is
+/// upstream's typo for `etag`; reproduced, since a rules file must resolve the
+/// same way in both implementations.
+fn disable_res_store(headers: &mut HeaderMap) {
+    set_header(headers, "cache-control", "no-store");
+    set_header(headers, "expires", &http_date(-60_000_000));
+    set_header(headers, "pragma", "no-cache");
+    remove_header(headers, "tag");
 }
 
 /// File path to append the request body to (`reqWrite`).
@@ -1192,6 +1747,10 @@ fn body_ops_present(resolved: &Resolved, prefix: &str) -> bool {
     if generic {
         return true;
     }
+    // `delete://body` and `delete://resBody.a` rewrite the body on their own.
+    if Deletions::of(resolved, prefix == "req").touches_body() {
+        return true;
+    }
     if prefix == "res" && resolved.value("resMerge").is_some() {
         return true;
     }
@@ -1202,6 +1761,188 @@ fn body_ops_present(resolved: &Resolved, prefix: &str) -> bool {
                 .iter()
                 .any(|s| resolved.value(&format!("{k}{s}")).is_some())
         })
+}
+
+/// whistle's coarse content classes (`getContentType`,
+/// `_original/lib/util/index.js:1475-1510`).
+///
+/// The order of the tests is upstream's and is load-bearing: `javascript` is
+/// looked for before `css`, which is looked for before `html`, so a type that
+/// mentions two of them resolves to the first. Only the media type is examined —
+/// parameters after the first `;` are dropped before the substring tests, so a
+/// `charset=` value cannot smuggle a class in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResClass {
+    Js,
+    Css,
+    Html,
+    Json,
+    Xml,
+    Text,
+    Img,
+}
+
+/// Classify a `Content-Type` header the way whistle does. `None` covers both a
+/// missing header and a type in none of the classes (e.g. `image/…` aside,
+/// `application/octet-stream`).
+fn res_class(content_type: &str) -> Option<ResClass> {
+    let raw = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(if raw.contains("javascript") {
+        ResClass::Js
+    } else if raw.contains("css") {
+        ResClass::Css
+    } else if raw.contains("html") {
+        ResClass::Html
+    } else if raw.contains("json") {
+        ResClass::Json
+    } else if raw.contains("xml") {
+        ResClass::Xml
+    } else if raw.contains("text/") {
+        ResClass::Text
+    } else if raw.contains("image/") {
+        ResClass::Img
+    } else {
+        return None;
+    })
+}
+
+/// Which typed-body families a response accepts.
+///
+/// The nuance that makes `jsAppend` useful at all: **an HTML response accepts
+/// the JS *and* the CSS families too** — `isJs = isHtml || resType === 'JS'`
+/// (`_original/lib/inspectors/res.js:952-954`). `jsAppend://alert(1)` on a page
+/// is the canonical whistle one-liner; it works because the injected script is
+/// wrapped in `<script>` before it reaches the markup (see [`wrap_js`]).
+#[derive(Clone, Copy)]
+struct BodyFamilies {
+    html: bool,
+    js: bool,
+    css: bool,
+}
+
+impl BodyFamilies {
+    fn of(class: Option<ResClass>) -> BodyFamilies {
+        let html = class == Some(ResClass::Html);
+        BodyFamilies {
+            html,
+            js: html || class == Some(ResClass::Js),
+            css: html || class == Some(ResClass::Css),
+        }
+    }
+}
+
+/// A URL written where whistle expects script or stylesheet source
+/// (`GEN_URL_RE`, `_original/lib/util/index.js:44`). Such a value is linked
+/// rather than inlined.
+static GEN_URL_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"(?i)^\s*(?:https?:)?//\w\S*\s*$").expect("static regex"));
+
+/// `<script>` attributes contributed by the injecting line's properties
+/// (`getScriptProps`, `_original/lib/util/index.js:277-303`). The groups are
+/// exclusive in upstream's order: the first `crossorigin` spelling wins, and
+/// `module` outranks `importmap` outranks `speculationrules`.
+fn script_props(props: &LineProps) -> String {
+    let mut out = String::new();
+    if props.has("use-credentials") || props.has("useCredentials") {
+        out.push_str(" crossorigin=\"use-credentials\"");
+    } else if props.has("anonymous") {
+        out.push_str(" crossorigin=\"anonymous\"");
+    } else if props.has("crossorigin") {
+        out.push_str(" crossorigin");
+    }
+    for flag in ["defer", "async", "nomodule"] {
+        if props.has(flag) {
+            out.push(' ');
+            out.push_str(flag);
+        }
+    }
+    if props.has("module") {
+        out.push_str(" type=\"module\"");
+    } else if props.has("importmap") {
+        out.push_str(" type=\"importmap\"");
+    } else if props.has("speculationrules") {
+        out.push_str(" type=\"speculationrules\"");
+    }
+    out
+}
+
+/// Wrap a `jsXxx` value for injection into markup (`wrapJs`,
+/// `_original/lib/util/index.js:305-313`): a bare URL becomes a `src=` script
+/// tag, anything else an inline one.
+fn wrap_js(js: &str, props: &LineProps) -> String {
+    let attrs = script_props(props);
+    match GEN_URL_RE.is_match(js) {
+        true => format!("<script{attrs} src=\"{}\"></script>", js.trim()),
+        false => format!("<script{attrs}>{js}</script>"),
+    }
+}
+
+/// Wrap a `cssXxx` value for injection into markup (`wrapCss`,
+/// `_original/lib/util/index.js:315-322`). Line properties do not apply here —
+/// upstream passes none.
+fn wrap_css(css: &str) -> String {
+    match GEN_URL_RE.is_match(css) {
+        true => format!("<link rel=\"stylesheet\" href=\"{}\" />", css.trim()),
+        false => format!("<style>{css}</style>"),
+    }
+}
+
+/// The separator whistle puts between several values landing in the same slot
+/// (`joinData`, `_original/lib/util/file-mgr.js:93-109`).
+const CRLF: &[u8] = b"\r\n";
+
+/// Prepended to a non-empty `top` on an HTML response unless `disable://doctype`
+/// (`_original/lib/util/whistle-transform.js:6,116-118`). Surprising but real:
+/// any `resPrepend`/`htmlPrepend` on a page also stamps a doctype in front of it.
+const DOCTYPE: &[u8] = b"<!DOCTYPE html>\r\n";
+
+/// The three slots whistle's `WhistleTransform` writes around a body: `top`
+/// before it, `body` *instead* of it, `bottom` after it
+/// (`_original/lib/util/whistle-transform.js:88-127`).
+///
+/// Each slot is a list because several operators feed it and are joined with
+/// CRLF — kept as a list rather than a string so an operator that matched with
+/// an empty value still counts as occupying its slot.
+#[derive(Default)]
+struct Injection {
+    top: Vec<Vec<u8>>,
+    body: Vec<Vec<u8>>,
+    bottom: Vec<Vec<u8>>,
+}
+
+impl Injection {
+    /// Wrap `data` in whatever the slots hold.
+    fn apply(self, data: Vec<u8>, doctype: bool) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        if !self.top.is_empty() && doctype {
+            out.extend_from_slice(DOCTYPE);
+        }
+        join_into(&mut out, self.top);
+        match self.body.is_empty() {
+            true => out.extend_from_slice(&data),
+            false => join_into(&mut out, self.body),
+        }
+        join_into(&mut out, self.bottom);
+        out
+    }
+}
+
+/// Append `pieces` to `out`, CRLF-separated.
+fn join_into(out: &mut Vec<u8>, pieces: Vec<Vec<u8>>) {
+    for (i, piece) in pieces.into_iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(CRLF);
+        }
+        out.extend(piece);
+    }
 }
 
 /// Deep-merge `patch` (a JSON object) into `target`; objects merge recursively,
@@ -1228,13 +1969,117 @@ pub fn wants_res_body(resolved: &Resolved) -> bool {
 }
 
 /// Transform a buffered request body per the resolved operators.
+///
+/// The request pipeline runs the injection first and `reqReplace` after it
+/// (`handleReq` adds the transform, then `handleReplace`,
+/// `_original/lib/inspectors/req.js:129-130,573`), so a substitution *does* see
+/// what `reqPrepend`/`reqAppend` put there — the opposite of the response side.
 pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
-    transform_body(body, resolved, "req", None)
+    // `delete://body` wipes the body *and* anything an operator meant to put
+    // around it (`removeBody`, `_original/lib/util/index.js:3592-3598`).
+    if Deletions::of(resolved, true).drop_body {
+        return Bytes::new();
+    }
+    // Request bodies are never injection-gated: whistle's request transform
+    // leaves `isHtml` unset, so `allowInject` lets every operator through.
+    let gate = InjectionGate::plain(resolved);
+    let mut injection = Injection::default();
+    collect_generic(&mut injection, &gate, "req");
+    let data = injection.apply(body.to_vec(), false);
+    // whistle gates `reqReplace` on the *request's* content type, which this
+    // entry point is not given; `Text` is the class that never refuses, so the
+    // gap is a request with no `content-type` (or an image one) being rewritten
+    // where upstream would leave it alone.
+    Bytes::from(apply_replace(data, resolved, "reqReplace", Some(ResClass::Text)))
 }
 
-/// Transform a buffered response body; `content_type` gates css/html/js ops.
+/// Transform a buffered response body; `content_type` decides which typed-body
+/// families apply and whether injected content is wrapped as markup.
+///
+/// Operators run in whistle's pipeline order, which is *not* the order they are
+/// written: the text transforms (`resMerge`, then `resReplace`) sit ahead of the
+/// injecting `WhistleTransform` in the response stream
+/// (`_original/lib/inspectors/res.js:1041,1114-1120`; `addTextTransform` splices
+/// its sub-pipeline in at the head, `_original/lib/init.js:135-141`). So a
+/// substitution never sees prepended or appended content, and `resBody`
+/// discards whatever `resMerge`/`resReplace` produced.
 pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option<&str>) -> Bytes {
-    transform_body(body, resolved, "res", content_type)
+    let del = Deletions::of(resolved, false);
+    if del.drop_body {
+        return Bytes::new();
+    }
+    let class = content_type.and_then(res_class);
+    let families = BodyFamilies::of(class);
+    // The gate is built from the body as it arrived: whistle decides once, from
+    // the *original* first non-whitespace byte, whether injection is allowed.
+    let gate = InjectionGate::new(resolved, families.html, &body);
+
+    let mut data = apply_res_merge(body.to_vec(), resolved, class, &del);
+    data = apply_replace(data, resolved, "resReplace", class);
+
+    let injection = collect_res_injection(&gate, families);
+    // Only an HTML response gets the doctype, and `disable://doctype` opts out.
+    let doctype = families.html && !is_disabled(resolved, "doctype");
+    Bytes::from(injection.apply(data, doctype))
+}
+
+/// Fill the `res*` slots, shared by both sides.
+fn collect_generic(injection: &mut Injection, gate: &InjectionGate<'_>, prefix: &str) {
+    // `*Body` occupies its slot even when empty — upstream substitutes an empty
+    // buffer for a blank value (`data.body = resBody || util.EMPTY_BUFFER`,
+    // `_original/lib/inspectors/res.js:1005`), so `resBody://` empties the body.
+    if let Some(v) = gate.value(&format!("{prefix}Body")) {
+        injection.body.push(v.as_bytes().to_vec());
+    }
+    if let Some(v) = gate.value(&format!("{prefix}Prepend")).filter(|v| !v.is_empty()) {
+        injection.top.push(v.as_bytes().to_vec());
+    }
+    if let Some(v) = gate.value(&format!("{prefix}Append")).filter(|v| !v.is_empty()) {
+        injection.bottom.push(v.as_bytes().to_vec());
+    }
+}
+
+/// Fill all three slots for a response, in whistle's order: the generic `res*`
+/// operators first, then `css*`, `html*` and `js*`
+/// (`_original/lib/inspectors/res.js:1063-1072`).
+///
+/// On an HTML response the `js*`/`css*` values are markup-wrapped, since raw
+/// JavaScript pasted into a page would only render as text.
+fn collect_res_injection(gate: &InjectionGate<'_>, families: BodyFamilies) -> Injection {
+    let mut injection = Injection::default();
+    collect_generic(&mut injection, gate, "res");
+
+    let html = families.html;
+    for (family, enabled) in [
+        ("css", families.css),
+        ("html", families.html),
+        ("js", families.js),
+    ] {
+        if !enabled {
+            continue;
+        }
+        // whistle orders the families css → html → js in every slot, so the two
+        // wrapped families bracket the raw markup one.
+        for (suffix, slot) in [
+            ("Body", &mut injection.body),
+            ("Prepend", &mut injection.top),
+            ("Append", &mut injection.bottom),
+        ] {
+            let protocol = format!("{family}{suffix}");
+            // Unlike `resBody`, a blank typed value contributes nothing: the
+            // HTML branch filters empty entries out before joining
+            // (`readRuleList`, `_original/lib/util/index.js:1320-1322`).
+            let Some(value) = gate.value(&protocol).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            slot.push(match (html, family) {
+                (true, "js") => wrap_js(value, gate.props(&protocol)).into_bytes(),
+                (true, "css") => wrap_css(value).into_bytes(),
+                _ => value.as_bytes().to_vec(),
+            });
+        }
+    }
+    injection
 }
 
 /// Decides, per operator, whether its content may be injected into a response
@@ -1264,15 +2109,7 @@ struct InjectionGate<'a> {
 }
 
 impl<'a> InjectionGate<'a> {
-    fn new(
-        resolved: &'a Resolved,
-        prefix: &str,
-        content_type: Option<&str>,
-        body: &'a [u8],
-    ) -> Self {
-        // Request bodies are never gated: whistle's request transform leaves
-        // `isHtml` unset, so `allowInject` lets every operator through.
-        let html = prefix == "res" && content_type.and_then(typed_body_kind) == Some("html");
+    fn new(resolved: &'a Resolved, html: bool, body: &'a [u8]) -> Self {
         let global = if html {
             let enabled = enabled_flags(resolved);
             LineProps::from_actions(
@@ -1291,6 +2128,11 @@ impl<'a> InjectionGate<'a> {
         }
     }
 
+    /// A gate that refuses nothing, for the request side.
+    fn plain(resolved: &'a Resolved) -> Self {
+        InjectionGate::new(resolved, false, &[])
+    }
+
     /// The value of an injecting operator, unless its line (or a request-wide
     /// `enable://`) refuses to inject it into this body.
     fn value(&self, protocol: &str) -> Option<&'a str> {
@@ -1302,123 +2144,312 @@ impl<'a> InjectionGate<'a> {
             && self.global.allows_injection(self.body);
         allowed.then_some(value)
     }
+
+    /// The line properties of the operator's winning line, which decide the
+    /// attributes of a wrapped `<script>`.
+    fn props(&self, protocol: &str) -> &'a LineProps {
+        self.resolved.props(protocol)
+    }
 }
 
-/// Apply `*Body` → `*Replace` → `*Prepend` → `*Append`, then content-type-specific
-/// (`css`/`html`/`js`) `Body`/`Prepend`/`Append` for the response.
-fn transform_body(
-    body: Bytes,
+/// `resMerge` — deep-merge a JSON patch into a JSON response body
+/// (`_original/lib/inspectors/res.js:1022-1069`).
+///
+/// The gate is narrower than it looks. Upstream only builds the merge transform
+/// for a response that is JS, HTML, JSON, or has no `content-type` at all
+/// (`res.js:1022`) — so `resMerge` on a `text/plain` body is inert — and it
+/// merges into the **first JSON-looking substring** rather than the whole body
+/// (`JSON_RE`, `res.js:846`), which is what lets it patch a JSONP payload
+/// without disturbing the callback wrapper.
+/// `del` carries the `delete://resBody.a.b` paths, which ride the same
+/// transform and are therefore gated the same way.
+fn apply_res_merge(
+    data: Vec<u8>,
     resolved: &Resolved,
-    prefix: &str,
-    content_type: Option<&str>,
-) -> Bytes {
-    // Built before anything is rewritten: whistle decides once, from the body as
-    // it arrived, whether injected content is allowed at all.
-    let gate = InjectionGate::new(resolved, prefix, content_type, &body);
-
-    let mut data: Vec<u8> = match gate.value(&format!("{prefix}Body")) {
-        Some(new) => new.as_bytes().to_vec(),
-        None => body.to_vec(),
+    class: Option<ResClass>,
+    del: &Deletions,
+) -> Vec<u8> {
+    let patch = resolved.value("resMerge");
+    if patch.is_none() && del.body_props.is_empty() {
+        return data;
+    }
+    let applies = matches!(
+        class,
+        None | Some(ResClass::Js) | Some(ResClass::Html) | Some(ResClass::Json)
+    );
+    if !applies {
+        return data;
+    }
+    let patch = match patch.map(serde_json::from_str::<serde_json::Value>) {
+        Some(Ok(patch)) => Some(patch),
+        // A `resMerge` that is not JSON leaves only the deletions to do.
+        Some(Err(_)) => None,
+        None => None,
     };
+    let text = match String::from_utf8(data) {
+        Ok(text) => text,
+        // Not text at all; whistle's transforms only ever see decoded strings.
+        Err(e) => return e.into_bytes(),
+    };
+    // An empty body is replaced by the patch outright (`res.js:1049-1054`).
+    if text.is_empty() {
+        let Some(mut patch) = patch else {
+            return Vec::new();
+        };
+        delete_json_props(&mut patch, &del.body_props);
+        return serde_json::to_vec(&patch).unwrap_or_default();
+    }
+    // For HTML (and for a typeless response) whistle gives up unless the body
+    // *starts* like JSON — `LIKE_JSON_RE`, `res.js:1029`.
+    let like_json = text.trim_start().starts_with(['{', '[']);
+    if matches!(class, None | Some(ResClass::Html)) && !like_json {
+        return text.into_bytes();
+    }
+    let Some((start, end)) = json_span(&text) else {
+        return text.into_bytes();
+    };
+    let Ok(mut base) = serde_json::from_str::<serde_json::Value>(&text[start..end]) else {
+        return text.into_bytes();
+    };
+    if let Some(patch) = &patch {
+        json_deep_merge(&mut base, patch);
+    }
+    delete_json_props(&mut base, &del.body_props);
+    let Ok(merged) = serde_json::to_string(&base) else {
+        return text.into_bytes();
+    };
+    format!("{}{merged}{}", &text[..start], &text[end..]).into_bytes()
+}
 
-    if let Some(spec) = resolved.value(&format!("{prefix}Replace")) {
-        data = apply_body_replace(data, spec);
-    }
-    if let Some(pre) = gate.value(&format!("{prefix}Prepend")) {
-        let mut v = pre.as_bytes().to_vec();
-        v.extend_from_slice(&data);
-        data = v;
-    }
-    if let Some(app) = gate.value(&format!("{prefix}Append")) {
-        data.extend_from_slice(app.as_bytes());
-    }
-
-    // resMerge: deep-merge a JSON patch into a JSON response body.
-    if prefix == "res" {
-        if let Some(patch_src) = resolved.value("resMerge") {
-            if let (Ok(mut base), Ok(patch)) = (
-                serde_json::from_slice::<serde_json::Value>(&data),
-                serde_json::from_str::<serde_json::Value>(patch_src),
-            ) {
-                json_deep_merge(&mut base, &patch);
-                if let Ok(s) = serde_json::to_vec(&base) {
-                    data = s;
+/// Remove dotted paths from a JSON value (`deleteProps` →
+/// `_original/lib/util/common.js:989-1084`). A numeric segment addressing an
+/// array element splices it out. The `\.`-escaped and `a[0]` spellings upstream
+/// also accepts are not ported.
+fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
+    for path in paths {
+        let mut keys = path.split('.').map(str::trim).peekable();
+        let mut node = &mut *value;
+        while let Some(key) = keys.next() {
+            if keys.peek().is_none() {
+                match node {
+                    serde_json::Value::Object(map) => {
+                        map.remove(key);
+                    }
+                    serde_json::Value::Array(list) => {
+                        if let Ok(i) = key.parse::<usize>() {
+                            if i < list.len() {
+                                list.remove(i);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
+                break;
+            }
+            let next = match node {
+                serde_json::Value::Object(map) => map.get_mut(key),
+                serde_json::Value::Array(list) => {
+                    key.parse::<usize>().ok().and_then(|i| list.get_mut(i))
+                }
+                _ => None,
+            };
+            match next {
+                Some(next) => node = next,
+                None => break,
             }
         }
     }
+}
 
-    // Content-type-specific ops (cssBody/htmlPrepend/jsAppend, …).
-    if prefix == "res" {
-        if let Some(kind) = content_type.and_then(typed_body_kind) {
-            if let Some(new) = gate.value(&format!("{kind}Body")) {
-                data = new.as_bytes().to_vec();
-            }
-            if let Some(pre) = gate.value(&format!("{kind}Prepend")) {
-                let mut v = pre.as_bytes().to_vec();
-                v.extend_from_slice(&data);
-                data = v;
-            }
-            if let Some(app) = gate.value(&format!("{kind}Append")) {
-                data.extend_from_slice(app.as_bytes());
-            }
+/// The span whistle's `JSON_RE` (`/{[\w\W]*}|\[[\w\W]*\]/`, `res.js:846`) picks
+/// out of a body: from the first `{` to the last `}`, or — only when there is no
+/// `{` at all — from the first `[` to the last `]`. Greedy on purpose, so a
+/// JSONP wrapper's parentheses stay outside.
+fn json_span(text: &str) -> Option<(usize, usize)> {
+    if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}')) {
+        if s < e {
+            return Some((s, e + 1));
         }
     }
-    Bytes::from(data)
+    let (s, e) = (text.find('[')?, text.rfind(']')?);
+    (s < e).then_some((s, e + 1))
 }
 
-/// Map a content type to a typed-body prefix (`html`/`css`/`js`).
-fn typed_body_kind(content_type: &str) -> Option<&'static str> {
-    let ct = content_type.to_ascii_lowercase();
-    if ct.contains("html") {
-        Some("html")
-    } else if ct.contains("css") {
-        Some("css")
-    } else if ct.contains("javascript") || ct.contains("ecmascript") {
-        Some("js")
-    } else {
-        None
+/// `resReplace` / `reqReplace` — substitute inside a body.
+///
+/// The value is a list of `pattern=replacement` pairs (`a=1&b=2`) or a JSON
+/// object, each applied in turn (`parseRuleJson` → `handleReplace`,
+/// `_original/lib/inspectors/res.js:124-145`). Upstream skips the whole
+/// operator for a response with no `content-type` or an image one, so those
+/// bodies are handed back untouched.
+fn apply_replace(
+    data: Vec<u8>,
+    resolved: &Resolved,
+    protocol: &str,
+    class: Option<ResClass>,
+) -> Vec<u8> {
+    let Some(spec) = resolved.value(protocol) else {
+        return data;
+    };
+    // Upstream refuses the whole operator for a response with no `content-type`
+    // or an image one (`handleReplace`, `_original/lib/inspectors/res.js:129-132`).
+    if matches!(class, None | Some(ResClass::Img)) {
+        return data;
     }
-}
-
-/// `*Replace` on a body: `from=to`, literal or `/regex/[i]`. Binary bodies untouched.
-fn apply_body_replace(data: Vec<u8>, spec: &str) -> Vec<u8> {
-    match String::from_utf8(data) {
-        Ok(text) => apply_str_replace(&text, spec).into_bytes(),
-        Err(e) => e.into_bytes(), // not UTF-8 text; leave binary body untouched
+    let pairs = parse_replace_pairs(spec);
+    if pairs.is_empty() {
+        return data;
     }
+    // Not UTF-8 means a binary body, which whistle's text transforms never see.
+    let mut text = match String::from_utf8(data) {
+        Ok(text) => text,
+        Err(e) => return e.into_bytes(),
+    };
+    for (pattern, value) in pairs {
+        text = replace_once_or_all(&text, &pattern, &value);
+    }
+    text.into_bytes()
 }
 
-/// Substitute `from=to` in `text`. If `from` is `/regex/[i]`, use a regex; else a
-/// literal replace-all. Shared by body `*Replace` and `urlReplace`.
-fn apply_str_replace(text: &str, spec: &str) -> String {
-    let Some((from, to)) = spec.split_once('=') else {
+/// Split a `*Replace` value into `pattern` → `replacement` pairs.
+///
+/// `parseQuery` (via `tryParseMatcher`) splits on `&` then on the first `=`, so
+/// `resReplace://a=1&b=2` is two substitutions, not one that inserts `1&b=2`.
+/// A `{json}` value is an object of the same shape.
+fn parse_replace_pairs(spec: &str) -> Vec<(String, String)> {
+    let spec = spec.trim();
+    if spec.starts_with('{') {
+        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(spec) {
+            return map
+                .into_iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => s,
+                        serde_json::Value::Null => String::new(),
+                        other => other.to_string(),
+                    };
+                    (k, val)
+                })
+                .collect();
+        }
+    }
+    spec.split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Apply one `pattern` → `value` substitution the way whistle's transforms do.
+///
+/// A pattern spelled `/…/[gimu]` is a regular expression (`ORIG_REG_EXP`,
+/// `_original/lib/util/index.js:611`), and follows JavaScript's rule that
+/// **without the `g` flag only the first match is replaced**. Anything else —
+/// including a half-formed `/a/x` — is a literal replace-all
+/// (`str.split(key).join(value)`, `_original/lib/util/index.js:2267`).
+fn replace_once_or_all(text: &str, pattern: &str, value: &str) -> String {
+    let Some((source, flags)) = split_regexp(pattern) else {
+        return text.replace(pattern, value);
+    };
+    // `/.*/ ` and `/.+/` mean "replace the whole body", special-cased upstream
+    // so the empty trailing match cannot duplicate the replacement
+    // (`ALL_RE`, `_original/lib/util/replace-pattern-transform.js:7,24-27`).
+    if matches!(source, ".*" | ".+") {
+        return value.to_string();
+    }
+    let mut prefix = String::new();
+    if flags.contains('i') {
+        prefix.push_str("(?i)");
+    }
+    if flags.contains('m') {
+        prefix.push_str("(?m)");
+    }
+    let Ok(re) = regex::Regex::new(&format!("{prefix}{source}")) else {
         return text.to_string();
     };
-    if from.starts_with('/') && from.len() > 1 {
-        if let Some(end) = from.rfind('/') {
-            if end > 0 {
-                let body = &from[1..end];
-                let flags = &from[end + 1..];
-                let pat = if flags.contains('i') {
-                    format!("(?i){body}")
-                } else {
-                    body.to_string()
-                };
-                if let Ok(re) = regex::Regex::new(&pat) {
-                    return re.replace_all(text, to).into_owned();
-                }
+    let value = js_replacement(value);
+    match flags.contains('g') {
+        true => re.replace_all(text, value.as_str()).into_owned(),
+        false => re.replace(text, value.as_str()).into_owned(),
+    }
+}
+
+/// Split `/source/flags` into its two halves, or `None` when the pattern is not
+/// that shape. Mirrors `ORIG_REG_EXP = /^\/(.+)\/([igmu]{0,4})$/`: the source is
+/// greedy (so `/a\/b/` keeps its inner slash) and every flag character must be
+/// one of `igmu`.
+fn split_regexp(pattern: &str) -> Option<(&str, &str)> {
+    let rest = pattern.strip_prefix('/')?;
+    let end = rest.rfind('/')?;
+    let (source, flags) = (&rest[..end], &rest[end + 1..]);
+    let ok = !source.is_empty()
+        && flags.len() <= 4
+        && flags.chars().all(|c| matches!(c, 'i' | 'g' | 'm' | 'u'));
+    ok.then_some((source, flags))
+}
+
+/// Rewrite a JavaScript replacement string into the `regex` crate's spelling.
+///
+/// `$&` is the whole match and `$1`…`$9` are groups in both, but Rust reads
+/// `$1x` as a capture *named* `1x`, so every reference is braced. `\$` escapes a
+/// reference upstream (`replacePattern`,
+/// `_original/lib/util/replace-pattern-transform.js:64-91`); the `$$`-prefixed
+/// URL-encoding form is not ported.
+fn js_replacement(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'$') {
+            chars.next();
+            out.push_str("$$"); // an escaped `$` is literal
+            continue;
+        }
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('&') => {
+                chars.next();
+                out.push_str("${0}");
             }
+            Some(d) if d.is_ascii_digit() => {
+                let d = *d;
+                chars.next();
+                out.push_str(&format!("${{{d}}}"));
+            }
+            // A lone `$` (or `$$`) is literal; `$$` is Rust's own escape.
+            _ => out.push_str("$$"),
         }
     }
-    text.replace(from, to)
+    out
+}
+
+/// Substitute a `from=to` list in `text`, shared by `urlReplace` and the body
+/// `*Replace` operators.
+fn apply_str_replace(text: &str, spec: &str) -> String {
+    let mut out = text.to_string();
+    for (pattern, value) in parse_replace_pairs(spec) {
+        out = replace_once_or_all(&out, &pattern, &value);
+    }
+    out
 }
 
 /// Rewrite the request path+query per `urlReplace`, `params`, and `urlParams`.
 pub fn rewrite_path(path: &str, resolved: &Resolved) -> String {
     let mut p = path.to_string();
     if let Some(spec) = resolved.value("urlReplace") {
-        p = apply_str_replace(&p, spec);
+        // whistle substitutes into the path *without* its leading slash — it
+        // slices the URL from one character past the host's `/`
+        // (`parsePathReplace`, `_original/lib/util/index.js:1009-1013`), so a
+        // pattern anchored with `^/` matches in neither implementation.
+        let rest = p.strip_prefix('/');
+        let replaced = apply_str_replace(rest.unwrap_or(&p), spec);
+        p = match rest.is_some() {
+            true => format!("/{replaced}"),
+            false => replaced,
+        };
     }
     let mut params: Vec<(String, String)> = Vec::new();
     for key in ["params", "urlParams"] {
@@ -1502,50 +2533,62 @@ fn collect_values<'a>(resolved: &'a Resolved, protocol: &str) -> Vec<&'a str> {
     out
 }
 
-/// Parse `name=value` / bare `name` (delete) / `{json}` into (name, value?) pairs.
-/// A `None` value means "delete this cookie".
-fn parse_cookie_ops(value: &str) -> Vec<(String, Option<String>)> {
+/// Parse a `reqCookies`/`resCookies` value into `name` → `value` pairs.
+///
+/// Like the other JSON-shaped operators, the value is either `{json}` or a
+/// query string, so `reqCookies://a=1&b=2` is two cookies. A name with no `=`
+/// gets an **empty value** — it does not delete the cookie; that is
+/// `delete://reqCookies.<name>`.
+fn parse_cookie_ops(value: &str) -> Vec<(String, String)> {
     let value = value.trim();
-    let mut out = Vec::new();
     if value.starts_with('{') {
         if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            for (k, v) in map {
-                let val = match v {
-                    serde_json::Value::Null => None,
-                    serde_json::Value::String(s) if s.is_empty() => None,
-                    serde_json::Value::String(s) => Some(s),
-                    other => Some(other.to_string()),
-                };
-                out.push((k, val));
-            }
-            return out;
+            return map
+                .into_iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => s,
+                        serde_json::Value::Null => String::new(),
+                        // A cookie declared as an object carries attributes
+                        // upstream (`getCookieItem`); whistle-rs writes only
+                        // its serialised form.
+                        other => other.to_string(),
+                    };
+                    (k, val)
+                })
+                .collect();
         }
     }
-    if let Some(i) = value.find('=') {
-        let name = value[..i].trim().to_string();
-        let val = value[i + 1..].trim();
-        out.push((name, if val.is_empty() { None } else { Some(val.to_string()) }));
-    } else if !value.is_empty() {
-        out.push((value.to_string(), None));
-    }
-    out
+    value
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (k.trim().to_string(), v.to_string()),
+            None => (pair.trim().to_string(), String::new()),
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
 }
 
-/// Merge `reqCookies` operators into the request `Cookie` header.
+/// Merge `reqCookies` operators into the request `Cookie` header, keeping the
+/// position of a cookie the request already carried (`setReqCookies`,
+/// `_original/lib/util/index.js:3053-3092`).
 fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
     let ops = collect_values(resolved, "reqCookies");
     if ops.is_empty() {
         return;
     }
-    // Existing cookies as an ordered list.
     let mut cookies: Vec<(String, String)> = headers
         .get(hyper::header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .map(|c| {
             c.split(';')
                 .filter_map(|kv| {
-                    let (k, v) = kv.trim().split_once('=')?;
-                    Some((k.trim().to_string(), v.trim().to_string()))
+                    let kv = kv.trim();
+                    match kv.split_once('=') {
+                        Some((k, v)) => Some((k.trim().to_string(), v.to_string())),
+                        None => (!kv.is_empty()).then(|| (kv.to_string(), String::new())),
+                    }
                 })
                 .collect()
         })
@@ -1553,40 +2596,78 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
 
     for value in ops {
         for (name, val) in parse_cookie_ops(value) {
-            cookies.retain(|(k, _)| *k != name);
-            if let Some(v) = val {
-                cookies.push((name, v));
+            let name = escape_cookie(&name, true);
+            let val = escape_cookie(&val, false);
+            match cookies.iter_mut().find(|(k, _)| *k == name) {
+                Some(slot) => slot.1 = val,
+                None => cookies.push((name, val)),
             }
         }
     }
 
-    if cookies.is_empty() {
-        headers.remove(hyper::header::COOKIE);
-    } else {
-        let joined = cookies
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        if let Ok(v) = HeaderValue::from_str(&joined) {
-            headers.insert(hyper::header::COOKIE, v);
+    let joined = cookies
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    set_header(headers, "cookie", &joined);
+}
+
+/// Emit `Set-Cookie` headers for `resCookies` operators, **replacing** any the
+/// response already sent under the same name rather than adding a second one.
+fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
+    let ops = collect_values(resolved, "resCookies");
+    if ops.is_empty() {
+        return;
+    }
+    let mut existing: Vec<(String, String)> = headers
+        .get_all(hyper::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|c| {
+            let name = c.split('=').next().unwrap_or(c).to_string();
+            (name, c.to_string())
+        })
+        .collect();
+
+    for value in ops {
+        for (name, val) in parse_cookie_ops(value) {
+            let name = escape_cookie(&name, true);
+            let cookie = format!("{name}={}", escape_cookie(&val, false));
+            match existing.iter_mut().find(|(k, _)| *k == name) {
+                Some(slot) => slot.1 = cookie,
+                None => existing.push((name, cookie)),
+            }
+        }
+    }
+
+    headers.remove(hyper::header::SET_COOKIE);
+    for (_, cookie) in existing {
+        if let Ok(v) = HeaderValue::from_str(&cookie) {
+            headers.append(hyper::header::SET_COOKIE, v);
         }
     }
 }
 
-/// Emit `Set-Cookie` headers for `resCookies` operators.
-fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
-    for value in collect_values(resolved, "resCookies") {
-        for (name, val) in parse_cookie_ops(value) {
-            let sc = match val {
-                Some(v) => format!("{name}={v}"),
-                None => format!("{name}=; Max-Age=0"),
-            };
-            if let Ok(v) = HeaderValue::from_str(&sc) {
-                headers.append(hyper::header::SET_COOKIE, v);
-            }
+/// Percent-encode what may not appear in a cookie name or value
+/// (`escapeName`/`escapeValue`, `_original/lib/util/index.js:3029-3050`). A name
+/// may not carry `=` either.
+fn escape_cookie(s: &str, is_name: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let forbidden = matches!(c, '\r' | '\n' | ';' | '%')
+            || (c as u32) > 0xFF
+            || (is_name && c == '=');
+        if !forbidden {
+            out.push(c);
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        for b in c.encode_utf8(&mut buf).as_bytes() {
+            out.push_str(&format!("%{b:02X}"));
         }
     }
+    out
 }
 
 /// Apply every value of a header multi-match protocol.
@@ -1601,6 +2682,9 @@ fn apply_header_ops(headers: &mut HeaderMap, resolved: &Resolved, protocol: &str
     }
 }
 
+/// Apply one header operator value: `{json}`, or a query string of `name=value`
+/// pairs (`resHeaders://x-a=1&x-b=2` is two headers, as `parseQuery` has it).
+/// The `name:value` spelling is a whistle-rs convenience, not upstream syntax.
 fn apply_header_value(headers: &mut HeaderMap, value: &str) {
     let value = value.trim();
     if value.starts_with('{') {
@@ -1615,14 +2699,17 @@ fn apply_header_value(headers: &mut HeaderMap, value: &str) {
             return;
         }
     }
-    let (name, val) = if let Some(i) = value.find('=') {
-        (&value[..i], &value[i + 1..])
-    } else if let Some(i) = value.find(':') {
-        (&value[..i], &value[i + 1..])
-    } else {
+    if value.contains('=') {
+        for pair in value.split('&') {
+            if let Some((name, val)) = pair.split_once('=') {
+                set_header(headers, name.trim(), val.trim());
+            }
+        }
         return;
-    };
-    set_header(headers, name.trim(), val.trim());
+    }
+    if let Some((name, val)) = value.split_once(':') {
+        set_header(headers, name.trim(), val.trim());
+    }
 }
 
 /// Set (replace) a header; empty value removes it. whistle treats empty as delete.
@@ -1669,20 +2756,21 @@ mod tests {
         m.resolve(&info)
     }
 
+    /// `reqCookies` merges into the existing header: a name already present
+    /// keeps its position, a new one is appended, and a bare name sets an
+    /// **empty** value rather than deleting the cookie (that is
+    /// `delete://reqCookies.<name>`).
     #[test]
-    fn req_cookies_merge_and_delete() {
+    fn req_cookies_merge_in_place() {
         let resolved = resolve(
-            "example.com reqCookies://a=1\nexample.com reqCookies://b=2\nexample.com reqCookies://old\n",
+            "example.com reqCookies://a=1&b=2\nexample.com reqCookies://old\n",
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
         headers.insert(hyper::header::COOKIE, "old=x; keep=y".parse().unwrap());
         apply_req_cookies(&mut headers, &resolved);
         let cookie = headers.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
-        assert!(cookie.contains("keep=y"));
-        assert!(cookie.contains("a=1"));
-        assert!(cookie.contains("b=2"));
-        assert!(!cookie.contains("old="));
+        assert_eq!(cookie, "old=; keep=y; a=1; b=2");
     }
 
     #[test]
@@ -1693,15 +2781,55 @@ mod tests {
         assert_eq!(&out[..], b"NEW");
     }
 
+    /// `resReplace` runs *before* the injection — its transform sits ahead of
+    /// the `WhistleTransform` in whistle's response pipeline — so it rewrites
+    /// the upstream body but never the prepended or appended text.
     #[test]
     fn res_body_prepend_append_replace() {
         let resolved = resolve(
-            "example.com/x resPrepend://<!--top-->\nexample.com/x resAppend://<!--end-->\nexample.com/x resReplace://foo=bar\n",
+            "example.com/x resPrepend://<!--foo-->\nexample.com/x resAppend://<!--foo-->\nexample.com/x resReplace://foo=bar\n",
             "http://example.com/x",
         );
         assert!(wants_res_body(&resolved));
-        let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved, None);
-        assert_eq!(&out[..], b"<!--top-->a bar b<!--end-->");
+        let out = transform_res_body(
+            Bytes::from_static(b"a foo b"),
+            &resolved,
+            Some("text/plain"),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "<!--foo-->a bar b<!--foo-->",
+            "the substitution must not reach the injected text"
+        );
+    }
+
+    /// A response with no `content-type` (or an image one) is skipped outright
+    /// by `handleReplace` (`_original/lib/inspectors/res.js:129-132`).
+    #[test]
+    fn res_replace_needs_a_replaceable_content_type() {
+        let resolved = resolve("example.com/x resReplace://foo=bar\n", "http://example.com/x");
+        for ct in [None, Some("image/png")] {
+            let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved, ct);
+            assert_eq!(&out[..], b"a foo b", "{ct:?} should not be rewritten");
+        }
+        let out = transform_res_body(
+            Bytes::from_static(b"a foo b"),
+            &resolved,
+            Some("text/plain"),
+        );
+        assert_eq!(&out[..], b"a bar b");
+    }
+
+    /// The value is a `&`-separated list of `pattern=replacement` pairs, each
+    /// applied in turn (`parseQuery` via `tryParseMatcher`).
+    #[test]
+    fn res_replace_applies_every_pair() {
+        let resolved = resolve(
+            "example.com/x resReplace://a=1&b=2\n",
+            "http://example.com/x",
+        );
+        let out = transform_res_body(Bytes::from_static(b"a b a"), &resolved, Some("text/plain"));
+        assert_eq!(&out[..], b"1 2 1");
     }
 
     #[test]
@@ -1722,11 +2850,140 @@ mod tests {
         assert_eq!(v["c"]["e"], 2); // kept (deep merge)
     }
 
+    /// `delete://` reaches the body too: a bare `body` empties it (discarding
+    /// any injection with it), and `resBody.<path>` removes a JSON property.
     #[test]
-    fn res_body_regex_replace() {
-        let resolved = resolve("example.com/x resReplace:///\\d+/=N\n", "http://example.com/x");
-        let out = transform_res_body(Bytes::from_static(b"id=123 and 45"), &resolved, None);
+    fn delete_reaches_the_body() {
+        let resolved = resolve(
+            "example.com/x delete://body\nexample.com/x resAppend://tail\n",
+            "http://example.com/x",
+        );
+        assert!(wants_res_body(&resolved));
+        let out = transform_res_body(Bytes::from_static(b"keep?"), &resolved, Some("text/plain"));
+        assert_eq!(&out[..], b"");
+
+        let resolved = resolve(
+            "example.com/x delete://resBody.a&resB.c.d\n",
+            "http://example.com/x",
+        );
+        assert!(wants_res_body(&resolved));
+        let out = transform_res_body(
+            Bytes::from_static(br#"{"a":1,"b":2,"c":{"d":3,"e":4}}"#),
+            &resolved,
+            Some("application/json"),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("a").is_none() && v["c"].get("d").is_none());
+        assert_eq!((v["b"].as_i64(), v["c"]["e"].as_i64()), (Some(2), Some(4)));
+
+        // `req.body` is the request's alone.
+        let resolved = resolve("example.com/x delete://req.body\n", "http://example.com/x");
+        assert!(wants_req_body(&resolved) && !wants_res_body(&resolved));
+        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved)[..], b"");
+    }
+
+    /// The `/regexp/flags` form follows JavaScript's `String#replace`: without
+    /// the `g` flag only the **first** match is substituted.
+    /// `resMerge` only builds its transform for a JS, HTML, JSON or typeless
+    /// response (`_original/lib/inspectors/res.js:1022`).
+    #[test]
+    fn res_merge_is_gated_on_the_content_type() {
+        let resolved = resolve(
+            "example.com/x resMerge://{\"a\":2}\n",
+            "http://example.com/x",
+        );
+        let body = br#"{"a":1}"#;
+        for ct in ["application/json", "text/html", "application/javascript"] {
+            let out = transform_res_body(Bytes::from_static(body), &resolved, Some(ct));
+            assert_eq!(&out[..], br#"{"a":2}"#, "{ct} should merge");
+        }
+        for ct in ["text/plain", "application/xml", "image/png"] {
+            let out = transform_res_body(Bytes::from_static(body), &resolved, Some(ct));
+            assert_eq!(&out[..], body, "{ct} should be left alone");
+        }
+    }
+
+    /// The patch lands in the first JSON-looking *substring*, so a JSONP
+    /// wrapper survives (`JSON_RE`, `_original/lib/inspectors/res.js:846`).
+    #[test]
+    fn res_merge_patches_a_json_substring() {
+        let resolved = resolve(
+            "example.com/x resMerge://{\"a\":2}\n",
+            "http://example.com/x",
+        );
+        let out = transform_res_body(
+            Bytes::from_static(br#"cb({"a":1});"#),
+            &resolved,
+            Some("application/javascript"),
+        );
+        assert_eq!(String::from_utf8_lossy(&out), r#"cb({"a":2});"#);
+        // An empty body is replaced by the patch outright.
+        let out = transform_res_body(Bytes::new(), &resolved, Some("application/json"));
+        assert_eq!(&out[..], br#"{"a":2}"#);
+        // An HTML body that does not *start* like JSON is left alone.
+        let out = transform_res_body(
+            Bytes::from_static(br#"<p>{"a":1}</p>"#),
+            &resolved,
+            Some("text/html"),
+        );
+        assert_eq!(String::from_utf8_lossy(&out), r#"<p>{"a":1}</p>"#);
+    }
+
+    #[test]
+    fn res_body_regex_replace_honours_the_g_flag() {
+        let once = resolve("example.com/x resReplace:///\\d+/=N\n", "http://example.com/x");
+        let out = transform_res_body(
+            Bytes::from_static(b"id=123 and 45"),
+            &once,
+            Some("text/plain"),
+        );
+        assert_eq!(&out[..], b"id=N and 45");
+
+        let all = resolve("example.com/x resReplace:///\\d+/g=N\n", "http://example.com/x");
+        let out = transform_res_body(
+            Bytes::from_static(b"id=123 and 45"),
+            &all,
+            Some("text/plain"),
+        );
         assert_eq!(&out[..], b"id=N and N");
+    }
+
+    /// A pattern that is not exactly `/source/[igmu]` is a literal string, not
+    /// a regexp — `ORIG_REG_EXP` anchors both ends and admits only those flags.
+    #[test]
+    fn a_half_formed_regexp_is_a_literal_pattern() {
+        assert_eq!(split_regexp("/\\d+/g"), Some(("\\d+", "g")));
+        assert_eq!(split_regexp("/a\\/b/"), Some(("a\\/b", "")));
+        assert_eq!(split_regexp("/a/x"), None, "`x` is not a whistle flag");
+        assert_eq!(split_regexp("/a/gimux"), None);
+        assert_eq!(split_regexp("//"), None, "an empty source is not a regexp");
+        assert_eq!(split_regexp("a/b"), None);
+
+        let resolved = resolve("example.com/x resReplace:////=Z\n", "http://example.com/x");
+        let out = transform_res_body(
+            Bytes::from_static(b"a // b // c"),
+            &resolved,
+            Some("text/plain"),
+        );
+        assert_eq!(&out[..], b"a Z b Z c", "a literal pattern replaces them all");
+    }
+
+    /// `$&` and `$1` reach the replacement, and `/.*/ ` swaps the whole body.
+    #[test]
+    fn regex_replacement_back_references() {
+        let resolved = resolve(
+            "example.com/x resReplace:///(\\w+)@(\\w+)/g=$2.$1x\n",
+            "http://example.com/x",
+        );
+        let out = transform_res_body(Bytes::from_static(b"a@b c@d"), &resolved, Some("text/plain"));
+        assert_eq!(&out[..], b"b.ax d.cx", "`$1x` is group 1 then a literal x");
+
+        assert_eq!(js_replacement("[$&]"), "[${0}]");
+        assert_eq!(js_replacement("\\$1"), "$$1");
+
+        let all = resolve("example.com/x resReplace:///.*/g=ONLY\n", "http://example.com/x");
+        let out = transform_res_body(Bytes::from_static(b"whatever"), &all, Some("text/plain"));
+        assert_eq!(&out[..], b"ONLY", "`/.*/ ` replaces the body exactly once");
     }
 
     #[test]
@@ -1797,14 +3054,14 @@ mod tests {
     #[test]
     fn delete_headers_and_cookies() {
         let resolved = resolve(
-            "example.com delete://x-req|reqCookies.sid\n",
+            "example.com delete://reqHeaders.x-req&reqCookies.sid\n",
             "http://example.com/",
         );
         let mut h = HeaderMap::new();
         h.insert("x-req", "1".parse().unwrap());
         h.insert("x-keep", "2".parse().unwrap());
         h.insert(hyper::header::COOKIE, "sid=abc; keep=1".parse().unwrap());
-        apply_deletes(&mut h, &resolved, true);
+        apply_deletes(&mut h, &Deletions::of(&resolved, true));
         assert!(h.get("x-req").is_none());
         assert!(h.get("x-keep").is_some());
         let c = h.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
@@ -1812,29 +3069,122 @@ mod tests {
         assert!(c.contains("keep=1"));
     }
 
+    /// whistle matches `delete://` keys against a fixed set of anchored
+    /// patterns (`_original/lib/util/index.js:2661-2669`) and ignores anything
+    /// else — including a bare header name, and the singular `header.`.
     #[test]
-    fn header_replace_regex() {
-        let resolved = resolve(
-            "example.com headerReplace://{\"resH.x-foo:ba.\":\"XX\"}\n",
-            "http://example.com/",
+    fn delete_keys_follow_upstreams_spellings() {
+        let names = |rule: &str, request_side: bool| {
+            let r = resolve(&format!("example.com delete://{rule}\n"), "http://example.com/");
+            Deletions::of(&r, request_side).headers
+        };
+        for spelling in [
+            "resHeaders.x-a",
+            "resHeader.x-a",
+            "resH.x-a",
+            "res.headers.x-a",
+            "res.h.x-a",
+            "RESHEADERS.x-a",
+            "headers.x-a",
+        ] {
+            assert_eq!(names(spelling, false), ["x-a"], "{spelling}");
+        }
+        for ignored in ["x-a", "header.x-a", "reqHeaders.x-a", "Headers.x-a"] {
+            assert!(names(ignored, false).is_empty(), "{ignored} must be inert");
+        }
+        // The type/charset keys are their own thing, not header names.
+        let r = resolve("example.com delete://resType&res.charset\n", "http://example.com/");
+        let del = Deletions::of(&r, false);
+        assert!(del.drop_type && del.drop_charset && del.headers.is_empty());
+    }
+
+    /// A `headerReplace` pattern is a regexp only in the `/…/flags` spelling;
+    /// anything else is a literal, replaced everywhere it occurs.
+    #[test]
+    fn header_replace_patterns() {
+        let replaced = |rule: &str, value: &str| {
+            let resolved = resolve(
+                &format!("example.com headerReplace://{rule}\n"),
+                "http://example.com/",
+            );
+            let mut h = HeaderMap::new();
+            h.insert("x-foo", value.parse().unwrap());
+            apply_header_replace(&mut h, &resolved, false);
+            h.get("x-foo").map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            replaced("{\"resH.x-foo:/ba./g\":\"XX\"}", "bar-baz"),
+            Some("XX-XX".to_string())
         );
-        let mut h = HeaderMap::new();
-        h.insert("x-foo", "bar-baz".parse().unwrap());
-        apply_header_replace(&mut h, &resolved, false);
-        assert_eq!(h.get("x-foo").unwrap(), "XX-XX");
+        assert_eq!(
+            replaced("{\"resH.x-foo:ba.\":\"XX\"}", "bar-baz"),
+            Some("bar-baz".to_string()),
+            "`ba.` is a literal, and `bar-baz` does not contain it"
+        );
+        assert_eq!(
+            replaced("{\"resH.x-foo:ba\":\"XX\"}", "bar-baz"),
+            Some("XXr-XXz".to_string())
+        );
+        // `reqHeaders.`/`resHeaders.` are not among upstream's four prefixes.
+        assert_eq!(
+            replaced("{\"resHeaders.x-foo:bar\":\"XX\"}", "bar"),
+            Some("bar".to_string())
+        );
+        // A key with no `:` has no pattern at all.
+        assert_eq!(
+            replaced("{\"res.x-foo\":\"XX\"}", "bar"),
+            Some("bar".to_string())
+        );
     }
 
     #[test]
     fn charset_set_and_strip() {
         let mut h = HeaderMap::new();
         h.insert(hyper::header::CONTENT_TYPE, "text/html".parse().unwrap());
-        set_charset(&mut h, "utf-8");
+        set_charset(&mut h, Some("utf-8"), false, false);
         assert_eq!(
             h.get(hyper::header::CONTENT_TYPE).unwrap(),
             "text/html; charset=utf-8"
         );
-        strip_charset(&mut h);
+        set_charset(&mut h, None, false, true);
         assert_eq!(h.get(hyper::header::CONTENT_TYPE).unwrap(), "text/html");
+
+        // `delete://resType` empties the media type but keeps the parameters —
+        // upstream blanks slot 0 rather than removing the header.
+        set_charset(&mut h, Some("gbk"), true, false);
+        assert_eq!(h.get(hyper::header::CONTENT_TYPE).unwrap(), "; charset=gbk");
+        // Nothing left at all removes the header.
+        set_charset(&mut h, None, true, true);
+        assert!(h.get(hyper::header::CONTENT_TYPE).is_none());
+    }
+
+    /// `resType://json` is a short name to look up, and a value with no
+    /// parameters inherits the ones already on the header (`getNewType`).
+    #[test]
+    fn res_type_looks_up_short_names() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            hyper::header::CONTENT_TYPE,
+            "text/html; charset=gbk".parse().unwrap(),
+        );
+        set_content_type(&mut h, "json", no_type_alias);
+        assert_eq!(
+            h.get(hyper::header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=gbk"
+        );
+        // An explicit parameter replaces the lot.
+        set_content_type(&mut h, "text/plain;charset=utf-8", no_type_alias);
+        assert_eq!(
+            h.get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/plain;charset=utf-8"
+        );
+        // An unknown short name is whistle's octet-stream default; `sse` is the
+        // one name that is not a file extension.
+        assert_eq!(lookup_type("nosuchtype", no_type_alias), "application/octet-stream");
+        assert_eq!(lookup_type("sse", no_type_alias), "text/event-stream");
+        // The request side has extra aliases of its own.
+        assert_eq!(lookup_type("form", req_type_alias), "application/x-www-form-urlencoded");
+        assert_eq!(lookup_type("form", no_type_alias), "application/octet-stream");
     }
 
     #[test]
@@ -2395,7 +3745,7 @@ mod tests {
     fn gating_is_per_line() {
         let out = inject(
             "example.com/x htmlAppend://<!--guarded--> lineProps://safeHtml\n\
-             example.com/x htmlPrepend://<!--free-->\n",
+             example.com/x htmlPrepend://<!--free--> disable://doctype\n",
             "{\"a\":1}",
             HTML,
         );
@@ -2449,16 +3799,504 @@ mod tests {
         assert_eq!(out, "hello");
     }
 
+    // ── typed body operators (html/js/css) ──
+
+    /// `jsXxx`/`cssXxx` reach an **HTML** response too, not just a JS or CSS
+    /// one: `isJs = isHtml || resType === 'JS'`
+    /// (`_original/lib/inspectors/res.js:952-954`). Raw JavaScript cannot go
+    /// into markup as-is, so it arrives wrapped.
     #[test]
-    fn res_cookies_set() {
-        let resolved = resolve("example.com resCookies://sid=abc\n", "http://example.com/");
+    fn js_and_css_operators_reach_html_responses() {
+        let out = inject(
+            "example.com/x jsAppend://alert(1) disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(out, "<p>hi</p><script>alert(1)</script>");
+
+        let out = inject(
+            "example.com/x cssPrepend://body{color:red} disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(out, "<style>body{color:red}</style><p>hi</p>");
+    }
+
+    /// A bare URL is linked rather than inlined (`GEN_URL_RE` → `wrapJs`/`wrapCss`).
+    #[test]
+    fn a_url_value_becomes_a_script_or_link_tag() {
+        let out = inject(
+            "example.com/x jsAppend://https://cdn.test/a.js disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(out, "<p>hi</p><script src=\"https://cdn.test/a.js\"></script>");
+
+        let out = inject(
+            "example.com/x cssAppend:////cdn.test/a.css disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(
+            out,
+            "<p>hi</p><link rel=\"stylesheet\" href=\"//cdn.test/a.css\" />"
+        );
+        // Not a URL: an inline script that merely starts with a comment.
+        assert!(!GEN_URL_RE.is_match("// just a comment"));
+    }
+
+    /// Line properties become `<script>` attributes (`getScriptProps`).
+    #[test]
+    fn line_props_become_script_attributes() {
+        let out = inject(
+            "example.com/x jsAppend://https://cdn.test/a.js lineProps://defer|module|anonymous disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(
+            out,
+            "<p>hi</p><script crossorigin=\"anonymous\" defer type=\"module\" src=\"https://cdn.test/a.js\"></script>"
+        );
+        assert_eq!(script_props(&LineProps::default()), "");
+        // The crossorigin spellings are exclusive, most specific first.
+        let props = LineProps::from_actions(["useCredentials", "anonymous", "crossorigin"]);
+        assert_eq!(script_props(&props), " crossorigin=\"use-credentials\"");
+    }
+
+    /// On a JS or CSS response the value goes in raw — there is no markup to
+    /// wrap it into — and the generic `res*` operator comes first, CRLF-joined.
+    #[test]
+    fn typed_operators_are_unwrapped_outside_html() {
+        let out = inject(
+            "example.com/x jsAppend://alert(1)\nexample.com/x resAppend:///*tail*/\n",
+            "var a;",
+            "application/javascript",
+        );
+        assert_eq!(out, "var a;/*tail*/\r\nalert(1)");
+        // A CSS response ignores the JS family entirely.
+        let out = inject(
+            "example.com/x jsAppend://alert(1)\nexample.com/x cssAppend://a{}\n",
+            "b{}",
+            "text/css",
+        );
+        assert_eq!(out, "b{}a{}");
+    }
+
+    /// Every slot orders its contributors `res*` → `css*` → `html*` → `js*`
+    /// (`_original/lib/inspectors/res.js:1063-1072`), joined with CRLF.
+    #[test]
+    fn html_slots_keep_the_upstream_family_order() {
+        let out = inject(
+            "example.com/x resAppend://R\nexample.com/x cssAppend://C\n\
+             example.com/x htmlAppend://H\nexample.com/x jsAppend://J\n\
+             example.com/x disable://doctype\n",
+            "<p></p>",
+            HTML,
+        );
+        assert_eq!(
+            out,
+            "<p></p>R\r\n<style>C</style>\r\nH\r\n<script>J</script>"
+        );
+    }
+
+    /// A `*Body` operator replaces the body while `top`/`bottom` still wrap it.
+    #[test]
+    fn body_operators_replace_and_stay_wrapped() {
+        let out = inject(
+            "example.com/x htmlBody://<b>new</b>\nexample.com/x resPrepend://<!--t-->\n\
+             example.com/x resAppend://<!--b-->\nexample.com/x disable://doctype\n",
+            "<p>old</p>",
+            HTML,
+        );
+        assert_eq!(out, "<!--t--><b>new</b><!--b-->");
+        // A blank `resBody` empties the body (`resBody || util.EMPTY_BUFFER`).
+        assert_eq!(inject("example.com/x resBody://\n", "keep?", "text/plain"), "");
+    }
+
+    /// whistle stamps a doctype in front of any `top` it injects into an HTML
+    /// response (`_original/lib/util/whistle-transform.js:116-118`), and
+    /// `disable://doctype` is the only way out.
+    #[test]
+    fn html_prepends_carry_a_doctype() {
+        assert_eq!(
+            inject("example.com/x resPrepend://<!--t-->\n", "<p></p>", HTML),
+            "<!DOCTYPE html>\r\n<!--t--><p></p>"
+        );
+        assert_eq!(
+            inject(
+                "example.com/x resPrepend://<!--t--> disable://doctype\n",
+                "<p></p>",
+                HTML
+            ),
+            "<!--t--><p></p>"
+        );
+        // `enable://` wins over `disable://` for the same flag (`isDisable`).
+        assert_eq!(
+            inject(
+                "example.com/x resPrepend://<!--t--> disable://doctype enable://doctype\n",
+                "<p></p>",
+                HTML
+            ),
+            "<!DOCTYPE html>\r\n<!--t--><p></p>"
+        );
+        // Only HTML, and only when something is actually prepended.
+        assert_eq!(
+            inject("example.com/x resAppend://<!--t-->\n", "<p></p>", HTML),
+            "<p></p><!--t-->"
+        );
+        assert_eq!(
+            inject("example.com/x resPrepend://x\n", "y", "text/plain"),
+            "xy"
+        );
+    }
+
+    /// The content classes, in upstream's test order.
+    #[test]
+    fn content_classes_match_upstream() {
+        assert_eq!(res_class("text/html; charset=utf-8"), Some(ResClass::Html));
+        assert_eq!(res_class("application/javascript"), Some(ResClass::Js));
+        assert_eq!(res_class("text/css"), Some(ResClass::Css));
+        assert_eq!(res_class("application/json"), Some(ResClass::Json));
+        assert_eq!(res_class("image/png"), Some(ResClass::Img));
+        assert_eq!(res_class("text/plain"), Some(ResClass::Text));
+        assert_eq!(res_class("application/octet-stream"), None);
+        assert_eq!(res_class(""), None);
+        // Parameters are stripped before the substring tests, so a filename in
+        // the type cannot promote an opaque body to HTML.
+        assert_eq!(res_class("application/octet-stream; name=a.html"), None);
+        // `application/ecmascript` is not `javascript` to whistle.
+        assert_eq!(res_class("application/ecmascript"), None);
+    }
+
+    /// Header operators take a `&`-separated list of pairs, like the other
+    /// JSON-shaped operators; `enable`/`disable` split on `|` and `&` only.
+    #[test]
+    fn header_and_flag_value_lists() {
+        let resolved = resolve(
+            "example.com resHeaders://x-a=1&x-b=2\nexample.com enable://p|q&r\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &resolved, "resHeaders");
+        assert_eq!(h.get("x-a").unwrap(), "1");
+        assert_eq!(h.get("x-b").unwrap(), "2");
+
+        let flags = enabled_flags(&resolved);
+        assert!(flags.contains("p") && flags.contains("q") && flags.contains("r"));
+        // A comma is not a separator upstream, so it stays part of the name.
+        let commas = resolve("example.com enable://p,q\n", "http://example.com/");
+        assert!(enabled_flags(&commas).contains("p,q"));
+    }
+
+    // ── response header operators ──
+
+    /// Response parts carrying `headers`, for the operator tests below.
+    fn res_parts(headers: &[(&str, &str)]) -> response::Parts {
+        let mut builder = Response::builder().status(200);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    /// Header value after applying `rules` to a response carrying `headers`.
+    fn res_header(rules: &str, headers: &[(&str, &str)], name: &str) -> Option<String> {
+        let resolved = resolve(rules, "http://example.com/x");
+        let mut parts = res_parts(headers);
+        apply_response(&mut parts, &resolved);
+        parts
+            .headers
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    /// `cache://` accepts a leading integer or one of three no-cache spellings,
+    /// and writes `Expires`/`Pragma` alongside `Cache-Control`. Anything else —
+    /// `cache://off`, say — is ignored rather than passed through.
+    #[test]
+    fn cache_operator_spellings() {
+        let cc = |v: &str| res_header(&format!("example.com cache://{v}\n"), &[], "cache-control");
+        assert_eq!(cc("600"), Some("max-age=600".to_string()));
+        assert_eq!(cc("60s"), Some("max-age=60".to_string()), "parseInt semantics");
+        assert_eq!(cc("-1"), Some("no-cache".to_string()));
+        assert_eq!(cc("no"), Some("no-cache".to_string()));
+        assert_eq!(cc("No-Cache"), Some("no-cache".to_string()));
+        assert_eq!(cc("no-store"), Some("no-store".to_string()));
+        assert_eq!(cc("off"), None, "not a spelling whistle recognises");
+        assert_eq!(cc("keep"), None);
+        assert_eq!(cc("reserve"), None);
+        // `keep`/`reserve` leave the upstream header where it was.
+        assert_eq!(
+            res_header(
+                "example.com cache://keep\n",
+                &[("cache-control", "max-age=5")],
+                "cache-control"
+            ),
+            Some("max-age=5".to_string())
+        );
+        let resolved = resolve("example.com cache://no\n", "http://example.com/x");
+        let mut parts = res_parts(&[]);
+        apply_response(&mut parts, &resolved);
+        assert_eq!(parts.headers.get("pragma").unwrap(), "no-cache");
+        assert!(
+            parts
+                .headers
+                .get("expires")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(" GMT")
+        );
+    }
+
+    /// Injecting into a body costs the response its CSP and its cacheability
+    /// (`_original/lib/inspectors/res.js:1093-1101`).
+    #[test]
+    fn injection_strips_csp_and_caching() {
+        let html = [
+            ("content-type", "text/html"),
+            ("content-security-policy", "default-src 'self'"),
+            ("cache-control", "max-age=600"),
+        ];
+        assert_eq!(
+            res_header(
+                "example.com jsAppend://alert(1)\n",
+                &html,
+                "content-security-policy"
+            ),
+            None,
+            "an injected script must not be blocked by the page's own CSP"
+        );
+        assert_eq!(
+            res_header("example.com jsAppend://alert(1)\n", &html, "cache-control"),
+            Some("no-store".to_string())
+        );
+        // `enable://keepCSP` and `enable://keepCache` opt out of each.
+        assert!(
+            res_header(
+                "example.com jsAppend://alert(1) enable://keepCSP|keepCache\n",
+                &html,
+                "content-security-policy"
+            )
+            .is_some()
+        );
+        assert_eq!(
+            res_header(
+                "example.com jsAppend://alert(1) enable://keepCache\n",
+                &html,
+                "cache-control"
+            ),
+            Some("max-age=600".to_string())
+        );
+        // An explicit `cache://` is the author's decision and survives.
+        assert_eq!(
+            res_header(
+                "example.com jsAppend://alert(1) cache://60\n",
+                &html,
+                "cache-control"
+            ),
+            Some("max-age=60".to_string())
+        );
+        // No injecting operator for *this* content type: nothing is stripped.
+        assert!(
+            res_header(
+                "example.com cssAppend://a{}\n",
+                &[
+                    ("content-type", "application/javascript"),
+                    ("content-security-policy", "default-src 'self'")
+                ],
+                "content-security-policy"
+            )
+            .is_some()
+        );
+    }
+
+    /// `attachment://` always names the file; with no value whistle falls back
+    /// to the request URL's last segment (`getFilename`).
+    #[test]
+    fn attachment_names_the_download() {
+        assert_eq!(
+            res_header("example.com attachment://报告.pdf\n", &[], "content-disposition"),
+            Some("attachment; filename=\"%E6%8A%A5%E5%91%8A.pdf\"".to_string()),
+            "a header value cannot carry non-Latin-1 bytes"
+        );
+        assert_eq!(encode_non_latin1("a b.pdf"), "a%20b.pdf");
+        let resolved = resolve("example.com attachment://\n", "http://example.com/d/report.csv");
+        let info = build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/d/report.csv",
+            &HeaderMap::new(),
+            None,
+        );
+        let mut parts = res_parts(&[]);
+        apply_response_for(&mut parts, &resolved, Some(&info));
+        assert_eq!(
+            parts.headers.get("content-disposition").unwrap(),
+            "attachment; filename=\"report.csv\""
+        );
+        assert_eq!(url_filename("http://a.com/x/y.pdf?q=1"), "y.pdf");
+        assert_eq!(url_filename("http://a.com/"), "index.html");
+        assert_eq!(url_filename("http://a.com"), "index.html");
+    }
+
+    /// `replaceStatus://401` also advertises the challenge whistle sends with it.
+    #[test]
+    fn replace_status_advertises_authentication() {
+        assert_eq!(
+            res_header("example.com replaceStatus://401\n", &[], "www-authenticate"),
+            Some("Basic realm=User Login".to_string())
+        );
+        assert_eq!(
+            res_header("example.com replaceStatus://407\n", &[], "proxy-authenticate"),
+            Some("Basic realm=User Login".to_string())
+        );
+    }
+
+    /// `resCors` negotiates rather than blanket-allowing: an explicit origin or
+    /// `enable` implies credentials, `*` does not, and a preflight fills the
+    /// requested methods/headers in from the request.
+    #[test]
+    fn res_cors_negotiates() {
+        let cors = |rule: &str, method: &str, req_headers: &[(&str, &str)], name: &str| {
+            let resolved = resolve(
+                &format!("example.com resCors://{rule}\n"),
+                "http://example.com/x",
+            );
+            let mut hm = HeaderMap::new();
+            for (k, v) in req_headers {
+                hm.insert(
+                    HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            let info = build_req_info(method, "http", "example.com", 80, "/x", &hm, None);
+            let mut parts = res_parts(&[]);
+            apply_response_for(&mut parts, &resolved, Some(&info));
+            parts.headers.get(name).map(|v| v.to_str().unwrap().to_string())
+        };
+
+        // `*` allows any origin but never credentials.
+        assert_eq!(
+            cors("*", "GET", &[], "access-control-allow-origin"),
+            Some("*".to_string())
+        );
+        assert_eq!(cors("*", "GET", &[], "access-control-allow-credentials"), None);
+
+        // `enable` echoes the caller's origin, with credentials.
+        let origin = [("origin", "https://app.test")];
+        assert_eq!(
+            cors("enable", "GET", &origin, "access-control-allow-origin"),
+            Some("https://app.test".to_string())
+        );
+        assert_eq!(
+            cors("enable", "GET", &origin, "access-control-allow-credentials"),
+            Some("true".to_string())
+        );
+        // …and does nothing at all when the request carries no origin.
+        assert_eq!(cors("enable", "GET", &[], "access-control-allow-origin"), None);
+
+        // An explicit URL is trimmed to its origin.
+        assert_eq!(
+            cors(
+                "https://app.test/some/path",
+                "GET",
+                &[],
+                "access-control-allow-origin"
+            ),
+            Some("https://app.test".to_string())
+        );
+
+        // The JSON form spells the rest out; `headers` is *expose* off-preflight.
+        let json = r#"{"methods":"GET,POST","headers":"x-a","maxAge":600}"#;
+        assert_eq!(
+            cors(json, "GET", &[], "access-control-allow-methods"),
+            Some("GET,POST".to_string())
+        );
+        assert_eq!(
+            cors(json, "GET", &[], "access-control-expose-headers"),
+            Some("x-a".to_string())
+        );
+        assert_eq!(
+            cors(json, "OPTIONS", &[], "access-control-allow-headers"),
+            Some("x-a".to_string())
+        );
+        assert_eq!(
+            cors(json, "GET", &[], "access-control-max-age"),
+            Some("600".to_string())
+        );
+
+        // A preflight completes itself from the request's own asks.
+        let preflight = [
+            ("access-control-request-headers", "x-token"),
+            ("access-control-request-method", "PUT"),
+        ];
+        assert_eq!(
+            cors("*", "OPTIONS", &preflight, "access-control-allow-headers"),
+            Some("x-token".to_string())
+        );
+        assert_eq!(
+            cors("*", "OPTIONS", &preflight, "access-control-allow-method"),
+            Some("PUT".to_string()),
+            "upstream writes the singular, non-standard name here"
+        );
+
+        // The query-string form.
+        assert_eq!(
+            cors("methods=GET&maxAge=30", "GET", &[], "access-control-max-age"),
+            Some("30".to_string())
+        );
+    }
+
+    /// `enable://cors` is not an upstream flag; whistle-rs keeps it as an alias
+    /// for `resCors://enable` rather than as a blanket `*`.
+    #[test]
+    fn enable_cors_is_an_alias_for_res_cors_enable() {
+        let resolved = resolve("example.com enable://cors\n", "http://example.com/x");
+        let mut hm = HeaderMap::new();
+        hm.insert("origin", "https://app.test".parse().unwrap());
+        let info = build_req_info("GET", "http", "example.com", 80, "/x", &hm, None);
+        let mut parts = res_parts(&[]);
+        apply_response_for(&mut parts, &resolved, Some(&info));
+        assert_eq!(
+            parts.headers.get("access-control-allow-origin").unwrap(),
+            "https://app.test"
+        );
+        // An explicit `resCors` wins over the alias.
+        let resolved = resolve(
+            "example.com enable://cors resCors://*\n",
+            "http://example.com/x",
+        );
+        let mut parts = res_parts(&[]);
+        apply_response_for(&mut parts, &resolved, Some(&info));
+        assert_eq!(parts.headers.get("access-control-allow-origin").unwrap(), "*");
+    }
+
+    /// `resCookies` replaces a `Set-Cookie` the response already sent under the
+    /// same name instead of adding a second one (`setResCookies`).
+    #[test]
+    fn res_cookies_replace_by_name() {
+        let resolved = resolve(
+            "example.com resCookies://sid=new&theme=dark\n",
+            "http://example.com/",
+        );
         let mut headers = HeaderMap::new();
+        headers.append(hyper::header::SET_COOKIE, "sid=old; Path=/".parse().unwrap());
+        headers.append(hyper::header::SET_COOKIE, "other=1".parse().unwrap());
         apply_res_cookies(&mut headers, &resolved);
         let vals: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
-        assert!(vals.iter().any(|v| v == "sid=abc"));
+        assert_eq!(vals, ["sid=new", "other=1", "theme=dark"]);
+
+        // A `;` in a value would end the cookie early, so it is encoded.
+        let resolved = resolve("example.com resCookies://a=x;Secure\n", "http://example.com/");
+        let mut headers = HeaderMap::new();
+        apply_res_cookies(&mut headers, &resolved);
+        assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x%3BSecure");
     }
 }
