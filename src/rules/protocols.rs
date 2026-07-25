@@ -100,15 +100,21 @@ pub const PROTOCOLS: &[&str] = &[
 
 /// Every upstream-proxy operator, in the order this port prefers them.
 ///
-/// whistle files all of them under a single `proxy` protocol, keeping only a
-/// `proxyName` to remember the spelling (`PROXY_RE` →
-/// `protocol = 'proxy'`, `_original/lib/rules/rules.js:1285-1288,1368-1388`).
-/// Two consequences follow, and both matter: at most one of them can win, and
-/// `ignore://proxy` drops whichever one matched. This port keeps them as
-/// separate keys, so the family has to be spelled out.
+/// whistle files all of them under one protocol key. A `socks://` line and a
+/// `proxy://` line both land in `_rules.proxy`, and the spelling survives only
+/// inside the stored matcher (`_original/lib/rules/rules.js:1305-1310`,
+/// `:1368-1388`). Two consequences follow from that, and both are behaviour:
 ///
-/// The `x`/`xs` spellings are absent because [`canonical`] has already folded
-/// them into their base protocol by the time a rule is resolved.
+/// * at most one upstream proxy can be in play, so the order here is a
+///   precedence order, not a list of independent operators;
+/// * `ignore://proxy` names the *family*, so it drops whichever one matched —
+///   `util.isIgnored(filter, 'proxy')` in `resolveProxy`
+///   (`_original/lib/rules/rules.js:2419-2443`). Naming one spelling
+///   (`ignore://socks`) drops only that one.
+///
+/// This port keeps a separate key per protocol, which is why the family has to
+/// be written down. The `x`/`xs` spellings are absent because [`canonical`] has
+/// already folded them into their base protocol by the time a rule resolves.
 pub const UPSTREAM_PROXY_PROTOCOLS: &[&str] = &[
     "socks",
     "https-proxy",

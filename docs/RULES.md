@@ -185,15 +185,33 @@ Route the forwarded request through another proxy. The address is
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `proxy` / `http-proxy` / `internal-proxy` / `internal-http-proxy` | `[user[:pass]@]host[:port]` | Route via an HTTP proxy |
-| `https-proxy` / `internal-https-proxy` | `[user[:pass]@]host[:port]` | Same, but the connection *to the proxy* is TLS |
+| `proxy` / `http-proxy` | `[user[:pass]@]host[:port]` | Route via an HTTP proxy |
+| `https-proxy` | `[user[:pass]@]host[:port]` | Same, but the connection *to the proxy* is TLS |
 | `socks` | `[user[:pass]@]host[:port]` | Route via a SOCKS5 proxy |
+| `http2https-proxy` | `[user[:pass]@]host[:port]` | HTTP proxy, and the **origin** is reached over TLS even for an `http://` request |
+| `https2http-proxy` / `internal-proxy` / `internal-http-proxy` | `[user[:pass]@]host[:port]` | HTTP proxy to another whistle: an `https://` origin's TLS is **stripped** for the hop |
+| `internal-https-proxy` | `[user[:pass]@]host[:port]` | The same, with a TLS connection to the proxy |
 
 ```
 example.com        proxy://127.0.0.1:8888
 .internal.corp     http-proxy://user:pass@10.0.0.1:3128
 secure.example.com socks://127.0.0.1:1080
 ```
+
+**Scheme-converting proxies.** Two families change what the *origin* connection
+speaks, which is the whole point of their names:
+
+- `http2https-proxy://` reaches the origin over TLS even though the request was
+  `http://` (`options.protocol = 'https:'`,
+  `_original/lib/inspectors/res.js:236-237`);
+- `https2http-proxy://` and the `internal-*` family hand the next hop a
+  **plaintext** request — they exist to chain to another whistle, which wants to
+  inspect it — and carry the original scheme in the
+  `x-whistle-https-request` header so that whistle restores it
+  (`res.js:229-234`, `lib/init.js:190-193`). whistle-rs sets that header when it
+  is the sending side and honours (and strips) it when it is the receiving one,
+  so two whistle-rs instances chain the way whistle does. Point one at a proxy
+  you do not control and the request travels in the clear.
 
 **How the hop is made.** Only a plain HTTP proxy fetching a plain HTTP origin
 sends the request in absolute-form (`GET http://host/path`); a TLS origin, a
@@ -212,7 +230,36 @@ credential at the first colon and sends an empty password. Hostnames are handed
 to the proxy unresolved (SOCKS5 address type 3), so the proxy does the DNS.
 
 If the upstream proxy is unreachable or refuses the `CONNECT`, the request
-fails with a 502 — it is never retried directly.
+fails with a 502 — it is never retried directly. The same goes for a proxy
+operator whose value is empty or unusable (`proxy://`, `socks://@`): the request
+fails with `proxy:// is not a usable proxy address` rather than quietly becoming
+a direct connection. whistle drops such a rule and connects direct; a rule that
+names a proxy and is silently ignored is exactly the failure this port refuses
+to reproduce.
+
+**Dropping the proxy.** `ignore://proxy` names the whole family, so it drops
+whichever proxy operator matched — `socks://`, `https-proxy://`,
+`http2https-proxy://` and the rest, not just a literal `proxy://`. That is
+whistle's behaviour, which keeps all of them under one protocol key
+(`resolveProxy`, `_original/lib/rules/rules.js:2419-2443`). Naming one spelling
+(`ignore://socks`) drops only that one. When a proxy operator matched and was
+ignored, a `pac://` rule on the same request is **not** consulted as a fallback
+(`_original/lib/rules/index.js:238`); `ignore://pac` drops a PAC rule on its own.
+
+```
+example.com   socks://127.0.0.1:1080
+example.com   ignore://proxy          # → direct, despite the socks rule
+```
+
+**A proxy that is this proxy.** `proxy://127.0.0.1:8899` — this proxy's own port
+on this machine, `--socks-port` included — would send the request back to
+whistle-rs, which would match the same rule and do it again until the process
+ran out of sockets. Such a hop is refused: the request is answered with a 302 to
+whistle-rs's own port (whistle's answer on the HTTP path,
+`_original/lib/inspectors/res.js:302-316`) and the log carries a
+`self loop via <address>` warning. Reaching the origin directly on our own port
+is left alone: it cannot recurse, because the request we send is not a proxy
+request.
 
 **Combining with `host://`.** By default a matching `host://` wins outright and
 the proxy is dropped. `proxyHost` (as `lineProps://proxyHost`, as
@@ -231,45 +278,46 @@ Precedence when several proxy operators match: `socks` > `https-proxy` >
 `http-proxy` > `proxy` > `internal-https-proxy` > `internal-proxy` >
 `internal-http-proxy` > `https2http-proxy` > `http2https-proxy` > `pac`.
 
-**Turning a proxy off.** `ignore://proxy` drops whichever upstream-proxy
-operator matched, whatever its spelling — `ignore://proxy` cancels a
-`socks://` rule just as it cancels a `proxy://` one, because upstream files all
-of them under one protocol. The specific name works too and is narrower:
-`ignore://socks` leaves an `http-proxy://` rule standing. Cancelling a proxy
-that matched also cancels any `pac://` fallback on the same request, so the
-request goes direct rather than quietly picking up a PAC-chosen proxy instead;
-with no proxy operator matched, `pac://` still applies and `ignore://pac` is
-what suppresses it.
-
-```
-example.com        socks://127.0.0.1:1080
-example.com        ignore://proxy          # goes direct after all
-```
-
 #### PAC
 
-`pac://<file>` evaluates a PAC file's `FindProxyForURL(url, host)` to pick the
-proxy. The result is read left to right; the first `PROXY`/`HTTP host:port`,
-`HTTPS host:port` or `SOCKS`/`SOCKS5 host:port` entry wins, and `DIRECT` means
-connect without a proxy.
+`pac://<location>` evaluates a PAC file's `FindProxyForURL(url, host)` to pick
+the proxy. The result is read left to right; the first `PROXY`/`HTTP host:port`,
+`HTTPS host:port` or `SOCKS`/`SOCKS5 host:port` entry wins, and `DIRECT` —
+anywhere in the list — means connect without a proxy.
+
+The location may be a local file, a `http(s)://` URL, or (whistle-rs only) the
+script itself inline, which in practice means a script with no whitespace in it,
+since a rule token ends at the first space.
 
 ```
 .corp.example.com   pac:///etc/whistle/corp.pac
+.corp.example.com   pac://http://wpad.corp.example.com/proxy.pac
 ```
 
-Known limits of this port's PAC support — each of these **falls back to a direct
-connection**, so a rule that looks like it is routing traffic may not be:
+A remote PAC file is fetched once and cached for 5 minutes, up to ten files at a
+time (whistle caches ten and never re-reads them, `cachedPacs`,
+`_original/lib/rules/index.js:264-274`). If a refresh fails, the cached copy
+keeps being used.
 
-- the value must be a **local file path** (or the script itself inline). A
-  remote `pac://http://…/proxy.pac` is *not* fetched; upstream fetches and
-  caches it (`node-pac`, `_original/lib/rules/index.js:257-275`);
-- only `isPlainHostName`, `dnsDomainIs` and `shExpMatch` are provided. A script
-  calling `myIpAddress`, `isInNet`, `dnsResolve`, `isResolvable`,
-  `localHostOrDomainIs`, `dnsDomainLevels`, `weekdayRange`, `dateRange` or
-  `timeRange` throws and yields no proxy;
-- `SOCKS4` results are ignored, and a `user@` prefix on the PAC URL
-  (upstream's `_pacAuth`) is not read as a credential;
-- the script is re-read and re-evaluated on every request rather than cached.
+The helper functions a PAC file may call are all present: `isPlainHostName`,
+`dnsDomainIs`, `localHostOrDomainIs`, `isResolvable`, `isInNet`, `dnsResolve`,
+`myIpAddress`, `dnsDomainLevels`, `shExpMatch`, `weekdayRange`, `dateRange`,
+`timeRange`, `convert_addr`, `alert`, and Microsoft's `isResolvableEx`,
+`isInNetEx`, `dnsResolveEx`, `myIpAddressEx`, `sortIpAddressList`,
+`getClientVersion`. A script that defines its own copy of one overrides ours.
+Name resolution is IPv4-only, so the `*Ex` helpers answer from the same data
+rather than pretending to know more.
+
+**A PAC file that fails does not mean `DIRECT`.** If the script cannot be
+fetched or read, does not parse, defines no `FindProxyForURL`, throws, or
+returns something with no usable entry (a `SOCKS4` proxy, say — this port speaks
+SOCKS5 only), the request **fails with a 502** naming the reason. whistle logs
+the error and connects direct (`_original/lib/rules/index.js:295`); a rule that
+pins traffic to a corporate proxy and silently stops doing so is the one outcome
+worth refusing. Only an explicit `DIRECT` is a direct connection.
+
+Still missing: a `user@` prefix on the PAC URL is not read as a proxy credential
+(upstream's `_pacAuth`), and `SOCKS4` is not supported.
 
 ### URL rewriting
 
@@ -890,15 +938,17 @@ that source at load time; `${port}` and `${version}` in operator values are subs
 `download→attachment`, `status→statusCode`, `skip→ignore`, `tlsOptions→cipher`,
 `pathReplace→urlReplace`, `reqMerge→params`, `resRules→resScript`,
 `ruleFile`/`ruleScript`/`rulesScript`/`reqScript`/`reqRules`→`rulesFile`, `P→G`.
+An `ignore://` naming an alias is normalised the same way, so `ignore://hosts`
+drops `host://` and `ignore://xproxy` drops the upstream-proxy family.
 
-Notes: `http2https-proxy://` does upgrade the origin hop — an `http://` request
-reaches the origin over TLS, through a `CONNECT` tunnel. `https2http-proxy` and
-the `internal-*` family resolve as plain HTTP proxies: their scheme conversion is
-**not** implemented, and they do not use whistle's whistle-to-whistle handshake
-(`x-whistle-https-request`), tunnelling with `CONNECT` instead. The `x`-prefixed
-variants (`xproxy://`, `xsocks://`, …) are aliases of their base proxy: upstream
-falls back to a **direct** connection when the proxy fails, this port does not
-and returns 502. `enable`/`disable` apply a curated flag set (see the
+Notes: `http2https-proxy`/`https2http-proxy` and the `internal-*` family do
+convert the origin scheme, and the stripped-TLS hop carries whistle's
+`x-whistle-https-request` marker (see [Upstream proxy](#upstream-proxy)); what is
+still missing from the `internal-*` family is the rest of whistle's
+whistle-to-whistle handshake — the client-id and intercept-policy headers. The
+`x`-prefixed variants (`xproxy://`, `xsocks://`, …) are aliases of their base
+proxy: upstream falls back to a **direct** connection when the proxy fails, this
+port does not and returns 502. `enable`/`disable` apply a curated flag set (see the
 [Flags](#flags-includes--values) table — others are inert); `pipe` routes to a
 registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
 extra rules from the values store / a file; `{name}` in any operator value is
@@ -910,9 +960,9 @@ so OpenSSL cipher-suite strings and older-than-1.2 pins are not honoured.
 **Upstream certificate verification differs from whistle's.** whistle sets
 `rejectUnauthorized: false` by default (`_original/lib/config.js:74`) and only
 verifies when started with `--safe`, so it happily debugs origins with
-self-signed, expired or private-CA certificates. This port always verifies the
-origin (and an `https-proxy://`) against the webpki root store, so those origins
-return 502 here. There is currently no flag to relax it.
+self-signed, expired or private-CA certificates. This port verifies the origin
+(and an `https-proxy://`) against the webpki root store by default, so those
+origins return 502 here unless it is started with `--insecure-upstream`.
 
 The local-file family serves from disk: `file`/`rawfile` serve bytes (`rawfile`
 parses a full HTTP response file — status line + headers + body); the `x`/`xs`

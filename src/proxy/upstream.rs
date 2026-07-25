@@ -16,10 +16,13 @@
 //! URI only for a plain HTTP proxy reaching a plain HTTP origin; TLS, SOCKS, an
 //! HTTPS proxy or a `host://` override each open a tunnel first (`res.js:292-297`).
 //! See [`uses_absolute_form`].
+//!
+//! One hop is refused outright: an upstream proxy that turns out to be *this*
+//! process. See [`self_loop`].
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -109,6 +112,12 @@ pub struct Target {
     pub connect_port: u16,
     /// Whether the origin speaks TLS.
     pub tls: bool,
+    /// True when [`Self::tls`] is false only because an `internal-*` /
+    /// `https2http-proxy` hop stripped the origin's TLS. The request then
+    /// carries whistle's `x-whistle-https-request` marker so the whistle on the
+    /// far side of the hop restores the scheme
+    /// (`_original/lib/inspectors/res.js:229-234`, `lib/init.js:190-193`).
+    pub origin_tls_stripped: bool,
     /// SNI / certificate hostname + `Host` header (the original request host).
     pub sni: String,
     /// The original request port (for the `Host` header / absolute-form URIs).
@@ -126,6 +135,125 @@ impl Target {
     /// request (`_original/lib/inspectors/res.js:296`).
     fn has_host_override(&self) -> bool {
         self.connect_host != self.sni || self.connect_port != self.request_port
+    }
+}
+
+// ── self-loop guard ────────────────────────────────────────────────────────
+//
+// `proxy://127.0.0.1:<our own port>` is a rule that routes a request back into
+// the process that is making it. The copy that arrives matches the same rule
+// and is proxied to us again, so the recursion is unbounded: each turn holds
+// two sockets open and the machine dies with "Too many open files" rather than
+// with an error naming the rule. whistle refuses the hop instead —
+// `isProxyPort(port) && isLocalAddress(ip)` (`_original/lib/util/index.js:1703`,
+// `:896`) is checked before every proxied connection, and answered with a 302
+// to whistle's own UI on the HTTP path (`lib/inspectors/res.js:302-316`) or a
+// "Self loop" error on the tunnel path (`lib/tunnel.js:457-465`,
+// `lib/https/index.js:339-343`).
+
+/// Where this process accepts proxy traffic; the input to [`self_loop`].
+#[derive(Default)]
+struct Listen {
+    /// Every port we serve on: the main proxy port and `--socks-port`.
+    /// whistle's `isProxyPort` compares against the same list
+    /// (`config.port`, `httpsPort`, `httpPort`, `socksPort`, `realPort`).
+    ports: Vec<u16>,
+    /// The address we bound to, or `None` when bound to all interfaces.
+    bind: Option<IpAddr>,
+}
+
+static LISTEN: Lazy<RwLock<Listen>> = Lazy::new(Default::default);
+
+/// Record where this proxy listens, so [`self_loop`] can recognise itself.
+/// Called once from [`crate::proxy::run`] before the first connection is served;
+/// until then no port matches and the guard simply never fires.
+pub fn set_listen(bind: Option<IpAddr>, ports: &[u16]) {
+    if let Ok(mut listen) = LISTEN.write() {
+        listen.bind = bind;
+        listen.ports = ports.to_vec();
+    }
+}
+
+/// Is `port` one this proxy itself serves on? (whistle's `isProxyPort`.)
+fn is_own_port(port: u16) -> bool {
+    LISTEN
+        .read()
+        .map(|l| l.ports.contains(&port))
+        .unwrap_or(false)
+}
+
+/// This machine's primary outbound address.
+///
+/// whistle keeps every interface address (`addressList`,
+/// `_original/lib/util/index.js:896-908`) so that naming the machine's LAN
+/// address is recognised as naming itself. Enumerating interfaces needs a
+/// platform crate; we ask the routing table instead, which covers the same
+/// case for the address traffic actually leaves by. Connecting a UDP socket
+/// sends no packets — it only fixes the local address the kernel would pick —
+/// and the peer is a documentation address (RFC 5737) that is never contacted.
+static PRIMARY_LOCAL_IP: Lazy<Option<IpAddr>> = Lazy::new(|| {
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    sock.connect(("192.0.2.1", 80)).ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+});
+
+/// This machine's primary outbound address, when the routing table can say.
+/// Also what a PAC file's `myIpAddress()` reports (`crate::proxy::script`).
+pub fn primary_local_ip() -> Option<IpAddr> {
+    *PRIMARY_LOCAL_IP
+}
+
+/// Does `ip` name this machine? (whistle's `isLocalAddress`.)
+fn is_local_ip(ip: IpAddr) -> bool {
+    // `0.0.0.0` is how a proxy value spells "everything local"; whistle treats
+    // it as local too, via `isLocalIp`.
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    if LISTEN.read().ok().and_then(|l| l.bind) == Some(ip) {
+        return true;
+    }
+    *PRIMARY_LOCAL_IP == Some(ip)
+}
+
+/// The address a hop would loop back to, if routing `target` would hand the
+/// request to this very proxy.
+///
+/// Only the **proxy hop** is examined. A direct connection to our own port
+/// cannot recurse in this port: the request we send is origin-form, so the
+/// copy that arrives is not a proxy request and is answered by the web UI.
+/// whistle 302s that case as well (`res.js:409-420`); reproducing the redirect
+/// would turn `curl -x localhost:8899 http://localhost:8899/rootCA.crt` into a
+/// redirect loop here, since we would send the client back through the proxy.
+pub async fn self_loop(target: &Target) -> Option<SocketAddr> {
+    let proxy = target.proxy.as_ref()?;
+    // The port check is first and needs no I/O, so the common request pays
+    // nothing: only a hop that already names one of our ports is resolved.
+    if !is_own_port(proxy.port) {
+        return None;
+    }
+    resolve_ips(&proxy.host, proxy.port)
+        .await
+        .into_iter()
+        .find(|ip| is_local_ip(*ip))
+        .map(|ip| SocketAddr::new(ip, proxy.port))
+}
+
+/// Resolve a proxy host to the addresses it would connect to. A hostname is
+/// looked up (whistle resolves the proxy URL the same way, `getServerIp`);
+/// failure yields no addresses, so an unresolvable host is not a self-loop and
+/// fails later, at connect time, with its own error.
+async fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
+    let host = host.trim_matches(['[', ']']);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+        Err(err) => {
+            tracing::debug!("resolving proxy host {host}: {err}");
+            Vec::new()
+        }
     }
 }
 
@@ -321,6 +449,13 @@ fn uses_absolute_form(target: &Target) -> bool {
 /// Forward `req` to `target` and return the upstream response (body still
 /// streaming). The request URI arrives origin-form with a `Host` header.
 pub async fn forward(target: &Target, mut req: Request<DynBody>) -> Result<Response<Incoming>> {
+    // Refused before anything is sent: a proxy hop pointing back at us would
+    // recurse until the process runs out of sockets. A caller that can answer
+    // more helpfully checks [`self_loop`] itself; this is the backstop on the
+    // one path every request takes into the network.
+    if let Some(addr) = self_loop(target).await {
+        bail!("Self loop ({addr})");
+    }
     let hop = Hop::from_request(&req);
 
     // A plain HTTP proxy fetching an http origin uses absolute-form + Proxy-Auth.
@@ -634,6 +769,7 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
         connect_host: host.clone(),
         connect_port: port,
         tls,
+        origin_tls_stripped: false,
         sni: host,
         request_port: port,
         proxy: None,
@@ -750,6 +886,7 @@ mod tests {
             connect_host: host.to_string(),
             connect_port: port,
             tls: false,
+            origin_tls_stripped: false,
             sni: host.to_string(),
             request_port: port,
             proxy,
@@ -857,6 +994,45 @@ mod tests {
         let mut phost = target("a.com", 80, Some(http()));
         phost.connect_host = "10.0.0.9".into();
         assert!(!uses_absolute_form(&phost));
+    }
+
+    /// A hop that names one of our own ports on an address of this machine is
+    /// refused before a socket is opened — whistle's "Self loop"
+    /// (`_original/lib/tunnel.js:457-465`). Everything one step away from that
+    /// (another local port, our port elsewhere, a direct connection) still goes.
+    ///
+    /// The ports registered here are outside the ephemeral range, so they can
+    /// never collide with a listener another test bound to port 0.
+    #[test]
+    fn a_proxy_pointing_back_at_us_is_refused() {
+        rt().block_on(async {
+            let cfg = |v: &str| parse_proxy(ProxyKind::Http, v).unwrap();
+            // Nothing is registered until the server starts: no port matches.
+            assert!(self_loop(&target("a.com", 80, Some(cfg("127.0.0.1:8899")))).await.is_none());
+
+            set_listen(None, &[8899, 1080]);
+
+            let looped = target("a.com", 80, Some(cfg("127.0.0.1:8899")));
+            assert_eq!(
+                self_loop(&looped).await.map(|a| a.to_string()),
+                Some("127.0.0.1:8899".to_string())
+            );
+            let err = forward(&looped, get("/", "a.com")).await.unwrap_err();
+            assert!(format!("{err:#}").contains("Self loop"), "{err:#}");
+
+            // The SOCKS port counts too, and a hostname is resolved first.
+            let socks = parse_proxy(ProxyKind::Socks, "localhost:1080").unwrap();
+            assert!(self_loop(&target("a.com", 80, Some(socks))).await.is_some());
+
+            // A different local port is somebody else's proxy.
+            assert!(self_loop(&target("a.com", 80, Some(cfg("127.0.0.1:8898")))).await.is_none());
+            // Our port number on another machine is not us.
+            assert!(self_loop(&target("a.com", 80, Some(cfg("203.0.113.7:8899")))).await.is_none());
+            // A direct connection to our own port cannot recurse; not checked.
+            assert!(self_loop(&target("127.0.0.1", 8899, None)).await.is_none());
+
+            set_listen(None, &[]);
+        });
     }
 
     #[test]

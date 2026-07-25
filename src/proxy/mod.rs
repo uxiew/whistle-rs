@@ -65,6 +65,39 @@ fn take_internal_marker(headers: &mut hyper::HeaderMap) -> bool {
     }
 }
 
+/// Request header saying "this request was https before the hop that carried it
+/// here" — whistle's `config.HTTPS_FIELD`
+/// (`'x-whistle-https-request'`, `_original/lib/util/common.js:160`).
+///
+/// An `internal-*` or `https2http-proxy://` hop deliberately hands the next
+/// whistle a plaintext request so it can be inspected, and sets this header so
+/// the scheme is not lost on the way (`_original/lib/inspectors/res.js:229-234`).
+/// We set it when we are the sending side and honour it when we are the
+/// receiving one (`lib/init.js:190-193`), which is what makes a chain of two
+/// whistles behave like one.
+pub const HTTPS_REQ_HEADER: &str = "x-whistle-https-request";
+
+/// Add [`HTTPS_REQ_HEADER`] when the hop we are about to make strips the
+/// origin's TLS, so the whistle on the far side knows the request was https.
+fn mark_stripped_tls(headers: &mut hyper::HeaderMap, target: &upstream::Target) {
+    if target.origin_tls_stripped {
+        headers.insert(
+            hyper::header::HeaderName::from_static(HTTPS_REQ_HEADER),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+    }
+}
+
+/// Strip the stripped-TLS marker, reporting whether it was present. Like the
+/// internal marker it is consumed on arrival, so it never reaches a rule
+/// condition, the capture, or the origin.
+fn take_https_marker(headers: &mut hyper::HeaderMap) -> bool {
+    match headers.remove(HTTPS_REQ_HEADER) {
+        Some(v) => !v.is_empty(),
+        None => false,
+    }
+}
+
 /// Maximum number of captured WebSocket frames kept in memory (across all
 /// connections). Whistle surfaces every frame; we keep a bounded ring buffer.
 const MAX_FRAMES: usize = 2000;
@@ -647,6 +680,13 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     );
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("whistle-rs listening on http://{addr}");
+
+    // Teach the forwarding layer which addresses are *us*, so a `proxy://` rule
+    // naming this proxy is refused instead of recursing into it. Registered
+    // before the first connection is accepted; see `upstream::self_loop`.
+    let mut own_ports = vec![state.config.port];
+    own_ports.extend(state.config.socks_port);
+    upstream::set_listen(state.config.host, &own_ports);
     tracing::info!(
         "root CA: {} (download at http://{}/rootCA.crt)",
         state.config.root_ca_cert_path().display(),
@@ -850,13 +890,21 @@ async fn serve(
     // deletes its own marker on arrival: rule filters, plugins, the capture and
     // the origin server must never see it.
     let is_internal_req = take_internal_marker(req.headers_mut());
+    // Consumed here too: an upstream whistle stripped this request's TLS for the
+    // hop, and the scheme it arrived under is not the one the rules should see.
+    let was_https = take_https_marker(req.headers_mut());
 
     // Derive scheme/host/port/path for matching.
     let (scheme, host, port, path) = match &origin {
         Origin::Forward => {
             let uri = req.uri();
             let host = uri.host().unwrap_or_default().to_string();
-            let scheme = uri.scheme_str().unwrap_or("http").to_string();
+            let mut scheme = uri.scheme_str().unwrap_or("http").to_string();
+            if was_https && scheme == "http" {
+                scheme = "https".to_string();
+            }
+            // Read after the marker, so a request restored to https and carrying
+            // no explicit port lands on 443 rather than 80.
             let port = uri
                 .port_u16()
                 .unwrap_or(if scheme == "https" { 443 } else { 80 });
@@ -1048,7 +1096,47 @@ async fn serve(
         .await;
     }
 
-    let target = apply::resolve_target(&info, &resolved);
+    // Fails the request rather than silently connecting direct when a proxy rule
+    // matched but could not be honoured (unusable address, unreachable or
+    // throwing PAC file) — see `apply::find_proxy`.
+    let target = apply::resolve_target(&info, &resolved).await?;
+
+    // A proxy rule that names this proxy would send the request back to us, be
+    // matched by the same rule, and recurse until the sockets run out. whistle
+    // answers the request from its own UI port instead of making the hop
+    // (`_original/lib/inspectors/res.js:302-316`); `upstream::forward` refuses
+    // the same hop with a "Self loop" error for every path that reaches it.
+    if let Some(addr) = upstream::self_loop(&target).await {
+        let location = format!(
+            "http://{}{}",
+            SocketAddr::new(addr.ip(), state.config.port),
+            info.path
+        );
+        tracing::warn!(
+            "{} {} -> self loop via {addr}; redirecting to {location}",
+            info.method,
+            info.full_url
+        );
+        let resp = Response::builder()
+            .status(StatusCode::FOUND)
+            .header(hyper::header::LOCATION, &location)
+            .body(body::empty())
+            .expect("static 302");
+        state.record(Session {
+            id: 0,
+            time_ms,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            status: resp.status().as_u16(),
+            client_ip: client_ip.clone(),
+            target: format!("self-loop {addr}"),
+            duration_ms: started.elapsed().as_millis(),
+            log: log_labels(&resolved),
+            res_headers: header_pairs(resp.headers()),
+            ..Default::default()
+        });
+        return Ok(resp);
+    }
 
     // Rewrite to origin-form + apply request-side rules. (Plugins that wanted to
     // handle this request already returned above; any rules they injected have
@@ -1058,6 +1146,7 @@ async fn serve(
     parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, &host, port, &scheme);
     parts.headers.remove("proxy-connection");
+    mark_stripped_tls(&mut parts.headers, &target);
     apply::apply_request(&mut parts, &resolved);
     // Plugin header rewrites land after the rule operators, so a plugin can
     // override what the rules set.
@@ -1493,7 +1582,7 @@ async fn serve_upgrade(
     time_ms: u128,
     started: Instant,
 ) -> Result<Response<DynBody>> {
-    let target = apply::resolve_target(info, resolved);
+    let target = apply::resolve_target(info, resolved).await?;
     let frame_script = resolved.value("frameScript").and_then(script::load_script);
     let websocket = is_websocket(&req);
     // Which plugins may hook this session's frames. Resolving the plan contacts
@@ -1510,6 +1599,7 @@ async fn serve_upgrade(
     parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, host, port, scheme);
     parts.headers.remove("proxy-connection");
+    mark_stripped_tls(&mut parts.headers, &target);
     apply::apply_request(&mut parts, resolved);
     let out_req = Request::from_parts(parts, body::empty());
 
@@ -1866,6 +1956,37 @@ mod internal_req_tests {
         let mut h = marked("");
         assert!(!take_internal_marker(&mut h));
         assert!(h.get(INTERNAL_REQ_HEADER).is_none());
+    }
+
+    /// The stripped-TLS marker travels only on a hop that actually strips TLS,
+    /// and is consumed on arrival like the internal one
+    /// (`_original/lib/inspectors/res.js:229-234`, `lib/init.js:190-193`).
+    #[test]
+    fn the_stripped_tls_marker_is_set_by_the_hop_and_consumed_on_arrival() {
+        let target = |tls: bool, stripped: bool| upstream::Target {
+            connect_host: "example.com".into(),
+            connect_port: 80,
+            tls,
+            origin_tls_stripped: stripped,
+            sni: "example.com".into(),
+            request_port: 443,
+            proxy: None,
+            tls_versions: upstream::TlsVersions::Default,
+        };
+
+        let mut h = hyper::HeaderMap::new();
+        mark_stripped_tls(&mut h, &target(false, true));
+        assert_eq!(h.get(HTTPS_REQ_HEADER).expect("marker"), "1");
+        // Consumed on the way in, so it never reaches a rule condition or the
+        // origin — and it says the request was https before the hop.
+        assert!(take_https_marker(&mut h));
+        assert!(h.get(HTTPS_REQ_HEADER).is_none());
+
+        // An ordinary hop marks nothing.
+        let mut h = hyper::HeaderMap::new();
+        mark_stripped_tls(&mut h, &target(true, false));
+        assert!(h.get(HTTPS_REQ_HEADER).is_none());
+        assert!(!take_https_marker(&mut h));
     }
 
     /// The end of the chain: the flag the pipeline derives from the header is

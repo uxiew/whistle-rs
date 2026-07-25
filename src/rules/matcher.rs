@@ -285,6 +285,10 @@ fn apply_ignores(resolved: &mut Resolved) {
                 resolved.multi.clear();
                 return;
             }
+            // `xproxy`/`xsocks`/… name the same operator as their base spelling
+            // once `canonical` has folded them, so an ignore has to be folded
+            // the same way to find the key it means.
+            let name = protocols::canonical(name).unwrap_or(name);
             if name == "proxy" {
                 ignore_upstream_proxies(resolved);
                 continue;
@@ -295,26 +299,25 @@ fn apply_ignores(resolved: &mut Resolved) {
     }
 }
 
-/// `ignore://proxy` drops **every** upstream-proxy operator, not just the one
+/// `ignore://proxy` drops **every** upstream-proxy operator, not only the one
 /// literally spelled `proxy://`.
 ///
-/// whistle can write it as a single check because all nine spellings share one
-/// protocol key (see [`protocols::UPSTREAM_PROXY_PROTOCOLS`]); its test is
-/// `util.isIgnored(filter, 'proxy') || util.isIgnored(filter, protocol)`
-/// (`_original/lib/rules/index.js:161-166`), where `protocol` is the spelling
-/// that matched — so the specific name works too, and that one already does
-/// here because the key matches.
+/// whistle needs no such loop because all nine spellings share a single
+/// protocol key, so `util.isIgnored(filter, 'proxy')` sees whichever one matched
+/// (`resolveProxy`, `_original/lib/rules/rules.js:2419-2443`; see
+/// [`protocols::UPSTREAM_PROXY_PROTOCOLS`]). Naming one spelling still drops
+/// only that one, which needs no special case here: the key is the name.
 ///
-/// Ignoring a proxy that matched also takes the PAC fallback with it: upstream
-/// returns before `resolvePacRule()` when `ignoreProxy` is set
-/// (`index.js:238-241`), so the request goes direct rather than quietly
-/// falling through to a PAC-chosen proxy. With no proxy operator matched at
-/// all, `ignoreProxy` stays false and PAC is still consulted — `ignore://pac`
-/// is what suppresses that.
+/// Dropping a proxy that matched takes the PAC fallback with it. whistle returns
+/// before it would consult `resolvePacRule()` when `ignoreProxy` is set
+/// (`_original/lib/rules/index.js:171,:238-241`), so `ignore://proxy` means "go
+/// direct", not "fall through to whatever the PAC file picks". With no proxy
+/// operator matched at all there is nothing to ignore, and a `pac://` rule is
+/// still honoured — `ignore://pac` is what suppresses that one.
 fn ignore_upstream_proxies(resolved: &mut Resolved) {
     let matched = protocols::UPSTREAM_PROXY_PROTOCOLS
         .iter()
-        .any(|proto| resolved.single.contains_key(*proto));
+        .any(|proto| resolved.get(proto).is_some());
     for proto in protocols::UPSTREAM_PROXY_PROTOCOLS {
         resolved.single.remove(*proto);
         resolved.multi.remove(*proto);
@@ -518,12 +521,11 @@ mod tests {
         assert!(r.value("host").is_none());
     }
 
-    /// `ignore://proxy` has to reach every upstream-proxy spelling, because
-    /// upstream files them all under one `proxy` key. Missing this means a rule
-    /// that says "do not use the proxy" still routes traffic through it.
+    /// `ignore://proxy` names the family, so every spelling goes. Missing this
+    /// means a rule saying "do not use the proxy" still routes through it.
     #[test]
     fn ignore_proxy_drops_every_proxy_spelling() {
-        for proto in crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS {
+        for proto in protocols::UPSTREAM_PROXY_PROTOCOLS {
             let mut m = crate::rules::RuleManager::new();
             m.set_text(&format!(
                 "example.com {proto}://10.0.0.1:8888\nexample.com ignore://proxy\n"
@@ -551,6 +553,21 @@ mod tests {
             m.resolve(&req("http://example.com/")).value("socks").is_some(),
             "ignoring a different spelling leaves socks:// alone"
         );
+    }
+
+    /// An `ignore://` naming an alias is folded to the canonical protocol
+    /// first, as upstream's `ignore[aliasProtocols[name] || name]` does
+    /// (`resolveIgnore`, `_original/lib/util/index.js:1891-1920`). The x-spelling
+    /// of a proxy is an alias of its base here, so it names the family.
+    #[test]
+    fn an_ignored_alias_is_folded_to_its_protocol() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com socks://10.0.0.1:1080\nexample.com ignore://xproxy\n");
+        assert!(m.resolve(&req("http://example.com/")).value("socks").is_none());
+
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com host://1.2.3.4\nexample.com ignore://hosts\n");
+        assert!(m.resolve(&req("http://example.com/")).value("host").is_none());
     }
 
     /// Ignoring a proxy that matched takes the PAC fallback with it: upstream
