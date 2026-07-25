@@ -134,26 +134,6 @@ pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str) {
     }
 }
 
-/// Collect matched `plugin://`/`pipe://` rules as `(name, param)` pairs, where
-/// `param` is the `/…` suffix after the plugin name.
-pub fn plugin_names(resolved: &Resolved) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for proto in ["plugin", "pipe"] {
-        for op in resolved.all(proto) {
-            let val = op.value.trim();
-            let name = val.split(['/', '?']).next().unwrap_or("").trim();
-            if name.is_empty() {
-                continue;
-            }
-            let param = val[name.len()..].trim_start_matches('/').to_string();
-            if !out.iter().any(|(n, _): &(String, String)| n == name) {
-                out.push((name.to_string(), param));
-            }
-        }
-    }
-    out
-}
-
 pub fn merge_included_rules(
     resolved: &mut Resolved,
     info: &ReqInfo,
