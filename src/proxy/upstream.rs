@@ -7,8 +7,15 @@
 //!
 //! Supports reaching the origin directly or through an upstream HTTP/HTTPS proxy
 //! (`proxy://`, `http-proxy://`, `https-proxy://`, `internal-proxy://`) or a
-//! SOCKS5 proxy (`socks://`). Ported from `_original/lib/handlers/http-proxy.js`
-//! and the tunnel logic in `lib/tunnel.js`.
+//! SOCKS5 proxy (`socks://`). Ported from the request dispatch in
+//! `_original/lib/inspectors/res.js:200-700`, its agent construction in
+//! `lib/config.js:230-264`, and the tunnel path in `lib/tunnel.js:440-560`.
+//!
+//! The one decision that shapes everything here is absolute-form versus
+//! `CONNECT`. whistle sends the request straight to the proxy with an absolute
+//! URI only for a plain HTTP proxy reaching a plain HTTP origin; TLS, SOCKS, an
+//! HTTPS proxy or a `host://` override each open a tunnel first (`res.js:292-297`).
+//! See [`uses_absolute_form`].
 
 use std::net::IpAddr;
 use std::pin::Pin;
