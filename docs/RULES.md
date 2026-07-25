@@ -198,41 +198,93 @@ example.com        params://debug=1&trace=on
 
 ### Filter conditions
 
-`filter`/`includeFilter` add an extra condition a request must satisfy for the rule
-to apply; `excludeFilter` skips the rule when the condition holds. Several filters on
-one line are ANDed.
+`includeFilter` adds a condition a request must satisfy for the rule to apply;
+`excludeFilter` skips the rule when the condition holds. Upstream's reference for the
+syntax is `_original/docs/docs/rules/filters.md`.
 
-| Form | Meaning |
-|------|---------|
-| `filter://m:GET` (or `method:`) | request method |
-| `filter://host:example.com` | request host (exact) |
-| `filter://h:name=value` (or `header:`) | request header equals; `h:name` = presence |
-| `filter://i:1.2.3.4` (or `ip:`, `clientIp:`) | client IP |
-| `filter://<regex>` | regex over the full request URL |
+```
+example.com   host://10.0.0.1   includeFilter://reqH.x-canary:1
+```
 
-**Divergences from upstream — a whistle rules file will not behave identically here.**
-Upstream's documented condition syntax is in `_original/docs/docs/rules/filters.md`;
-these are the differences, all verified against a running proxy:
+**How several filters combine** (whistle's `matchExcludeFilters`,
+`_original/lib/rules/rules.js:1967`):
 
-| Upstream | Here | Effect |
+- include filters are **OR**ed — one of them holding is enough;
+- a matching **exclude** filter vetoes the rule, whatever the includes decided;
+- a rule with only exclude filters applies unless one of them holds.
+
+#### Conditions
+
+A condition is written `<name><sep><value>`. `<sep>` is `:` after any filter
+operator; `.` and `=` work after `includeFilter`/`excludeFilter` only, which is
+upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
+(`_original/lib/rules/rules.js:57-60`). **Any** condition's value may be written as
+`/regexp/[i]` instead of a literal.
+
+| Condition | Spellings | Matches |
 |---|---|---|
-| `reqH.<key>:<pattern>` | `h:<key>=<value>` | Upstream's spelling falls through to the URL-regex fallback and **silently never matches** |
-| `resH.<key>:<pattern>` | — | Response headers aren't available at match time; not ported |
-| `s:<pattern>` | — | Response status; not ported |
-| `b:<pattern>` | — | Request body; not ported |
-| `chance:<probability>` | — | Random sampling; silently never matches |
-| `serverIp:<pattern>` | — | Not ported |
-| `i:<pattern>` | client IP only | Upstream matches the client **or** server IP |
-| `/regexp/i` as a condition value | exact match only | e.g. `m:/^P/` is not honoured |
+| Request header | `reqH.<key>:<v>` ← canonical; also `reqH.<key>=<v>`, `req.`/`reqHeader.`/`reqHeaders.`, `reqH:<key>=<v>`, `h:<key>=<v>`, `header:` | header **contains** `<v>`, case-insensitively. No `<v>` = presence test |
+| Method | `m:<v>`, `method:<v>` | request method (regexps always ignore case) |
+| Client IP | `clientIp:<v>`, `clientIP:` | the client's IP |
+| Client or server IP | `i:<v>`, `ip:<v>` | the client's IP — see the note below |
+| Host | `host:<v>`, `host=<v>` | request host |
+| Sampling | `chance:<p>`, `chance:<n>%`, `probability:` | a random fraction of requests (`Math.random() < p`) |
+| URL | anything else | the full request URL, using the same pattern engine as a rule's own [pattern](#patterns) — regexp, wildcard or prefix |
 
-Unknown conditions fall through to the URL-regex fallback, so an unsupported filter
-makes its rule **inert** rather than firing wrongly — it fails closed, but silently.
+> Header values match by **containment**, like upstream's `filterHeader`
+> (`rules.js:1922`) — `reqH.content-type:json` matches `application/json`. The older
+> `h:<key>=<value>` spelling used to require equality here and now matches the same
+> way; write `reqH.<key>:/^value$/` when you need an exact value.
+
+A `!` inverts a condition. It goes in front of the value (`m:!GET`), straight after a
+header key (`reqH.x-tag!:v`), or in front of a URL pattern (`includeFilter://!*.cdn.com`);
+two of them cancel. Note that `!` in front of a condition *name* is not a negation —
+`includeFilter://!m:GET` is a negated URL pattern, here and upstream.
 
 ```
-example.com   host://10.0.0.1   filter://m:POST        # only POST requests
-example.com   resHeaders://x-a=1   excludeFilter://i:127.0.0.1   # skip localhost
-.example.com  host://5.5.5.5   filter://h:x-canary=1   # only tagged requests
+example.com   host://10.0.0.1      includeFilter://m:POST            # only POST
+example.com   host://10.0.0.1      includeFilter://m:/^P/            # POST, PUT, PATCH
+example.com   resHeaders://x-a=1   excludeFilter://clientIp:127.0.0.1
+.example.com  host://5.5.5.5       includeFilter://reqH.content-type:json
+example.com   statusCode://503     includeFilter://chance:5%         # fail 5% of calls
+example.com   host://10.0.0.1      excludeFilter://*/health
 ```
+
+#### Conditions that cannot be evaluated yet
+
+whistle resolves a request's rules twice — once before the request is sent and again
+in the response phase — so upstream can answer conditions about the response. This
+port resolves once, before the request is sent.
+
+These conditions are therefore **parsed and recognised**, so they are never mistaken
+for a URL pattern, but they evaluate to "unknown". Upstream's `getFilterResult`
+(`_original/lib/rules/rules.js:1809`) turns an unknown answer into `false` *before* it
+consults `!`, and this port does the same: an include filter is never satisfied, an
+exclude filter never fires, and no `!` can flip either. The subsystem fails closed.
+
+| Condition | Would need |
+|---|---|
+| `s:<v>`, `statusCode:<v>` | the response status — i.e. re-resolving rules after the response headers arrive |
+| `resH.<key>:<v>`, `res.`/`resHeader.`/`resHeaders.` | the same, plus the response headers threaded into `ReqInfo` |
+| `serverIp:<v>` | the resolved upstream address, known only once the connection is made |
+| `clientPort:`, `serverPort:`, `remoteAddress:`, `remotePort:` | the socket addresses of both ends, plumbed from the connection into `ReqInfo` |
+| `b:<v>`, `body:<v>` | the request body buffered *before* rules resolve (upstream pre-reads it when a line carries a body filter) |
+| `env:<key>=<v>` | the plugin environment store |
+| `from:<v>` | the request's origin flags (`tunnel`, `composer`, `sni`, …), which the proxy layer knows but does not pass to the matcher |
+
+#### Remaining divergences from upstream
+
+| Upstream | Here | Why |
+|---|---|---|
+| `filter://…` is an **exclude** filter (`isInclude = matcher[1] === 'n'`, `rules.js:1563`) | an **include** filter | This port has always read it that way and its rules files say so; flipping it silently would invert every existing `filter://` rule. Prefer `includeFilter://`/`excludeFilter://`, which mean the same thing in both. |
+| `i:` matches the client IP, then falls back to the server IP | client IP only | The server IP does not exist yet at match time. Upstream only reaches its server-IP arm when the client IP is unknown, so the two agree in practice. |
+| `host:<v>` routes to proxy-host filtering | matches the request host | `host:` (with a colon) is this port's own spelling; upstream has only `host=`/`host.`, for a different job. |
+| header values are also compared against `encodeURIComponent(value)` | not compared | That arm is unreachable upstream: the haystack is lowercased while `encodeURIComponent` emits upper-case hex. |
+| `ignore://<cond>:<v>` is a filter | an `ignore://` operator | Rare; `ignore://<protocol>` keeps its documented meaning here. |
+
+A filter whose condition cannot be parsed at all (`includeFilter://`, an empty header
+key) is dropped, exactly as upstream drops it — the rule then applies without that
+condition.
 
 ### Disabling operators
 
