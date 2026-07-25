@@ -1022,7 +1022,7 @@ async fn serve(
         // it does over real ones, so `resHeaders://` and friends must land here
         // as well.
         let (mut parts, body) = resp.into_parts();
-        apply::apply_response(&mut parts, &resolved);
+        apply::apply_response_for(&mut parts, &resolved, Some(&info));
         let resp = Response::from_parts(parts, body);
         state.record(Session {
             id: 0,
@@ -1171,7 +1171,7 @@ async fn serve(
 
     // Apply response-side rules.
     let (mut parts, body) = upstream_resp.into_parts();
-    apply::apply_response(&mut parts, &resolved);
+    apply::apply_response_for(&mut parts, &resolved, Some(&info));
 
     // Response hook, part 1: plugins that did *not* ask for the response body
     // run here, so the response can keep streaming. Such a plugin may still
