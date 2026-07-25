@@ -1,0 +1,15 @@
+{
+  "name": "whistle-rs-plugin",
+  "version": "1.0.0",
+  "description": "Zero-dependency SDK for writing whistle-rs plugins in JavaScript or TypeScript",
+  "main": "whistle-rs-plugin.js",
+  "types": "whistle-rs-plugin.d.ts",
+  "files": [
+    "whistle-rs-plugin.js",
+    "whistle-rs-plugin.d.ts"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT"
+}
