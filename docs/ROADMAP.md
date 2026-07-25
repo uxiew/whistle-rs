@@ -123,7 +123,14 @@
       （`_original/lib/util/index.js:2899-2921`）补齐了 `reqCors` —— 此前它把整个值当作
       `Origin` 写入（`reqCors://enable` 会写出 `Origin: enable`），现在只认 URL / `*`，
       并支持 `method=` / `headers=` 两个预检头。
-- [ ] `rulesFile` / `resScript` 上游会拼接/取首，本移植仍只用首行。
+- [x] ~~`rulesFile` / `resScript` 上游会拼接/取首，本移植仍只用首行~~ → 已修。
+      `rulesFile` 现按上游的过滤规则累积（`_original/lib/rules/rules.js:2258-2272`）：
+      写作 `reqRules://` 的行**全部保留**，其余拼写只保留**第一条**（候选脚本），
+      保留者按解析顺序拼成**一份**规则文本再解析 —— 因此跨文件争用单值算子由包含顺序决定。
+      `resScript` 现在跳过 `resRules://` 拼写去找真正的脚本（此前会把规则文件丢给 JS 引擎）。
+      仍未做：上游会把内容像 JS 的候选项**执行**并把它吐出的规则拼回去（`isRulesContent`），
+      本移植没有动态规则脚本；`resScript` 的 `resRules://` 条目也无处安放 ——
+      本移植的 `resScript` 是直接改响应的 JS 钩子，不是规则生产者。
 - [ ] `params://` 合并进请求体（当前折叠只作用于查询串）。
 
 ### 筛选器（本轮审计发现）

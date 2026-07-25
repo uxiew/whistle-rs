@@ -1407,8 +1407,8 @@ async fn serve(
     .await;
 
     let res_speed = apply::res_speed_kbps(&resolved);
-    let res_script = resolved
-        .value("resScript")
+    let res_script = apply::res_script_op(&resolved)
+        .map(|op| op.value.as_str())
         .and_then(script::load_script);
     let weinre = resolved.value("weinre").map(|s| s.to_string());
     let location_href = resolved.value("locationHref").map(|s| s.to_string());

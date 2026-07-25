@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 
 use super::body::{self, DynBody};
 use super::upstream::{ProxyKind, Target, parse_proxy};
-use crate::rules::{LineProps, ReqInfo, Resolved, RuleManager};
+use crate::rules::{LineProps, ReqInfo, Resolved, RuleManager, RuleOp};
 
 /// Build the request facts the matcher needs.
 pub fn build_req_info(
@@ -196,16 +196,79 @@ pub fn merge_included_rules(
             texts.push(content.clone());
         }
     }
-    if let Some(path) = resolved.value("rulesFile") {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            texts.push(content);
-        }
+    // Every `rulesFile://` line contributes, joined into one rules text — see
+    // `accumulated_script_ops`.
+    let joined = rules_file_ops(resolved)
+        .iter()
+        .filter_map(|op| std::fs::read_to_string(&op.value).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !joined.trim().is_empty() {
+        texts.push(joined);
     }
     for text in texts {
         let mut mgr = RuleManager::new();
         mgr.set_text(&text);
         merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
     }
+}
+
+/// The `rulesFile://` operators whose contents make up the included rules text.
+pub fn rules_file_ops(resolved: &Resolved) -> Vec<&RuleOp> {
+    accumulated_script_ops(resolved, "rulesFile", "reqRules")
+}
+
+/// The `resScript://` operator that names a script, if any.
+///
+/// Upstream's `resScript` list can hold *rules text* as well as a script — the
+/// `resRules://` spelling marks the former — and only the first entry that is
+/// not so marked is ever executed (`_original/lib/rules/rules.js:2258-2272`).
+/// This port used the first entry whatever its spelling, so a file of rules
+/// written ahead of the script was handed to the JS engine instead of it.
+///
+/// The `resRules://` entries themselves are **not** applied here: upstream folds
+/// them into a rules text that the response phase parses, whereas this port's
+/// `resScript` is a JavaScript hook that mutates the response directly. See
+/// `docs/ROADMAP.md`.
+pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
+    accumulated_script_ops(resolved, "resScript", "resRules")
+        .into_iter()
+        .find(|op| raw_protocol(op) != Some("resRules"))
+}
+
+/// The entries upstream keeps for `rulesFile` / `resScript`
+/// (`_original/lib/rules/rules.js:2258-2272`).
+///
+/// Both protocols accumulate, but the list is filtered before it is read: every
+/// line written with the `pure_spelling` alias (`reqRules://` for `rulesFile`,
+/// `resRules://` for `resScript`) is kept, because it can only be rules text,
+/// while **at most one** line written any other way survives — that one is the
+/// candidate *script*, and a second script would have no defined meaning.
+///
+/// `RuleOp::raw` is what makes the distinction visible after parsing: the
+/// aliases all fold to one canonical protocol name, but `raw` still carries the
+/// spelling the rules file used.
+fn accumulated_script_ops<'a>(
+    resolved: &'a Resolved,
+    protocol: &str,
+    pure_spelling: &str,
+) -> Vec<&'a RuleOp> {
+    let mut seen_script = false;
+    resolved
+        .all(protocol)
+        .iter()
+        .filter(|op| {
+            if raw_protocol(op) == Some(pure_spelling) {
+                return true;
+            }
+            !std::mem::replace(&mut seen_script, true)
+        })
+        .collect()
+}
+
+/// The protocol an operator was *written* with, before alias folding.
+fn raw_protocol(op: &RuleOp) -> Option<&str> {
+    op.raw.split_once("://").map(|(proto, _)| proto)
 }
 
 /// How to reach the proxy each upstream-proxy operator names.
@@ -3126,6 +3189,30 @@ mod tests {
         m.resolve(&info)
     }
 
+    /// As [`resolve`], returning the [`ReqInfo`] as well for the callers that
+    /// need it (the include merge, which resolves the included text in the
+    /// request's own scope).
+    fn resolve_with_info(rules: &str, url: &str) -> (ReqInfo, Resolved) {
+        let mut m = RuleManager::new();
+        m.set_text(rules);
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let info = build_req_info(
+            "GET",
+            scheme,
+            host,
+            if scheme == "https" { 443 } else { 80 },
+            path,
+            &HeaderMap::new(),
+            None,
+        );
+        let resolved = m.resolve(&info);
+        (info, resolved)
+    }
+
     /// `reqCookies` merges into the existing header: a name already present
     /// keeps its position, a new one is appended, and a bare name sets an
     /// **empty** value rather than deleting the cookie (that is
@@ -3690,6 +3777,91 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Every `reqRules://` line contributes to the included rules text, and at
+    /// most one line spelled any other way — upstream's filter over the
+    /// accumulated list (`_original/lib/rules/rules.js:2258-2272`). This port
+    /// used to read only the first line whatever its spelling.
+    #[test]
+    fn rules_file_lines_accumulate() {
+        let fx = Fixtures::new("rulesfile-accum");
+        let a = fx.write("a.txt", b"example.com resHeaders://x-a=1\n");
+        let b = fx.write("b.txt", b"example.com resHeaders://x-b=2\n");
+        let c = fx.write("c.txt", b"example.com resHeaders://x-c=3\n");
+
+        let merged = |rules: &str| {
+            let (info, mut resolved) = resolve_with_info(rules, "http://example.com/");
+            merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+            let mut h = HeaderMap::new();
+            apply_header_ops(&mut h, &resolved, "resHeaders");
+            h
+        };
+
+        // Two `reqRules://` lines: both are rules text, so both apply.
+        let h = merged(&format!(
+            "example.com reqRules://{a}\nexample.com reqRules://{b}\n"
+        ));
+        assert_eq!(h.get("x-a").unwrap(), "1");
+        assert_eq!(h.get("x-b").unwrap(), "2");
+
+        // Two `rulesFile://` lines: each is a *candidate script*, and upstream
+        // keeps only the first. The second is dropped, not merged.
+        let h = merged(&format!(
+            "example.com rulesFile://{a}\nexample.com rulesFile://{b}\n"
+        ));
+        assert_eq!(h.get("x-a").unwrap(), "1");
+        assert!(h.get("x-b").is_none());
+
+        // Mixed: every `reqRules://` line plus the first other one.
+        let h = merged(&format!(
+            "example.com reqRules://{a}\n\
+             example.com rulesFile://{b}\n\
+             example.com rulesFile://{c}\n"
+        ));
+        assert_eq!(h.get("x-a").unwrap(), "1");
+        assert_eq!(h.get("x-b").unwrap(), "2");
+        assert!(h.get("x-c").is_none());
+
+        // The pieces are joined into *one* rules text, so a single-value
+        // protocol contested across two files is decided by their order.
+        let host_a = fx.write("host-a.txt", b"example.com host://1.1.1.1\n");
+        let host_b = fx.write("host-b.txt", b"example.com host://2.2.2.2\n");
+        let (info, mut resolved) = resolve_with_info(
+            &format!("example.com reqRules://{host_a}\nexample.com reqRules://{host_b}\n"),
+            "http://example.com/",
+        );
+        merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        assert_eq!(resolved.value("host"), Some("1.1.1.1"));
+    }
+
+    /// `resScript` picks the first line **not** spelled `resRules://` — the only
+    /// one upstream ever executes. Before this, a rules file written above the
+    /// script was handed to the JS engine in its place.
+    #[test]
+    fn res_script_skips_the_rules_spelling() {
+        let resolved = resolve(
+            "example.com resRules:///rules.txt resScript:///script.js\n",
+            "http://example.com/",
+        );
+        assert_eq!(
+            res_script_op(&resolved).map(|op| op.value.as_str()),
+            Some("/script.js")
+        );
+        // With no script at all there is nothing to run, rather than the rules
+        // file being evaluated as JavaScript.
+        let only_rules = resolve("example.com resRules:///rules.txt\n", "http://example.com/");
+        assert!(res_script_op(&only_rules).is_none());
+        // A second script is dropped before the search, so it can never be
+        // reached even if the first is a `resRules://` line.
+        let two = resolve(
+            "example.com resScript:///one.js resScript:///two.js\n",
+            "http://example.com/",
+        );
+        assert_eq!(
+            res_script_op(&two).map(|op| op.value.as_str()),
+            Some("/one.js")
+        );
     }
 
     /// Serve a file rule for `GET http://x.com/`, returning status, content type

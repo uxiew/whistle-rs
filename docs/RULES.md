@@ -650,7 +650,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
 | `responseFor` | a URL | Prefetch the URL; annotate the request with `x-whistle-response-for-*` |
 | `rule` | value name | Include the named value's rules and apply them too |
-| `rulesFile` | file path | Include rules from a file and apply them too |
+| `rulesFile` | file path | Include rules from a file and apply them too. Also spelled `reqRules://`, `ruleFile://`, `ruleScript://`, `rulesScript://`, `reqScript://` — see below |
 | `pipe` | plugin name | Route through a registered server (like `plugin`) |
 
 `{name}` anywhere in an operator value is replaced with the content of the named value
@@ -666,6 +666,33 @@ page.example.com    responseFor://http://auth.internal/verify
 example.com         resBody://{mockJson}        # {mockJson} from the values store
 example.com         rulesFile:///etc/whistle/extra.rules
 ```
+
+#### How several `rulesFile://` lines combine
+
+`rulesFile` accumulates, but its list is filtered before the files are read
+(`_original/lib/rules/rules.js:2258-2272`), and the filter turns on how the line was
+*spelled*:
+
+* `reqRules://<path>` says "this file is rules" — **every** such line is kept;
+* any other spelling (`rulesFile://`, `ruleFile://`, `ruleScript://`,
+  `rulesScript://`, `reqScript://`) marks a *candidate script*, and **only the first**
+  survives. A second one is dropped silently.
+
+The surviving files are concatenated, in resolution order, and parsed as **one** rules
+text — so a single-value protocol contested between two of them is decided by the
+order they were included in, not by which file it came from.
+
+```
+example.com   reqRules:///etc/whistle/a.rules     # kept
+example.com   reqRules:///etc/whistle/b.rules     # kept
+example.com   rulesFile:///etc/whistle/c.rules    # kept (first non-reqRules line)
+example.com   rulesFile:///etc/whistle/d.rules    # dropped
+```
+
+> whistle additionally *executes* the surviving candidate when its content looks like
+> JavaScript rather than rules (`isRulesContent`, `_original/lib/rules/index.js:41`),
+> and splices the rules the script emits into the join. whistle-rs has no dynamic-rules
+> script: every kept file is read as rules text.
 
 ### Delays & throttling
 
@@ -1114,18 +1141,12 @@ in upstream whistle.
 
 Known gaps in the operator layer, deliberately left:
 
-- **Header-shaped operators apply last-line-wins, first-line-wins upstream.**
-  `reqHeaders`, `resHeaders`, `reqCookies`, `resCookies`, `reqCors`, `resCors`
-  and `trailers` accumulate correctly, but whistle collapses them into one map
-  the way it does `resReplace` (see [How several lines of one operator
-  combine](#how-several-lines-of-one-operator-combine)), so a header named on two
-  lines takes the *first* line's value there and the *last* line's here. Lines
-  naming different headers behave identically.
-- **`rulesFile` and `resScript` accumulate upstream but not here.** whistle
-  concatenates every matching `rulesFile://` and keeps the first *script* among
-  them; whistle-rs reads only the winning line of each.
-- **`params://` merged into a request body is not ported** (see below), so its
-  multi-line fold only reaches the query string.
+- **`resRules://` entries of a `resScript` list are not applied.** Upstream folds
+  them into a rules text the response phase parses; whistle-rs's `resScript` is a
+  JavaScript hook that mutates the response directly, so it has nowhere to put
+  them. They are *skipped* rather than run as JavaScript — the script whistle-rs
+  executes is the first entry not spelled `resRules://`, which is the one
+  upstream executes too.
 - **`attachment://` with no value** cannot derive a filename from the request URL
   yet — it emits a bare `Content-Disposition: attachment` where upstream would say
   `filename="report.csv"`. Give the name explicitly to be sure.
