@@ -209,7 +209,7 @@ Precedence when several are present: `socks` > `https-proxy` > `http-proxy` >
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `urlReplace` | `from=to` (or `/regex/[i]=to`) | Substitute inside the request path+query |
+| `urlReplace` | `from=to` (or `/regex/[i]=to`) | Substitute inside the request path+query (accumulates) |
 | `params` / `urlParams` | `k=v&k2=v2` or `{json}` | Add/override query params (accumulates) |
 
 ```
@@ -603,6 +603,10 @@ When any body operator applies, whistle-rs buffers that body, transforms it, and
 recomputes `Content-Length` (dropping any `Transfer-Encoding`). Requests and
 responses without a body operator are streamed through untouched.
 
+Every operator in this table accumulates: writing the same one on several
+matching lines makes them all contribute, joined per family — see
+[How several lines of one operator combine](#how-several-lines-of-one-operator-combine).
+
 ```
 api.example.com/echo   reqBody://{"mocked":true}
 example.com/app.js     resBody://console.log('patched')
@@ -636,7 +640,9 @@ pipeline, a response is transformed as:
 2. `resReplace`
 3. the injection: `*Body` replaces the body, `*Prepend` goes before it and
    `*Append` after — with the contributors of each slot in the order `res*`,
-   `css*`, `html*`, `js*`, joined by CRLF
+   `css*`, `html*`, `js*`, joined by CRLF. Every one of these operators is
+   multi-match, so each contributor may itself be several lines; see
+   [How several lines of one operator combine](#how-several-lines-of-one-operator-combine).
 
 So a substitution never sees prepended or appended text, and a `*Body` discards
 whatever `resMerge`/`resReplace` produced. **The request is the other way round:**
@@ -663,6 +669,11 @@ occurs. The regexp form follows JavaScript, so without the `g` flag only the
 `resReplace` is skipped entirely for a response with no `Content-Type` or an
 image one. `*Replace` on a non-UTF-8 (binary) body is a no-op.
 
+Several matching lines do **not** run as separate passes: their pairs are
+collapsed into one map first, so a pattern written twice takes the first line's
+replacement. See [How several lines of one operator
+combine](#how-several-lines-of-one-operator-combine).
+
 #### `resMerge` details
 
 `resMerge` applies only to a JavaScript, HTML, JSON or `Content-Type`-less
@@ -675,6 +686,15 @@ api.test/jsonp   resMerge://{"ok":true}     # cb({"a":1}) → cb({"a":1,"ok":tru
 
 An HTML (or typeless) body that does not *start* with `{`/`[` is left alone, and
 an empty body is replaced by the patch outright.
+
+Several matching lines fold into one patch before that merge, and the fold is
+**shallow** — `resMerge://true` is whistle's marker line for making it deep:
+
+```
+api.test/data  resMerge://{"n":{"y":8}}
+api.test/data  resMerge://{"n":{"w":7}}   # dropped: shallow, first line wins `n`
+api.test/data  resMerge://true            # …unless this asks for a deep fold
+```
 
 > `statusCode` is dual-purpose, matching whistle: when there is no upstream request it
 > mocks the response; combined with a forwarded request it replaces the status.
@@ -689,18 +709,47 @@ For each request whistle-rs walks the rules and builds a resolved set:
    normal rules.
 2. **First-match-wins** for single-value protocols (`host`, `redirect`, `ua`, …):
    the first matching rule (respecting importance) sets the value.
-3. **Accumulate** for multi-match protocols — `reqHeaders`, `resHeaders`,
-   `reqCookies`, `resCookies`, `reqCors`, `resCors`, `trailers`, `plugin`, `log`,
-   `delete`, `params`, `urlParams`, `headerReplace`, `enable`, `disable`, `ignore`,
-   `pipe` — where every matching value is kept, in top-to-bottom order.
+3. **Accumulate** for multi-match protocols — whistle's `multiMatchs` list, kept
+   as it is: `enable`, `disable`, `ignore`, `filter`, `delete`, `plugin`,
+   `style`, `cipher`, `trailers`, `urlParams`, `params`, `headerReplace`,
+   `reqHeaders`, `resHeaders`, `reqCors`, `resCors`, `reqCookies`, `resCookies`,
+   `reqReplace`, `urlReplace`, `resReplace`, `resMerge`, `reqBody`, `reqPrepend`,
+   `reqAppend`, `resBody`, `resPrepend`, `resAppend`, the `html`/`js`/`css`
+   families, `rulesFile`, `resScript`, `G` (plus `log` and `pipe`, which this
+   port also accumulates) — where every matching value is kept, in top-to-bottom
+   order.
 
 Within a pass, rules are evaluated in **file order**, so put more specific / higher
 priority rules earlier (or mark them `$`).
 
-> whistle also accumulates the **body** operators (`resBody`, `resPrepend`,
-> `resAppend`, the `html`/`js`/`css` families, `resReplace`, `resMerge`,
-> `reqBody`, `reqPrepend`, `reqAppend`, `urlReplace`); whistle-rs keeps only the
-> first matching line of each. Write one line per body operator.
+### How several lines of one operator combine
+
+A multi-match protocol still has a *winner* — the first match, important lines
+first — and anything reading a single value (`host`, a file path, a flag) uses it.
+The operators that consume the whole list combine it differently per family:
+
+| Family | Combination |
+|--------|-------------|
+| `resBody` / `resPrepend` / `resAppend`, `reqBody` / `reqPrepend` / `reqAppend`, and the typed `htmlBody`, `jsAppend`, `cssPrepend`, … | **CRLF-joined** in resolution order. Blank lines drop out of the join. Each typed line is wrapped on its own, so two `jsAppend://` lines are two `<script>` tags, each with its own `lineProps` attributes. |
+| `reqReplace` / `resReplace` / `urlReplace` | Collapsed into **one pattern map**. Every pattern applies; a pattern written on two lines takes the **first** line's replacement. The map's order is the last line's patterns first, then whatever each earlier line adds — so substitutions chain in that order. |
+| `resMerge` | Collapsed into **one patch**, first line winning a contested key. The fold is **shallow** unless one of the lines is the literal `resMerge://true`, whistle's marker for a deep fold; that line contributes no data of its own. The combined patch is then deep-merged into the body. |
+| `params` / `urlParams` | Collapsed into one map each, first line winning a contested key; `urlParams` is then laid over `params`. |
+| `reqHeaders` / `resHeaders` / `reqCookies` / `resCookies` / `reqCors` / `resCors` / `trailers` / `headerReplace` | Applied in turn, top to bottom. |
+
+```
+example.com/x  resPrepend://<!--head-->
+example.com/x  jsAppend://one()
+example.com/x  jsAppend://two()
+# → <!DOCTYPE html><!--head--><page><script>one()</script><script>two()</script>
+```
+
+An `important` (`$`) line leads the list, so it both wins contested keys and comes
+first in a join:
+
+```
+example.com/x  resAppend://normal
+$example.com/x resAppend://important     # → body + "important\r\nnormal"
+```
 
 ---
 
@@ -857,12 +906,18 @@ in upstream whistle.
 
 Known gaps in the operator layer, deliberately left:
 
-- **Body operators are first-match-wins here, accumulating upstream.** whistle
-  lists `resBody`, `resPrepend`, `resAppend`, the `html`/`js`/`css` families,
-  `resReplace`, `resMerge`, `reqBody`, `reqPrepend`, `reqAppend` and `urlReplace`
-  among its multi-match protocols, so several matching lines all contribute
-  (CRLF-joined for the injecting ones, applied in turn for `resReplace`, deep-merged
-  for `resMerge`). whistle-rs keeps only the first matching line of each.
+- **Header-shaped operators apply last-line-wins, first-line-wins upstream.**
+  `reqHeaders`, `resHeaders`, `reqCookies`, `resCookies`, `reqCors`, `resCors`
+  and `trailers` accumulate correctly, but whistle collapses them into one map
+  the way it does `resReplace` (see [How several lines of one operator
+  combine](#how-several-lines-of-one-operator-combine)), so a header named on two
+  lines takes the *first* line's value there and the *last* line's here. Lines
+  naming different headers behave identically.
+- **`rulesFile` and `resScript` accumulate upstream but not here.** whistle
+  concatenates every matching `rulesFile://` and keeps the first *script* among
+  them; whistle-rs reads only the winning line of each.
+- **`params://` merged into a request body is not ported** (see below), so its
+  multi-line fold only reaches the query string.
 - **`attachment://` with no value** cannot derive a filename from the request URL
   yet — it emits a bare `Content-Disposition: attachment` where upstream would say
   `filename="report.csv"`. Give the name explicitly to be sure.
