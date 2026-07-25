@@ -383,10 +383,16 @@ mod tests {
 
     /// Server state backed by a throwaway storage dir, so the tests never touch
     /// the developer's real `~/.whistle-rs`.
+    ///
+    /// One dir per state, not one per run: these tests execute in parallel and
+    /// would otherwise race to write the same root CA, now and then reading a
+    /// half-written PEM back.
     fn state_with(plugins: crate::plugins::Plugins) -> Arc<AppState> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = Config {
             storage_dir: std::env::temp_dir()
-                .join(format!("whistle-rs-ws-tests-{}", std::process::id())),
+                .join(format!("whistle-rs-ws-tests-{}-{n}", std::process::id())),
             persist_sessions: false,
             ..Config::default()
         };

@@ -163,12 +163,13 @@ impl RustPlugin for UpperPlugin {
 /// directions.
 ///
 /// The reference for the frame hook, and for its one discipline: it touches
-/// text frames only, and a binary frame leaves exactly as it arrived. Nothing
-/// here decodes a payload to a `String` — `to_ascii_uppercase` works on bytes,
-/// so even a text frame carrying multi-byte UTF-8 survives byte for byte.
+/// whole text messages only — never a binary frame, never a fragment of
+/// anything — and leaves everything else exactly as it arrived. Nothing here
+/// decodes a payload to a `String` either: `to_ascii_uppercase` works on bytes,
+/// so a text frame carrying multi-byte UTF-8 survives byte for byte.
 struct WsUpperPlugin;
 
-/// WebSocket opcode for a complete text message.
+/// WebSocket opcode for a text message.
 const OPCODE_TEXT: u8 = 0x1;
 
 impl RustPlugin for WsUpperPlugin {
@@ -195,7 +196,7 @@ impl RustPlugin for WsUpperPlugin {
     }
 
     fn on_ws_frame(&self, _meta: &FrameMeta, frame: &HookFrame<'_>) -> Verdict {
-        if frame.opcode != OPCODE_TEXT {
+        if frame.opcode != OPCODE_TEXT || !frame.fin {
             return Verdict::Keep;
         }
         Verdict::Replace(Bytes::from(frame.payload.to_ascii_uppercase()))

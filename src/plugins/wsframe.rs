@@ -73,11 +73,16 @@
 //! ## Latency, honestly
 //!
 //! A hooked frame is delayed by one loopback round-trip plus the plugin's own
-//! work — measured at roughly 0.2 ms per frame for a Node plugin on the same
-//! host, against ~0.05 ms unhooked. Frames are not pipelined: frame *n+1* is not
-//! offered until frame *n*'s verdict is in, because a hook that reorders a
-//! WebSocket is worse than a hook that is slow. Sessions with no frame-hook
-//! plugin never open a connection and never pay a byte of this.
+//! work. Measured against the Node SDK on the same host (debug build, 500
+//! sequential echo round-trips, so two hooked frames each): 0.084 ms per
+//! round-trip unhooked, 0.129 ms hooked — about **20 µs per hooked frame** at
+//! the median, 37 µs at the mean, 75 µs at p95.
+//!
+//! Frames are not pipelined: frame *n+1* is not offered until frame *n*'s
+//! verdict is in, because a hook that reorders a WebSocket is worse than a hook
+//! that is slow. Sessions with no frame-hook plugin never open a connection and
+//! never pay a byte of this — the same benchmark with the plugin *running but
+//! not named by any matching rule* measures 0.084 ms, the unhooked figure.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -141,6 +141,94 @@ export type PipeHook = (
 ) => import('stream').Duplex | void | Promise<import('stream').Duplex | void>;
 
 /**
+ * One WebSocket frame offered to `onWsFrame`.
+ *
+ * `payload` is a `Buffer` and stays one. Decoding a frame to a string and
+ * re-encoding it replaces every byte that is not valid UTF-8 with U+FFFD, which
+ * silently corrupts a binary frame and inflates it by half — check `isText`
+ * before reaching for `text`.
+ *
+ * The proxy honours a new payload and a drop. It ignores any change to `fin` or
+ * `opcode`: retyping a frame, or restructuring a fragmented message, corrupts
+ * the stream it travels in.
+ */
+export interface WsFrame {
+  /** Final frame of its message (the WebSocket FIN bit). */
+  readonly fin: boolean;
+  /** `0x0` continuation, `0x1` text, `0x2` binary. Control frames never arrive. */
+  readonly opcode: number;
+  /** The payload as raw bytes. Assign a Buffer to rewrite it in place. */
+  payload: Buffer;
+  /** `'send'` (client→server) or `'receive'` (server→client). */
+  readonly direction: 'send' | 'receive';
+  /**
+   * A whole text message in one frame — the only shape `text` is safe on. A
+   * *fragment* of a text message has `opcode === 0x1` too but is not this,
+   * because a multi-byte character can straddle two fragments.
+   */
+  readonly isText: boolean;
+  /** A whole binary message in one frame. */
+  readonly isBinary: boolean;
+  /**
+   * Part of a fragmented message: either a non-final frame or a continuation.
+   * Delivered like any other frame, but decode at your peril — reassemble
+   * across `isFragment` frames if you need the text.
+   */
+  readonly isFragment: boolean;
+  /** The payload decoded as UTF-8 — deliberately opt-in. */
+  readonly text: string;
+  /** Replace the payload with the UTF-8 encoding of `value`. */
+  setText(value: string): this;
+}
+
+/**
+ * Context for a hooked WebSocket session: the handshake, and which way this
+ * connection's frames are going. One instance per direction, alive for the
+ * whole session, so a hook can keep per-session state on it.
+ */
+export interface WsSession {
+  /** The captured session's id — the one `/frames.json` files these under. */
+  readonly id: number;
+  readonly method: string;
+  /** The `ws://…` / `wss://…` URL of the handshake. */
+  readonly url: string;
+  /** The `/…` suffix after the plugin name. */
+  readonly param: string;
+  /** The `pipe://name(value)` argument, when the rule supplied one. */
+  readonly pipeValue?: string;
+  readonly clientIp?: string;
+  /** The handshake request's headers, as `[name, value]` pairs. */
+  readonly headers: HeaderPair[];
+  /** Which direction this connection carries. */
+  readonly direction: 'send' | 'receive';
+  /** The handshake URL, parsed. */
+  readonly parsedUrl: URL;
+
+  /** Look up a handshake header, case-insensitively. */
+  header(name: string): string | undefined;
+  /** A query-string parameter, or `undefined`. */
+  query(name: string): string | undefined;
+}
+
+/**
+ * What a frame hook may return:
+ *
+ * - `undefined` / `true` / the frame itself → forward `frame.payload`, so
+ *   mutating it in place works and so does `return frame`
+ * - `null` / `false` → drop the frame
+ * - a `Buffer` → those exact bytes
+ * - a string → its UTF-8 encoding
+ * - anything else → its JSON encoding
+ */
+export type WsVerdict = Buffer | string | object | boolean | null | undefined | WsFrame;
+
+/**
+ * A WebSocket frame hook. Called once per data frame per direction, in order,
+ * and the frame waits for it — see `docs/PLUGINS.md` for the cost.
+ */
+export type WsFrameHook = (frame: WsFrame, ctx: WsSession) => WsVerdict | Promise<WsVerdict>;
+
+/**
  * A whistle-rs plugin. Define at least one hook — which ones you define is what
  * the capability manifest advertises to the proxy.
  */
@@ -168,6 +256,14 @@ export interface Plugin {
   pipeRequest?: PipeHook;
   /** Transform the response body as it streams back. Reached by `pipe://<name>`. */
   pipeResponse?: PipeHook;
+
+  /**
+   * Inspect, rewrite or drop each frame of a tunnelled WebSocket, both
+   * directions. Reached by `plugin://<name>` *or* `pipe://<name>` on the
+   * WebSocket's URL — a WebSocket has no buffered-versus-streaming choice for
+   * the scheme to express.
+   */
+  onWsFrame?: WsFrameHook;
 }
 
 export interface StartOptions {
@@ -199,3 +295,13 @@ export const MAX_BODY_BYTES: number;
 
 /** Header carrying a piped body's metadata, for non-SDK implementations. */
 export const PIPE_META_HEADER: string;
+
+/** Header carrying a hooked WebSocket session's metadata. */
+export const WS_META_HEADER: string;
+
+/** WebSocket opcode: continuation of a fragmented message. */
+export const WS_CONTINUATION: number;
+/** WebSocket opcode: a text message. */
+export const WS_TEXT: number;
+/** WebSocket opcode: a binary message. */
+export const WS_BINARY: number;

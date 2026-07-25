@@ -29,6 +29,17 @@
 // Pipe hooks are reached by a `pipe://shout` rule (vs `plugin://` for the
 // buffered ones).
 //
+// A WebSocket is neither: its unit is a frame, so it has its own hook, which
+// either rule scheme reaches.
+//
+//   start({
+//     name: 'ws',
+//     onWsFrame(frame, ctx) {
+//       if (frame.isText) return frame.text.toUpperCase();  // rewrite
+//       // binary frames: leave the Buffer alone
+//     },
+//   });
+//
 // TypeScript users: see whistle-rs-plugin.d.ts. The same entry point works for
 // `export default { … }` — an ES module default export is unwrapped.
 
@@ -50,6 +61,7 @@ const HOOKS = [
   ['onResponse', 'response'],
   ['pipeRequest', 'pipeRequest'],
   ['pipeResponse', 'pipeResponse'],
+  ['onWsFrame', 'wsFrame'],
 ];
 
 function start(plugin, opts) {
@@ -85,6 +97,12 @@ function start(plugin, opts) {
     if (route === '/pipe/request' || route === '/pipe/response') {
       const isReq = route === '/pipe/request';
       return servePipe(plugin, name, isReq ? 'pipeRequest' : 'pipeResponse', req, res);
+    }
+
+    // Likewise the frame hook: one long-lived connection carrying a session's
+    // frames, not a request with a body.
+    if (route === '/ws/frames') {
+      return serveWsFrames(plugin, name, req, res);
     }
 
     readBody(req, (err, raw) => {
@@ -229,13 +247,7 @@ function transform(fn, flush) {
  */
 class PipeCtx {
   constructor(req, isRequestHook) {
-    let meta = {};
-    try {
-      const raw = Buffer.from(String(req.headers[PIPE_META_HEADER] || ''), 'base64');
-      meta = JSON.parse(raw.toString('utf8')) || {};
-    } catch (e) {
-      meta = {};
-    }
+    const meta = decodeMeta(req, PIPE_META_HEADER);
     /** Correlation id, shared with this request's buffered hooks. */
     this.id = meta.id;
     this.method = meta.method || 'GET';
@@ -254,6 +266,268 @@ class PipeCtx {
   }
 
   /** Look up a header, case-insensitively. Returns undefined if absent. */
+  header(name) {
+    return findHeader(this.headers, name);
+  }
+
+  /** The URL parsed, for convenient access to pathname/query. */
+  get parsedUrl() {
+    if (!this._parsed) this._parsed = parseUrl(this.url);
+    return this._parsed;
+  }
+
+  /** A query-string parameter, or undefined. */
+  query(name) {
+    const v = this.parsedUrl.searchParams.get(name);
+    return v === null ? undefined : v;
+  }
+}
+
+/** Decode a hook's base64-JSON metadata header; never throws. */
+function decodeMeta(req, header) {
+  try {
+    const raw = Buffer.from(String(req.headers[header] || ''), 'base64');
+    return JSON.parse(raw.toString('utf8')) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket frame hook
+// ---------------------------------------------------------------------------
+
+/** Header carrying the metadata of a hooked WebSocket session. */
+const WS_META_HEADER = 'x-whistle-rs-ws';
+
+/** Continuation of a fragmented message. */
+const WS_CONTINUATION = 0x0;
+/** A text message (UTF-8). */
+const WS_TEXT = 0x1;
+/** A binary message. */
+const WS_BINARY = 0x2;
+
+/** Bytes of record header: flags, opcode, and a 32-bit payload length. */
+const RECORD_HEADER = 6;
+const FLAG_FIN = 0x01;
+const FLAG_DROP = 0x02;
+
+/**
+ * Serve the frame hook: one long-lived connection carrying one direction of one
+ * WebSocket session, a record per frame in and a verdict record per frame out.
+ *
+ * The `200` goes out before anything is read, exactly as for a pipe hook —
+ * whistle-rs holds every frame of the session until it sees this head, and
+ * forwards them all unhooked if it never does.
+ */
+function serveWsFrames(plugin, name, req, res) {
+  const handler = plugin.onWsFrame;
+  if (typeof handler !== 'function') {
+    res.writeHead(404, { 'content-length': 0 });
+    return res.end();
+  }
+  res.writeHead(200, { 'content-type': 'application/octet-stream' });
+  res.flushHeaders();
+
+  const ctx = new WsSession(req);
+  // Verdicts are written in the order the frames arrived, whatever an async
+  // handler does with them: a hook that reordered a WebSocket would be worse
+  // than one that is slow.
+  let queue = Promise.resolve();
+
+  req.on(
+    'data',
+    readRecords((flags, opcode, payload) => {
+      const frame = new WsFrame(flags, opcode, payload, ctx.direction);
+      queue = queue.then(async () => {
+        const out = await decide(plugin, name, handler, frame, ctx);
+        if (res.writableEnded) return;
+        res.cork();
+        res.write(recordHeader(frame, out));
+        if (out) res.write(out);
+        res.uncork();
+      });
+    })
+  );
+  // The session is over when the proxy stops sending; answer what is left first.
+  req.on('end', () => queue.then(() => res.end(), () => res.end()));
+  req.on('error', (e) => {
+    console.error(`[${name}] onWsFrame stream failed:`, e);
+    res.destroy();
+  });
+}
+
+/**
+ * Feed chunks in, get complete records out.
+ *
+ * Chunk boundaries mean nothing here — a record may span many, and many may
+ * share one — so the pieces are held and joined exactly once per record. A
+ * frame can be megabytes; re-joining a growing buffer per chunk would be
+ * quadratic in its size.
+ */
+function readRecords(onRecord) {
+  let chunks = [];
+  let size = 0;
+  let head = null;
+
+  const join = () => {
+    const buf = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, size);
+    chunks = [buf];
+    return buf;
+  };
+  const consume = (buf, n) => {
+    chunks = [buf.subarray(n)];
+    size = chunks[0].length;
+  };
+
+  return (chunk) => {
+    chunks.push(chunk);
+    size += chunk.length;
+    for (;;) {
+      if (!head) {
+        if (size < RECORD_HEADER) return;
+        const buf = join();
+        head = { flags: buf[0], opcode: buf[1], len: buf.readUInt32BE(2) };
+        consume(buf, RECORD_HEADER);
+      }
+      if (size < head.len) return;
+      const buf = join();
+      const payload = buf.subarray(0, head.len);
+      const done = head;
+      consume(buf, head.len);
+      head = null;
+      onRecord(done.flags, done.opcode, payload);
+    }
+  };
+}
+
+/**
+ * Run the hook for one frame, returning the payload to forward or `null` to
+ * drop it. A throwing hook forwards the frame untouched, like every other hook
+ * in this SDK.
+ */
+async function decide(plugin, name, handler, frame, ctx) {
+  let out;
+  try {
+    out = await handler.call(plugin, frame, ctx);
+  } catch (e) {
+    console.error(`[${name}] onWsFrame threw:`, e);
+    return frame.payload;
+  }
+  return framePayload(frame, out);
+}
+
+/**
+ * What a hook returned, as bytes:
+ *
+ * - `undefined` / `true` / the frame itself → `frame.payload`, so mutating it
+ *   in place works and so does `return frame`
+ * - `null` / `false` → drop the frame
+ * - a `Buffer` → those exact bytes
+ * - a string → its UTF-8 encoding
+ * - anything else → its JSON encoding
+ */
+function framePayload(frame, out) {
+  if (out === null || out === false) return null;
+  if (out === undefined || out === true || out === frame) return frame.payload;
+  if (Buffer.isBuffer(out)) return out;
+  if (typeof out === 'string') return Buffer.from(out, 'utf8');
+  return Buffer.from(JSON.stringify(out), 'utf8');
+}
+
+/** The six-byte header of one verdict record. */
+function recordHeader(frame, payload) {
+  const head = Buffer.allocUnsafe(RECORD_HEADER);
+  head[0] = (frame.fin ? FLAG_FIN : 0) | (payload ? 0 : FLAG_DROP);
+  head[1] = frame.opcode;
+  head.writeUInt32BE(payload ? payload.length : 0, 2);
+  return head;
+}
+
+/**
+ * One WebSocket frame offered to `onWsFrame`.
+ *
+ * `payload` is a Buffer and stays one. Decoding a frame to a string and
+ * re-encoding it replaces every byte that is not valid UTF-8 with U+FFFD, which
+ * silently corrupts a binary frame and inflates it by half — check `isText`
+ * before you reach for `text`.
+ *
+ * The proxy honours a new payload and a drop. It ignores any change to `fin` or
+ * `opcode`: retyping a frame, or restructuring a fragmented message, corrupts
+ * the stream it travels in.
+ */
+class WsFrame {
+  constructor(flags, opcode, payload, direction) {
+    /** Final frame of its message (the WebSocket FIN bit). */
+    this.fin = (flags & FLAG_FIN) !== 0;
+    /** `0x0` continuation, `0x1` text, `0x2` binary. */
+    this.opcode = opcode;
+    /** The payload as raw bytes. Assign a Buffer to rewrite it in place. */
+    this.payload = payload;
+    /** `'send'` (client→server) or `'receive'` (server→client). */
+    this.direction = direction;
+  }
+
+  /**
+   * A whole text message in one frame — the only shape `text` is safe on.
+   * A *fragment* of a text message has `opcode === WS_TEXT` too but is not
+   * this, because a multi-byte character can straddle two fragments.
+   */
+  get isText() {
+    return this.opcode === WS_TEXT && this.fin;
+  }
+
+  /** A whole binary message in one frame. */
+  get isBinary() {
+    return this.opcode === WS_BINARY && this.fin;
+  }
+
+  /**
+   * Part of a fragmented message: either a non-final frame or a continuation.
+   * Such frames are delivered like any other, but decode them at your peril —
+   * reassemble across `isFragment` frames if you need the text.
+   */
+  get isFragment() {
+    return !this.fin || this.opcode === WS_CONTINUATION;
+  }
+
+  /** The payload decoded as UTF-8 — deliberately opt-in. */
+  get text() {
+    return this.payload.toString('utf8');
+  }
+
+  /** Replace the payload with the UTF-8 encoding of `value`. */
+  setText(value) {
+    this.payload = Buffer.from(String(value), 'utf8');
+    return this;
+  }
+}
+
+/**
+ * Context for a hooked WebSocket session — the handshake, and which way this
+ * connection's frames are going. One instance per direction, alive for the
+ * whole session, so a hook can keep per-session state on it.
+ */
+class WsSession {
+  constructor(req) {
+    const meta = decodeMeta(req, WS_META_HEADER);
+    /** The captured session's id — the one `/frames.json` files these under. */
+    this.id = meta.id;
+    this.method = meta.method || 'GET';
+    /** The `ws://…` / `wss://…` URL of the handshake. */
+    this.url = meta.url || '';
+    /** The `/…` suffix after the plugin name. */
+    this.param = meta.param || '';
+    /** The `pipe://name(value)` argument, when the rule supplied one. */
+    this.pipeValue = meta.pipeValue;
+    this.clientIp = meta.clientIp;
+    /** The handshake request's headers, as `[name, value]` pairs. */
+    this.headers = meta.headers || [];
+    /** `'send'` (client→server) or `'receive'` (server→client). */
+    this.direction = meta.direction === 'receive' ? 'receive' : 'send';
+  }
+
+  /** Look up a handshake header, case-insensitively. */
   header(name) {
     return findHeader(this.headers, name);
   }
@@ -485,4 +759,13 @@ function applyBody(out, body) {
   }
 }
 
-module.exports = { start, transform, MAX_BODY_BYTES, PIPE_META_HEADER };
+module.exports = {
+  start,
+  transform,
+  MAX_BODY_BYTES,
+  PIPE_META_HEADER,
+  WS_META_HEADER,
+  WS_CONTINUATION,
+  WS_TEXT,
+  WS_BINARY,
+};
