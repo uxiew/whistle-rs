@@ -98,6 +98,29 @@ pub const PROTOCOLS: &[&str] = &[
     "xrawfile",
 ];
 
+/// Every upstream-proxy operator, in the order this port prefers them.
+///
+/// whistle files all of them under a single `proxy` protocol, keeping only a
+/// `proxyName` to remember the spelling (`PROXY_RE` →
+/// `protocol = 'proxy'`, `_original/lib/rules/rules.js:1285-1288,1368-1388`).
+/// Two consequences follow, and both matter: at most one of them can win, and
+/// `ignore://proxy` drops whichever one matched. This port keeps them as
+/// separate keys, so the family has to be spelled out.
+///
+/// The `x`/`xs` spellings are absent because [`canonical`] has already folded
+/// them into their base protocol by the time a rule is resolved.
+pub const UPSTREAM_PROXY_PROTOCOLS: &[&str] = &[
+    "socks",
+    "https-proxy",
+    "http-proxy",
+    "proxy",
+    "internal-https-proxy",
+    "internal-proxy",
+    "internal-http-proxy",
+    "https2http-proxy",
+    "http2https-proxy",
+];
+
 /// whistle's "tool" protocols (`_original/lib/rules/protocols.js:73`).
 pub const TOOL_PROTOCOLS: &[&str] = &["log", "weinre"];
 

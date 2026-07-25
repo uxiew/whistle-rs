@@ -285,9 +285,43 @@ fn apply_ignores(resolved: &mut Resolved) {
                 resolved.multi.clear();
                 return;
             }
+            if name == "proxy" {
+                ignore_upstream_proxies(resolved);
+                continue;
+            }
             resolved.single.remove(name);
             resolved.multi.remove(name);
         }
+    }
+}
+
+/// `ignore://proxy` drops **every** upstream-proxy operator, not just the one
+/// literally spelled `proxy://`.
+///
+/// whistle can write it as a single check because all nine spellings share one
+/// protocol key (see [`protocols::UPSTREAM_PROXY_PROTOCOLS`]); its test is
+/// `util.isIgnored(filter, 'proxy') || util.isIgnored(filter, protocol)`
+/// (`_original/lib/rules/index.js:161-166`), where `protocol` is the spelling
+/// that matched — so the specific name works too, and that one already does
+/// here because the key matches.
+///
+/// Ignoring a proxy that matched also takes the PAC fallback with it: upstream
+/// returns before `resolvePacRule()` when `ignoreProxy` is set
+/// (`index.js:238-241`), so the request goes direct rather than quietly
+/// falling through to a PAC-chosen proxy. With no proxy operator matched at
+/// all, `ignoreProxy` stays false and PAC is still consulted — `ignore://pac`
+/// is what suppresses that.
+fn ignore_upstream_proxies(resolved: &mut Resolved) {
+    let matched = protocols::UPSTREAM_PROXY_PROTOCOLS
+        .iter()
+        .any(|proto| resolved.single.contains_key(*proto));
+    for proto in protocols::UPSTREAM_PROXY_PROTOCOLS {
+        resolved.single.remove(*proto);
+        resolved.multi.remove(*proto);
+    }
+    if matched {
+        resolved.single.remove("pac");
+        resolved.multi.remove("pac");
     }
 }
 
@@ -482,6 +516,68 @@ mod tests {
         m.set_text("example.com host://1.2.3.4\nexample.com ignore://host\n");
         let r = m.resolve(&req("http://example.com/"));
         assert!(r.value("host").is_none());
+    }
+
+    /// `ignore://proxy` has to reach every upstream-proxy spelling, because
+    /// upstream files them all under one `proxy` key. Missing this means a rule
+    /// that says "do not use the proxy" still routes traffic through it.
+    #[test]
+    fn ignore_proxy_drops_every_proxy_spelling() {
+        for proto in crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(&format!(
+                "example.com {proto}://10.0.0.1:8888\nexample.com ignore://proxy\n"
+            ));
+            let r = m.resolve(&req("http://example.com/"));
+            assert!(
+                r.value(proto).is_none(),
+                "ignore://proxy must drop {proto}://"
+            );
+        }
+    }
+
+    /// The specific spelling works too — upstream tests both the generic name
+    /// and the matched protocol (`_original/lib/rules/index.js:161-166`) — and
+    /// it drops only that one.
+    #[test]
+    fn ignoring_one_proxy_spelling_spares_the_others() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com socks://10.0.0.1:1080\nexample.com ignore://socks\n");
+        assert!(m.resolve(&req("http://example.com/")).value("socks").is_none());
+
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com socks://10.0.0.1:1080\nexample.com ignore://http-proxy\n");
+        assert!(
+            m.resolve(&req("http://example.com/")).value("socks").is_some(),
+            "ignoring a different spelling leaves socks:// alone"
+        );
+    }
+
+    /// Ignoring a proxy that matched takes the PAC fallback with it: upstream
+    /// returns before `resolvePacRule()` (`index.js:238-241`), so the request
+    /// goes direct rather than quietly picking up a PAC-chosen proxy instead.
+    #[test]
+    fn ignoring_a_matched_proxy_also_drops_the_pac_fallback() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text(
+            "example.com proxy://10.0.0.1:8888\nexample.com pac:///tmp/x.pac\nexample.com ignore://proxy\n",
+        );
+        let r = m.resolve(&req("http://example.com/"));
+        assert!(r.value("proxy").is_none());
+        assert!(r.value("pac").is_none(), "the PAC fallback goes too");
+    }
+
+    /// …but with no proxy operator matched, `ignoreProxy` stays false upstream
+    /// and PAC is still consulted. Only `ignore://pac` suppresses that.
+    #[test]
+    fn ignore_proxy_alone_leaves_pac_standing() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com pac:///tmp/x.pac\nexample.com ignore://proxy\n");
+        assert!(m.resolve(&req("http://example.com/")).value("pac").is_some());
+
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com pac:///tmp/x.pac\nexample.com ignore://pac\n");
+        assert!(m.resolve(&req("http://example.com/")).value("pac").is_none());
     }
 
     #[test]
