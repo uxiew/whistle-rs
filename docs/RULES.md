@@ -231,6 +231,21 @@ Precedence when several proxy operators match: `socks` > `https-proxy` >
 `http-proxy` > `proxy` > `internal-https-proxy` > `internal-proxy` >
 `internal-http-proxy` > `https2http-proxy` > `http2https-proxy` > `pac`.
 
+**Turning a proxy off.** `ignore://proxy` drops whichever upstream-proxy
+operator matched, whatever its spelling — `ignore://proxy` cancels a
+`socks://` rule just as it cancels a `proxy://` one, because upstream files all
+of them under one protocol. The specific name works too and is narrower:
+`ignore://socks` leaves an `http-proxy://` rule standing. Cancelling a proxy
+that matched also cancels any `pac://` fallback on the same request, so the
+request goes direct rather than quietly picking up a PAC-chosen proxy instead;
+with no proxy operator matched, `pac://` still applies and `ignore://pac` is
+what suppresses it.
+
+```
+example.com        socks://127.0.0.1:1080
+example.com        ignore://proxy          # goes direct after all
+```
+
 #### PAC
 
 `pac://<file>` evaluates a PAC file's `FindProxyForURL(url, host)` to pick the
@@ -876,10 +891,10 @@ that source at load time; `${port}` and `${version}` in operator values are subs
 `pathReplace→urlReplace`, `reqMerge→params`, `resRules→resScript`,
 `ruleFile`/`ruleScript`/`rulesScript`/`reqScript`/`reqRules`→`rulesFile`, `P→G`.
 
-Notes: `https2http-proxy`/`http2https-proxy` resolve as plain HTTP proxies — the
-scheme conversion is **not** implemented, so `http2https-proxy://` does not
-upgrade an `http://` origin to TLS the way upstream does, and the
-`internal-*` family does not use whistle's whistle-to-whistle handshake
+Notes: `http2https-proxy://` does upgrade the origin hop — an `http://` request
+reaches the origin over TLS, through a `CONNECT` tunnel. `https2http-proxy` and
+the `internal-*` family resolve as plain HTTP proxies: their scheme conversion is
+**not** implemented, and they do not use whistle's whistle-to-whistle handshake
 (`x-whistle-https-request`), tunnelling with `CONNECT` instead. The `x`-prefixed
 variants (`xproxy://`, `xsocks://`, …) are aliases of their base proxy: upstream
 falls back to a **direct** connection when the proxy fails, this port does not
