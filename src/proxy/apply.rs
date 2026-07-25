@@ -1908,14 +1908,20 @@ const DOCTYPE: &[u8] = b"<!DOCTYPE html>\r\n";
 /// before it, `body` *instead* of it, `bottom` after it
 /// (`_original/lib/util/whistle-transform.js:88-127`).
 ///
-/// Each slot is a list because several operators feed it and are joined with
-/// CRLF — kept as a list rather than a string so an operator that matched with
-/// an empty value still counts as occupying its slot.
+/// Each slot is a list because several operators — and, since they are
+/// multi-match, several *lines* per operator — feed it. The parts are joined
+/// with CRLF, whistle's separator for everything that lands in one slot.
 #[derive(Default)]
 struct Injection {
     top: Vec<Vec<u8>>,
     body: Vec<Vec<u8>>,
     bottom: Vec<Vec<u8>>,
+    /// Whether the body slot was claimed at all. Distinct from `body` being
+    /// non-empty: a `*Body` operator that matched with a blank value still
+    /// replaces the body (upstream substitutes an empty *buffer*, which is
+    /// truthy, `_original/lib/inspectors/res.js:1005` +
+    /// `whistle-transform.js:110-114`), so `resBody://` empties it.
+    replaces_body: bool,
 }
 
 impl Injection {
@@ -1926,9 +1932,9 @@ impl Injection {
             out.extend_from_slice(DOCTYPE);
         }
         join_into(&mut out, self.top);
-        match self.body.is_empty() {
-            true => out.extend_from_slice(&data),
-            false => join_into(&mut out, self.body),
+        match self.replaces_body {
+            true => join_into(&mut out, self.body),
+            false => out.extend_from_slice(&data),
         }
         join_into(&mut out, self.bottom);
         out
@@ -1945,6 +1951,20 @@ fn join_into(out: &mut Vec<u8>, pieces: Vec<Vec<u8>>) {
     }
 }
 
+/// CRLF-join the values of one operator's matching lines, dropping blanks
+/// (`joinData`, `_original/lib/util/file-mgr.js:93-109`, whose loop skips falsy
+/// entries; the HTML path filters them a step earlier, `index.js:1320-1322`).
+fn join_values(values: &[&str]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for value in values.iter().filter(|v| !v.is_empty()) {
+        if !out.is_empty() {
+            out.extend_from_slice(CRLF);
+        }
+        out.extend_from_slice(value.as_bytes());
+    }
+    out
+}
+
 /// Deep-merge `patch` (a JSON object) into `target`; objects merge recursively,
 /// other values are overwritten. Ported from whistle's `resMerge`.
 fn json_deep_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -1956,6 +1976,71 @@ fn json_deep_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
         }
         (t, p) => *t = p.clone(),
     }
+}
+
+/// Merge `patch` into `target` one key deep — jQuery's `extend` without its
+/// leading `true`, which is how upstream combines several lines of the same
+/// JSON-shaped operator.
+fn json_shallow_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (target, patch) {
+        (serde_json::Value::Object(t), serde_json::Value::Object(p)) => {
+            for (k, v) in p {
+                t.insert(k.clone(), v.clone());
+            }
+        }
+        (t, p) => *t = p.clone(),
+    }
+}
+
+/// Collapse every matching line of a JSON-shaped operator (`resMerge`) into one
+/// patch, mirroring `readRuleList`'s JSON branch
+/// (`_original/lib/util/index.js:1300-1312`).
+///
+/// Like [`merge_rule_maps`] the list is reversed and folded onto its own last
+/// entry, so the **first** (highest-priority) line wins a contested key. Two
+/// details are specific to this branch:
+///
+/// * the fold is *shallow* unless one of the lines is the literal `true`, which
+///   upstream detects with `isDeep` and turns into `extend`'s deep flag. So
+///   `resMerge://true` is a marker line that contributes no data of its own and
+///   makes the remaining lines merge recursively;
+/// * a single line is passed through untouched — the fold only runs for two or
+///   more — so a lone non-object `resMerge` keeps whatever meaning it had.
+///
+/// The combined patch is then always deep-merged *into the body*
+/// (`extend(true, obj, params)`, `_original/lib/inspectors/res.js:1046`).
+fn merge_json_patches(resolved: &Resolved, protocol: &str) -> Option<serde_json::Value> {
+    let mut deep = false;
+    let mut patches: Vec<serde_json::Value> = Vec::new();
+    for op in resolved.all(protocol) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(op.value.trim()) else {
+            // Not JSON at all; upstream's `_parseJSON` yields null and the
+            // line is filtered out.
+            continue;
+        };
+        match value {
+            serde_json::Value::Bool(true) => deep = true,
+            serde_json::Value::Null => {}
+            value => patches.push(value),
+        }
+    }
+    if patches.len() < 2 {
+        return patches.pop();
+    }
+    // `extend.apply(null, reversed)`: the last line is the target, and each
+    // earlier line is laid over it in turn.
+    let mut target = patches.pop()?;
+    if !(target.is_object() || target.is_array()) {
+        // `if (typeof result[0] !== 'object') { result[0] = {}; }`
+        target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    for src in patches.iter().rev() {
+        match deep {
+            true => json_deep_merge(&mut target, src),
+            false => json_shallow_merge(&mut target, src),
+        }
+    }
+    Some(target)
 }
 
 /// True if any request-body operator applies (so the body must be buffered).
@@ -2028,19 +2113,32 @@ pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option
     Bytes::from(injection.apply(data, doctype))
 }
 
-/// Fill the `res*` slots, shared by both sides.
+/// Fill the generic (`res*` / `req*`) contribution of each slot, shared by both
+/// sides.
+///
+/// Several lines carrying the same operator are CRLF-joined in resolution order
+/// and pushed as one part. That is byte-identical to pushing each line
+/// separately — the typed families that follow use the same separator — but it
+/// keeps the "matched but blank" case distinguishable, which the body slot
+/// needs.
 fn collect_generic(injection: &mut Injection, gate: &InjectionGate<'_>, prefix: &str) {
-    // `*Body` occupies its slot even when empty — upstream substitutes an empty
-    // buffer for a blank value (`data.body = resBody || util.EMPTY_BUFFER`,
-    // `_original/lib/inspectors/res.js:1005`), so `resBody://` empties the body.
-    if let Some(v) = gate.value(&format!("{prefix}Body")) {
-        injection.body.push(v.as_bytes().to_vec());
+    if let Some(joined) = gate.joined(&format!("{prefix}Body")).filter(Joined::claims_body) {
+        injection.replaces_body = true;
+        // Pushed even when blank, so that a typed `*Body` behind it is
+        // CRLF-*appended* to the empty buffer rather than replacing it — an
+        // upstream quirk of `EMPTY_BUFFER` being truthy (`res.js:1085-1087`).
+        injection.body.push(joined.bytes);
     }
-    if let Some(v) = gate.value(&format!("{prefix}Prepend")).filter(|v| !v.is_empty()) {
-        injection.top.push(v.as_bytes().to_vec());
-    }
-    if let Some(v) = gate.value(&format!("{prefix}Append")).filter(|v| !v.is_empty()) {
-        injection.bottom.push(v.as_bytes().to_vec());
+    // `*Prepend`/`*Append` carry no such marker: upstream assigns the raw value
+    // and tests it for truthiness, so an all-blank one contributes nothing
+    // (`_original/lib/inspectors/res.js:1008-1009,1082-1092`).
+    for (protocol, slot) in [
+        (format!("{prefix}Prepend"), &mut injection.top),
+        (format!("{prefix}Append"), &mut injection.bottom),
+    ] {
+        if let Some(joined) = gate.joined(&protocol).filter(|j| !j.bytes.is_empty()) {
+            slot.push(joined.bytes);
+        }
     }
 }
 
@@ -2071,17 +2169,30 @@ fn collect_res_injection(gate: &InjectionGate<'_>, families: BodyFamilies) -> In
             ("Append", &mut injection.bottom),
         ] {
             let protocol = format!("{family}{suffix}");
-            // Unlike `resBody`, a blank typed value contributes nothing: the
-            // HTML branch filters empty entries out before joining
-            // (`readRuleList`, `_original/lib/util/index.js:1320-1322`).
-            let Some(value) = gate.value(&protocol).filter(|v| !v.is_empty()) else {
+            let Some(lines) = gate.lines(&protocol) else {
                 continue;
             };
-            slot.push(match (html, family) {
-                (true, "js") => wrap_js(value, gate.props(&protocol)).into_bytes(),
-                (true, "css") => wrap_css(value).into_bytes(),
-                _ => value.as_bytes().to_vec(),
-            });
+            // Unlike the generic operators, each line is wrapped on its own —
+            // upstream marks up every entry of the list before joining
+            // (`readRuleList`, `_original/lib/util/index.js:955-966`), so two
+            // `jsAppend://` lines become two `<script>` tags, not one holding
+            // both bodies. Blanks contribute nothing.
+            let mut pushed = false;
+            for (value, props) in lines.into_iter().filter(|(v, _)| !v.is_empty()) {
+                slot.push(match (html, family) {
+                    (true, "js") => wrap_js(value, props).into_bytes(),
+                    (true, "css") => wrap_css(value).into_bytes(),
+                    _ => value.as_bytes().to_vec(),
+                });
+                pushed = true;
+            }
+            // A typed `*Body` only claims the slot when it actually contributed
+            // — upstream folds it in with `joinArr`/`if (body)`, both of which
+            // are truthiness tests (`res.js:1068,1085`), so a blank or wholly
+            // refused one leaves the original body in place.
+            if suffix == "Body" && pushed {
+                injection.replaces_body = true;
+            }
         }
     }
     injection
@@ -2138,22 +2249,67 @@ impl<'a> InjectionGate<'a> {
         InjectionGate::new(resolved, false, &[])
     }
 
-    /// The value of an injecting operator, unless its line (or a request-wide
-    /// `enable://`) refuses to inject it into this body.
-    fn value(&self, protocol: &str) -> Option<&'a str> {
-        let value = self.resolved.value(protocol)?;
-        if !self.html {
-            return Some(value);
+    /// Every line contributing to an injecting operator, in resolution order,
+    /// each paired with its own line properties. Lines the gate refuses are
+    /// dropped individually, the way `filterHtml` walks the buffer list.
+    ///
+    /// Returns `None` when the operator did not match at all — which is not the
+    /// same as matching and being refused, since a `*Body` that matched claims
+    /// the body slot regardless of what survives the gate.
+    fn lines(&self, protocol: &str) -> Option<Vec<(&'a str, &'a LineProps)>> {
+        let ops = self.resolved.all(protocol);
+        if ops.is_empty() {
+            return None;
         }
-        let allowed = self.resolved.props(protocol).allows_injection(self.body)
-            && self.global.allows_injection(self.body);
-        allowed.then_some(value)
+        let refuse_all = self.html && !self.global.allows_injection(self.body);
+        Some(match refuse_all {
+            true => Vec::new(),
+            false => ops
+                .iter()
+                .filter(|op| !self.html || op.props.allows_injection(self.body))
+                .map(|op| (op.value.as_str(), &op.props))
+                .collect(),
+        })
     }
 
-    /// The line properties of the operator's winning line, which decide the
-    /// attributes of a wrapped `<script>`.
-    fn props(&self, protocol: &str) -> &'a LineProps {
-        self.resolved.props(protocol)
+    /// The CRLF-join of an operator's surviving lines, or `None` when the
+    /// operator did not match.
+    fn joined(&self, protocol: &str) -> Option<Joined> {
+        let kept = self.lines(protocol)?;
+        let values: Vec<&str> = kept.iter().map(|(v, _)| *v).collect();
+        Some(Joined {
+            bytes: join_values(&values),
+            had_content: self
+                .resolved
+                .all(protocol)
+                .iter()
+                .any(|op| !op.value.is_empty()),
+        })
+    }
+}
+
+/// One operator's contribution to a slot, after gating and joining.
+struct Joined {
+    /// The CRLF-join of the lines that survived the gate.
+    bytes: Vec<u8>,
+    /// Whether any matching line carried content *before* gating. Together with
+    /// `bytes` this separates "matched blank" from "matched and was refused",
+    /// which the body slot treats differently — see [`Joined::claims_body`].
+    had_content: bool,
+}
+
+impl Joined {
+    /// Whether a generic `*Body` operator with this contribution replaces the
+    /// body.
+    ///
+    /// A blank one does: upstream never builds a list for it and assigns an
+    /// empty buffer instead (`resBody || util.EMPTY_BUFFER`,
+    /// `_original/lib/inspectors/res.js:1005`). One whose every line the HTML
+    /// gate refused does not: its list survives to the transform, where
+    /// `filterHtml` empties it and the join yields the falsy `''`
+    /// (`_original/lib/util/whistle-transform.js:47-60,110`).
+    fn claims_body(&self) -> bool {
+        !self.bytes.is_empty() || !self.had_content
     }
 }
 
@@ -2174,7 +2330,7 @@ fn apply_res_merge(
     class: Option<ResClass>,
     del: &Deletions,
 ) -> Vec<u8> {
-    let patch = resolved.value("resMerge");
+    let patch = merge_json_patches(resolved, "resMerge");
     if patch.is_none() && del.body_props.is_empty() {
         return data;
     }
@@ -2185,12 +2341,6 @@ fn apply_res_merge(
     if !applies {
         return data;
     }
-    let patch = match patch.map(serde_json::from_str::<serde_json::Value>) {
-        Some(Ok(patch)) => Some(patch),
-        // A `resMerge` that is not JSON leaves only the deletions to do.
-        Some(Err(_)) => None,
-        None => None,
-    };
     let text = match String::from_utf8(data) {
         Ok(text) => text,
         // Not text at all; whistle's transforms only ever see decoded strings.
@@ -2293,15 +2443,12 @@ fn apply_replace(
     protocol: &str,
     class: Option<ResClass>,
 ) -> Vec<u8> {
-    let Some(spec) = resolved.value(protocol) else {
-        return data;
-    };
     // Upstream refuses the whole operator for a response with no `content-type`
     // or an image one (`handleReplace`, `_original/lib/inspectors/res.js:129-132`).
     if matches!(class, None | Some(ResClass::Img)) {
         return data;
     }
-    let pairs = parse_replace_pairs(spec);
+    let pairs = merge_rule_maps(resolved, protocol);
     if pairs.is_empty() {
         return data;
     }
@@ -2314,6 +2461,50 @@ fn apply_replace(
         text = replace_once_or_all(&text, &pattern, &value);
     }
     text.into_bytes()
+}
+
+/// Collapse every matching line of a key/value operator into one ordered map,
+/// the way `readRuleList`'s JSON branch does
+/// (`_original/lib/util/index.js:1300-1312`).
+///
+/// The mechanism is worth spelling out, because it is not "apply each line in
+/// turn": upstream **reverses** the list and `extend`s it onto its own last
+/// entry. Two consequences, both reproduced here:
+///
+/// * a key written on several lines takes the **first** (highest-priority)
+///   line's value — consistent with first-match-wins everywhere else;
+/// * the resulting key *order* is the last line's keys first, then whatever
+///   each earlier line adds. Since `handleReplace` and `parsePathReplace` walk
+///   that order, the last line's substitutions are applied first
+///   (`_original/lib/inspectors/res.js:134-144`,
+///   `_original/lib/util/index.js:1014-1022`).
+///
+/// Shared by `reqReplace`/`resReplace`/`urlReplace`, which all reach the body
+/// and path rewriters through `parseRuleJson`.
+fn merge_rule_maps(resolved: &Resolved, protocol: &str) -> Vec<(String, String)> {
+    merge_line_maps(
+        resolved
+            .all(protocol)
+            .iter()
+            .map(|op| parse_replace_pairs(&op.value)),
+    )
+}
+
+/// The `extend`-over-the-reversed-list core of [`merge_rule_maps`], over lines
+/// already parsed into pairs.
+fn merge_line_maps(
+    lines: impl DoubleEndedIterator<Item = Vec<(String, String)>>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for pairs in lines.rev() {
+        for (key, value) in pairs {
+            match out.iter_mut().find(|(k, _)| *k == key) {
+                Some(slot) => slot.1 = value,
+                None => out.push((key, value)),
+            }
+        }
+    }
+    out
 }
 
 /// Split a `*Replace` value into `pattern` → `replacement` pairs.
@@ -2431,12 +2622,11 @@ fn js_replacement(value: &str) -> String {
     out
 }
 
-/// Substitute a `from=to` list in `text`, shared by `urlReplace` and the body
-/// `*Replace` operators.
-fn apply_str_replace(text: &str, spec: &str) -> String {
+/// Substitute a `pattern` → `replacement` list in `text`, in order.
+fn apply_str_replace(text: &str, pairs: &[(String, String)]) -> String {
     let mut out = text.to_string();
-    for (pattern, value) in parse_replace_pairs(spec) {
-        out = replace_once_or_all(&out, &pattern, &value);
+    for (pattern, value) in pairs {
+        out = replace_once_or_all(&out, pattern, value);
     }
     out
 }
@@ -2444,23 +2634,27 @@ fn apply_str_replace(text: &str, spec: &str) -> String {
 /// Rewrite the request path+query per `urlReplace`, `params`, and `urlParams`.
 pub fn rewrite_path(path: &str, resolved: &Resolved) -> String {
     let mut p = path.to_string();
-    if let Some(spec) = resolved.value("urlReplace") {
+    let replacements = merge_rule_maps(resolved, "urlReplace");
+    if !replacements.is_empty() {
         // whistle substitutes into the path *without* its leading slash — it
         // slices the URL from one character past the host's `/`
         // (`parsePathReplace`, `_original/lib/util/index.js:1009-1013`), so a
         // pattern anchored with `^/` matches in neither implementation.
         let rest = p.strip_prefix('/');
-        let replaced = apply_str_replace(rest.unwrap_or(&p), spec);
+        let replaced = apply_str_replace(rest.unwrap_or(&p), &replacements);
         p = match rest.is_some() {
             true => format!("/{replaced}"),
             false => replaced,
         };
     }
+    // Each protocol collapses to one map of its own, then `urlParams` is laid
+    // over `params` (`extend(_params, urlParams)`,
+    // `_original/lib/inspectors/req.js:425`).
     let mut params: Vec<(String, String)> = Vec::new();
     for key in ["params", "urlParams"] {
-        for v in collect_values(resolved, key) {
-            params.extend(parse_query_pairs(v));
-        }
+        params.extend(merge_line_maps(
+            resolved.all(key).iter().map(|op| parse_query_pairs(&op.value)),
+        ));
     }
     if !params.is_empty() {
         p = merge_query(&p, &params);
@@ -3944,6 +4138,270 @@ mod tests {
         assert_eq!(
             inject("example.com/x resPrepend://x\n", "y", "text/plain"),
             "xy"
+        );
+    }
+
+    // ── multi-match body operators ──
+    //
+    // Every operator below is in upstream's `multiMatchs`
+    // (`_original/lib/rules/protocols.js:186-226`), so several lines of the same
+    // one all take effect. How they combine differs per family, and each test
+    // names the mechanism it covers.
+
+    /// The injecting operators CRLF-join their lines in resolution order
+    /// (`joinData`, `_original/lib/util/file-mgr.js:93-109`).
+    #[test]
+    fn several_injection_lines_are_crlf_joined() {
+        assert_eq!(
+            inject(
+                "example.com/x resAppend://one\nexample.com/x resAppend://two\n",
+                "body",
+                "text/plain",
+            ),
+            "bodyone\r\ntwo"
+        );
+        assert_eq!(
+            inject(
+                "example.com/x resPrepend://one\nexample.com/x resPrepend://two\n\
+                 example.com/x disable://doctype\n",
+                "body",
+                "text/plain",
+            ),
+            "one\r\ntwobody"
+        );
+        // `*Body` replaces once, with the join of every line.
+        assert_eq!(
+            inject(
+                "example.com/x resBody://one\nexample.com/x resBody://two\n",
+                "gone",
+                "text/plain",
+            ),
+            "one\r\ntwo"
+        );
+    }
+
+    /// Each line of a typed family is wrapped on its own before the join, so two
+    /// `jsAppend://` lines are two `<script>` tags rather than one holding both
+    /// (`readRuleList` wraps per list entry, `_original/lib/util/index.js:955-966`).
+    #[test]
+    fn several_typed_lines_are_wrapped_separately() {
+        assert_eq!(
+            inject(
+                "example.com/x jsAppend://a()\nexample.com/x jsAppend://b()\n",
+                "<p></p>",
+                HTML,
+            ),
+            "<p></p><script>a()</script>\r\n<script>b()</script>"
+        );
+        // …and each keeps the attributes of *its own* line.
+        assert_eq!(
+            inject(
+                "example.com/x jsAppend://https://a.test/a.js lineProps://defer\n\
+                 example.com/x jsAppend://https://b.test/b.js lineProps://module\n",
+                "<p></p>",
+                HTML,
+            ),
+            "<p></p><script defer src=\"https://a.test/a.js\"></script>\r\n\
+             <script type=\"module\" src=\"https://b.test/b.js\"></script>"
+        );
+    }
+
+    /// Accumulation follows the matcher's order, so an `important` line leads
+    /// even when it is written last.
+    #[test]
+    fn important_lines_lead_the_accumulation() {
+        assert_eq!(
+            inject(
+                "example.com/x resAppend://normal\n$example.com/x resAppend://important\n",
+                "body",
+                "text/plain",
+            ),
+            "bodyimportant\r\nnormal"
+        );
+        // The same order decides who wins a contested `*Replace` pattern.
+        let out = transform_res_body(
+            Bytes::from_static(b"x"),
+            &resolve(
+                "example.com/x resReplace://x=normal\n$example.com/x resReplace://x=important\n",
+                "http://example.com/x",
+            ),
+            Some("text/plain"),
+        );
+        assert_eq!(out, Bytes::from_static(b"important"));
+    }
+
+    /// `*Replace` lines collapse into one pattern map rather than running as
+    /// separate passes: every pattern applies, and a pattern written twice takes
+    /// the first line's replacement (`readRuleList`'s JSON branch reverses the
+    /// list and `extend`s it, `_original/lib/util/index.js:1300-1312`).
+    #[test]
+    fn several_replace_lines_merge_into_one_map() {
+        let replace = |rules: &str, body: &'static str| {
+            String::from_utf8(
+                transform_res_body(
+                    Bytes::from_static(body.as_bytes()),
+                    &resolve(rules, "http://example.com/x"),
+                    Some("text/plain"),
+                )
+                .to_vec(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            replace(
+                "example.com/x resReplace://a=1\nexample.com/x resReplace://b=2\n",
+                "a b",
+            ),
+            "1 2"
+        );
+        // Contested pattern: the higher-priority line's replacement wins.
+        assert_eq!(
+            replace(
+                "example.com/x resReplace://a=first\nexample.com/x resReplace://a=second\n",
+                "a",
+            ),
+            "first"
+        );
+        // Substitutions still chain, and the *last* line's patterns run first —
+        // upstream's merged key order. Here `x`→`y` (line two) runs before
+        // `y`→`z` (line one), so the body ends up fully rewritten.
+        assert_eq!(
+            replace(
+                "example.com/x resReplace://y=z\nexample.com/x resReplace://x=y\n",
+                "x",
+            ),
+            "z"
+        );
+    }
+
+    /// `resMerge` lines collapse into one patch the same way — first line wins a
+    /// contested key — and the fold is shallow unless a `resMerge://true` marker
+    /// line turns on `extend`'s deep flag (`isDeep`,
+    /// `_original/lib/util/index.js:1206-1212`).
+    #[test]
+    fn several_merge_lines_collapse_into_one_patch() {
+        let merge = |rules: &str| {
+            String::from_utf8(
+                transform_res_body(
+                    Bytes::from_static(b"{\"keep\":0}"),
+                    &resolve(rules, "http://example.com/x"),
+                    Some("application/json"),
+                )
+                .to_vec(),
+            )
+            .unwrap()
+        };
+        // Disjoint keys from both lines land, and the body's own key survives.
+        assert_eq!(
+            merge("example.com/x resMerge://{\"a\":1}\nexample.com/x resMerge://{\"b\":2}\n"),
+            "{\"a\":1,\"b\":2,\"keep\":0}"
+        );
+        // Contested key: the first line wins.
+        assert_eq!(
+            merge("example.com/x resMerge://{\"a\":1}\nexample.com/x resMerge://{\"a\":2}\n"),
+            "{\"a\":1,\"keep\":0}"
+        );
+        // Shallow by default, so the second line's nested object is replaced
+        // wholesale rather than merged into.
+        assert_eq!(
+            merge(
+                "example.com/x resMerge://{\"n\":{\"a\":1}}\n\
+                 example.com/x resMerge://{\"n\":{\"b\":2}}\n"
+            ),
+            "{\"keep\":0,\"n\":{\"a\":1}}"
+        );
+        // …unless a marker line asks for a deep fold. It contributes no data.
+        assert_eq!(
+            merge(
+                "example.com/x resMerge://{\"n\":{\"a\":1}}\n\
+                 example.com/x resMerge://{\"n\":{\"b\":2}}\n\
+                 example.com/x resMerge://true\n"
+            ),
+            "{\"keep\":0,\"n\":{\"a\":1,\"b\":2}}"
+        );
+    }
+
+    /// `urlReplace` merges its lines into one map like the body `*Replace`
+    /// operators, then `parsePathReplace` walks it
+    /// (`_original/lib/util/index.js:1014-1022`).
+    #[test]
+    fn several_url_replace_lines_rewrite_one_path() {
+        let resolved = resolve(
+            "example.com/api urlReplace://v1=v2\nexample.com/api urlReplace://old=new\n",
+            "http://example.com/api/v1/old",
+        );
+        assert_eq!(rewrite_path("/api/v1/old", &resolved), "/api/v2/new");
+    }
+
+    /// The request side accumulates through the same code path.
+    #[test]
+    fn several_request_body_lines_accumulate() {
+        let resolved = resolve(
+            "example.com reqPrepend://p1\nexample.com reqPrepend://p2\n\
+             example.com reqAppend://a1\nexample.com reqAppend://a2\n",
+            "http://example.com/",
+        );
+        let out = transform_req_body(Bytes::from_static(b"BODY"), &resolved, Some("text/plain"));
+        assert_eq!(out, Bytes::from_static(b"p1\r\np2BODYa1\r\na2"));
+    }
+
+    /// A blank line inside an accumulating operator is dropped before the join —
+    /// it must not leave a stray separator behind — while a `*Body` that is blank
+    /// on *every* line still empties the body.
+    #[test]
+    fn blank_lines_drop_out_of_the_join() {
+        assert_eq!(
+            inject(
+                "example.com/x resAppend://one\nexample.com/x resAppend://\n",
+                "body",
+                "text/plain",
+            ),
+            "bodyone"
+        );
+        assert_eq!(
+            inject(
+                "example.com/x resBody://\nexample.com/x resBody://kept\n",
+                "gone",
+                "text/plain",
+            ),
+            "kept"
+        );
+        assert_eq!(
+            inject(
+                "example.com/x resBody://\nexample.com/x resBody://\n",
+                "gone",
+                "text/plain",
+            ),
+            ""
+        );
+    }
+
+    /// The injection gate is per line, so one refused line does not take the
+    /// others down with it (`filterHtml` walks the buffer list,
+    /// `_original/lib/util/whistle-transform.js:47-60`). The refused line is
+    /// written first here, where a first-match-wins resolution would have let it
+    /// silence the whole operator.
+    #[test]
+    fn the_gate_refuses_accumulated_lines_one_by_one() {
+        assert_eq!(
+            inject(
+                "example.com/x htmlAppend://<!--refused--> lineProps://strictHtml\n\
+                 example.com/x htmlAppend://<!--kept-->\n",
+                "{\"json\":1}",
+                HTML,
+            ),
+            "{\"json\":1}<!--kept-->"
+        );
+        // A `resBody` whose every line the gate refuses leaves the body alone,
+        // where a blank one would have emptied it (`filterHtml` reduces the list
+        // to the falsy `''`, `whistle-transform.js:110`).
+        assert_eq!(
+            inject(
+                "example.com/x resBody://gone lineProps://strictHtml\n",
+                "{\"json\":1}",
+                HTML,
+            ),
+            "{\"json\":1}"
         );
     }
 

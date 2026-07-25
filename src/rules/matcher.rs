@@ -409,6 +409,35 @@ mod tests {
         assert_eq!(r.value("host"), Some("2.2.2.2"));
     }
 
+    /// A multi-match list keeps the two-pass order: `important` lines first,
+    /// source order within a pass. Everything downstream that accumulates —
+    /// the body operators most visibly — inherits its precedence from this.
+    #[test]
+    fn a_multi_match_list_leads_with_the_important_lines() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text(
+            "example.com resAppend://n1\n$example.com resAppend://i1\n\
+             example.com resAppend://n2\n$example.com resAppend://i2\n",
+        );
+        let r = m.resolve(&req("http://example.com/"));
+        let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["i1", "i2", "n1", "n2"]);
+        // The winner the single-value accessors report is the list's head.
+        assert_eq!(r.value("resAppend"), Some("i1"));
+    }
+
+    /// `all` is total: a single-match protocol reports its one winner, so
+    /// accumulating callers need no special case.
+    #[test]
+    fn all_reports_a_single_match_winner_too() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com host://1.1.1.1\nexample.com host://2.2.2.2\n");
+        let r = m.resolve(&req("http://example.com/"));
+        let values: Vec<&str> = r.all("host").iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["1.1.1.1"]);
+        assert!(r.all("nothing-matched").is_empty());
+    }
+
     #[test]
     fn filter_method_include() {
         let mut m = crate::rules::RuleManager::new();
