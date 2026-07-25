@@ -2253,32 +2253,35 @@ impl<'a> InjectionGate<'a> {
     /// each paired with its own line properties. Lines the gate refuses are
     /// dropped individually, the way `filterHtml` walks the buffer list.
     ///
-    /// Returns `None` when the operator did not match at all — which is not the
-    /// same as matching and being refused, since a `*Body` that matched claims
-    /// the body slot regardless of what survives the gate.
+    /// `None` means the operator contributes nothing here: either it did not
+    /// match, or a request-wide `enable://strictHtml`/`safeHtml` shut the whole
+    /// injection off — upstream's `allowInject` returns false for that and the
+    /// transform then leaves even the body slot alone
+    /// (`_original/lib/util/whistle-transform.js:71-83,107-114`). An empty list,
+    /// by contrast, is an operator that matched and had every line refused
+    /// individually, which the body slot treats differently.
     fn lines(&self, protocol: &str) -> Option<Vec<(&'a str, &'a LineProps)>> {
         let ops = self.resolved.all(protocol);
-        if ops.is_empty() {
+        if ops.is_empty() || (self.html && !self.global.allows_injection(self.body)) {
             return None;
         }
-        let refuse_all = self.html && !self.global.allows_injection(self.body);
-        Some(match refuse_all {
-            true => Vec::new(),
-            false => ops
-                .iter()
+        Some(
+            ops.iter()
                 .filter(|op| !self.html || op.props.allows_injection(self.body))
                 .map(|op| (op.value.as_str(), &op.props))
                 .collect(),
-        })
+        )
     }
 
-    /// The CRLF-join of an operator's surviving lines, or `None` when the
-    /// operator did not match.
+    /// The CRLF-join of an operator's surviving lines, or `None` when it
+    /// contributes nothing (see [`InjectionGate::lines`]).
     fn joined(&self, protocol: &str) -> Option<Joined> {
         let kept = self.lines(protocol)?;
         let values: Vec<&str> = kept.iter().map(|(v, _)| *v).collect();
         Some(Joined {
             bytes: join_values(&values),
+            // Read from the *ungated* list on purpose: what distinguishes a
+            // blank operator from a refused one is what it was written with.
             had_content: self
                 .resolved
                 .all(protocol)
@@ -4402,6 +4405,22 @@ mod tests {
                 HTML,
             ),
             "{\"json\":1}"
+        );
+        // A request-wide `enable://strictHtml` shuts the injection off wholesale
+        // (`allowInject` returns false), so even a blank `resBody` — which would
+        // otherwise empty the body — does nothing.
+        assert_eq!(
+            inject(
+                "example.com/x resBody:// enable://strictHtml\n",
+                "{\"json\":1}",
+                HTML,
+            ),
+            "{\"json\":1}"
+        );
+        // Without it, the blank line empties the body as usual.
+        assert_eq!(
+            inject("example.com/x resBody://\n", "{\"json\":1}", HTML),
+            ""
         );
     }
 
