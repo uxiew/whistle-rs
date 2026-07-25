@@ -177,6 +177,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module map, request lifecycle, and how to extend the proxy |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md) | Writing plugins (Rust in-process + Node subprocess), the JSON protocol |
 | [`docs/TEMPLATES.md`](docs/TEMPLATES.md) | Local files and templates: the two render passes, the `${var}` table, jsonp, content-type inference |
+| [`docs/LINE_PROPS.md`](docs/LINE_PROPS.md) | Per-line rule properties (`lineProps://`): syntax, the property table, and what each one is wired to |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Future plans and the subsystems still simplified vs. upstream |
 | [`README.zh-CN.md`](README.zh-CN.md) | 简体中文说明文档 |
 

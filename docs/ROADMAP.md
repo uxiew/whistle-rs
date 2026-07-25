@@ -7,7 +7,7 @@
 
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
-> 单元测试 **116** 项全绿、构建 0 警告。
+> 单元测试 **181** 项全绿、构建 0 警告。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
 > HAR 导出、`cipher` TLS 版本固定、流量落盘持久化、请求重放、规则分组管理。
@@ -59,6 +59,15 @@
 - [x] ~~行内 `#` 注释~~ → 已修。此前只处理行首 `#`。
 - [x] ~~多行 `` line` `` 块~~ → 已实现。
 
+### 模式匹配（本轮审计修复）
+
+同一个根因的三处实例，都是**失败开放**（规则悄悄匹配了不该匹配的请求）：
+
+- [x] ~~`:8080` 端口 pattern 匹配一切~~ → 已按上游编译为 `^[\w]+://[^/?]+:<port>/`。
+- [x] ~~`example.test:8080` 忽略端口~~ → `Pattern::Prefix` 现在携带 `port`，匹配时校验。
+- [x] ~~`!pattern` 取反~~ → 已支持，且与上游一致地**只作用于正则与端口 pattern**；
+      上游对取反的字面量/通配 pattern 是在解析期直接丢弃的（`rules.js:1259-1268`），本移植照做。
+
 ### 筛选器（本轮审计发现）
 
 原版文档的条件语法见 `_original/docs/docs/rules/filters.md`；以下差异均已用运行中的代理实测：
@@ -86,15 +95,12 @@
       现已实现（封闭白名单 + `.key` 子路径 + `${{var}}` URI 编码）。同时修正了三个缺陷：
       未知占位符曾被置空（上游是原样保留）、`jsonp://` 的 callback 包装是本移植凭空发明的
       （已移除）、第一遍正则曾每请求重新编译。
-- [ ] `${var.replace(a,b)}` 修饰符（当前识别到该后缀即整体保留原样，不做半渲染）。
-- [ ] 文件查找的 `|` 多路径回退、`..` 拒绝、结尾 `/` 展开 index.html。
 - [ ] `{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量（与插件运行时耦合）。
-- [x] ~~`lineProps`（whistle 规则行级属性系统）~~ → **部分完成**，见
-      [`LINE_PROPS.md`](LINE_PROPS.md)。解析层与原版完全对齐（`[|&]` 分隔、无转义、多令牌合并、
-      未知属性保留）；`important` 已端到端生效；`internal`/`internalOnly` 的匹配门禁
-      （`resolve_refs_scoped`）已实现并测试，但**尚无调用方传入内部请求标记**；
-      `safeHtml`/`strictHtml` 的判定函数已就绪，等待 `apply.rs` 注入路径调用。
-      其余 12 个属性已解析并可经 `Resolved::props(protocol)` 读取，暂无运行时效果。
+- [x] ~~`lineProps`（whistle 规则行级属性系统）~~ → 见 [`LINE_PROPS.md`](LINE_PROPS.md)。
+      解析层与原版完全对齐；`important`、`safeHtml`/`strictHtml` 注入门禁、
+      `internal`/`internalOnly` 作用域、`proxyFirst`/`proxyHost`/`proxyHostOnly`、
+      `weakRule` 均已端到端接线并验证。其余属性经核对**在本移植中无对应可接之处**
+      （如本移植不发自动 CORS，`disableAutoCors` 无物可抑制），已在文档中逐条说明理由。
 
 ### 架构受限（rustls / MITM 时序）
 

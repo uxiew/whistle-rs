@@ -91,6 +91,30 @@ A pattern wrapped in slashes is a regex tested against the **full request URL**
 /^https:\/\/cdn\./i   host://10.0.0.9
 ```
 
+### 5. Port
+
+A bare `:<port>` scopes a rule to a port, whatever the host:
+
+```
+:8080          host://127.0.0.1:3000    # only requests to port 8080
+```
+
+A port on a normal pattern is honoured too — `example.com:8080` matches that host
+**only** on that port.
+
+### `!` — negated patterns
+
+`!` before a **regexp** (or a port pattern) inverts it:
+
+```
+!/example\.com/   host://127.0.0.1     # everything except example.com
+```
+
+Matching upstream, negation is only honoured for regexps and port patterns: a
+negated literal or wildcard pattern is **dropped at parse time**
+(`_original/lib/rules/rules.js:1259-1268`), so `!example.com host://x` configures
+nothing in either implementation.
+
 ### `$` — important patterns
 
 Prefix any pattern with `$` to mark the rule **important**: important rules are
@@ -616,9 +640,11 @@ fragment is also treated as a comment, so `example.com/a#b file:///x` loses the
 
 ### Simplified vs. upstream
 
-whistle's template variables (`${…}`), plugin variables (`%name=…`), the full
-`lineProps` system, and the Node-subprocess plugin loader are not implemented
-(plugins/pipes here are external HTTP servers). `resCors`/`enable://cors` set a
+whistle's plugin variables (`%name=…`) and its Node-object plugin API are not
+implemented — plugins here are external HTTP servers speaking whistle-rs's own
+protocol (see [`PLUGINS.md`](PLUGINS.md)). Template variables and `lineProps`
+*are* implemented; see [`TEMPLATES.md`](TEMPLATES.md) and
+[`LINE_PROPS.md`](LINE_PROPS.md) for exactly how far. `resCors`/`enable://cors` set a
 permissive `Access-Control-Allow-Origin` (not the full negotiated CORS set).
 Patterns/operators outside the documented forms may parse but not behave exactly as
 in upstream whistle.

@@ -167,6 +167,7 @@ $example.com          host://2.2.2.2
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图、请求生命周期、如何扩展代理 |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md) | 编写插件（Rust 进程内 + Node 子进程）与 JSON 协议 |
 | [`docs/TEMPLATES.md`](docs/TEMPLATES.md) | 本地文件与模板：两遍替换、`${var}` 变量表、jsonp、Content-Type 推断 |
+| [`docs/LINE_PROPS.md`](docs/LINE_PROPS.md) | 规则行级属性 `lineProps://`：语法、属性表与各自的接线状态 |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | 未来计划与仍简化/未对齐的子系统 |
 
 ## 移植范围：已实现 vs. 简化
