@@ -441,58 +441,116 @@ impl RuleManager {
     }
 }
 
-/// Strip a `#`/`//` line comment (outside of the value) — whistle's
-/// `removeComment` (simplified: honours a leading `#`).
+/// Strip a `#` comment: the `#` and everything after it, **anywhere** on the
+/// line — whistle's `removeComment` (`_original/lib/util/common.js:2043`) is a
+/// global `/#[^\r\n]*/g`.
+///
+/// Deliberately aggressive: upstream also eats a `#` inside a URL fragment, so
+/// `example.com/a#b file:///x` loses `#b`. Matched rather than "improved", so a
+/// rules file behaves the same in both implementations.
 fn remove_comment(line: &str) -> &str {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') {
-        return "";
+    match line.find('#') {
+        Some(i) => &line[..i],
+        None => line,
     }
-    line
+}
+
+/// Collapse whistle's multi-line rule blocks into single lines.
+///
+/// ```text
+/// line`
+/// proxy://127.0.0.1:8080
+/// www.example.com
+/// api.example.com
+/// `
+/// ```
+/// becomes `proxy://127.0.0.1:8080 www.example.com api.example.com`
+/// (`MULTI_TO_ONE_RE` + `toLine`, `_original/lib/rules/rules.js:21,:369-375`).
+///
+/// One deviation: upstream's replacement keeps the `` line` `` opener and the
+/// closing backtick in the collapsed text, where they survive as extra pattern
+/// tokens that can never match. We drop them instead — same effective rules,
+/// without the dead entries.
+///
+/// Comments are stripped *before* this runs, matching `mergeLines`; the other
+/// order would change what a `#` inside a block does.
+fn merge_lines(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut block: Option<Vec<String>> = None;
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        match &mut block {
+            None => {
+                if trimmed == "line`" {
+                    block = Some(Vec::new());
+                } else {
+                    out.push(raw.to_string());
+                }
+            }
+            Some(parts) => {
+                if trimmed == "`" {
+                    out.push(parts.join(" "));
+                    block = None;
+                } else if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    // An unterminated block still yields its rule rather than vanishing.
+    if let Some(parts) = block {
+        if !parts.is_empty() {
+            out.push(parts.join(" "));
+        }
+    }
+    out.join("\n")
 }
 
 /// Parse whole rules text into a list of [`Rule`]s.
 /// Mirrors `parseText` in `_original/lib/rules/rules.js:1738`.
 pub fn parse_text(text: &str) -> Vec<Rule> {
+    // Order matters: whistle's `mergeLines` strips comments over the whole text
+    // and only then collapses `line`…`` blocks.
+    let stripped: String = text
+        .lines()
+        .map(remove_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let merged = merge_lines(&stripped);
+
     let mut out = Vec::new();
-    for raw_line in text.lines() {
-        let line = remove_comment(raw_line);
-        let tokens: Vec<&str> = line.split_whitespace().collect();
+    for raw_line in merged.lines() {
+        let tokens: Vec<&str> = raw_line.split_whitespace().collect();
         if tokens.len() < 2 {
             // A lone token isn't a rule (whistle needs pattern + ≥1 operator).
             continue;
         }
-        if let Some(rule) = parse_line(&tokens, raw_line) {
-            out.push(rule);
-        }
+        out.extend(parse_line(&tokens, raw_line));
     }
     out
 }
 
-/// Parse a single tokenised line into a [`Rule`].
-fn parse_line(tokens: &[&str], raw_line: &str) -> Option<Rule> {
-    // whistle also supports "operators first, then patterns"; we detect the
-    // common case: the first token is the pattern, the rest are operators.
-    // If the *first* token carries a protocol and later tokens look like
-    // patterns, we swap (the reversed form).
-    let (pattern_tok, op_toks): (&str, Vec<&str>) = if looks_like_pattern(tokens[0]) {
-        (tokens[0], tokens[1..].to_vec())
-    } else if let Some(pat) = tokens[1..].iter().find(|t| looks_like_pattern(t)) {
-        // Reversed form: gather ops (everything that isn't a pattern) and use
-        // the first pattern found. Keeps behaviour close to the original's
-        // `indexOfPattern` handling without its full generality.
-        let ops: Vec<&str> = tokens
-            .iter()
-            .copied()
-            .filter(|t| !looks_like_pattern(t))
-            .collect();
-        (*pat, ops)
-    } else {
-        (tokens[0], tokens[1..].to_vec())
-    };
+/// Parse one logical rule line into **one rule per pattern**.
+///
+/// whistle splits a line's tokens into patterns and operators regardless of
+/// order, then produces a rule for every (operator set × pattern) pair — which
+/// is what makes `host://1.1.1.1 a.com b.com` apply to *both* hosts, and what
+/// the multi-line `line`…`` block relies on. Returning a single rule silently
+/// dropped every pattern after the first.
+fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
+    // Classify every token once. A token that looks like a pattern is one;
+    // everything else is an operator, filter or line property.
+    let (pattern_toks, op_toks): (Vec<&str>, Vec<&str>) =
+        tokens.iter().copied().partition(|t| looks_like_pattern(t));
 
-    let important = pattern_tok.starts_with('$');
-    let pattern = parse_pattern(pattern_tok)?;
+    // No pattern at all: whistle treats the first token as the pattern, which
+    // keeps `a.com host://x`-shaped lines working when `a.com` is not
+    // recognised as a pattern by itself.
+    let (pattern_toks, op_toks) = if pattern_toks.is_empty() {
+        (vec![tokens[0]], tokens[1..].to_vec())
+    } else {
+        (pattern_toks, op_toks)
+    };
 
     // Separate line properties, filter conditions and ordinary operators.
     let mut props = LineProps::default();
@@ -510,19 +568,25 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Option<Rule> {
     // `lineProps` is a modifier, not an operator: a line carrying nothing else
     // configures nothing (the original drops it the same way).
     if ops.is_empty() && filters.is_empty() {
-        return None;
+        return Vec::new();
     }
     for op in &mut ops {
         op.props = props.clone();
     }
-    Some(Rule {
-        pattern,
-        ops,
-        raw_line: raw_line.to_string(),
-        important,
-        filters,
-        props,
-    })
+
+    pattern_toks
+        .into_iter()
+        .filter_map(|tok| {
+            Some(Rule {
+                pattern: parse_pattern(tok)?,
+                ops: ops.clone(),
+                raw_line: raw_line.to_string(),
+                important: tok.starts_with('$'),
+                filters: filters.clone(),
+                props: props.clone(),
+            })
+        })
+        .collect()
 }
 
 /// The `lineProps://…` payload of `tok`, if it declares line properties.
@@ -582,9 +646,16 @@ fn looks_like_pattern(tok: &str) -> bool {
     if t.starts_with('/') {
         return true; // regexp
     }
-    // A line-property token is neither pattern nor operator; classifying it as a
-    // pattern would hijack the reversed (operators-first) form.
+    // Line properties and filters are neither pattern nor operator. Classifying
+    // one as a pattern would both lose its effect and mint a rule that can
+    // never match, so they are excluded before anything else is considered.
     if line_props_spec(t).is_some() {
+        return false;
+    }
+    if matches!(
+        split_protocol(t).map(|(p, _)| p),
+        Some("filter" | "includeFilter" | "excludeFilter")
+    ) {
         return false;
     }
     // An operator has a known `protocol://` prefix.
@@ -993,5 +1064,132 @@ mod line_props_tests {
         assert!(!strict.allows_injection(b"hello"));
         // Empty body counts as markup.
         assert!(strict.allows_injection(b""));
+    }
+}
+
+#[cfg(test)]
+mod parse_text_tests {
+    use super::*;
+
+    fn req(url: &str) -> ReqInfo {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, path) = match rest.find('/') {
+            Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+            None => (rest.to_string(), "/".to_string()),
+        };
+        ReqInfo {
+            method: "GET".into(),
+            scheme: scheme.into(),
+            host,
+            port: if scheme == "https" { 443 } else { 80 },
+            path,
+            full_url: url.into(),
+            client_ip: None,
+            headers: Default::default(),
+        }
+    }
+
+    fn host_for(text: &str, url: &str) -> Option<String> {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        mgr.resolve(&req(url)).value("host").map(str::to_string)
+    }
+
+    // ── one rule per pattern ──
+
+    /// whistle expands a line into one rule per pattern; taking only the first
+    /// silently dropped every other host on the line.
+    #[test]
+    fn every_pattern_on_a_line_gets_the_operator() {
+        let text = "host://9.9.9.9 a.com b.com c.com";
+        for h in ["a.com", "b.com", "c.com"] {
+            assert_eq!(
+                host_for(text, &format!("http://{h}/")).as_deref(),
+                Some("9.9.9.9"),
+                "{h} should match"
+            );
+        }
+        assert_eq!(host_for(text, "http://d.com/"), None);
+    }
+
+    /// The same holds for the pattern-first spelling.
+    #[test]
+    fn pattern_first_form_also_expands() {
+        let text = "a.com b.com host://8.8.8.8";
+        assert_eq!(host_for(text, "http://a.com/").as_deref(), Some("8.8.8.8"));
+        assert_eq!(host_for(text, "http://b.com/").as_deref(), Some("8.8.8.8"));
+    }
+
+    /// Filters and line properties must not be mistaken for patterns — doing so
+    /// both loses their effect and mints a rule that can never match.
+    #[test]
+    fn filters_and_props_are_not_patterns() {
+        let rules = parse_text("a.com host://1.1.1.1 excludeFilter://m:GET lineProps://important");
+        assert_eq!(rules.len(), 1, "only `a.com` is a pattern");
+        assert_eq!(rules[0].filters.len(), 1);
+        assert!(rules[0].props.has("important"));
+    }
+
+    // ── comments ──
+
+    /// whistle's removeComment is a global `/#[^\r\n]*/g`, so a trailing comment
+    /// is stripped rather than parsed as extra tokens.
+    #[test]
+    fn trailing_comment_is_stripped() {
+        assert_eq!(
+            host_for("a.com host://1.1.1.1   # 说明文字", "http://a.com/").as_deref(),
+            Some("1.1.1.1")
+        );
+        let rules = parse_text("a.com host://1.1.1.1 # b.com c.com");
+        assert_eq!(rules.len(), 1, "commented-out patterns must not become rules");
+    }
+
+    #[test]
+    fn whole_line_comment_still_ignored() {
+        assert!(parse_text("# a.com host://1.1.1.1").is_empty());
+        assert!(parse_text("   # indented").is_empty());
+    }
+
+    // ── multi-line blocks ──
+
+    #[test]
+    fn multi_line_block_collapses() {
+        let text = "line`\nhost://7.7.7.7\nwww.example.com\napi.example.com\n`";
+        assert_eq!(
+            host_for(text, "http://www.example.com/").as_deref(),
+            Some("7.7.7.7")
+        );
+        assert_eq!(
+            host_for(text, "http://api.example.com/").as_deref(),
+            Some("7.7.7.7")
+        );
+        // The block markers must not survive as rules of their own.
+        assert_eq!(parse_text(text).len(), 2);
+    }
+
+    #[test]
+    fn rules_around_a_block_still_parse() {
+        let text = "before.com host://1.1.1.1\nline`\nhost://2.2.2.2\ninside.com\n`\nafter.com host://3.3.3.3";
+        assert_eq!(host_for(text, "http://before.com/").as_deref(), Some("1.1.1.1"));
+        assert_eq!(host_for(text, "http://inside.com/").as_deref(), Some("2.2.2.2"));
+        assert_eq!(host_for(text, "http://after.com/").as_deref(), Some("3.3.3.3"));
+    }
+
+    /// Comments are stripped before blocks are collapsed, so a `#` inside a
+    /// block comments out that line only.
+    #[test]
+    fn comment_inside_a_block() {
+        let text = "line`\nhost://4.4.4.4\nkept.com\n# skipped.com\n`";
+        assert_eq!(host_for(text, "http://kept.com/").as_deref(), Some("4.4.4.4"));
+        assert_eq!(host_for(text, "http://skipped.com/"), None);
+    }
+
+    /// An unterminated block still yields its rule rather than vanishing.
+    #[test]
+    fn unterminated_block_is_salvaged() {
+        assert_eq!(
+            host_for("line`\nhost://5.5.5.5\nlonely.com", "http://lonely.com/").as_deref(),
+            Some("5.5.5.5")
+        );
     }
 }
