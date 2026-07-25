@@ -32,16 +32,19 @@
 //! request hook only, no bodies, dispatched to `POST /`. Existing plugins
 //! therefore keep working untouched.
 //!
-//! The four hooks fall into two families, and which family runs is chosen by the
-//! *rule*, not the plugin:
+//! The hooks fall into families, and which family runs is chosen by the *rule*,
+//! not the plugin:
 //!
 //! | Rule | Hooks | Body |
 //! |------|-------|------|
 //! | `plugin://name[/param]` | `request`, `response` | buffered whole, opt-in |
 //! | `pipe://name[(value)]`  | `pipeRequest`, `pipeResponse` | streamed, never buffered |
+//! | either, on a WebSocket   | `wsFrame` | one frame at a time |
 //!
 //! `pipe://` on a plugin that declares no pipe hook falls back to the buffered
-//! hooks, which is what it has always meant.
+//! hooks, which is what it has always meant. `wsFrame` is reached by *both*
+//! schemes, because a WebSocket offers no buffered-versus-streaming choice for
+//! the scheme to express — see [`wsframe`].
 //!
 //! ### `POST /request` — before the upstream request
 //!
@@ -79,8 +82,15 @@
 //! replaces it, both chunked; metadata rides in one header. Nothing is buffered
 //! at either end. See [`pipe`] for the exchange and why it is HTTP rather than
 //! whistle's CONNECT + `transproto` framing.
+//!
+//! ### `POST /ws/frames` — the WebSocket frame hook
+//!
+//! One long-lived connection per direction of a tunnelled WebSocket, carrying
+//! one length-prefixed record per data frame and one verdict record back. See
+//! [`wsframe`] for the record format and why frames need one.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::json;
 use tokio::sync::OnceCell;
@@ -109,12 +119,18 @@ pub struct PluginManifest {
     pub pipe_request: bool,
     /// Serves the streaming `POST /pipe/response` hook.
     pub pipe_response: bool,
+    /// Serves the WebSocket frame hook, `POST /ws/frames`.
+    pub ws_frame: bool,
 }
 
 impl PluginManifest {
-    /// Whether a `pipe://` rule has a streaming hook to reach on this plugin.
-    /// When it does not, `pipe://` keeps its historical meaning — an alias for
-    /// `plugin://`.
+    /// Whether a `pipe://` rule has a *body* streaming hook to reach on this
+    /// plugin. When it does not, `pipe://` keeps its historical meaning — an
+    /// alias for `plugin://`.
+    ///
+    /// Deliberately excludes [`ws_frame`](Self::ws_frame): the frame hook has
+    /// nothing to say about how an HTTP body is handled, and a plugin that
+    /// declares only `wsFrame` must not change what `pipe://` means for one.
     pub fn has_pipe_hook(&self) -> bool {
         self.pipe_request || self.pipe_response
     }
@@ -139,6 +155,7 @@ impl PluginManifest {
             response_body: false,
             pipe_request: false,
             pipe_response: false,
+            ws_frame: false,
         }
     }
 
@@ -171,6 +188,7 @@ impl PluginManifest {
             response_body: flag("responseBody"),
             pipe_request: hooks.iter().any(|h| h == "piperequest"),
             pipe_response: hooks.iter().any(|h| h == "piperesponse"),
+            ws_frame: hooks.iter().any(|h| h == "wsframe"),
         })
     }
 }
@@ -354,6 +372,20 @@ pub trait RustPlugin: Send + Sync {
         body
     }
 
+    /// The WebSocket frame hook: inspect or rewrite one frame of a tunnelled
+    /// session. Default: forward it unchanged.
+    ///
+    /// Called once per data frame per direction, in the tunnel's own task, so
+    /// an implementation must be quick and must not block — every frame in that
+    /// direction waits behind it.
+    fn on_ws_frame(
+        &self,
+        _meta: &wsframe::FrameMeta,
+        _frame: &wsframe::HookFrame,
+    ) -> wsframe::Verdict {
+        wsframe::Verdict::Keep
+    }
+
     /// Declared capabilities. Default: request hook only, no bodies.
     fn manifest(&self) -> PluginManifest {
         PluginManifest::v1_fallback(self.name())
@@ -406,6 +438,9 @@ impl RemotePlugin {
                                     m.pipe_request,
                                     m.pipe_response
                                 );
+                            }
+                            if m.ws_frame {
+                                tracing::info!("plugin {} hooks WebSocket frames", self.name);
                             }
                             m
                         }
@@ -624,8 +659,12 @@ fn value_to_string(v: &serde_json::Value) -> String {
 }
 
 /// A registered plugin, of either runtime.
+///
+/// Native plugins are held behind an `Arc` so a long-lived hook (a WebSocket
+/// frame hook outlives the call that opened it) can keep one alive without
+/// borrowing the registry.
 enum PluginKind {
-    Rust(Box<dyn RustPlugin>),
+    Rust(Arc<dyn RustPlugin>),
     Remote(RemotePlugin),
 }
 
@@ -654,7 +693,7 @@ impl Plugins {
 
     pub fn register_rust(&mut self, plugin: Box<dyn RustPlugin>) {
         self.map
-            .insert(plugin.name().to_string(), PluginKind::Rust(plugin));
+            .insert(plugin.name().to_string(), PluginKind::Rust(plugin.into()));
     }
 
     pub fn register_remote(&mut self, name: &str, host_port: &str) {
@@ -762,10 +801,46 @@ impl Plugins {
             }
         }
     }
+
+    /// Open plugin `name`'s frame hook for one direction of a WebSocket session.
+    ///
+    /// `None` — the common answer — means the session runs exactly as it would
+    /// with no plugin at all: an unknown plugin, one that declares no frame
+    /// hook, or a remote one that could not be reached. A plugin that cannot be
+    /// dialled is never allowed to cost the WebSocket anything.
+    pub async fn ws_frame_hook(
+        &self,
+        name: &str,
+        meta: &wsframe::FrameMeta,
+    ) -> Option<wsframe::FrameHook> {
+        match self.map.get(name)? {
+            PluginKind::Rust(p) => p.manifest().ws_frame.then(|| wsframe::FrameHook::Native {
+                name: name.to_string(),
+                plugin: p.clone(),
+                meta: meta.clone(),
+            }),
+            PluginKind::Remote(r) => {
+                if !r.manifest().await.ws_frame {
+                    return None;
+                }
+                match wsframe::connect(name, &r.base_url, meta).await {
+                    Ok(hook) => Some(wsframe::FrameHook::Remote(hook)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "wsFrame {name} ({}): {e:#}; frames forwarded unchanged",
+                            meta.dir.label()
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub mod builtin;
 pub mod pipe;
+pub mod wsframe;
 
 #[cfg(test)]
 mod tests {

@@ -31,7 +31,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation) |
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
 | `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
-| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + capturing/`frameScript` tunnel |
+| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks |
 | `src/proxy/webui.rs` | `biz/webui` | Built-in web UI + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
 | `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
 | `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`) |
@@ -199,7 +199,7 @@ whistle-rs/
         ├── upstream.rs
         ├── socks.rs       # inbound SOCKS5 server
         ├── script.rs      # JS engine (resScript/frameScript/pac)
-        ├── ws.rs          # WebSocket frame codec + capturing/frameScript tunnel
+        ├── ws.rs          # WebSocket frame codec + capturing tunnel (frameScript, frame hooks)
         ├── webui.rs       # built-in web UI + API
         └── body.rs
 ```

@@ -1496,6 +1496,12 @@ async fn serve_upgrade(
     let target = apply::resolve_target(info, resolved);
     let frame_script = resolved.value("frameScript").and_then(script::load_script);
     let websocket = is_websocket(&req);
+    // Which plugins may hook this session's frames. Resolving the plan contacts
+    // nothing and allocates nothing unless a rule named a registered plugin;
+    // the plugins themselves are dialled later, from inside the tunnel.
+    let frame_plan = websocket
+        .then(|| ws::FramePlan::new(&state.plugins, resolved, info))
+        .unwrap_or_default();
     let client_upgrade = hyper::upgrade::on(&mut req);
 
     // Build the upstream handshake request (upgrades carry no body).
@@ -1551,9 +1557,10 @@ async fn serve_upgrade(
                 let c = TokioIo::new(client_io);
                 let u = TokioIo::new(upstream_io);
                 if websocket {
-                    // Frame-aware tunnel: capture every frame (and run the
-                    // script on text frames when a frameScript rule matched).
-                    ws::capturing_tunnel(c, u, frame_script, state, session_id).await;
+                    // Frame-aware tunnel: capture every frame, run the script on
+                    // text frames when a frameScript rule matched, and offer each
+                    // data frame to the plugins the plan named.
+                    ws::capturing_tunnel(c, u, frame_script, frame_plan, state, session_id).await;
                 } else {
                     // Non-WebSocket upgrade: opaque byte passthrough.
                     let mut c = c;
