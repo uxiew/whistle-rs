@@ -97,6 +97,50 @@ export interface ResponseCtx extends BaseCtx {
 }
 
 /**
+ * Context passed to a streaming hook — everything the buffered hooks receive
+ * except the body, which is the stream itself.
+ */
+export interface PipeCtx {
+  /** Correlation id, shared with this request's buffered hooks. */
+  readonly id: number;
+  readonly method: string;
+  readonly url: string;
+  /** The `/…` suffix after the plugin name. */
+  readonly param: string;
+  /** The `pipe://name(value)` argument, when the rule supplied one. */
+  readonly pipeValue?: string;
+  readonly clientIp?: string;
+  /** Request headers in `pipeRequest`, response headers in `pipeResponse`. */
+  readonly headers: HeaderPair[];
+  /** The upstream status — `pipeResponse` only. */
+  readonly statusCode?: number;
+  /** Which body is flowing, for a hook that serves both. */
+  readonly direction: 'request' | 'response';
+  /** The request URL, parsed. */
+  readonly parsedUrl: URL;
+
+  /** Look up a header, case-insensitively. */
+  header(name: string): string | undefined;
+  /** A query-string parameter, or `undefined`. */
+  query(name: string): string | undefined;
+}
+
+/**
+ * A streaming hook: body bytes arrive on `src` and whatever reaches `dest` is
+ * what continues on to the origin (`pipeRequest`) or the client
+ * (`pipeResponse`). Nothing is buffered at either end.
+ *
+ * Return a `Duplex` (usually a `Transform`) and the SDK wires
+ * `src → returned → dest` for you; otherwise wire the pipeline yourself.
+ * Returning nothing without wiring anything leaves the body hanging.
+ */
+export type PipeHook = (
+  src: import('http').IncomingMessage,
+  dest: import('http').ServerResponse,
+  ctx: PipeCtx
+) => import('stream').Duplex | void | Promise<import('stream').Duplex | void>;
+
+/**
  * A whistle-rs plugin. Define at least one hook — which ones you define is what
  * the capability manifest advertises to the proxy.
  */
@@ -112,10 +156,18 @@ export interface Plugin {
   /** Ask for the response body to be delivered on `ctx.body`. Off by default. */
   responseBody?: boolean;
 
-  /** Runs before the upstream request. */
+  /** Runs before the upstream request. Reached by `plugin://<name>`. */
   onRequest?(ctx: RequestCtx): void | Promise<void>;
-  /** Runs after the upstream response arrives. */
+  /** Runs after the upstream response arrives. Reached by `plugin://<name>`. */
   onResponse?(ctx: ResponseCtx): void | Promise<void>;
+
+  /**
+   * Transform the request body **as it streams** upstream. Reached by
+   * `pipe://<name>`; needs no body flag, because nothing is ever buffered.
+   */
+  pipeRequest?: PipeHook;
+  /** Transform the response body as it streams back. Reached by `pipe://<name>`. */
+  pipeResponse?: PipeHook;
 }
 
 export interface StartOptions {
@@ -129,5 +181,21 @@ export interface StartOptions {
  */
 export function start(plugin: Plugin, opts?: StartOptions): import('http').Server;
 
+/**
+ * Build a `Transform` from a plain chunk mapper — the usual shape of a pipe
+ * hook. Return a value to emit it, or something falsy to drop the chunk.
+ *
+ * ```ts
+ * pipeResponse: () => transform((chunk) => chunk.toString().toUpperCase()),
+ * ```
+ */
+export function transform(
+  fn: (chunk: Buffer, stream: import('stream').Transform) => BodyInit | undefined,
+  flush?: (stream: import('stream').Transform) => BodyInit | undefined
+): import('stream').Transform;
+
 /** Largest payload the SDK will buffer from the proxy (16 MiB). */
 export const MAX_BODY_BYTES: number;
+
+/** Header carrying a piped body's metadata, for non-SDK implementations. */
+export const PIPE_META_HEADER: string;
