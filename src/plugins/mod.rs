@@ -88,6 +88,26 @@
 //! One long-lived connection per direction of a tunnelled WebSocket, carrying
 //! one length-prefixed record per data frame and one verdict record back. See
 //! [`wsframe`] for the record format and why frames need one.
+//!
+//! ### `POST /auth` — the gate
+//!
+//! Runs before everything else in the request phase and decides whether the
+//! request proceeds at all. It is the one hook that **fails closed**: a plugin
+//! that declares `auth` and then cannot be reached blocks the requests it was
+//! matched against, rather than waving them through. See [`auth`].
+//!
+//! ### `POST /stats` — fire and forget
+//!
+//! Told what went past, once before the request is forwarded (`reqStats`) and
+//! once after the response head arrives (`resStats`). Nothing waits for it and
+//! the reply is discarded, which is what makes it safe on the request path. See
+//! [`stats`].
+//!
+//! ### `GET|POST /ui/…` — the plugin's own pages
+//!
+//! The web UI routes `/plugin/<name>/…` to the plugin, prefix stripped, as an
+//! ordinary HTTP hop. A UI request deliberately carries no proxied-request
+//! context — see [`ui`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -107,10 +127,20 @@ use crate::rules::Resolved;
 pub struct PluginManifest {
     pub name: String,
     pub version: Option<String>,
-    /// Serve the `POST /request` hook.
+    /// The proxy runs this plugin's **request phase**. True when any hook of
+    /// that phase is declared — [`auth`](Self::auth), [`req_stats`](Self::req_stats)
+    /// or [`request_hook`](Self::request_hook) — because they are dispatched
+    /// from one place, in that order.
     pub on_request: bool,
-    /// Serve the `POST /response` hook.
+    /// Serves the buffered `POST /request` hook specifically.
+    pub request_hook: bool,
+    /// The proxy runs this plugin's **response phase**: the buffered
+    /// [`response_hook`](Self::response_hook), the [`res_stats`](Self::res_stats)
+    /// ping, or both. This is the flag the proxy gates dispatch on; a
+    /// stats-only plugin would otherwise never be called.
     pub on_response: bool,
+    /// Serves the buffered `POST /response` hook specifically.
+    pub response_hook: bool,
     /// Wants the request body buffered and handed over.
     pub request_body: bool,
     /// Wants the response body buffered and handed over.
@@ -121,6 +151,16 @@ pub struct PluginManifest {
     pub pipe_response: bool,
     /// Serves the WebSocket frame hook, `POST /ws/frames`.
     pub ws_frame: bool,
+    /// Serves `POST /auth` — the gate that decides whether a request proceeds.
+    /// The only hook whose failure blocks rather than degrades; see [`auth`].
+    pub auth: bool,
+    /// Serves the fire-and-forget request-phase `POST /stats`.
+    pub req_stats: bool,
+    /// Serves the fire-and-forget response-phase `POST /stats`.
+    pub res_stats: bool,
+    /// Serves `GET|POST /ui/…` — the plugin's own pages, routed from the web UI
+    /// at `/plugin/<name>/`.
+    pub ui: bool,
 }
 
 impl PluginManifest {
@@ -143,19 +183,35 @@ impl PluginManifest {
         }
     }
 
-    /// What we assume when a plugin does not serve `/manifest`: the original
-    /// protocol — a request hook, no bodies.
-    pub fn v1_fallback(name: &str) -> Self {
+    /// A manifest declaring nothing, to build on. Adding a hook to the protocol
+    /// therefore never has to touch every existing declaration.
+    pub fn none(name: &str) -> Self {
         PluginManifest {
             name: name.to_string(),
             version: None,
-            on_request: true,
+            on_request: false,
+            request_hook: false,
             on_response: false,
+            response_hook: false,
             request_body: false,
             response_body: false,
             pipe_request: false,
             pipe_response: false,
             ws_frame: false,
+            auth: false,
+            req_stats: false,
+            res_stats: false,
+            ui: false,
+        }
+    }
+
+    /// What we assume when a plugin does not serve `/manifest`: the original
+    /// protocol — a request hook, no bodies.
+    pub fn v1_fallback(name: &str) -> Self {
+        PluginManifest {
+            on_request: true,
+            request_hook: true,
+            ..PluginManifest::none(name)
         }
     }
 
@@ -172,6 +228,9 @@ impl PluginManifest {
             })
             .unwrap_or_default();
         let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+        let has = |h: &str| hooks.iter().any(|k| k == h);
+        let (request_hook, response_hook) = (has("request"), has("response"));
+        let (auth, req_stats, res_stats) = (has("auth"), has("reqstats"), has("resstats"));
         Some(PluginManifest {
             name: v
                 .get("name")
@@ -182,13 +241,19 @@ impl PluginManifest {
                 .get("version")
                 .and_then(|s| s.as_str())
                 .map(str::to_string),
-            on_request: hooks.iter().any(|h| h == "request"),
-            on_response: hooks.iter().any(|h| h == "response"),
+            on_request: request_hook || auth || req_stats,
+            request_hook,
+            on_response: response_hook || res_stats,
+            response_hook,
             request_body: flag("requestBody"),
             response_body: flag("responseBody"),
-            pipe_request: hooks.iter().any(|h| h == "piperequest"),
-            pipe_response: hooks.iter().any(|h| h == "piperesponse"),
-            ws_frame: hooks.iter().any(|h| h == "wsframe"),
+            pipe_request: has("piperequest"),
+            pipe_response: has("piperesponse"),
+            ws_frame: has("wsframe"),
+            auth,
+            req_stats,
+            res_stats,
+            ui: has("ui"),
         })
     }
 }
@@ -358,6 +423,32 @@ pub trait RustPlugin: Send + Sync {
     /// Produce rules, header rewrites and/or a response for the request.
     fn on_request(&self, req: &PluginReq) -> PluginResult;
 
+    /// Decide whether the request may proceed. Default: it may.
+    ///
+    /// Runs *before* [`on_request`](RustPlugin::on_request), and a denial stops
+    /// the request there and then — no later plugin's hooks run. Only consulted
+    /// when the manifest declares [`PluginManifest::auth`].
+    fn auth(&self, _req: &PluginReq) -> auth::AuthVerdict {
+        auth::AuthVerdict::Allow(Vec::new())
+    }
+
+    /// Told that a request went past, before it is forwarded. Default: ignore.
+    ///
+    /// Nothing is returned, and nothing waits: a stats hook observes, it does
+    /// not decide. Runs in the request task, so it must be quick.
+    fn on_req_stats(&self, _req: &PluginReq) {}
+
+    /// Told how a request turned out. Default: ignore.
+    fn on_res_stats(&self, _res: &PluginRes) {}
+
+    /// Serve one of this plugin's own UI pages. Default: nothing here.
+    ///
+    /// Receives the browser's request with the `/plugin/<name>` prefix stripped
+    /// — and no proxied-request context, deliberately; see [`ui`].
+    fn ui(&self, _req: &ui::UiReq) -> ui::UiResp {
+        ui::UiResp::not_found()
+    }
+
     /// Observe or rewrite the upstream response. Default: no change.
     fn on_response(&self, _res: &PluginRes) -> PluginResResult {
         PluginResResult::default()
@@ -461,10 +552,38 @@ impl RemotePlugin {
             .await
     }
 
+    /// Run the request phase: the gate, then the ping, then the hook.
+    ///
+    /// The order is upstream's (`lib/plugins/index.js:929-960`) and it is the
+    /// only one that makes sense: a blocked request has no rules to inject and
+    /// nothing downstream to tell about.
     async fn on_request(&self, req: &PluginReq) -> PluginResult {
         let manifest = self.manifest().await;
-        if !manifest.on_request {
-            return PluginResult::default();
+        let mut admitted: Vec<(String, String)> = Vec::new();
+        if manifest.auth {
+            match self.auth(req).await {
+                auth::AuthVerdict::Allow(headers) => admitted = headers,
+                auth::AuthVerdict::Deny(denial) => {
+                    if let Some(reason) = &denial.reason {
+                        tracing::warn!("auth {}: {reason}; request blocked", self.name);
+                    } else {
+                        tracing::info!("auth {}: blocked {} {}", self.name, req.method, req.url);
+                    }
+                    return PluginResult {
+                        response: Some(auth::deny_response(&self.name, &denial).await),
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+        if manifest.req_stats {
+            stats::post(&self.name, &self.base_url, stats::request_payload(req));
+        }
+        if !manifest.request_hook {
+            return PluginResult {
+                set_headers: admitted,
+                ..Default::default()
+            };
         }
         // v1 plugins have no `/request` route; they answer on `/`.
         let is_v1 = !manifest.on_response && !manifest.request_body && manifest.version.is_none();
@@ -482,14 +601,43 @@ impl RemotePlugin {
             payload["bodyBase64"] = json!(b64(body));
         }
 
-        match self.post(path, &payload.to_string()).await {
+        let mut result = match self.post(path, &payload.to_string()).await {
             Some(bytes) => parse_request_result(&bytes),
             None => PluginResult::default(),
+        };
+        // The gate's headers go on first, so a plugin's own request hook can
+        // still override what its auth hook set — the narrower hook wins.
+        admitted.append(&mut result.set_headers);
+        result.set_headers = admitted;
+        result
+    }
+
+    /// Ask the gate. Every failure is a denial; see [`auth`] for why.
+    async fn auth(&self, req: &PluginReq) -> auth::AuthVerdict {
+        let body = auth::payload(req).to_string();
+        let call = self.post_status("/auth", &body);
+        match tokio::time::timeout(auth::AUTH_TIMEOUT, call).await {
+            Ok(Ok((200, bytes))) => auth::parse_reply(&bytes),
+            // 204/304 are this protocol's "nothing to say", which for a gate
+            // means it has no objection.
+            Ok(Ok((204, _))) | Ok(Ok((304, _))) => auth::AuthVerdict::Allow(Vec::new()),
+            Ok(Ok((status, _))) => {
+                auth::AuthVerdict::Deny(auth::Denial::failed(format!("auth returned {status}")))
+            }
+            Ok(Err(e)) => auth::AuthVerdict::Deny(auth::Denial::failed(format!("{e:#}"))),
+            Err(_) => auth::AuthVerdict::Deny(auth::Denial::failed(format!(
+                "no verdict within {:?}",
+                auth::AUTH_TIMEOUT
+            ))),
         }
     }
 
     async fn on_response(&self, res: &PluginRes) -> PluginResResult {
-        if !self.manifest().await.on_response {
+        let manifest = self.manifest().await;
+        if manifest.res_stats {
+            stats::post(&self.name, &self.base_url, stats::response_payload(res));
+        }
+        if !manifest.response_hook {
             return PluginResResult::default();
         }
         let mut payload = json!({
@@ -510,20 +658,39 @@ impl RemotePlugin {
         }
     }
 
+    /// POST to the plugin, returning a body only when there is one to act on.
+    ///
+    /// Collapses every other outcome — transport error, non-200, the idiomatic
+    /// `204`/`304` "nothing to do" — into `None`, because for these hooks they
+    /// all mean the same thing: leave the request alone.
+    async fn post(&self, path: &str, body: &str) -> Option<bytes::Bytes> {
+        match self.post_status(path, body).await {
+            Ok((200, bytes)) => Some(bytes),
+            Ok((status, _)) => {
+                if status != 204 && status != 304 {
+                    tracing::debug!("plugin {} {path} returned status {status}", self.name);
+                }
+                None
+            }
+            Err(e) => {
+                tracing::debug!("plugin {} {path} failed: {e:#}", self.name);
+                None
+            }
+        }
+    }
+
     /// POST to the plugin, retrying briefly: a freshly spawned plugin process
     /// may still be binding its port when the first request arrives.
-    async fn post(&self, path: &str, body: &str) -> Option<bytes::Bytes> {
+    ///
+    /// Keeps the status and the error, which the gate needs — for [`auth`] a
+    /// plugin that answered `403` and a plugin that could not be reached are
+    /// both denials, but only one of them is the plugin's own decision.
+    async fn post_status(&self, path: &str, body: &str) -> anyhow::Result<(u16, bytes::Bytes)> {
         let url = format!("{}{path}", self.base_url);
         let mut last_err = None;
         for attempt in 0..3 {
             match upstream::simple_post_json(&url, body).await {
-                Ok((200, bytes)) => return Some(bytes),
-                // 204/304 are the idiomatic "nothing to do" replies.
-                Ok((204, _)) | Ok((304, _)) => return None,
-                Ok((status, _)) => {
-                    tracing::debug!("plugin {} {path} returned status {status}", self.name);
-                    return None;
-                }
+                Ok(pair) => return Ok(pair),
                 Err(e) => {
                     last_err = Some(e);
                     if attempt + 1 < 3 {
@@ -532,10 +699,7 @@ impl RemotePlugin {
                 }
             }
         }
-        if let Some(e) = last_err {
-            tracing::debug!("plugin {} {path} failed: {e:#}", self.name);
-        }
-        None
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("plugin {} unreachable", self.name)))
     }
 }
 
@@ -753,20 +917,123 @@ impl Plugins {
         false
     }
 
-    /// Run plugin `name`'s request hook. Returns `None` if no such plugin.
+    /// Run plugin `name`'s request phase. Returns `None` if no such plugin.
+    ///
+    /// The gate runs first and a denial comes back as
+    /// [`PluginResult::response`], which the proxy already knows how to serve
+    /// and which already ends the plugin chain — the same stop upstream gets by
+    /// abandoning the remaining plugins' rules (`lib/plugins/index.js:929-936`).
     pub async fn on_request(&self, name: &str, req: &PluginReq) -> Option<PluginResult> {
         match self.map.get(name)? {
-            PluginKind::Rust(p) => Some(p.on_request(req)),
+            PluginKind::Rust(p) => {
+                let manifest = p.manifest();
+                let mut admitted: Vec<(String, String)> = Vec::new();
+                if manifest.auth {
+                    match p.auth(req) {
+                        auth::AuthVerdict::Allow(headers) => {
+                            admitted = headers;
+                            // The same restriction the wire protocol applies, so
+                            // both runtimes honour one contract.
+                            admitted.retain(|(k, _)| auth::allowed_request_header(k));
+                        }
+                        auth::AuthVerdict::Deny(denial) => {
+                            tracing::info!("auth {name}: blocked {} {}", req.method, req.url);
+                            return Some(PluginResult {
+                                response: Some(auth::deny_response(name, &denial).await),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                if manifest.req_stats {
+                    p.on_req_stats(req);
+                }
+                let mut result = p.on_request(req);
+                admitted.append(&mut result.set_headers);
+                result.set_headers = admitted;
+                Some(result)
+            }
             PluginKind::Remote(r) => Some(r.on_request(req).await),
         }
     }
 
-    /// Run plugin `name`'s response hook. Returns `None` if no such plugin.
+    /// Run plugin `name`'s response phase. Returns `None` if no such plugin.
     pub async fn on_response(&self, name: &str, res: &PluginRes) -> Option<PluginResResult> {
         match self.map.get(name)? {
-            PluginKind::Rust(p) => Some(p.on_response(res)),
+            PluginKind::Rust(p) => {
+                let manifest = p.manifest();
+                if manifest.res_stats {
+                    p.on_res_stats(res);
+                }
+                if !manifest.response_hook {
+                    return Some(PluginResResult::default());
+                }
+                Some(p.on_response(res))
+            }
             PluginKind::Remote(r) => Some(r.on_response(res).await),
         }
+    }
+
+    /// Serve one of plugin `name`'s own pages.
+    ///
+    /// `None` means "not a plugin UI": no such plugin, or one that declares no
+    /// `ui` hook. The web UI turns that into its own 404 rather than inventing
+    /// a page.
+    pub async fn serve_ui(
+        &self,
+        name: &str,
+        req: hyper::Request<DynBody>,
+    ) -> Option<hyper::Response<DynBody>> {
+        match self.map.get(name)? {
+            PluginKind::Rust(p) => {
+                if !p.manifest().ui {
+                    return None;
+                }
+                let (parts, body) = req.into_parts();
+                let bytes = http_body_util::BodyExt::collect(body)
+                    .await
+                    .map(|c| c.to_bytes().to_vec())
+                    .unwrap_or_default();
+                let ureq = ui::UiReq {
+                    method: parts.method.as_str().to_string(),
+                    path: parts.uri.path().to_string(),
+                    query: parts.uri.query().unwrap_or("").to_string(),
+                    headers: parts
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                        .collect(),
+                    body: bytes,
+                };
+                Some(p.ui(&ureq).into_response())
+            }
+            PluginKind::Remote(r) => {
+                if !r.manifest().await.ui {
+                    return None;
+                }
+                Some(match ui::forward(name, &r.base_url, req).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::debug!("ui {name}: {e:#}");
+                        ui::error_page(
+                            hyper::StatusCode::BAD_GATEWAY,
+                            &format!("plugin {name} UI unavailable: {e}"),
+                        )
+                    }
+                })
+            }
+        }
+    }
+
+    /// Names of the registered plugins that serve their own UI, sorted.
+    pub async fn ui_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for name in self.names() {
+            if matches!(self.manifest(&name).await, Some(m) if m.ui) {
+                out.push(name);
+            }
+        }
+        out
     }
 
     /// Route `body` through plugin `name`'s streaming hook for `dir`.
@@ -838,8 +1105,11 @@ impl Plugins {
     }
 }
 
+pub mod auth;
 pub mod builtin;
 pub mod pipe;
+pub mod stats;
+pub mod ui;
 pub mod wsframe;
 
 #[cfg(test)]
@@ -1121,5 +1391,372 @@ mod tests {
     async fn collect(body: DynBody) -> Vec<u8> {
         use http_body_util::BodyExt;
         body.collect().await.map(|c| c.to_bytes().to_vec()).unwrap_or_default()
+    }
+
+    // -- the auth gate, the stats pings and the UI hook ----------------------
+
+    /// A minimal plugin server: answers the given routes and records every path
+    /// it was asked for, so a test can assert what was *not* called.
+    struct FakePlugin {
+        url: String,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakePlugin {
+        fn paths(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// Start a fake plugin. `routes` maps a path to `(status, body)`; anything
+    /// else gets a 404.
+    async fn fake_plugin(routes: Vec<(&'static str, u16, String)>) -> FakePlugin {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let routes = routes.clone();
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut byte = [0u8; 1];
+                    // Head only: the payloads here are small and we never need
+                    // to read them back.
+                    while sock.read_exact(&mut byte).await.is_ok() {
+                        buf.push(byte[0]);
+                        if buf.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let path = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    recorder.lock().unwrap().push(path.clone());
+                    let (status, body) = routes
+                        .iter()
+                        .find(|(p, _, _)| *p == path)
+                        .map(|(_, s, b)| (*s, b.clone()))
+                        .unwrap_or((404, String::new()));
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.ok();
+                    sock.flush().await.ok();
+                });
+            }
+        });
+        FakePlugin { url, seen }
+    }
+
+    fn manifest_route(hooks: &str) -> (&'static str, u16, String) {
+        (
+            "/manifest",
+            200,
+            format!(r#"{{"name":"p","version":"1","hooks":[{hooks}]}}"#),
+        )
+    }
+
+    /// The fail-closed property, stated as a test: a plugin that declares `auth`
+    /// and then cannot answer must block, not admit.
+    #[test]
+    fn a_failing_auth_plugin_blocks() {
+        rt().block_on(async {
+            // Declares auth, but every /auth call 500s.
+            let fake = fake_plugin(vec![
+                manifest_route(r#""auth","request""#),
+                ("/auth", 500, String::new()),
+                ("/request", 200, r#"{"rules":"* resHeaders://x=1"}"#.into()),
+            ])
+            .await;
+            let mut p = Plugins::new();
+            p.register_remote("p", &fake.url);
+
+            let out = p.on_request("p", &req()).await.expect("registered");
+            let resp = out.response.expect("a failing gate must produce a block");
+            assert_eq!(resp.status, 502, "a broken gate is not a refusal");
+            assert!(out.rules.is_none(), "a blocked request gets no rules");
+            // The request hook must not have run behind a failed gate.
+            assert!(!fake.paths().iter().any(|p| p == "/request"));
+        });
+    }
+
+    /// Same property when the plugin is not there at all.
+    #[test]
+    fn an_unreachable_auth_plugin_blocks() {
+        rt().block_on(async {
+            let fake = fake_plugin(vec![manifest_route(r#""auth""#)]).await;
+            let url = fake.url.clone();
+            let mut p = Plugins::new();
+            p.register_remote("p", &url);
+            // Warm the manifest cache, then take the plugin away.
+            assert!(p.manifest("p").await.expect("manifest").auth);
+            drop(fake);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            // The port may or may not still accept; either way the verdict
+            // never arrives, and either way the request must be blocked.
+            let out = p.on_request("p", &req()).await.expect("registered");
+            let resp = out.response.expect("an absent gate must block");
+            assert_eq!(resp.status, 502);
+        });
+    }
+
+    /// An admitted request keeps going, and the gate's headers are filtered to
+    /// the identifying subset.
+    #[test]
+    fn an_allowed_request_proceeds_with_filtered_headers() {
+        rt().block_on(async {
+            let fake = fake_plugin(vec![
+                manifest_route(r#""auth","request""#),
+                (
+                    "/auth",
+                    200,
+                    r#"{"allow":true,"setHeaders":{"x-whistle-user":"bob","cookie":"stolen"}}"#
+                        .into(),
+                ),
+                ("/request", 200, r#"{"setHeaders":{"x-from-hook":"1"}}"#.into()),
+            ])
+            .await;
+            let mut p = Plugins::new();
+            p.register_remote("p", &fake.url);
+
+            let out = p.on_request("p", &req()).await.expect("registered");
+            assert!(out.response.is_none(), "an allowed request is not answered");
+            assert_eq!(
+                out.set_headers,
+                vec![
+                    ("x-whistle-user".to_string(), "bob".to_string()),
+                    ("x-from-hook".to_string(), "1".to_string()),
+                ]
+            );
+            assert!(fake.paths().iter().any(|p| p == "/request"));
+        });
+    }
+
+    /// A plugin that declares no `auth` hook is never asked for a verdict — the
+    /// gate costs a matched plugin nothing unless it wants one.
+    #[test]
+    fn a_plugin_without_the_hook_is_never_gated() {
+        rt().block_on(async {
+            let fake = fake_plugin(vec![
+                manifest_route(r#""request""#),
+                ("/request", 200, "{}".into()),
+            ])
+            .await;
+            let mut p = Plugins::new();
+            p.register_remote("p", &fake.url);
+
+            let out = p.on_request("p", &req()).await.expect("registered");
+            assert!(out.response.is_none());
+            assert_eq!(fake.paths(), vec!["/manifest", "/request"]);
+        });
+    }
+
+    /// A deliberate refusal is a 403 with the plugin's own page, and it stops
+    /// the plugin before its request hook.
+    #[test]
+    fn a_refusal_serves_the_plugins_page() {
+        rt().block_on(async {
+            let fake = fake_plugin(vec![
+                manifest_route(r#""auth","request""#),
+                ("/auth", 200, r#"{"allow":false,"html":"<b>no</b>"}"#.into()),
+                ("/request", 200, "{}".into()),
+            ])
+            .await;
+            let mut p = Plugins::new();
+            p.register_remote("p", &fake.url);
+
+            let resp = p
+                .on_request("p", &req())
+                .await
+                .expect("registered")
+                .response
+                .expect("refused");
+            assert_eq!(resp.status, 403);
+            assert_eq!(resp.body, b"<b>no</b>");
+            assert!(resp
+                .headers
+                .iter()
+                .any(|(k, v)| k == auth::AUTH_HEADER && v == "p"));
+            assert!(!fake.paths().iter().any(|p| p == "/request"));
+        });
+    }
+
+    /// Stats are dispatched from the phases the proxy already runs, and never
+    /// waited for. A stats-only plugin still gets its response-phase ping, which
+    /// only works because the manifest reports the phase as needed.
+    #[test]
+    fn stats_only_plugin_is_still_dispatched() {
+        rt().block_on(async {
+            let fake = fake_plugin(vec![
+                manifest_route(r#""reqStats","resStats""#),
+                ("/stats", 200, String::new()),
+            ])
+            .await;
+            let mut p = Plugins::new();
+            p.register_remote("p", &fake.url);
+
+            let m = p.manifest("p").await.expect("manifest");
+            assert!(m.on_request && m.on_response, "both phases must be dispatched");
+            assert!(!m.request_hook && !m.response_hook, "but neither hook is served");
+
+            p.on_request("p", &req()).await.expect("registered");
+            let res = PluginRes {
+                id: 1,
+                status: 204,
+                ..Default::default()
+            };
+            p.on_response("p", &res).await.expect("registered");
+
+            // Fire-and-forget: the pings are in flight, so wait for them here
+            // rather than in the request path, which is the entire point.
+            for _ in 0..50 {
+                if fake.paths().iter().filter(|p| *p == "/stats").count() == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(fake.paths().iter().filter(|p| *p == "/stats").count(), 2);
+            // Nothing else was called: a stats plugin serves no buffered hook.
+            assert!(!fake.paths().iter().any(|p| p == "/request" || p == "/response"));
+        });
+    }
+
+    /// The UI hop: prefix stripped here, `/ui` added on the way out.
+    #[test]
+    fn ui_requests_reach_the_plugin_under_the_ui_prefix() {
+        rt().block_on(async {
+            let fake = fake_plugin(vec![
+                manifest_route(r#""ui""#),
+                ("/ui/page.html?x=1", 200, "<h1>plugin</h1>".into()),
+            ])
+            .await;
+            let mut p = Plugins::new();
+            p.register_remote("p", &fake.url);
+
+            let req = hyper::Request::builder()
+                .uri("/page.html?x=1")
+                .body(crate::proxy::body::empty())
+                .expect("request");
+            let resp = p.serve_ui("p", req).await.expect("a ui plugin answers");
+            assert_eq!(resp.status(), 200);
+            assert_eq!(collect(resp.into_body()).await, b"<h1>plugin</h1>");
+            assert!(fake.paths().iter().any(|p| p == "/ui/page.html?x=1"));
+        });
+    }
+
+    /// A plugin that declares no UI is not a UI: the web UI must be able to tell
+    /// the difference and serve its own 404.
+    #[test]
+    fn plugins_without_a_ui_hook_are_not_routed() {
+        rt().block_on(async {
+            let mut p = Plugins::new();
+            p.register_remote("p", "http://127.0.0.1:1");
+            let request = || {
+                hyper::Request::builder()
+                    .uri("/")
+                    .body(crate::proxy::body::empty())
+                    .expect("request")
+            };
+            // Unknown plugin, and a registered one with no manifest at all.
+            assert!(p.serve_ui("nope", request()).await.is_none());
+            assert!(p.serve_ui("p", request()).await.is_none());
+            // A built-in without the hook is equally not routed.
+            assert!(p.serve_ui("echo", request()).await.is_none());
+        });
+    }
+
+    /// The built-in gate, end to end in-process: block, admit, count, render.
+    #[test]
+    fn rust_gate_blocks_admits_and_serves_its_page() {
+        rt().block_on(async {
+            let p = Plugins::new();
+            let mut anonymous = req();
+            anonymous.param = "s3cret".into();
+            anonymous.headers = vec![("host".into(), "example.com".into())];
+
+            let blocked = p
+                .on_request("gate", &anonymous)
+                .await
+                .expect("registered")
+                .response
+                .expect("no token means blocked");
+            // No credentials at all asks for them; a wrong token does not.
+            assert_eq!(blocked.status, 401);
+
+            let mut wrong = anonymous.clone_for_test();
+            wrong.headers.push(("x-gate-token".into(), "guess".into()));
+            let blocked = p
+                .on_request("gate", &wrong)
+                .await
+                .expect("registered")
+                .response
+                .expect("a wrong token is blocked");
+            assert_eq!(blocked.status, 403);
+
+            let mut right = anonymous.clone_for_test();
+            right.headers.push(("x-gate-token".into(), "s3cret".into()));
+            let out = p.on_request("gate", &right).await.expect("registered");
+            assert!(out.response.is_none(), "the right token gets through");
+            assert_eq!(
+                out.set_headers,
+                vec![("x-whistle-gate-user".to_string(), "s3cret".to_string())]
+            );
+
+            // The response phase pings the same plugin, in process.
+            let res = PluginRes {
+                id: 1,
+                status: 200,
+                ..Default::default()
+            };
+            p.on_response("gate", &res).await.expect("registered");
+
+            let request = hyper::Request::builder()
+                .uri("/stats.json")
+                .body(crate::proxy::body::empty())
+                .expect("request");
+            let resp = p.serve_ui("gate", request).await.expect("gate serves a ui");
+            assert_eq!(resp.status(), 200);
+            let body = collect(resp.into_body()).await;
+            let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(v["admitted"], 1);
+            assert_eq!(v["blocked"], 2);
+            assert_eq!(v["responses"], 1);
+            assert_eq!(v["lastStatus"], 200);
+        });
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    impl PluginReq {
+        /// Copy a request for a second dispatch (test helper).
+        fn clone_for_test(&self) -> PluginReq {
+            PluginReq {
+                id: self.id,
+                method: self.method.clone(),
+                url: self.url.clone(),
+                headers: self.headers.clone(),
+                client_ip: self.client_ip.clone(),
+                param: self.param.clone(),
+                body: self.body.clone(),
+            }
+        }
     }
 }
