@@ -81,6 +81,21 @@ impl ProxyAuth {
     }
 }
 
+/// Where a proxy hop connects instead of the requested origin — whistle's
+/// `req._phost`.
+///
+/// It comes from a `host://` rule that survived alongside the proxy, or from
+/// the proxy URL's own `?host=` query (`P_HOST_RE`,
+/// `_original/lib/rules/index.js:81,:243`). The `host://` rule wins when both
+/// are present, because whistle only reads the query `if (!req._phost)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostOverride {
+    pub host: String,
+    /// Absent when the override named no port: the request's own port is then
+    /// kept (`options.port` is left alone, `_original/lib/inspectors/res.js:377-382`).
+    pub port: Option<u16>,
+}
+
 /// A parsed upstream proxy.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -88,6 +103,17 @@ pub struct ProxyConfig {
     pub host: String,
     pub port: u16,
     pub auth: Option<ProxyAuth>,
+    /// `?host=` written into the proxy URL. See [`HostOverride`]; a `host://`
+    /// rule takes precedence and is folded into [`Target::connect_host`]
+    /// instead.
+    pub host_override: Option<HostOverride>,
+    /// `proxyTunnel`: the address this hop connects to is itself a proxy, so
+    /// CONNECT onward through it to the real origin. See [`Target::hop_addr`].
+    pub tunnel: bool,
+    /// The `x`-prefixed spellings (`xproxy://`, `xsocks://`, …) ask for a direct
+    /// connection if the hop cannot be made (`X_RE`,
+    /// `_original/lib/inspectors/res.js:31,:546-560`).
+    pub fallback_direct: bool,
 }
 
 /// Which TLS protocol versions to offer on the upstream (origin) handshake.
@@ -129,12 +155,44 @@ pub struct Target {
 }
 
 impl Target {
-    /// True when a `host://` rule redirected the connection away from the
-    /// requested host. whistle calls this `req._phost`, and it is one of the
-    /// conditions that force a CONNECT tunnel rather than an absolute-form
-    /// request (`_original/lib/inspectors/res.js:296`).
+    /// The address this connection is actually made to.
+    ///
+    /// Normally the requested origin. A `host://` rule has already been folded
+    /// into [`Self::connect_host`] by the time a `Target` is built; a proxy
+    /// URL's own `?host=` is applied here instead, and only when no `host://`
+    /// rule spoke first — the same precedence as whistle's
+    /// `if (!req._phost && P_HOST_RE.test(proxy.matcher))`
+    /// (`_original/lib/rules/index.js:243`).
+    fn hop_addr(&self) -> (&str, u16) {
+        let direct = (self.connect_host.as_str(), self.connect_port);
+        if direct.0 != self.sni || direct.1 != self.request_port {
+            return direct;
+        }
+        match self.proxy.as_ref().and_then(|p| p.host_override.as_ref()) {
+            Some(o) => (o.host.as_str(), o.port.unwrap_or(self.request_port)),
+            None => direct,
+        }
+    }
+
+    /// True when something redirected the connection away from the requested
+    /// host — a `host://` rule or a proxy URL's `?host=`. whistle calls this
+    /// `req._phost`, and it is one of the conditions that force a CONNECT
+    /// tunnel rather than an absolute-form request
+    /// (`_original/lib/inspectors/res.js:296`).
     fn has_host_override(&self) -> bool {
-        self.connect_host != self.sni || self.connect_port != self.request_port
+        let (host, port) = self.hop_addr();
+        host != self.sni || port != self.request_port
+    }
+
+    /// Does this hop CONNECT twice — once to the overridden address, then again
+    /// through it to the real origin? See [`ProxyConfig::tunnel`].
+    ///
+    /// Both halves are required: whistle guards the second CONNECT with
+    /// `req._phost && req._proxyTunnel` (`_original/lib/util/index.js:889`,
+    /// `lib/tunnel.js:535-537`). Without an override there is no further
+    /// upstream to tunnel through, and the flag does nothing.
+    fn uses_proxy_tunnel(&self) -> bool {
+        self.proxy.as_ref().is_some_and(|p| p.tunnel) && self.has_host_override()
     }
 }
 
@@ -448,15 +506,113 @@ fn uses_absolute_form(target: &Target) -> bool {
 
 /// Forward `req` to `target` and return the upstream response (body still
 /// streaming). The request URI arrives origin-form with a `Host` header.
-pub async fn forward(target: &Target, mut req: Request<DynBody>) -> Result<Response<Incoming>> {
+pub async fn forward(target: &Target, req: Request<DynBody>) -> Result<Response<Incoming>> {
+    forward_with_addr(target, req).await.map(|(resp, _)| resp)
+}
+
+/// [`forward`], additionally reporting the address the request actually reached
+/// — the origin's on a direct connection, the upstream proxy's on a hop.
+///
+/// This is the only moment that address exists: a named origin is handed
+/// straight to `TcpStream::connect`, which picks among the resolver's answers
+/// without telling us, and asking the resolver again can answer differently
+/// under round-robin DNS. `serverIp:` is evaluated in the response phase from
+/// what this returns, so it matches on the address that was used rather than on
+/// a second guess. `None` means the connection never got far enough to have a
+/// peer (or the platform declined to say), and the condition then stays
+/// unanswerable rather than matching.
+pub async fn forward_with_addr(
+    target: &Target,
+    req: Request<DynBody>,
+) -> Result<(Response<Incoming>, Option<SocketAddr>)> {
+    let fallback = target
+        .proxy
+        .as_ref()
+        .is_some_and(|proxy| proxy.fallback_direct);
+    match forward_once(target, req).await {
+        Ok(out) => Ok(out),
+        // `xproxy://` and friends mean "through this proxy, or straight there if
+        // that fails" (`X_RE`, `_original/lib/inspectors/res.js:546-560`). Only a
+        // failure to *establish* the hop retries: past that point the request has
+        // been written to a socket the caller no longer owns a copy of, and
+        // whistle's own retry is likewise guarded on the connection not having
+        // been piped yet (`piped`, `res.js:529,:673-680`).
+        Err(RetryableError::Connect(err)) if fallback => {
+            tracing::debug!("proxy hop failed ({err:#}); falling back to a direct connection");
+            let direct = Target {
+                proxy: None,
+                ..target.clone()
+            };
+            forward_once(&direct, err.into_request())
+                .await
+                .map_err(RetryableError::into_inner)
+        }
+        Err(err) => Err(err.into_inner()),
+    }
+}
+
+/// A failure from [`forward_once`], tagged with whether the request survived it.
+enum RetryableError {
+    /// The connection was never established, so nothing was sent and the
+    /// request is handed back intact for another attempt.
+    Connect(UnsentRequest),
+    /// The request is gone — written to the wire, or consumed by a failed
+    /// handshake. Retrying it is not possible, only reporting it.
+    Sent(anyhow::Error),
+}
+
+/// A request that was never written, and the error that stopped it.
+struct UnsentRequest {
+    error: anyhow::Error,
+    request: Request<DynBody>,
+}
+
+impl UnsentRequest {
+    fn into_request(self) -> Request<DynBody> {
+        self.request
+    }
+}
+
+impl std::fmt::Display for UnsentRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl RetryableError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            RetryableError::Connect(unsent) => unsent.error,
+            RetryableError::Sent(err) => err,
+        }
+    }
+}
+
+/// One attempt at [`forward_with_addr`], with no fallback of its own.
+async fn forward_once(
+    target: &Target,
+    mut req: Request<DynBody>,
+) -> Result<(Response<Incoming>, Option<SocketAddr>), RetryableError> {
     // Refused before anything is sent: a proxy hop pointing back at us would
     // recurse until the process runs out of sockets. A caller that can answer
     // more helpfully checks [`self_loop`] itself; this is the backstop on the
     // one path every request takes into the network.
     if let Some(addr) = self_loop(target).await {
-        bail!("Self loop ({addr})");
+        return Err(RetryableError::Connect(UnsentRequest {
+            error: anyhow!("Self loop ({addr})"),
+            request: req,
+        }));
     }
     let hop = Hop::from_request(&req);
+
+    // Connect before touching the request. Nothing is sent yet, so a hop that
+    // cannot be established hands `req` back untouched — which is what lets an
+    // `xproxy://` fall back to a direct connection with the *same* request,
+    // rather than one already rewritten for a proxy that is not there.
+    let (stream, peer) = match origin_stream(target, &hop).await {
+        Ok(out) => out,
+        Err(error) => return Err(RetryableError::Connect(UnsentRequest { error, request: req })),
+    };
 
     // A plain HTTP proxy fetching an http origin uses absolute-form + Proxy-Auth.
     if uses_absolute_form(target) {
@@ -489,8 +645,10 @@ pub async fn forward(target: &Target, mut req: Request<DynBody>) -> Result<Respo
         }
     }
 
-    let stream = origin_stream(target, &hop).await?;
-    send(TokioIo::new(stream), req).await
+    let resp = send(TokioIo::new(stream), req)
+        .await
+        .map_err(RetryableError::Sent)?;
+    Ok((resp, peer))
 }
 
 /// Render `host:port` for a URL authority, omitting the default port and
@@ -510,22 +668,29 @@ fn join_host_port(host: &str, port: u16, default_port: u16) -> String {
 
 /// Establish a stream to the origin (through a proxy if configured), TLS-wrapping
 /// it when the origin speaks TLS.
-async fn origin_stream(target: &Target, hop: &Hop) -> Result<BoxedIo> {
-    let base: BoxedIo = match &target.proxy {
+///
+/// Also reports the socket's peer address — the origin's on a direct connection,
+/// the proxy's on a hop, which is whistle's `req.hostIp` in both cases
+/// (`setHostsInfo` is fed the resolved *proxy* address when a proxy rule
+/// matched, `_original/lib/inspectors/res.js:238,:259`). It is the only place
+/// the chosen address is ever visible, so `serverIp:` gets it from here.
+async fn origin_stream(target: &Target, hop: &Hop) -> Result<(BoxedIo, Option<SocketAddr>)> {
+    let (dst_host, dst_port) = target.hop_addr();
+    let (base, peer): (BoxedIo, Option<SocketAddr>) = match &target.proxy {
         None => {
-            let tcp = TcpStream::connect((target.connect_host.as_str(), target.connect_port))
+            let tcp = TcpStream::connect((dst_host, dst_port))
                 .await
-                .with_context(|| {
-                    format!("connecting to {}:{}", target.connect_host, target.connect_port)
-                })?;
+                .with_context(|| format!("connecting to {dst_host}:{dst_port}"))?;
             tcp.set_nodelay(true).ok();
-            BoxedIo(Box::new(tcp))
+            let peer = tcp.peer_addr().ok();
+            (BoxedIo(Box::new(tcp)), peer)
         }
         Some(proxy) => {
             let ptcp = TcpStream::connect((proxy.host.as_str(), proxy.port))
                 .await
                 .with_context(|| format!("connecting to proxy {}:{}", proxy.host, proxy.port))?;
             ptcp.set_nodelay(true).ok();
+            let peer = ptcp.peer_addr().ok();
             // Optionally TLS to the proxy itself (https-proxy).
             let pstream: BoxedIo = if proxy.kind == ProxyKind::Https {
                 let connector = TlsConnector::from(CLIENT_CONFIG.clone());
@@ -535,26 +700,37 @@ async fn origin_stream(target: &Target, hop: &Hop) -> Result<BoxedIo> {
             } else {
                 BoxedIo(Box::new(ptcp))
             };
-            match proxy.kind {
+            let stream = match proxy.kind {
                 ProxyKind::Socks => {
-                    socks5_connect(pstream, &target.connect_host, target.connect_port, &proxy.auth)
-                        .await?
+                    socks5_connect(pstream, dst_host, dst_port, &proxy.auth).await?
                 }
                 ProxyKind::Http | ProxyKind::Https => {
                     if uses_absolute_form(target) {
                         // Plain http via a plain proxy: absolute-form, no CONNECT.
-                        return Ok(pstream);
+                        return Ok((pstream, peer));
                     }
-                    http_connect(
-                        pstream,
-                        &target.connect_host,
-                        target.connect_port,
-                        hop,
-                        proxy,
-                    )
-                    .await?
+                    let tunnelled = http_connect(pstream, dst_host, dst_port, hop, proxy, false)
+                        .await
+                        .with_context(|| format!("via proxy {}:{}", proxy.host, proxy.port))?;
+                    if target.uses_proxy_tunnel() {
+                        // The address we just reached is itself a proxy: ask it,
+                        // through the tunnel we now hold, for the real origin.
+                        http_connect(
+                            tunnelled,
+                            &target.sni,
+                            target.request_port,
+                            hop,
+                            proxy,
+                            true,
+                        )
+                        .await
+                        .with_context(|| format!("via proxy tunnel {dst_host}:{dst_port}"))?
+                    } else {
+                        tunnelled
+                    }
                 }
-            }
+            };
+            (stream, peer)
         }
     };
 
@@ -566,9 +742,9 @@ async fn origin_stream(target: &Target, hop: &Hop) -> Result<BoxedIo> {
             .connect(server_name, base)
             .await
             .context("upstream TLS handshake")?;
-        Ok(BoxedIo(Box::new(tls)))
+        Ok((BoxedIo(Box::new(tls)), peer))
     } else {
-        Ok(base)
+        Ok((base, peer))
     }
 }
 
@@ -594,6 +770,13 @@ where
     Ok(resp)
 }
 
+/// The header a `proxyTunnel` hop sends on its **inner** CONNECT, asking the
+/// whistle at the far end of the first tunnel to intercept rather than blindly
+/// relay (`headers['x-whistle-policy'] = 'intercept'`,
+/// `_original/lib/util/patch.js:135-138`, set because `setProxyAgent` always
+/// passes `enableIntercept: true`, `lib/inspectors/res.js:472`).
+const POLICY_HEADER: &str = "X-Whistle-Policy";
+
 /// Issue a CONNECT to an HTTP proxy, tunnelling to `host:port`.
 ///
 /// The hop headers mirror whistle's `proxyHeaders`
@@ -601,12 +784,22 @@ where
 /// `Proxy-Connection`, the client's `User-Agent`, and `Proxy-Authorization`.
 /// whistle can suppress the last two with `disable://proxyUA` /
 /// `disable://proxyConnection`; those flags do not reach this layer.
+///
+/// `inner` marks the second CONNECT of a `proxyTunnel` chain, which travels
+/// *inside* the first tunnel and is addressed to a further proxy. It carries
+/// the same headers plus [`POLICY_HEADER`], which is what upstream's rewritten
+/// CONNECT does (`_original/lib/util/patch.js:120-140`) — including the
+/// `Proxy-Authorization`. Worth knowing: one rule names both hops and supplies
+/// one credential, so the second proxy is shown the credential written for the
+/// first. Upstream does the same, and dropping it would make an authenticated
+/// second hop unreachable.
 async fn http_connect(
     mut s: BoxedIo,
     host: &str,
     port: u16,
     hop: &Hop,
     proxy: &ProxyConfig,
+    inner: bool,
 ) -> Result<BoxedIo> {
     let authority = join_host_port(host, port, 0);
     let mut req = format!(
@@ -621,6 +814,9 @@ async fn http_connect(
         if is_header_value(&auth) {
             req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
         }
+    }
+    if inner {
+        req.push_str(&format!("{POLICY_HEADER}: intercept\r\n"));
     }
     req.push_str("\r\n");
     s.write_all(req.as_bytes()).await.context("proxy CONNECT write")?;
@@ -833,6 +1029,53 @@ fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
     }
 }
 
+/// whistle's `P_HOST_RE` (`_original/lib/rules/index.js:81`): a `?host=` /
+/// `&host=` parameter in a proxy operator's own URL, naming the address the
+/// **proxy** should connect to instead of the requested origin.
+///
+/// The character class is upstream's, verbatim (`[\w.:-]+`): it admits an IPv6
+/// literal's colons, which is also how a port is written, so the split is left
+/// to [`split_host_port`] exactly as whistle leaves it to `parseUrl`. An
+/// unbracketed IPv6 address is therefore not expressible here — upstream has
+/// the same hole, since `[` and `]` are outside the class.
+fn parse_host_query(value: &str) -> Option<HostOverride> {
+    let (_, query) = value.split_once('?')?;
+    let raw = query.split('&').find_map(|seg| {
+        let (k, v) = seg.split_once('=')?;
+        k.eq_ignore_ascii_case("host").then_some(v)
+    })?;
+    if raw.is_empty()
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+    {
+        return None;
+    }
+    // A port of 0 is how "no port given" comes back; whistle's `parseUrl` leaves
+    // `port` undefined for the same input and keeps the request's own port.
+    let (host, port) = split_host_port(raw, 0);
+    if host.is_empty() {
+        return None;
+    }
+    Some(HostOverride {
+        host,
+        port: (port != 0).then_some(port),
+    })
+}
+
+/// Parse a proxy operator as it was **written on the rule line**, query flags
+/// and all: `[user[:pass]@]host[:port][?host=…]`.
+///
+/// Separate from [`parse_proxy`] because most callers already hold a bare
+/// address; this one additionally understands the `?host=` override that
+/// whistle reads straight off the matcher.
+pub fn parse_proxy_rule(kind: ProxyKind, matcher: &str) -> Option<ProxyConfig> {
+    let address = matcher.split('?').next().unwrap_or(matcher);
+    let mut cfg = parse_proxy(kind, address)?;
+    cfg.host_override = parse_host_query(matcher);
+    Some(cfg)
+}
+
 /// Parse a proxy operator value: `[user[:pass]@]host[:port]`.
 pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
     let value = value.trim().trim_start_matches("//");
@@ -854,7 +1097,15 @@ pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
     if host.is_empty() {
         return None;
     }
-    Some(ProxyConfig { kind, host, port, auth })
+    Some(ProxyConfig {
+        kind,
+        host,
+        port,
+        auth,
+        host_override: None,
+        tunnel: false,
+        fallback_direct: false,
+    })
 }
 
 #[cfg(test)]
@@ -1225,5 +1476,315 @@ mod tests {
                 assert!(pass.is_empty(), "empty password for {host}");
             });
         }
+    }
+
+    /// `?host=` in a proxy URL names where the *proxy* should connect
+    /// (`P_HOST_RE`, `_original/lib/rules/index.js:81,:243`). A missing port
+    /// means "keep the request's own", which is why it is `None` here rather
+    /// than a guessed 80.
+    #[test]
+    fn a_proxy_url_can_carry_its_own_host_override() {
+        let p = parse_proxy_rule(ProxyKind::Http, "127.0.0.1:8888?host=10.0.0.9:8080").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("127.0.0.1", 8888));
+        assert_eq!(
+            p.host_override,
+            Some(HostOverride { host: "10.0.0.9".into(), port: Some(8080) })
+        );
+
+        let no_port = parse_proxy_rule(ProxyKind::Http, "127.0.0.1?host=10.0.0.9").unwrap();
+        assert_eq!(
+            no_port.host_override,
+            Some(HostOverride { host: "10.0.0.9".into(), port: None })
+        );
+
+        // It may sit anywhere in the query, beside whistle's other flags.
+        let mixed = parse_proxy_rule(ProxyKind::Socks, "1.2.3.4?proxyHost&host=a.internal").unwrap();
+        assert_eq!(mixed.host_override.unwrap().host, "a.internal");
+
+        // No query, an empty value, or a character outside upstream's
+        // `[\w.:-]+` leaves the origin alone.
+        assert!(parse_proxy_rule(ProxyKind::Http, "1.2.3.4:8888").unwrap().host_override.is_none());
+        assert!(parse_proxy_rule(ProxyKind::Http, "1.2.3.4?host=").unwrap().host_override.is_none());
+        assert!(parse_proxy_rule(ProxyKind::Http, "1.2.3.4?host=a/b").unwrap().host_override.is_none());
+        assert!(parse_proxy_rule(ProxyKind::Http, "1.2.3.4?hosts=x").unwrap().host_override.is_none());
+        // The address still parses when the query is present.
+        assert!(parse_proxy_rule(ProxyKind::Http, "?host=x").is_none());
+    }
+
+    /// A `host://` rule outranks the proxy URL's own `?host=` — whistle only
+    /// reads the query `if (!req._phost)` (`lib/rules/index.js:243`) — and
+    /// either one forces a CONNECT tunnel.
+    #[test]
+    fn the_host_rule_outranks_the_proxy_urls_own_override() {
+        let cfg = parse_proxy_rule(ProxyKind::Http, "127.0.0.1:1?host=10.0.0.9:8080").unwrap();
+        let mut t = target("example.com", 80, Some(cfg));
+        assert_eq!(t.hop_addr(), ("10.0.0.9", 8080));
+        assert!(t.has_host_override());
+        assert!(!uses_absolute_form(&t), "an override always tunnels");
+
+        // A `host://` rule has already been folded into connect_host by now.
+        t.connect_host = "192.168.1.5".into();
+        t.connect_port = 8000;
+        assert_eq!(t.hop_addr(), ("192.168.1.5", 8000));
+
+        // Without a port, the request's own is kept.
+        let cfg = parse_proxy_rule(ProxyKind::Http, "127.0.0.1:1?host=10.0.0.9").unwrap();
+        let t = target("example.com", 8080, Some(cfg));
+        assert_eq!(t.hop_addr(), ("10.0.0.9", 8080));
+
+        // No proxy, no override: straight to the origin, and still no
+        // absolute-form (that needs a proxy).
+        let plain = target("example.com", 80, None);
+        assert_eq!(plain.hop_addr(), ("example.com", 80));
+        assert!(!plain.has_host_override());
+    }
+
+    /// `proxyTunnel` needs both halves: the flag *and* an address to tunnel
+    /// through (`req._phost && req._proxyTunnel`,
+    /// `_original/lib/util/index.js:889`).
+    #[test]
+    fn proxy_tunnel_needs_an_address_to_tunnel_through() {
+        let mut cfg = parse_proxy(ProxyKind::Http, "127.0.0.1:1").unwrap();
+        cfg.tunnel = true;
+        assert!(!target("a.com", 80, Some(cfg.clone())).uses_proxy_tunnel());
+
+        cfg.host_override = Some(HostOverride { host: "10.0.0.9".into(), port: Some(8080) });
+        assert!(target("a.com", 80, Some(cfg.clone())).uses_proxy_tunnel());
+
+        // The flag is what asks for the second CONNECT; an override alone is
+        // just a redirected first one.
+        cfg.tunnel = false;
+        assert!(!target("a.com", 80, Some(cfg)).uses_proxy_tunnel());
+    }
+
+    /// End to end: `?host=` sends the CONNECT to the override, and the request
+    /// inside the tunnel still names the requested host.
+    #[test]
+    fn the_proxy_urls_host_override_redirects_the_connect() {
+        rt().block_on(async {
+            let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut s, _) = origin.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                let line = head.lines().next().unwrap_or("").to_string();
+                s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{line}", line.len())
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            });
+
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_port = proxy.local_addr().unwrap().port();
+            let seen = tokio::spawn(async move {
+                let (mut s, _) = proxy.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                let mut up = TcpStream::connect(("127.0.0.1", origin_port)).await.unwrap();
+                tokio::io::copy_bidirectional(&mut s, &mut up).await.ok();
+                head
+            });
+
+            let cfg = parse_proxy_rule(
+                ProxyKind::Http,
+                &format!("127.0.0.1:{proxy_port}?host=127.0.0.1:{origin_port}"),
+            )
+            .unwrap();
+            let resp = forward(&target("example.com", 80, Some(cfg)), get("/x", "example.com"))
+                .await
+                .expect("tunnelled via ?host=");
+            assert_eq!(resp.status(), 200);
+            let echoed = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(echoed, Bytes::from("GET /x HTTP/1.1"));
+
+            let head = seen.await.unwrap();
+            assert!(
+                head.starts_with(&format!("CONNECT 127.0.0.1:{origin_port} HTTP/1.1\r\n")),
+                "CONNECT to the ?host= address, got: {head:?}"
+            );
+        });
+    }
+
+    /// End to end: `proxyTunnel` CONNECTs twice — once to the overridden
+    /// address, then through that tunnel to the real origin, with the
+    /// intercept policy on the inner hop (`_original/lib/util/patch.js:120-140`).
+    #[test]
+    fn proxy_tunnel_connects_onward_through_the_overridden_address() {
+        rt().block_on(async {
+            let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut s, _) = origin.accept().await.unwrap();
+                read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+            });
+
+            // The second proxy: answers the *inner* CONNECT and reaches the origin.
+            let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let second_port = second.local_addr().unwrap().port();
+            let inner_seen = tokio::spawn(async move {
+                let (mut s, _) = second.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                let mut up = TcpStream::connect(("127.0.0.1", origin_port)).await.unwrap();
+                tokio::io::copy_bidirectional(&mut s, &mut up).await.ok();
+                head
+            });
+
+            // The first proxy: answers the outer CONNECT, splices to the second.
+            let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let first_port = first.local_addr().unwrap().port();
+            let outer_seen = tokio::spawn(async move {
+                let (mut s, _) = first.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                let mut up = TcpStream::connect(("127.0.0.1", second_port)).await.unwrap();
+                tokio::io::copy_bidirectional(&mut s, &mut up).await.ok();
+                head
+            });
+
+            let mut cfg = parse_proxy_rule(
+                ProxyKind::Http,
+                &format!("bob:s3cr3t@127.0.0.1:{first_port}?host=127.0.0.1:{second_port}"),
+            )
+            .unwrap();
+            cfg.tunnel = true;
+            let resp = forward(&target("example.com", 443, Some(cfg)), get("/", "example.com"))
+                .await
+                .expect("double CONNECT");
+            assert_eq!(resp.status(), 204);
+
+            let outer = outer_seen.await.unwrap();
+            assert!(
+                outer.starts_with(&format!("CONNECT 127.0.0.1:{second_port} HTTP/1.1\r\n")),
+                "outer CONNECT names the further proxy, got: {outer:?}"
+            );
+            let inner = inner_seen.await.unwrap();
+            assert!(
+                inner.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"),
+                "inner CONNECT names the real origin, got: {inner:?}"
+            );
+            assert!(
+                inner.to_lowercase().contains("x-whistle-policy: intercept\r\n"),
+                "{inner:?}"
+            );
+            // One rule, one credential: it authenticates both hops (patch.js
+            // copies the CONNECT headers onto the inner request).
+            assert!(inner.contains("Proxy-Authorization: Basic Ym9iOnMzY3IzdA==\r\n"), "{inner:?}");
+        });
+    }
+
+    /// `xproxy://` and friends fall back to a direct connection when the hop
+    /// cannot be made (`X_RE`, `_original/lib/inspectors/res.js:546-560`), and
+    /// the plain spellings still fail closed.
+    #[test]
+    fn an_x_proxy_falls_back_to_a_direct_connection() {
+        rt().block_on(async {
+            let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin.local_addr().unwrap().port();
+            let seen = tokio::spawn(async move {
+                let (mut s, _) = origin.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                head
+            });
+
+            // A port nothing listens on: bind it, read the port, drop it.
+            let dead_port = {
+                let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                l.local_addr().unwrap().port()
+            };
+
+            let mut cfg = parse_proxy(ProxyKind::Http, &format!("127.0.0.1:{dead_port}")).unwrap();
+            cfg.fallback_direct = true;
+            let resp = forward(
+                &target("127.0.0.1", origin_port, Some(cfg.clone())),
+                get("/x", "example.com"),
+            )
+            .await
+            .expect("falls back to direct");
+            assert_eq!(resp.status(), 204);
+            // The retry sends the request the client wrote, origin-form —
+            // not the absolute-form one the proxy would have received.
+            let head = seen.await.unwrap();
+            assert!(head.starts_with("GET /x HTTP/1.1\r\n"), "{head:?}");
+
+            // Without the flag the same rule fails closed.
+            cfg.fallback_direct = false;
+            let err = forward(&target("127.0.0.1", origin_port, Some(cfg)), get("/x", "example.com"))
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("connecting to proxy"), "{err:#}");
+        });
+    }
+
+    /// A proxy that answers and *then* fails is not retried: the request has
+    /// been written and cannot be replayed. whistle guards its own retry the
+    /// same way (`piped`, `res.js:529`).
+    #[test]
+    fn the_fallback_stops_once_the_request_is_on_the_wire() {
+        rt().block_on(async {
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = proxy.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut s, _) = proxy.accept().await.unwrap();
+                read_head(&mut s).await;
+                // Accept the tunnel, then hang up mid-conversation.
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                read_head(&mut s).await;
+                drop(s);
+            });
+
+            let mut cfg = parse_proxy(ProxyKind::Http, &format!("127.0.0.1:{port}")).unwrap();
+            cfg.fallback_direct = true;
+            let mut t = target("example.com", 80, Some(cfg));
+            // An override forces CONNECT, so the proxy gets to answer first.
+            t.connect_host = "10.0.0.9".into();
+            assert!(forward(&t, get("/x", "example.com")).await.is_err());
+        });
+    }
+
+    /// The address a request actually reached, which is the only thing
+    /// `serverIp:` can honestly answer with: the origin's on a direct
+    /// connection, the *proxy's* on a hop — whistle's `req.hostIp` is the
+    /// proxy's address too (`_original/lib/inspectors/res.js:238,:259`).
+    #[test]
+    fn forwarding_reports_the_address_the_request_reached() {
+        rt().block_on(async {
+            let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut s, _) = origin.accept().await.unwrap();
+                    tokio::spawn(async move {
+                        read_head(&mut s).await;
+                        s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                    });
+                }
+            });
+
+            // Direct: the origin's own address, resolved from the name we asked for.
+            let (_, addr) = forward_with_addr(
+                &target("localhost", origin_port, None),
+                get("/", "localhost"),
+            )
+            .await
+            .expect("direct");
+            let addr = addr.expect("a connected socket has a peer");
+            assert!(addr.ip().is_loopback(), "{addr}");
+            assert_eq!(addr.port(), origin_port);
+
+            // Through a proxy: the proxy's address, as whistle reports it.
+            let cfg = parse_proxy(ProxyKind::Http, &format!("127.0.0.1:{origin_port}")).unwrap();
+            let (_, via) = forward_with_addr(
+                &target("example.com", 80, Some(cfg)),
+                get("/", "example.com"),
+            )
+            .await
+            .expect("proxied");
+            assert_eq!(via.map(|a| a.to_string()), Some(format!("127.0.0.1:{origin_port}")));
+        });
     }
 }
