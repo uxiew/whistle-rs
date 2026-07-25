@@ -77,8 +77,42 @@ URL 里**没有** `?` 时第一遍整个跳过，但**第二遍照常执行**。
 | `${{var}}` | 结果做 `encodeURIComponent` 编码 |
 | `$${var}` | 原始模式：查询串/cookie 的值**不做**百分号解码 |
 | `${var.key}` | 子路径，如 `${query.foo}`、`${reqHeaders.user-agent}`、`${env.PATH}` |
+| `${var.replace(a,b)}` | 对解析结果再做一次替换，见下节 |
 
 变量名**大小写不敏感**（`${reqHeaders}` 与 `${reqheaders}` 等价）。
+
+---
+
+## `.replace(pattern,replacement)` 修饰符
+
+变量名（或子路径）末尾可以跟一个 `.replace(...)`，对**解析出来的值**再做一次替换
+（`resolveTplVar`，`_original/lib/rules/rules.js:725-752`）。它在 `${{...}}` 的
+URI 编码**之前**生效。
+
+| 写法 | 结果 |
+|------|------|
+| `${query.v.replace(a,b)}` | 普通子串替换，**只替换第一处**（JS `String.replace` 的字符串形式） |
+| `${url.replace(/a/gi,b)}` | `/…/flags` 会被编译成真正的正则；`g` 全部替换，`i`/`m` 同 JS，`u` 无需转换 |
+| `${v.replace(/(\d+)-(\d+)/,$2/$1)}` | 反向引用 `$&`、`$0`..`$9` |
+| `${v.replace(/(.+)/,$$1)}` | `$$n` 把该分组做 `encodeURIComponent` |
+| `${v.replace(/(x)/,\$1)}` | `\$n` 原样输出 `$n`；`\\$n` 输出一个反斜杠加值 |
+| `${v.replace(a\,b,-)}` | `\,` 是参数里的字面逗号；`\\,` 是字面 `\,` |
+| `${v.replace(/x/g)}` | 没有第二个参数 = 删除 |
+| **`${query.absent.replace(,默认值)}`** | **pattern 为空时不做替换，而是给空值兜底** |
+
+最后一行容易漏掉：上游是 `val = pattern ? val : val || replacement`
+（`rules.js:744-746`）。所以
+
+- pattern 为空 + 值为空 → 输出 `replacement`
+- pattern 为空 + 值非空 → 输出原值
+- pattern **非**空 + 值为空 → 输出空串（**不会**兜底）
+
+反向引用只有在 pattern 是正则时才展开：字符串 pattern 没有捕获组，JS 会把 `$1`
+原样留下（`$&` 仍然生效）。
+
+> **不支持的正则会整体保留原样。** JS 的断言 `(?=…)`、反向引用 `\1` 在 Rust 的
+> `regex` 里没有对应实现，此时 whistle-rs 输出完整的 `${...}` 占位符，而不是
+> 假装替换过了。
 
 ---
 
@@ -120,7 +154,6 @@ URL 里**没有** `?` 时第一遍整个跳过，但**第二遍照常执行**。
 
 | 变量 | 原因 |
 |------|------|
-| `${var.replace(a,b)}` | `.replace()` 修饰符未移植。引擎会识别该后缀并**整体保留原样**，而不是错误地渲染成半成品 |
 | `${localClientId}` | 需要客户端身份体系 |
 | `${whistle.<插件名>}` | 需要插件运行时耦合 |
 
@@ -152,13 +185,14 @@ GET http://example.com/api?callback=cb123
 
 按上游的回退链推断（`file-proxy.js:255-258`）：
 
-1. **文件自身的扩展名**
+1. **命中的那个文件的扩展名**（不是规则里写的值 —— 见「文件查找」）
 2. 都没有时，看**请求 URL 的扩展名**
 3. 再没有则 `text/html`
 
 第 2 步是为什么 `example.com/a.json file:///tmp/mock` 能返回 JSON —— 即使 mock 文件没有扩展名。
 
-模板响应的状态码**恒为 200**，`content-length` 在渲染**之后**重新计算，且**不支持 Range 请求**。
+模板响应的状态码**恒为 200**，`content-length` 在渲染**之后**重新计算，且**不支持 Range 请求**
+（`file://` 目前也不支持，见「文件查找」末尾）。
 
 响应侧算子（`resHeaders://`、`resType://`、`resCors://` 等）**对模板/文件响应同样生效** ——
 和上游一样，短路产生的响应也会走一遍响应侧规则：
@@ -193,24 +227,60 @@ Content-Type: application/json
 {"error":"nope"}
 ```
 
+分隔头和 body 的空行**接受任意 CR/LF 组合**（`HEADERS_SEP_RE`，`file-proxy.js:12`）：
+`\r\n\r\n`、`\n\n`、`\r\r`、`\n\r` 等八种写法都算，手写的 `.http` fixture 不必纠结换行符。
+
+两个边界行为：
+
+- **前 256 KB 内找不到空行就不当作 raw 响应**（`MAX_HEADERS_SIZE`，`file-proxy.js:13,151-158`），
+  整个文件按普通文件返回，而不是把第一行误当成状态行。
+- body 按**字节**切分并原样返回，二进制内容（图片等）不会被 UTF-8 转换损坏。
+
 ---
 
 ## 文件查找
 
-值先按原样当作路径，找不到再尝试补一个前导 `/`。
+规则的值不是一个路径，而是一串候选：按下面的顺序展开成列表，**第一个 `stat()` 结果是普通文件的候选生效**
+（`getRuleFiles`，`_original/lib/util/index.js:1420-1444`；`readFiles`，`file-proxy.js:38-58`）。
 
-**尚未移植**（写文档时逐条核对过实现）：
+| 写法 | 展开成 |
+|------|--------|
+| `a\|b\|c` | `a`、`b`、`c` —— 多路径回退 |
+| `~/mock.json` | `$HOME/mock.json`（全角 `～/` 同样生效；单独一个 `~` 不展开） |
+| `/tmp/site/` | `/tmp/site`，然后 `/tmp/site/index.html` |
+| `tmp/x`（缺少前导 `/`） | `tmp/x`，然后 `/tmp/x` —— whistle-rs 自己的兜底 |
+
+含 `..` 路径段的候选会被**拒绝**（`UP_PATH_REGEXP`，`_original/lib/util/common.js:29`），
+不参与查找；如果整条规则最终没找到文件，404 的正文里显示的就是这个标记：
+
+```
+$ curl -x http://127.0.0.1:8899 'http://mock.test/up'
+whistle-rs: file not found <strong>(Path contains parent directory notation &#39;..&#39;)</strong>
+```
+
+被拒绝的候选不会中断整条规则 —— `file://../escape|/tmp/ok.txt` 仍然会服务 `/tmp/ok.txt`。
+`x` / `xs` 规则则照旧回落到真实服务器。
+
+`a..b` 这样的文件名不受影响：只有**独立成段**的 `..` 才算越级。
+
+> **上游怪癖：`xs` 前缀不拆 `|`。** 拆分用的正则（`rules.js:96`）写的是 `^x?(...)`，
+> 只允许**单个** `x`，所以 `xsfile://a|b` 在原版里就不会被拆开，整串会被当成一个文件名。
+> whistle-rs **刻意复刻**了这个行为：`|` 在 POSIX 文件名里是合法字符，"修好"它会让同一份规则文件在两边解析出不同的路径。
+
+Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写的值 ——
+所以 `file:///tmp/site/` 命中 `index.html` 时会返回 `text/html`。
+
+`file://` 的定位是在开发机上服务任意本地路径，因此除了上面的 `..` 校验**不做沙箱限制** ——
+上游对绝对路径同样不加限制。
+
+**尚未移植**：
 
 | 上游行为 | 现状 |
 |----------|------|
-| `a\|b\|c` 多路径回退，第一个存在的文件生效 | 未实现，`\|` 会被当作路径的一部分 |
-| 路径含 `..` 时返回带特定文案的 404 | 未实现，不做校验 |
-| 结尾 `/` 展开为「目录本身」和「目录 + index.html」两个候选 | 未实现 |
+| 路径先 `decodeURIComponent`，并截掉 `?`/`#` 之后的部分（`decodePath`，`util/index.js:1403-1418`） | 未实现。上游需要它是因为目录规则会把请求路径拼到值后面，whistle-rs 不拼；代价是 `file:///tmp/a%20b.json` 这种写法目前不会解码 |
 | 从 values 存储 / 远程 URL / 插件 key 解析文件 | 未实现 |
-
-`file://` 的定位是在开发机上服务任意本地路径，因此**不做沙箱限制** —— 上游对绝对路径同样不加限制。
-
-> 顺带一提，上游拆分 `|` 的正则只允许**单个** `x` 前缀，所以即使在原版里，`xsfile://a|b` 的多路径回退也不生效。
+| `file://` 的 Range 请求（206 + `content-range`，`file-proxy.js:102,160-172`） | 未实现，整份文件以 200 返回。Range 是可选的，客户端会自行处理；另外上游 `parseRange` 对 `bytes=-500` 这类后缀区间算错（`util/index.js:3358-3366`），复刻与否都需要额外决策 |
+| `rawfile://` 的**内联值**形式会删掉 `content-encoding`（`file-proxy.js:71-73`） | 无法触发：whistle-rs 的规则解析器不支持 `<...>` 内联值，文件族的值永远是路径 |
 
 ### 文件缓存
 
