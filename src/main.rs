@@ -64,6 +64,15 @@ struct Cli {
     #[arg(long)]
     no_persist: bool,
 
+    /// Do not verify the origin server's TLS certificate.
+    ///
+    /// whistle never verifies unless started with `--safe`; whistle-rs verifies
+    /// by default and this opts out. Needed for self-signed or private-CA
+    /// origins — and it means this proxy can no longer tell you when the
+    /// connection it is inspecting has itself been intercepted.
+    #[arg(long)]
+    insecure_upstream: bool,
+
     /// Days of session history to retain on disk.
     #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_DAYS)]
     persist_days: u32,
@@ -193,6 +202,14 @@ async fn main() -> Result<()> {
         }
     }
     tracing::info!("plugins: {}", registry.names().join(", "));
+
+    whistle_rs::proxy::upstream::set_insecure_upstream(cli.insecure_upstream);
+    if cli.insecure_upstream {
+        tracing::warn!(
+            "--insecure-upstream: origin certificates are NOT verified; \
+             an intercepted upstream connection will look identical to a genuine one"
+        );
+    }
 
     let mut state = AppState::with_plugins(config, manager, ca, registry);
 

@@ -1000,3 +1000,25 @@ Known gaps in the operator layer, deliberately left:
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.
+
+
+## Origin certificate verification
+
+whistle does **not** verify the origin server's certificate: `rejectUnauthorized`
+is `false` by default and only `--safe` turns it on
+(`_original/lib/config.js:74`). whistle-rs inverts that default — it verifies,
+and `--insecure-upstream` opts out:
+
+```bash
+whistle-rs --insecure-upstream      # accept self-signed / private-CA origins
+```
+
+Without it, a self-signed or private-CA origin returns **502** where whistle
+would have proxied it.
+
+The inversion is deliberate and is the one place this port does not reproduce
+upstream's default. Everywhere else, fidelity wins — a rules file must resolve
+identically in both implementations. But a debugging proxy that silently accepts
+any upstream certificate cannot tell its user when the connection it is
+inspecting has itself been intercepted, and that is a property worth keeping by
+default and spending a flag on.

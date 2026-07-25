@@ -129,7 +129,87 @@ impl Target {
     }
 }
 
+/// Whether to skip verification of the **origin's** certificate.
+///
+/// whistle sets `rejectUnauthorized = false` by default and only verifies with
+/// `--safe` (`_original/lib/config.js:74`). whistle-rs inverts that: verifying
+/// is the default and this opts out, because a debugging proxy that silently
+/// accepts any upstream certificate cannot tell its user when the connection it
+/// is inspecting has itself been intercepted. See `--insecure-upstream`.
+static INSECURE_UPSTREAM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Opt out of origin certificate verification, process-wide. Call before
+/// serving; the TLS configs are built once, on first use.
+pub fn set_insecure_upstream(insecure: bool) {
+    INSECURE_UPSTREAM.store(insecure, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn insecure_upstream() -> bool {
+    INSECURE_UPSTREAM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A verifier that accepts any certificate. Only reachable behind
+/// `--insecure-upstream`; see [`INSECURE_UPSTREAM`] for why that is opt-in.
+#[derive(Debug)]
+struct AcceptAnyServerCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 fn build_client_config(versions: &[&'static rustls::SupportedProtocolVersion]) -> Arc<ClientConfig> {
+    if insecure_upstream() {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+        let cfg = ClientConfig::builder_with_protocol_versions(versions)
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+            .with_no_client_auth();
+        return Arc::new(cfg);
+    }
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let cfg = ClientConfig::builder_with_protocol_versions(versions)
@@ -643,6 +723,18 @@ pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
 
 #[cfg(test)]
 mod tests {
+    /// The opt-out is process-wide and read when a TLS config is first built,
+    /// so it must be set before serving starts. Guarding the default here
+    /// because "verifies unless asked not to" is the security property.
+    #[test]
+    fn upstream_verification_is_on_unless_opted_out() {
+        assert!(!insecure_upstream(), "verification must default to on");
+        set_insecure_upstream(true);
+        assert!(insecure_upstream());
+        set_insecure_upstream(false);
+        assert!(!insecure_upstream());
+    }
+
     use super::*;
     use tokio::net::TcpListener;
 
