@@ -4,6 +4,7 @@
 //! (`req.js`, `res.js`) and the handlers. Implements the most-used operators;
 //! others parse and resolve but are not yet applied (documented in README).
 
+use anyhow::{Context as _, Result, anyhow, bail};
 use bytes::Bytes;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::http::request;
@@ -167,51 +168,68 @@ pub fn merge_included_rules(
     }
 }
 
-/// Upstream-proxy operators in the order whistle prefers them, with the proxy
-/// kind each implies. Scheme-converting proxies are treated as plain HTTP
-/// proxies — this port does not implement the scheme flip.
-const PROXY_PROTOS: &[(&str, ProxyKind)] = &[
-    ("socks", ProxyKind::Socks),
-    ("https-proxy", ProxyKind::Https),
-    ("http-proxy", ProxyKind::Http),
-    ("proxy", ProxyKind::Http),
-    ("internal-https-proxy", ProxyKind::Https),
-    ("internal-proxy", ProxyKind::Http),
-    ("internal-http-proxy", ProxyKind::Http),
-    ("https2http-proxy", ProxyKind::Http),
-    ("http2https-proxy", ProxyKind::Http),
-];
+/// How to reach the proxy each upstream-proxy operator names.
+///
+/// Only the transport is decided here. The scheme conversions two of the names
+/// promise are a separate question, answered by [`origin_tls`]: `internal-*` and
+/// `https2http-proxy` speak plain HTTP *to* the proxy either way.
+fn proxy_kind(proto: &str) -> ProxyKind {
+    match proto {
+        "socks" => ProxyKind::Socks,
+        "https-proxy" | "internal-https-proxy" => ProxyKind::Https,
+        _ => ProxyKind::Http,
+    }
+}
 
 /// The protocol of the matched upstream-proxy rule, if one matched at all.
 /// Cheap on purpose: it answers "is there a proxy rule?" without parsing the
 /// value or evaluating a PAC script.
 fn matched_proxy_proto(resolved: &Resolved) -> Option<&'static str> {
-    PROXY_PROTOS
+    crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS
         .iter()
-        .map(|&(proto, _)| proto)
+        .copied()
         .find(|proto| resolved.value(proto).is_some())
 }
 
 /// The winning upstream proxy, with the protocol that supplied it so its line
-/// properties can be read back.
-fn find_proxy(
+/// properties can be read back. `Ok(None)` means "no proxy rule matched, or the
+/// one that did chose a direct connection".
+///
+/// Every other outcome is an error, and that is the point: a rule that names a
+/// proxy has said where the request must go. When the address is unusable, or a
+/// PAC file cannot be fetched or throws, the request cannot go there — and
+/// sending it straight to the origin instead would quietly do the one thing the
+/// rule ruled out. whistle degrades to a direct connection in both cases (an
+/// empty matcher is falsy at `_original/lib/inspectors/res.js:214`; a failed PAC
+/// only reaches `logger.error`, `lib/rules/index.js:295`), so this port is
+/// deliberately stricter. See `docs/RULES.md`.
+async fn find_proxy(
     info: &ReqInfo,
     resolved: &Resolved,
-) -> Option<(&'static str, super::upstream::ProxyConfig)> {
-    let direct = PROXY_PROTOS.iter().find_map(|&(proto, kind)| {
+) -> Result<Option<(&'static str, super::upstream::ProxyConfig)>> {
+    for proto in crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS {
+        let Some(raw) = resolved.value(proto) else {
+            continue;
+        };
         // A proxy URL may carry whistle's own query flags (`?proxyHost`), which
         // are not part of the address.
-        let value = proxy_address(resolved.value(proto)?);
-        Some((proto, parse_proxy(kind, value)?))
-    });
-    if direct.is_some() {
-        return direct;
+        let value = proxy_address(raw);
+        let cfg = parse_proxy(proxy_kind(proto), value)
+            .ok_or_else(|| anyhow!("{proto}://{raw} is not a usable proxy address"))?;
+        return Ok(Some((proto, cfg)));
     }
-    // `pac://<file>` picks the proxy by evaluating FindProxyForURL.
-    let pac_val = resolved.value("pac")?;
-    let src = crate::proxy::script::load_script(pac_val)?;
-    let result = crate::proxy::script::eval_pac(&src, &info.full_url, &info.host)?;
-    Some(("pac", parse_pac_result(&result)?))
+    // `pac://` picks the proxy by evaluating FindProxyForURL, from a local file,
+    // an inline script, or a URL that is fetched and cached.
+    let Some(pac_val) = resolved.value("pac") else {
+        return Ok(None);
+    };
+    let result = crate::proxy::script::find_proxy_for_url(pac_val, &info.full_url, &info.host)
+        .await
+        .with_context(|| format!("pac://{pac_val}"))?;
+    match parse_pac_result(&result)? {
+        Some(cfg) => Ok(Some(("pac", cfg))),
+        None => Ok(None),
+    }
 }
 
 /// A proxy operator's address, without whistle's query flags.
@@ -268,7 +286,10 @@ fn proxy_survives_host(resolved: &Resolved, proxy_proto: &str, host_matched: boo
 }
 
 /// Compute the upstream target, honouring `host://` (and `:port`) overrides.
-pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
+///
+/// Fails rather than falling back to a direct connection when a proxy rule
+/// matched but could not be honoured; see [`find_proxy`].
+pub async fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Result<Target> {
     let mut connect_host = info.host.clone();
     let mut connect_port = info.port;
 
@@ -283,14 +304,23 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
         }
     }
 
-    let proxy = find_proxy(info, resolved)
-        .filter(|(proto, _)| proxy_survives_host(resolved, proto, host_rule.is_some()))
-        .map(|(_, cfg)| cfg);
+    let matched = find_proxy(info, resolved)
+        .await?
+        .filter(|(proto, _)| proxy_survives_host(resolved, proto, host_rule.is_some()));
+    let (proxy_proto, proxy) = match matched {
+        Some((proto, cfg)) => (Some(proto), Some(cfg)),
+        None => (None, None),
+    };
 
-    Target {
+    let request_tls = info.scheme == "https" || info.scheme == "wss";
+    let tls = origin_tls(request_tls, proxy_proto);
+    Ok(Target {
         connect_host,
         connect_port,
-        tls: info.scheme == "https" || info.scheme == "wss",
+        tls,
+        // Whether the hop stripped the origin's TLS: the request then carries
+        // whistle's marker so the whistle on the far side can put it back.
+        origin_tls_stripped: request_tls && !tls,
         sni: info.host.clone(),
         request_port: info.port,
         proxy,
@@ -298,6 +328,35 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
             .value("cipher")
             .map(parse_cipher_versions)
             .unwrap_or_default(),
+    })
+}
+
+/// Does the connection to the origin speak TLS?
+///
+/// Normally the request's own scheme decides. Two families of proxy operator
+/// exist to override it, and until now neither did — traffic went out in
+/// whatever the scheme said, so `http2https-proxy://` left cleartext on the wire
+/// that the rule promised to encrypt:
+///
+/// * `http2https-proxy://` turns an http origin into an https one
+///   (`options.protocol = 'https:'`, `_original/lib/inspectors/res.js:236-237`,
+///   and `wss = true` for the WebSocket path, `lib/https/index.js:323-324`);
+/// * `https2http-proxy://` and the `internal-*` family are hops to another
+///   whistle, which wants the request in plaintext so it can inspect it: the
+///   origin's TLS is stripped and a marker header carries the fact across
+///   (`headers[config.HTTPS_FIELD] = 1; options.protocol = null;`,
+///   `res.js:229-234`). Note that this sends cleartext to the proxy — it is what
+///   the operator's name asks for, and the receiving whistle restores the
+///   scheme, but it is worth knowing before pointing one at a public proxy.
+///
+/// A `pac://`-chosen proxy converts nothing: whistle reads the conversion off
+/// the rule's own protocol, and PAC results carry no whistle protocol.
+fn origin_tls(request_tls: bool, proxy_proto: Option<&str>) -> bool {
+    match proxy_proto {
+        Some("http2https-proxy") => true,
+        Some("https2http-proxy" | "internal-proxy" | "internal-http-proxy"
+            | "internal-https-proxy") => false,
+        _ => request_tls,
     }
 }
 
@@ -395,33 +454,30 @@ pub fn is_aborted(resolved: &Resolved) -> bool {
 }
 
 /// Parse a PAC `FindProxyForURL` return value into a proxy (first usable entry).
-/// `DIRECT` (or no proxy entry) yields `None` → connect directly.
-fn parse_pac_result(result: &str) -> Option<super::upstream::ProxyConfig> {
+///
+/// `DIRECT` — anywhere in the list — yields `Ok(None)`: the script was asked
+/// where to send the request and answered "nowhere in particular". A result with
+/// no usable entry and no `DIRECT` is an error instead, because the script *did*
+/// name somewhere and we could not act on it. `SOCKS4` is such a case: this port
+/// speaks SOCKS5 only, and quietly going direct would hide that.
+fn parse_pac_result(result: &str) -> Result<Option<super::upstream::ProxyConfig>> {
     for entry in result.split(';') {
         let mut it = entry.split_whitespace();
         let kind = it.next().unwrap_or("").to_ascii_uppercase();
         let hostport = it.next().unwrap_or("");
-        match kind.as_str() {
-            "DIRECT" => return None,
-            "PROXY" | "HTTP" => {
-                if let Some(p) = parse_proxy(ProxyKind::Http, hostport) {
-                    return Some(p);
-                }
-            }
-            "HTTPS" => {
-                if let Some(p) = parse_proxy(ProxyKind::Https, hostport) {
-                    return Some(p);
-                }
-            }
-            "SOCKS" | "SOCKS5" => {
-                if let Some(p) = parse_proxy(ProxyKind::Socks, hostport) {
-                    return Some(p);
-                }
-            }
-            _ => {}
+        let parsed = match kind.as_str() {
+            "" => continue,
+            "DIRECT" => return Ok(None),
+            "PROXY" | "HTTP" => parse_proxy(ProxyKind::Http, hostport),
+            "HTTPS" => parse_proxy(ProxyKind::Https, hostport),
+            "SOCKS" | "SOCKS5" => parse_proxy(ProxyKind::Socks, hostport),
+            _ => None,
+        };
+        if let Some(p) = parsed {
+            return Ok(Some(p));
         }
     }
-    None
+    bail!("FindProxyForURL returned no usable proxy: {result:?}");
 }
 
 /// Parse a `host` operator value (`ip`, `ip:port`, `host:port`, `:port`).
@@ -2930,6 +2986,21 @@ mod tests {
         super::super::template::ProxyEnv { host: "", port: 8899, version: "9.9.9" }
     }
 
+    /// Tests drive the async parts on a runtime of their own; `resolve_target`
+    /// is async because a `pac://` rule may have to fetch its script.
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    /// The target `resolved` produces for `info`, which must not fail.
+    fn resolved_target(info: &ReqInfo, resolved: &Resolved) -> Target {
+        rt().block_on(resolve_target(info, resolved))
+            .expect("resolve_target")
+    }
+
     fn resolve(rules: &str, url: &str) -> Resolved {
         let mut m = RuleManager::new();
         m.set_text(rules);
@@ -3443,17 +3514,17 @@ mod tests {
         let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
 
         let r = resolve("a.com internal-https-proxy://1.2.3.4:8080\n", "http://a.com/");
-        let p = resolve_target(&info, &r).proxy.expect("internal-https-proxy");
+        let p = resolved_target(&info, &r).proxy.expect("internal-https-proxy");
         assert_eq!(p.kind, ProxyKind::Https);
         assert_eq!(p.port, 8080);
 
         let r2 = resolve("a.com internal-http-proxy://1.2.3.4:8081\n", "http://a.com/");
-        let p2 = resolve_target(&info, &r2).proxy.expect("internal-http-proxy");
+        let p2 = resolved_target(&info, &r2).proxy.expect("internal-http-proxy");
         assert_eq!(p2.kind, ProxyKind::Http);
 
         // `xproxy` is an alias of `proxy`.
         let r3 = resolve("a.com xproxy://5.6.7.8:3128\n", "http://a.com/");
-        let p3 = resolve_target(&info, &r3).proxy.expect("xproxy");
+        let p3 = resolved_target(&info, &r3).proxy.expect("xproxy");
         assert_eq!(p3.kind, ProxyKind::Http);
         assert_eq!(p3.port, 3128);
     }
@@ -3738,14 +3809,15 @@ mod tests {
         use super::super::upstream::TlsVersions;
         let resolved = resolve("example.com cipher://TLSv1.2\n", "https://example.com/");
         let info = build_req_info("GET", "https", "example.com", 443, "/", &HeaderMap::new(), None);
-        let target = resolve_target(&info, &resolved);
+        let target = resolved_target(&info, &resolved);
         assert_eq!(target.tls_versions, TlsVersions::Only12);
     }
 
     // ── host / proxy precedence (proxyFirst, proxyHost, proxyHostOnly) ──
 
-    /// The upstream target `rules` produce for `url`.
-    fn target(rules: &str, url: &str) -> Target {
+    /// The upstream target `rules` produce for `url`, or the error that stopped
+    /// the request from being sent anywhere.
+    fn try_target(rules: &str, url: &str) -> Result<Target> {
         let resolved = resolve(rules, url);
         let (scheme, rest) = url.split_once("://").unwrap();
         let (host, path) = match rest.find('/') {
@@ -3761,7 +3833,12 @@ mod tests {
             &HeaderMap::new(),
             None,
         );
-        resolve_target(&info, &resolved)
+        rt().block_on(resolve_target(&info, &resolved))
+    }
+
+    /// The upstream target `rules` produce for `url`.
+    fn target(rules: &str, url: &str) -> Target {
+        try_target(rules, url).unwrap_or_else(|e| panic!("resolve_target: {e:#}"))
     }
 
     const HOST_AND_PROXY: &str = "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\n";
@@ -3833,6 +3910,177 @@ mod tests {
             "proxyHostOnly with no host rule drops the proxy"
         );
         assert_eq!(without_host.connect_host, "example.com");
+    }
+
+    // ── ignore://proxy, unusable proxies, scheme-converting proxies ──
+
+    /// `ignore://proxy` names the whole upstream-proxy family, because whistle
+    /// keeps one key for all of them (`resolveProxy`,
+    /// `_original/lib/rules/rules.js:2419-2443`). Naming one spelling drops only
+    /// that one. Every one of these used to traverse the hop regardless.
+    #[test]
+    fn ignore_proxy_drops_every_proxy_protocol() {
+        for proto in crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS {
+            let t = target(
+                &format!("example.com {proto}://127.0.0.1:8888\nexample.com ignore://proxy\n"),
+                "http://example.com/",
+            );
+            assert!(t.proxy.is_none(), "ignore://proxy must drop {proto}://");
+        }
+
+        // The x-spelling of the family says the same thing.
+        let t = target(
+            "example.com socks://127.0.0.1:1080\nexample.com ignore://xproxy\n",
+            "http://example.com/",
+        );
+        assert!(t.proxy.is_none(), "ignore://xproxy must drop the family");
+
+        // Naming one protocol leaves the others alone.
+        let t = target(
+            "example.com proxy://127.0.0.1:8888\nexample.com ignore://socks\n",
+            "http://example.com/",
+        );
+        assert_eq!(
+            t.proxy.expect("ignore://socks must not touch proxy://").port,
+            8888
+        );
+        let t = target(
+            "example.com socks://127.0.0.1:1080\nexample.com ignore://socks\n",
+            "http://example.com/",
+        );
+        assert!(t.proxy.is_none(), "ignore://socks drops socks://");
+    }
+
+    /// An ignored proxy does not fall through to a `pac://` rule: whistle
+    /// returns before it would consult PAC (`_original/lib/rules/index.js:238`).
+    /// A `pac://` rule with no proxy rule to ignore is still honoured, and
+    /// `ignore://pac` is what suppresses that one.
+    #[test]
+    fn ignoring_the_proxy_does_not_fall_through_to_pac() {
+        // A rule token cannot contain whitespace, so a PAC script reaches a rule
+        // as a path (or a URL) rather than inline.
+        let fx = Fixtures::new("pac-ignore");
+        let pac = fx.write(
+            "corp.pac",
+            b"function FindProxyForURL(u, h) { return 'PROXY 10.0.0.1:3128'; }",
+        );
+
+        let t = target(
+            &format!("example.com proxy://127.0.0.1:8888\nexample.com pac://{pac}\nexample.com ignore://proxy\n"),
+            "http://example.com/",
+        );
+        assert!(t.proxy.is_none(), "ignore://proxy must not fall back to PAC");
+
+        let t = target(&format!("example.com pac://{pac}\n"), "http://example.com/");
+        assert_eq!(t.proxy.expect("pac chooses the proxy").port, 3128);
+
+        let t = target(
+            &format!("example.com pac://{pac}\nexample.com ignore://pac\n"),
+            "http://example.com/",
+        );
+        assert!(t.proxy.is_none(), "ignore://pac drops the PAC rule");
+    }
+
+    /// A proxy rule whose value is empty or unusable fails the request. It used
+    /// to be skipped, which turned "route this through a proxy" into a direct
+    /// connection with nothing said about it.
+    #[test]
+    fn an_unusable_proxy_value_fails_rather_than_going_direct() {
+        for rules in [
+            "example.com proxy://\n",
+            "example.com proxy:// \n",
+            "example.com socks://\n",
+            "example.com http-proxy://@\n",
+            "example.com proxy://?proxyHost\n",
+        ] {
+            let err = try_target(rules, "http://example.com/")
+                .expect_err(&format!("{rules:?} must not resolve to a direct connection"));
+            assert!(
+                format!("{err:#}").contains("proxy address"),
+                "{rules:?}: {err:#}"
+            );
+        }
+    }
+
+    /// A PAC file that answers with something we cannot use is an error too;
+    /// only `DIRECT` means "no proxy".
+    #[test]
+    fn a_pac_result_we_cannot_use_is_not_a_direct_connection() {
+        assert!(parse_pac_result("DIRECT").expect("DIRECT parses").is_none());
+        assert!(parse_pac_result("PROXY 1.2.3.4:8080; DIRECT").expect("parses").is_some());
+        // Unknown entry, then DIRECT: the DIRECT still wins.
+        assert!(parse_pac_result("SOCKS4 1.2.3.4:1080; DIRECT").expect("parses").is_none());
+        // …but on its own, an entry we cannot honour is not a direct connection.
+        assert!(parse_pac_result("SOCKS4 1.2.3.4:1080").is_err());
+        assert!(parse_pac_result("PROXY").is_err());
+        assert!(parse_pac_result("").is_err());
+    }
+
+    /// `http2https-proxy://` upgrades an http origin to TLS
+    /// (`_original/lib/inspectors/res.js:236-237`), and the `internal-*` /
+    /// `https2http-proxy://` family strips an https origin's TLS for the hop
+    /// and marks the request instead (`res.js:229-234`). Neither conversion
+    /// happened before: the scheme travelled unchanged, so `http2https-proxy`
+    /// left in cleartext what the rule promised to encrypt.
+    #[test]
+    fn scheme_converting_proxies_change_the_origin_connection() {
+        let t = target(
+            "example.com http2https-proxy://127.0.0.1:8888\n",
+            "http://example.com/",
+        );
+        assert!(t.tls, "http2https-proxy must reach the origin over TLS");
+        assert!(!t.origin_tls_stripped);
+
+        // …and an origin that is already https stays https.
+        let t = target(
+            "example.com http2https-proxy://127.0.0.1:8888\n",
+            "https://example.com/",
+        );
+        assert!(t.tls);
+
+        for proto in [
+            "https2http-proxy",
+            "internal-proxy",
+            "internal-http-proxy",
+            "internal-https-proxy",
+        ] {
+            let t = target(
+                &format!("example.com {proto}://127.0.0.1:8888\n"),
+                "https://example.com/",
+            );
+            assert!(!t.tls, "{proto} hands the origin request over in plaintext");
+            assert!(t.origin_tls_stripped, "{proto} must mark the stripped TLS");
+
+            // An http origin has no TLS to strip, so nothing is marked.
+            let t = target(
+                &format!("example.com {proto}://127.0.0.1:8888\n"),
+                "http://example.com/",
+            );
+            assert!(!t.tls);
+            assert!(!t.origin_tls_stripped);
+        }
+
+        // A plain proxy converts nothing.
+        let t = target("example.com proxy://127.0.0.1:8888\n", "https://example.com/");
+        assert!(t.tls);
+        assert!(!t.origin_tls_stripped);
+    }
+
+    /// Every protocol in the family list is one `find_proxy` actually reads,
+    /// with the transport its name implies. The list lives in the rules layer
+    /// (it is what `ignore://proxy` means); this is the check that the two
+    /// halves cannot drift apart.
+    #[test]
+    fn every_family_protocol_resolves_with_its_transport() {
+        for proto in crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS {
+            let t = target(
+                &format!("example.com {proto}://127.0.0.1:8888\n"),
+                "http://example.com/",
+            );
+            let p = t.proxy.unwrap_or_else(|| panic!("{proto}:// must resolve"));
+            assert_eq!(p.kind, proxy_kind(proto), "transport for {proto}");
+            assert_eq!(p.port, 8888);
+        }
     }
 
     // ── weakRule ──

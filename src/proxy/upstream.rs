@@ -112,6 +112,12 @@ pub struct Target {
     pub connect_port: u16,
     /// Whether the origin speaks TLS.
     pub tls: bool,
+    /// True when [`Self::tls`] is false only because an `internal-*` /
+    /// `https2http-proxy` hop stripped the origin's TLS. The request then
+    /// carries whistle's `x-whistle-https-request` marker so the whistle on the
+    /// far side of the hop restores the scheme
+    /// (`_original/lib/inspectors/res.js:229-234`, `lib/init.js:190-193`).
+    pub origin_tls_stripped: bool,
     /// SNI / certificate hostname + `Host` header (the original request host).
     pub sni: String,
     /// The original request port (for the `Host` header / absolute-form URIs).
@@ -763,6 +769,7 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
         connect_host: host.clone(),
         connect_port: port,
         tls,
+        origin_tls_stripped: false,
         sni: host,
         request_port: port,
         proxy: None,
@@ -879,6 +886,7 @@ mod tests {
             connect_host: host.to_string(),
             connect_port: port,
             tls: false,
+            origin_tls_stripped: false,
             sni: host.to_string(),
             request_port: port,
             proxy,
