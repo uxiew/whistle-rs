@@ -409,6 +409,14 @@ pub async fn simple_get(url: &str) -> Result<(u16, Bytes)> {
 /// POST a JSON body to a URL and return `(status, body)`. Used by the plugin
 /// runtime to dispatch to remote (Node/HTTP) plugins.
 pub async fn simple_post_json(url: &str, json: &str) -> Result<(u16, Bytes)> {
+    simple_request("POST", url, Some(json)).await
+}
+
+/// One-shot HTTP request to an absolute URL, returning `(status, body)`.
+///
+/// Deliberately minimal: no pooling, no redirects, no retries — the plugin
+/// runtime layers its own retry policy on top, and plugin endpoints are local.
+async fn simple_request(method: &str, url: &str, json: Option<&str>) -> Result<(u16, Bytes)> {
     let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("bad url {url}"))?;
     let (host_port, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -431,12 +439,15 @@ pub async fn simple_post_json(url: &str, json: &str) -> Result<(u16, Bytes)> {
         proxy: None,
         tls_versions: TlsVersions::Default,
     };
-    let req = Request::builder()
-        .method("POST")
-        .uri(path)
-        .header("host", &host)
-        .header("content-type", "application/json")
-        .body(super::body::full(Bytes::from(json.to_owned())))
+    let mut builder = Request::builder().method(method).uri(path).header("host", &host);
+    if json.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+    let req = builder
+        .body(match json {
+            Some(j) => super::body::full(Bytes::from(j.to_owned())),
+            None => super::body::empty(),
+        })
         .context("building plugin request")?;
     let resp = forward(&target, req).await?;
     let status = resp.status().as_u16();

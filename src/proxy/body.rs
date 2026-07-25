@@ -34,27 +34,26 @@ pub fn from_incoming(body: Incoming) -> DynBody {
         .boxed()
 }
 
-/// Box a forwarded upstream body while copying a bounded preview of its bytes
-/// into `capture` as they stream past. Frames are forwarded unchanged and
+/// Box a forwarded body while copying a bounded preview of its bytes into
+/// `capture` as they stream past. Frames are forwarded unchanged and
 /// immediately, so streaming (including SSE) is never delayed.
-pub fn tee(body: Incoming, capture: super::Capture) -> DynBody {
+pub fn tee(body: DynBody, capture: super::Capture) -> DynBody {
     TeeBody {
         inner: Box::pin(body),
         capture,
     }
-    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     .boxed()
 }
 
 /// Body wrapper for [`tee`]: passes frames through, recording data bytes.
 struct TeeBody {
-    inner: Pin<Box<Incoming>>,
+    inner: Pin<Box<DynBody>>,
     capture: super::Capture,
 }
 
 impl Body for TeeBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn poll_frame(
         self: Pin<&mut Self>,

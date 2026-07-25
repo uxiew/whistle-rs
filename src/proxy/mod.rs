@@ -40,6 +40,23 @@ pub const MAX_SESSIONS: usize = 500;
 /// connections). Whistle surfaces every frame; we keep a bounded ring buffer.
 const MAX_FRAMES: usize = 2000;
 
+/// Collect a whole [`DynBody`] into memory. Its boxed error type is unsized, so
+/// it needs flattening before `?` can carry it into `anyhow`.
+async fn collect_body(body: DynBody) -> Result<Bytes> {
+    match body.collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(e) => Err(anyhow::anyhow!("reading body: {e}")),
+    }
+}
+
+/// Monotonic id handed to plugins so their request and response hooks can be
+/// correlated. Distinct from a [`Session`] id, which is only assigned once the
+/// transaction is recorded — far too late for the request hook.
+fn next_plugin_req_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Shared server state.
 pub struct AppState {
     pub config: Config,
@@ -846,27 +863,63 @@ async fn serve(
     let started = Instant::now();
     let time_ms = now_ms();
 
-    // Plugin hooks: a matched `plugin://name` (or `pipe://name`) may inject
-    // rules and/or return a response directly (Rust in-process or Node/remote).
-    let plugin_matches = apply::plugin_names(&resolved);
+    // Plugins matched by `plugin://name` / `pipe://name`, minus any that aren't
+    // registered. Kept for both the request hook here and the response hook
+    // after the upstream call.
+    let plugin_matches: Vec<(String, String)> = apply::plugin_names(&resolved)
+        .into_iter()
+        .filter(|(name, _)| state.plugins.contains(name))
+        .collect();
+    let plugin_names: Vec<String> = plugin_matches.iter().map(|(n, _)| n.clone()).collect();
+
+    // Correlates this request's plugin hooks with each other. Session ids are
+    // only assigned once a transaction is recorded, which is too late here.
+    let plugin_req_id = next_plugin_req_id();
+
+    // Normalise the request body to `DynBody` so a plugin can optionally be
+    // handed it. Buffering happens *only* when a matched plugin's manifest
+    // declares `requestBody` — otherwise the body stays a lazy stream and the
+    // proxy's streaming fast path is untouched.
+    let (req, plugin_req_body): (Request<DynBody>, Option<Bytes>) = {
+        let (parts, incoming) = req.into_parts();
+        let wants_body = !plugin_matches.is_empty()
+            && has_request_body(&parts.headers)
+            && state.plugins.any_wants_request_body(&plugin_names).await;
+        if wants_body {
+            let bytes = incoming.collect().await?.to_bytes();
+            (
+                Request::from_parts(parts, body::full(bytes.clone())),
+                Some(bytes),
+            )
+        } else {
+            (
+                Request::from_parts(parts, body::from_incoming(incoming)),
+                None,
+            )
+        }
+    };
+
+    // Request hook: a matched plugin may inject rules, rewrite request headers,
+    // and/or answer the request directly (Rust in-process or remote).
+    let mut plugin_set_headers: Vec<(String, String)> = Vec::new();
+    let mut plugin_remove_headers: Vec<String> = Vec::new();
     if !plugin_matches.is_empty() {
         let preq_headers: Vec<(String, String)> = req
             .headers()
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        for (name, param) in plugin_matches {
-            if !state.plugins.contains(&name) {
-                continue;
-            }
+        for (name, param) in plugin_matches.iter() {
             let preq = crate::plugins::PluginReq {
+                id: plugin_req_id,
                 method: info.method.clone(),
                 url: info.full_url.clone(),
                 headers: preq_headers.clone(),
                 client_ip: client_ip.clone(),
-                param,
+                param: param.clone(),
+                body: plugin_req_body.clone().map(|b| b.to_vec()),
             };
-            let Some(result) = state.plugins.dispatch(&name, &preq).await else {
+            let Some(result) = state.plugins.on_request(name, &preq).await else {
                 continue;
             };
             if let Some(rules) = result.rules {
@@ -874,6 +927,8 @@ async fn serve(
                 let values = state.values.read().unwrap();
                 apply::substitute_values(&mut resolved, &values);
             }
+            plugin_set_headers.extend(result.set_headers);
+            plugin_remove_headers.extend(result.remove_headers);
             if let Some(resp) = result.response {
                 tracing::info!("{} {} -> plugin {name}", info.method, info.full_url);
                 let response = plugin_response(resp);
@@ -939,6 +994,14 @@ async fn serve(
     ensure_host_header(&mut parts.headers, &host, port, &scheme);
     parts.headers.remove("proxy-connection");
     apply::apply_request(&mut parts, &resolved);
+    // Plugin header rewrites land after the rule operators, so a plugin can
+    // override what the rules set.
+    for name in &plugin_remove_headers {
+        parts.headers.remove(name.to_ascii_lowercase().as_str());
+    }
+    for (k, v) in &plugin_set_headers {
+        set_header_raw(&mut parts.headers, k, v);
+    }
     // responseFor: prefetch another URL and annotate this request with its result.
     if let Some(url) = resolved.value("responseFor") {
         if let Ok((status, body)) = upstream::simple_get(url).await {
@@ -968,7 +1031,7 @@ async fn serve(
         || req_write.is_some()
         || req_write_raw.is_some()
     {
-        let bytes = incoming.collect().await?.to_bytes();
+        let bytes = collect_body(incoming).await?;
         let new = apply::transform_req_body(bytes, &resolved);
         if let Some(path) = &req_write {
             write_body_file(path, &new);
@@ -996,7 +1059,7 @@ async fn serve(
         req_body_cap = Some(cap.clone());
         body::tee(incoming, cap)
     } else {
-        body::from_incoming(incoming)
+        incoming
     };
     // Capture the outgoing request headers (as forwarded).
     let req_header_pairs = header_pairs(&parts.headers);
@@ -1025,6 +1088,38 @@ async fn serve(
     let (mut parts, body) = upstream_resp.into_parts();
     apply::apply_response(&mut parts, &resolved);
 
+    // Response hook, part 1: plugins that did *not* ask for the response body
+    // run here, so the response can keep streaming. Such a plugin may still
+    // replace the body outright — that needs no knowledge of the original.
+    let mut plugin_res_override: Option<Vec<u8>> = None;
+    let mut plugin_wants_res_body = false;
+    for (name, param) in plugin_matches.iter() {
+        let Some(manifest) = state.plugins.manifest(name).await else {
+            continue;
+        };
+        if !manifest.on_response {
+            continue;
+        }
+        if manifest.response_body {
+            plugin_wants_res_body = true;
+            continue; // handled below, once the body is in hand
+        }
+        let pres = crate::plugins::PluginRes {
+            id: plugin_req_id,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            status: parts.status.as_u16(),
+            headers: header_pairs(&parts.headers),
+            param: param.clone(),
+            body: None,
+        };
+        if let Some(result) = state.plugins.on_response(name, &pres).await {
+            if let Some(new) = apply_plugin_res_result(&mut parts, result) {
+                plugin_res_override = Some(new);
+            }
+        }
+    }
+
     let res_speed = apply::res_speed_kbps(&resolved);
     let res_script = resolved
         .value("resScript")
@@ -1049,9 +1144,40 @@ async fn serve(
         || res_write.is_some()
         || res_write_raw.is_some()
         || !trailers.is_empty()
+        || plugin_wants_res_body
+        || plugin_res_override.is_some()
     {
-        let bytes = body.collect().await?.to_bytes();
+        // A plugin that replaced the body outright makes the upstream bytes
+        // irrelevant — don't wait on them.
+        let bytes = match &plugin_res_override {
+            Some(new) => Bytes::from(new.clone()),
+            None => body.collect().await?.to_bytes(),
+        };
         let mut new = apply::transform_res_body(bytes, &resolved, res_ct.as_deref());
+
+        // Response hook, part 2: plugins that asked for the body.
+        for (name, param) in plugin_matches.iter() {
+            let Some(manifest) = state.plugins.manifest(name).await else {
+                continue;
+            };
+            if !manifest.on_response || !manifest.response_body {
+                continue;
+            }
+            let pres = crate::plugins::PluginRes {
+                id: plugin_req_id,
+                method: info.method.clone(),
+                url: info.full_url.clone(),
+                status: parts.status.as_u16(),
+                headers: header_pairs(&parts.headers),
+                param: param.clone(),
+                body: Some(new.to_vec()),
+            };
+            if let Some(result) = state.plugins.on_response(name, &pres).await {
+                if let Some(replaced) = apply_plugin_res_result(&mut parts, result) {
+                    new = Bytes::from(replaced);
+                }
+            }
+        }
             if let Some(src) = &res_script {
                 let hv: Vec<(String, String)> = parts
                     .headers
@@ -1136,7 +1262,7 @@ async fn serve(
             // No transform: stream through, copying a bounded preview for inspection.
             let cap = Capture::new(res_ct.clone(), res_enc.as_deref(), state.config.body_preview_cap);
             res_body_cap = Some(cap.clone());
-            body::tee(body, cap)
+            body::tee(body::from_incoming(body), cap)
         };
 
     let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
@@ -1163,7 +1289,27 @@ async fn serve(
 }
 
 /// True if the request asks to upgrade the protocol (e.g. a WebSocket handshake).
-fn is_upgrade(req: &Request<Incoming>) -> bool {
+/// Apply a plugin response-hook result to the response head. Returns the
+/// replacement body, if the plugin supplied one.
+fn apply_plugin_res_result(
+    parts: &mut hyper::http::response::Parts,
+    result: crate::plugins::PluginResResult,
+) -> Option<Vec<u8>> {
+    if let Some(code) = result.status {
+        if let Ok(s) = StatusCode::from_u16(code) {
+            parts.status = s;
+        }
+    }
+    for name in &result.remove_headers {
+        parts.headers.remove(name.to_ascii_lowercase().as_str());
+    }
+    for (k, v) in &result.set_headers {
+        set_header_raw(&mut parts.headers, k, v);
+    }
+    result.body
+}
+
+fn is_upgrade(req: &Request<DynBody>) -> bool {
     let headers = req.headers();
     let conn_upgrade = headers
         .get(hyper::header::CONNECTION)
@@ -1175,7 +1321,7 @@ fn is_upgrade(req: &Request<Incoming>) -> bool {
 
 /// True if the upgrade handshake targets the WebSocket protocol (as opposed to
 /// some other `Upgrade:` protocol we should tunnel opaquely).
-fn is_websocket(req: &Request<Incoming>) -> bool {
+fn is_websocket(req: &Request<DynBody>) -> bool {
     req.headers()
         .get(hyper::header::UPGRADE)
         .and_then(|v| v.to_str().ok())
@@ -1190,7 +1336,7 @@ fn is_websocket(req: &Request<Incoming>) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn serve_upgrade(
     state: &Arc<AppState>,
-    mut req: Request<Incoming>,
+    mut req: Request<DynBody>,
     info: &ReqInfo,
     resolved: &Resolved,
     scheme: &str,
