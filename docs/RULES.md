@@ -554,7 +554,7 @@ example.com/app.js     file:///Users/me/dev/app.js
 | `method` | HTTP method | Override the request method |
 | `reqType` | MIME type or short name | Set the request `Content-Type` (`reqType://json`, `reqType://form`, …) |
 | `reqCharset` | charset | Set the charset on the request `Content-Type` |
-| `reqCors` | origin | Set the request `Origin` header |
+| `reqCors` | origin URL, `*`, or `method=…&headers=…` | Set the request `Origin`, and the `Access-Control-Request-Method` / `-Headers` preflight headers. A URL is reduced to its origin. `enable` is the *response*-side spelling and does nothing here. |
 | `auth` | `user:pass` | Add an HTTP Basic `Authorization` header |
 | `forwardedFor` | IP | Set the `X-Forwarded-For` header |
 | `reqWrite` | file path | Append the request body to a file |
@@ -926,7 +926,8 @@ The operators that consume the whole list combine it differently per family:
 | `reqReplace` / `resReplace` / `urlReplace` | Collapsed into **one pattern map**. Every pattern applies; a pattern written on two lines takes the **first** line's replacement. The map's order is the last line's patterns first, then whatever each earlier line adds — so substitutions chain in that order. |
 | `resMerge` | Collapsed into **one patch**, first line winning a contested key. The fold is **shallow** unless one of the lines is the literal `resMerge://true`, whistle's marker for a deep fold; that line contributes no data of its own. The combined patch is then deep-merged into the body. |
 | `params` / `urlParams` | Collapsed into one map each, first line winning a contested key; `urlParams` is then laid over `params`. |
-| `reqHeaders` / `resHeaders` / `reqCookies` / `resCookies` / `reqCors` / `resCors` / `trailers` / `headerReplace` | Applied in turn, top to bottom. |
+| `reqHeaders` / `resHeaders` / `reqCookies` / `resCookies` / `reqCors` / `resCors` / `trailers` | Collapsed into **one map**, first line winning a contested name. These are `parseRuleJson`'s own arguments (`_original/lib/inspectors/req.js:459-468`, `res.js:845-855`), so they take the same fold as `resMerge` and `params`. |
+| `headerReplace` | Applied in turn, top to bottom. |
 
 ```
 example.com/x  resPrepend://<!--head-->

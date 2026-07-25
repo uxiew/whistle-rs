@@ -116,10 +116,13 @@
 
 ### 多值算子（本轮审计遗留）
 
-- [ ] **同名 header 的争用优先级相反** —— `reqHeaders`/`resHeaders`/`reqCookies`/
-      `resCookies`/`reqCors`/`resCors`/`trailers` 在上游走同一套 `parseRuleJson` 折叠，
-      同一个 header 名被两行指定时取**首行**的值，本移植取**末行**。指定不同 header 的
-      多行行为一致。修复所需的 `merge_line_maps` 辅助已存在。
+- [x] ~~**同名 header 的争用优先级相反**~~ → 已修。`reqHeaders`/`resHeaders`/`reqCookies`/
+      `resCookies`/`reqCors`/`resCors`/`trailers` 现在与上游一样走 `parseRuleJson` 折叠
+      （`merge_line_maps`）：同一个 header 名被两行指定时取**首行**的值，与其余「首个匹配
+      获胜」一致；指定不同 header 的多行仍全部生效。顺带按 `setReqCors`
+      （`_original/lib/util/index.js:2899-2921`）补齐了 `reqCors` —— 此前它把整个值当作
+      `Origin` 写入（`reqCors://enable` 会写出 `Origin: enable`），现在只认 URL / `*`，
+      并支持 `method=` / `headers=` 两个预检头。
 - [ ] `rulesFile` / `resScript` 上游会拼接/取首，本移植仍只用首行。
 - [ ] `params://` 合并进请求体（当前折叠只作用于查询串）。
 

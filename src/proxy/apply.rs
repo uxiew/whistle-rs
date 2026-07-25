@@ -1020,11 +1020,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(xff) = resolved.value("forwardedFor") {
         set_header(&mut parts.headers, "x-forwarded-for", xff);
     }
-    if let Some(origin) = resolved.value("reqCors") {
-        if !origin.is_empty() {
-            set_header(&mut parts.headers, "origin", origin);
-        }
-    }
+    apply_req_cors(&mut parts.headers, resolved);
     apply_req_cookies(&mut parts.headers, resolved);
     let del = Deletions::of(resolved, true);
     // `reqCharset` and the type/charset deletions are one operation upstream
@@ -1448,6 +1444,36 @@ fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
     }
 }
 
+/// `reqCors://…` — the request half of whistle's CORS negotiation
+/// (`setReqCors`, `_original/lib/util/index.js:2899-2921`).
+///
+/// The value takes the same four shorthand spellings as `resCors` and folds the
+/// same way, but only three of the resulting keys mean anything on a request:
+/// `origin` (a URL, reduced to its origin, or `*`), `method` and `headers`,
+/// which become the two preflight headers. Notably `enable` sets **nothing** —
+/// there is no request origin to echo back — so `reqCors://enable` is inert
+/// upstream, and is here.
+fn apply_req_cors(headers: &mut HeaderMap, resolved: &Resolved) {
+    let spec = merge_cors_ops(resolved, "reqCors");
+    if spec.is_empty() {
+        return;
+    }
+    match spec.get("origin").map(String::as_str) {
+        Some("*") => set_header(headers, "origin", "*"),
+        Some(url) if is_http_url(url) => set_header(headers, "origin", &parse_origin(url)),
+        // `cors['*'] === ''` — the `resCors://*` shorthand — is the other way
+        // to ask for a wildcard origin.
+        _ if spec.get("*").is_some_and(String::is_empty) => set_header(headers, "origin", "*"),
+        _ => {}
+    }
+    if let Some(method) = spec.get("method") {
+        set_header(headers, "access-control-request-method", method);
+    }
+    if let Some(list) = spec.get("headers") {
+        set_header(headers, "access-control-request-headers", list);
+    }
+}
+
 /// `resCors://…` — the response half of whistle's CORS negotiation
 /// (`setResCors`, `_original/lib/util/index.js:2923-2975`).
 ///
@@ -1461,10 +1487,7 @@ fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
 /// Without `info` the request-dependent half is skipped: the origin cannot be
 /// echoed and a preflight cannot be recognised.
 fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&ReqInfo>) {
-    let mut spec: HashMap<String, String> = HashMap::new();
-    for value in collect_values(resolved, "resCors") {
-        spec.extend(parse_cors(value));
-    }
+    let mut spec = merge_cors_ops(resolved, "resCors");
     // whistle has no `enable://cors`; whistle-rs keeps it as an alias for
     // `resCors://enable` so existing rule files still mean something, rather
     // than blasting `*` at every header as it used to.
@@ -1518,6 +1541,22 @@ fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&Re
     if let Some(max_age) = spec.get("maxage") {
         set_header(headers, "access-control-max-age", max_age);
     }
+}
+
+/// Collapse every line of a CORS protocol into one option map.
+///
+/// The same `parseRuleJson` fold as headers and cookies, with a key contested
+/// by two lines taken from the **first**. The keys are looked up by name below,
+/// never walked in order, so unlike [`merge_line_maps`] this can stay a
+/// `HashMap`: extending in reverse line order leaves the first line's value in
+/// place, which is what upstream's `result.reverse()` + `extend` produces
+/// (`_original/lib/util/index.js:1305-1316`).
+fn merge_cors_ops(resolved: &Resolved, protocol: &str) -> HashMap<String, String> {
+    let mut spec: HashMap<String, String> = HashMap::new();
+    for op in resolved.all(protocol).iter().rev() {
+        spec.extend(parse_cors(&op.value));
+    }
+    spec
 }
 
 /// Parse one `resCors` value into whistle's lower-cased option map.
@@ -1823,10 +1862,14 @@ pub fn res_write_raw_path(resolved: &Resolved) -> Option<String> {
 }
 
 /// Build the response trailer headers from `trailers://` operators.
+///
+/// `trailers` is one of `parseRuleJson`'s arguments (`_original/lib/inspectors/res.js:845-855`),
+/// so several lines fold into one map with the first line winning a contested
+/// name, exactly as `resHeaders` does.
 pub fn build_trailers(resolved: &Resolved) -> HeaderMap {
     let mut h = HeaderMap::new();
-    for value in collect_values(resolved, "trailers") {
-        apply_header_value(&mut h, value);
+    for (name, value) in merge_header_ops(resolved, "trailers") {
+        set_header(&mut h, &name, &value);
     }
     h
 }
@@ -2827,6 +2870,18 @@ fn collect_values<'a>(resolved: &'a Resolved, protocol: &str) -> Vec<&'a str> {
     resolved.all(protocol).iter().map(|o| o.value.as_str()).collect()
 }
 
+/// Collapse every line of a cookie protocol into one ordered `name` → `value`
+/// map, first line winning a contested name — the `parseRuleJson` fold, as for
+/// headers (`_original/lib/inspectors/req.js:459-468`).
+fn merge_cookie_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, String)> {
+    merge_line_maps(
+        resolved
+            .all(protocol)
+            .iter()
+            .map(|op| parse_cookie_ops(&op.value)),
+    )
+}
+
 /// Parse a `reqCookies`/`resCookies` value into `name` → `value` pairs.
 ///
 /// Like the other JSON-shaped operators, the value is either `{json}` or a
@@ -2868,7 +2923,7 @@ fn parse_cookie_ops(value: &str) -> Vec<(String, String)> {
 /// position of a cookie the request already carried (`setReqCookies`,
 /// `_original/lib/util/index.js:3053-3092`).
 fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
-    let ops = collect_values(resolved, "reqCookies");
+    let ops = merge_cookie_ops(resolved, "reqCookies");
     if ops.is_empty() {
         return;
     }
@@ -2888,14 +2943,12 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
         })
         .unwrap_or_default();
 
-    for value in ops {
-        for (name, val) in parse_cookie_ops(value) {
-            let name = escape_cookie(&name, true);
-            let val = escape_cookie(&val, false);
-            match cookies.iter_mut().find(|(k, _)| *k == name) {
-                Some(slot) => slot.1 = val,
-                None => cookies.push((name, val)),
-            }
+    for (name, val) in ops {
+        let name = escape_cookie(&name, true);
+        let val = escape_cookie(&val, false);
+        match cookies.iter_mut().find(|(k, _)| *k == name) {
+            Some(slot) => slot.1 = val,
+            None => cookies.push((name, val)),
         }
     }
 
@@ -2910,7 +2963,7 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
 /// Emit `Set-Cookie` headers for `resCookies` operators, **replacing** any the
 /// response already sent under the same name rather than adding a second one.
 fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
-    let ops = collect_values(resolved, "resCookies");
+    let ops = merge_cookie_ops(resolved, "resCookies");
     if ops.is_empty() {
         return;
     }
@@ -2924,14 +2977,12 @@ fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
         })
         .collect();
 
-    for value in ops {
-        for (name, val) in parse_cookie_ops(value) {
-            let name = escape_cookie(&name, true);
-            let cookie = format!("{name}={}", escape_cookie(&val, false));
-            match existing.iter_mut().find(|(k, _)| *k == name) {
-                Some(slot) => slot.1 = cookie,
-                None => existing.push((name, cookie)),
-            }
+    for (name, val) in ops {
+        let name = escape_cookie(&name, true);
+        let cookie = format!("{name}={}", escape_cookie(&val, false));
+        match existing.iter_mut().find(|(k, _)| *k == name) {
+            Some(slot) => slot.1 = cookie,
+            None => existing.push((name, cookie)),
         }
     }
 
@@ -2965,40 +3016,54 @@ fn escape_cookie(s: &str, is_name: bool) -> String {
 }
 
 /// Apply every value of a header multi-match protocol.
-/// Supports `name=value`, `name:value`, and a JSON object of pairs.
+///
+/// The lines are collapsed into **one** map first ([`merge_line_maps`]), so a
+/// header named on two lines takes the first line's value — see that function
+/// for why the fold, not a top-to-bottom apply, is what upstream does.
 fn apply_header_ops(headers: &mut HeaderMap, resolved: &Resolved, protocol: &str) {
-    for op in resolved.all(protocol) {
-        apply_header_value(headers, &op.value);
+    for (name, value) in merge_header_ops(resolved, protocol) {
+        set_header(headers, &name, &value);
     }
 }
 
-/// Apply one header operator value: `{json}`, or a query string of `name=value`
-/// pairs (`resHeaders://x-a=1&x-b=2` is two headers, as `parseQuery` has it).
-/// The `name:value` spelling is a whistle-rs convenience, not upstream syntax.
-fn apply_header_value(headers: &mut HeaderMap, value: &str) {
+/// Collapse every line of a header protocol into one ordered `name` → `value`
+/// map, first line winning a contested name.
+fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, String)> {
+    merge_line_maps(
+        resolved
+            .all(protocol)
+            .iter()
+            .map(|op| parse_header_pairs(&op.value)),
+    )
+}
+
+/// Parse one header operator value into `name` → `value` pairs: `{json}`, or a
+/// query string of `name=value` pairs (`resHeaders://x-a=1&x-b=2` is two
+/// headers, as `parseQuery` has it). The `name:value` spelling is a whistle-rs
+/// convenience, not upstream syntax.
+fn parse_header_pairs(value: &str) -> Vec<(String, String)> {
     let value = value.trim();
     if value.starts_with('{') {
         if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            for (k, v) in map {
-                if let Some(s) = v.as_str() {
-                    set_header(headers, &k, s);
-                } else {
-                    set_header(headers, &k, &v.to_string());
-                }
-            }
-            return;
+            return map
+                .into_iter()
+                .map(|(k, v)| match v {
+                    serde_json::Value::String(s) => (k, s),
+                    other => (k, other.to_string()),
+                })
+                .collect();
         }
     }
     if value.contains('=') {
-        for pair in value.split('&') {
-            if let Some((name, val)) = pair.split_once('=') {
-                set_header(headers, name.trim(), val.trim());
-            }
-        }
-        return;
+        return value
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(name, val)| (name.trim().to_string(), val.trim().to_string()))
+            .collect();
     }
-    if let Some((name, val)) = value.split_once(':') {
-        set_header(headers, name.trim(), val.trim());
+    match value.split_once(':') {
+        Some((name, val)) => vec![(name.trim().to_string(), val.trim().to_string())],
+        None => Vec::new(),
     }
 }
 
@@ -4764,6 +4829,130 @@ mod tests {
         // A comma is not a separator upstream, so it stays part of the name.
         let commas = resolve("example.com enable://p,q\n", "http://example.com/");
         assert!(enabled_flags(&commas).contains("p,q"));
+    }
+
+    /// Request parts for the operator tests below.
+    fn req_parts(headers: &[(&str, &str)]) -> request::Parts {
+        let mut builder = hyper::Request::builder().uri("http://example.com/");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    /// Two lines naming the **same** header: the first one wins.
+    ///
+    /// This is the `parseRuleJson` fold (`_original/lib/util/index.js:1305-1316`),
+    /// not a top-to-bottom apply — upstream reverses the list and `extend`s it,
+    /// so the highest-priority line's value survives, consistent with
+    /// first-match-wins everywhere else. Lines naming *different* headers all
+    /// contribute.
+    #[test]
+    fn contested_header_takes_the_first_line() {
+        let resolved = resolve(
+            "example.com resHeaders://x-a=first&x-only-1=1\n\
+             example.com resHeaders://x-a=second&x-only-2=2\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &resolved, "resHeaders");
+        assert_eq!(h.get("x-a").unwrap(), "first");
+        assert_eq!(h.get("x-only-1").unwrap(), "1");
+        assert_eq!(h.get("x-only-2").unwrap(), "2");
+
+        // `important` reorders the lines, and the fold follows the resolution
+        // order rather than the source order.
+        let important = resolve(
+            "example.com resHeaders://x-a=plain\n\
+             example.com resHeaders://x-a=important lineProps://important\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &important, "resHeaders");
+        assert_eq!(h.get("x-a").unwrap(), "important");
+    }
+
+    /// The same fold reaches `reqHeaders`, `trailers`, and both cookie
+    /// operators — every protocol upstream hands to `parseRuleJson`
+    /// (`_original/lib/inspectors/req.js:459-468`, `res.js:845-855`).
+    #[test]
+    fn contested_key_takes_the_first_line_everywhere() {
+        let resolved = resolve(
+            "example.com reqHeaders://x-a=first  reqCookies://sid=first  trailers://x-t=first\n\
+             example.com reqHeaders://x-a=second reqCookies://sid=second trailers://x-t=second\n",
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &resolved);
+        assert_eq!(parts.headers.get("x-a").unwrap(), "first");
+        assert_eq!(parts.headers.get("cookie").unwrap(), "sid=first");
+        assert_eq!(build_trailers(&resolved).get("x-t").unwrap(), "first");
+
+        let res = resolve(
+            "example.com resCookies://sid=first\nexample.com resCookies://sid=second\n",
+            "http://example.com/",
+        );
+        let mut parts = res_parts(&[]);
+        apply_response(&mut parts, &res);
+        assert_eq!(parts.headers.get("set-cookie").unwrap(), "sid=first");
+    }
+
+    /// `resCors` folds too: the first line's `origin` wins, and a key only a
+    /// later line mentions still lands.
+    #[test]
+    fn contested_cors_key_takes_the_first_line() {
+        let resolved = resolve(
+            "example.com resCors://{\"origin\":\"http://a.test\"}\n\
+             example.com resCors://origin=http://b.test&methods=GET\n",
+            "http://example.com/",
+        );
+        let mut parts = res_parts(&[]);
+        apply_response(&mut parts, &resolved);
+        assert_eq!(
+            parts.headers.get("access-control-allow-origin").unwrap(),
+            "http://a.test"
+        );
+        assert_eq!(
+            parts.headers.get("access-control-allow-methods").unwrap(),
+            "GET"
+        );
+    }
+
+    /// `reqCors` is `setReqCors` (`_original/lib/util/index.js:2899-2921`): a
+    /// URL origin is reduced to its origin, `*` passes through, and `method` /
+    /// `headers` become the preflight request headers. `enable` sets nothing —
+    /// there is no origin to echo on the request side.
+    #[test]
+    fn req_cors_sets_origin_and_preflight_headers() {
+        let resolved = resolve(
+            "example.com reqCors://http://a.test/page?q=1\n",
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &resolved);
+        assert_eq!(parts.headers.get("origin").unwrap(), "http://a.test");
+
+        let star = resolve(
+            "example.com reqCors://* reqCors://method=PUT&headers=x-a\n",
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &star);
+        assert_eq!(parts.headers.get("origin").unwrap(), "*");
+        assert_eq!(
+            parts.headers.get("access-control-request-method").unwrap(),
+            "PUT"
+        );
+        assert_eq!(
+            parts.headers.get("access-control-request-headers").unwrap(),
+            "x-a"
+        );
+
+        // `enable` is the response-side spelling; on a request it is inert.
+        let enable = resolve("example.com reqCors://enable\n", "http://example.com/");
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &enable);
+        assert!(parts.headers.get("origin").is_none());
     }
 
     // ── response header operators ──
