@@ -370,10 +370,16 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 
 | Condition | Spellings | Matches |
 |---|---|---|
-| Request header | `reqH.<key>:<v>` ← canonical; also `reqH.<key>=<v>`, `req.`/`reqHeader.`/`reqHeaders.`, `reqH:<key>=<v>`, `h:<key>=<v>`, `header:` | header **contains** `<v>`, case-insensitively. No `<v>` = presence test |
+| Request header | `reqH.<key>:<v>` ← canonical; also `reqH.<key>=<v>`, `req.`/`reqHeader.`/`reqHeaders.`, `reqH:<key>=<v>` | header **contains** `<v>`, case-insensitively. No `<v>` = presence test |
+| Either header | `h:<key>=<v>`, `header:<key>=<v>` | the **request's** header, falling back to the **response's** when the request has no such key — see [response phase](#the-response-phase) |
+| Response header | `resH.<key>:<v>`; also `res.`/`resHeader.`/`resHeaders.` | that response header, by containment (response phase) |
+| Status | `s:<v>`, `statusCode:<v>` | the response status (response phase) |
 | Method | `m:<v>`, `method:<v>` | request method (regexps always ignore case) |
-| Client IP | `clientIp:<v>`, `clientIP:` | the client's IP |
+| Client IP | `clientIp:<v>`, `clientIP:`, `remoteAddress:<v>` | the client's IP |
 | Client or server IP | `i:<v>`, `ip:<v>` | the client's IP — see the note below |
+| Client port | `clientPort:<v>`, `remotePort:<v>` | the client socket's port |
+| Server address | `serverIp:<v>`, `serverIP:` | the address the request was sent to, when it is known exactly (response phase) |
+| Server port | `serverPort:<v>` | the port the request was sent to (response phase) |
 | Host | `host:<v>`, `host=<v>` | request host |
 | Sampling | `chance:<p>`, `chance:<n>%`, `probability:` | a random fraction of requests (`Math.random() < p`) |
 | URL | anything else | the full request URL, using the same pattern engine as a rule's own [pattern](#patterns) — regexp, wildcard or prefix |
@@ -399,24 +405,94 @@ example.com   statusCode://503     includeFilter://chance:5%         # fail 5% o
 example.com   host://10.0.0.1      excludeFilter://*/health
 ```
 
-#### Conditions that cannot be evaluated yet
+#### The response phase
 
-whistle resolves a request's rules twice — once before the request is sent and again
-in the response phase — so upstream can answer conditions about the response. This
-port resolves once, before the request is sent.
+whistle resolves a request's rules **twice**: once before the request is sent
+(`resolveReqRules`) and again once the response head has arrived
+(`resolveResRules` → `pluginMgr.getResRules`, `_original/lib/rules/rules.js:2302-2308`,
+`lib/plugins/index.js:1322`). That second pass is what lets a rule ask about the
+response. whistle-rs does the same.
 
-These conditions are therefore **parsed and recognised**, so they are never mistaken
-for a URL pattern, but they evaluate to "unknown". Upstream's `getFilterResult`
+**What each pass decides.** Upstream splits the operators between the passes and this
+port follows it: the response phase owns `pureResProtocols`
+(`_original/lib/rules/protocols.js:82-111`) —
+
+> `replaceStatus`, `cache`, `attachment`, `resMerge`, `resDelay`, `resSpeed`,
+> `resType`, `resCharset`, `resCookies`, `resCors`, `resHeaders`, `trailers`,
+> `resPrepend`, `resBody`, `resAppend`, `resReplace`, `resWrite`, `resWriteRaw`,
+> `cssAppend`/`htmlAppend`/`jsAppend`, `cssBody`/`htmlBody`/`jsBody`,
+> `cssPrepend`/`htmlPrepend`/`jsPrepend`, `responseFor`, `log`, `weinre`
+
+— and everything else is decided before the request goes out. So a response condition
+can turn `resHeaders://` on, and can never turn `host://` on:
+
+```
+example.com   resHeaders://x-slow=1   includeFilter://s:/^5/   # applies on a 5xx
+example.com   host://10.0.0.1         includeFilter://s:200    # never applies
+```
+
+The second line is not an error — upstream evaluates it too, in the request phase,
+where the status is still unknown and the condition therefore fails (see
+[fail-closed](#conditions-that-still-cannot-be-evaluated) below). By the time the
+status is known the request has already gone to the origin the rules chose.
+
+**Which conditions the second pass answers:** `s:`/`statusCode:`, `resH.` (and its
+`res.`/`resHeader.`/`resHeaders.` spellings), `serverIp:`, `serverPort:`, and the
+response-header fallback of `h:`/`header:`. In the request phase they are unanswerable
+and fail closed; a `!` cannot rescue them there, and can once the answer is known:
+
+```
+example.com   resHeaders://x-not-ok=1   includeFilter://s:!200
+```
+
+**Precedence.** The two passes are merged by *source order*: an operator carries the
+position of the line that wrote it, so the winner is the same one a single walk over
+the file would have picked, whichever pass resolved it.
+
+```
+example.com   replaceStatus://502
+example.com   replaceStatus://500   includeFilter://s:404      # 502 wins, it is first
+```
+
+> Upstream's `mergeRule` (`_original/lib/util/index.js:2147-2171`) instead prefers the
+> response pass unconditionally. It can afford to: its two passes read *disjoint*
+> protocol sets, so it never holds two operators for the same protocol from the same
+> rules file. Here they can meet, and source order is what reproduces upstream's
+> observable behaviour.
+
+`ignore://` resolved in the response phase reaches what the request phase had already
+resolved, restricted to the response-phase protocols above — upstream's
+`ignoreRules(origin, …, isResRules)` (`_original/lib/util/index.js:2083`). So
+`ignore://resHeaders includeFilter://s:404` suppresses response headers set by *other*
+lines when the origin answered 404, and never touches `host://`.
+
+**Cost.** Each rule group records, when it parses, which of its lines could need the
+phase. A rules file that never mentions the response skips the second pass entirely
+(measured at ~2 ns per response, against ~2.4 µs for a 500-rule request pass), and a
+file that does pays for those lines only — one conditional line in 500 costs ~24 ns.
+
+**Not covered by the second pass:** rules pulled in by `rule://` / `rulesFile://` and
+rules injected by a plugin are resolved once, in the request phase. Upstream
+re-resolves those managers too (`fRules`/`pRules`/`hRules` in `getResRules`).
+WebSocket and tunnelled (`CONNECT`) traffic have no response phase here either.
+
+`serverIp:` is answered when the address the request went to is known **exactly** — an
+IP-literal origin, or a `host://` override naming an address. For a named origin this
+port hands the name to the connect call and never sees which address it picked; asking
+the resolver a second time could answer differently, so the condition stays
+unanswerable and fails closed rather than matching a guess.
+
+#### Conditions that still cannot be evaluated
+
+These are **parsed and recognised**, so they are never mistaken for a URL pattern, but
+they evaluate to "unknown". Upstream's `getFilterResult`
 (`_original/lib/rules/rules.js:1809`) turns an unknown answer into `false` *before* it
 consults `!`, and this port does the same: an include filter is never satisfied, an
-exclude filter never fires, and no `!` can flip either. The subsystem fails closed.
+exclude filter never fires, and no `!` can flip either. The subsystem fails closed —
+in the request phase this is also how every response condition above behaves.
 
 | Condition | Would need |
 |---|---|
-| `s:<v>`, `statusCode:<v>` | the response status — i.e. re-resolving rules after the response headers arrive |
-| `resH.<key>:<v>`, `res.`/`resHeader.`/`resHeaders.` | the same, plus the response headers threaded into `ReqInfo` |
-| `serverIp:<v>` | the resolved upstream address, known only once the connection is made |
-| `clientPort:`, `serverPort:`, `remoteAddress:`, `remotePort:` | the socket addresses of both ends, plumbed from the connection into `ReqInfo` |
 | `b:<v>`, `body:<v>` | the request body buffered *before* rules resolve (upstream pre-reads it when a line carries a body filter) |
 | `env:<key>=<v>` | the plugin environment store |
 | `from:<v>` | the request's origin flags (`tunnel`, `composer`, `sni`, …), which the proxy layer knows but does not pass to the matcher |
@@ -425,7 +501,9 @@ exclude filter never fires, and no `!` can flip either. The subsystem fails clos
 
 | Upstream | Here | Why |
 |---|---|---|
-| `i:` matches the client IP, then falls back to the server IP | client IP only | The server IP does not exist yet at match time. Upstream only reaches its server-IP arm when the client IP is unknown, so the two agree in practice. |
+| `i:` matches the client IP, then falls back to the server IP | client IP only | Upstream's server-IP arm is unreachable: `filterProp` reports an ip filter as handled the moment `req.clientIp` is null, so the `req.hostIp` line below it never runs for one (`rules.js:1824-1830,:1875-1880`). Write `serverIp:` for the server's address. |
+| the response pass wins when both passes resolve one protocol | source order wins | See [the response phase](#the-response-phase): upstream's two passes read disjoint protocols and never face the case. |
+| `remoteAddress:`/`remotePort:` are the raw socket, distinct from `clientIp:`/`clientPort:` | the same socket | The two differ upstream only for a request forwarded by another whistle, whose client-IP override headers this port does not honour. |
 | `filter://<url-pattern>` with no trailing `/` is a **pattern**, not a filter | an exclude URL filter | Upstream's `PATTERN_FILTER_RE` requires the payload to end in `/` or `/i`; the bare form falls out of its filter parser and becomes another pattern for the line. Every *documented* `filter://` URL spelling is an exclude filter in both. |
 | `host:<v>` routes to proxy-host filtering | matches the request host | `host:` (with a colon) is this port's own spelling; upstream has only `host=`/`host.`, for a different job. |
 | header values are also compared against `encodeURIComponent(value)` | not compared | That arm is unreachable upstream: the haystack is lowercased while `encodeURIComponent` emits upper-case hex. |
