@@ -81,6 +81,21 @@ impl LineProps {
         }
     }
 
+    /// Build properties from explicit action names, as if a line had declared
+    /// them.
+    ///
+    /// The proxy layer folds the request-scoped `enable://safeHtml` /
+    /// `enable://strictHtml` switches into the same gate as the per-line ones —
+    /// upstream stamps them onto every injecting rule of the request
+    /// (`_original/lib/inspectors/res.js:970-987`).
+    pub fn from_actions<'a>(actions: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut props = LineProps::default();
+        for action in actions {
+            props.merge(action);
+        }
+        props
+    }
+
     /// Is `action` set on this line?
     pub fn has(&self, action: &str) -> bool {
         self.actions.contains(action)
@@ -162,6 +177,9 @@ pub enum Pattern {
         host: String,
         /// Leading-dot wildcard, e.g. `.example.com` matches subdomains.
         host_suffix: bool,
+        /// Explicit port written in the pattern (`example.com:8080`), which
+        /// scopes the rule to that port. `None` means "any port".
+        port: Option<u16>,
         /// Path prefix (may be empty).
         path: String,
     },
@@ -178,6 +196,10 @@ pub struct Rule {
     pub raw_line: String,
     /// `$`-prefixed exact/important patterns win over normal ones.
     pub important: bool,
+    /// `!`-prefixed pattern: the rule applies to every request the pattern does
+    /// *not* match (`NON_RE`, `_original/lib/rules/rules.js:19`; the inversion
+    /// itself is at `rules.js:994-998`).
+    pub negate: bool,
     /// Extra `filter`/`includeFilter`/`excludeFilter` conditions.
     pub filters: Vec<Filter>,
     /// `lineProps://…` declared on this line (also mirrored onto every op).
@@ -577,11 +599,13 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
     pattern_toks
         .into_iter()
         .filter_map(|tok| {
+            let parsed = parse_pattern(tok)?;
             Some(Rule {
-                pattern: parse_pattern(tok)?,
+                pattern: parsed.pattern,
                 ops: ops.clone(),
                 raw_line: raw_line.to_string(),
-                important: tok.starts_with('$'),
+                important: parsed.important,
+                negate: parsed.negate,
                 filters: filters.clone(),
                 props: props.clone(),
             })
@@ -642,9 +666,12 @@ fn parse_filter(tok: &str) -> Option<Filter> {
 
 /// Heuristic: does this token read as a match pattern (vs. an operator)?
 fn looks_like_pattern(tok: &str) -> bool {
-    let t = tok.strip_prefix('$').unwrap_or(tok);
-    if t.starts_with('/') {
-        return true; // regexp
+    // Both pattern prefixes have to come off first, or `!/re/` and `!:8080`
+    // would not be recognised for what they are.
+    let t = tok.strip_prefix('!').unwrap_or(tok);
+    let t = t.strip_prefix('$').unwrap_or(t);
+    if t.starts_with('/') || t.starts_with(':') {
+        return true; // regexp or port pattern
     }
     // Line properties and filters are neither pattern nor operator. Classifying
     // one as a pattern would both lose its effect and mint a rule that can
@@ -737,8 +764,43 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
     None
 }
 
-/// Parse a pattern token into a [`Pattern`].
-fn parse_pattern(tok: &str) -> Option<Pattern> {
+/// A pattern token after its `!` / `$` prefixes have been peeled off.
+struct ParsedPattern {
+    pattern: Pattern,
+    /// `$` — this port's important-rule shorthand. (Upstream spells importance
+    /// `lineProps://important` and uses `$` for exact-URL matching, so its
+    /// `!$url` "negative exact" form has no equivalent here.)
+    important: bool,
+    /// `!` — invert the pattern test.
+    negate: bool,
+}
+
+/// Parse a pattern token into a [`Pattern`] plus its prefix modifiers.
+///
+/// The order mirrors `parseRule` (`_original/lib/rules/rules.js:1235-1252`),
+/// whose `// 位置不能变` comment marks exactly this: `!` comes off first, the
+/// port-pattern test runs on what is left — so `!:8080` is a *negated* port
+/// pattern while `$:8080` is not a port pattern at all — and only then is the
+/// `$` prefix handled.
+fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
+    let (negate, tok) = match tok.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, tok),
+    };
+    let done = |pattern, important| {
+        Some(ParsedPattern {
+            pattern,
+            important,
+            negate,
+        })
+    };
+
+    // Port pattern: `:8080` scopes the rule to one port.
+    if let Some(re) = port_pattern(tok) {
+        return done(Pattern::Regex(re), false);
+    }
+
+    let important = tok.starts_with('$');
     let tok = tok.strip_prefix('$').unwrap_or(tok);
 
     // Regexp pattern: /body/flags
@@ -753,22 +815,50 @@ fn parse_pattern(tok: &str) -> Option<Pattern> {
                 }
                 pat.push_str(body);
                 if let Ok(re) = Regex::new(&pat) {
-                    return Some(Pattern::Regex(re));
+                    return done(Pattern::Regex(re), important);
                 }
             }
         }
+    }
+
+    // Everything below is a literal pattern, and whistle refuses to negate
+    // those: `parseWildcard` bails out for a negated wildcard
+    // (`rules.js:1171-1173`) and a negated plain pattern falls into the
+    // `else if (not) return;` at `rules.js:1266`. Dropping the rule — rather
+    // than inventing an inversion the original does not have — keeps a rules
+    // file behaving the same in both implementations.
+    if negate {
+        return None;
     }
 
     // Wildcard pattern → regex.
     if tok.contains('*') {
         let re = wildcard_to_regex(tok);
         if let Ok(re) = Regex::new(&re) {
-            return Some(Pattern::Regex(re));
+            return done(Pattern::Regex(re), important);
         }
     }
 
     // Scheme/host/path prefix.
-    Some(parse_prefix(tok))
+    done(parse_prefix(tok), important)
+}
+
+/// Compile a `:8080`-style port pattern.
+///
+/// `PORT_PATTERN_RE = /^!?:\d{1,5}$/` (`_original/lib/rules/rules.js:71`) and
+/// the compilation at `rules.js:1249-1252`: `^[\w]+://[^/?]+:<port>/`. Matching
+/// the URL text means the port has to be *spelled out*, so `:80` does not match
+/// `http://example.com/` in either implementation.
+///
+/// Anything less than a real port test is dangerous: this port used to fall
+/// through to the prefix parser, which dropped the port, ended up with an empty
+/// host and matched **every** request.
+fn port_pattern(tok: &str) -> Option<Regex> {
+    let digits = tok.strip_prefix(':')?;
+    if digits.is_empty() || digits.len() > 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Regex::new(&format!(r"^[\w]+://[^/?]+:{digits}/")).ok()
 }
 
 /// Build a scheme/host/path prefix pattern from a plain token.
@@ -781,26 +871,31 @@ fn parse_prefix(tok: &str) -> Pattern {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, String::new()),
     };
-    // Strip an explicit port from the host part for matching purposes.
-    let host_no_port = host_part.rsplit_once(':').map_or(host_part, |(h, p)| {
-        if p.chars().all(|c| c.is_ascii_digit()) {
-            h
-        } else {
-            host_part
-        }
-    });
+    // An explicit port scopes the rule to that port. The original matches the
+    // pattern as a literal prefix of the request URL, port and all, so dropping
+    // it here (as this port used to) made `example.com:8080` match every port.
+    // A `:port` that is not a valid u16 is left as part of the host, which then
+    // simply never matches — better than silently widening the rule.
+    let (host_no_port, port) = match host_part.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(port) => (h, Some(port)),
+            Err(_) => (host_part, None),
+        },
+        None => (host_part, None),
+    };
     let (host_suffix, host) = if let Some(stripped) = host_no_port.strip_prefix('.') {
         (true, stripped.to_lowercase())
     } else {
         (false, host_no_port.to_lowercase())
     };
-    if host.is_empty() && path.is_empty() && scheme.is_none() {
+    if host.is_empty() && path.is_empty() && scheme.is_none() && port.is_none() {
         return Pattern::Any;
     }
     Pattern::Prefix {
         scheme,
         host,
         host_suffix,
+        port,
         path,
     }
 }
@@ -981,6 +1076,20 @@ mod line_props_tests {
         assert!(r.ops.iter().all(|op| op.props.has("safeHtml")));
     }
 
+    /// The two legacy `includeFilter://` spellings are rewritten to
+    /// `lineProps://` before parsing (`formatShorthand`,
+    /// `_original/lib/rules/rules.js:224-229`), so they must become properties
+    /// rather than filter conditions.
+    #[test]
+    fn legacy_include_filter_aliases() {
+        let r = one("example.com htmlAppend://<!--x--> includeFilter://safeHtml");
+        assert!(r.props.has("safeHtml"));
+        assert!(r.filters.is_empty(), "must not become a filter condition");
+        assert!(one("example.com htmlAppend://<!--x--> includeFilter://strictHtml")
+            .props
+            .has("strictHtml"));
+    }
+
     // ── important ──
 
     /// `lineProps://important` outranks an earlier normal line for the same
@@ -1064,6 +1173,158 @@ mod line_props_tests {
         assert!(!strict.allows_injection(b"hello"));
         // Empty body counts as markup.
         assert!(strict.allows_injection(b""));
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::*;
+
+    fn req(url: &str) -> ReqInfo {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host_port, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], rest[i..].to_string()),
+            None => (rest, "/".to_string()),
+        };
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => {
+                (h.to_string(), p.parse().unwrap())
+            }
+            _ => (
+                host_port.to_string(),
+                if scheme == "https" { 443 } else { 80 },
+            ),
+        };
+        ReqInfo {
+            method: "GET".into(),
+            scheme: scheme.into(),
+            host,
+            port,
+            path,
+            full_url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Does `text`'s rule match `url`?
+    fn hits(text: &str, url: &str) -> bool {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        mgr.resolve(&req(url)).value("host").is_some()
+    }
+
+    // ── `:port` patterns ──
+
+    /// `:8080` scopes a rule to one port, on any host. It used to reach the
+    /// prefix parser, which dropped the port and left an empty host — i.e. a
+    /// pattern that quietly matched **every** request.
+    #[test]
+    fn port_pattern_matches_only_that_port() {
+        let text = ":8080 host://1.1.1.1";
+        assert!(hits(text, "http://any.test:8080/"));
+        assert!(hits(text, "https://other.test:8080/deep/path?q=1"));
+        assert!(!hits(text, "http://any.test/"), "port 80 must not match");
+        assert!(!hits(text, "http://other.test:9999/"));
+        assert!(!hits(text, "http://any.test:18080/"), "not a suffix match");
+    }
+
+    /// Like upstream, the port has to be spelled out in the URL: the compiled
+    /// pattern is `^[\w]+://[^/?]+:<port>/`, so a default port does not match.
+    #[test]
+    fn default_port_is_not_spelled_out() {
+        assert!(!hits(":80 host://1.1.1.1", "http://any.test/"));
+        assert!(hits(":80 host://1.1.1.1", "http://any.test:80/"));
+    }
+
+    /// `!:8080` is recognised as *both* a port pattern and a negation — the
+    /// ordering upstream marks with `// 位置不能变`.
+    #[test]
+    fn negated_port_pattern() {
+        let text = "!:8080 host://1.1.1.1";
+        assert!(!hits(text, "http://any.test:8080/"));
+        assert!(hits(text, "http://any.test/"));
+        // …and it must not be mistaken for a `host:port` operator.
+        let rules = parse_text("!:8080 statusCode://418");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].ops.len(), 1);
+        assert_eq!(rules[0].ops[0].protocol, "statusCode");
+    }
+
+    /// A port written into an ordinary pattern scopes it just the same —
+    /// upstream matches the pattern as a literal prefix of the URL, port
+    /// included.
+    #[test]
+    fn explicit_port_in_a_host_pattern() {
+        let text = "example.test:8080 host://1.1.1.1";
+        assert!(hits(text, "http://example.test:8080/"));
+        assert!(!hits(text, "http://example.test/"));
+        assert!(!hits(text, "http://other.test:8080/"));
+        // A portless pattern still matches any port.
+        assert!(hits("example.test host://1.1.1.1", "http://example.test:8080/"));
+    }
+
+    /// A `:` that is not a port stays part of the host, which then matches
+    /// nothing — rather than being dropped and widening the rule.
+    #[test]
+    fn unparsable_port_does_not_widen_the_pattern() {
+        assert!(!hits("example.test:99999 host://1.1.1.1", "http://example.test/"));
+        assert!(!hits(": host://1.1.1.1", "http://example.test/"));
+    }
+
+    // ── `!` negation ──
+
+    /// `!/re/` matches every request the regexp does not
+    /// (`_original/lib/rules/rules.js:994-998`).
+    #[test]
+    fn negated_regexp_inverts_the_match() {
+        let text = "!/example\\.test/ host://1.1.1.1";
+        assert!(!hits(text, "http://example.test/"));
+        assert!(hits(text, "http://other.test/"));
+    }
+
+    /// Only the *pattern* test is inverted: filter conditions still have to
+    /// hold as written.
+    #[test]
+    fn negation_leaves_filters_alone() {
+        let text = "!/example\\.test/ host://1.1.1.1 filter://m:POST";
+        assert!(!hits(text, "http://other.test/"), "GET fails the filter");
+
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        let post = |url: &str| {
+            let mut r = req(url);
+            r.method = "POST".into();
+            r
+        };
+        assert!(mgr.resolve(&post("http://other.test/")).value("host").is_some());
+        assert!(
+            mgr.resolve(&post("http://example.test/")).value("host").is_none(),
+            "the negated pattern still excludes example.test"
+        );
+    }
+
+    /// Upstream refuses to negate a literal pattern: `parseWildcard` bails out
+    /// for a negated wildcard (`rules.js:1171-1173`) and a negated plain
+    /// pattern hits `else if (not) return;` (`rules.js:1266`). Both drop the
+    /// rule, so this port drops it too rather than inventing an inversion.
+    #[test]
+    fn literal_patterns_cannot_be_negated() {
+        assert!(parse_text("!example.test host://1.1.1.1").is_empty());
+        assert!(parse_text("!*.example.test host://1.1.1.1").is_empty());
+        // Other patterns on the same line are unaffected.
+        let rules = parse_text("!example.test other.test host://1.1.1.1");
+        assert_eq!(rules.len(), 1);
+        assert!(hits("!example.test other.test host://1.1.1.1", "http://other.test/"));
+    }
+
+    /// The `$` important shorthand still works, and survives a `!` in front.
+    #[test]
+    fn important_prefix_after_negation() {
+        let rules = parse_text("$example.test host://1.1.1.1");
+        assert!(rules[0].is_important());
+        assert!(!rules[0].negate);
+        // `!$…` parses as negate + important; being literal, it is dropped.
+        assert!(parse_text("!$example.test host://1.1.1.1").is_empty());
     }
 }
 

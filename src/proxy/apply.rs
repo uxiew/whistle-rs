@@ -18,7 +18,7 @@ use once_cell::sync::Lazy;
 
 use super::body::{self, DynBody};
 use super::upstream::{ProxyKind, Target, parse_proxy};
-use crate::rules::{ReqInfo, Resolved, RuleManager};
+use crate::rules::{LineProps, ReqInfo, Resolved, RuleManager};
 
 /// Build the request facts the matcher needs.
 pub fn build_req_info(
@@ -117,15 +117,16 @@ fn replace_ci(haystack: &str, needle: &str, repl: &str) -> String {
     out
 }
 
-/// Merge additional rules referenced by `rule://name` (from the values store) and
-/// `rulesFile://path` (from disk): resolve them against `info` and fill in any
-/// operators not already set.
 /// Merge an ad-hoc rules text (e.g. produced by a plugin) into the resolved set.
 /// Existing single-match operators win; multi-match operators accumulate.
-pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str) {
+///
+/// `is_internal_req` carries the request's origin through, so an
+/// `internal`/`internalOnly` line inside injected rules is scoped exactly as it
+/// would be at top level.
+pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str, is_internal_req: bool) {
     let mut mgr = RuleManager::new();
     mgr.set_text(text);
-    let sub = mgr.resolve(info);
+    let sub = mgr.resolve_scoped(info, is_internal_req);
     for (k, v) in sub.single {
         resolved.single.entry(k).or_insert(v);
     }
@@ -134,10 +135,13 @@ pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str) {
     }
 }
 
+/// Merge the rules pulled in by `rule://<name>` (from the values store) and
+/// `rulesFile://<path>` (from disk), resolved in the request's own scope.
 pub fn merge_included_rules(
     resolved: &mut Resolved,
     info: &ReqInfo,
     values: &HashMap<String, String>,
+    is_internal_req: bool,
 ) {
     let mut texts: Vec<String> = Vec::new();
     if let Some(name) = resolved.value("rule") {
@@ -153,7 +157,7 @@ pub fn merge_included_rules(
     for text in texts {
         let mut mgr = RuleManager::new();
         mgr.set_text(&text);
-        let sub = mgr.resolve(info);
+        let sub = mgr.resolve_scoped(info, is_internal_req);
         for (k, v) in sub.single {
             resolved.single.entry(k).or_insert(v);
         }
@@ -163,12 +167,113 @@ pub fn merge_included_rules(
     }
 }
 
+/// Upstream-proxy operators in the order whistle prefers them, with the proxy
+/// kind each implies. Scheme-converting proxies are treated as plain HTTP
+/// proxies — this port does not implement the scheme flip.
+const PROXY_PROTOS: &[(&str, ProxyKind)] = &[
+    ("socks", ProxyKind::Socks),
+    ("https-proxy", ProxyKind::Https),
+    ("http-proxy", ProxyKind::Http),
+    ("proxy", ProxyKind::Http),
+    ("internal-https-proxy", ProxyKind::Https),
+    ("internal-proxy", ProxyKind::Http),
+    ("internal-http-proxy", ProxyKind::Http),
+    ("https2http-proxy", ProxyKind::Http),
+    ("http2https-proxy", ProxyKind::Http),
+];
+
+/// The protocol of the matched upstream-proxy rule, if one matched at all.
+/// Cheap on purpose: it answers "is there a proxy rule?" without parsing the
+/// value or evaluating a PAC script.
+fn matched_proxy_proto(resolved: &Resolved) -> Option<&'static str> {
+    PROXY_PROTOS
+        .iter()
+        .map(|&(proto, _)| proto)
+        .find(|proto| resolved.value(proto).is_some())
+}
+
+/// The winning upstream proxy, with the protocol that supplied it so its line
+/// properties can be read back.
+fn find_proxy(
+    info: &ReqInfo,
+    resolved: &Resolved,
+) -> Option<(&'static str, super::upstream::ProxyConfig)> {
+    let direct = PROXY_PROTOS.iter().find_map(|&(proto, kind)| {
+        // A proxy URL may carry whistle's own query flags (`?proxyHost`), which
+        // are not part of the address.
+        let value = proxy_address(resolved.value(proto)?);
+        Some((proto, parse_proxy(kind, value)?))
+    });
+    if direct.is_some() {
+        return direct;
+    }
+    // `pac://<file>` picks the proxy by evaluating FindProxyForURL.
+    let pac_val = resolved.value("pac")?;
+    let src = crate::proxy::script::load_script(pac_val)?;
+    let result = crate::proxy::script::eval_pac(&src, &info.full_url, &info.host)?;
+    Some(("pac", parse_pac_result(&result)?))
+}
+
+/// A proxy operator's address, without whistle's query flags.
+fn proxy_address(value: &str) -> &str {
+    value.split('?').next().unwrap_or(value)
+}
+
+/// `?proxyHost` / `&proxyHosts` written into an upstream proxy's own URL —
+/// whistle's URL-borne spelling of the line property
+/// (`PROXY_HOSTS_RE`, `_original/lib/rules/index.js:80,:168`).
+fn proxy_host_flag(value: &str) -> bool {
+    let Some((_, query)) = value.split_once('?') else {
+        return false;
+    };
+    query
+        .split('&')
+        .any(|seg| seg.eq_ignore_ascii_case("proxyHost") || seg.eq_ignore_ascii_case("proxyHosts"))
+}
+
+/// Does a matched upstream proxy survive next to a matched `host://` rule?
+///
+/// whistle's default is that `host` wins outright: with both matched, the proxy
+/// is dropped and the request goes straight to the host address
+/// (`_original/lib/rules/index.js:220-237`). The line properties invert that:
+///
+/// * `proxyHost` (on either line) — use both: reach the origin through the
+///   proxy, but have the proxy connect to the `host://` address (`_phost`);
+/// * `proxyHostOnly` — as `proxyHost`, and additionally drop the proxy when no
+///   `host://` rule matched, since there is then no host for it to apply;
+/// * `proxyFirst` (on either line) — prefer the proxy over the plain host.
+///
+/// `enable://proxyHost` / `enable://proxyFirst` say the same request-wide.
+fn proxy_survives_host(resolved: &Resolved, proxy_proto: &str, host_matched: bool) -> bool {
+    let proxy_props = resolved.props(proxy_proto);
+    let host_props = resolved.props("host");
+    let proxy_host_only = proxy_props.has("proxyHostOnly");
+    if !host_matched {
+        return !proxy_host_only;
+    }
+    let enabled = enabled_flags(resolved);
+    let url_flag = proxy_proto != "pac"
+        && resolved
+            .value(proxy_proto)
+            .map(proxy_host_flag)
+            .unwrap_or(false);
+    proxy_host_only
+        || url_flag
+        || proxy_props.has("proxyHost")
+        || host_props.has("proxyHost")
+        || enabled.contains("proxyHost")
+        || proxy_props.has("proxyFirst")
+        || host_props.has("proxyFirst")
+        || enabled.contains("proxyFirst")
+}
+
 /// Compute the upstream target, honouring `host://` (and `:port`) overrides.
 pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
     let mut connect_host = info.host.clone();
     let mut connect_port = info.port;
 
-    if let Some(value) = resolved.value("host") {
+    let host_rule = resolved.value("host");
+    if let Some(value) = host_rule {
         let (h, p) = parse_host_value(value, info.port);
         if let Some(h) = h {
             connect_host = h;
@@ -178,46 +283,9 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
         }
     }
 
-    // First matching proxy operator wins (socks > https-proxy > http-proxy > proxy).
-    let proxy = resolved
-        .value("socks")
-        .and_then(|v| parse_proxy(ProxyKind::Socks, v))
-        .or_else(|| {
-            resolved
-                .value("https-proxy")
-                .and_then(|v| parse_proxy(ProxyKind::Https, v))
-        })
-        .or_else(|| {
-            resolved
-                .value("http-proxy")
-                .and_then(|v| parse_proxy(ProxyKind::Http, v))
-        })
-        .or_else(|| resolved.value("proxy").and_then(|v| parse_proxy(ProxyKind::Http, v)))
-        .or_else(|| {
-            resolved
-                .value("internal-https-proxy")
-                .and_then(|v| parse_proxy(ProxyKind::Https, v))
-        })
-        .or_else(|| {
-            resolved
-                .value("internal-proxy")
-                .or_else(|| resolved.value("internal-http-proxy"))
-                .and_then(|v| parse_proxy(ProxyKind::Http, v))
-        })
-        // Scheme-converting proxies are treated as HTTP proxies (approximation).
-        .or_else(|| {
-            resolved
-                .value("https2http-proxy")
-                .or_else(|| resolved.value("http2https-proxy"))
-                .and_then(|v| parse_proxy(ProxyKind::Http, v))
-        })
-        // `pac://<file>` picks the proxy by evaluating FindProxyForURL.
-        .or_else(|| {
-            let pac_val = resolved.value("pac")?;
-            let src = crate::proxy::script::load_script(pac_val)?;
-            let result = crate::proxy::script::eval_pac(&src, &info.full_url, &info.host)?;
-            parse_pac_result(&result)
-        });
+    let proxy = find_proxy(info, resolved)
+        .filter(|(proto, _)| proxy_survives_host(resolved, proto, host_rule.is_some()))
+        .map(|(_, cfg)| cfg);
 
     Target {
         connect_host,
@@ -396,10 +464,32 @@ pub fn short_circuit(
     }
 
     if let Some((proto, value)) = find_file_rule(resolved) {
-        return serve_file_family(proto, value, info, env);
+        if !weak_rule_yields(resolved, proto) {
+            return serve_file_family(proto, value, info, env);
+        }
     }
 
     None
+}
+
+/// `weakRule` — the local-file rule steps aside for a matching `proxy`/`host`
+/// rule instead of answering the request, inverting the usual precedence
+/// (`filterWeakRule`, `_original/lib/util/index.js:3733-3745`).
+///
+/// Upstream drops the local rule when a `host://` rule matched, or when a proxy
+/// rule matched that is *not* `proxyHostOnly` — that spelling needs a host rule
+/// to mean anything, so on its own it does not outrank the file.
+/// `enable://weakRule` says the same request-wide.
+fn weak_rule_yields(resolved: &Resolved, file_proto: &str) -> bool {
+    if !resolved.props(file_proto).has("weakRule") && !enabled_flags(resolved).contains("weakRule") {
+        return false;
+    }
+    if resolved.value("host").is_some() {
+        return true;
+    }
+    matched_proxy_proto(resolved)
+        .map(|proto| !resolved.props(proto).has("proxyHostOnly"))
+        .unwrap_or(false)
 }
 
 /// The local-file / template protocols, in resolution order (base before `x`/`xs`
@@ -1147,6 +1237,73 @@ pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option
     transform_body(body, resolved, "res", content_type)
 }
 
+/// Decides, per operator, whether its content may be injected into a response
+/// body — the `safeHtml` / `strictHtml` line properties.
+///
+/// Ported from `WhistleTransform#allowInject` + `filterHtml`
+/// (`_original/lib/util/whistle-transform.js:66-89`). Three things matter:
+///
+/// * the decision looks at the **original** upstream body, before any operator
+///   has rewritten it, and at its first non-whitespace byte only;
+/// * only HTML responses are gated — `allowInject` returns `true` immediately
+///   for anything else (`whistle-transform.js:68`), so `safeHtml` on a `jsAppend`
+///   for a JavaScript response does nothing;
+/// * the gate is **per line**: whistle marks each injected buffer with the
+///   properties of the rule line that produced it (`_original/lib/util/index.js:1375-1381`)
+///   and filters them individually, so one line may inject while another on the
+///   same request is refused.
+struct InjectionGate<'a> {
+    resolved: &'a Resolved,
+    /// The unmodified upstream body the decision is made from.
+    body: &'a [u8],
+    /// False when nothing is gated (non-HTML response, or the request side).
+    html: bool,
+    /// `enable://safeHtml` / `enable://strictHtml`, which upstream stamps onto
+    /// every injecting rule of the request (`_original/lib/inspectors/res.js:970-987`).
+    global: LineProps,
+}
+
+impl<'a> InjectionGate<'a> {
+    fn new(
+        resolved: &'a Resolved,
+        prefix: &str,
+        content_type: Option<&str>,
+        body: &'a [u8],
+    ) -> Self {
+        // Request bodies are never gated: whistle's request transform leaves
+        // `isHtml` unset, so `allowInject` lets every operator through.
+        let html = prefix == "res" && content_type.and_then(typed_body_kind) == Some("html");
+        let global = if html {
+            let enabled = enabled_flags(resolved);
+            LineProps::from_actions(
+                ["strictHtml", "safeHtml"]
+                    .into_iter()
+                    .filter(|a| enabled.contains(*a)),
+            )
+        } else {
+            LineProps::default()
+        };
+        InjectionGate {
+            resolved,
+            body,
+            html,
+            global,
+        }
+    }
+
+    /// The value of an injecting operator, unless its line (or a request-wide
+    /// `enable://`) refuses to inject it into this body.
+    fn value(&self, protocol: &str) -> Option<&'a str> {
+        let value = self.resolved.value(protocol)?;
+        if !self.html {
+            return Some(value);
+        }
+        let allowed = self.resolved.props(protocol).allows_injection(self.body)
+            && self.global.allows_injection(self.body);
+        allowed.then_some(value)
+    }
+}
+
 /// Apply `*Body` → `*Replace` → `*Prepend` → `*Append`, then content-type-specific
 /// (`css`/`html`/`js`) `Body`/`Prepend`/`Append` for the response.
 fn transform_body(
@@ -1155,7 +1312,11 @@ fn transform_body(
     prefix: &str,
     content_type: Option<&str>,
 ) -> Bytes {
-    let mut data: Vec<u8> = match resolved.value(&format!("{prefix}Body")) {
+    // Built before anything is rewritten: whistle decides once, from the body as
+    // it arrived, whether injected content is allowed at all.
+    let gate = InjectionGate::new(resolved, prefix, content_type, &body);
+
+    let mut data: Vec<u8> = match gate.value(&format!("{prefix}Body")) {
         Some(new) => new.as_bytes().to_vec(),
         None => body.to_vec(),
     };
@@ -1163,12 +1324,12 @@ fn transform_body(
     if let Some(spec) = resolved.value(&format!("{prefix}Replace")) {
         data = apply_body_replace(data, spec);
     }
-    if let Some(pre) = resolved.value(&format!("{prefix}Prepend")) {
+    if let Some(pre) = gate.value(&format!("{prefix}Prepend")) {
         let mut v = pre.as_bytes().to_vec();
         v.extend_from_slice(&data);
         data = v;
     }
-    if let Some(app) = resolved.value(&format!("{prefix}Append")) {
+    if let Some(app) = gate.value(&format!("{prefix}Append")) {
         data.extend_from_slice(app.as_bytes());
     }
 
@@ -1190,15 +1351,15 @@ fn transform_body(
     // Content-type-specific ops (cssBody/htmlPrepend/jsAppend, …).
     if prefix == "res" {
         if let Some(kind) = content_type.and_then(typed_body_kind) {
-            if let Some(new) = resolved.value(&format!("{kind}Body")) {
+            if let Some(new) = gate.value(&format!("{kind}Body")) {
                 data = new.as_bytes().to_vec();
             }
-            if let Some(pre) = resolved.value(&format!("{kind}Prepend")) {
+            if let Some(pre) = gate.value(&format!("{kind}Prepend")) {
                 let mut v = pre.as_bytes().to_vec();
                 v.extend_from_slice(&data);
                 data = v;
             }
-            if let Some(app) = resolved.value(&format!("{kind}Append")) {
+            if let Some(app) = gate.value(&format!("{kind}Append")) {
                 data.extend_from_slice(app.as_bytes());
             }
         }
@@ -2035,6 +2196,257 @@ mod tests {
         let info = build_req_info("GET", "https", "example.com", 443, "/", &HeaderMap::new(), None);
         let target = resolve_target(&info, &resolved);
         assert_eq!(target.tls_versions, TlsVersions::Only12);
+    }
+
+    // ── host / proxy precedence (proxyFirst, proxyHost, proxyHostOnly) ──
+
+    /// The upstream target `rules` produce for `url`.
+    fn target(rules: &str, url: &str) -> Target {
+        let resolved = resolve(rules, url);
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let info = build_req_info(
+            "GET",
+            scheme,
+            host,
+            if scheme == "https" { 443 } else { 80 },
+            path,
+            &HeaderMap::new(),
+            None,
+        );
+        resolve_target(&info, &resolved)
+    }
+
+    const HOST_AND_PROXY: &str = "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\n";
+
+    /// With both a `host://` and a `proxy://` rule matched, whistle uses the
+    /// host and drops the proxy (`_original/lib/rules/index.js:220-237`).
+    #[test]
+    fn host_outranks_proxy_by_default() {
+        let t = target(HOST_AND_PROXY, "http://example.com/");
+        assert_eq!(t.connect_host, "1.2.3.4");
+        assert!(t.proxy.is_none(), "the proxy must lose to the host rule");
+    }
+
+    /// A proxy rule with no host rule to lose to is used as-is.
+    #[test]
+    fn proxy_alone_is_untouched() {
+        let t = target("example.com proxy://127.0.0.1:8888\n", "http://example.com/");
+        assert_eq!(t.proxy.expect("proxy").port, 8888);
+    }
+
+    /// `proxyFirst` and `proxyHost` (on either line) keep both, so the request
+    /// goes through the proxy to the host address.
+    #[test]
+    fn proxy_first_and_proxy_host_keep_both() {
+        for rules in [
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyFirst\n",
+            "example.com host://1.2.3.4 lineProps://proxyFirst\nexample.com proxy://127.0.0.1:8888\n",
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyHost\n",
+            "example.com host://1.2.3.4 lineProps://proxyHost\nexample.com proxy://127.0.0.1:8888\n",
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\nexample.com enable://proxyFirst\n",
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\nexample.com enable://proxyHost\n",
+        ] {
+            let t = target(rules, "http://example.com/");
+            assert!(t.proxy.is_some(), "proxy should survive: {rules}");
+            assert_eq!(t.connect_host, "1.2.3.4", "host override still applies");
+        }
+    }
+
+    /// `?proxyHost` in the proxy's own URL says the same thing, and is not part
+    /// of the proxy address.
+    #[test]
+    fn proxy_host_flag_in_the_proxy_url() {
+        let t = target(
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888?proxyHost\n",
+            "http://example.com/",
+        );
+        let p = t.proxy.expect("?proxyHost should keep the proxy");
+        assert_eq!(p.host, "127.0.0.1");
+        assert_eq!(p.port, 8888, "the query flag must not leak into the address");
+    }
+
+    /// `proxyHostOnly` keeps both when a host rule matched, and discards the
+    /// proxy when none did.
+    #[test]
+    fn proxy_host_only_requires_a_host_rule() {
+        let with_host = target(
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyHostOnly\n",
+            "http://example.com/",
+        );
+        assert!(with_host.proxy.is_some());
+        assert_eq!(with_host.connect_host, "1.2.3.4");
+
+        let without_host = target(
+            "example.com proxy://127.0.0.1:8888 lineProps://proxyHostOnly\n",
+            "http://example.com/",
+        );
+        assert!(
+            without_host.proxy.is_none(),
+            "proxyHostOnly with no host rule drops the proxy"
+        );
+        assert_eq!(without_host.connect_host, "example.com");
+    }
+
+    // ── weakRule ──
+
+    /// `weakRule` on a local-file line makes it yield to a matching proxy or
+    /// host rule (`filterWeakRule`, `_original/lib/util/index.js:3733`).
+    #[test]
+    fn weak_rule_yields_to_proxy_or_host() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        for rules in [
+            "a.com file:///no/such/file lineProps://weakRule\na.com proxy://127.0.0.1:8888\n",
+            "a.com file:///no/such/file lineProps://weakRule\na.com host://1.2.3.4\n",
+            "a.com file:///no/such/file\na.com host://1.2.3.4\na.com enable://weakRule\n",
+        ] {
+            let r = resolve(rules, "http://a.com/");
+            assert!(
+                short_circuit(&info, &r, test_env()).is_none(),
+                "the file rule should step aside: {rules}"
+            );
+        }
+    }
+
+    /// Without something to yield *to*, the file rule still answers — including
+    /// when the only proxy rule is `proxyHostOnly` with no host rule to apply.
+    #[test]
+    fn weak_rule_keeps_the_file_when_nothing_outranks_it() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        for rules in [
+            "a.com file:///no/such/file lineProps://weakRule\n",
+            "a.com file:///no/such/file lineProps://weakRule\na.com proxy://127.0.0.1:8888 lineProps://proxyHostOnly\n",
+            // No weakRule: the file rule wins over the proxy as usual.
+            "a.com file:///no/such/file\na.com proxy://127.0.0.1:8888\n",
+        ] {
+            let r = resolve(rules, "http://a.com/");
+            assert!(
+                short_circuit(&info, &r, test_env()).is_some(),
+                "the file rule should answer: {rules}"
+            );
+        }
+    }
+
+    // ── safeHtml / strictHtml injection gating ──
+
+    /// Body after applying the response operators of `rules` to `body`, served
+    /// as `content_type`.
+    fn inject(rules: &str, body: &'static str, content_type: &str) -> String {
+        let resolved = resolve(rules, "http://example.com/x");
+        let out = transform_res_body(
+            Bytes::from_static(body.as_bytes()),
+            &resolved,
+            Some(content_type),
+        );
+        String::from_utf8(out.to_vec()).unwrap()
+    }
+
+    const HTML: &str = "text/html; charset=utf-8";
+
+    /// Markup accepts injection whatever the line says — the decision is made
+    /// from the body's first non-whitespace byte.
+    #[test]
+    fn injection_into_markup_always_allowed() {
+        for props in ["", " lineProps://safeHtml", " lineProps://strictHtml"] {
+            let rules = format!("example.com/x htmlAppend://<!--tail-->{props}\n");
+            assert_eq!(
+                inject(&rules, "<html></html>", HTML),
+                "<html></html><!--tail-->",
+                "markup should accept injection with{props:?}"
+            );
+        }
+    }
+
+    /// `safeHtml` refuses a JSON-looking body; `strictHtml` refuses anything
+    /// that is not markup (`_original/lib/util/whistle-transform.js:66-89`).
+    #[test]
+    fn safe_and_strict_html_refuse_non_markup() {
+        let json = "{\"a\":1}";
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t-->\n", json, HTML),
+            "{\"a\":1}<!--t-->",
+            "an unguarded line still injects into JSON"
+        );
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t--> lineProps://safeHtml\n", json, HTML),
+            json
+        );
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t--> lineProps://strictHtml\n", json, HTML),
+            json
+        );
+        // Bare text is "safe" but not markup: only strictHtml refuses it.
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t--> lineProps://safeHtml\n", "hello", HTML),
+            "hello<!--t-->"
+        );
+        assert_eq!(
+            inject("example.com/x htmlAppend://<!--t--> lineProps://strictHtml\n", "hello", HTML),
+            "hello"
+        );
+    }
+
+    /// The gate is per line: a guarded line is dropped while an unguarded one
+    /// on the same request still injects.
+    #[test]
+    fn gating_is_per_line() {
+        let out = inject(
+            "example.com/x htmlAppend://<!--guarded--> lineProps://safeHtml\n\
+             example.com/x htmlPrepend://<!--free-->\n",
+            "{\"a\":1}",
+            HTML,
+        );
+        assert_eq!(out, "<!--free-->{\"a\":1}");
+    }
+
+    /// Non-HTML responses are not gated at all: upstream's `allowInject`
+    /// returns before it ever looks at the properties.
+    #[test]
+    fn gating_only_applies_to_html_responses() {
+        let out = inject(
+            "example.com/x resAppend:///*t*/ lineProps://strictHtml\n",
+            "{\"a\":1}",
+            "application/json",
+        );
+        assert_eq!(out, "{\"a\":1}/*t*/");
+    }
+
+    /// The generic body operators are gated too — upstream filters
+    /// `resBody`/`resPrepend`/`resAppend` through the same list.
+    #[test]
+    fn generic_body_operators_are_gated() {
+        assert_eq!(
+            inject(
+                "example.com/x resPrepend://<!--p--> lineProps://strictHtml\n",
+                "plain text",
+                HTML
+            ),
+            "plain text"
+        );
+        assert_eq!(
+            inject(
+                "example.com/x resBody://replaced lineProps://safeHtml\n",
+                "[1,2]",
+                HTML
+            ),
+            "[1,2]",
+            "safeHtml must keep a JSON body rather than replace it"
+        );
+    }
+
+    /// `enable://strictHtml` applies the strict gate to every line of the
+    /// request (`_original/lib/inspectors/res.js:970-987`).
+    #[test]
+    fn enable_strict_html_gates_every_line() {
+        let out = inject(
+            "example.com/x htmlAppend://<!--t-->\nexample.com/x enable://strictHtml\n",
+            "hello",
+            HTML,
+        );
+        assert_eq!(out, "hello");
     }
 
     #[test]

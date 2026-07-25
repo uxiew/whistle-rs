@@ -37,6 +37,34 @@ use body::DynBody;
 /// Maximum number of captured transactions kept in memory.
 pub const MAX_SESSIONS: usize = 500;
 
+/// Request header that marks a request as *whistle-internal*: issued by the
+/// proxy (or its tooling) rather than by a client being debugged. It is what
+/// makes the `lineProps://internal` and `lineProps://internalOnly` rule lines
+/// visible — see [`crate::rules::LineProps::allows_scope`].
+///
+/// whistle marks such requests with a per-process secret header
+/// (`config.PROXY_ID_HEADER = 'x-whistle-proxy-id-' + uid`,
+/// `_original/lib/config.js:89`), set by the HTTP client it uses for its own
+/// calls (`setInternalOptions`, `_original/lib/util/common.js:1268`) and deleted
+/// again the moment the proxy sees it (`checkPluginReqOnce`,
+/// `_original/lib/util/index.js:3414-3425`). This port uses a fixed, documented
+/// name rather than a secret one: it has no privileged internal service to
+/// protect, and a stable name is what lets a client — or whistle-rs's own
+/// tooling — deliberately exercise an `internal` rule.
+///
+/// Any non-empty value marks the request. The header is removed before the
+/// rules run, so it never reaches a `filter://h:` condition, the session
+/// capture, or the origin server.
+pub const INTERNAL_REQ_HEADER: &str = "x-whistle-internal-req";
+
+/// Strip the internal-request marker, reporting whether it was present.
+fn take_internal_marker(headers: &mut hyper::HeaderMap) -> bool {
+    match headers.remove(INTERNAL_REQ_HEADER) {
+        Some(v) => !v.is_empty(),
+        None => false,
+    }
+}
+
 /// Maximum number of captured WebSocket frames kept in memory (across all
 /// connections). Whistle surfaces every frame; we keep a bounded ring buffer.
 const MAX_FRAMES: usize = 2000;
@@ -814,10 +842,15 @@ fn guard(result: Result<Response<DynBody>>) -> Response<DynBody> {
 /// Core request pipeline: match rules, apply them, forward upstream.
 async fn serve(
     state: Arc<AppState>,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     origin: Origin,
     client_ip: Option<String>,
 ) -> Result<Response<DynBody>> {
+    // Consumed before anything else looks at the headers, exactly like whistle
+    // deletes its own marker on arrival: rule filters, plugins, the capture and
+    // the origin server must never see it.
+    let is_internal_req = take_internal_marker(req.headers_mut());
+
     // Derive scheme/host/port/path for matching.
     let (scheme, host, port, path) = match &origin {
         Origin::Forward => {
@@ -853,11 +886,15 @@ async fn serve(
         req.headers(),
         client_ip.clone(),
     );
-    let mut resolved = state.rules.read().unwrap().resolve(&info);
+    let mut resolved = state
+        .rules
+        .read()
+        .unwrap()
+        .resolve_scoped(&info, is_internal_req);
     {
         let values = state.values.read().unwrap();
         apply::substitute_values(&mut resolved, &values);
-        apply::merge_included_rules(&mut resolved, &info, &values);
+        apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
         apply::substitute_values(&mut resolved, &values);
     }
     apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
@@ -936,7 +973,7 @@ async fn serve(
                 continue;
             };
             if let Some(rules) = result.rules {
-                apply::merge_rules_text(&mut resolved, &info, &rules);
+                apply::merge_rules_text(&mut resolved, &info, &rules, is_internal_req);
                 let values = state.values.read().unwrap();
                 apply::substitute_values(&mut resolved, &values);
             }
@@ -1784,5 +1821,58 @@ mod pipe_wiring_tests {
             assert_eq!(collect_body(out).await.expect("body"), Bytes::from_static(b"SHOUT"));
             assert!(headers.get(hyper::header::CONTENT_LENGTH).is_none());
         });
+    }
+}
+
+#[cfg(test)]
+mod internal_req_tests {
+    use super::*;
+
+    fn marked(value: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(INTERNAL_REQ_HEADER, value.parse().unwrap());
+        h
+    }
+
+    /// The marker flags the request *and* is consumed, so nothing downstream —
+    /// a `filter://h:` condition, a plugin, the capture, the origin server —
+    /// ever sees it.
+    #[test]
+    fn marker_is_consumed() {
+        let mut h = marked("1");
+        assert!(take_internal_marker(&mut h));
+        assert!(h.get(INTERNAL_REQ_HEADER).is_none());
+    }
+
+    /// A missing or empty marker is an ordinary client request; an empty one is
+    /// still stripped.
+    #[test]
+    fn unmarked_request_is_client_scoped() {
+        assert!(!take_internal_marker(&mut hyper::HeaderMap::new()));
+        let mut h = marked("");
+        assert!(!take_internal_marker(&mut h));
+        assert!(h.get(INTERNAL_REQ_HEADER).is_none());
+    }
+
+    /// The end of the chain: the flag the pipeline derives from the header is
+    /// what makes `internalOnly` lines visible and plain lines invisible.
+    #[test]
+    fn scope_reaches_rule_resolution() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(
+            "example.com host://1.1.1.1\n\
+             example.com host://2.2.2.2 lineProps://internalOnly\n",
+        );
+        let info = apply::build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        assert_eq!(mgr.resolve_scoped(&info, false).value("host"), Some("1.1.1.1"));
+        assert_eq!(mgr.resolve_scoped(&info, true).value("host"), Some("2.2.2.2"));
     }
 }
