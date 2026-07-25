@@ -381,7 +381,7 @@ pub trait RustPlugin: Send + Sync {
     fn on_ws_frame(
         &self,
         _meta: &wsframe::FrameMeta,
-        _frame: &wsframe::HookFrame<'_>,
+        _frame: &wsframe::HookFrame,
     ) -> wsframe::Verdict {
         wsframe::Verdict::Keep
     }

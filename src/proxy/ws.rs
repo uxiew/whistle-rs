@@ -328,7 +328,8 @@ async fn run_hooks(
             .exchange(&HookFrame {
                 fin,
                 opcode,
-                payload: &payload,
+                // A refcount, not a copy: the hook shares the pump's bytes.
+                payload: payload.clone(),
             })
             .await;
         match verdict {
@@ -463,7 +464,7 @@ mod tests {
     /// A native plugin whose frame hook is supplied by the test.
     struct TestPlugin {
         name: &'static str,
-        verdict: fn(&HookFrame<'_>) -> Verdict,
+        verdict: fn(&HookFrame) -> Verdict,
     }
 
     impl RustPlugin for TestPlugin {
@@ -482,12 +483,12 @@ mod tests {
             }
         }
 
-        fn on_ws_frame(&self, _meta: &FrameMeta, frame: &HookFrame<'_>) -> Verdict {
+        fn on_ws_frame(&self, _meta: &FrameMeta, frame: &HookFrame) -> Verdict {
             (self.verdict)(frame)
         }
     }
 
-    fn state_hooking(name: &'static str, verdict: fn(&HookFrame<'_>) -> Verdict) -> Arc<AppState> {
+    fn state_hooking(name: &'static str, verdict: fn(&HookFrame) -> Verdict) -> Arc<AppState> {
         let mut plugins = crate::plugins::Plugins::new();
         plugins.register_rust(Box::new(TestPlugin { name, verdict }));
         state_with(plugins)
@@ -588,7 +589,7 @@ mod tests {
     fn binary_frames_survive_the_hook_byte_for_byte() {
         rt().block_on(async {
             let state = state_hooking("echo-bytes", |f| {
-                Verdict::Replace(Bytes::copy_from_slice(f.payload))
+                Verdict::Replace(f.payload.clone())
             });
             let plan = plan_for(&state, "ws.test pipe://echo-bytes\n");
             let mut wire = spawn_tunnel(&state, plan, None);
@@ -616,7 +617,7 @@ mod tests {
     fn a_dropped_frame_never_reaches_the_peer() {
         rt().block_on(async {
             let state = state_hooking("censor", |f| {
-                if f.payload == b"secret" {
+                if f.payload.as_ref() == b"secret" {
                     Verdict::Drop
                 } else {
                     Verdict::Keep

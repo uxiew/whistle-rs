@@ -53,7 +53,7 @@
 - [x] ~~**WebSocket 帧级拦改**（原版 `wsReqRead`/`wsResRead` 一族）~~ → 已完成，见
       [`PLUGINS.md`](PLUGINS.md#websocket-帧钩子--onwsframe)。每会话每方向一条长连接
       （`POST /ws/frames`），逐帧一进一出；控制帧不交付，帧类型与分片结构不可改，
-      插件出错只丢钩子不丢连接。实测每帧约 20µs（p50），不挂插件的会话零开销。
+      插件出错只丢钩子不丢连接。实测每帧约 38µs（p50），不挂插件的会话零开销。
 - [ ] **更多插件钩子**：`uiServer`/`statsServer`（插件自带 UI/统计页）、`auth`、
       `sniCallback`。
 

@@ -195,7 +195,7 @@ impl RustPlugin for WsUpperPlugin {
         PluginResult::default()
     }
 
-    fn on_ws_frame(&self, _meta: &FrameMeta, frame: &HookFrame<'_>) -> Verdict {
+    fn on_ws_frame(&self, _meta: &FrameMeta, frame: &HookFrame) -> Verdict {
         if frame.opcode != OPCODE_TEXT || !frame.fin {
             return Verdict::Keep;
         }

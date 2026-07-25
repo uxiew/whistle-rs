@@ -74,15 +74,15 @@
 //!
 //! A hooked frame is delayed by one loopback round-trip plus the plugin's own
 //! work. Measured against the Node SDK on the same host (debug build, 500
-//! sequential echo round-trips, so two hooked frames each): 0.084 ms per
-//! round-trip unhooked, 0.129 ms hooked — about **20 µs per hooked frame** at
-//! the median, 37 µs at the mean, 75 µs at p95.
+//! sequential echo round-trips, so two hooked frames each): 0.091 ms per
+//! round-trip unhooked, 0.166 ms hooked — about **38 µs per hooked frame** at
+//! the median, 42 µs at the mean, 56 µs at p95.
 //!
 //! Frames are not pipelined: frame *n+1* is not offered until frame *n*'s
 //! verdict is in, because a hook that reorders a WebSocket is worse than a hook
 //! that is slow. Sessions with no frame-hook plugin never open a connection and
 //! never pay a byte of this — the same benchmark with the plugin *running but
-//! not named by any matching rule* measures 0.084 ms, the unhooked figure.
+//! not named by any matching rule* measures 0.090 ms, the unhooked figure.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -195,14 +195,16 @@ impl FrameMeta {
 }
 
 /// One frame offered to a hook.
-pub struct HookFrame<'a> {
+pub struct HookFrame {
     /// Final frame of its message (the WebSocket FIN bit).
     pub fin: bool,
     /// WebSocket opcode: `0x0` continuation, `0x1` text, `0x2` binary.
     pub opcode: u8,
-    /// The unmasked payload — raw bytes. Never decoded to text on the way
-    /// through: a binary frame that survives a UTF-8 round-trip is a coincidence.
-    pub payload: &'a [u8],
+    /// The unmasked payload — raw bytes, and shared rather than copied, so a
+    /// megabyte frame costs a refcount to offer. Never decoded to text on the
+    /// way through: a binary frame that survives a UTF-8 round-trip is a
+    /// coincidence.
+    pub payload: Bytes,
 }
 
 /// What a hook decided about one frame.
@@ -241,7 +243,7 @@ impl FrameHook {
     ///
     /// An `Err` means the hook is finished, not that the frame is: the caller
     /// forwards the frame untouched and stops consulting this hook.
-    pub async fn exchange(&mut self, frame: &HookFrame<'_>) -> anyhow::Result<Verdict> {
+    pub async fn exchange(&mut self, frame: &HookFrame) -> anyhow::Result<Verdict> {
         match self {
             FrameHook::Native { plugin, meta, .. } => Ok(plugin.on_ws_frame(meta, frame)),
             FrameHook::Remote(r) => r.exchange(frame).await,
@@ -259,7 +261,7 @@ pub struct RemoteHook {
 }
 
 impl RemoteHook {
-    async fn exchange(&mut self, frame: &HookFrame<'_>) -> anyhow::Result<Verdict> {
+    async fn exchange(&mut self, frame: &HookFrame) -> anyhow::Result<Verdict> {
         if frame.payload.len() > u32::MAX as usize {
             anyhow::bail!("frame of {} bytes exceeds the record format", frame.payload.len());
         }
@@ -277,7 +279,12 @@ impl RemoteHook {
     }
 
     /// Write one record, as either one chunk or two.
-    async fn send(&self, frame: &HookFrame<'_>) -> anyhow::Result<()> {
+    ///
+    /// A large payload rides as its own chunk: it is already an owned `Bytes`,
+    /// so sending it whole costs a refcount, while folding it into the header
+    /// buffer would copy every byte. Small payloads go the other way — one
+    /// buffer is one write, and a copy of a few bytes is free.
+    async fn send(&self, frame: &HookFrame) -> anyhow::Result<()> {
         let big = frame.payload.len() >= CHUNK_SEPARATELY;
         let mut head = BytesMut::with_capacity(if big {
             RECORD_HEADER
@@ -288,13 +295,15 @@ impl RemoteHook {
         head.put_u8(frame.opcode);
         head.put_u32(frame.payload.len() as u32);
         if !big {
-            head.extend_from_slice(frame.payload);
+            head.extend_from_slice(&frame.payload);
         }
         let stopped = || anyhow::anyhow!("plugin stopped reading frames");
         self.tx.send(Ok(head.freeze())).await.map_err(|_| stopped())?;
         if big {
-            let payload = Bytes::copy_from_slice(frame.payload);
-            self.tx.send(Ok(payload)).await.map_err(|_| stopped())?;
+            self.tx
+                .send(Ok(frame.payload.clone()))
+                .await
+                .map_err(|_| stopped())?;
         }
         Ok(())
     }
@@ -414,11 +423,11 @@ mod tests {
         }
     }
 
-    fn frame<'a>(opcode: u8, payload: &'a [u8]) -> HookFrame<'a> {
+    fn frame(opcode: u8, payload: &[u8]) -> HookFrame {
         HookFrame {
             fin: true,
             opcode,
-            payload,
+            payload: Bytes::copy_from_slice(payload),
         }
     }
 
