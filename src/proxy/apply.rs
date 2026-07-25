@@ -187,11 +187,109 @@ pub fn merge_included_rules(
     }
 }
 
+/// Upstream-proxy operators in the order whistle prefers them, with the proxy
+/// kind each implies. Scheme-converting proxies are treated as plain HTTP
+/// proxies — this port does not implement the scheme flip.
+const PROXY_PROTOS: &[(&str, ProxyKind)] = &[
+    ("socks", ProxyKind::Socks),
+    ("https-proxy", ProxyKind::Https),
+    ("http-proxy", ProxyKind::Http),
+    ("proxy", ProxyKind::Http),
+    ("internal-https-proxy", ProxyKind::Https),
+    ("internal-proxy", ProxyKind::Http),
+    ("internal-http-proxy", ProxyKind::Http),
+    ("https2http-proxy", ProxyKind::Http),
+    ("http2https-proxy", ProxyKind::Http),
+];
+
+/// The protocol of the matched upstream-proxy rule, if one matched at all.
+/// Cheap on purpose: it answers "is there a proxy rule?" without parsing the
+/// value or evaluating a PAC script.
+fn matched_proxy_proto(resolved: &Resolved) -> Option<&'static str> {
+    PROXY_PROTOS
+        .iter()
+        .map(|&(proto, _)| proto)
+        .find(|proto| resolved.value(proto).is_some())
+}
+
+/// The winning upstream proxy, with the protocol that supplied it so its line
+/// properties can be read back.
+fn find_proxy(info: &ReqInfo, resolved: &Resolved) -> Option<(&'static str, super::upstream::ProxyConfig)> {
+    let direct = PROXY_PROTOS.iter().find_map(|&(proto, kind)| {
+        // A proxy URL may carry whistle's own query flags (`?proxyHost`), which
+        // are not part of the address.
+        let value = proxy_address(resolved.value(proto)?);
+        Some((proto, parse_proxy(kind, value)?))
+    });
+    if direct.is_some() {
+        return direct;
+    }
+    // `pac://<file>` picks the proxy by evaluating FindProxyForURL.
+    let pac_val = resolved.value("pac")?;
+    let src = crate::proxy::script::load_script(pac_val)?;
+    let result = crate::proxy::script::eval_pac(&src, &info.full_url, &info.host)?;
+    Some(("pac", parse_pac_result(&result)?))
+}
+
+/// A proxy operator's address, without whistle's query flags.
+fn proxy_address(value: &str) -> &str {
+    value.split('?').next().unwrap_or(value)
+}
+
+/// `?proxyHost` / `&proxyHosts` written into an upstream proxy's own URL —
+/// whistle's URL-borne spelling of the line property
+/// (`PROXY_HOSTS_RE`, `_original/lib/rules/index.js:80,:168`).
+fn proxy_host_flag(value: &str) -> bool {
+    let Some((_, query)) = value.split_once('?') else {
+        return false;
+    };
+    query
+        .split('&')
+        .any(|seg| seg.eq_ignore_ascii_case("proxyHost") || seg.eq_ignore_ascii_case("proxyHosts"))
+}
+
+/// Does a matched upstream proxy survive next to a matched `host://` rule?
+///
+/// whistle's default is that `host` wins outright: with both matched, the proxy
+/// is dropped and the request goes straight to the host address
+/// (`_original/lib/rules/index.js:220-237`). The line properties invert that:
+///
+/// * `proxyHost` (on either line) — use both: reach the origin through the
+///   proxy, but have the proxy connect to the `host://` address (`_phost`);
+/// * `proxyHostOnly` — as `proxyHost`, and additionally drop the proxy when no
+///   `host://` rule matched, since there is then no host for it to apply;
+/// * `proxyFirst` (on either line) — prefer the proxy over the plain host.
+///
+/// `enable://proxyHost` / `enable://proxyFirst` say the same request-wide.
+fn proxy_survives_host(resolved: &Resolved, proxy_proto: &str, host_matched: bool) -> bool {
+    let proxy_props = resolved.props(proxy_proto);
+    let host_props = resolved.props("host");
+    let proxy_host_only = proxy_props.has("proxyHostOnly");
+    if !host_matched {
+        return !proxy_host_only;
+    }
+    let enabled = enabled_flags(resolved);
+    let url_flag = proxy_proto != "pac"
+        && resolved
+            .value(proxy_proto)
+            .map(proxy_host_flag)
+            .unwrap_or(false);
+    proxy_host_only
+        || url_flag
+        || proxy_props.has("proxyHost")
+        || host_props.has("proxyHost")
+        || enabled.contains("proxyHost")
+        || proxy_props.has("proxyFirst")
+        || host_props.has("proxyFirst")
+        || enabled.contains("proxyFirst")
+}
+
 /// Compute the upstream target, honouring `host://` (and `:port`) overrides.
 pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
     let mut connect_host = info.host.clone();
     let mut connect_port = info.port;
 
+    let host_matched = resolved.value("host").is_some();
     if let Some(value) = resolved.value("host") {
         let (h, p) = parse_host_value(value, info.port);
         if let Some(h) = h {
@@ -202,46 +300,9 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
         }
     }
 
-    // First matching proxy operator wins (socks > https-proxy > http-proxy > proxy).
-    let proxy = resolved
-        .value("socks")
-        .and_then(|v| parse_proxy(ProxyKind::Socks, v))
-        .or_else(|| {
-            resolved
-                .value("https-proxy")
-                .and_then(|v| parse_proxy(ProxyKind::Https, v))
-        })
-        .or_else(|| {
-            resolved
-                .value("http-proxy")
-                .and_then(|v| parse_proxy(ProxyKind::Http, v))
-        })
-        .or_else(|| resolved.value("proxy").and_then(|v| parse_proxy(ProxyKind::Http, v)))
-        .or_else(|| {
-            resolved
-                .value("internal-https-proxy")
-                .and_then(|v| parse_proxy(ProxyKind::Https, v))
-        })
-        .or_else(|| {
-            resolved
-                .value("internal-proxy")
-                .or_else(|| resolved.value("internal-http-proxy"))
-                .and_then(|v| parse_proxy(ProxyKind::Http, v))
-        })
-        // Scheme-converting proxies are treated as HTTP proxies (approximation).
-        .or_else(|| {
-            resolved
-                .value("https2http-proxy")
-                .or_else(|| resolved.value("http2https-proxy"))
-                .and_then(|v| parse_proxy(ProxyKind::Http, v))
-        })
-        // `pac://<file>` picks the proxy by evaluating FindProxyForURL.
-        .or_else(|| {
-            let pac_val = resolved.value("pac")?;
-            let src = crate::proxy::script::load_script(pac_val)?;
-            let result = crate::proxy::script::eval_pac(&src, &info.full_url, &info.host)?;
-            parse_pac_result(&result)
-        });
+    let proxy = find_proxy(info, resolved)
+        .filter(|(proto, _)| proxy_survives_host(resolved, proto, host_matched))
+        .map(|(_, cfg)| cfg);
 
     Target {
         connect_host,
@@ -420,10 +481,32 @@ pub fn short_circuit(
     }
 
     if let Some((proto, value)) = find_file_rule(resolved) {
-        return serve_file_family(proto, value, info, env);
+        if !weak_rule_yields(resolved, proto) {
+            return serve_file_family(proto, value, info, env);
+        }
     }
 
     None
+}
+
+/// `weakRule` — the local-file rule steps aside for a matching `proxy`/`host`
+/// rule instead of answering the request, inverting the usual precedence
+/// (`filterWeakRule`, `_original/lib/util/index.js:3733-3745`).
+///
+/// Upstream drops the local rule when a `host://` rule matched, or when a proxy
+/// rule matched that is *not* `proxyHostOnly` — that spelling needs a host rule
+/// to mean anything, so on its own it does not outrank the file.
+/// `enable://weakRule` says the same request-wide.
+fn weak_rule_yields(resolved: &Resolved, file_proto: &str) -> bool {
+    if !resolved.props(file_proto).has("weakRule") && !enabled_flags(resolved).contains("weakRule") {
+        return false;
+    }
+    if resolved.value("host").is_some() {
+        return true;
+    }
+    matched_proxy_proto(resolved)
+        .map(|proto| !resolved.props(proto).has("proxyHostOnly"))
+        .unwrap_or(false)
 }
 
 /// The local-file / template protocols, in resolution order (base before `x`/`xs`
@@ -1733,6 +1816,138 @@ mod tests {
         let info = build_req_info("GET", "https", "example.com", 443, "/", &HeaderMap::new(), None);
         let target = resolve_target(&info, &resolved);
         assert_eq!(target.tls_versions, TlsVersions::Only12);
+    }
+
+    // ── host / proxy precedence (proxyFirst, proxyHost, proxyHostOnly) ──
+
+    /// The upstream target `rules` produce for `url`.
+    fn target(rules: &str, url: &str) -> Target {
+        let resolved = resolve(rules, url);
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let info = build_req_info(
+            "GET",
+            scheme,
+            host,
+            if scheme == "https" { 443 } else { 80 },
+            path,
+            &HeaderMap::new(),
+            None,
+        );
+        resolve_target(&info, &resolved)
+    }
+
+    const HOST_AND_PROXY: &str = "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\n";
+
+    /// With both a `host://` and a `proxy://` rule matched, whistle uses the
+    /// host and drops the proxy (`_original/lib/rules/index.js:220-237`).
+    #[test]
+    fn host_outranks_proxy_by_default() {
+        let t = target(HOST_AND_PROXY, "http://example.com/");
+        assert_eq!(t.connect_host, "1.2.3.4");
+        assert!(t.proxy.is_none(), "the proxy must lose to the host rule");
+    }
+
+    /// A proxy rule with no host rule to lose to is used as-is.
+    #[test]
+    fn proxy_alone_is_untouched() {
+        let t = target("example.com proxy://127.0.0.1:8888\n", "http://example.com/");
+        assert_eq!(t.proxy.expect("proxy").port, 8888);
+    }
+
+    /// `proxyFirst` and `proxyHost` (on either line) keep both, so the request
+    /// goes through the proxy to the host address.
+    #[test]
+    fn proxy_first_and_proxy_host_keep_both() {
+        for rules in [
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyFirst\n",
+            "example.com host://1.2.3.4 lineProps://proxyFirst\nexample.com proxy://127.0.0.1:8888\n",
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyHost\n",
+            "example.com host://1.2.3.4 lineProps://proxyHost\nexample.com proxy://127.0.0.1:8888\n",
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\nexample.com enable://proxyFirst\n",
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\nexample.com enable://proxyHost\n",
+        ] {
+            let t = target(rules, "http://example.com/");
+            assert!(t.proxy.is_some(), "proxy should survive: {rules}");
+            assert_eq!(t.connect_host, "1.2.3.4", "host override still applies");
+        }
+    }
+
+    /// `?proxyHost` in the proxy's own URL says the same thing, and is not part
+    /// of the proxy address.
+    #[test]
+    fn proxy_host_flag_in_the_proxy_url() {
+        let t = target(
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888?proxyHost\n",
+            "http://example.com/",
+        );
+        let p = t.proxy.expect("?proxyHost should keep the proxy");
+        assert_eq!(p.host, "127.0.0.1");
+        assert_eq!(p.port, 8888, "the query flag must not leak into the address");
+    }
+
+    /// `proxyHostOnly` keeps both when a host rule matched, and discards the
+    /// proxy when none did.
+    #[test]
+    fn proxy_host_only_requires_a_host_rule() {
+        let with_host = target(
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyHostOnly\n",
+            "http://example.com/",
+        );
+        assert!(with_host.proxy.is_some());
+        assert_eq!(with_host.connect_host, "1.2.3.4");
+
+        let without_host = target(
+            "example.com proxy://127.0.0.1:8888 lineProps://proxyHostOnly\n",
+            "http://example.com/",
+        );
+        assert!(
+            without_host.proxy.is_none(),
+            "proxyHostOnly with no host rule drops the proxy"
+        );
+        assert_eq!(without_host.connect_host, "example.com");
+    }
+
+    // ── weakRule ──
+
+    /// `weakRule` on a local-file line makes it yield to a matching proxy or
+    /// host rule (`filterWeakRule`, `_original/lib/util/index.js:3733`).
+    #[test]
+    fn weak_rule_yields_to_proxy_or_host() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        for rules in [
+            "a.com file:///no/such/file lineProps://weakRule\na.com proxy://127.0.0.1:8888\n",
+            "a.com file:///no/such/file lineProps://weakRule\na.com host://1.2.3.4\n",
+            "a.com file:///no/such/file\na.com host://1.2.3.4\na.com enable://weakRule\n",
+        ] {
+            let r = resolve(rules, "http://a.com/");
+            assert!(
+                short_circuit(&info, &r, test_env()).is_none(),
+                "the file rule should step aside: {rules}"
+            );
+        }
+    }
+
+    /// Without something to yield *to*, the file rule still answers — including
+    /// when the only proxy rule is `proxyHostOnly` with no host rule to apply.
+    #[test]
+    fn weak_rule_keeps_the_file_when_nothing_outranks_it() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        for rules in [
+            "a.com file:///no/such/file lineProps://weakRule\n",
+            "a.com file:///no/such/file lineProps://weakRule\na.com proxy://127.0.0.1:8888 lineProps://proxyHostOnly\n",
+            // No weakRule: the file rule wins over the proxy as usual.
+            "a.com file:///no/such/file\na.com proxy://127.0.0.1:8888\n",
+        ] {
+            let r = resolve(rules, "http://a.com/");
+            assert!(
+                short_circuit(&info, &r, test_env()).is_some(),
+                "the file rule should answer: {rules}"
+            );
+        }
     }
 
     // ── safeHtml / strictHtml injection gating ──
