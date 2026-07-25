@@ -1720,10 +1720,17 @@ mod pipe_wiring_tests {
 
     /// Server state backed by a throwaway storage dir, so running the tests
     /// never touches the developer's real `~/.whistle-rs`.
+    /// A private storage dir per call: these tests run in parallel threads, and
+    /// sharing one made them race to write the root CA, which surfaced as an
+    /// occasional "PEM error: malformed".
     fn state() -> Arc<AppState> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         let config = Config {
-            storage_dir: std::env::temp_dir()
-                .join(format!("whistle-rs-pipe-tests-{}", std::process::id())),
+            storage_dir: std::env::temp_dir().join(format!(
+                "whistle-rs-pipe-tests-{}-{unique}",
+                std::process::id()
+            )),
             persist_sessions: false,
             ..Config::default()
         };
