@@ -196,6 +196,27 @@ pub async fn transform(
     body::from_incoming(resp.into_body())
 }
 
+/// Open an HTTP/1.1 connection to a local plugin endpoint, returning the
+/// request sender and the authority to address it by.
+///
+/// Shared with the frame transport ([`super::wsframe`]): both dial a plugin the
+/// same way and differ only in what they then send over the connection.
+pub(super) async fn dial(
+    base_url: &str,
+) -> anyhow::Result<(hyper::client::conn::http1::SendRequest<DynBody>, String)> {
+    let (host, port) = host_port(base_url)?;
+    let tcp = TcpStream::connect((host.as_str(), port)).await?;
+    // Latency, not throughput, is what matters for a per-frame pipe.
+    tcp.set_nodelay(true).ok();
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::debug!("plugin connection closed: {e}");
+        }
+    });
+    Ok((sender, format!("{host}:{port}")))
+}
+
 /// Open a connection to the plugin and build the streaming request around
 /// `input` (the body the plugin will read).
 async fn connect(
@@ -207,18 +228,7 @@ async fn connect(
     hyper::client::conn::http1::SendRequest<DynBody>,
     Request<DynBody>,
 )> {
-    let (host, port) = host_port(base_url)?;
-    let tcp = TcpStream::connect((host.as_str(), port)).await?;
-    // Latency, not throughput, is what matters for a per-frame pipe.
-    tcp.set_nodelay(true).ok();
-    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::debug!("pipe plugin connection closed: {e}");
-        }
-    });
-
-    let authority = format!("{host}:{port}");
+    let (sender, authority) = dial(base_url).await?;
     let uri: Uri = dir.path().parse()?;
     let encoded = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
