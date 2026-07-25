@@ -24,13 +24,24 @@
 //!
 //! ```json
 //! { "name": "my-plugin", "version": "1.0.0",
-//!   "hooks": ["request", "response"],
+//!   "hooks": ["request", "response", "pipeRequest", "pipeResponse"],
 //!   "requestBody": false, "responseBody": true }
 //! ```
 //!
 //! A plugin that does not serve `/manifest` is treated as **protocol v1**:
 //! request hook only, no bodies, dispatched to `POST /`. Existing plugins
 //! therefore keep working untouched.
+//!
+//! The four hooks fall into two families, and which family runs is chosen by the
+//! *rule*, not the plugin:
+//!
+//! | Rule | Hooks | Body |
+//! |------|-------|------|
+//! | `plugin://name[/param]` | `request`, `response` | buffered whole, opt-in |
+//! | `pipe://name[(value)]`  | `pipeRequest`, `pipeResponse` | streamed, never buffered |
+//!
+//! `pipe://` on a plugin that declares no pipe hook falls back to the buffered
+//! hooks, which is what it has always meant.
 //!
 //! ### `POST /request` — before the upstream request
 //!
@@ -61,13 +72,22 @@
 //! Every field is optional; omitting all of them leaves the response untouched.
 //!
 //! Binary bodies use `bodyBase64` in both directions; `body` is UTF-8 text.
+//!
+//! ### `POST /pipe/request`, `POST /pipe/response` — streaming hooks
+//!
+//! The request body *is* the body being proxied and the reply body *is* what
+//! replaces it, both chunked; metadata rides in one header. Nothing is buffered
+//! at either end. See [`pipe`] for the exchange and why it is HTTP rather than
+//! whistle's CONNECT + `transproto` framing.
 
 use std::collections::HashMap;
 
 use serde_json::json;
 use tokio::sync::OnceCell;
 
+use crate::proxy::body::DynBody;
 use crate::proxy::upstream;
+use crate::rules::Resolved;
 
 /// What a plugin can do, so the proxy only pays for what is actually used.
 ///
@@ -85,9 +105,28 @@ pub struct PluginManifest {
     pub request_body: bool,
     /// Wants the response body buffered and handed over.
     pub response_body: bool,
+    /// Serves the streaming `POST /pipe/request` hook.
+    pub pipe_request: bool,
+    /// Serves the streaming `POST /pipe/response` hook.
+    pub pipe_response: bool,
 }
 
 impl PluginManifest {
+    /// Whether a `pipe://` rule has a streaming hook to reach on this plugin.
+    /// When it does not, `pipe://` keeps its historical meaning — an alias for
+    /// `plugin://`.
+    pub fn has_pipe_hook(&self) -> bool {
+        self.pipe_request || self.pipe_response
+    }
+
+    /// Whether this plugin serves the streaming hook for `dir`.
+    pub fn serves_pipe(&self, dir: pipe::Dir) -> bool {
+        match dir {
+            pipe::Dir::Request => self.pipe_request,
+            pipe::Dir::Response => self.pipe_response,
+        }
+    }
+
     /// What we assume when a plugin does not serve `/manifest`: the original
     /// protocol — a request hook, no bodies.
     pub fn v1_fallback(name: &str) -> Self {
@@ -98,6 +137,8 @@ impl PluginManifest {
             on_response: false,
             request_body: false,
             response_body: false,
+            pipe_request: false,
+            pipe_response: false,
         }
     }
 
@@ -128,8 +169,94 @@ impl PluginManifest {
             on_response: hooks.iter().any(|h| h == "response"),
             request_body: flag("requestBody"),
             response_body: flag("responseBody"),
+            pipe_request: hooks.iter().any(|h| h == "piperequest"),
+            pipe_response: hooks.iter().any(|h| h == "piperesponse"),
         })
     }
+}
+
+/// One matched `plugin://` or `pipe://` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginMatch {
+    /// The plugin name — everything before a `/param` suffix or `(value)`.
+    pub name: String,
+    /// The `/…` suffix after the name, a routing hint inside one plugin.
+    pub param: String,
+    /// The `(…)` value of `pipe://name(value)` — whistle's `pipeValue`.
+    pub pipe_value: Option<String>,
+    /// Matched through `pipe://` (streaming) rather than `plugin://` (buffered).
+    pub via_pipe: bool,
+}
+
+/// Collect the `plugin://` and `pipe://` rules that matched this request.
+///
+/// Lives here rather than beside the other rule readers because the two schemes
+/// have different value grammars, and only the plugin runtime cares which:
+/// `plugin://name/param` routes inside a plugin, while `pipe://name(value)`
+/// carries an opaque argument (whistle's `PIPE_PLUGIN_RE`, which also tolerates
+/// the `whistle.`/`plugin.` package prefixes real whistle plugins are named
+/// with). A name is taken once per scheme, in rule order.
+pub fn matched(resolved: &Resolved) -> Vec<PluginMatch> {
+    let mut out: Vec<PluginMatch> = Vec::new();
+    for (proto, via_pipe) in [("plugin", false), ("pipe", true)] {
+        for op in resolved.all(proto) {
+            let Some(m) = parse_match(&op.value, via_pipe) else {
+                continue;
+            };
+            if !out.iter().any(|o| o.name == m.name && o.via_pipe == m.via_pipe) {
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// Parse one rule value into a [`PluginMatch`]. Returns `None` for an empty name.
+///
+/// The extra grammar — `(value)` and the package prefixes — is `pipe://`-only,
+/// so `plugin://` keeps parsing exactly as it always has.
+fn parse_match(value: &str, via_pipe: bool) -> Option<PluginMatch> {
+    let value = value.trim();
+    if let Some((head, arg)) = via_pipe.then(|| split_pipe_arg(value)).flatten() {
+        let name = clean_name(head);
+        return (!name.is_empty()).then(|| PluginMatch {
+            name,
+            param: String::new(),
+            pipe_value: Some(arg.to_string()),
+            via_pipe,
+        });
+    }
+    let head = value.split(['/', '?']).next().unwrap_or("").trim();
+    let name = if via_pipe { clean_name(head) } else { head.to_string() };
+    if name.is_empty() {
+        return None;
+    }
+    Some(PluginMatch {
+        param: value[head.len()..].trim_start_matches('/').to_string(),
+        name,
+        pipe_value: None,
+        via_pipe,
+    })
+}
+
+/// Split `name(value)`, the `pipe://` argument grammar. The argument runs to the
+/// *final* `)`, so it may itself contain slashes, parens and whitespace.
+fn split_pipe_arg(value: &str) -> Option<(&str, &str)> {
+    let open = value.find('(')?;
+    let close = value.rfind(')')?;
+    (close > open).then(|| (&value[..open], &value[open + 1..close]))
+}
+
+/// Strip the `whistle.` / `plugin.` package prefixes whistle plugin names carry,
+/// as `PIPE_PLUGIN_RE` does.
+fn clean_name(raw: &str) -> String {
+    let raw = raw.trim();
+    for prefix in ["whistle.", "plugin."] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    raw.to_string()
 }
 
 /// The request context handed to a plugin's request hook.
@@ -218,6 +345,15 @@ pub trait RustPlugin: Send + Sync {
         PluginResResult::default()
     }
 
+    /// The streaming (`pipe://`) hook: wrap `body` so bytes are transformed as
+    /// they flow. Default: identity — the body is returned untouched.
+    ///
+    /// Implementations must not collect the body; doing so silently reintroduces
+    /// the buffering the pipe hooks exist to avoid.
+    fn pipe(&self, _dir: pipe::Dir, _meta: &pipe::PipeMeta, body: DynBody) -> DynBody {
+        body
+    }
+
     /// Declared capabilities. Default: request hook only, no bodies.
     fn manifest(&self) -> PluginManifest {
         PluginManifest::v1_fallback(self.name())
@@ -261,8 +397,16 @@ impl RemotePlugin {
                                 m.on_request,
                                 m.on_response,
                                 m.request_body,
-                                m.response_body
+                                m.response_body,
                             );
+                            if m.has_pipe_hook() {
+                                tracing::info!(
+                                    "plugin {} streaming hooks: pipeRequest={} pipeResponse={}",
+                                    self.name,
+                                    m.pipe_request,
+                                    m.pipe_response
+                                );
+                            }
                             m
                         }
                         None => {
@@ -585,9 +729,43 @@ impl Plugins {
             PluginKind::Remote(r) => Some(r.on_response(res).await),
         }
     }
+
+    /// Route `body` through plugin `name`'s streaming hook for `dir`.
+    ///
+    /// Always returns a usable body: an unknown plugin, an undeclared hook or a
+    /// failed handshake all yield `body` unchanged. Nothing here reads the body,
+    /// so a request whose plugins declare no pipe hook is not slowed at all.
+    pub async fn pipe(
+        &self,
+        name: &str,
+        dir: pipe::Dir,
+        meta: &pipe::PipeMeta,
+        body: DynBody,
+    ) -> DynBody {
+        let Some(plugin) = self.map.get(name) else {
+            return body;
+        };
+        match plugin {
+            PluginKind::Rust(p) => {
+                if p.manifest().serves_pipe(dir) {
+                    p.pipe(dir, meta, body)
+                } else {
+                    body
+                }
+            }
+            PluginKind::Remote(r) => {
+                if r.manifest().await.serves_pipe(dir) {
+                    pipe::transform(name, &r.base_url, dir, meta, body).await
+                } else {
+                    body
+                }
+            }
+        }
+    }
 }
 
 pub mod builtin;
+pub mod pipe;
 
 #[cfg(test)]
 mod tests {
@@ -741,6 +919,132 @@ mod tests {
         let m = PluginManifest::v1_fallback("legacy");
         assert!(m.on_request);
         assert!(!m.on_response && !m.request_body && !m.response_body);
+        assert!(!m.has_pipe_hook());
         assert!(PluginManifest::parse("p", b"not json").is_none());
+    }
+
+    #[test]
+    fn manifest_declares_streaming_hooks() {
+        let m = PluginManifest::parse("p", br#"{"hooks":["pipeResponse"]}"#).unwrap();
+        assert!(m.has_pipe_hook());
+        assert!(m.serves_pipe(pipe::Dir::Response));
+        assert!(!m.serves_pipe(pipe::Dir::Request));
+        // Streaming hooks are independent of the buffered ones and of the body
+        // flags — a pipe plugin never asks the proxy to buffer.
+        assert!(!m.on_response && !m.response_body);
+    }
+
+    /// `pipe://name(value)` — whistle's `pipeValue`, with the package prefixes
+    /// real whistle plugin names carry.
+    #[test]
+    fn pipe_rule_value_syntax() {
+        let m = parse_match("upper(shout loudly)", true).unwrap();
+        assert_eq!(m.name, "upper");
+        assert_eq!(m.pipe_value.as_deref(), Some("shout loudly"));
+        assert!(m.via_pipe);
+
+        // The argument is opaque: slashes and nested parens survive intact.
+        let nested = parse_match("p(a/b(c))", true).unwrap();
+        assert_eq!(nested.name, "p");
+        assert_eq!(nested.pipe_value.as_deref(), Some("a/b(c)"));
+
+        for raw in ["whistle.upper", "plugin.upper"] {
+            assert_eq!(parse_match(raw, true).unwrap().name, "upper");
+        }
+        assert!(parse_match("(x)", true).is_none());
+    }
+
+    /// `plugin://` parses exactly as it always has: no `(…)` grammar, no prefix
+    /// stripping, `/param` preserved.
+    #[test]
+    fn plugin_rule_value_syntax_unchanged() {
+        let m = parse_match("my-plugin/deep/param", false).unwrap();
+        assert_eq!(m.name, "my-plugin");
+        assert_eq!(m.param, "deep/param");
+        assert!(m.pipe_value.is_none() && !m.via_pipe);
+
+        assert_eq!(parse_match("whistle.x", false).unwrap().name, "whistle.x");
+        assert_eq!(parse_match("p(v)", false).unwrap().name, "p(v)");
+        assert!(parse_match("  ", false).is_none());
+    }
+
+    #[test]
+    fn matched_keeps_schemes_apart() {
+        let mut mgr = crate::rules::RuleManager::new();
+        mgr.set_text("example.com plugin://a\nexample.com pipe://a(v)\nexample.com pipe://a(w)\n");
+        let info = crate::proxy::apply::build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        let ms = matched(&mgr.resolve(&info));
+        // The same plugin may appear once per scheme; a repeated scheme does not.
+        assert_eq!(ms.len(), 2);
+        assert!(ms.iter().any(|m| !m.via_pipe && m.pipe_value.is_none()));
+        assert!(ms.iter().any(|m| m.via_pipe && m.pipe_value.as_deref() == Some("v")));
+    }
+
+    /// The load-bearing property: a plugin that declares no streaming hook must
+    /// hand the body straight back, untouched and unread.
+    #[test]
+    fn no_streaming_hook_means_no_pipe() {
+        let p = Plugins::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let meta = pipe::PipeMeta::default();
+            // `stamp` has a response hook but no streaming one.
+            let out = p
+                .pipe("stamp", pipe::Dir::Response, &meta, crate::proxy::body::full("as-is"))
+                .await;
+            assert_eq!(collect(out).await, b"as-is");
+            // An unregistered name is equally harmless.
+            let out = p
+                .pipe("nope", pipe::Dir::Response, &meta, crate::proxy::body::full("as-is"))
+                .await;
+            assert_eq!(collect(out).await, b"as-is");
+        });
+    }
+
+    /// The built-in Rust pipe plugin transforms frame by frame, and only in the
+    /// directions it declares.
+    #[test]
+    fn rust_pipe_plugin_transforms_each_frame() {
+        let p = Plugins::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let meta = pipe::PipeMeta::default();
+            let (tx, source) = crate::proxy::body::channel(4);
+            let out = p.pipe("upper", pipe::Dir::Response, &meta, source).await;
+            tokio::spawn(async move {
+                for part in ["ab", "cd"] {
+                    tx.send(Ok(bytes::Bytes::from_static(part.as_bytes()))).await.ok();
+                }
+            });
+            // Two frames in, two frames out — a transform, not a collect.
+            let mut frames = Vec::new();
+            let mut out = out;
+            while let Some(Ok(f)) = http_body_util::BodyExt::frame(&mut out).await {
+                if let Ok(d) = f.into_data() {
+                    frames.push(String::from_utf8_lossy(&d).into_owned());
+                }
+            }
+            assert_eq!(frames, vec!["AB", "CD"]);
+        });
+    }
+
+    /// Drain a body into bytes (test helper).
+    async fn collect(body: DynBody) -> Vec<u8> {
+        use http_body_util::BodyExt;
+        body.collect().await.map(|c| c.to_bytes().to_vec()).unwrap_or_default()
     }
 }

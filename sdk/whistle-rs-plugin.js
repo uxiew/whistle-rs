@@ -17,10 +17,23 @@
 // delivery on the `requestBody` / `responseBody` flags. Declaring a body you do
 // not need costs the proxy its streaming fast path, so both default to false.
 //
+// For bodies you want to see *as they flow* — SSE, uploads, anything large —
+// define a pipe hook instead. It is handed a readable of body bytes and a
+// writable for the transformed ones, and nothing is buffered at either end:
+//
+//   start({
+//     name: 'shout',
+//     pipeResponse(req, res) { return upperCaseTransform(); },
+//   });
+//
+// Pipe hooks are reached by a `pipe://shout` rule (vs `plugin://` for the
+// buffered ones).
+//
 // TypeScript users: see whistle-rs-plugin.d.ts. The same entry point works for
 // `export default { … }` — an ES module default export is unwrapped.
 
 const http = require('http');
+const { Transform } = require('stream');
 
 /** Bodies larger than this are refused rather than buffered without bound. */
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
@@ -32,10 +45,20 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
  * (`WHISTLE_RS_PLUGIN_PORT`, `WHISTLE_RS_PLUGIN_NAME`); pass `opts.port` to
  * run standalone, e.g. in tests.
  */
+const HOOKS = [
+  ['onRequest', 'request'],
+  ['onResponse', 'response'],
+  ['pipeRequest', 'pipeRequest'],
+  ['pipeResponse', 'pipeResponse'],
+];
+
 function start(plugin, opts) {
   plugin = unwrapDefault(plugin);
-  if (!plugin || (typeof plugin.onRequest !== 'function' && typeof plugin.onResponse !== 'function')) {
-    throw new TypeError('whistle-rs plugin: define at least one of onRequest / onResponse');
+  const defined = HOOKS.filter(([method]) => plugin && typeof plugin[method] === 'function');
+  if (!defined.length) {
+    throw new TypeError(
+      `whistle-rs plugin: define at least one of ${HOOKS.map(([m]) => m).join(' / ')}`
+    );
   }
   opts = opts || {};
 
@@ -45,10 +68,7 @@ function start(plugin, opts) {
   const manifest = {
     name,
     version: plugin.version || '1',
-    hooks: [
-      typeof plugin.onRequest === 'function' ? 'request' : null,
-      typeof plugin.onResponse === 'function' ? 'response' : null,
-    ].filter(Boolean),
+    hooks: defined.map(([, hook]) => hook),
     requestBody: plugin.requestBody === true,
     responseBody: plugin.responseBody === true,
   };
@@ -58,6 +78,13 @@ function start(plugin, opts) {
 
     if (route === '/manifest') {
       return sendJson(res, 200, manifest);
+    }
+
+    // Pipe hooks are handed the live streams — never routed through readBody,
+    // which would defeat the entire point.
+    if (route === '/pipe/request' || route === '/pipe/response') {
+      const isReq = route === '/pipe/request';
+      return servePipe(plugin, name, isReq ? 'pipeRequest' : 'pipeResponse', req, res);
     }
 
     readBody(req, (err, raw) => {
@@ -97,6 +124,169 @@ function start(plugin, opts) {
     console.log(`[${name}] whistle-rs plugin listening on 127.0.0.1:${bound} (hooks: ${manifest.hooks.join(', ') || 'none'})`);
   });
   return server;
+}
+
+/** Header carrying the base64-encoded JSON metadata of a piped body. */
+const PIPE_META_HEADER = 'x-whistle-rs-pipe';
+
+/**
+ * Serve one streaming hook.
+ *
+ * The `200` goes out *before* the handler runs, and before a single body byte
+ * is asked for. That is the contract: whistle-rs reads nothing from the body
+ * until it sees this head, so answering at once is what starts the stream — and
+ * failing to (because we are down, or because we answer anything else) lets the
+ * proxy forward the original body untouched instead of losing it.
+ */
+function servePipe(plugin, name, hookName, req, res) {
+  const handler = plugin[hookName];
+  if (typeof handler !== 'function') {
+    res.writeHead(404, { 'content-length': 0 });
+    return res.end();
+  }
+  res.writeHead(200, { 'content-type': 'application/octet-stream' });
+  res.flushHeaders();
+
+  const ctx = new PipeCtx(req, hookName === 'pipeRequest');
+  // Whatever goes wrong, the body must still come out the other side.
+  const passthrough = () => {
+    if (!res.writableEnded && !req.readableFlowing) req.pipe(res);
+  };
+  const failed = (what, e) => {
+    console.error(`[${name}] ${hookName} ${what}:`, e);
+  };
+  req.on('error', (e) => {
+    failed('source stream failed', e);
+    res.destroy();
+  });
+
+  const wire = (out) => {
+    if (!isDuplex(out)) return false;
+    out.on('error', (e) => {
+      failed('transform failed', e);
+      res.end();
+    });
+    req.pipe(out).pipe(res);
+    return true;
+  };
+
+  let out;
+  try {
+    out = handler.call(plugin, req, res, ctx);
+  } catch (e) {
+    failed('threw', e);
+    return passthrough();
+  }
+  if (wire(out)) return;
+  if (out && typeof out.then === 'function') {
+    // An async hook: nothing is read while it settles, so no bytes are lost.
+    out.then(wire).catch((e) => {
+      failed('rejected', e);
+      passthrough();
+    });
+  }
+  // Anything else means the hook wired the streams itself.
+}
+
+/** Whether `s` can sit in the middle of a pipeline. */
+function isDuplex(s) {
+  return !!s && typeof s.pipe === 'function' && typeof s.write === 'function';
+}
+
+/**
+ * Build a `Transform` from a plain chunk mapper — the usual shape of a pipe
+ * hook. Return a Buffer/string to emit it, or a falsy value to drop the chunk.
+ *
+ * ```js
+ * pipeResponse: () => transform((chunk) => chunk.toString().toUpperCase()),
+ * ```
+ */
+function transform(fn, flush) {
+  return new Transform({
+    transform(chunk, encoding, cb) {
+      let out;
+      try {
+        out = fn(chunk, this);
+      } catch (e) {
+        return cb(e);
+      }
+      cb(null, out == null || out === '' ? undefined : out);
+    },
+    flush(cb) {
+      if (typeof flush !== 'function') return cb();
+      try {
+        cb(null, flush(this) || undefined);
+      } catch (e) {
+        cb(e);
+      }
+    },
+  });
+}
+
+/**
+ * Context for a streaming hook: everything the buffered hooks get except the
+ * body, which is the stream itself.
+ */
+class PipeCtx {
+  constructor(req, isRequestHook) {
+    let meta = {};
+    try {
+      const raw = Buffer.from(String(req.headers[PIPE_META_HEADER] || ''), 'base64');
+      meta = JSON.parse(raw.toString('utf8')) || {};
+    } catch (e) {
+      meta = {};
+    }
+    /** Correlation id, shared with this request's buffered hooks. */
+    this.id = meta.id;
+    this.method = meta.method || 'GET';
+    this.url = meta.url || '';
+    /** The `/…` suffix after the plugin name. */
+    this.param = meta.param || '';
+    /** The `pipe://name(value)` argument, when the rule supplied one. */
+    this.pipeValue = meta.pipeValue;
+    this.clientIp = meta.clientIp;
+    /** Request headers in `pipeRequest`, response headers in `pipeResponse`. */
+    this.headers = meta.headers || [];
+    /** The upstream status — `pipeResponse` only. */
+    this.statusCode = meta.statusCode;
+    /** `'request'` or `'response'`, for hooks that serve both. */
+    this.direction = isRequestHook ? 'request' : 'response';
+  }
+
+  /** Look up a header, case-insensitively. Returns undefined if absent. */
+  header(name) {
+    return findHeader(this.headers, name);
+  }
+
+  /** The URL parsed, for convenient access to pathname/query. */
+  get parsedUrl() {
+    if (!this._parsed) this._parsed = parseUrl(this.url);
+    return this._parsed;
+  }
+
+  /** A query-string parameter, or undefined. */
+  query(name) {
+    const v = this.parsedUrl.searchParams.get(name);
+    return v === null ? undefined : v;
+  }
+}
+
+/** Case-insensitive lookup over `[name, value]` pairs. */
+function findHeader(headers, name) {
+  const want = String(name).toLowerCase();
+  for (const [k, v] of headers) {
+    if (String(k).toLowerCase() === want) return v;
+  }
+  return undefined;
+}
+
+/** Parse a URL, falling back to a placeholder rather than throwing. */
+function parseUrl(url) {
+  try {
+    return new URL(url);
+  } catch (e) {
+    return new URL('http://invalid.local/');
+  }
 }
 
 /** Accept both `module.exports = {…}` and ESM `export default {…}`. */
@@ -157,11 +347,7 @@ class BaseCtx {
 
   /** Look up a header, case-insensitively. Returns undefined if absent. */
   header(name) {
-    const want = String(name).toLowerCase();
-    for (const [k, v] of this.headers) {
-      if (String(k).toLowerCase() === want) return v;
-    }
-    return undefined;
+    return findHeader(this.headers, name);
   }
 
   /** Set a header (replacing any existing value of the same name). */
@@ -193,13 +379,7 @@ class BaseCtx {
 
   /** The URL parsed, for convenient access to pathname/query. */
   get parsedUrl() {
-    if (!this._parsed) {
-      try {
-        this._parsed = new URL(this.url);
-      } catch (e) {
-        this._parsed = new URL('http://invalid.local/');
-      }
-    }
+    if (!this._parsed) this._parsed = parseUrl(this.url);
     return this._parsed;
   }
 
@@ -305,4 +485,4 @@ function applyBody(out, body) {
   }
 }
 
-module.exports = { start, MAX_BODY_BYTES };
+module.exports = { start, transform, MAX_BODY_BYTES, PIPE_META_HEADER };

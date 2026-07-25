@@ -865,12 +865,24 @@ async fn serve(
     let time_ms = now_ms();
 
     // Plugins matched by `plugin://name` / `pipe://name`, minus any that aren't
-    // registered. Kept for both the request hook here and the response hook
-    // after the upstream call.
-    let plugin_matches: Vec<(String, String)> = apply::plugin_names(&resolved)
-        .into_iter()
-        .filter(|(name, _)| state.plugins.contains(name))
-        .collect();
+    // registered. `pipe://` drives the *streaming* hooks and `plugin://` the
+    // buffered ones, so the two are kept apart; a `pipe://` rule naming a plugin
+    // with no streaming hook falls back to the buffered path, which is what
+    // `pipe://` meant before the streaming hooks existed.
+    let mut plugin_matches: Vec<(String, String)> = Vec::new();
+    let mut pipe_matches: Vec<crate::plugins::PluginMatch> = Vec::new();
+    for m in crate::plugins::matched(&resolved) {
+        if !state.plugins.contains(&m.name) {
+            continue;
+        }
+        let streams = m.via_pipe
+            && matches!(state.plugins.manifest(&m.name).await, Some(mf) if mf.has_pipe_hook());
+        if streams {
+            pipe_matches.push(m);
+        } else {
+            plugin_matches.push((m.name.clone(), m.param.clone()));
+        }
+    }
     let plugin_names: Vec<String> = plugin_matches.iter().map(|(n, _)| n.clone()).collect();
 
     // Correlates this request's plugin hooks with each other. Session ids are
@@ -1077,6 +1089,26 @@ async fn serve(
     } else {
         incoming
     };
+    // Streaming request hook: a `pipe://` plugin sees the body as the client
+    // sends it, and what it emits is what goes upstream. No-op (and no cost)
+    // when nothing matched.
+    let req_body = pipe_body(
+        &state,
+        &pipe_matches,
+        crate::plugins::pipe::Dir::Request,
+        crate::plugins::pipe::PipeMeta {
+            id: plugin_req_id,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            client_ip: client_ip.clone(),
+            headers: header_pairs(&parts.headers),
+            ..Default::default()
+        },
+        &mut parts.headers,
+        req_body,
+    )
+    .await;
+
     // Capture the outgoing request headers (as forwarded).
     let req_header_pairs = header_pairs(&parts.headers);
     let out_req = Request::from_parts(parts, req_body);
@@ -1136,6 +1168,28 @@ async fn serve(
         }
     }
 
+    // Streaming response hook: a `pipe://` plugin transforms upstream bytes as
+    // they arrive. Deliberately *before* the buffering decision below, so a
+    // piped response still takes the streaming branch — the whole point of the
+    // hook is that it never forces a body into memory.
+    let body = pipe_body(
+        &state,
+        &pipe_matches,
+        crate::plugins::pipe::Dir::Response,
+        crate::plugins::pipe::PipeMeta {
+            id: plugin_req_id,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            client_ip: client_ip.clone(),
+            headers: header_pairs(&parts.headers),
+            status: Some(parts.status.as_u16()),
+            ..Default::default()
+        },
+        &mut parts.headers,
+        body::from_incoming(body),
+    )
+    .await;
+
     let res_speed = apply::res_speed_kbps(&resolved);
     let res_script = resolved
         .value("resScript")
@@ -1167,7 +1221,7 @@ async fn serve(
         // irrelevant — don't wait on them.
         let bytes = match &plugin_res_override {
             Some(new) => Bytes::from(new.clone()),
-            None => body.collect().await?.to_bytes(),
+            None => collect_body(body).await?,
         };
         let mut new = apply::transform_res_body(bytes, &resolved, res_ct.as_deref());
 
@@ -1278,7 +1332,7 @@ async fn serve(
             // No transform: stream through, copying a bounded preview for inspection.
             let cap = Capture::new(res_ct.clone(), res_enc.as_deref(), state.config.body_preview_cap);
             res_body_cap = Some(cap.clone());
-            body::tee(body::from_incoming(body), cap)
+            body::tee(body, cap)
         };
 
     let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
@@ -1304,7 +1358,46 @@ async fn serve(
     Ok(Response::from_parts(parts, res_body))
 }
 
-/// True if the request asks to upgrade the protocol (e.g. a WebSocket handshake).
+/// Hand `body` to every matched `pipe://` plugin that serves the streaming hook
+/// for `dir`, chaining them in rule order so the second sees the first's output.
+///
+/// Returns `body` untouched — same allocation, same laziness — when no plugin
+/// takes it, which is what keeps a request without streaming plugins on exactly
+/// the path it was on before. When one does take it, the length headers go: a
+/// transform may change the body's size, and the framing is chunked from here on.
+async fn pipe_body(
+    state: &AppState,
+    matches: &[crate::plugins::PluginMatch],
+    dir: crate::plugins::pipe::Dir,
+    meta: crate::plugins::pipe::PipeMeta,
+    headers: &mut hyper::HeaderMap,
+    body: DynBody,
+) -> DynBody {
+    if matches.is_empty() {
+        return body;
+    }
+    let mut active = Vec::new();
+    for m in matches {
+        if matches!(state.plugins.manifest(&m.name).await, Some(mf) if mf.serves_pipe(dir)) {
+            active.push(m);
+        }
+    }
+    if active.is_empty() {
+        return body;
+    }
+    apply::strip_length_headers(headers);
+    let mut body = body;
+    for m in active {
+        let meta = crate::plugins::pipe::PipeMeta {
+            param: m.param.clone(),
+            pipe_value: m.pipe_value.clone(),
+            ..meta.clone()
+        };
+        body = state.plugins.pipe(&m.name, dir, &meta, body).await;
+    }
+    body
+}
+
 /// Apply a plugin response-hook result to the response head. Returns the
 /// replacement body, if the plugin supplied one.
 fn apply_plugin_res_result(
@@ -1325,6 +1418,7 @@ fn apply_plugin_res_result(
     result.body
 }
 
+/// True if the request asks to upgrade the protocol (e.g. a WebSocket handshake).
 fn is_upgrade(req: &Request<DynBody>) -> bool {
     let headers = req.headers();
     let conn_upgrade = headers
@@ -1573,4 +1667,122 @@ fn authority_host_port(uri: &Uri) -> Option<(String, u16)> {
     let host = auth.host().to_string();
     let port = auth.port_u16().unwrap_or(443);
     Some((host, port))
+}
+
+#[cfg(test)]
+mod pipe_wiring_tests {
+    use super::*;
+    use crate::plugins::pipe::{Dir, PipeMeta};
+
+    /// Server state backed by a throwaway storage dir, so running the tests
+    /// never touches the developer's real `~/.whistle-rs`.
+    fn state() -> Arc<AppState> {
+        let config = Config {
+            storage_dir: std::env::temp_dir()
+                .join(format!("whistle-rs-pipe-tests-{}", std::process::id())),
+            persist_sessions: false,
+            ..Config::default()
+        };
+        let ca = CertAuthority::load_or_create(&config).expect("ca");
+        Arc::new(AppState::new(config, RuleManager::new(), ca))
+    }
+
+    fn headers_with_length() -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::CONTENT_LENGTH, "9".parse().unwrap());
+        h
+    }
+
+    /// The non-negotiable: with no streaming plugin matched, the body comes back
+    /// still lazy. Proven by sending its frames only *after* `pipe_body` has
+    /// returned — a body that had been collected could not carry them.
+    #[test]
+    fn no_pipe_plugin_leaves_the_body_streaming() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let state = state();
+            let mut headers = headers_with_length();
+            let (tx, source) = body::channel(4);
+
+            let out = pipe_body(&state, &[], Dir::Response, PipeMeta::default(), &mut headers, source).await;
+
+            // Nothing was read, so these frames still reach the client.
+            tokio::spawn(async move {
+                for part in ["not ", "buffered"] {
+                    tx.send(Ok(Bytes::from_static(part.as_bytes()))).await.ok();
+                }
+            });
+            let bytes = collect_body(out).await.expect("body");
+            assert_eq!(bytes, Bytes::from_static(b"not buffered"));
+            // And the framing headers are untouched — only a plugin that
+            // actually takes the stream may change the body's length.
+            assert_eq!(headers.get(hyper::header::CONTENT_LENGTH).unwrap(), "9");
+        });
+    }
+
+    /// A `pipe://` match whose plugin declares no streaming hook is equally
+    /// inert — the fallback to the buffered path must not disturb the body.
+    #[test]
+    fn matched_plugin_without_the_hook_is_inert() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let state = state();
+            let mut headers = headers_with_length();
+            // `stamp` serves the buffered response hook, never a streaming one.
+            let matches = vec![crate::plugins::PluginMatch {
+                name: "stamp".to_string(),
+                param: String::new(),
+                pipe_value: None,
+                via_pipe: true,
+            }];
+            let out = pipe_body(
+                &state,
+                &matches,
+                Dir::Response,
+                PipeMeta::default(),
+                &mut headers,
+                body::full("as-is"),
+            )
+            .await;
+            assert_eq!(collect_body(out).await.expect("body"), Bytes::from_static(b"as-is"));
+            assert_eq!(headers.get(hyper::header::CONTENT_LENGTH).unwrap(), "9");
+        });
+    }
+
+    /// A plugin that does take the stream transforms it and drops the length
+    /// headers, since the transform may change the body's size.
+    #[test]
+    fn pipe_plugin_takes_the_stream_and_drops_length() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let state = state();
+            let mut headers = headers_with_length();
+            let matches = vec![crate::plugins::PluginMatch {
+                name: "upper".to_string(),
+                param: String::new(),
+                pipe_value: Some("v".to_string()),
+                via_pipe: true,
+            }];
+            let out = pipe_body(
+                &state,
+                &matches,
+                Dir::Response,
+                PipeMeta::default(),
+                &mut headers,
+                body::full("shout"),
+            )
+            .await;
+            assert_eq!(collect_body(out).await.expect("body"), Bytes::from_static(b"SHOUT"));
+            assert!(headers.get(hyper::header::CONTENT_LENGTH).is_none());
+        });
+    }
 }

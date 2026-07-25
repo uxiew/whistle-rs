@@ -43,10 +43,13 @@
 - [x] ~~**向插件传递请求体**~~ → 已完成，见 [`PLUGINS.md`](PLUGINS.md)。请求体与响应体
       都可投递给插件，但**由插件的能力清单决定是否缓冲** —— 未声明的插件保持流式零开销
       （已用 SSE 实测双向验证）。
-- [ ] **流式 body 钩子**（原版 `reqRead`/`resRead`）—— 当前是「缓冲后整体传递」。真正的
-      流式需要基于 CONNECT 的插件传输、长度前缀分帧（`transproto.js`：`'\n'+长度+'\n'+负载`，
-      EOF `'\n0\n'`）、单字节握手确认，以及边收边转的 body 路径；单次 JSON POST 无法表达。
-- [ ] **`pipe://` 真正的流式管道** —— 当前与 `plugin://` 同为整体分发（依赖上一条）。
+- [x] ~~**流式 body 钩子**（原版 `reqRead`/`resRead`）~~ → 已完成，见
+      [`PLUGINS.md`](PLUGINS.md#流式钩子--pipe)。传输选了 HTTP/1.1 chunked 而非原版的
+      CONNECT + `transproto` 分帧 —— 后者重新发明的正是 chunked，而 hyper 与 Node 两端都
+      已实现好；代价是与原版 `pipe://` 插件不互通，理由与「不复刻原版插件 API」一致。
+      握手先于字节：插件应答 200 之前的任何失败都零代价（body 原样放行）。
+- [x] ~~**`pipe://` 真正的流式管道**~~ → 已完成。`pipe://` 现在选中流式钩子、支持
+      `pipe://name(value)` 取值语法；指向没有流式钩子的插件时退化为 `plugin://`。
 - [ ] **更多插件钩子**：`uiServer`/`statsServer`（插件自带 UI/统计页）、`auth`、
       `sniCallback`、WebSocket 帧级拦改。
 
@@ -125,8 +128,8 @@
 
 ## 参与
 
-若要优先某一项，**流式 body 钩子**（连带解锁真正的 `pipe://`）是剩余工作里最有价值的一块：
-它是当前架构唯一挡住的能力，其余多为增量。
+剩下的多为增量工作。最接近「架构挡住的能力」的一项是 **WebSocket 帧级拦改** ——
+帧已经抓到并展示了，但插件还够不着；流式钩子的传输层可以复用，缺的是帧级的接线。
 
 模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
 插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，
