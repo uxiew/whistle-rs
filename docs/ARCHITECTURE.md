@@ -34,7 +34,12 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks |
 | `src/proxy/webui.rs` | `biz/webui` | Built-in web UI + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
 | `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
-| `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`) |
+| `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`, `upper`, `ws-upper`, `gate`) |
+| `src/plugins/pipe.rs` | `lib/util/transproto.js` | Streaming body transport (`pipe://`), chunked HTTP rather than upstream's framing |
+| `src/plugins/wsframe.rs` | `load-plugin.js` (ws hooks) | Per-frame WebSocket transport, one long-lived record-framed connection per direction |
+| `src/plugins/auth.rs` | `load-plugin.js:1746`, `plugins/index.js:831` | Auth gate — fails **closed**: a broken gate is 502, a refusal 403 |
+| `src/plugins/ui.rs` | `biz/webui/lib/index.js:466` | `/plugin/<name>/…` served from the plugin's own pages |
+| `src/plugins/stats.rs` | `plugins/index.js:1369` | Fire-and-forget per-phase stats |
 | `sdk/whistle-rs-plugin.js` | `lib/plugins/load-plugin.js` | Zero-dependency JS/TS plugin SDK (+ `.d.ts` types) |
 | `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
 | `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
@@ -217,6 +222,6 @@ whistle-rs/
 | add a rule operator | `src/rules/protocols.rs` (register), then `src/proxy/apply.rs` (act on it) |
 | change how rules match | `src/rules/matcher.rs` |
 | write a plugin | [`PLUGINS.md`](PLUGINS.md), then `sdk/whistle-rs-plugin.d.ts` |
-| add a plugin hook | `src/plugins/mod.rs` (protocol + trait), `src/proxy/mod.rs` (call site) |
+| add a plugin hook | `src/plugins/mod.rs` (manifest + trait), then the call site — but check first whether the existing dispatch already suffices, as `auth` did |
 | touch the request pipeline | `serve()` in `src/proxy/mod.rs` — the one place every request flows through |
 | add a UI page or endpoint | the route match at the top of `src/proxy/webui.rs` |
