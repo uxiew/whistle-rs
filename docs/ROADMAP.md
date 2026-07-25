@@ -175,6 +175,13 @@
       不对齐处：上游按块流式改写 multipart，本移植缓冲后整体改写（其余请求体算子本来就缓冲），
       因此没有 `reqMergeBigData` / `MAX_REQ_SIZE` 上限；非 UTF-8 请求体不处理（上游试 GB18030）。
 
+### 待跟进（本轮发现，超出当轮范围）
+
+- [ ] **插件直接应答的出口不应用任何响应期算子** —— `src/proxy/mod.rs:1146` 直接返回
+      `plugin_response(resp)`，因此 `resHeaders://`、`replaceStatus://`、trailers 等
+      对插件产生的响应全部不生效；上游会对这条路径跑 `getResRules`。
+- [ ] `xhost://` 的直连回退（`retryXHost`，`res.js:571-600`）。
+
 ### 筛选器（本轮审计发现）
 
 原版文档的条件语法见 `_original/docs/docs/rules/filters.md`；以下差异均已用运行中的代理实测：
