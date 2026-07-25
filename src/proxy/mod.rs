@@ -968,6 +968,13 @@ async fn serve(
     };
     if let Some(resp) = apply::short_circuit(&info, &resolved, proxy_env) {
         tracing::info!("{} {} -> short-circuit", info.method, info.full_url);
+        // Response-side operators apply to a mocked response too: upstream runs
+        // its response inspectors over `file`/`tpl`/`redirect` responses just as
+        // it does over real ones, so `resHeaders://` and friends must land here
+        // as well.
+        let (mut parts, body) = resp.into_parts();
+        apply::apply_response(&mut parts, &resolved);
+        let resp = Response::from_parts(parts, body);
         state.record(Session {
             id: 0,
             time_ms,

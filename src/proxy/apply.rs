@@ -1562,6 +1562,29 @@ mod tests {
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Response-side operators must reach a mocked response too — upstream runs
+    /// its response inspectors over `file`/`tpl`/`redirect` results as well.
+    #[test]
+    fn short_circuit_response_takes_response_operators() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/x", &HeaderMap::new(), None);
+        let resolved = resolve(
+            "a.com file:///definitely/missing/file resHeaders://x-mock=1 resType://json",
+            "http://a.com/x",
+        );
+        let resp = short_circuit(&info, &resolved, test_env()).expect("file:// short-circuits");
+        let mut parts = resp.into_parts().0;
+        apply_response(&mut parts, &resolved);
+        assert_eq!(parts.headers.get("x-mock").map(|v| v.to_str().unwrap()), Some("1"));
+        assert!(
+            parts
+                .headers
+                .get("content-type")
+                .map(|v| v.to_str().unwrap().contains("json"))
+                .unwrap_or(false),
+            "resType:// should have set a JSON content type"
+        );
+    }
+
     #[test]
     fn file_protocol_recognised() {
         use crate::rules::protocols::is_file_protocol;

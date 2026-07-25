@@ -160,6 +160,16 @@ GET http://example.com/api?callback=cb123
 
 模板响应的状态码**恒为 200**，`content-length` 在渲染**之后**重新计算，且**不支持 Range 请求**。
 
+响应侧算子（`resHeaders://`、`resType://`、`resCors://` 等）**对模板/文件响应同样生效** ——
+和上游一样，短路产生的响应也会走一遍响应侧规则：
+
+```
+example.com/api   tpl:///tmp/mock.json  resHeaders://x-mock=1
+```
+
+但插件的 `onResponse` **不会**对短路响应触发：那个钩子的语义是「上游响应到达之后」，
+而短路时根本没有上游。插件想影响这类响应，请用 `onRequest` 里的 `ctx.setRules(...)`。
+
 ---
 
 ## 协议家族
