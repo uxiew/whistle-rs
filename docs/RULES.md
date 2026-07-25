@@ -61,6 +61,31 @@ Matching rules:
 | host | matched **exactly** (case-insensitive), unless it starts with a dot (see below) |
 | path | matched as a **prefix** of the request path+query |
 
+### Path matching stops at a segment boundary
+
+A path prefix only matches at a `/`, `\` or `?` boundary — the same rule
+upstream documents (`_original/docs/docs/rules/pattern.md`) and enforces at
+`rules.js:1091-1097`:
+
+```
+example.com/path/to
+  ✅ example.com/path/to
+  ✅ example.com/path/to/xxx?q=1
+  ✅ example.com/path/to?q=1
+  ❌ example.com/path/toxxx        # no boundary after `to`
+```
+
+A pattern that already ends in `/` imposes no further boundary. A pattern
+carrying a query means "**same path**, query is a prefix":
+
+```
+example.com/path/to?xxx
+  ✅ example.com/path/to?xxx
+  ✅ example.com/path/to?xxxyyy&z
+  ❌ example.com/path/to/yyy?xxx   # path must match exactly
+  ❌ example.com/path/to           # query required
+```
+
 ### 2. Leading-dot subdomain match
 
 A host beginning with `.` matches the domain itself **and every subdomain**:

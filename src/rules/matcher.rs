@@ -30,6 +30,36 @@ fn pattern_matches(rule: &Rule, req: &ReqInfo) -> bool {
     pattern_accepts(&rule.pattern, req) != rule.negate
 }
 
+/// `/`, `\` and `?` all end a path segment upstream (`isPathSeparator`,
+/// `_original/lib/rules/rules.js:307`).
+fn is_path_separator(c: char) -> bool {
+    c == '/' || c == '\\' || c == '?'
+}
+
+/// Does a prefix match end on a path boundary?
+///
+/// A bare prefix test would make `example.com/path/to` match
+/// `/path/toxxx`, which upstream explicitly rejects — its docs give exactly
+/// that case (`docs/docs/rules/pattern.md`, "路径前缀匹配（以 `/` 为边界）").
+/// The condition is upstream's, at `_original/lib/rules/rules.js:1091-1097`:
+/// the whole path matched, or the next character is a separator, or the
+/// pattern itself ended on one.
+///
+/// A pattern carrying a query is exempt: there the semantics are "same path,
+/// query is a prefix", which the plain `starts_with` already gives.
+fn path_match_ends_cleanly(pattern_path: &str, req_path: &str) -> bool {
+    if pattern_path.contains('?') {
+        return true;
+    }
+    if pattern_path.ends_with(is_path_separator) {
+        return true;
+    }
+    match req_path[pattern_path.len()..].chars().next() {
+        None => true,
+        Some(c) => is_path_separator(c),
+    }
+}
+
 fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
     match pattern {
         Pattern::Any => true,
@@ -62,8 +92,13 @@ fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
                     return false;
                 }
             }
-            if !path.is_empty() && !req.path.starts_with(path.as_str()) {
-                return false;
+            if !path.is_empty() {
+                if !req.path.starts_with(path.as_str()) {
+                    return false;
+                }
+                if !path_match_ends_cleanly(path, &req.path) {
+                    return false;
+                }
             }
             true
         }
@@ -449,6 +484,43 @@ mod tests {
         assert_eq!(r.value("host"), Some("5.5.5.5"));
         let r2 = m.resolve(&req("http://example.com/"));
         assert_eq!(r2.value("host"), Some("5.5.5.5"));
+    }
+
+    /// A path prefix must end on a `/`, `\\` or `?` boundary — upstream's docs
+    /// spell out that `example.com/path/to` does **not** match `/path/toxxx`
+    /// (`_original/docs/docs/rules/pattern.md`), and its matcher enforces it at
+    /// `rules.js:1091-1097`.
+    ///
+    /// A plain `starts_with` made every path rule match more URLs than written:
+    /// `example.com/api` also caught `/apifoo` and `/apikeys`.
+    #[test]
+    fn path_prefix_stops_at_a_segment_boundary() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com/path/to host://1.1.1.1\n");
+        let hit = |u: &str| m.resolve(&req(u)).value("host").is_some();
+
+        assert!(hit("http://example.com/path/to"), "exact path");
+        assert!(hit("http://example.com/path/to/xxx?q=1"), "deeper path");
+        assert!(hit("http://example.com/path/to?q=1"), "query follows");
+        assert!(!hit("http://example.com/path/toxxx"), "no boundary after `to`");
+        assert!(!hit("http://example.com/path/tox/y"), "no boundary after `to`");
+    }
+
+    /// A pattern already ending on a separator imposes no further boundary, and
+    /// one carrying a query keeps its "same path, query is a prefix" rule.
+    #[test]
+    fn boundary_exemptions() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com/path/ host://1.1.1.1\n");
+        assert!(m.resolve(&req("http://example.com/path/anything")).value("host").is_some());
+
+        let mut q = crate::rules::RuleManager::new();
+        q.set_text("example.com/path/to?xxx host://2.2.2.2\n");
+        let hit = |u: &str| q.resolve(&req(u)).value("host").is_some();
+        assert!(hit("http://example.com/path/to?xxx"));
+        assert!(hit("http://example.com/path/to?xxxyyy&z"), "query prefix");
+        assert!(!hit("http://example.com/path/to/yyy?xxx"), "path must be exact");
+        assert!(!hit("http://example.com/path/to"), "query required");
     }
 }
 
