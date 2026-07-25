@@ -706,6 +706,67 @@ mod tests {
         });
     }
 
+    /// A remote plugin that accepts the session and then dies. Every frame must
+    /// still cross, in both directions: the proxy owns the frame stream, so
+    /// losing a hook is never losing a WebSocket.
+    #[test]
+    fn a_plugin_that_dies_mid_session_is_abandoned_not_the_connection() {
+        rt().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            // Declares the hook, accepts the session, then hangs up at once.
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while tokio::io::AsyncReadExt::read_exact(&mut sock, &mut byte)
+                            .await
+                            .is_ok()
+                        {
+                            head.push(byte[0]);
+                            if head.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let reply: &[u8] = if head.starts_with(b"GET /manifest") {
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"name\":\"flaky\",\"hooks\":[\"wsFrame\"]}"
+                        } else {
+                            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n"
+                        };
+                        let _ = sock.write_all(reply).await;
+                    });
+                }
+            });
+
+            let mut plugins = crate::plugins::Plugins::new();
+            plugins.register_remote("flaky", &addr.to_string());
+            let state = state_with(plugins);
+            let plan = plan_for(&state, "ws.test pipe://flaky\n");
+            assert!(!plan.is_empty());
+            let mut wire = spawn_tunnel(&state, plan, None);
+
+            for payload in [&b"one"[..], &b"two"[..]] {
+                write_frame(&mut wire.client, true, OPCODE_TEXT, payload, true)
+                    .await
+                    .expect("client write");
+                let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+                assert_eq!(got.payload, payload, "the frame crosses even so");
+            }
+            write_frame(&mut wire.server, true, OPCODE_TEXT, b"down", false)
+                .await
+                .expect("server write");
+            let back = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            assert_eq!(back.payload, b"down", "and the other direction too");
+            finish(wire).await;
+
+            let frames = state.ws_frames.lock().unwrap();
+            assert_eq!(frames.len(), 3, "and every one of them is still captured");
+        });
+    }
+
     /// `frameScript` runs first and the plugin sees its output, so the two
     /// compose instead of racing.
     #[test]

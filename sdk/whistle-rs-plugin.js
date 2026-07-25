@@ -429,10 +429,14 @@ async function decide(plugin, name, handler, frame, ctx) {
  */
 function framePayload(frame, out) {
   if (out === null || out === false) return null;
-  if (out === undefined || out === true || out === frame) return frame.payload;
-  if (Buffer.isBuffer(out)) return out;
-  if (typeof out === 'string') return Buffer.from(out, 'utf8');
-  return Buffer.from(JSON.stringify(out), 'utf8');
+  // Whatever comes back leaves here as a Buffer. A record declares its own
+  // length, so letting anything else through — a payload the hook replaced
+  // with a string, say — would desync the stream rather than merely misbehave.
+  const value = out === undefined || out === true || out === frame ? frame.payload : out;
+  if (Buffer.isBuffer(value)) return value;
+  if (value == null) return Buffer.alloc(0);
+  if (typeof value === 'string') return Buffer.from(value, 'utf8');
+  return Buffer.from(JSON.stringify(value), 'utf8');
 }
 
 /** The six-byte header of one verdict record. */
