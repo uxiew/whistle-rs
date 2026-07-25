@@ -214,7 +214,10 @@ fn matched_proxy_proto(resolved: &Resolved) -> Option<&'static str> {
 
 /// The winning upstream proxy, with the protocol that supplied it so its line
 /// properties can be read back.
-fn find_proxy(info: &ReqInfo, resolved: &Resolved) -> Option<(&'static str, super::upstream::ProxyConfig)> {
+fn find_proxy(
+    info: &ReqInfo,
+    resolved: &Resolved,
+) -> Option<(&'static str, super::upstream::ProxyConfig)> {
     let direct = PROXY_PROTOS.iter().find_map(|&(proto, kind)| {
         // A proxy URL may carry whistle's own query flags (`?proxyHost`), which
         // are not part of the address.
@@ -289,8 +292,8 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
     let mut connect_host = info.host.clone();
     let mut connect_port = info.port;
 
-    let host_matched = resolved.value("host").is_some();
-    if let Some(value) = resolved.value("host") {
+    let host_rule = resolved.value("host");
+    if let Some(value) = host_rule {
         let (h, p) = parse_host_value(value, info.port);
         if let Some(h) = h {
             connect_host = h;
@@ -301,7 +304,7 @@ pub fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Target {
     }
 
     let proxy = find_proxy(info, resolved)
-        .filter(|(proto, _)| proxy_survives_host(resolved, proto, host_matched))
+        .filter(|(proto, _)| proxy_survives_host(resolved, proto, host_rule.is_some()))
         .map(|(_, cfg)| cfg);
 
     Target {

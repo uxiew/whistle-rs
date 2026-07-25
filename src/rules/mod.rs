@@ -996,6 +996,20 @@ mod line_props_tests {
         assert!(r.ops.iter().all(|op| op.props.has("safeHtml")));
     }
 
+    /// The two legacy `includeFilter://` spellings are rewritten to
+    /// `lineProps://` before parsing (`formatShorthand`,
+    /// `_original/lib/rules/rules.js:224-229`), so they must become properties
+    /// rather than filter conditions.
+    #[test]
+    fn legacy_include_filter_aliases() {
+        let r = one("example.com htmlAppend://<!--x--> includeFilter://safeHtml");
+        assert!(r.props.has("safeHtml"));
+        assert!(r.filters.is_empty(), "must not become a filter condition");
+        assert!(one("example.com htmlAppend://<!--x--> includeFilter://strictHtml")
+            .props
+            .has("strictHtml"));
+    }
+
     // ── important ──
 
     /// `lineProps://important` outranks an earlier normal line for the same
