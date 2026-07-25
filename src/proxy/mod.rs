@@ -908,19 +908,26 @@ fn resolve_response_phase(
     resolved.merge_response_phase(extra);
 }
 
-/// The address the request actually went to, when it is known exactly.
+/// The address the request actually went to.
 ///
-/// `host://10.0.0.1` and an IP-literal origin give it directly. A named origin
-/// does not: this port hands the name to `TcpStream::connect` and never sees
-/// which address that picked, and asking the resolver again could answer with a
-/// different one. `serverIp:` then stays unanswerable and fails closed, rather
-/// than matching on a guess.
-fn known_server_ip(target: &upstream::Target) -> Option<String> {
-    target
-        .connect_host
-        .parse::<IpAddr>()
-        .ok()
-        .map(|ip| ip.to_string())
+/// It comes from the socket: `TcpStream::connect` picks among the resolver's
+/// answers without saying which, and asking the resolver a second time can
+/// answer differently under round-robin DNS, so the connected peer is the only
+/// honest source. Through an upstream proxy that peer is the *proxy*, which is
+/// what whistle reports too (`req.hostIp` is set from the resolved proxy
+/// address when a proxy rule matched, `_original/lib/inspectors/res.js:238,:259`).
+///
+/// The `connect_host` fallback covers the case where no connection was made at
+/// all; `serverIp:` then stays unanswerable and fails closed rather than
+/// matching on a guess.
+fn known_server_ip(target: &upstream::Target, reached: Option<SocketAddr>) -> Option<String> {
+    reached.map(|a| a.ip().to_string()).or_else(|| {
+        target
+            .connect_host
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| ip.to_string())
+    })
 }
 
 /// Turn an internal error into a 502 so the service signature stays infallible.
@@ -1323,7 +1330,7 @@ async fn serve(
         if target.tls { "https" } else { "http" }
     );
 
-    let upstream_resp = upstream::forward(&target, out_req).await?;
+    let (upstream_resp, server_addr) = upstream::forward_with_addr(&target, out_req).await?;
 
     let (mut parts, body) = upstream_resp.into_parts();
 
@@ -1339,7 +1346,7 @@ async fn serve(
         apply::build_res_info(
             parts.status.as_u16(),
             &parts.headers,
-            known_server_ip(&target),
+            known_server_ip(&target, server_addr),
             Some(target.connect_port),
         ),
         is_internal_req,

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
 
 use super::body::{self, DynBody};
-use super::upstream::{ProxyKind, Target, parse_proxy};
+use super::upstream::{ProxyKind, Target, parse_proxy, parse_proxy_rule};
 use crate::rules::{LineProps, ReqInfo, Resolved, RuleManager};
 
 /// Build the request facts the matcher needs.
@@ -247,15 +247,26 @@ async fn find_proxy(
     info: &ReqInfo,
     resolved: &Resolved,
 ) -> Result<Option<(&'static str, super::upstream::ProxyConfig)>> {
-    for proto in crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS {
-        let Some(raw) = resolved.value(proto) else {
-            continue;
-        };
-        // A proxy URL may carry whistle's own query flags (`?proxyHost`), which
-        // are not part of the address.
-        let value = proxy_address(raw);
-        let cfg = parse_proxy(proxy_kind(proto), value)
-            .ok_or_else(|| anyhow!("{proto}://{raw} is not a usable proxy address"))?;
+    // Upstream files every proxy spelling under a single `proxy` key, so the
+    // first matching *rule line* wins rather than a protocol priority
+    // (`PROXY_RE` → `protocol = 'proxy'`, `_original/lib/rules/rules.js:1286`).
+    // This port keeps one key per protocol, so rule order is recovered from the
+    // winning operator's resolution order.
+    let first_by_rule_order = crate::rules::protocols::UPSTREAM_PROXY_PROTOCOLS
+        .iter()
+        .copied()
+        .filter_map(|proto| resolved.get(proto).map(|op| (proto, op)))
+        .min_by_key(|(_, op)| op.order);
+    if let Some((proto, op)) = first_by_rule_order {
+        // `parse_proxy_rule` reads the address and the `?host=` override off the
+        // matcher as written; whistle's other query flags (`?proxyHost`) are not
+        // part of either.
+        let mut cfg = parse_proxy_rule(proxy_kind(proto), &op.value)
+            .ok_or_else(|| anyhow!("{proto}://{} is not a usable proxy address", op.value))?;
+        cfg.tunnel = proxy_tunnel(resolved, proto);
+        // The `x`-prefixed spellings ask for a direct connection if the hop
+        // fails (`X_RE`, `_original/lib/inspectors/res.js:31`).
+        cfg.fallback_direct = op.raw.starts_with('x');
         return Ok(Some((proto, cfg)));
     }
     // `pac://` picks the proxy by evaluating FindProxyForURL, from a local file,
@@ -272,9 +283,13 @@ async fn find_proxy(
     }
 }
 
-/// A proxy operator's address, without whistle's query flags.
-fn proxy_address(value: &str) -> &str {
-    value.split('?').next().unwrap_or(value)
+/// `proxyTunnel`: the address the hop connects to is itself a proxy, so CONNECT
+/// onward through it. Written on the proxy line, on the `host://` line, or
+/// request-wide with `enable://proxyTunnel` (`_original/lib/rules/index.js:85-89`).
+fn proxy_tunnel(resolved: &Resolved, proxy_proto: &str) -> bool {
+    resolved.props(proxy_proto).has("proxyTunnel")
+        || resolved.props("host").has("proxyTunnel")
+        || enabled_flags(resolved).contains("proxyTunnel")
 }
 
 /// `?proxyHost` / `&proxyHosts` written into an upstream proxy's own URL —
