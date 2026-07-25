@@ -10,7 +10,10 @@
 //! * single-value protocols use first-match-wins (respecting importance)
 //! * multi-match protocols accumulate every matching value in order
 
-use super::{Cond, Filter, Pattern, ReqInfo, Resolved, Rule, protocols};
+use super::{
+    Cond, CondValue, Filter, HeaderScope, Pattern, ReqInfo, Resolved, Rule, RuleOp, order_key,
+    protocols,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -151,28 +154,88 @@ fn filter_holds(f: &Filter, req: &ReqInfo) -> bool {
     }
 }
 
-/// Evaluate one condition. `None` means "not knowable while rules are being
-/// resolved" — the request has not been sent yet.
+/// Evaluate one condition. `None` means "not knowable" — either the fact has no
+/// equivalent here at all ([`crate::rules::Deferred`]) or it belongs to the
+/// response and this is the request phase, where [`ReqInfo::res`] is `None`.
 fn cond_holds(cond: &Cond, req: &ReqInfo) -> Option<bool> {
     match cond {
         Cond::Method(v) => Some(v.matches(&req.method)),
         Cond::Host(v) => Some(v.matches(&req.host)),
         Cond::Url(p) => Some(pattern_accepts(p, req)),
-        // An absent header is a known `false` (so `reqH.x-tag!:v` holds for a
-        // request without the header), unlike an unknowable fact.
-        Cond::ReqHeader { name, value } => Some(
-            req.headers
-                .iter()
-                .any(|(n, v)| n == name && value.matches_header(v)),
-        ),
-        // whistle checks the client IP and then the server IP, but the server
-        // IP is only known once the connection is made — at rule-resolution
-        // time both implementations have the client's alone
-        // (`_original/lib/rules/rules.js:1875-1880`).
+        Cond::Header { name, value, scope } => header_holds(req, name, value, *scope),
+        // whistle documents `i:` as client-or-server, but only ever tests the
+        // client's — see [`Cond::Ip`].
         Cond::Ip(v) | Cond::ClientIp(v) => req.client_ip.as_deref().map(|ip| v.matches(ip)),
+        // The raw socket's address and port. This port honours no header that
+        // overrides the client IP, so `remoteAddress:` and `clientIp:` read the
+        // same socket here; upstream separates them only for a request that
+        // arrived through another whistle (`lib/init.js:167-187`).
+        Cond::RemoteAddress(v) => req.client_ip.as_deref().map(|ip| v.matches(ip)),
+        Cond::ClientPort(v) | Cond::RemotePort(v) => {
+            req.client_port.map(|p| v.matches(&p.to_string()))
+        }
         Cond::Chance(p) => Some(random_unit() < *p),
+        // ── response phase ──
+        Cond::StatusCode(v) => req.res.as_ref().map(|r| v.matches(&r.status.to_string())),
+        // A response whose server address was never known keeps `serverIp:`
+        // unanswerable rather than guessing at it.
+        Cond::ServerIp(v) => req
+            .res
+            .as_ref()
+            .and_then(|r| r.server_ip.as_deref())
+            .map(|ip| v.matches(ip)),
+        Cond::ServerPort(v) => req
+            .res
+            .as_ref()
+            .and_then(|r| r.server_port)
+            .map(|p| v.matches(&p.to_string())),
         Cond::Deferred(_) => None,
     }
+}
+
+/// One header condition, in whichever message its spelling names.
+///
+/// Ported from `filterHeader` (`_original/lib/rules/rules.js:1917-1946`) and its
+/// three call sites (`:1953-1961`). Two details are upstream's and both matter:
+///
+/// * a header the message does not carry is a *known* `false`, not an unknown —
+///   so `reqH.x-tag!:v` holds for a request without the header;
+/// * the `h:`/`header:` spelling passes `req.resHeaders` as a fallback, so it
+///   reads the response's header when the request has none. In the request
+///   phase there are no response headers, which is exactly upstream's state
+///   there, and the condition answers "no".
+fn header_holds(
+    req: &ReqInfo,
+    name: &str,
+    value: &CondValue,
+    scope: HeaderScope,
+) -> Option<bool> {
+    let res_headers = || req.res.as_ref().map(|r| r.headers.as_slice());
+    match scope {
+        HeaderScope::Request => Some(header_matches(&req.headers, name, value)),
+        // Unknown until the response head is in, so that a rule carrying it is
+        // resolved again rather than answered "no" too early.
+        HeaderScope::Response => res_headers().map(|h| header_matches(h, name, value)),
+        HeaderScope::RequestThenResponse => {
+            if req.headers.iter().any(|(n, _)| n == name) {
+                return Some(header_matches(&req.headers, name, value));
+            }
+            match res_headers() {
+                Some(h) => Some(header_matches(h, name, value)),
+                // The request has no such header; in the request phase that is
+                // upstream's known `false` (`value == null` with no
+                // `resHeaders`).
+                None => Some(false),
+            }
+        }
+    }
+}
+
+/// Does any `name` header in `headers` satisfy `value`?
+fn header_matches(headers: &[(String, String)], name: &str, value: &CondValue) -> bool {
+    headers
+        .iter()
+        .any(|(n, v)| n == name && value.matches_header(v))
 }
 
 /// A uniform draw from `[0, 1)`, whistle's `Math.random()` for `chance:`.
@@ -244,30 +307,95 @@ pub fn resolve_refs_scoped(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool
     // pass we keep first-match order. `is_important` folds `lineProps://important`
     // in with this port's `$`-prefix shorthand.
     for pass_important in [true, false] {
-        for rule in rules.iter().filter(|r| r.is_important() == pass_important) {
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.is_important() != pass_important {
+                continue;
+            }
             if !rule.props.allows_scope(is_internal_req) || !matches(rule, req) {
                 continue;
             }
+            // A line whose filters ask about the response has not said anything
+            // about the response *yet*. Its response-phase operators are left
+            // for [`resolve_response_refs`], which is where upstream decides
+            // them too; everything else on the line applies now.
+            let defer_res = rule.needs_response_phase(req);
             for op in &rule.ops {
-                if protocols::is_multi_match(&op.protocol) {
-                    resolved
-                        .multi
-                        .entry(op.protocol.clone())
-                        .or_default()
-                        .push(op.clone());
-                } else {
-                    // first-match-wins (importance handled by pass order)
-                    resolved
-                        .single
-                        .entry(op.protocol.clone())
-                        .or_insert_with(|| op.clone());
+                if defer_res && protocols::is_res_phase(&op.protocol) {
+                    continue;
                 }
+                take(&mut resolved, op, order_key(index, pass_important));
             }
         }
     }
 
     apply_ignores(&mut resolved);
     resolved
+}
+
+/// Add `op` to `resolved` under its protocol's arity rule, stamped with `order`.
+fn take(resolved: &mut Resolved, op: &RuleOp, order: u64) {
+    let mut op = op.clone();
+    op.order = order;
+    if protocols::is_multi_match(&op.protocol) {
+        resolved
+            .multi
+            .entry(op.protocol.clone())
+            .or_default()
+            .push(op);
+    } else {
+        // first-match-wins (importance handled by pass order)
+        resolved.single.entry(op.protocol.clone()).or_insert(op);
+    }
+}
+
+/// Resolve the operators [`resolve_refs_scoped`] withheld, now that `req`
+/// carries the response head ([`ReqInfo::res`]).
+///
+/// This is the second half of upstream's two-phase resolution
+/// (`resolveResRules` → `pluginMgr.getResRules`, `_original/lib/rules/rules.js:2306`,
+/// `lib/plugins/index.js:1322`), narrowed to what this port actually withheld:
+///
+/// * only rules whose filters ask about the response are walked — every other
+///   rule was resolved completely in the request phase, and walking it again
+///   would resolve its operators a second time;
+/// * only [`protocols::RES_PHASE_PROTOCOLS`] operators are kept, mirroring
+///   `pureResProtocols`, so no rule can change where a request went after it has
+///   gone there;
+/// * `ignore://` is kept unapplied, because these ignores have to reach the
+///   *request* phase's operators as well — see
+///   [`Resolved::apply_response_ignores`].
+///
+/// `None` says nothing was withheld for this request, so the request phase's
+/// answer is already complete.
+pub fn resolve_response_refs(
+    rules: &[&Rule],
+    req: &ReqInfo,
+    is_internal_req: bool,
+) -> Option<Resolved> {
+    // Cheap pre-scan over a precomputed flag; the walk proper only runs for the
+    // rules that actually withheld something.
+    if !rules.iter().any(|r| r.may_need_response_phase()) {
+        return None;
+    }
+    let mut resolved = Resolved::default();
+    let mut deferred_any = false;
+    for pass_important in [true, false] {
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.is_important() != pass_important || !rule.needs_response_phase(req) {
+                continue;
+            }
+            deferred_any = true;
+            if !rule.props.allows_scope(is_internal_req) || !matches(rule, req) {
+                continue;
+            }
+            for op in &rule.ops {
+                if protocols::is_res_phase(&op.protocol) || op.protocol == "ignore" {
+                    take(&mut resolved, op, order_key(index, pass_important));
+                }
+            }
+        }
+    }
+    deferred_any.then_some(resolved)
 }
 
 /// `ignore://<proto>[,<proto>…]` removes those protocols from the resolved set;
@@ -981,5 +1109,403 @@ mod filter_tests {
         // `!` inverts a URL pattern, which a rule's own pattern cannot do.
         assert!(hits("includeFilter://!other.com", &cgi));
         assert!(!hits("includeFilter://!example.com", &cgi));
+    }
+}
+
+/// The response phase: what a second resolution adds once the head is in.
+///
+/// Every case here is the pair "does hold" / "does not hold", because the point
+/// of the phase is that the same rule now answers both ways depending on the
+/// response — a rule that always applied would prove nothing.
+#[cfg(test)]
+mod response_phase_tests {
+    use super::*;
+    use crate::rules::{ResInfo, RuleManager};
+
+    fn req(url: &str) -> ReqInfo {
+        let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+        let (host, path) = match rest.find('/') {
+            Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+            None => (rest.to_string(), "/".to_string()),
+        };
+        ReqInfo {
+            method: "GET".into(),
+            scheme: scheme.into(),
+            host,
+            port: if scheme == "https" { 443 } else { 80 },
+            path,
+            full_url: url.into(),
+            client_ip: Some("127.0.0.1".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A response head with `status` and nothing else.
+    fn res(status: u16) -> ResInfo {
+        ResInfo {
+            status,
+            ..Default::default()
+        }
+    }
+
+    fn res_with(status: u16, headers: &[(&str, &str)]) -> ResInfo {
+        ResInfo {
+            status,
+            headers: headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Both passes, wired exactly as `crate::proxy::serve` wires them.
+    fn resolve(text: &str, req: &ReqInfo, res: Option<ResInfo>) -> Resolved {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        let mut resolved = mgr.resolve(req);
+        let mut with_res = req.clone();
+        with_res.res = res;
+        if let Some(extra) = mgr.resolve_response(&with_res, false) {
+            resolved.merge_response_phase(extra);
+        }
+        resolved
+    }
+
+    /// The value `protocol` ends up with after both passes.
+    fn value(text: &str, status: u16, protocol: &str) -> Option<String> {
+        resolve(text, &req("http://example.com/"), Some(res(status)))
+            .value(protocol)
+            .map(str::to_string)
+    }
+
+    // ── the conditions that just came alive ──
+
+    #[test]
+    fn an_include_filter_on_the_status_holds_only_for_that_status() {
+        let text = "example.com resHeaders://x-hit=1 includeFilter://s:200\n";
+        assert_eq!(value(text, 200, "resHeaders").as_deref(), Some("x-hit=1"));
+        assert_eq!(value(text, 404, "resHeaders"), None);
+        // …and nothing at all before the response arrives.
+        let early = resolve(text, &req("http://example.com/"), None);
+        assert!(early.value("resHeaders").is_none());
+    }
+
+    #[test]
+    fn a_status_regexp_matches_the_family() {
+        let text = "example.com resType://text/plain includeFilter://statusCode:/^2/\n";
+        assert_eq!(value(text, 204, "resType").as_deref(), Some("text/plain"));
+        assert_eq!(value(text, 301, "resType"), None);
+    }
+
+    /// Negation works now that the answer is known — which it could not while
+    /// the condition was unanswerable, since `getFilterResult` drops `not` for
+    /// an unknown (`_original/lib/rules/rules.js:1809`).
+    #[test]
+    fn a_negated_status_holds_for_every_other_status() {
+        let text = "example.com resHeaders://x-hit=1 includeFilter://s:!200\n";
+        assert_eq!(value(text, 500, "resHeaders").as_deref(), Some("x-hit=1"));
+        assert_eq!(value(text, 200, "resHeaders"), None);
+    }
+
+    #[test]
+    fn an_exclude_filter_on_the_status_now_fires() {
+        let text = "example.com resHeaders://x-hit=1 excludeFilter://s:404\n";
+        assert_eq!(value(text, 200, "resHeaders").as_deref(), Some("x-hit=1"));
+        assert_eq!(
+            value(text, 404, "resHeaders"),
+            None,
+            "the operator was withheld from the request pass so this could fire"
+        );
+    }
+
+    /// Response headers match by containment, like every other header condition
+    /// — upstream's own example is `resH.content-type:json`.
+    #[test]
+    fn a_response_header_condition_matches_by_containment() {
+        let text = "example.com resAppend://<!--tail--> includeFilter://resH.content-type:json\n";
+        let hit = |ct: &str| {
+            resolve(
+                text,
+                &req("http://example.com/"),
+                Some(res_with(200, &[("content-type", ct)])),
+            )
+            .value("resAppend")
+            .is_some()
+        };
+        assert!(hit("application/JSON; charset=utf-8"));
+        assert!(!hit("text/html"));
+        // A response without the header at all is a known "no".
+        assert!(resolve(text, &req("http://example.com/"), Some(res(200)))
+            .value("resAppend")
+            .is_none());
+    }
+
+    /// `h:`/`header:` reads the request first and the response only when the
+    /// request has no such header (`filterHeader(req.headers, filter.header,
+    /// req.resHeaders)`, `_original/lib/rules/rules.js:1953`).
+    #[test]
+    fn the_bare_header_spelling_falls_back_to_the_response() {
+        let text = "example.com resHeaders://x-hit=1 includeFilter://h:x-tag=yes\n";
+        let head = res_with(200, &[("x-tag", "yes")]);
+        assert!(
+            resolve(text, &req("http://example.com/"), Some(head.clone()))
+                .value("resHeaders")
+                .is_some(),
+            "the response's header answers when the request has none"
+        );
+
+        // With the request carrying the key, the response is never consulted —
+        // so a request value that disagrees loses, it does not fall through.
+        let mut tagged = req("http://example.com/");
+        tagged.headers.push(("x-tag".into(), "no".into()));
+        assert!(
+            resolve(text, &tagged, Some(head))
+                .value("resHeaders")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_server_address_answers_once_the_request_has_gone() {
+        let text = "example.com resHeaders://x-hit=1 includeFilter://serverIp:10.0.0.7\n";
+        let sent_to = |ip: Option<&str>| ResInfo {
+            status: 200,
+            server_ip: ip.map(str::to_string),
+            ..Default::default()
+        };
+        let hit = |ip: Option<&str>| {
+            resolve(text, &req("http://example.com/"), Some(sent_to(ip)))
+                .value("resHeaders")
+                .is_some()
+        };
+        assert!(hit(Some("10.0.0.7")));
+        assert!(!hit(Some("10.0.0.8")));
+        // An address this port never learned leaves the condition unanswerable,
+        // so the filter fails closed rather than matching a guess.
+        assert!(!hit(None));
+    }
+
+    #[test]
+    fn the_server_port_answers_too() {
+        let text = "example.com resHeaders://x-hit=1 includeFilter://serverPort:8443\n";
+        let sent_to = |port: u16| ResInfo {
+            status: 200,
+            server_port: Some(port),
+            ..Default::default()
+        };
+        let hit = |port: u16| {
+            resolve(text, &req("http://example.com/"), Some(sent_to(port)))
+                .value("resHeaders")
+                .is_some()
+        };
+        assert!(hit(8443));
+        assert!(!hit(443));
+    }
+
+    /// The client socket's port is known in the *request* phase — it is not a
+    /// response fact, it just had nowhere to travel before.
+    #[test]
+    fn the_client_port_answers_in_the_request_phase() {
+        for token in ["clientPort:54321", "remotePort:54321"] {
+            let text = format!("example.com host://10.0.0.1 includeFilter://{token}\n");
+            let mut r = req("http://example.com/");
+            r.client_port = Some(54321);
+            assert_eq!(
+                resolve(&text, &r, None).value("host"),
+                Some("10.0.0.1"),
+                "{token}"
+            );
+            r.client_port = Some(1234);
+            assert!(resolve(&text, &r, None).value("host").is_none(), "{token}");
+            // Unknown stays unknown, and fails closed.
+            r.client_port = None;
+            assert!(resolve(&text, &r, None).value("host").is_none(), "{token}");
+        }
+    }
+
+    #[test]
+    fn the_remote_address_is_the_client_socket() {
+        let text = "example.com host://10.0.0.1 includeFilter://remoteAddress:127.0.0.1\n";
+        assert_eq!(
+            resolve(text, &req("http://example.com/"), None).value("host"),
+            Some("10.0.0.1")
+        );
+        let mut elsewhere = req("http://example.com/");
+        elsewhere.client_ip = Some("10.9.9.9".into());
+        assert!(resolve(text, &elsewhere, None).value("host").is_none());
+    }
+
+    // ── what the second pass may and may not touch ──
+
+    /// A request-phase operator is decided before the request is sent and never
+    /// revisited, so a response condition can never turn it on. Upstream is the
+    /// same: `host` is absent from the response pass's protocol list.
+    #[test]
+    fn a_request_phase_operator_is_never_decided_by_the_response() {
+        let text = "example.com host://10.0.0.1 includeFilter://s:200\n";
+        assert!(value(text, 200, "host").is_none());
+        assert!(value(text, 404, "host").is_none());
+    }
+
+    /// …and the rule's *other* operators still apply in the request phase when
+    /// only an exclude filter mentions the response, which is what upstream's
+    /// request pass does with the status still unknown.
+    #[test]
+    fn an_excluded_response_condition_leaves_the_request_operators_alone() {
+        let text = "example.com host://10.0.0.1 resHeaders://x-hit=1 excludeFilter://s:404\n";
+        assert_eq!(value(text, 404, "host").as_deref(), Some("10.0.0.1"));
+        assert_eq!(value(text, 404, "resHeaders"), None);
+        assert_eq!(value(text, 200, "resHeaders").as_deref(), Some("x-hit=1"));
+    }
+
+    /// `ignore://` resolved in the response phase reaches operators the request
+    /// phase had already resolved — from other lines included.
+    #[test]
+    fn a_response_phase_ignore_drops_a_request_phase_operator() {
+        let text = "example.com resHeaders://x-hit=1\n\
+                    example.com ignore://resHeaders includeFilter://s:404\n";
+        assert_eq!(value(text, 200, "resHeaders").as_deref(), Some("x-hit=1"));
+        assert_eq!(value(text, 404, "resHeaders"), None);
+    }
+
+    /// `ignore://all` in the response phase clears the response-phase operators
+    /// and only those — upstream's `isResRules` restriction
+    /// (`_original/lib/util/index.js:2083`).
+    #[test]
+    fn a_response_phase_ignore_all_spares_the_request_phase() {
+        let text = "example.com host://10.0.0.1 resHeaders://x-hit=1\n\
+                    example.com ignore://all includeFilter://s:404\n";
+        let r = resolve(text, &req("http://example.com/"), Some(res(404)));
+        assert!(r.value("resHeaders").is_none());
+        assert_eq!(r.value("host"), Some("10.0.0.1"), "the request had gone already");
+    }
+
+    // ── precedence ──
+
+    /// The winner is the one written first, whichever pass resolved it. Getting
+    /// this wrong is silent: both rules apply, the wrong one just wins.
+    #[test]
+    fn source_order_decides_across_the_two_passes() {
+        let conditional = "example.com replaceStatus://500 includeFilter://s:404\n";
+        let plain = "example.com replaceStatus://502\n";
+        assert_eq!(
+            value(&format!("{conditional}{plain}"), 404, "replaceStatus").as_deref(),
+            Some("500"),
+            "the conditional line is written first"
+        );
+        assert_eq!(
+            value(&format!("{plain}{conditional}"), 404, "replaceStatus").as_deref(),
+            Some("502"),
+            "the plain line is written first"
+        );
+    }
+
+    /// The same for a multi-match protocol, where every value survives and only
+    /// the order changes.
+    #[test]
+    fn a_multi_match_list_keeps_source_order_across_the_passes() {
+        let text = "example.com resAppend://a\n\
+                    example.com resAppend://b includeFilter://s:404\n\
+                    example.com resAppend://c\n";
+        let r = resolve(text, &req("http://example.com/"), Some(res(404)));
+        let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["a", "b", "c"]);
+    }
+
+    /// An important line still outranks the lines above it, in either pass.
+    #[test]
+    fn importance_outranks_source_order_across_the_passes() {
+        let text = "example.com resAppend://normal\n\
+                    $example.com resAppend://important includeFilter://s:404\n";
+        let r = resolve(text, &req("http://example.com/"), Some(res(404)));
+        let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["important", "normal"]);
+    }
+
+    /// Two operators of one line keep the order they were written in.
+    #[test]
+    fn operators_of_one_line_keep_their_order() {
+        let text = "example.com resAppend://first resAppend://second includeFilter://s:200\n";
+        let r = resolve(text, &req("http://example.com/"), Some(res(200)));
+        let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["first", "second"]);
+    }
+
+    // ── the pass is skipped when nothing needs it ──
+
+    /// The common case: no rule mentions the response, so there is no second
+    /// pass at all — not an empty one.
+    #[test]
+    fn no_second_pass_when_no_rule_mentions_the_response() {
+        for text in [
+            "example.com resHeaders://x=1\n",
+            "example.com resHeaders://x=1 includeFilter://m:GET\n",
+            "example.com resHeaders://x=1 includeFilter://reqH.x-tag:1\n",
+            // A response condition with nothing to say about the response: the
+            // request pass answered it (with "no") and that is final.
+            "example.com host://10.0.0.1 includeFilter://s:200\n",
+            "",
+        ] {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            assert!(!mgr.may_need_response_phase(), "{text:?}");
+            let mut with_res = req("http://example.com/");
+            with_res.res = Some(res(200));
+            assert!(mgr.resolve_response(&with_res, false).is_none(), "{text:?}");
+        }
+    }
+
+    /// …and it does run for the rules that need it.
+    #[test]
+    fn a_second_pass_runs_when_a_rule_needs_it() {
+        for text in [
+            "example.com resHeaders://x=1 includeFilter://s:200\n",
+            "example.com resHeaders://x=1 excludeFilter://resH.x-tag:1\n",
+            "example.com resHeaders://x=1 includeFilter://serverIp:1.2.3.4\n",
+            "example.com ignore://resHeaders includeFilter://s:404\n",
+        ] {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            assert!(mgr.may_need_response_phase(), "{text:?}");
+            let mut with_res = req("http://example.com/");
+            with_res.res = Some(res(200));
+            assert!(mgr.resolve_response(&with_res, false).is_some(), "{text:?}");
+        }
+    }
+
+    /// `h:` needs the response phase only when the request cannot answer it,
+    /// so the spelling costs nothing on a request that carries the header.
+    #[test]
+    fn the_bare_header_spelling_needs_the_response_only_when_the_request_cannot_answer() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com resHeaders://x=1 includeFilter://h:x-tag=yes\n");
+        assert!(mgr.may_need_response_phase(), "the static answer is conservative");
+
+        let mut tagged = req("http://example.com/");
+        tagged.headers.push(("x-tag".into(), "yes".into()));
+        tagged.res = Some(res(200));
+        assert!(mgr.resolve_response(&tagged, false).is_none());
+
+        let mut bare = req("http://example.com/");
+        bare.res = Some(res(200));
+        assert!(mgr.resolve_response(&bare, false).is_some());
+    }
+
+    /// A rule that already applied keeps applying: a response condition on one
+    /// line must not disturb an unconditional line's operators.
+    #[test]
+    fn an_unrelated_rule_is_untouched_by_the_second_pass() {
+        let text = "example.com resHeaders://x-always=1\n\
+                    example.com resType://text/plain includeFilter://s:404\n";
+        for status in [200, 404] {
+            let r = resolve(text, &req("http://example.com/"), Some(res(status)));
+            assert_eq!(
+                r.all("resHeaders").len(),
+                1,
+                "status {status}: resolved once, not twice"
+            );
+            assert_eq!(r.value("resHeaders"), Some("x-always=1"));
+        }
     }
 }

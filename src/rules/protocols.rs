@@ -130,6 +130,65 @@ pub const UPSTREAM_PROXY_PROTOCOLS: &[&str] = &[
 /// whistle's "tool" protocols (`_original/lib/rules/protocols.js:73`).
 pub const TOOL_PROTOCOLS: &[&str] = &["log", "weinre"];
 
+/// The operators whistle decides in the **response** phase — `pureResProtocols`
+/// (`_original/lib/rules/protocols.js:82-111`), which is `resProtocols` minus the
+/// filtering machinery, plus [`TOOL_PROTOCOLS`].
+///
+/// Upstream resolves a request's rules twice and splits the protocol set between
+/// the passes: `resolveReqRules` skips every name in this list
+/// (`reqProtocols`, `protocols.js:156-158`) and `resolveResRules` resolves
+/// *only* these (`rules.js:2234-2235`). So a rule's effect on the response is
+/// always decided with the response head in hand.
+///
+/// This port resolves everything in the request pass and then re-resolves just
+/// these names once the response head arrives — but only for the rules whose
+/// filters actually ask about the response, which is what
+/// [`crate::rules::Rule::needs_response_phase`] decides. See
+/// [`crate::rules::matcher::resolve_response_refs`].
+///
+/// Names absent from upstream's list are absent here too, and the omissions are
+/// deliberate: `statusCode`, `redirect`, `location` and `resScript` are req-phase
+/// operators upstream, because they either answer the request without one being
+/// sent or are needed before the response exists.
+pub const RES_PHASE_PROTOCOLS: &[&str] = &[
+    "replaceStatus",
+    "cache",
+    "attachment",
+    "resMerge",
+    "resDelay",
+    "resSpeed",
+    "resType",
+    "resCharset",
+    "resCookies",
+    "resCors",
+    "resHeaders",
+    "trailers",
+    "resPrepend",
+    "resBody",
+    "resAppend",
+    "resReplace",
+    "resWrite",
+    "resWriteRaw",
+    "cssAppend",
+    "htmlAppend",
+    "jsAppend",
+    "cssBody",
+    "htmlBody",
+    "jsBody",
+    "cssPrepend",
+    "htmlPrepend",
+    "jsPrepend",
+    "responseFor",
+    // `.concat(toolProtocols)` — kept in sync with [`TOOL_PROTOCOLS`].
+    "log",
+    "weinre",
+];
+
+/// Is this operator decided in the response phase (see [`RES_PHASE_PROTOCOLS`])?
+pub fn is_res_phase(name: &str) -> bool {
+    RES_PHASE_PROTOCOLS.contains(&name)
+}
+
 /// Protocols that may legitimately appear multiple times in a resolved set
 /// (`multiMatchs`, `_original/lib/rules/protocols.js:186-226`). We keep every
 /// matching value for these instead of first-match-wins.
@@ -248,4 +307,29 @@ pub fn is_protocol(name: &str) -> bool {
 /// Returns true if this protocol keeps every matching value (see [`MULTI_MATCH`]).
 pub fn is_multi_match(name: &str) -> bool {
     MULTI_MATCH.contains(&name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every response-phase name has to be a protocol the parser recognises, or
+    /// a rule writing it would never produce an operator to re-resolve.
+    #[test]
+    fn res_phase_protocols_are_all_known_protocols() {
+        for name in RES_PHASE_PROTOCOLS {
+            assert!(is_protocol(name), "{name} is not a known protocol");
+            assert!(canonical(name).is_none(), "{name} should be canonical");
+        }
+    }
+
+    /// The tool protocols are part of the response phase upstream
+    /// (`pureResProtocols.concat(toolProtocols)`), and both lists are written
+    /// out here, so they can drift apart.
+    #[test]
+    fn tool_protocols_are_response_phase() {
+        for name in TOOL_PROTOCOLS {
+            assert!(is_res_phase(name), "{name} must be resolved in the res phase");
+        }
+    }
 }

@@ -162,6 +162,22 @@ pub struct RuleOp {
     /// so that resolution — which mixes operators from many lines — keeps each
     /// one's line scope.
     pub props: LineProps,
+    /// Where this operator sits in the resolution order — important lines first,
+    /// then source order (see [`order_key`]). Stamped when a rule resolves.
+    ///
+    /// It exists so that the response phase can slot its operators back into the
+    /// list *as if* both passes had been one walk: without it, re-resolving a
+    /// rule later would move its operators to one end of the list and change
+    /// which one wins. Operators merged in from another rules text sort last —
+    /// see [`crate::proxy::apply::merge_rules_text`].
+    pub order: u64,
+}
+
+/// The resolution-order key of the rule at `index`: important lines sort before
+/// normal ones, source order within each group. Both passes derive it from the
+/// same rule list, so a key means the same thing in either.
+pub fn order_key(index: usize, important: bool) -> u64 {
+    ((!important as u64) << 32) | index as u64
 }
 
 /// How a rule's pattern decides whether a request matches.
@@ -204,6 +220,11 @@ pub struct Rule {
     pub filters: Vec<Filter>,
     /// `lineProps://…` declared on this line (also mirrored onto every op).
     pub props: LineProps,
+    /// Precomputed: does this line write an operator the response phase decides
+    /// ([`protocols::is_res_phase`]), or an `ignore://` that could drop one?
+    pub res_phase_ops: bool,
+    /// Precomputed: might one of its filters need the response head?
+    pub res_dependent: bool,
 }
 
 impl Rule {
@@ -213,6 +234,37 @@ impl Rule {
     /// the front of each protocol's rule list (`_original/lib/rules/rules.js:1393`).
     pub fn is_important(&self) -> bool {
         self.important || self.props.important()
+    }
+
+    /// Could this line's effect depend on the response head?
+    ///
+    /// Both halves are precomputed at parse time, so the request pass pays one
+    /// `bool` per rule to find out that it has nothing to do — which is the
+    /// common case, and the reason the second pass costs nothing when no rule
+    /// asks for it.
+    ///
+    /// Deliberately conservative: [`Cond::may_need_response`] over-reports where
+    /// the precise answer needs the request. [`Rule::needs_response_phase`] is
+    /// the exact test.
+    pub fn may_need_response_phase(&self) -> bool {
+        self.res_phase_ops && self.res_dependent
+    }
+
+    /// Must this line's response-phase operators wait for the response head?
+    ///
+    /// True when one of its filters asks about the response *and* it has
+    /// something to say about the response. Those operators are then withheld
+    /// from the request pass and resolved again once the head is in — which is
+    /// upstream's arrangement, where the response-phase protocols are simply
+    /// absent from the request pass (`reqProtocols`,
+    /// `_original/lib/rules/protocols.js:156`).
+    ///
+    /// A line whose filters ask about the response but whose operators are all
+    /// request-phase is *not* response-dependent: `host://` has to be decided
+    /// before the request is sent, so upstream decides it with the status still
+    /// unknown, and the condition fails closed there for good.
+    pub fn needs_response_phase(&self, req: &ReqInfo) -> bool {
+        self.may_need_response_phase() && self.filters.iter().any(|f| f.cond.needs_response(req))
     }
 }
 
@@ -237,31 +289,77 @@ pub struct Filter {
     pub cond: Cond,
 }
 
+/// Which message a header condition reads.
+///
+/// Upstream files header conditions under three property names, picked by the
+/// third character of the condition's own name — `re**q**H` → `reqHeader`,
+/// `re**s**H` → `resHeader`, anything else (`h`, `header`) → `header`
+/// (`_original/lib/rules/rules.js:1668-1681`). Only the last of the three
+/// consults both messages, and it does so in that order:
+/// `filterHeader(req.headers, filter.header, req.resHeaders)` (`rules.js:1953`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderScope {
+    /// `reqH.<key>:` — the request's headers, and only those.
+    Request,
+    /// `resH.<key>:` — the response's headers, and only those.
+    Response,
+    /// `h:<key>=` / `header:<key>=` — the request's headers, falling back to the
+    /// response's when the request does not carry the key at all.
+    RequestThenResponse,
+}
+
 /// What a [`Filter`] tests.
 ///
 /// Conditions are evaluated to `Option<bool>`: `None` says "the fact this tests
 /// is not knowable yet", which upstream's `getFilterResult`
 /// (`_original/lib/rules/rules.js:1809`) collapses to `false` *without* applying
 /// `not`. Everything therefore fails closed.
+///
+/// Several of these test facts that only exist once the response head has
+/// arrived. They answer `None` in the request phase and for real in the response
+/// phase — see [`ResInfo`] and [`Cond::needs_response`].
 #[derive(Debug, Clone)]
 pub enum Cond {
     /// `m:GET` / `method:GET` — request method (always case-insensitive).
     Method(CondValue),
     /// `host:example.com` — request host.
     Host(CondValue),
-    /// `reqH.<key>:<value>` (and the `h:`/`header:`/`req…` spellings) — a
-    /// request header. Upstream tests *containment*, not equality.
-    ReqHeader { name: String, value: CondValue },
+    /// `reqH.<key>:<value>` (and the `h:`/`header:`/`resH.` spellings) — a
+    /// header of the request, the response, or both; see [`HeaderScope`].
+    /// Upstream tests *containment*, not equality.
+    Header {
+        name: String,
+        value: CondValue,
+        scope: HeaderScope,
+    },
     /// `clientIp:1.2.3.4` — the client's IP.
     ClientIp(CondValue),
-    /// `i:1.2.3.4` / `ip:` — client **or** server IP. The server IP is not known
-    /// while rules are resolved, so in practice this tests the client's.
+    /// `i:1.2.3.4` / `ip:` — documented as client **or** server IP, but the
+    /// server-IP arm is unreachable upstream: `filterProp` returns a truthy
+    /// "handled" as soon as an ip filter is seen with `req.clientIp == null`,
+    /// so the `req.hostIp` line below it never runs for one
+    /// (`_original/lib/rules/rules.js:1824-1830,:1875-1880`). This tests the
+    /// client's IP, and matches upstream by doing so.
     Ip(CondValue),
     /// `chance:0.25` / `chance:25%` — sample a fraction of requests, upstream's
     /// `Math.random() < probability` (`_original/lib/rules/rules.js:1860-1868`).
     /// A value that is not a number is stored as `NaN`, which never matches —
     /// the same coercion JS performs.
     Chance(f64),
+    /// `s:404` / `statusCode:/^5/` — the response status. Response phase only.
+    StatusCode(CondValue),
+    /// `serverIp:1.2.3.4` — the address the request was actually sent to.
+    /// Response phase only, and only when that address is known exactly.
+    ServerIp(CondValue),
+    /// `serverPort:8080` — the port the request was sent to. Response phase only.
+    ServerPort(CondValue),
+    /// `clientPort:54321` — the client socket's port.
+    ClientPort(CondValue),
+    /// `remoteAddress:1.2.3.4` — the client socket's address, before any
+    /// forwarding header is honoured (`getRemoteAddr`, `lib/util/common.js:1738`).
+    RemoteAddress(CondValue),
+    /// `remotePort:54321` — the client socket's port, as above.
+    RemotePort(CondValue),
     /// A URL pattern, written exactly like a rule's own pattern (regexp,
     /// wildcard, or scheme/host/path prefix). This is the fallback for anything
     /// that is not a recognised condition name.
@@ -271,30 +369,54 @@ pub enum Cond {
     Deferred(Deferred),
 }
 
-/// Conditions this port parses but cannot answer at rule-resolution time.
+impl Cond {
+    /// Can this condition only be answered once the response head is in?
+    ///
+    /// `req` is consulted because one spelling is conditional: `h:<key>` reads
+    /// the *request's* header when there is one and only then falls back to the
+    /// response's, so it needs the response phase exactly when the request does
+    /// not carry the key.
+    ///
+    /// The answer decides two things: whether the rule's response-phase
+    /// operators are withheld from the request pass, and whether a second pass
+    /// runs at all. It must therefore never under-report.
+    pub fn needs_response(&self, req: &ReqInfo) -> bool {
+        match self {
+            Cond::StatusCode(_) | Cond::ServerIp(_) | Cond::ServerPort(_) => true,
+            Cond::Header { name, scope, .. } => match scope {
+                HeaderScope::Response => true,
+                HeaderScope::Request => false,
+                HeaderScope::RequestThenResponse => !req.has_header(name),
+            },
+            _ => false,
+        }
+    }
+
+    /// [`Cond::needs_response`] without a request to consult: `true` whenever
+    /// *some* request would need the response phase. Computed once at parse
+    /// time, so the per-request checks can be skipped wholesale.
+    pub fn may_need_response(&self) -> bool {
+        matches!(
+            self,
+            Cond::StatusCode(_)
+                | Cond::ServerIp(_)
+                | Cond::ServerPort(_)
+                | Cond::Header {
+                    scope: HeaderScope::Response | HeaderScope::RequestThenResponse,
+                    ..
+                }
+        )
+    }
+}
+
+/// Conditions this port parses but cannot answer at all.
 ///
-/// whistle resolves rules again in the response phase, so upstream can answer
-/// these later; this port resolves once, before the request is sent. Rather
-/// than let such a condition fall through to the URL-pattern fallback — where
-/// it would be a nonsense regexp that quietly matches nothing (or, worse,
+/// Rather than let such a condition fall through to the URL-pattern fallback —
+/// where it would be a nonsense regexp that quietly matches nothing (or, worse,
 /// something) — it is parsed, recorded, and evaluated as "unknown", which makes
 /// its filter fail closed. `docs/RULES.md` lists what each one would need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deferred {
-    /// `s:` / `statusCode:` — needs the response.
-    StatusCode,
-    /// `resH.<key>:` / `res:<key>=` — needs the response headers.
-    ResHeader,
-    /// `serverIp:` — needs the resolved upstream address.
-    ServerIp,
-    /// `clientPort:` — needs the accepted socket's peer port.
-    ClientPort,
-    /// `serverPort:` — needs the upstream socket's port.
-    ServerPort,
-    /// `remoteAddress:` — needs the upstream socket's address.
-    RemoteAddress,
-    /// `remotePort:` — needs the upstream socket's port.
-    RemotePort,
     /// `b:` / `body:` — needs the request body buffered before rules resolve.
     Body,
     /// `env:` — needs the plugin environment store.
@@ -389,6 +511,42 @@ pub struct ReqInfo {
     pub headers: Vec<(String, String)>,
     /// Client IP, if known, for `i:` / `clientIp:` filter conditions.
     pub client_ip: Option<String>,
+    /// The client socket's port, for `clientPort:` / `remotePort:`.
+    pub client_port: Option<u16>,
+    /// The response head, once there is one — see [`ResInfo`]. `None` during the
+    /// request phase, which is what makes every response-phase condition fail
+    /// closed there.
+    pub res: Option<ResInfo>,
+}
+
+impl ReqInfo {
+    /// Does the request carry `name` at all (whatever its value)?
+    fn has_header(&self, name: &str) -> bool {
+        self.headers.iter().any(|(n, _)| n == name)
+    }
+}
+
+/// The response facts a second resolution pass adds to [`ReqInfo`].
+///
+/// These live on the request rather than beside it because that is where
+/// upstream puts them: `req.statusCode = _res.statusCode` and
+/// `req.resHeaders = res.headers` are stamped onto the request object before the
+/// response rules resolve (`_original/lib/inspectors/res.js:802-806`,
+/// `lib/plugins/index.js:1323-1326`), and its `matchFilter` reads them straight
+/// off `req`.
+#[derive(Debug, Clone, Default)]
+pub struct ResInfo {
+    /// The status the origin (or a short-circuit rule) answered with.
+    pub status: u16,
+    /// Response headers as (lowercased-name, value) pairs.
+    pub headers: Vec<(String, String)>,
+    /// The address the request was sent to, when it is known exactly —
+    /// upstream's `req.hostIp`. A named origin whose address this port never saw
+    /// leaves it `None`, so `serverIp:` fails closed rather than matching a
+    /// second, possibly different, resolver answer.
+    pub server_ip: Option<String>,
+    /// The port the request was sent to — upstream's `req.serverPort`.
+    pub server_port: Option<u16>,
 }
 
 /// The winning operators for a request, keyed by protocol.
@@ -450,6 +608,90 @@ impl Resolved {
     pub fn has_prop(&self, protocol: &str, action: &str) -> bool {
         self.props(protocol).has(action)
     }
+
+    /// Fold a response-phase resolution into this request-phase one.
+    ///
+    /// The two hold *disjoint* operators — the request pass withheld exactly
+    /// what the response pass resolved (see [`Rule::needs_response_phase`]) — so
+    /// this is an insertion, not a contest, and each operator goes where it
+    /// would have gone had one walk produced both: by [`RuleOp::order`], which
+    /// is important lines first and source order within.
+    ///
+    /// That differs from upstream's `mergeRule` (`lib/util/index.js:2147`),
+    /// which unconditionally prefers the response pass — it can afford to,
+    /// because its two passes read *different* protocols and so never hold two
+    /// operators from the same rules file. Reconstructing the source order is
+    /// what makes both files below behave the same, as they do upstream:
+    ///
+    /// ```text
+    /// example.com  replaceStatus://502
+    /// example.com  replaceStatus://500  includeFilter://s:404
+    /// ```
+    ///
+    /// An operator merged in from somewhere else — a plugin's rules, a
+    /// `rule://` include — carries `order == u64::MAX` and therefore stays
+    /// behind everything either pass resolved, which is where the request phase
+    /// already put it.
+    pub fn merge_response_phase(&mut self, mut res: Resolved) {
+        // Taken out first: an `ignore://` resolved in the response phase has to
+        // reach what the *request* phase resolved, which the merge below — an
+        // insertion of operators the request phase never saw — does not touch.
+        let ignores = res.multi.remove("ignore").unwrap_or_default();
+        for (protocol, op) in res.single {
+            match self.single.get(&protocol) {
+                Some(cur) if cur.order <= op.order => {}
+                _ => {
+                    self.single.insert(protocol, op);
+                }
+            }
+        }
+        for (protocol, ops) in res.multi {
+            let list = self.multi.entry(protocol).or_default();
+            // `ops` is already in resolution order, and the scan resumes after
+            // the last insertion so operators sharing a key — two `resHeaders://`
+            // on one line — keep the order they were written in.
+            let mut from = 0;
+            for op in ops {
+                let at = list[from..]
+                    .iter()
+                    .position(|cur| cur.order > op.order)
+                    .map_or(list.len(), |i| from + i);
+                list.insert(at, op);
+                from = at + 1;
+            }
+        }
+        self.apply_response_ignores(&ignores);
+    }
+
+    /// Drop the response-phase operators an `ignore://` resolved in the response
+    /// phase names.
+    ///
+    /// Kept apart from [`matcher::resolve_refs_scoped`]'s own ignore handling
+    /// because these ignores have to reach operators the *request* pass
+    /// resolved, and because they may only reach response-phase ones — which is
+    /// upstream's `ignoreRules(origin, …, isResRules)` restricting itself to
+    /// `resProtocols` (`_original/lib/util/index.js:2083`).
+    fn apply_response_ignores(&mut self, ignores: &[RuleOp]) {
+        for op in ignores {
+            for name in op.value.split(['|', ',', ' ']) {
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if name == "all" {
+                    self.single.retain(|k, _| !protocols::is_res_phase(k));
+                    self.multi.retain(|k, _| !protocols::is_res_phase(k));
+                    return;
+                }
+                let name = protocols::canonical(name).unwrap_or(name);
+                if !protocols::is_res_phase(name) {
+                    continue;
+                }
+                self.single.remove(name);
+                self.multi.remove(name);
+            }
+        }
+    }
 }
 
 /// A named group of rules that can be individually enabled/disabled.
@@ -463,6 +705,10 @@ pub struct RuleGroup {
     pub enabled: bool,
     /// Parsed rules from `text`.
     rules: Vec<Rule>,
+    /// Does any rule here carry response-phase operators behind a filter that
+    /// asks about the response? Computed once per parse — see
+    /// [`RuleManager::may_need_response_phase`].
+    res_phase_candidates: bool,
 }
 
 impl RuleGroup {
@@ -472,6 +718,7 @@ impl RuleGroup {
             name: name.to_string(),
             text: text.to_string(),
             enabled,
+            res_phase_candidates: rules.iter().any(Rule::may_need_response_phase),
             rules,
         }
     }
@@ -479,6 +726,7 @@ impl RuleGroup {
     /// Re-parse rules from the current text.
     fn reparse(&mut self) {
         self.rules = parse_text(&self.text);
+        self.res_phase_candidates = self.rules.iter().any(Rule::may_need_response_phase);
     }
 
     /// Number of parsed rules in this group.
@@ -555,13 +803,45 @@ impl RuleManager {
     /// that the `internal`/`internalOnly` line properties can be honoured. Pass
     /// `true` for requests whistle itself issues (plugin calls, internal paths).
     pub fn resolve_scoped(&self, req: &ReqInfo, is_internal_req: bool) -> Resolved {
-        let all_rules: Vec<&Rule> = self
-            .groups
+        matcher::resolve_refs_scoped(&self.enabled_rules(), req, is_internal_req)
+    }
+
+    /// Could *any* enabled rule need a second, response-phase resolution?
+    ///
+    /// Answered from a flag each group precomputes when it parses, so the
+    /// overwhelmingly common answer — "no rule mentions the response" — costs
+    /// one comparison per group and the response pass is skipped outright.
+    pub fn may_need_response_phase(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|g| g.enabled && g.res_phase_candidates)
+    }
+
+    /// Resolve the response-phase operators the request pass withheld, given a
+    /// [`ReqInfo`] carrying the response head ([`ReqInfo::res`]).
+    ///
+    /// `None` means there was nothing to do — no rule's response-phase operators
+    /// were withheld for this request — and the caller can keep the request
+    /// phase's answer as it stands. See [`matcher::resolve_response_refs`] for
+    /// what the pass covers and [`Resolved::merge_response_phase`] for how the
+    /// two are put back together.
+    pub fn resolve_response(&self, req: &ReqInfo, is_internal_req: bool) -> Option<Resolved> {
+        if !self.may_need_response_phase() {
+            return None;
+        }
+        matcher::resolve_response_refs(&self.enabled_rules(), req, is_internal_req)
+    }
+
+    /// Every rule of every enabled group, in resolution order.
+    ///
+    /// Both passes build the list the same way, so a rule keeps its index — and
+    /// therefore its [`order_key`] — across them.
+    fn enabled_rules(&self) -> Vec<&Rule> {
+        self.groups
             .iter()
             .filter(|g| g.enabled)
             .flat_map(|g| &g.rules)
-            .collect();
-        matcher::resolve_refs_scoped(&all_rules, req, is_internal_req)
+            .collect()
     }
 
     // ── Group management API ──
@@ -757,6 +1037,14 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
         op.props = props.clone();
     }
 
+    // Both answers are the same for every rule this line produces, and both are
+    // read on the hot path — the request pass asks each matched rule whether to
+    // withhold its response-phase operators.
+    let res_phase_ops = ops
+        .iter()
+        .any(|op| protocols::is_res_phase(&op.protocol) || op.protocol == "ignore");
+    let res_dependent = filters.iter().any(|f| f.cond.may_need_response());
+
     pattern_toks
         .into_iter()
         .filter_map(|tok| {
@@ -769,6 +1057,8 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
                 negate: parsed.negate,
                 filters: filters.clone(),
                 props: props.clone(),
+                res_phase_ops,
+                res_dependent,
             })
         })
         .collect()
@@ -797,7 +1087,14 @@ enum CondKind {
     Host,
     Ip,
     ClientIp,
-    ReqHeader,
+    ServerIp,
+    ClientPort,
+    ServerPort,
+    RemoteAddress,
+    RemotePort,
+    StatusCode,
+    /// A header condition, in one of the three scopes upstream distinguishes.
+    Header(HeaderScope),
     Chance,
     /// Recognised, but unanswerable here — see [`Deferred`].
     Later(Deferred),
@@ -825,33 +1122,35 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("method", CondKind::Method, true, false),
     ("i", CondKind::Ip, true, false),
     ("ip", CondKind::Ip, true, false),
-    ("h", CondKind::ReqHeader, true, false),
-    ("header", CondKind::ReqHeader, true, false),
+    // `h`/`header` are upstream's `filter.header`, the one header spelling that
+    // reads the response too — see [`HeaderScope`].
+    ("h", CondKind::Header(HeaderScope::RequestThenResponse), true, false),
+    ("header", CondKind::Header(HeaderScope::RequestThenResponse), true, false),
     // `host:` is this port's own spelling (upstream has only the pure form, and
     // routes it to proxy-host filtering rather than to the request's host).
     ("host", CondKind::Host, true, true),
     ("clientIp", CondKind::ClientIp, true, true),
     ("clientIP", CondKind::ClientIp, true, true),
-    ("req", CondKind::ReqHeader, true, true),
-    ("reqH", CondKind::ReqHeader, true, true),
-    ("reqHeader", CondKind::ReqHeader, true, true),
-    ("reqHeaders", CondKind::ReqHeader, true, true),
+    ("req", CondKind::Header(HeaderScope::Request), true, true),
+    ("reqH", CondKind::Header(HeaderScope::Request), true, true),
+    ("reqHeader", CondKind::Header(HeaderScope::Request), true, true),
+    ("reqHeaders", CondKind::Header(HeaderScope::Request), true, true),
     ("chance", CondKind::Chance, true, true),
     ("probability", CondKind::Chance, true, true),
-    ("s", CondKind::Later(Deferred::StatusCode), true, false),
-    ("statusCode", CondKind::Later(Deferred::StatusCode), true, true),
+    ("s", CondKind::StatusCode, true, false),
+    ("statusCode", CondKind::StatusCode, true, true),
     ("b", CondKind::Later(Deferred::Body), true, false),
     ("body", CondKind::Later(Deferred::Body), true, false),
-    ("res", CondKind::Later(Deferred::ResHeader), true, true),
-    ("resH", CondKind::Later(Deferred::ResHeader), true, true),
-    ("resHeader", CondKind::Later(Deferred::ResHeader), true, true),
-    ("resHeaders", CondKind::Later(Deferred::ResHeader), true, true),
-    ("serverIp", CondKind::Later(Deferred::ServerIp), true, true),
-    ("serverIP", CondKind::Later(Deferred::ServerIp), true, true),
-    ("clientPort", CondKind::Later(Deferred::ClientPort), true, true),
-    ("serverPort", CondKind::Later(Deferred::ServerPort), true, true),
-    ("remoteAddress", CondKind::Later(Deferred::RemoteAddress), true, true),
-    ("remotePort", CondKind::Later(Deferred::RemotePort), true, true),
+    ("res", CondKind::Header(HeaderScope::Response), true, true),
+    ("resH", CondKind::Header(HeaderScope::Response), true, true),
+    ("resHeader", CondKind::Header(HeaderScope::Response), true, true),
+    ("resHeaders", CondKind::Header(HeaderScope::Response), true, true),
+    ("serverIp", CondKind::ServerIp, true, true),
+    ("serverIP", CondKind::ServerIp, true, true),
+    ("clientPort", CondKind::ClientPort, true, true),
+    ("serverPort", CondKind::ServerPort, true, true),
+    ("remoteAddress", CondKind::RemoteAddress, true, true),
+    ("remotePort", CondKind::RemotePort, true, true),
     ("env", CondKind::Later(Deferred::Env), true, true),
     ("from", CondKind::Later(Deferred::From), true, true),
 ];
@@ -975,12 +1274,19 @@ fn build_cond(kind: CondKind, rest: &str) -> Option<(Cond, bool)> {
         CondKind::Host => Cond::Host(CondValue::parse(rest, false)),
         CondKind::Ip => Cond::Ip(CondValue::parse(rest, false)),
         CondKind::ClientIp => Cond::ClientIp(CondValue::parse(rest, false)),
-        CondKind::ReqHeader => {
+        CondKind::ServerIp => Cond::ServerIp(CondValue::parse(rest, false)),
+        CondKind::ClientPort => Cond::ClientPort(CondValue::parse(rest, false)),
+        CondKind::ServerPort => Cond::ServerPort(CondValue::parse(rest, false)),
+        CondKind::RemoteAddress => Cond::RemoteAddress(CondValue::parse(rest, false)),
+        CondKind::RemotePort => Cond::RemotePort(CondValue::parse(rest, false)),
+        CondKind::StatusCode => Cond::StatusCode(CondValue::parse(rest, false)),
+        CondKind::Header(scope) => {
             let (key, key_negate, value) = split_keyed_value(rest, true)?;
             return Some((
-                Cond::ReqHeader {
+                Cond::Header {
                     name: key.to_lowercase(),
                     value: CondValue::parse(value, false),
+                    scope,
                 },
                 negate != key_negate,
             ));
@@ -1099,7 +1405,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
                 protocol: canon.to_string(),
                 value: rest.to_string(),
                 raw: tok.to_string(),
-                props: LineProps::default(),
+                ..Default::default()
             });
         }
         // Unknown scheme (e.g. a plain proxy target) — treat as a proxy URL.
@@ -1107,7 +1413,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
             protocol: proto.to_string(),
             value: rest.to_string(),
             raw: tok.to_string(),
-            props: LineProps::default(),
+            ..Default::default()
         });
     }
     if is_host_shorthand(tok) {
@@ -1115,7 +1421,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
             protocol: "host".to_string(),
             value: tok.to_string(),
             raw: tok.to_string(),
-            props: LineProps::default(),
+            ..Default::default()
         });
     }
     // Bare path / file shorthand → file operator.
@@ -1124,7 +1430,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
             protocol: "file".to_string(),
             value: tok.to_string(),
             raw: tok.to_string(),
-            props: LineProps::default(),
+            ..Default::default()
         });
     }
     None
@@ -1309,8 +1615,7 @@ mod group_tests {
             port,
             path: path.clone(),
             full_url: url.into(),
-            client_ip: None,
-            headers: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -1380,8 +1685,7 @@ mod line_props_tests {
             port,
             path,
             full_url: url.into(),
-            client_ip: None,
-            headers: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -1581,7 +1885,7 @@ mod filter_parse_tests {
             "filter://h:x-tag:yes",
         ] {
             match cond_of(token).cond {
-                Cond::ReqHeader { name, value } => {
+                Cond::Header { name, value, .. } => {
                     assert_eq!(name, "x-tag", "{token}");
                     assert!(value.matches_header("yes"), "{token}");
                 }
@@ -1590,11 +1894,31 @@ mod filter_parse_tests {
         }
     }
 
+    /// Which message a header spelling reads, upstream's `propName[2]` switch
+    /// (`_original/lib/rules/rules.js:1668-1681`): `re**q**H` the request,
+    /// `re**s**H` the response, and the bare `h`/`header` both.
+    #[test]
+    fn header_spellings_carry_their_scope() {
+        let scope_of = |token: &str| match cond_of(token).cond {
+            Cond::Header { scope, .. } => scope,
+            other => panic!("{token} parsed as {other:?}"),
+        };
+        for token in ["includeFilter://reqH.x:1", "includeFilter://reqHeaders.x:1"] {
+            assert_eq!(scope_of(token), HeaderScope::Request, "{token}");
+        }
+        for token in ["includeFilter://resH.x:1", "includeFilter://resHeaders.x:1"] {
+            assert_eq!(scope_of(token), HeaderScope::Response, "{token}");
+        }
+        for token in ["filter://h:x=1", "filter://header:x=1"] {
+            assert_eq!(scope_of(token), HeaderScope::RequestThenResponse, "{token}");
+        }
+    }
+
     /// Header keys are case-folded, since `ReqInfo` stores them lowercased.
     #[test]
     fn header_key_is_lowercased() {
         match cond_of("includeFilter://reqH.X-Tag:yes").cond {
-            Cond::ReqHeader { name, .. } => assert_eq!(name, "x-tag"),
+            Cond::Header { name, .. } => assert_eq!(name, "x-tag"),
             other => panic!("parsed as {other:?}"),
         }
     }
@@ -1603,7 +1927,7 @@ mod filter_parse_tests {
     #[test]
     fn header_without_a_value_matches_anything() {
         match cond_of("includeFilter://reqH.x-tag").cond {
-            Cond::ReqHeader { name, value } => {
+            Cond::Header { name, value, .. } => {
                 assert_eq!(name, "x-tag");
                 assert!(value.matches_header("whatever"));
                 assert!(value.matches_header(""));
@@ -1623,7 +1947,7 @@ mod filter_parse_tests {
         ));
         assert!(matches!(
             cond_of("includeFilter://reqH.x-tag:yes").cond,
-            Cond::ReqHeader { .. }
+            Cond::Header { .. }
         ));
     }
 
@@ -1634,30 +1958,63 @@ mod filter_parse_tests {
         assert!(matches!(cond_of("filter://host:example.com").cond, Cond::Host(_)));
         assert!(matches!(
             cond_of("filter://statusCode:200").cond,
-            Cond::Deferred(Deferred::StatusCode)
+            Cond::StatusCode(_)
         ));
         assert!(matches!(cond_of("filter://ip:1.2.3.4").cond, Cond::Ip(_)));
         assert!(matches!(
             cond_of("includeFilter://reqHeaders.x:1").cond,
-            Cond::ReqHeader { .. }
+            Cond::Header { .. }
         ));
     }
 
-    /// Every condition upstream defers to the response phase is recognised, so
+    /// The conditions whose facts arrive with the response head parse into
+    /// conditions of their own — they are answered in the response phase, not
+    /// deferred forever.
+    #[test]
+    fn response_phase_conditions_are_recognised() {
+        assert!(matches!(cond_of("filter://s:200").cond, Cond::StatusCode(_)));
+        assert!(matches!(
+            cond_of("filter://statusCode:200").cond,
+            Cond::StatusCode(_)
+        ));
+        assert!(matches!(
+            cond_of("includeFilter://resH.content-type:json").cond,
+            Cond::Header {
+                scope: HeaderScope::Response,
+                ..
+            }
+        ));
+        assert!(matches!(
+            cond_of("filter://serverIp:1.2.3.4").cond,
+            Cond::ServerIp(_)
+        ));
+        assert!(matches!(
+            cond_of("includeFilter://serverIp=1.2.3.4").cond,
+            Cond::ServerIp(_)
+        ));
+        assert!(matches!(
+            cond_of("filter://serverPort:8080").cond,
+            Cond::ServerPort(_)
+        ));
+        assert!(matches!(
+            cond_of("filter://clientPort:8080").cond,
+            Cond::ClientPort(_)
+        ));
+        assert!(matches!(
+            cond_of("filter://remoteAddress:1.2.3.4").cond,
+            Cond::RemoteAddress(_)
+        ));
+        assert!(matches!(
+            cond_of("filter://remotePort:80").cond,
+            Cond::RemotePort(_)
+        ));
+    }
+
+    /// Every condition this port still cannot answer at all is recognised, so
     /// it cannot be mistaken for a URL pattern.
     #[test]
     fn deferred_conditions_are_recognised() {
         let cases = [
-            ("filter://s:200", Deferred::StatusCode),
-            ("filter://statusCode:200", Deferred::StatusCode),
-            ("includeFilter://resH.content-type:json", Deferred::ResHeader),
-            ("includeFilter://resHeaders.x:1", Deferred::ResHeader),
-            ("filter://serverIp:1.2.3.4", Deferred::ServerIp),
-            ("includeFilter://serverIp=1.2.3.4", Deferred::ServerIp),
-            ("filter://clientPort:8080", Deferred::ClientPort),
-            ("filter://serverPort:8080", Deferred::ServerPort),
-            ("filter://remoteAddress:1.2.3.4", Deferred::RemoteAddress),
-            ("filter://remotePort:80", Deferred::RemotePort),
             ("filter://b:keyword", Deferred::Body),
             ("filter://body:keyword", Deferred::Body),
             ("filter://env:x=1", Deferred::Env),
@@ -1682,7 +2039,7 @@ mod filter_parse_tests {
         ));
         assert!(matches!(
             cond_of("includeFilter://reqH.x-tag:/^ye/i").cond,
-            Cond::ReqHeader {
+            Cond::Header {
                 value: CondValue::Regex(_),
                 ..
             }
@@ -1764,7 +2121,7 @@ mod filter_parse_tests {
         let f = cond_of("includeFilter://reqH.!x-tag!:yes");
         assert!(!f.negate);
         match f.cond {
-            Cond::ReqHeader { name, .. } => assert_eq!(name, "x-tag"),
+            Cond::Header { name, .. } => assert_eq!(name, "x-tag"),
             other => panic!("parsed as {other:?}"),
         }
     }
@@ -1776,7 +2133,7 @@ mod filter_parse_tests {
         let f = cond_of("includeFilter://reqH.x-tag:!yes");
         assert!(!f.negate);
         match f.cond {
-            Cond::ReqHeader { value, .. } => {
+            Cond::Header { value, .. } => {
                 assert!(value.matches_header("!yes"));
                 assert!(!value.matches_header("yes"));
             }
@@ -2023,8 +2380,7 @@ mod parse_text_tests {
             port: if scheme == "https" { 443 } else { 80 },
             path,
             full_url: url.into(),
-            client_ip: None,
-            headers: Default::default(),
+            ..Default::default()
         }
     }
 

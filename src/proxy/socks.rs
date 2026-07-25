@@ -9,7 +9,7 @@
 //! Scope matches upstream's: SOCKS5 only (no SOCKS4), `CONNECT` only — neither
 //! `BIND` nor `UDP ASSOCIATE` is offered, and no authentication is required.
 
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -38,14 +38,14 @@ pub async fn run(state: Arc<AppState>, port: u16) -> Result<()> {
         stream.set_nodelay(true).ok();
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(state, stream, peer.ip()).await {
+            if let Err(e) = handle(state, stream, peer).await {
                 tracing::debug!("socks connection error: {e}");
             }
         });
     }
 }
 
-async fn handle(state: Arc<AppState>, mut stream: TcpStream, peer: IpAddr) -> Result<()> {
+async fn handle(state: Arc<AppState>, mut stream: TcpStream, peer: SocketAddr) -> Result<()> {
     let (host, port) = handshake(&mut stream).await?;
     // Peek the first byte to tell TLS (0x16 handshake record) from plain HTTP.
     let mut b = [0u8; 1];
