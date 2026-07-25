@@ -59,7 +59,12 @@
 
 - [ ] `tpl`/`dust`/`jsonp` 升级为完整 dust.js / handlebars 语义（当前为 `{name}` 简单替换）。
 - [ ] `{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量（与插件运行时耦合）。
-- [ ] `lineProps`（whistle 规则行级属性系统）。
+- [x] ~~`lineProps`（whistle 规则行级属性系统）~~ → **部分完成**，见
+      [`LINE_PROPS.md`](LINE_PROPS.md)。解析层与原版完全对齐（`[|&]` 分隔、无转义、多令牌合并、
+      未知属性保留）；`important` 已端到端生效；`internal`/`internalOnly` 的匹配门禁
+      （`resolve_refs_scoped`）已实现并测试，但**尚无调用方传入内部请求标记**；
+      `safeHtml`/`strictHtml` 的判定函数已就绪，等待 `apply.rs` 注入路径调用。
+      其余 12 个属性已解析并可经 `Resolved::props(protocol)` 读取，暂无运行时效果。
 
 ### 架构受限（rustls / MITM 时序）
 
