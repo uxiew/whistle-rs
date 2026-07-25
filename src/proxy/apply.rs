@@ -2245,9 +2245,95 @@ fn merge_json_patches(resolved: &Resolved, protocol: &str) -> Option<serde_json:
     Some(target)
 }
 
+/// The request facts `params://` needs to pick its destination.
+///
+/// Both are read *after* the request operators have run, because `reqType://`
+/// and `method://` are applied before `handleParams` decides
+/// (`_original/lib/inspectors/req.js:536,560-561`) — a `reqType://json` line
+/// therefore sends the params into the body.
+#[derive(Clone, Copy, Default)]
+pub struct ReqBodyCtx<'a> {
+    /// The method as forwarded (after `method://`).
+    pub method: &'a str,
+    /// The `Content-Type` as forwarded (after `reqType://` and `reqHeaders://`).
+    pub content_type: Option<&'a str>,
+}
+
+/// Which kind of request body `params://` merges into, if any.
+///
+/// `None` means the params address the query string instead — upstream's
+/// `hasBody` flag (`handleParams`, `_original/lib/inspectors/req.js:157-232`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParamsBody {
+    /// `application/json` (and anything else `getContentType` calls JSON).
+    Json,
+    /// `application/x-www-form-urlencoded` — **POST only**, as upstream has it.
+    Form,
+    /// `multipart/…` with a boundary; the boundary is read back from the type.
+    Multipart,
+}
+
+/// Where `params://` lands for this request, given what the rules resolved.
+///
+/// Answering `None` when no `params://` (and no `delete://reqBody.…`) matched is
+/// what keeps this off the hot path: an unmatched request never looks at its own
+/// content type. Both guards are map lookups — `Deletions::of`, which walks and
+/// allocates, is reached only once a `delete://` has actually matched.
+fn params_body_kind(resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> Option<ParamsBody> {
+    let asks = !resolved.all("params").is_empty()
+        || (!resolved.all("delete").is_empty()
+            && !Deletions::of(resolved, true).body_props.is_empty());
+    asks.then(|| request_body_kind(ctx)).flatten()
+}
+
+/// Classify a request body by method and content type, the way `handleParams`
+/// branches on it.
+fn request_body_kind(ctx: ReqBodyCtx<'_>) -> Option<ParamsBody> {
+    let ct = ctx.content_type?;
+    // `isMultipart` tests the content type alone — no method, no body check
+    // (`_original/lib/util/index.js:1724-1727`) — and the boundary must be
+    // spelled out for the parts to be found at all.
+    if ct.to_ascii_lowercase().contains("multipart") {
+        return multipart_boundary(ct).map(|_| ParamsBody::Multipart);
+    }
+    // `isUrlEncoded` is POST-only (`_original/lib/util/common.js:692-695`),
+    // while `isJSONContent` accepts any method that may carry a body.
+    if ct.to_ascii_lowercase().contains("application/x-www-form-urlencoded") {
+        return ctx.method.eq_ignore_ascii_case("POST").then_some(ParamsBody::Form);
+    }
+    if method_has_body(ctx.method) && matches!(res_class(ct), Some(ResClass::Json)) {
+        return Some(ParamsBody::Json);
+    }
+    None
+}
+
+/// `hasRequestBody` (`_original/lib/util/common.js:1591-1604`) — the methods
+/// whistle will look for a body on.
+fn method_has_body(method: &str) -> bool {
+    !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS" | "CONNECT"
+    )
+}
+
+/// The `boundary=` of a multipart content type (`BUOUNDARY_RE`,
+/// `_original/lib/inspectors/req.js:19`), quoted or bare.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    let lower = content_type.to_ascii_lowercase();
+    let at = lower.find("boundary=")? + "boundary=".len();
+    let rest = &content_type[at..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        return (end > 0).then(|| quoted[..end].to_string());
+    }
+    let end = rest.find(';').unwrap_or(rest.len());
+    let bare = rest[..end].trim();
+    (!bare.is_empty()).then(|| bare.to_string())
+}
+
 /// True if any request-body operator applies (so the body must be buffered).
-pub fn wants_req_body(resolved: &Resolved) -> bool {
-    body_ops_present(resolved, "req")
+pub fn wants_req_body(resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> bool {
+    body_ops_present(resolved, "req") || params_body_kind(resolved, ctx).is_some()
 }
 
 /// True if any response-body operator applies (so the body must be buffered).
@@ -2261,14 +2347,11 @@ pub fn wants_res_body(resolved: &Resolved) -> bool {
 /// (`handleReq` adds the transform, then `handleReplace`,
 /// `_original/lib/inspectors/req.js:129-130,573`), so a substitution *does* see
 /// what `reqPrepend`/`reqAppend` put there — the opposite of the response side.
-pub fn transform_req_body(
-    body: Bytes,
-    resolved: &Resolved,
-    content_type: Option<&str>,
-) -> Bytes {
+pub fn transform_req_body(body: Bytes, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> Bytes {
+    let del = Deletions::of(resolved, true);
     // `delete://body` wipes the body *and* anything an operator meant to put
     // around it (`removeBody`, `_original/lib/util/index.js:3592-3598`).
-    if Deletions::of(resolved, true).drop_body {
+    if del.drop_body {
         return Bytes::new();
     }
     // Request bodies are never injection-gated: whistle's request transform
@@ -2276,13 +2359,213 @@ pub fn transform_req_body(
     let gate = InjectionGate::plain(resolved);
     let mut injection = Injection::default();
     collect_generic(&mut injection, &gate, "req");
-    let data = injection.apply(body.to_vec(), false);
+    let mut data = injection.apply(body.to_vec(), false);
+    if let Some(kind) = params_body_kind(resolved, ctx) {
+        data = merge_params_into_body(data, resolved, &del, kind, ctx);
+    }
     // whistle gates `reqReplace` on the request's own content type, exactly as
     // it gates `resReplace` on the response's (`_original/lib/inspectors/req.js`
     // mirrors `res.js:129-132`): a request with no `content-type`, or an image
     // one, is left alone.
-    let class = content_type.and_then(res_class);
+    let class = ctx.content_type.and_then(res_class);
     Bytes::from(apply_replace(data, resolved, "reqReplace", class))
+}
+
+/// `params://` merged into the request body, and `delete://reqBody.…` applied
+/// alongside it (`handleParams`, `_original/lib/inspectors/req.js:157-232`).
+///
+/// The two ride the same transform upstream, which is why the deletions land
+/// here rather than in a pass of their own: they are only ever applied to a body
+/// whose shape whistle recognises.
+fn merge_params_into_body(
+    data: Vec<u8>,
+    resolved: &Resolved,
+    del: &Deletions,
+    kind: ParamsBody,
+    ctx: ReqBodyCtx<'_>,
+) -> Vec<u8> {
+    if kind == ParamsBody::Multipart {
+        let Some(boundary) = ctx.content_type.and_then(multipart_boundary) else {
+            return data;
+        };
+        return merge_params_into_multipart(data, resolved, del, &boundary);
+    }
+    // Not UTF-8 means bytes whistle's text transforms never see. (Upstream tries
+    // GB18030 first and re-encodes afterwards; this port stays UTF-8, as it does
+    // for every other text transform.)
+    let mut text = match String::from_utf8(data) {
+        Ok(text) => text,
+        Err(e) => return e.into_bytes(),
+    };
+    match kind {
+        ParamsBody::Json => {
+            let params = merge_params_values(resolved, "params");
+            // An empty body becomes the params outright — `JSON.stringify(params)`
+            // on the no-buffer branch (`req.js:214-218`).
+            if text.trim().is_empty() {
+                let mut obj = serde_json::Value::Object(params.into_iter().collect());
+                delete_json_props(&mut obj, &del.body_props);
+                return serde_json::to_vec(&obj).unwrap_or_default();
+            }
+            // Only the first JSON-looking span is patched, so a body wrapped in
+            // something else keeps its wrapper (`JSON_RE`, `req.js:18,193`).
+            let Some((start, end)) = json_span(&text) else {
+                return text.into_bytes();
+            };
+            let Ok(mut base) = serde_json::from_str::<serde_json::Value>(&text[start..end]) else {
+                return text.into_bytes();
+            };
+            // `extend(true, obj, params)` — deep, unlike the fold that built it.
+            for (key, value) in params {
+                json_deep_merge_key(&mut base, &key, value);
+            }
+            delete_json_props(&mut base, &del.body_props);
+            let Ok(merged) = serde_json::to_string(&base) else {
+                return text.into_bytes();
+            };
+            format!("{}{merged}{}", &text[..start], &text[end..]).into_bytes()
+        }
+        ParamsBody::Form => {
+            let params = merge_params_pairs(resolved, "params");
+            text = merge_query_string(&text, &params, &del.body_props);
+            text.into_bytes()
+        }
+        ParamsBody::Multipart => unreachable!("handled above"),
+    }
+}
+
+/// `params://` merged into a `multipart/form-data` body.
+///
+/// Upstream rewrites this one *streaming*, part by part, so it never holds a
+/// file upload in memory (`_original/lib/inspectors/req.js:226-410`). This port
+/// has the whole body in hand already — every other request-body operator
+/// buffers — so it splits on the boundary instead, which is far less code for
+/// the same result on a well-formed body:
+///
+/// * a part whose `name=` is in `params` has its **whole** part replaced, so an
+///   uploaded file named by a param becomes a plain field (upstream's
+///   `toMultipart(name, params[name])` does exactly this);
+/// * a part named by `delete://reqBody.<name>` is dropped;
+/// * params that matched no part are appended as new parts, in fold order.
+///
+/// A body that does not start with the boundary is left alone — upstream's
+/// `badMultipart` path, which passes the bytes through untouched.
+fn merge_params_into_multipart(
+    data: Vec<u8>,
+    resolved: &Resolved,
+    del: &Deletions,
+    boundary: &str,
+) -> Vec<u8> {
+    let start = format!("--{boundary}\r\n").into_bytes();
+    if !data.starts_with(&start) {
+        return data;
+    }
+    let sep = format!("\r\n--{boundary}").into_bytes();
+    let mut params = merge_params_pairs(resolved, "params");
+
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut rest = &data[start.len()..];
+    loop {
+        let Some(at) = find_bytes(rest, &sep) else {
+            // No closing boundary: not a body this can rewrite safely.
+            return data;
+        };
+        let part = &rest[..at];
+        let name = multipart_part_name(part);
+        let deleted = name
+            .as_deref()
+            .is_some_and(|n| del.body_props.iter().any(|d| d == n));
+        // `params[name] = undefined` marks the param consumed, so it is not
+        // appended again at the end.
+        let replacement = name
+            .as_deref()
+            .and_then(|n| params.iter().position(|(k, _)| k == n))
+            .map(|i| params.remove(i));
+        if !deleted {
+            match replacement {
+                Some((k, v)) => push_multipart_part(&mut out, boundary, &k, &v),
+                None => push_multipart_raw(&mut out, boundary, part),
+            }
+        }
+        rest = &rest[at + sep.len()..];
+        // `--` after the boundary ends the body; `\r\n` starts the next part.
+        if rest.starts_with(b"--") {
+            break;
+        }
+        match rest.strip_prefix(b"\r\n".as_slice()) {
+            Some(next) => rest = next,
+            None => return data,
+        }
+    }
+    for (name, value) in &params {
+        push_multipart_part(&mut out, boundary, name, value);
+    }
+    if out.is_empty() {
+        // Every part was deleted and nothing replaced them: emit an empty body
+        // rather than a lone terminator.
+        return Vec::new();
+    }
+    out.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
+    out
+}
+
+/// Append one already-encoded part, with the separator it needs.
+fn push_multipart_raw(out: &mut Vec<u8>, boundary: &str, part: &[u8]) {
+    match out.is_empty() {
+        true => out.extend_from_slice(format!("--{boundary}\r\n").as_bytes()),
+        false => out.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes()),
+    }
+    out.extend_from_slice(part);
+}
+
+/// Append a plain `name`/`value` field (`toMultipart`,
+/// `_original/lib/inspectors/req.js:61-95` — the string branch).
+fn push_multipart_part(out: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    let part = format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}");
+    push_multipart_raw(out, boundary, part.as_bytes());
+}
+
+/// The `name=` of a multipart part, read from the headers ahead of its blank
+/// line (`getName` over `NAME_RE`, `_original/lib/inspectors/req.js:41-59`).
+fn multipart_part_name(part: &[u8]) -> Option<String> {
+    let at = find_bytes(part, b"\r\n\r\n")?;
+    let headers = std::str::from_utf8(&part[..at]).ok()?;
+    let start = headers.to_ascii_lowercase().find("name=")? + "name=".len();
+    let rest = &headers[start..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return quoted.find('"').map(|end| quoted[..end].to_string());
+    }
+    let end = rest.find([';', '\r']).unwrap_or(rest.len());
+    let bare = rest[..end].trim();
+    // A `'`-quoted name is unwrapped too (`getName`'s second branch).
+    let bare = bare
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(bare);
+    (!bare.is_empty()).then(|| bare.to_string())
+}
+
+/// Index of `needle` in `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Deep-merge one `params` entry into a JSON value at the top level.
+fn json_deep_merge_key(base: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    let serde_json::Value::Object(map) = base else {
+        return;
+    };
+    match map.get_mut(key) {
+        Some(slot) => json_deep_merge(slot, &value),
+        None => {
+            map.insert(key.to_string(), value);
+        }
+    }
 }
 
 /// Transform a buffered response body; `content_type` decides which typed-body
@@ -2697,10 +2980,13 @@ fn merge_rule_maps(resolved: &Resolved, protocol: &str) -> Vec<(String, String)>
 
 /// The `extend`-over-the-reversed-list core of [`merge_rule_maps`], over lines
 /// already parsed into pairs.
-fn merge_line_maps(
-    lines: impl DoubleEndedIterator<Item = Vec<(String, String)>>,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+///
+/// Generic in the value so that `params://` can fold as JSON — the flat
+/// `String` view cannot carry a nested object into a JSON request body.
+fn merge_line_maps<V>(
+    lines: impl DoubleEndedIterator<Item = Vec<(String, V)>>,
+) -> Vec<(String, V)> {
+    let mut out: Vec<(String, V)> = Vec::new();
     for pairs in lines.rev() {
         for (key, value) in pairs {
             match out.iter_mut().find(|(k, _)| *k == key) {
@@ -2837,7 +3123,7 @@ fn apply_str_replace(text: &str, pairs: &[(String, String)]) -> String {
 }
 
 /// Rewrite the request path+query per `urlReplace`, `params`, and `urlParams`.
-pub fn rewrite_path(path: &str, resolved: &Resolved) -> String {
+pub fn rewrite_path(path: &str, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> String {
     let mut p = path.to_string();
     let replacements = merge_rule_maps(resolved, "urlReplace");
     if !replacements.is_empty() {
@@ -2854,43 +3140,73 @@ pub fn rewrite_path(path: &str, resolved: &Resolved) -> String {
     }
     // Each protocol collapses to one map of its own, then `urlParams` is laid
     // over `params` (`extend(_params, urlParams)`,
-    // `_original/lib/inspectors/req.js:425`).
+    // `_original/lib/inspectors/req.js:425`). `params` is skipped entirely when
+    // the body claimed it — `_params = hasBody ? null : params` (`req.js:421`);
+    // `urlParams` always addresses the query.
     let mut params: Vec<(String, String)> = Vec::new();
-    for key in ["params", "urlParams"] {
-        params.extend(merge_line_maps(
-            resolved.all(key).iter().map(|op| parse_query_pairs(&op.value)),
-        ));
+    if params_body_kind(resolved, ctx).is_none() {
+        params.extend(merge_params_pairs(resolved, "params"));
     }
+    params.extend(merge_params_pairs(resolved, "urlParams"));
     if !params.is_empty() {
         p = merge_query(&p, &params);
     }
     p
 }
 
-/// Parse `k=v&k2=v2` or `{json}` into query pairs.
-fn parse_query_pairs(value: &str) -> Vec<(String, String)> {
+/// The `params`/`urlParams` lines of one protocol folded into a flat map, first
+/// line winning a contested name.
+fn merge_params_pairs(resolved: &Resolved, protocol: &str) -> Vec<(String, String)> {
+    merge_params_values(resolved, protocol)
+        .into_iter()
+        .map(|(k, v)| (k, json_to_param_string(v)))
+        .collect()
+}
+
+/// The same fold, keeping each value as JSON so a nested object survives into a
+/// JSON request body.
+fn merge_params_values(resolved: &Resolved, protocol: &str) -> Vec<(String, serde_json::Value)> {
+    merge_line_maps(
+        resolved
+            .all(protocol)
+            .iter()
+            .map(|op| parse_param_values(&op.value)),
+    )
+}
+
+/// Parse `k=v&k2=v2` or `{json}` into `name` → JSON value pairs.
+fn parse_param_values(value: &str) -> Vec<(String, serde_json::Value)> {
     let value = value.trim();
     if value.starts_with('{') {
         if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            return map
-                .into_iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        serde_json::Value::String(s) => s,
-                        other => other.to_string(),
-                    };
-                    (k, val)
-                })
-                .collect();
+            return map.into_iter().collect();
         }
     }
     value
         .split('&')
         .filter_map(|kv| {
             let (k, v) = kv.split_once('=')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
+            Some((
+                k.trim().to_string(),
+                serde_json::Value::String(v.trim().to_string()),
+            ))
         })
         .collect()
+}
+
+/// A param value as it appears in a query string or a form body: a JSON string
+/// unquoted, anything else serialised.
+///
+/// Upstream reaches the same place by a different road — `qs.stringify` would
+/// spell a nested object `a[b]=1` — so a `params://{"a":{"b":1}}` written
+/// against a *form* body differs. Against a JSON body, which is where a nested
+/// value belongs, both implementations merge the structure.
+fn json_to_param_string(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 /// Merge `params` into the query string of `path`, overriding same-named keys.
@@ -2899,27 +3215,42 @@ fn merge_query(path: &str, params: &[(String, String)]) -> String {
         Some((b, q)) => (b, q),
         None => (path, ""),
     };
+    let merged = merge_query_string(query, params, &[]);
+    if merged.is_empty() {
+        return base.to_string();
+    }
+    format!("{base}?{merged}")
+}
+
+/// `replaceQueryString` (`_original/lib/util/index.js:1738-1800`): overlay
+/// `params` on a `k=v&…` string, dropping the names in `del`.
+///
+/// The surviving original pairs keep their position and order; each replaced or
+/// new name is appended in `params` order. Shared by the query string and the
+/// urlencoded request body, which upstream runs through the same function.
+fn merge_query_string(query: &str, params: &[(String, String)], del: &[String]) -> String {
+    let deleted = |name: &str| del.iter().any(|d| d == name);
     let mut pairs: Vec<(String, String)> = query
         .split('&')
         .filter(|s| !s.is_empty())
-        .filter_map(|kv| {
+        .map(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            Some((k.to_string(), v.to_string()))
+            (k.to_string(), v.to_string())
         })
+        .filter(|(k, _)| !deleted(k))
         .collect();
     for (k, v) in params {
+        if deleted(k) {
+            continue;
+        }
         pairs.retain(|(ek, _)| ek != k);
         pairs.push((k.clone(), v.clone()));
     }
-    if pairs.is_empty() {
-        return base.to_string();
-    }
-    let q = pairs
+    pairs
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
-        .join("&");
-    format!("{base}?{q}")
+        .join("&")
 }
 
 /// Remove length/encoding headers so hyper recomputes them for a rewritten body.
@@ -3189,6 +3520,11 @@ mod tests {
         m.resolve(&info)
     }
 
+    /// Request facts for the body operators: a POST carrying `content_type`.
+    fn body_ctx(content_type: Option<&str>) -> ReqBodyCtx<'_> {
+        ReqBodyCtx { method: "POST", content_type }
+    }
+
     /// As [`resolve`], returning the [`ReqInfo`] as well for the callers that
     /// need it (the include merge, which resolves the included text in the
     /// request's own scope).
@@ -3335,8 +3671,8 @@ mod tests {
 
         // `req.body` is the request's alone.
         let resolved = resolve("example.com/x delete://req.body\n", "http://example.com/x");
-        assert!(wants_req_body(&resolved) && !wants_res_body(&resolved));
-        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved, Some("text/plain"))[..], b"");
+        assert!(wants_req_body(&resolved, body_ctx(None)) && !wants_res_body(&resolved));
+        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved, body_ctx(Some("text/plain")))[..], b"");
     }
 
     /// The `/regexp/flags` form follows JavaScript's `String#replace`: without
@@ -3446,10 +3782,10 @@ mod tests {
     #[test]
     fn req_body_replaced_only_when_present() {
         let none = resolve("example.com host://1.1.1.1\n", "http://example.com/");
-        assert!(!wants_req_body(&none));
+        assert!(!wants_req_body(&none, body_ctx(None)));
         let some = resolve("example.com reqBody://HELLO\n", "http://example.com/");
-        assert!(wants_req_body(&some));
-        let out = transform_req_body(Bytes::from_static(b"orig"), &some, Some("text/plain"));
+        assert!(wants_req_body(&some, body_ctx(None)));
+        let out = transform_req_body(Bytes::from_static(b"orig"), &some, body_ctx(Some("text/plain")));
         assert_eq!(&out[..], b"HELLO");
     }
 
@@ -3493,7 +3829,7 @@ mod tests {
             "example.com/api urlReplace://v1=v2\nexample.com/api params://token=abc\n",
             "http://example.com/api/v1/users?a=1",
         );
-        let out = rewrite_path("/api/v1/users?a=1", &resolved);
+        let out = rewrite_path("/api/v1/users?a=1", &resolved, body_ctx(None));
         assert!(out.starts_with("/api/v2/users?"));
         assert!(out.contains("a=1"));
         assert!(out.contains("token=abc"));
@@ -3502,10 +3838,184 @@ mod tests {
     #[test]
     fn params_override_existing_key() {
         let resolved = resolve("example.com params://a=2\n", "http://example.com/p?a=1&b=3");
-        let out = rewrite_path("/p?a=1&b=3", &resolved);
+        let out = rewrite_path("/p?a=1&b=3", &resolved, body_ctx(None));
         assert!(out.contains("b=3"));
         assert!(out.contains("a=2"));
         assert!(!out.contains("a=1"));
+    }
+
+    // ── `params://` merged into the request body ──
+
+    /// `transform_req_body` for a POST carrying `ct`.
+    fn merged_body(rules: &str, ct: Option<&str>, body: &str) -> String {
+        let resolved = resolve(rules, "http://example.com/p");
+        let out = transform_req_body(Bytes::from(body.to_string()), &resolved, body_ctx(ct));
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A form body takes the params, and the query string does **not** — the
+    /// two are exclusive upstream (`_params = hasBody ? null : params`,
+    /// `_original/lib/inspectors/req.js:421`). `urlParams` still goes to the
+    /// query either way.
+    #[test]
+    fn params_merge_into_a_form_body() {
+        const FORM: &str = "application/x-www-form-urlencoded";
+        assert_eq!(
+            merged_body("example.com params://b=2\n", Some(FORM), "a=1"),
+            "a=1&b=2"
+        );
+        // A name already in the body is replaced in place.
+        assert_eq!(
+            merged_body("example.com params://a=9\n", Some(FORM), "a=1&b=2"),
+            "b=2&a=9"
+        );
+        // An empty body becomes the params outright.
+        assert_eq!(merged_body("example.com params://a=1\n", Some(FORM), ""), "a=1");
+
+        let resolved = resolve(
+            "example.com params://b=2 urlParams://c=3\n",
+            "http://example.com/p?a=1",
+        );
+        let ctx = body_ctx(Some(FORM));
+        assert_eq!(rewrite_path("/p?a=1", &resolved, ctx), "/p?a=1&c=3");
+        // Without a body to take them, the params land in the query as before.
+        assert_eq!(
+            rewrite_path("/p?a=1", &resolved, body_ctx(None)),
+            "/p?a=1&b=2&c=3"
+        );
+    }
+
+    /// `isUrlEncoded` is POST-only upstream
+    /// (`_original/lib/util/common.js:692-695`), so the same rule on a PUT sends
+    /// the params to the query string. Odd, and reproduced.
+    #[test]
+    fn a_form_body_takes_params_only_on_post() {
+        const FORM: &str = "application/x-www-form-urlencoded";
+        let resolved = resolve("example.com params://b=2\n", "http://example.com/p");
+        let put = ReqBodyCtx { method: "PUT", content_type: Some(FORM) };
+        assert!(!wants_req_body(&resolved, put));
+        assert_eq!(rewrite_path("/p", &resolved, put), "/p?b=2");
+
+        let post = ReqBodyCtx { method: "POST", content_type: Some(FORM) };
+        assert!(wants_req_body(&resolved, post));
+        assert_eq!(rewrite_path("/p", &resolved, post), "/p");
+    }
+
+    /// A JSON body is patched, deeply, and only across its first JSON-looking
+    /// span so a wrapper survives (`JSON_RE`, `_original/lib/inspectors/req.js:18`).
+    #[test]
+    fn params_merge_into_a_json_body() {
+        const JSON: &str = "application/json";
+        assert_eq!(
+            merged_body("example.com params://b=2\n", Some(JSON), "{\"a\":1}"),
+            "{\"a\":1,\"b\":\"2\"}"
+        );
+        // A `{json}` value keeps its structure and merges deeply — the flat
+        // `name=value` view could only have inserted a string.
+        assert_eq!(
+            merged_body(
+                "example.com params://{\"a\":{\"y\":2}}\n",
+                Some(JSON),
+                "{\"a\":{\"x\":1}}"
+            ),
+            "{\"a\":{\"x\":1,\"y\":2}}"
+        );
+        // The wrapper around the JSON span is untouched.
+        assert_eq!(
+            merged_body("example.com params://b=2\n", Some(JSON), "cb({\"a\":1})"),
+            "cb({\"a\":1,\"b\":\"2\"})"
+        );
+        // An empty body becomes the params, serialised as JSON.
+        assert_eq!(
+            merged_body("example.com params://a=1\n", Some(JSON), ""),
+            "{\"a\":\"1\"}"
+        );
+        // A GET carries no body upstream, so the params address the query.
+        let resolved = resolve("example.com params://b=2\n", "http://example.com/p");
+        let get = ReqBodyCtx { method: "GET", content_type: Some(JSON) };
+        assert_eq!(rewrite_path("/p", &resolved, get), "/p?b=2");
+    }
+
+    /// `delete://reqBody.<path>` rides the same transform upstream, so it only
+    /// ever reaches a body whose shape whistle recognises.
+    #[test]
+    fn delete_req_body_props() {
+        assert_eq!(
+            merged_body(
+                "example.com delete://reqBody.a.x\n",
+                Some("application/json"),
+                "{\"a\":{\"x\":1,\"y\":2}}"
+            ),
+            "{\"a\":{\"y\":2}}"
+        );
+        assert_eq!(
+            merged_body(
+                "example.com delete://reqBody.a\n",
+                Some("application/x-www-form-urlencoded"),
+                "a=1&b=2"
+            ),
+            "b=2"
+        );
+    }
+
+    /// A multipart body: a part named by a param is replaced whole, one named
+    /// by `delete://reqBody.` is dropped, and an unmatched param is appended.
+    #[test]
+    fn params_merge_into_a_multipart_body() {
+        const CT: &str = "multipart/form-data; boundary=X";
+        let body = "--X\r\n\
+                    Content-Disposition: form-data; name=\"keep\"\r\n\r\nkept\r\n\
+                    --X\r\n\
+                    Content-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n\
+                    Content-Type: application/octet-stream\r\n\r\nRAW\r\n\
+                    --X\r\n\
+                    Content-Disposition: form-data; name=\"gone\"\r\n\r\nbye\r\n\
+                    --X--";
+        let out = merged_body(
+            "example.com params://file=replaced&extra=new delete://reqBody.gone\n",
+            Some(CT),
+            body,
+        );
+        assert_eq!(
+            out,
+            "--X\r\n\
+             Content-Disposition: form-data; name=\"keep\"\r\n\r\nkept\r\n\
+             --X\r\n\
+             Content-Disposition: form-data; name=\"file\"\r\n\r\nreplaced\r\n\
+             --X\r\n\
+             Content-Disposition: form-data; name=\"extra\"\r\n\r\nnew\r\n\
+             --X--"
+        );
+        // A body that does not open with the boundary is passed through, which
+        // is upstream's `badMultipart` path.
+        assert_eq!(
+            merged_body("example.com params://a=1\n", Some(CT), "not multipart"),
+            "not multipart"
+        );
+        // No boundary in the content type means no parts to find, so the params
+        // fall back to the query string.
+        let resolved = resolve("example.com params://a=1\n", "http://example.com/p");
+        let no_boundary = ReqBodyCtx {
+            method: "POST",
+            content_type: Some("multipart/form-data"),
+        };
+        assert!(!wants_req_body(&resolved, no_boundary));
+        assert_eq!(rewrite_path("/p", &resolved, no_boundary), "/p?a=1");
+    }
+
+    /// A request no `params://` line matched never looks at its own body: the
+    /// buffering decision is answered from the resolved set alone.
+    #[test]
+    fn params_cost_nothing_when_no_rule_asks() {
+        let resolved = resolve("example.com host://1.1.1.1\n", "http://example.com/p");
+        for ct in [
+            None,
+            Some("application/json"),
+            Some("application/x-www-form-urlencoded"),
+            Some("multipart/form-data; boundary=X"),
+        ] {
+            assert!(!wants_req_body(&resolved, body_ctx(ct)));
+        }
     }
 
     #[test]
@@ -4874,7 +5384,7 @@ mod tests {
             "example.com/api urlReplace://v1=v2\nexample.com/api urlReplace://old=new\n",
             "http://example.com/api/v1/old",
         );
-        assert_eq!(rewrite_path("/api/v1/old", &resolved), "/api/v2/new");
+        assert_eq!(rewrite_path("/api/v1/old", &resolved, body_ctx(None)), "/api/v2/new");
     }
 
     /// The request side accumulates through the same code path.
@@ -4885,7 +5395,7 @@ mod tests {
              example.com reqAppend://a1\nexample.com reqAppend://a2\n",
             "http://example.com/",
         );
-        let out = transform_req_body(Bytes::from_static(b"BODY"), &resolved, Some("text/plain"));
+        let out = transform_req_body(Bytes::from_static(b"BODY"), &resolved, body_ctx(Some("text/plain")));
         assert_eq!(out, Bytes::from_static(b"p1\r\np2BODYa1\r\na2"));
     }
 
@@ -5427,17 +5937,17 @@ mod tests {
         let body = || Bytes::from_static(b"old");
 
         assert_eq!(
-            &transform_req_body(body(), &resolved, Some("text/plain"))[..],
+            &transform_req_body(body(), &resolved, body_ctx(Some("text/plain")))[..],
             b"new",
             "text is rewritten"
         );
         assert_eq!(
-            &transform_req_body(body(), &resolved, None)[..],
+            &transform_req_body(body(), &resolved, body_ctx(None))[..],
             b"old",
             "no content-type: left alone"
         );
         assert_eq!(
-            &transform_req_body(body(), &resolved, Some("image/png"))[..],
+            &transform_req_body(body(), &resolved, body_ctx(Some("image/png")))[..],
             b"old",
             "images are left alone"
         );
@@ -5467,3 +5977,4 @@ mod tests {
         assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x%3BSecure");
     }
 }
+

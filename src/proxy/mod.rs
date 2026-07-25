@@ -1213,8 +1213,6 @@ async fn serve(
     // handle this request already returned above; any rules they injected have
     // been merged into `resolved`.)
     let (mut parts, incoming) = req.into_parts();
-    let new_path = apply::rewrite_path(&info.path, &resolved);
-    parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, &host, port, &scheme);
     parts.headers.remove("proxy-connection");
     mark_stripped_tls(&mut parts.headers, &target);
@@ -1249,15 +1247,26 @@ async fn serve(
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // Read after the request operators, because `method://` and `reqType://`
+    // decide whether `params://` addresses the body or the query string — as
+    // they do upstream (`_original/lib/inspectors/req.js:536,560-561`). That is
+    // also why the path is rewritten here rather than before `apply_request`.
+    let req_method = parts.method.to_string();
+    let body_ctx = apply::ReqBodyCtx {
+        method: &req_method,
+        content_type: req_ct.as_deref(),
+    };
+    let new_path = apply::rewrite_path(&info.path, &resolved, body_ctx);
+    parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     let req_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     let mut req_body_cap: Option<Capture> = None;
-    let req_body: DynBody = if apply::wants_req_body(&resolved)
+    let req_body: DynBody = if apply::wants_req_body(&resolved, body_ctx)
         || req_speed.is_some()
         || req_write.is_some()
         || req_write_raw.is_some()
     {
         let bytes = collect_body(incoming).await?;
-        let new = apply::transform_req_body(bytes, &resolved, req_ct.as_deref());
+        let new = apply::transform_req_body(bytes, &resolved, body_ctx);
         if let Some(path) = &req_write {
             write_body_file(path, &new);
         }
@@ -1683,9 +1692,10 @@ async fn serve_upgrade(
         .unwrap_or_default();
     let client_upgrade = hyper::upgrade::on(&mut req);
 
-    // Build the upstream handshake request (upgrades carry no body).
+    // Build the upstream handshake request (upgrades carry no body, so
+    // `params://` can only address the query string here).
     let (mut parts, _body) = req.into_parts();
-    let new_path = apply::rewrite_path(&info.path, resolved);
+    let new_path = apply::rewrite_path(&info.path, resolved, apply::ReqBodyCtx::default());
     parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, host, port, scheme);
     parts.headers.remove("proxy-connection");

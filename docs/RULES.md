@@ -324,7 +324,8 @@ Still missing: a `user@` prefix on the PAC URL is not read as a proxy credential
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `urlReplace` | `from=to` (or `/regex/[i]=to`) | Substitute inside the request path+query (accumulates) |
-| `params` / `urlParams` | `k=v&k2=v2` or `{json}` | Add/override query params (accumulates) |
+| `params` | `k=v&k2=v2` or `{json}` | Add/override params — in the **request body** when the request has one whistle recognises, otherwise in the query string (accumulates) |
+| `urlParams` | `k=v&k2=v2` or `{json}` | Add/override **query** params, always (accumulates) |
 
 ```
 example.com/api    urlReplace://v1=v2                 # /api/v1/x -> /api/v2/x
@@ -334,6 +335,38 @@ example.com        params://debug=1&trace=on
 
 > Note the `/regex/` convention: since paths start with `/`, write literals without
 > surrounding slashes (`urlReplace://old=new`) and reserve `/…/` for regexes.
+
+#### Where `params://` lands
+
+`params` addresses **one** place, never both — upstream's `_params = hasBody ? null :
+params` (`handleParams`, `_original/lib/inspectors/req.js:157-232,421`). The request's
+method and `Content-Type`, *as forwarded* (so after `method://`, `reqType://` and
+`reqHeaders://`), decide which:
+
+| Request | Where the params go |
+|---|---|
+| `Content-Type: multipart/…` **with a `boundary=`** | the body: a part with a matching `name=` is replaced whole, the rest are appended as new parts |
+| `Content-Type: application/x-www-form-urlencoded`, **POST only** | the body, as a query string |
+| a JSON content type, on any method that may carry a body (not `GET`/`HEAD`/`OPTIONS`/`CONNECT`) | the body, **deep**-merged into its first JSON-looking span |
+| anything else | the query string |
+
+The POST-only rule for form bodies is upstream's `isUrlEncoded`
+(`_original/lib/util/common.js:692-695`); the same rule on a `PUT` sends the params to
+the query string in both implementations.
+
+`delete://reqBody.<path>` rides the same transform, so it too applies only to a body of
+one of those three kinds: a dotted path out of a JSON body, a name out of a form body
+or a multipart part.
+
+An empty body becomes the params outright — `{"a":"1"}` for JSON, `a=1` for a form.
+`params://{"a":{"b":1}}` keeps its structure into a JSON body; against a form body it is
+serialised (whistle writes `a[b]=1` there instead).
+
+```
+api.example.com   params://uid=42            # POSTed form/JSON body gains uid
+api.example.com   urlParams://trace=1        # ?trace=1, whatever the body is
+api.example.com   delete://reqBody.password  # dropped from the body
+```
 
 ### Filter conditions
 
@@ -1154,8 +1187,14 @@ Known gaps in the operator layer, deliberately left:
   live path for the same reason; the explicit forms (`*`, a URL, `methods=…`) work.
 - **Injected text is UTF-8.** whistle re-encodes it into the response's declared
   charset; a `charset=gbk` page will see mojibake in the injected fragment.
-- **`params://` on a request body** is treated as query parameters only. whistle
-  also merges them into a form, multipart or JSON request body.
+- **`params://` into a body is buffered, not streamed.** whistle rewrites a
+  multipart body part by part so an upload never lands in memory; whistle-rs has
+  the body in hand already (every other request-body operator buffers) and splits
+  on the boundary. Same result on a well-formed body, more memory on a large one.
+  Upstream's `reqMergeBigData` / `MAX_REQ_SIZE` ceilings have no counterpart here.
+- **A non-UTF-8 request body is left alone** by the `params://` merge. whistle
+  tries GB18030 and re-encodes afterwards; this port stays UTF-8, as it does for
+  every other text transform.
 - **`delete://resCookies.x`** does not emit the expiring `Set-Cookie` upstream
   writes, and `delete://trailer.x` is not applied.
 - **A cookie declared as a JSON object** (`resCookies://{"sid":{"value":"x","httpOnly":true}}`)

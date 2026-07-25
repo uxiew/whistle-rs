@@ -131,7 +131,17 @@
       仍未做：上游会把内容像 JS 的候选项**执行**并把它吐出的规则拼回去（`isRulesContent`），
       本移植没有动态规则脚本；`resScript` 的 `resRules://` 条目也无处安放 ——
       本移植的 `resScript` 是直接改响应的 JS 钩子，不是规则生产者。
-- [ ] `params://` 合并进请求体（当前折叠只作用于查询串）。
+- [x] ~~`params://` 合并进请求体~~ → 已完成，三种体都实现了：`multipart`（按 `name=` 整段替换 /
+      追加新段）、`x-www-form-urlencoded`（仅 POST，与上游 `isUrlEncoded` 一致）、JSON
+      （深合并进第一段 JSON 形状的子串）。与上游一样**二选一**：体接走了 `params` 就不再
+      进查询串（`_params = hasBody ? null : params`，`_original/lib/inspectors/req.js:421`），
+      `urlParams` 恒进查询串。`delete://reqBody.<path>` 同乘一条变换，因此也一并接线。
+      判定所用的 method / content-type 取**转发时**的值（即 `method://`、`reqType://` 之后），
+      与上游 `handleReq` → `handleParams` 的顺序一致。
+      **开销**：没有 `params://` 命中时判定为两次 map 查找，实测 ~19ns/请求（对照 500 条规则
+      的解析 ~2.6µs、既有的 `body_ops_present` ~245ns）；请求路径上调用两次，合计 ~38ns。
+      不对齐处：上游按块流式改写 multipart，本移植缓冲后整体改写（其余请求体算子本来就缓冲），
+      因此没有 `reqMergeBigData` / `MAX_REQ_SIZE` 上限；非 UTF-8 请求体不处理（上游试 GB18030）。
 
 ### 筛选器（本轮审计发现）
 
