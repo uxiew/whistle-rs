@@ -217,26 +217,159 @@ impl Rule {
 }
 
 /// A `filter`/`includeFilter`/`excludeFilter` match condition on a rule.
+///
+/// Whether a set of filters lets a rule through is decided by
+/// [`matcher::filters_match`], which mirrors upstream's `matchExcludeFilters`
+/// (`_original/lib/rules/rules.js:1967`): include filters are **or**-ed, and any
+/// matching exclude filter vetoes the rule.
 #[derive(Debug, Clone)]
 pub struct Filter {
     /// `excludeFilter://` negates: the rule is skipped when the condition holds.
     pub exclude: bool,
+    /// A `!` written in front of the condition's value (`m:!GET`), in front of a
+    /// URL pattern (`includeFilter://!*.cdn.com`), or straight after a header
+    /// key (`reqH.x-tag!:v`) inverts the condition
+    /// (`_original/lib/rules/rules.js:1565,1652`).
+    ///
+    /// It only ever inverts a *known* answer — see [`Cond::Deferred`].
+    pub negate: bool,
     pub cond: Cond,
 }
 
 /// What a [`Filter`] tests.
+///
+/// Conditions are evaluated to `Option<bool>`: `None` says "the fact this tests
+/// is not knowable yet", which upstream's `getFilterResult`
+/// (`_original/lib/rules/rules.js:1809`) collapses to `false` *without* applying
+/// `not`. Everything therefore fails closed.
 #[derive(Debug, Clone)]
 pub enum Cond {
-    /// `m:GET` — request method (case-insensitive).
-    Method(String),
-    /// `host:example.com` — request host (exact, case-insensitive).
-    Host(String),
-    /// `h:name[=value]` — request header presence or exact value.
-    Header { name: String, value: Option<String> },
-    /// `i:1.2.3.4` — client IP.
-    ClientIp(String),
-    /// Fallback: a regex tested against the full request URL.
-    Url(Regex),
+    /// `m:GET` / `method:GET` — request method (always case-insensitive).
+    Method(CondValue),
+    /// `host:example.com` — request host.
+    Host(CondValue),
+    /// `reqH.<key>:<value>` (and the `h:`/`header:`/`req…` spellings) — a
+    /// request header. Upstream tests *containment*, not equality.
+    ReqHeader { name: String, value: CondValue },
+    /// `clientIp:1.2.3.4` — the client's IP.
+    ClientIp(CondValue),
+    /// `i:1.2.3.4` / `ip:` — client **or** server IP. The server IP is not known
+    /// while rules are resolved, so in practice this tests the client's.
+    Ip(CondValue),
+    /// `chance:0.25` / `chance:25%` — sample a fraction of requests, upstream's
+    /// `Math.random() < probability` (`_original/lib/rules/rules.js:1860-1868`).
+    /// A value that is not a number is stored as `NaN`, which never matches —
+    /// the same coercion JS performs.
+    Chance(f64),
+    /// A URL pattern, written exactly like a rule's own pattern (regexp,
+    /// wildcard, or scheme/host/path prefix). This is the fallback for anything
+    /// that is not a recognised condition name.
+    Url(Pattern),
+    /// Recognised, but the fact it tests does not exist while rules are being
+    /// resolved. Never matches; see [`Deferred`].
+    Deferred(Deferred),
+}
+
+/// Conditions this port parses but cannot answer at rule-resolution time.
+///
+/// whistle resolves rules again in the response phase, so upstream can answer
+/// these later; this port resolves once, before the request is sent. Rather
+/// than let such a condition fall through to the URL-pattern fallback — where
+/// it would be a nonsense regexp that quietly matches nothing (or, worse,
+/// something) — it is parsed, recorded, and evaluated as "unknown", which makes
+/// its filter fail closed. `docs/RULES.md` lists what each one would need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deferred {
+    /// `s:` / `statusCode:` — needs the response.
+    StatusCode,
+    /// `resH.<key>:` / `res:<key>=` — needs the response headers.
+    ResHeader,
+    /// `serverIp:` — needs the resolved upstream address.
+    ServerIp,
+    /// `clientPort:` — needs the accepted socket's peer port.
+    ClientPort,
+    /// `serverPort:` — needs the upstream socket's port.
+    ServerPort,
+    /// `remoteAddress:` — needs the upstream socket's address.
+    RemoteAddress,
+    /// `remotePort:` — needs the upstream socket's port.
+    RemotePort,
+    /// `b:` / `body:` — needs the request body buffered before rules resolve.
+    Body,
+    /// `env:` — needs the plugin environment store.
+    Env,
+    /// `from:` — needs the request's origin flags (tunnel, composer, SNI, …).
+    From,
+}
+
+/// The right-hand side of a filter condition.
+///
+/// Any condition's value may be written as `/regexp/[i]` instead of a literal:
+/// upstream funnels every one of them through `util.toRegExp`
+/// (`_original/lib/util/index.js:723`), whose `REG_EXP_RE` is
+/// `^/(.+)/(i?u?|ui)$`. A `/…/` that fails to compile degrades to a literal,
+/// exactly like `toRegExp` returning `null`.
+#[derive(Debug, Clone)]
+pub enum CondValue {
+    /// `/re/[i]`.
+    Regex(Regex),
+    /// A literal, lowercased — all literal comparisons are case-insensitive.
+    Literal(String),
+}
+
+impl CondValue {
+    /// Parse a condition's value. `always_ignore_case` mirrors the second
+    /// argument of `util.toRegExp`, which whistle passes only for the method
+    /// condition (`_original/lib/rules/rules.js:1603`).
+    fn parse(raw: &str, always_ignore_case: bool) -> Self {
+        Self::as_regex(raw, always_ignore_case)
+            .unwrap_or_else(|| CondValue::Literal(raw.to_lowercase()))
+    }
+
+    /// `/body/flags` → a compiled regexp, or `None` when this is a literal (or
+    /// a regexp Rust's engine cannot compile — JS-only constructs such as
+    /// lookbehind degrade to a literal rather than dropping the rule).
+    fn as_regex(raw: &str, always_ignore_case: bool) -> Option<Self> {
+        let rest = raw.strip_prefix('/')?;
+        let end = rest.rfind('/')?;
+        let (body, flags) = (&rest[..end], &rest[end + 1..]);
+        // `(.+)` — an empty body is not a regexp, and `u` is implied in Rust.
+        if body.is_empty() || !matches!(flags, "" | "i" | "u" | "iu" | "ui") {
+            return None;
+        }
+        let src = if always_ignore_case || flags.contains('i') {
+            format!("(?i){body}")
+        } else {
+            body.to_string()
+        };
+        Regex::new(&src).ok().map(CondValue::Regex)
+    }
+
+    /// Scalar comparison (`m:`, `i:`, `host:`): whistle compares the whole
+    /// value, so this is equality — case-insensitively, since the literal was
+    /// lowercased at parse time.
+    pub fn matches(&self, actual: &str) -> bool {
+        match self {
+            CondValue::Regex(re) => re.is_match(actual),
+            CondValue::Literal(lit) => actual.eq_ignore_ascii_case(lit),
+        }
+    }
+
+    /// Header comparison: upstream's `filterHeader`
+    /// (`_original/lib/rules/rules.js:1922-1945`) tests **containment**, not
+    /// equality — which is what makes `reqH.content-type:json` match
+    /// `application/json`. An empty expected value therefore matches any value,
+    /// i.e. it is a presence test.
+    ///
+    /// Upstream additionally compares against `encodeURIComponent(value)`; that
+    /// arm is unreachable, because the haystack is lowercased while
+    /// `encodeURIComponent` emits upper-case hex, so it is not ported.
+    pub fn matches_header(&self, actual: &str) -> bool {
+        match self {
+            CondValue::Regex(re) => re.is_match(actual),
+            CondValue::Literal(lit) => actual.to_lowercase().contains(lit.as_str()),
+        }
+    }
 }
 
 /// Parsed request facts the matcher needs. Built by the proxy layer.
@@ -581,8 +714,10 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
     for t in &op_toks {
         if let Some(spec) = line_props_spec(t) {
             props.merge(spec);
-        } else if let Some(f) = parse_filter(t) {
-            filters.push(f);
+        } else if is_filter_token(t) {
+            // A filter whose condition does not parse is dropped, never demoted
+            // to an operator named `includeFilter`.
+            filters.extend(parse_filter(t));
         } else if let Some(op) = parse_op(t) {
             ops.push(op);
         }
@@ -629,39 +764,223 @@ fn line_props_spec(tok: &str) -> Option<&str> {
     }
 }
 
+/// What a condition prefix builds, before its value has been parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CondKind {
+    Method,
+    Host,
+    Ip,
+    ClientIp,
+    ReqHeader,
+    Chance,
+    /// Recognised, but unanswerable here — see [`Deferred`].
+    Later(Deferred),
+}
+
+/// Every condition spelling whistle understands: `(name, kind, props, pure)`.
+///
+/// Upstream splits them across two regexes
+/// (`_original/lib/rules/rules.js:57-60`):
+///
+/// * `PROPS_FILTER_RE` — `<name>:<value>`, after any of
+///   `filter`/`includeFilter`/`excludeFilter`/`ignore` (the `props` column);
+/// * `PURE_FILTER_RE` — `<name>.<value>` or `<name>=<value>`, after
+///   `includeFilter`/`excludeFilter` only, for a slightly different name set
+///   (the `pure` column).
+///
+/// The distinction is worth keeping: a spelling upstream does *not* recognise
+/// falls through to its URL-pattern branch and matches nothing, so accepting
+/// more here would make rules fire that upstream leaves inert.
+///
+/// Order does not matter — a name only wins if the character right after it is
+/// a separator that name allows, so `host` can never be read as `h`.
+const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
+    ("m", CondKind::Method, true, false),
+    ("method", CondKind::Method, true, false),
+    ("i", CondKind::Ip, true, false),
+    ("ip", CondKind::Ip, true, false),
+    ("h", CondKind::ReqHeader, true, false),
+    ("header", CondKind::ReqHeader, true, false),
+    // `host:` is this port's own spelling (upstream has only the pure form, and
+    // routes it to proxy-host filtering rather than to the request's host).
+    ("host", CondKind::Host, true, true),
+    ("clientIp", CondKind::ClientIp, true, true),
+    ("clientIP", CondKind::ClientIp, true, true),
+    ("req", CondKind::ReqHeader, true, true),
+    ("reqH", CondKind::ReqHeader, true, true),
+    ("reqHeader", CondKind::ReqHeader, true, true),
+    ("reqHeaders", CondKind::ReqHeader, true, true),
+    ("chance", CondKind::Chance, true, true),
+    ("probability", CondKind::Chance, true, true),
+    ("s", CondKind::Later(Deferred::StatusCode), true, false),
+    ("statusCode", CondKind::Later(Deferred::StatusCode), true, true),
+    ("b", CondKind::Later(Deferred::Body), true, false),
+    ("body", CondKind::Later(Deferred::Body), true, false),
+    ("res", CondKind::Later(Deferred::ResHeader), true, true),
+    ("resH", CondKind::Later(Deferred::ResHeader), true, true),
+    ("resHeader", CondKind::Later(Deferred::ResHeader), true, true),
+    ("resHeaders", CondKind::Later(Deferred::ResHeader), true, true),
+    ("serverIp", CondKind::Later(Deferred::ServerIp), true, true),
+    ("serverIP", CondKind::Later(Deferred::ServerIp), true, true),
+    ("clientPort", CondKind::Later(Deferred::ClientPort), true, true),
+    ("serverPort", CondKind::Later(Deferred::ServerPort), true, true),
+    ("remoteAddress", CondKind::Later(Deferred::RemoteAddress), true, true),
+    ("remotePort", CondKind::Later(Deferred::RemotePort), true, true),
+    ("env", CondKind::Later(Deferred::Env), true, true),
+    ("from", CondKind::Later(Deferred::From), true, true),
+];
+
+/// Is this token a filter condition (as opposed to an operator or a pattern)?
+///
+/// Used by [`parse_line`] so that a filter whose condition does not parse is
+/// dropped instead of degrading into an operator named `includeFilter`.
+fn is_filter_token(tok: &str) -> bool {
+    matches!(
+        split_protocol(tok).map(|(p, _)| p),
+        Some("filter" | "includeFilter" | "excludeFilter")
+    )
+}
+
 /// Parse a `filter://` / `includeFilter://` / `excludeFilter://` token.
+///
+/// Returns `None` for a token that is not a filter at all, and for one whose
+/// condition is unusable (an empty payload, an empty header key) — upstream
+/// drops those too (`resolveMatchFilter`, `_original/lib/rules/rules.js:1556`).
 fn parse_filter(tok: &str) -> Option<Filter> {
     let (proto, spec) = split_protocol(tok)?;
+    // NOTE: upstream reads `filter://` as an *exclude* filter
+    // (`isInclude = matcher[1] === 'n'`, `_original/lib/rules/rules.js:1563`).
+    // This port has always treated it as an include, and its docs and examples
+    // say so; the divergence is recorded in `docs/RULES.md` rather than flipped
+    // underneath existing rules files.
     let exclude = match proto {
         "filter" | "includeFilter" => false,
         "excludeFilter" => true,
         _ => return None,
     };
-    let cond = if let Some(v) = spec.strip_prefix("m:").or_else(|| spec.strip_prefix("method:")) {
-        Cond::Method(v.to_string())
-    } else if let Some(v) = spec.strip_prefix("host:") {
-        Cond::Host(v.to_lowercase())
-    } else if let Some(v) = spec
-        .strip_prefix("i:")
-        .or_else(|| spec.strip_prefix("ip:"))
-        .or_else(|| spec.strip_prefix("clientIp:"))
-    {
-        Cond::ClientIp(v.to_string())
-    } else if let Some(v) = spec.strip_prefix("h:").or_else(|| spec.strip_prefix("header:")) {
-        let (name, value) = match v.split_once('=') {
-            Some((n, val)) => (n.to_lowercase(), Some(val.to_string())),
-            None => (v.to_lowercase(), None),
-        };
-        Cond::Header { name, value }
-    } else {
-        // Fallback: treat as a regex over the full URL.
-        let body = spec.trim_matches('/');
-        match Regex::new(body) {
-            Ok(re) => Cond::Url(re),
-            Err(_) => return None,
+    // `.`/`=` separated conditions are an includeFilter/excludeFilter-only form.
+    let pure_ok = proto != "filter";
+    if spec.is_empty() {
+        return None;
+    }
+    let (cond, negate) = parse_cond(spec, pure_ok)?;
+    Some(Filter {
+        exclude,
+        negate,
+        cond,
+    })
+}
+
+/// Parse the payload of a filter token into a condition plus its negation flag.
+fn parse_cond(spec: &str, pure_ok: bool) -> Option<(Cond, bool)> {
+    match split_cond_name(spec, pure_ok) {
+        Some((kind, rest)) => build_cond(kind, rest),
+        // Anything unrecognised is a URL pattern, matched exactly like a rule's
+        // own pattern. Only here may a `!` precede the payload: with a condition
+        // name present it belongs to the value, so `includeFilter://!m:GET` is a
+        // (negated) URL pattern upstream, not a method condition.
+        None => {
+            let (negate, body) = strip_negation(spec);
+            let pattern = parse_pattern(body)?.pattern;
+            Some((Cond::Url(pattern), negate))
         }
+    }
+}
+
+/// Split `<name><sep><rest>` when `<name>` is a known condition and `<sep>` is a
+/// separator that name accepts.
+fn split_cond_name(spec: &str, pure_ok: bool) -> Option<(CondKind, &str)> {
+    for &(name, kind, props, pure) in COND_SPECS {
+        let Some(rest) = spec.strip_prefix(name) else {
+            continue;
+        };
+        let sep = rest.as_bytes().first()?;
+        let accepted = match sep {
+            b':' => props,
+            b'.' | b'=' => pure && pure_ok,
+            _ => false,
+        };
+        if accepted {
+            return Some((kind, &rest[1..]));
+        }
+    }
+    None
+}
+
+/// `!value` → negated. Upstream folds the flag with `not = !not`, so a token can
+/// carry it in more than one place (`_original/lib/rules/rules.js:1565`).
+fn strip_negation(value: &str) -> (bool, &str) {
+    match value.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    }
+}
+
+/// Build the condition for `kind` from everything after its separator.
+fn build_cond(kind: CondKind, rest: &str) -> Option<(Cond, bool)> {
+    let (negate, rest) = strip_negation(rest);
+    let cond = match kind {
+        // whistle compiles method regexps with a forced `i` flag.
+        CondKind::Method => Cond::Method(CondValue::parse(rest, true)),
+        CondKind::Host => Cond::Host(CondValue::parse(rest, false)),
+        CondKind::Ip => Cond::Ip(CondValue::parse(rest, false)),
+        CondKind::ClientIp => Cond::ClientIp(CondValue::parse(rest, false)),
+        CondKind::ReqHeader => {
+            let (key, key_negate, value) = split_keyed_value(rest, true)?;
+            return Some((
+                Cond::ReqHeader {
+                    name: key.to_lowercase(),
+                    value: CondValue::parse(value, false),
+                },
+                negate != key_negate,
+            ));
+        }
+        CondKind::Chance => {
+            let (key, key_negate, _) = split_keyed_value(rest, false)?;
+            return Some((Cond::Chance(parse_probability(key)), negate != key_negate));
+        }
+        CondKind::Later(what) => Cond::Deferred(what),
     };
-    Some(Filter { exclude, cond })
+    Some((cond, negate))
+}
+
+/// Split a keyed condition (`<key>=<value>`, or `<key>:<value>` for headers)
+/// into its key, whether the key carried a trailing `!`, and its value.
+///
+/// Upstream looks for `=` first and only falls back to `:` for header-shaped
+/// conditions, which is why `chance:50%` keeps its `%` and why
+/// `reqH.referer:http://x` splits at the *first* colon
+/// (`_original/lib/rules/rules.js:1645-1660`). A key left empty by its `!`
+/// drops the whole filter.
+fn split_keyed_value(rest: &str, colon_separates: bool) -> Option<(&str, bool, &str)> {
+    let sep = rest
+        .find('=')
+        .or_else(|| if colon_separates { rest.find(':') } else { None });
+    let (key, value) = match sep {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    let (key, negate) = match key.strip_suffix('!') {
+        Some(k) => (k, true),
+        None => (key, false),
+    };
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, negate, value))
+}
+
+/// `chance:0.25` / `chance:25%` → the probability to sample at.
+///
+/// A value JS would coerce to `NaN` stays `NaN` here, so the comparison against
+/// a random number is false however it is written — including for a bare `%`,
+/// which upstream's length check also leaves alone.
+fn parse_probability(key: &str) -> f64 {
+    let parsed = match key.strip_suffix('%') {
+        Some(n) => n.parse::<f64>().map(|v| v / 100.0),
+        None => key.parse::<f64>(),
+    };
+    parsed.unwrap_or(f64::NAN)
 }
 
 /// Heuristic: does this token read as a match pattern (vs. an operator)?
@@ -679,10 +998,7 @@ fn looks_like_pattern(tok: &str) -> bool {
     if line_props_spec(t).is_some() {
         return false;
     }
-    if matches!(
-        split_protocol(t).map(|(p, _)| p),
-        Some("filter" | "includeFilter" | "excludeFilter")
-    ) {
+    if is_filter_token(t) {
         return false;
     }
     // An operator has a known `protocol://` prefix.
@@ -1173,6 +1489,294 @@ mod line_props_tests {
         assert!(!strict.allows_injection(b"hello"));
         // Empty body counts as markup.
         assert!(strict.allows_injection(b""));
+    }
+}
+
+#[cfg(test)]
+mod filter_parse_tests {
+    use super::*;
+
+    /// The single filter parsed from a one-line rule.
+    fn cond_of(token: &str) -> Filter {
+        let text = format!("example.com host://1.1.1.1 {token}");
+        let rules = parse_text(&text);
+        assert_eq!(rules.len(), 1, "expected one rule from {text:?}");
+        let mut filters = rules.into_iter().next().unwrap().filters;
+        assert_eq!(filters.len(), 1, "expected one filter from {token:?}");
+        filters.remove(0)
+    }
+
+    /// Filters parsed from a token, which may be none.
+    fn filters_of(token: &str) -> Vec<Filter> {
+        let text = format!("example.com host://1.1.1.1 {token}");
+        parse_text(&text).into_iter().next().unwrap().filters
+    }
+
+    // ── condition spellings ──
+
+    /// Upstream's canonical request-header syntax, in every spelling its two
+    /// regexes accept (`_original/lib/rules/rules.js:57-60`).
+    #[test]
+    fn request_header_spellings() {
+        for token in [
+            "includeFilter://reqH.x-tag:yes",
+            "includeFilter://reqH.x-tag=yes",
+            "includeFilter://req.x-tag:yes",
+            "includeFilter://reqHeader.x-tag:yes",
+            "includeFilter://reqHeaders.x-tag:yes",
+            "includeFilter://reqH:x-tag=yes",
+            "filter://reqH:x-tag=yes",
+            "filter://h:x-tag=yes",
+            "filter://header:x-tag=yes",
+            "filter://h:x-tag:yes",
+        ] {
+            match cond_of(token).cond {
+                Cond::ReqHeader { name, value } => {
+                    assert_eq!(name, "x-tag", "{token}");
+                    assert!(value.matches_header("yes"), "{token}");
+                }
+                other => panic!("{token} parsed as {other:?}"),
+            }
+        }
+    }
+
+    /// Header keys are case-folded, since `ReqInfo` stores them lowercased.
+    #[test]
+    fn header_key_is_lowercased() {
+        match cond_of("includeFilter://reqH.X-Tag:yes").cond {
+            Cond::ReqHeader { name, .. } => assert_eq!(name, "x-tag"),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// A header condition with no value at all is a presence test.
+    #[test]
+    fn header_without_a_value_matches_anything() {
+        match cond_of("includeFilter://reqH.x-tag").cond {
+            Cond::ReqHeader { name, value } => {
+                assert_eq!(name, "x-tag");
+                assert!(value.matches_header("whatever"));
+                assert!(value.matches_header(""));
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// The `.`/`=` form belongs to `includeFilter`/`excludeFilter`; upstream's
+    /// `PROPS_FILTER_RE` is the only one `filter://` reaches, so `filter://`
+    /// with a dotted name is a URL pattern — as it is upstream.
+    #[test]
+    fn pure_form_is_not_available_to_plain_filter() {
+        assert!(matches!(
+            cond_of("filter://reqH.x-tag:yes").cond,
+            Cond::Url(_)
+        ));
+        assert!(matches!(
+            cond_of("includeFilter://reqH.x-tag:yes").cond,
+            Cond::ReqHeader { .. }
+        ));
+    }
+
+    /// Names are matched whole: the separator that follows decides, so `host`
+    /// is never mistaken for `h`, nor `statusCode` for `s`.
+    #[test]
+    fn longer_names_are_not_shadowed() {
+        assert!(matches!(cond_of("filter://host:example.com").cond, Cond::Host(_)));
+        assert!(matches!(
+            cond_of("filter://statusCode:200").cond,
+            Cond::Deferred(Deferred::StatusCode)
+        ));
+        assert!(matches!(cond_of("filter://ip:1.2.3.4").cond, Cond::Ip(_)));
+        assert!(matches!(
+            cond_of("includeFilter://reqHeaders.x:1").cond,
+            Cond::ReqHeader { .. }
+        ));
+    }
+
+    /// Every condition upstream defers to the response phase is recognised, so
+    /// it cannot be mistaken for a URL pattern.
+    #[test]
+    fn deferred_conditions_are_recognised() {
+        let cases = [
+            ("filter://s:200", Deferred::StatusCode),
+            ("filter://statusCode:200", Deferred::StatusCode),
+            ("includeFilter://resH.content-type:json", Deferred::ResHeader),
+            ("includeFilter://resHeaders.x:1", Deferred::ResHeader),
+            ("filter://serverIp:1.2.3.4", Deferred::ServerIp),
+            ("includeFilter://serverIp=1.2.3.4", Deferred::ServerIp),
+            ("filter://clientPort:8080", Deferred::ClientPort),
+            ("filter://serverPort:8080", Deferred::ServerPort),
+            ("filter://remoteAddress:1.2.3.4", Deferred::RemoteAddress),
+            ("filter://remotePort:80", Deferred::RemotePort),
+            ("filter://b:keyword", Deferred::Body),
+            ("filter://body:keyword", Deferred::Body),
+            ("filter://env:x=1", Deferred::Env),
+            ("filter://from:composer", Deferred::From),
+        ];
+        for (token, want) in cases {
+            match cond_of(token).cond {
+                Cond::Deferred(got) => assert_eq!(got, want, "{token}"),
+                other => panic!("{token} parsed as {other:?}"),
+            }
+        }
+    }
+
+    // ── regexp-valued conditions ──
+
+    /// Any condition's value may be a `/regexp/[i]`.
+    #[test]
+    fn regexp_values() {
+        assert!(matches!(
+            cond_of("filter://m:/^P/").cond,
+            Cond::Method(CondValue::Regex(_))
+        ));
+        assert!(matches!(
+            cond_of("includeFilter://reqH.x-tag:/^ye/i").cond,
+            Cond::ReqHeader {
+                value: CondValue::Regex(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            cond_of("filter://i:/^10\\./").cond,
+            Cond::Ip(CondValue::Regex(_))
+        ));
+    }
+
+    /// whistle compiles method regexps with a forced `i` flag
+    /// (`util.toRegExp(value, true)`), unlike every other condition.
+    #[test]
+    fn method_regexps_ignore_case_without_the_flag() {
+        match cond_of("filter://m:/^post$/").cond {
+            Cond::Method(v) => assert!(v.matches("POST")),
+            other => panic!("parsed as {other:?}"),
+        }
+        match cond_of("filter://host:/^EXAMPLE\\.com$/").cond {
+            Cond::Host(v) => assert!(!v.matches("example.com"), "no implicit `i` here"),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// `REG_EXP_RE` is `^/(.+)/(i?u?|ui)$`: an empty body or an unknown flag is
+    /// a literal, and so is a pattern Rust's engine cannot compile.
+    #[test]
+    fn near_misses_degrade_to_literals() {
+        for token in [
+            "filter://m:／/",     // not a slash at all
+            "filter://m://",      // empty body
+            "filter://m:/GET/g",  // flag whistle's regex does not accept
+            "filter://m:/(?<=x)/", // valid in JS, unsupported by Rust's engine
+        ] {
+            assert!(
+                matches!(cond_of(token).cond, Cond::Method(CondValue::Literal(_))),
+                "{token} should be a literal"
+            );
+        }
+    }
+
+    // ── chance ──
+
+    #[test]
+    fn chance_values() {
+        let p = |token: &str| match cond_of(token).cond {
+            Cond::Chance(p) => p,
+            other => panic!("{token} parsed as {other:?}"),
+        };
+        assert_eq!(p("includeFilter://chance:0.25"), 0.25);
+        assert_eq!(p("includeFilter://chance:25%"), 0.25);
+        assert_eq!(p("includeFilter://probability:1"), 1.0);
+        assert_eq!(p("includeFilter://chance=0.5"), 0.5);
+        assert_eq!(p("filter://chance:0"), 0.0);
+        // Anything JS would coerce to NaN stays NaN, and NaN never matches.
+        assert!(p("includeFilter://chance:half").is_nan());
+        assert!(p("includeFilter://chance:%").is_nan());
+    }
+
+    // ── negation ──
+
+    /// `!` may sit in front of a condition's value, after a header key, or in
+    /// front of a URL pattern.
+    #[test]
+    fn negation_spellings() {
+        assert!(cond_of("filter://m:!GET").negate);
+        assert!(cond_of("includeFilter://reqH.x-tag!:yes").negate);
+        assert!(cond_of("includeFilter://!*.cdn.example.com").negate);
+        assert!(!cond_of("filter://m:GET").negate);
+        // A `!` in front of a condition *name* is not a negation: upstream's
+        // props regex requires the name first, so this is a URL pattern.
+        assert!(matches!(cond_of("includeFilter://!m:GET").cond, Cond::Url(_)));
+    }
+
+    /// A header condition can carry a `!` in both places, and they cancel —
+    /// upstream folds each one in with `not = !not`.
+    #[test]
+    fn double_negation_cancels() {
+        let f = cond_of("includeFilter://reqH.!x-tag!:yes");
+        assert!(!f.negate);
+        match f.cond {
+            Cond::ReqHeader { name, .. } => assert_eq!(name, "x-tag"),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// The value's `!` is only read before the *key*: once the key separator
+    /// has been passed, a `!` is part of the expected value.
+    #[test]
+    fn bang_after_the_separator_is_literal() {
+        let f = cond_of("includeFilter://reqH.x-tag:!yes");
+        assert!(!f.negate);
+        match f.cond {
+            Cond::ReqHeader { value, .. } => {
+                assert!(value.matches_header("!yes"));
+                assert!(!value.matches_header("yes"));
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    // ── URL-pattern fallback ──
+
+    /// An unrecognised condition is a URL pattern, parsed with the same engine
+    /// as a rule's own pattern — wildcards and prefixes included, where the old
+    /// "strip the slashes and hope it is a regex" fallback dropped them.
+    #[test]
+    fn url_fallback_uses_the_pattern_engine() {
+        for token in [
+            "includeFilter://*/cgi-*",
+            "excludeFilter://www.test.com",
+            "includeFilter://https://www.test.com/path",
+            "excludeFilter:///admin/",
+        ] {
+            assert!(
+                matches!(cond_of(token).cond, Cond::Url(_)),
+                "{token} should be a URL pattern"
+            );
+        }
+    }
+
+    // ── graceful degradation ──
+
+    /// A filter that cannot be parsed is dropped, and must never be demoted to
+    /// an operator called `includeFilter`.
+    #[test]
+    fn unusable_filters_are_dropped_not_demoted() {
+        for token in [
+            "includeFilter://",
+            "includeFilter://reqH.:yes",
+            "includeFilter://reqH.!:yes",
+        ] {
+            assert!(filters_of(token).is_empty(), "{token} should be dropped");
+            let rules = parse_text(&format!("example.com host://1.1.1.1 {token}"));
+            assert_eq!(rules[0].ops.len(), 1, "{token} must not become an operator");
+        }
+    }
+
+    /// `excludeFilter://` is the only spelling that excludes here.
+    #[test]
+    fn exclude_flag() {
+        assert!(cond_of("excludeFilter://m:GET").exclude);
+        assert!(!cond_of("includeFilter://m:GET").exclude);
+        assert!(!cond_of("filter://m:GET").exclude);
     }
 }
 
