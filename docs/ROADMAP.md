@@ -5,10 +5,11 @@
 本文件诚实记录 **whistle-rs 相对原版 whistle 的对齐进度**：已完成的工作，以及仍
 **有意简化 / 尚未移植 / 架构受限**的更大子系统与少数边缘算子。
 
-> 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族、
-> `@`-includes、`${port}/${version}` 配置变量；单元测试 **60** 项全绿、构建 0 警告。
+> 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
+> （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
+> 单元测试 **106** 项全绿、构建 0 警告。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
-> 统一插件系统（Rust + Node）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
+> 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
 > HAR 导出、`cipher` TLS 版本固定、流量落盘持久化、请求重放、规则分组管理。
 
 ---
@@ -17,7 +18,7 @@
 
 | 领域 | 状态 |
 |------|------|
-| 统一插件系统（Rust 进程内 + Node 子进程 + 远程） | ✅ `server`/`rulesServer` 钩子、二进制响应体、就绪等待 |
+| 插件运行时（Rust 进程内 + 子进程 + 远程） | ✅ 二进制响应体、就绪等待、失败重试 |
 | `@`-includes（从 URL / 文件引入规则） | ✅ 加载时解析 |
 | `${port}` / `${version}` 配置变量 | ✅ |
 | 响应体解码（gzip / deflate / brotli）用于查看 | ✅ 流式解码，界限 16 KB，不影响转发 |
@@ -57,7 +58,14 @@
 
 ### 模板与变量（原版本身很窄）
 
-- [ ] `tpl`/`dust`/`jsonp` 升级为完整 dust.js / handlebars 语义（当前为 `{name}` 简单替换）。
+- [x] ~~`tpl`/`dust`/`jsonp` 升级为完整 dust.js / handlebars 语义~~ → **前提有误，已按上游实情完成**，
+      见 [`TEMPLATES.md`](TEMPLATES.md)。原版**根本没有模板引擎**：`tpl`/`dust`/`jsonp`
+      字节级等价，没有 section/循环/嵌套。真正缺失的是第二遍 `${var}` 运行时变量替换，
+      现已实现（封闭白名单 + `.key` 子路径 + `${{var}}` URI 编码）。同时修正了三个缺陷：
+      未知占位符曾被置空（上游是原样保留）、`jsonp://` 的 callback 包装是本移植凭空发明的
+      （已移除）、第一遍正则曾每请求重新编译。
+- [ ] `${var.replace(a,b)}` 修饰符（当前识别到该后缀即整体保留原样，不做半渲染）。
+- [ ] 文件查找的 `|` 多路径回退、`..` 拒绝、结尾 `/` 展开 index.html。
 - [ ] `{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量（与插件运行时耦合）。
 - [x] ~~`lineProps`（whistle 规则行级属性系统）~~ → **部分完成**，见
       [`LINE_PROPS.md`](LINE_PROPS.md)。解析层与原版完全对齐（`[|&]` 分隔、无转义、多令牌合并、
@@ -89,8 +97,8 @@
 
 - **逐字节复刻 React 前端** —— 内建轻量 UI 已覆盖核心检查/编辑需求；除非有明确诉求，
   不重写 `biz/webui`。
-- **硬绑定 Node.js 运行时** —— 项目目标是单一静态二进制；Node 子进程插件加载器（含未来的
-  npm 兼容层）将是可选特性，而非硬依赖。
+- **硬绑定 Node.js 运行时** —— 项目目标是单一静态二进制。JS/TS 插件跑在子进程里，
+  是**可选**特性：不写插件就完全不需要 Node。
 - **`G` / `style` 算子的「流量效果」** —— `G` 是全局插件变量基础设施、`style` 是规则列表
   配色，二者都不是逐请求的流量算子；保持「解析但不产生效果」。
 
@@ -98,6 +106,9 @@
 
 ## 参与
 
-若要优先某一项，**npm `whistle.*` 插件兼容加载器** 是解锁现有 whistle 生态、投入产出比
-最高的下一块大工作。模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖细节见
-[`RULES.md`](RULES.md)，插件编写见 [`PLUGINS.md`](PLUGINS.md)。
+若要优先某一项，**流式 body 钩子**（连带解锁真正的 `pipe://`）是剩余工作里最有价值的一块：
+它是当前架构唯一挡住的能力，其余多为增量。
+
+模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
+插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，
+规则行级属性见 [`LINE_PROPS.md`](LINE_PROPS.md)。

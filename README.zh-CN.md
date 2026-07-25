@@ -166,6 +166,7 @@ $example.com          host://2.2.2.2
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | 在各平台下载、安装并信任根 CA |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图、请求生命周期、如何扩展代理 |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md) | 编写插件（Rust 进程内 + Node 子进程）与 JSON 协议 |
+| [`docs/TEMPLATES.md`](docs/TEMPLATES.md) | 本地文件与模板：两遍替换、`${var}` 变量表、jsonp、Content-Type 推断 |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | 未来计划与仍简化/未对齐的子系统 |
 
 ## 移植范围：已实现 vs. 简化
@@ -204,16 +205,20 @@ $example.com          host://2.2.2.2
 且依赖 Node 插件加载器）、`G`（全局规则标记）、`style`（界面里的规则颜色）—— 每个都在
 覆盖表中注明了原因。
 
-**插件**支持两种运行时、共用同一套契约（`plugin://name`）：**Rust** 进程内插件
-（`RustPlugin` trait）与 **Node/远程**插件（小巧的 JSON 协议）—— whistle-rs 可拉起
-Node 进程（`--node-plugin`）或指向已运行的进程（`--plugin`）。插件可注入规则和/或返回
-mock 响应，详见 [`docs/PLUGINS.md`](docs/PLUGINS.md)。它覆盖了最常用的
-`server`/`rulesServer` 钩子，但不是完整的 Node 对象插件 API，因此现成的 npm `whistle.*`
-包无法原样运行（兼容加载器见[路线图](docs/ROADMAP.md)）。
+**插件**是 whistle-rs 自研的体系，两种运行时共用同一套契约（`plugin://name`）：
+**Rust** 进程内插件（`RustPlugin` trait）与 **JS/TS** 插件（`sdk/` 提供零依赖运行时
+与 `.d.ts` 类型）—— whistle-rs 可拉起 Node 进程（`--node-plugin`）或指向已运行的
+进程（`--plugin`）。插件可以注入规则、直接应答、改写请求头，以及改写响应的状态码/头/体；
+是否投递 body 由插件的能力清单决定，未声明的插件保持流式零开销。
+详见 [`docs/PLUGINS.md`](docs/PLUGINS.md)。
+
+这不是原版插件 API 的复刻，现成的 `npm i whistle.xxx` 包无法直接运行 —— 这是有意的取舍，
+理由见[路线图的 Non-goals](docs/ROADMAP.md)。
 
 **相对原版的其他简化**（可用，但非逐字节移植）：whistle 的 React web UI（`biz/`）由一个
 轻量内建 UI 替代；weinre 仅做脚本注入（inspector 服务在外部）；流量抓取（含头、Body 与
-WebSocket 帧）在内存中（不持久化），Body 预览上限 16 KB，压缩过的 Body 以二进制展示而不解码。
+WebSocket 帧）保留在内存的环形缓冲中，可选落盘（`--no-persist` 关闭），Body 预览上限
+默认 16 KB（`--body-preview-limit` 可调），gzip/deflate/brotli 会为查看而解码。
 
 算子级别的细节见 [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage)，
 未来计划见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。

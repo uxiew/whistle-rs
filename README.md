@@ -176,6 +176,7 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | Downloading, installing & trusting the root CA on every platform |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module map, request lifecycle, and how to extend the proxy |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md) | Writing plugins (Rust in-process + Node subprocess), the JSON protocol |
+| [`docs/TEMPLATES.md`](docs/TEMPLATES.md) | Local files and templates: the two render passes, the `${var}` table, jsonp, content-type inference |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Future plans and the subsystems still simplified vs. upstream |
 | [`README.zh-CN.md`](README.zh-CN.md) | 简体中文说明文档 |
 
@@ -222,19 +223,27 @@ SNI time before rule resolution, needing the Node plugin loader), `G` (global-ru
 marker), and `style` (rule colour in the UI) — each documented with its reason in the
 coverage table.
 
-**Plugins** run in two runtimes sharing one contract (`plugin://name`): **Rust**
-in-process plugins (the `RustPlugin` trait) and **Node/remote** plugins over a small
-JSON protocol — whistle-rs can spawn the Node process (`--node-plugin`) or point at a
-running one (`--plugin`). Plugins can inject rules and/or return a mock response. See
-[`docs/PLUGINS.md`](docs/PLUGINS.md). This covers the common `server`/`rulesServer`
-hooks, not the full Node-object plugin API, so arbitrary npm `whistle.*` packages
-don't run unchanged (a compatibility loader is on the [roadmap](docs/ROADMAP.md)).
+**Plugins** are whistle-rs's own system, with two runtimes sharing one contract
+(`plugin://name`): **Rust** in-process plugins (the `RustPlugin` trait) and **JS/TS**
+plugins built on the zero-dependency SDK in `sdk/`, which ships TypeScript
+definitions. whistle-rs can spawn the Node process (`--node-plugin`) or point at a
+running one (`--plugin`). A plugin can inject rules, answer a request directly,
+rewrite request headers, and rewrite the response status, headers and body. Whether a
+body is delivered is driven by the plugin's capability manifest, so plugins that do
+not ask for one keep the proxy's streaming fast path. See
+[`docs/PLUGINS.md`](docs/PLUGINS.md).
+
+This is not a reimplementation of the original's plugin API, so `npm i whistle.xxx`
+packages do not run unchanged — a deliberate trade-off, reasoned about in the
+[roadmap's non-goals](docs/ROADMAP.md).
 
 **Simplified vs. the original** (functional, but not a byte-for-byte port): whistle's
 React web UI (`biz/`) is replaced by a lightweight built-in UI; weinre is
 script-injection only (the inspector server is external); the traffic capture
-(headers, bodies, and WebSocket frames) is in-memory (not persisted), body previews
-are bounded to 16 KB, and compressed bodies are shown as binary rather than decoded.
+(headers, bodies, and WebSocket frames) lives in a bounded in-memory ring buffer with
+optional persistence to disk (`--no-persist` turns it off), body previews default to
+16 KB (`--body-preview-limit`), and gzip/deflate/brotli bodies are decoded for
+viewing.
 
 See [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage) for the
 operator-level detail.
