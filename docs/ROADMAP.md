@@ -30,6 +30,8 @@
 | 流量落盘持久化 | ✅ JSONL 追加写入 + 每日轮转 + 启动恢复 (`--no-persist` / `--persist-days`) |
 | 请求重放 | ✅ `POST /api/replay` self-loopback + UI ↻ 按钮 |
 | 规则分组管理 | ✅ 多组 CRUD + toggle + 持久化到 `storage_dir/rules/` |
+| 自研插件体系 v2 | ✅ 能力清单 (`GET /manifest`)、请求/响应双钩子、请求头改写、按需 body 投递 |
+| JS / TS 插件 SDK | ✅ 零依赖运行时 + `.d.ts` 类型定义（`sdk/`），`satisfies Plugin` 可用 |
 
 ---
 
@@ -37,17 +39,15 @@
 
 ### 大型子系统（多天工作量）
 
-- [ ] **现成 npm `whistle.*` 插件兼容加载器** —— 原版插件 API 基于对 Node `req`/`res`
-      对象的装饰（`setRules`/`request`/`writeHead` 等约 2000 行加载器），并非简单的 HTTP
-      头协议。要原样运行现有 npm 插件需移植这层加载器。当前的统一插件系统覆盖了最常用的
-      `server`/`rulesServer` 能力（用 Rust 或按约定的 Node 协议编写），但不直接兼容任意
-      `npm i whistle.xxx`。**这是投入产出比最高的下一块大工作。**
-- [ ] **更多插件钩子**：`reqRead`/`resRead`（请求/响应体流式读写）、`uiServer`/
-      `statsServer`（插件自带 UI/统计页）、`auth`、`sniCallback`。
-- [ ] **`pipe://` 真正的流式管道** —— 当前与 `plugin://` 同为整体分发；真正的 pipe 需要
-      把 Body 边流边过插件（依赖 `reqRead`/`resRead`）。
-- [ ] **向插件传递请求体** —— 需要在插件分发前缓冲请求体并重构下游 Body 类型（对核心
-      serve 管线是侵入式改动）；当前只传 方法/URL/头/客户端 IP/param。
+- [x] ~~**向插件传递请求体**~~ → 已完成，见 [`PLUGINS.md`](PLUGINS.md)。请求体与响应体
+      都可投递给插件，但**由插件的能力清单决定是否缓冲** —— 未声明的插件保持流式零开销
+      （已用 SSE 实测双向验证）。
+- [ ] **流式 body 钩子**（原版 `reqRead`/`resRead`）—— 当前是「缓冲后整体传递」。真正的
+      流式需要基于 CONNECT 的插件传输、长度前缀分帧（`transproto.js`：`'\n'+长度+'\n'+负载`，
+      EOF `'\n0\n'`）、单字节握手确认，以及边收边转的 body 路径；单次 JSON POST 无法表达。
+- [ ] **`pipe://` 真正的流式管道** —— 当前与 `plugin://` 同为整体分发（依赖上一条）。
+- [ ] **更多插件钩子**：`uiServer`/`statsServer`（插件自带 UI/统计页）、`auth`、
+      `sniCallback`、WebSocket 帧级拦改。
 
 ### 观测与持久化
 
@@ -81,6 +81,11 @@
 ---
 
 ## 不打算做的事（Non-goals）
+
+- **现成 npm `whistle.*` 包的兼容运行** —— 原版插件 API 建立在对 Node `req`/`res` 对象的
+  装饰之上（约 2600 行加载器、位置式 CSV 头协议、单端口多钩子分发）。与其被这套历史包袱
+  绑定，whistle-rs 选择了一套显式、有类型、语言无关的自研协议，配 JS/TS SDK。
+  见 [`PLUGINS.md`](PLUGINS.md)。
 
 - **逐字节复刻 React 前端** —— 内建轻量 UI 已覆盖核心检查/编辑需求；除非有明确诉求，
   不重写 `biz/webui`。
