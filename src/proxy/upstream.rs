@@ -10,7 +10,7 @@
 //! SOCKS5 proxy (`socks://`). Ported from `_original/lib/handlers/http-proxy.js`
 //! and the tunnel logic in `lib/tunnel.js`.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -41,13 +41,43 @@ pub enum ProxyKind {
     Socks,
 }
 
+/// Credentials written into an upstream proxy's URL (`proxy://user:pass@host`).
+///
+/// Kept as the raw `user[:pass]` string because whistle uses it two different
+/// ways and the two disagree when the password is absent: the HTTP hop base64s
+/// the credential *verbatim* (`'Basic ' + toBuffer(proxyOptions.auth).toString('base64')`,
+/// `_original/lib/inspectors/res.js:291`), while the SOCKS hop splits it at the
+/// first colon with an empty password (`getAuths`, `_original/lib/config.js:285-309`).
+/// So `proxy://user@host` sends `Basic dXNlcg==` — not `Basic dXNlcjo=`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyAuth(String);
+
+impl ProxyAuth {
+    /// The `Proxy-Authorization` value: `Basic <base64 of the raw credential>`.
+    pub fn header_value(&self) -> String {
+        let token = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            self.0.as_bytes(),
+        );
+        format!("Basic {token}")
+    }
+
+    /// SOCKS5 username/password, split at the first colon (password may be empty).
+    pub fn user_pass(&self) -> (&str, &str) {
+        match self.0.split_once(':') {
+            Some((u, p)) => (u, p),
+            None => (self.0.as_str(), ""),
+        }
+    }
+}
+
 /// A parsed upstream proxy.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub kind: ProxyKind,
     pub host: String,
     pub port: u16,
-    pub auth: Option<(String, String)>,
+    pub auth: Option<ProxyAuth>,
 }
 
 /// Which TLS protocol versions to offer on the upstream (origin) handshake.
@@ -80,6 +110,16 @@ pub struct Target {
     pub proxy: Option<ProxyConfig>,
     /// TLS version constraint for the origin handshake (`cipher` operator).
     pub tls_versions: TlsVersions,
+}
+
+impl Target {
+    /// True when a `host://` rule redirected the connection away from the
+    /// requested host. whistle calls this `req._phost`, and it is one of the
+    /// conditions that force a CONNECT tunnel rather than an absolute-form
+    /// request (`_original/lib/inspectors/res.js:296`).
+    fn has_host_override(&self) -> bool {
+        self.connect_host != self.sni || self.connect_port != self.request_port
+    }
 }
 
 fn build_client_config(versions: &[&'static rustls::SupportedProtocolVersion]) -> Arc<ClientConfig> {
@@ -142,39 +182,113 @@ impl AsyncWrite for BoxedIo {
     }
 }
 
+/// What the client request contributes to the hop between us and an upstream
+/// proxy. whistle builds the CONNECT's headers from the client's rather than
+/// sending a bare CONNECT (`_original/lib/inspectors/res.js:317-354`).
+#[derive(Default)]
+struct Hop {
+    /// The client's `User-Agent`, echoed on the CONNECT (`res.js:333-337`).
+    user_agent: Option<String>,
+    /// The client's own `Proxy-Authorization`, used when the proxy URL carries
+    /// no credentials of its own (`res.js:290-294`).
+    client_proxy_auth: Option<String>,
+}
+
+impl Hop {
+    fn from_request(req: &Request<DynBody>) -> Self {
+        let get = |name: hyper::header::HeaderName| {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        Hop {
+            user_agent: get(hyper::header::USER_AGENT),
+            client_proxy_auth: get(hyper::header::PROXY_AUTHORIZATION),
+        }
+    }
+
+    /// The `Proxy-Authorization` to present on this hop, if any.
+    fn proxy_auth(&self, proxy: &ProxyConfig) -> Option<String> {
+        match &proxy.auth {
+            Some(auth) => Some(auth.header_value()),
+            None => self.client_proxy_auth.clone(),
+        }
+    }
+}
+
+/// Does this hop send the request in absolute-form to the proxy rather than
+/// tunnelling it with CONNECT?
+///
+/// whistle takes the absolute-form path only when everything below is false
+/// (`_original/lib/inspectors/res.js:292-297`): a TLS origin, a SOCKS proxy, an
+/// HTTPS proxy, or a `host://` override travelling with the proxy (`req._phost`)
+/// each force a CONNECT tunnel instead.
+fn uses_absolute_form(target: &Target) -> bool {
+    match &target.proxy {
+        Some(p) => p.kind == ProxyKind::Http && !target.tls && !target.has_host_override(),
+        None => false,
+    }
+}
+
 /// Forward `req` to `target` and return the upstream response (body still
 /// streaming). The request URI arrives origin-form with a `Host` header.
 pub async fn forward(target: &Target, mut req: Request<DynBody>) -> Result<Response<Incoming>> {
+    let hop = Hop::from_request(&req);
+
     // A plain HTTP proxy fetching an http origin uses absolute-form + Proxy-Auth.
-    let absolute_form = matches!(&target.proxy, Some(p) if p.kind != ProxyKind::Socks) && !target.tls;
-    if absolute_form {
+    if uses_absolute_form(target) {
         let path = req
             .uri()
             .path_and_query()
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
-        let authority = if target.connect_port == 80 {
-            target.connect_host.clone()
-        } else {
-            format!("{}:{}", target.connect_host, target.connect_port)
-        };
+        // whistle names the *requested* host in the absolute URI, taken from the
+        // `Host` header so a header rule that rewrote it is honoured
+        // (`options.path = 'http://' + (headers.host || options.host) + path`,
+        // `_original/lib/inspectors/res.js:606-612`). Using the connect address
+        // instead would hand a `host://` override to the upstream proxy.
+        let authority = req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| join_host_port(&target.connect_host, target.connect_port, 80));
         let abs = format!("http://{authority}{path}");
         *req.uri_mut() = abs.parse::<Uri>().unwrap_or_else(|_| req.uri().clone());
-        if let Some(ProxyConfig { auth: Some((u, p)), .. }) = &target.proxy {
-            if let Ok(v) = hyper::header::HeaderValue::from_str(&basic_auth(u, p)) {
-                req.headers_mut()
-                    .insert(hyper::header::PROXY_AUTHORIZATION, v);
+        if let Some(proxy) = &target.proxy {
+            if let Some(v) = hop.proxy_auth(proxy) {
+                if let Ok(v) = hyper::header::HeaderValue::from_str(&v) {
+                    req.headers_mut()
+                        .insert(hyper::header::PROXY_AUTHORIZATION, v);
+                }
             }
         }
     }
 
-    let stream = origin_stream(target).await?;
+    let stream = origin_stream(target, &hop).await?;
     send(TokioIo::new(stream), req).await
+}
+
+/// Render `host:port` for a URL authority, omitting the default port and
+/// bracketing an IPv6 literal.
+fn join_host_port(host: &str, port: u16, default_port: u16) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if port == default_port {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// Establish a stream to the origin (through a proxy if configured), TLS-wrapping
 /// it when the origin speaks TLS.
-async fn origin_stream(target: &Target) -> Result<BoxedIo> {
+async fn origin_stream(target: &Target, hop: &Hop) -> Result<BoxedIo> {
     let base: BoxedIo = match &target.proxy {
         None => {
             let tcp = TcpStream::connect((target.connect_host.as_str(), target.connect_port))
@@ -205,18 +319,18 @@ async fn origin_stream(target: &Target) -> Result<BoxedIo> {
                         .await?
                 }
                 ProxyKind::Http | ProxyKind::Https => {
-                    if target.tls {
-                        http_connect(
-                            pstream,
-                            &target.connect_host,
-                            target.connect_port,
-                            &proxy.auth,
-                        )
-                        .await?
-                    } else {
-                        // Plain http via proxy: request is absolute-form, no CONNECT.
+                    if uses_absolute_form(target) {
+                        // Plain http via a plain proxy: absolute-form, no CONNECT.
                         return Ok(pstream);
                     }
+                    http_connect(
+                        pstream,
+                        &target.connect_host,
+                        target.connect_port,
+                        hop,
+                        proxy,
+                    )
+                    .await?
                 }
             }
         }
@@ -259,15 +373,32 @@ where
 }
 
 /// Issue a CONNECT to an HTTP proxy, tunnelling to `host:port`.
+///
+/// The hop headers mirror whistle's `proxyHeaders`
+/// (`_original/lib/inspectors/res.js:317-354`): `Host`, a keep-alive
+/// `Proxy-Connection`, the client's `User-Agent`, and `Proxy-Authorization`.
+/// whistle can suppress the last two with `disable://proxyUA` /
+/// `disable://proxyConnection`; those flags do not reach this layer.
 async fn http_connect(
     mut s: BoxedIo,
     host: &str,
     port: u16,
-    auth: &Option<(String, String)>,
+    hop: &Hop,
+    proxy: &ProxyConfig,
 ) -> Result<BoxedIo> {
-    let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
-    if let Some((u, p)) = auth {
-        req.push_str(&format!("Proxy-Authorization: {}\r\n", basic_auth(u, p)));
+    let authority = join_host_port(host, port, 0);
+    let mut req = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n"
+    );
+    if let Some(ua) = &hop.user_agent {
+        if is_header_value(ua) {
+            req.push_str(&format!("User-Agent: {ua}\r\n"));
+        }
+    }
+    if let Some(auth) = hop.proxy_auth(proxy) {
+        if is_header_value(&auth) {
+            req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+        }
     }
     req.push_str("\r\n");
     s.write_all(req.as_bytes()).await.context("proxy CONNECT write")?;
@@ -297,12 +428,19 @@ async fn http_connect(
     Ok(s)
 }
 
+/// True if `v` is safe to splice into our hand-written CONNECT request line.
+/// The value reaches us from the client, so a CR/LF would let it forge extra
+/// headers on the hop to the proxy.
+fn is_header_value(v: &str) -> bool {
+    !v.is_empty() && !v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
 /// Perform a SOCKS5 handshake + CONNECT to `host:port`.
 async fn socks5_connect(
     mut s: BoxedIo,
     host: &str,
     port: u16,
-    auth: &Option<(String, String)>,
+    auth: &Option<ProxyAuth>,
 ) -> Result<BoxedIo> {
     // Greeting: offer no-auth (and user/pass if we have credentials).
     if auth.is_some() {
@@ -320,7 +458,11 @@ async fn socks5_connect(
         0x02 => {
             let (u, p) = auth
                 .as_ref()
-                .ok_or_else(|| anyhow!("proxy requires auth but none given"))?;
+                .ok_or_else(|| anyhow!("proxy requires auth but none given"))?
+                .user_pass();
+            if u.len() > 255 || p.len() > 255 {
+                bail!("SOCKS5 credentials exceed the 255-byte field limit");
+            }
             let mut req = vec![0x01, u.len() as u8];
             req.extend_from_slice(u.as_bytes());
             req.push(p.len() as u8);
@@ -336,15 +478,26 @@ async fn socks5_connect(
         m => bail!("SOCKS5: unsupported auth method {m}"),
     }
 
-    // CONNECT request.
+    // CONNECT request. Hostnames go over the wire unresolved so the proxy does
+    // the DNS (`localDNS: false`, `_original/lib/config.js:1116`).
     let mut req = vec![0x05, 0x01, 0x00];
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        req.push(0x01);
-        req.extend_from_slice(&ip.octets());
-    } else {
-        req.push(0x03);
-        req.push(host.len() as u8);
-        req.extend_from_slice(host.as_bytes());
+    match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => {
+            req.push(0x01);
+            req.extend_from_slice(&ip.octets());
+        }
+        Ok(IpAddr::V6(ip)) => {
+            req.push(0x04);
+            req.extend_from_slice(&ip.octets());
+        }
+        Err(_) => {
+            if host.len() > 255 {
+                bail!("SOCKS5 hostname exceeds the 255-byte field limit");
+            }
+            req.push(0x03);
+            req.push(host.len() as u8);
+            req.extend_from_slice(host.as_bytes());
+        }
     }
     req.extend_from_slice(&port.to_be_bytes());
     s.write_all(&req).await?;
@@ -372,38 +525,7 @@ async fn socks5_connect(
 /// Fetch a URL with a simple GET and return `(status, body)`. Used by
 /// `responseFor` to prefetch another request's response.
 pub async fn simple_get(url: &str) -> Result<(u16, Bytes)> {
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("bad url {url}"))?;
-    let (host_port, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let tls = scheme.eq_ignore_ascii_case("https");
-    let default_port = if tls { 443 } else { 80 };
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-            (h.to_string(), p.parse().unwrap_or(default_port))
-        }
-        _ => (host_port.to_string(), default_port),
-    };
-    let target = Target {
-        connect_host: host.clone(),
-        connect_port: port,
-        tls,
-        sni: host.clone(),
-        request_port: port,
-        proxy: None,
-        tls_versions: TlsVersions::Default,
-    };
-    let req = Request::builder()
-        .method("GET")
-        .uri(path)
-        .header("host", &host)
-        .body(super::body::empty())
-        .context("building responseFor request")?;
-    let resp = forward(&target, req).await?;
-    let status = resp.status().as_u16();
-    let bytes = resp.into_body().collect().await?.to_bytes();
-    Ok((status, bytes))
+    simple_request("GET", url, None).await
 }
 
 /// POST a JSON body to a URL and return `(status, body)`. Used by the plugin
@@ -412,34 +534,37 @@ pub async fn simple_post_json(url: &str, json: &str) -> Result<(u16, Bytes)> {
     simple_request("POST", url, Some(json)).await
 }
 
+/// Split an absolute URL into a direct [`Target`] and its origin-form path.
+fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("bad url {url}"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let tls = scheme.eq_ignore_ascii_case("https");
+    let (host, port) = split_host_port(authority, if tls { 443 } else { 80 });
+    let target = Target {
+        connect_host: host.clone(),
+        connect_port: port,
+        tls,
+        sni: host,
+        request_port: port,
+        proxy: None,
+        tls_versions: TlsVersions::Default,
+    };
+    Ok((target, path.to_string()))
+}
+
 /// One-shot HTTP request to an absolute URL, returning `(status, body)`.
 ///
 /// Deliberately minimal: no pooling, no redirects, no retries — the plugin
 /// runtime layers its own retry policy on top, and plugin endpoints are local.
 async fn simple_request(method: &str, url: &str, json: Option<&str>) -> Result<(u16, Bytes)> {
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("bad url {url}"))?;
-    let (host_port, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let tls = scheme.eq_ignore_ascii_case("https");
-    let default_port = if tls { 443 } else { 80 };
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-            (h.to_string(), p.parse().unwrap_or(default_port))
-        }
-        _ => (host_port.to_string(), default_port),
-    };
-    let target = Target {
-        connect_host: host.clone(),
-        connect_port: port,
-        tls,
-        sni: host.clone(),
-        request_port: port,
-        proxy: None,
-        tls_versions: TlsVersions::Default,
-    };
-    let mut builder = Request::builder().method(method).uri(path).header("host", &host);
+    let (target, path) = parse_absolute_url(url)?;
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", &target.sni);
     if json.is_some() {
         builder = builder.header("content-type", "application/json");
     }
@@ -455,28 +580,46 @@ async fn simple_request(method: &str, url: &str, json: Option<&str>) -> Result<(
     Ok((status, bytes))
 }
 
-/// Build a `Basic <base64>` credential string.
-fn basic_auth(user: &str, pass: &str) -> String {
-    let token = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        format!("{user}:{pass}").as_bytes(),
-    );
-    format!("Basic {token}")
+/// Split an authority into host and port the way Node's URL parser does.
+///
+/// An IPv6 literal is bracketed in a URL (`[::1]:8080`); the brackets are part
+/// of the authority but not of the host, and `TcpStream::connect` wants the
+/// address without them. Anything after the last colon that is not all digits
+/// is part of the host (a bare `::1` has no port).
+fn split_host_port(authority: &str, default_port: u16) -> (String, u16) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // `[v6]` or `[v6]:port` — never split inside the brackets.
+        if let Some((v6, after)) = rest.split_once(']') {
+            let port = after
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(default_port);
+            return (v6.to_string(), port);
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p))
+            if !p.is_empty()
+                && p.chars().all(|c| c.is_ascii_digit())
+                // A bare IPv6 literal has several colons and no port at all.
+                && !h.contains(':') =>
+        {
+            (h.to_string(), p.parse().unwrap_or(default_port))
+        }
+        _ => (authority.to_string(), default_port),
+    }
 }
 
-/// Parse a proxy operator value: `[user:pass@]host[:port]`.
+/// Parse a proxy operator value: `[user[:pass]@]host[:port]`.
 pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
     let value = value.trim().trim_start_matches("//");
     if value.is_empty() {
         return None;
     }
+    // The credential ends at the *last* `@`, so a password may itself contain one.
     let (auth, hostport) = match value.rsplit_once('@') {
-        Some((creds, hp)) => {
-            let auth = creds
-                .split_once(':')
-                .map(|(u, p)| (u.to_string(), p.to_string()));
-            (auth, hp)
-        }
+        Some((creds, hp)) if !creds.is_empty() => (Some(ProxyAuth(creds.to_string())), hp),
+        Some((_, hp)) => (None, hp),
         None => (None, value),
     };
     let default_port = match kind {
@@ -484,12 +627,7 @@ pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
         ProxyKind::Https => 443,
         ProxyKind::Http => 80,
     };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-            (h.to_string(), p.parse().unwrap_or(default_port))
-        }
-        _ => (hostport.to_string(), default_port),
-    };
+    let (host, port) = split_host_port(hostport, default_port);
     if host.is_empty() {
         return None;
     }
@@ -499,13 +637,56 @@ pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    fn target(host: &str, port: u16, proxy: Option<ProxyConfig>) -> Target {
+        Target {
+            connect_host: host.to_string(),
+            connect_port: port,
+            tls: false,
+            sni: host.to_string(),
+            request_port: port,
+            proxy,
+            tls_versions: TlsVersions::Default,
+        }
+    }
+
+    fn get(url: &str, host_header: &str) -> Request<DynBody> {
+        Request::builder()
+            .method("GET")
+            .uri(url)
+            .header("host", host_header)
+            .header("user-agent", "probe/1.0")
+            .body(super::super::body::empty())
+            .expect("request")
+    }
+
+    /// Read one request head (up to the blank line) from `s`.
+    async fn read_head(s: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while s.read_exact(&mut byte).await.is_ok() {
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
 
     #[test]
     fn parse_http_proxy_with_auth() {
         let p = parse_proxy(ProxyKind::Http, "user:pass@127.0.0.1:8888").unwrap();
         assert_eq!(p.host, "127.0.0.1");
         assert_eq!(p.port, 8888);
-        assert_eq!(p.auth, Some(("user".into(), "pass".into())));
+        assert_eq!(p.auth.unwrap().header_value(), "Basic dXNlcjpwYXNz");
     }
 
     #[test]
@@ -513,5 +694,261 @@ mod tests {
         let p = parse_proxy(ProxyKind::Socks, "10.0.0.1").unwrap();
         assert_eq!(p.port, 1080);
         assert!(p.auth.is_none());
+    }
+
+    /// whistle base64s the credential verbatim, so a password-less one is
+    /// `base64("user")` and not `base64("user:")` (`res.js:291`). The SOCKS hop
+    /// splits the same string with an empty password (`config.js:285-309`).
+    #[test]
+    fn credentials_without_a_password_still_travel() {
+        let p = parse_proxy(ProxyKind::Http, "user@127.0.0.1:8888").unwrap();
+        let auth = p.auth.expect("auth survives a missing password");
+        assert_eq!(auth.header_value(), "Basic dXNlcg==");
+        assert_eq!(auth.user_pass(), ("user", ""));
+
+        // A password may itself contain '@' — the credential ends at the last one.
+        let p2 = parse_proxy(ProxyKind::Socks, "u:p@ss@10.0.0.1:1080").unwrap();
+        assert_eq!(p2.host, "10.0.0.1");
+        assert_eq!(p2.auth.unwrap().user_pass(), ("u", "p@ss"));
+    }
+
+    #[test]
+    fn ipv6_proxy_addresses_keep_their_address() {
+        let p = parse_proxy(ProxyKind::Http, "[::1]:8888").unwrap();
+        assert_eq!(p.host, "::1");
+        assert_eq!(p.port, 8888);
+
+        // Bracketless and portless: every colon belongs to the address.
+        let p2 = parse_proxy(ProxyKind::Socks, "fe80::1").unwrap();
+        assert_eq!(p2.host, "fe80::1");
+        assert_eq!(p2.port, 1080);
+
+        let p3 = parse_proxy(ProxyKind::Https, "[2001:db8::5]").unwrap();
+        assert_eq!(p3.host, "2001:db8::5");
+        assert_eq!(p3.port, 443);
+    }
+
+    #[test]
+    fn authority_rendering_brackets_ipv6_and_drops_the_default_port() {
+        assert_eq!(join_host_port("a.com", 80, 80), "a.com");
+        assert_eq!(join_host_port("a.com", 8080, 80), "a.com:8080");
+        assert_eq!(join_host_port("::1", 443, 0), "[::1]:443");
+        assert_eq!(join_host_port("[::1]", 443, 0), "[::1]:443");
+    }
+
+    /// Only a plain HTTP proxy reaching a plain HTTP origin uses absolute-form;
+    /// TLS, SOCKS, an HTTPS proxy and a `host://` override all force a CONNECT
+    /// (`_original/lib/inspectors/res.js:292-297`).
+    #[test]
+    fn absolute_form_is_reserved_for_the_plain_http_hop() {
+        let http = || parse_proxy(ProxyKind::Http, "127.0.0.1:1").unwrap();
+        assert!(uses_absolute_form(&target("a.com", 80, Some(http()))));
+        assert!(!uses_absolute_form(&target("a.com", 80, None)));
+
+        let mut tls = target("a.com", 443, Some(http()));
+        tls.tls = true;
+        assert!(!uses_absolute_form(&tls));
+
+        let socks = parse_proxy(ProxyKind::Socks, "127.0.0.1:1").unwrap();
+        assert!(!uses_absolute_form(&target("a.com", 80, Some(socks))));
+
+        let https = parse_proxy(ProxyKind::Https, "127.0.0.1:1").unwrap();
+        assert!(!uses_absolute_form(&target("a.com", 80, Some(https))));
+
+        let mut phost = target("a.com", 80, Some(http()));
+        phost.connect_host = "10.0.0.9".into();
+        assert!(!uses_absolute_form(&phost));
+    }
+
+    #[test]
+    fn crlf_never_reaches_the_connect_request() {
+        assert!(is_header_value("Mozilla/5.0"));
+        assert!(!is_header_value("evil\r\nX-Injected: 1"));
+        assert!(!is_header_value("evil\nX-Injected: 1"));
+        assert!(!is_header_value(""));
+    }
+
+    /// End to end: a plain HTTP request through an HTTP proxy is sent
+    /// absolute-form, and the URI names the requested host — not the address we
+    /// happen to be connecting to (`res.js:606-612`).
+    #[test]
+    fn plain_http_traverses_the_proxy_in_absolute_form() {
+        rt().block_on(async {
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = proxy.local_addr().unwrap().port();
+            let seen = tokio::spawn(async move {
+                let (mut s, _) = proxy.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                    .await
+                    .unwrap();
+                head
+            });
+
+            let cfg = parse_proxy(ProxyKind::Http, &format!("bob:s3cr3t@127.0.0.1:{port}")).unwrap();
+            let resp = forward(
+                &target("example.com", 80, Some(cfg)),
+                get("/p?q=1", "example.com"),
+            )
+            .await
+            .expect("forward through proxy");
+            assert_eq!(resp.status(), 200);
+
+            let head = seen.await.unwrap();
+            assert!(
+                head.starts_with("GET http://example.com/p?q=1 HTTP/1.1\r\n"),
+                "absolute-form request line, got: {head:?}"
+            );
+            assert!(head.to_lowercase().contains("proxy-authorization: basic Ym9iOnMzY3IzdA=="
+                .to_lowercase()
+                .as_str()));
+        });
+    }
+
+    /// A `host://` override travelling with the proxy switches the hop to
+    /// CONNECT, and the tunnel target is the overridden address while the
+    /// request inside still carries the original `Host`.
+    #[test]
+    fn a_host_override_tunnels_with_connect() {
+        rt().block_on(async {
+            // The "origin" the proxy will be asked to reach.
+            let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut s, _) = origin.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                let body = format!("{}", head.lines().next().unwrap_or(""));
+                s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            });
+
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_port = proxy.local_addr().unwrap().port();
+            let seen = tokio::spawn(async move {
+                let (mut s, _) = proxy.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                // Splice the tunnel onto the real origin.
+                let mut up = TcpStream::connect(("127.0.0.1", origin_port)).await.unwrap();
+                tokio::io::copy_bidirectional(&mut s, &mut up).await.ok();
+                head
+            });
+
+            let cfg = parse_proxy(ProxyKind::Http, &format!("127.0.0.1:{proxy_port}")).unwrap();
+            let mut t = target("example.com", 80, Some(cfg));
+            t.connect_host = "127.0.0.1".into();
+            t.connect_port = origin_port;
+
+            let resp = forward(&t, get("/x", "example.com")).await.expect("tunnelled");
+            assert_eq!(resp.status(), 200);
+            let echoed = resp.into_body().collect().await.unwrap().to_bytes();
+            // Inside the tunnel the request is origin-form, not absolute-form.
+            assert_eq!(echoed, Bytes::from("GET /x HTTP/1.1"));
+
+            let head = seen.await.unwrap();
+            assert!(
+                head.starts_with(&format!("CONNECT 127.0.0.1:{origin_port} HTTP/1.1\r\n")),
+                "CONNECT to the overridden address, got: {head:?}"
+            );
+            let lower = head.to_lowercase();
+            assert!(lower.contains("proxy-connection: keep-alive\r\n"), "{head:?}");
+            assert!(lower.contains("user-agent: probe/1.0\r\n"), "{head:?}");
+        });
+    }
+
+    /// A refusing proxy surfaces as an error rather than a silent direct
+    /// connection — the request must never leak past the proxy it was pinned to.
+    #[test]
+    fn a_refused_connect_fails_the_request() {
+        rt().block_on(async {
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = proxy.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut s, _) = proxy.accept().await.unwrap();
+                read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+
+            let cfg = parse_proxy(ProxyKind::Http, &format!("127.0.0.1:{port}")).unwrap();
+            let mut t = target("example.com", 80, Some(cfg));
+            t.connect_host = "10.0.0.9".into();
+            let err = forward(&t, get("/x", "example.com")).await.unwrap_err();
+            assert!(format!("{err:#}").contains("407"), "{err:#}");
+        });
+    }
+
+    /// SOCKS5: hostnames go over the wire unresolved (ATYP 3) and IPv6 uses
+    /// ATYP 4 rather than being spelled out as a domain name.
+    #[test]
+    fn socks5_addresses_the_origin_by_name_or_ipv6() {
+        for (host, want_atyp, want_addr) in [
+            ("example.com", 0x03u8, b"example.com".to_vec()),
+            ("::1", 0x04, std::net::Ipv6Addr::LOCALHOST.octets().to_vec()),
+            ("127.0.0.1", 0x01, vec![127, 0, 0, 1]),
+        ] {
+            rt().block_on(async {
+                let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = socks.local_addr().unwrap().port();
+                let seen = tokio::spawn(async move {
+                    let (mut s, _) = socks.accept().await.unwrap();
+                    let mut greeting = [0u8; 4];
+                    s.read_exact(&mut greeting[..3]).await.unwrap();
+                    let nmethods = greeting[1] as usize;
+                    if nmethods > 1 {
+                        s.read_exact(&mut greeting[3..3 + nmethods - 1]).await.unwrap();
+                    }
+                    s.write_all(&[0x05, 0x02]).await.unwrap(); // demand user/pass
+                    let mut hdr = [0u8; 2];
+                    s.read_exact(&mut hdr).await.unwrap();
+                    let mut user = vec![0u8; hdr[1] as usize];
+                    s.read_exact(&mut user).await.unwrap();
+                    let mut plen = [0u8; 1];
+                    s.read_exact(&mut plen).await.unwrap();
+                    let mut pass = vec![0u8; plen[0] as usize];
+                    s.read_exact(&mut pass).await.unwrap();
+                    s.write_all(&[0x01, 0x00]).await.unwrap();
+
+                    let mut req = [0u8; 4];
+                    s.read_exact(&mut req).await.unwrap();
+                    let len = match req[3] {
+                        0x01 => 4,
+                        0x04 => 16,
+                        _ => {
+                            let mut l = [0u8; 1];
+                            s.read_exact(&mut l).await.unwrap();
+                            l[0] as usize
+                        }
+                    };
+                    let mut addr = vec![0u8; len + 2];
+                    s.read_exact(&mut addr).await.unwrap();
+                    s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                    // Play the origin inside the tunnel.
+                    read_head(&mut s).await;
+                    s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                    (req[3], len, addr, user, pass)
+                });
+
+                let cfg =
+                    parse_proxy(ProxyKind::Socks, &format!("bob@127.0.0.1:{port}")).unwrap();
+                let resp = forward(&target(host, 80, Some(cfg)), get("/", host))
+                    .await
+                    .expect("socks forward");
+                assert_eq!(resp.status(), 204);
+
+                let (atyp, len, addr, user, pass) = seen.await.unwrap();
+                assert_eq!(atyp, want_atyp, "address type for {host}");
+                assert_eq!(&addr[..len], &want_addr[..], "address bytes for {host}");
+                assert_eq!(user, b"bob", "username for {host}");
+                assert!(pass.is_empty(), "empty password for {host}");
+            });
+        }
     }
 }
