@@ -10,6 +10,9 @@ whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 - **改写响应** —— 状态码、响应头、响应体
 - **流式改写 body** —— 边收边改，全程不落内存（`pipe://`）
 - **拦改 WebSocket 帧** —— 逐帧、双向，可改写也可丢弃
+- **决定放不放行** —— 认证钩子，**唯一一个失败即拦截**的钩子
+- **上报统计** —— 请求/响应两个阶段各一次，发完不管
+- **自带页面** —— 在 `/plugin/<name>/` 下服务插件自己的 UI
 
 两种运行时实现同一套契约：
 
@@ -18,13 +21,21 @@ whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 | **JS / TS 插件** | 独立进程，通过 HTTP 协议通信。用 [`sdk/`](../sdk/) 的零依赖 SDK 编写，协议细节完全被封装 |
 | **Rust 插件** | 进程内原生插件，实现 `RustPlugin` trait，零 IPC。见 [`src/plugins/builtin.rs`](../src/plugins/builtin.rs) |
 
-钩子分三族，**由规则的协议名决定跑哪一族**：
+改写流量的钩子分三族，**由规则的协议名决定跑哪一族**：
 
 | 规则 | 钩子 | body |
 |------|------|------|
 | `plugin://<name>[/<param>]` | `onRequest` / `onResponse` | 整体缓冲，需显式声明 |
 | `pipe://<name>[(<value>)]` | `pipeRequest` / `pipeResponse` | **流式，永不缓冲** |
 | 两者皆可，命中 WebSocket 时 | `onWsFrame` | 逐帧，一次一帧 |
+
+另有三个**不改写流量**的钩子：
+
+| 钩子 | 由什么触发 | 说明 |
+|------|-----------|------|
+| [`onAuth`](#认证钩子--onauth) | 同上两种规则，跑在所有请求钩子**之前** | 决定这个请求放不放行 |
+| [`onReqStats` / `onResStats`](#统计钩子--onreqstats--onresstats) | 同上，两个阶段各一次 | 只上报，不等回应 |
+| [`onUi`](#插件页面--onui) | 浏览器访问 `/plugin/<name>/…` | 插件自己的页面，与代理流量无关 |
 
 `pipe://` 指向一个没有声明任何流式钩子的插件时，退化为 `plugin://` —— 与流式钩子出现之前的语义一致，老规则不会失效。
 
@@ -402,6 +413,239 @@ SERVER  saw cont   fin=true  "ment"
 
 ---
 
+## 认证钩子 / `onAuth`
+
+一个插件决定这个请求**放不放行**。返回 `false` 就是拦下来。
+
+```js
+const { start } = require('whistle-rs/sdk/whistle-rs-plugin');
+
+start({
+  name: 'gate',
+
+  onAuth(ctx) {
+    const token = ctx.header('x-gate-token');
+    if (!token) {
+      ctx.setLogin(true);              // 401 + www-authenticate，浏览器弹登录框
+      return false;
+    }
+    if (token !== ctx.param) {
+      ctx.setHtml('<h1>403</h1>');     // 自定义拦截页
+      return false;
+    }
+    ctx.setHeader('x-whistle-user', token);   // 放行，并给下游带上身份
+  },
+});
+```
+
+```
+example.com   plugin://gate/s3cret
+```
+
+完整示例见 [`examples/plugins/token-gate.js`](../examples/plugins/token-gate.js)（认证 + 统计 + 页面三个钩子）；
+Rust 版本见 [`src/plugins/builtin.rs`](../src/plugins/builtin.rs) 里的 `plugin://gate`。
+
+### 拦截的四种形态
+
+| 调用 | 客户端看到 |
+|------|-----------|
+| 什么都不调，`return false` | `403` + `Forbidden` |
+| `ctx.setHtml(html)` | `403` + 这段 HTML |
+| `ctx.setRedirect(url)` | `302` + `location: url` |
+| `ctx.setUrl(url)` / `setFile(path)` | `403` + **该 URL / 文件的内容**（代理去 GET / 读盘） |
+| `ctx.setLogin(true)` | `401` + `www-authenticate: Basic`（`setStatus(407)` 则是 `proxy-authenticate`） |
+| `ctx.setStatus(code)` | 换掉状态码，**仅接受 3xx–5xx** |
+
+对应原版的 `req.setHtml` / `setRedirect` / `setUrl` / `setFile` / `setLogin`。原版把拦截翻译成
+三条合成规则（`lib/plugins/index.js:936-959`：`method://get <url>`、`redirect://<url>`、
+`status:// + resBody://`），whistle-rs 直接渲染成响应 —— 合成规则在原版存在，是因为拦截结果必须
+重新汇入一条只认规则的管线，所以每条都用 `ignore://` 钉死；这里少一层机器就到同一个地方，而且
+**直接应答会终止插件链**，那才是关键的部分。
+
+几个刻意的选择：
+
+- **拦截永远不是 2xx。** `setStatus(200)` 会被忽略，退回 `403`。
+- **`setHeader` 只认 `x-whistle-*` 和 `proxy-authorization`**，且只在**放行**时生效。
+  与原版同一组限制（`load-plugin.js:1757-1768`、`index.js:878-895`），并且在代理侧**再过滤一次** ——
+  插件不是安全边界。认证钩子是用来**标识**一个请求的，不是用来改写它的。
+- **没有 body。** 认证钩子拿不到请求体：为了鉴权而缓冲每一个上传，代价不成比例；原版也不给。
+
+### 失败即拦截（fail closed）
+
+这套插件系统里所有其它钩子失败都降级成「什么都不做」：管道接不上就原样放行，帧钩子挂了就摘掉，
+请求钩子超时就当无操作。那些都是**装饰性**的属性，请求继续走反而更好。
+
+**认证不是装饰性的。** 一个坏掉就放行的门不是门，所以这里**每一种失败都拦截**：
+
+| 情况 | 结果 |
+|------|------|
+| 插件连不上 / 中途死了 | `502`，正文写明原因 |
+| 5 秒内没给裁决 | `502` |
+| 应答非 200/204 | `502` |
+| 应答 200 但不是能看懂的 JSON | `502` |
+| 应答 200/204 且**正文为空** | **放行** —— 这是本协议里一致的「无话可说」 |
+| 声明了 `auth` 却不提供 `/auth` 端点 | `502`（清单说了有，那就得有） |
+
+原版从另一个方向落到同一处：它的 `authReq` 把传输错误和主动拒绝一视同仁（`if (err || body)` →
+forbidden，`lib/plugins/index.js:836`），并且给错误 `502`、给主动拒绝 `403`
+（`index.js:951`）。**状态码就是这两者的区分方式**，这里保留了它。
+
+实测（杀掉插件进程之后，同一条原本 200 的请求）：
+
+```
+$ curl -i -x 127.0.0.1:19181 -H 'x-gate-token: s3cret' http://127.0.0.1:19180/open
+HTTP/1.1 502 Bad Gateway
+x-whistle-rs-auth: tokengate
+content-type: text/html; charset=utf-8
+
+Plugin auth failed: connecting to 127.0.0.1:61043: Connection refused (os error 61)
+```
+
+日志里同时留一行 `WARN auth tokengate: … ; request blocked`。**没有命中这个门的请求不受影响**
+（同一时刻 `/plain` 依然 200）。
+
+### 代价
+
+认证跑在请求路径上，所以它的开销落在**每一个命中的请求**上。同一台机器、debug 构建、
+Node 插件在本机 loopback，四种配置交替发送（每轮各发一次，让负载波动平摊到所有配置上），
+每种 400 次串行请求：
+
+```
+基线二进制（f21b92a）  /bare            mean 0.234ms  p50 0.226ms  p95 0.299ms
+本分支                 /bare            mean 0.226ms  p50 0.223ms  p95 0.267ms
+基线二进制（f21b92a）  /plain (stamp)   mean 0.245ms  p50 0.241ms  p95 0.290ms
+本分支                 /plain (stamp)   mean 0.247ms  p50 0.242ms  p95 0.292ms
+插件在跑但规则没命中                     mean 0.212ms  p50 0.208ms  p95 0.248ms
+命中门（Node，走 HTTP）                  mean 0.419ms  p50 0.402ms  p95 0.489ms
+命中门（Rust，进程内）                   mean 0.258ms  p50 0.255ms  p95 0.296ms
+```
+
+三件事：
+
+1. **前两组是硬要求**：没有认证插件的请求，与加这个钩子之前**一模一样** —— `/bare`（无规则）
+   和 `/plain`（命中一个没有认证钩子的插件）两条路径都在噪声内。字节也一样：同一请求分别打到
+   基线二进制和本分支，响应头（除 `date`）与响应体逐字节相同。
+2. **Node 的门约 +0.18ms（p50）** —— 就是一次本机 HTTP 往返，和其它远程钩子同价。
+3. **Rust 的门约 +0.03ms** —— 没有 IPC，剩下的只是判断和一个额外的头。
+
+### Rust 插件
+
+```rust
+fn auth(&self, req: &PluginReq) -> AuthVerdict {
+    if req.headers.iter().any(|(k, v)| k == "x-gate-token" && v == "s3cret") {
+        return AuthVerdict::Allow(vec![("x-whistle-user".into(), "bob".into())]);
+    }
+    AuthVerdict::Deny(Denial {
+        page: DenyPage::Html(b"<h1>no</h1>".to_vec()),
+        ..Denial::forbidden()
+    })
+}
+```
+
+内置的 `plugin://gate` 就是这么实现的。
+
+---
+
+## 统计钩子 / `onReqStats` / `onResStats`
+
+告诉插件「有什么东西过去了」。**发完不管**：应答被丢弃，请求路径上没有任何东西等它。
+
+```js
+start({
+  name: 'gate',
+  onReqStats(ctx) { seen.push(ctx.url); },
+  onResStats(ctx) { byStatus[ctx.statusCode] = (byStatus[ctx.statusCode] || 0) + 1; },
+});
+```
+
+这正是它敢挂在热路径上的原因：一个卡住、崩掉、返回 500 的统计插件，代价是一次
+`tokio::spawn` 和一个 socket，**不是一毫秒的延迟**。原版也是这么做的 —— 开一个请求，
+`response.on('data', util.noop)`，错误吞掉，从不回调（`lib/plugins/index.js:1369-1408`）。
+
+反过来说：**统计钩子不是做决定的地方**。想改请求就用认证钩子或请求钩子，那两个之所以被等待，
+正是因为它们说了算。
+
+`ctx` 是缓冲钩子那套元信息（`id` / `method` / `url` / `headers` / `param` / `clientIp`），
+外加 `ctx.phase`（`'request'` / `'response'`）和 `ctx.statusCode`（仅响应阶段）。
+
+每个阶段每个插件恰好一次：代理本来就按阶段遍历命中的插件一遍，所以不需要原版那种
+`req._postResStats` 去重标记。
+
+---
+
+## 插件页面 / `onUi`
+
+浏览器访问 `http://<代理端口>/plugin/<name>/…`，请求就交给这个插件。
+
+```js
+start({
+  name: 'gate',
+  onUi(req, res) {
+    if (req.url === '/stats.json') return seen;         // 非字符串 → JSON
+    return `<h1>admitted ${seen.admitted}</h1>`;        // 字符串 → HTML
+    // 什么都不返回，就自己写 res —— 拿到的是 Node 原生的 (req, res)
+  },
+});
+```
+
+```
+http://127.0.0.1:8899/plugin/          # 所有带 UI 的插件的索引
+http://127.0.0.1:8899/plugin/gate/     # 插件自己的首页
+```
+
+### 为什么是「再转发一次 HTTP」
+
+UI 请求本来就是一个 HTTP 请求配一个 HTTP 应答，所以这个钩子整个复用 HTTP：浏览器的方法、路径、
+查询串、头、body 原样发给插件的 `/ui…`，插件的状态码、头、body 流式回来。没有 JSON 信封，
+因为没有东西需要被信封装 —— 与 `pipe://` 选择 chunked 而不是自造分帧是同一条理由的下一步。
+插件作者写的就是一个普通的 Node handler，可以用自己的路径、content-type、缓存头和流式输出，
+这些没有一样能塞进 JSON 协议里。
+
+代理会把 `/plugin/<name>` 从路径上摘掉，再补上 `/ui` 前缀 —— 这就是插件的**页面**和它的**钩子**
+互不打架的原因：`/ui` 下面是浏览器的地盘，旁边的 `/manifest`、`/request`、`/auth` 是代理的地盘。
+原版用另一种方式隔开（同一个端口，靠一个内部的 hook-name 头分发，`load-plugin.js:2006-2024`），
+但它有一个独立的 `uiServer` 对象可以分发过去；这里只有一个 server 和一个路由表，所以这条边界
+必须画在路径上。
+
+### UI 请求拿不到什么
+
+**拿不到被代理的那个请求。** 原版在这一点上很明确：HTTP 钩子拿的是 `initReq(req, res, true)`
+（带规则、会话信息、原始请求/响应的完整装饰对象），而 UI 钩子只拿 `setContext(req)` ——
+挂上存储，以及调用方传了会话头时的客户端地址（`load-plugin.js:160-200`、`:2019-2024`）。
+
+whistle-rs 照做：插件收到的就是**浏览器自己那个请求**，别的没有。理由不是省事 —— UI 请求是
+浏览器在向插件要一张页面，它不属于任何人的代理流量，硬塞一个请求上下文进去等于凭空发明一段
+根本不存在的关联。想展示抓到的流量，就在**真的看得见流量**的钩子里（`onRequest`、`onResStats`）
+攒起来，再从自己的状态里渲染 —— 原版插件也正是这么写的。
+
+### 失败与限制
+
+- 插件连不上 / 10 秒不应答 → 浏览器看到 `502`，日志里一行 `debug`。**代理流量不受影响**。
+- 页面里请用**相对链接**。绝对路径（`/style.css`）会打到代理的 web UI 上，不会到插件。
+  访问 `/plugin/<name>`（无尾斜杠）会被 `302` 到带斜杠的形式，否则相对链接全断 —— 原版同理
+  （`biz/webui/lib/index.js:489-491`）。
+- **这个路由没有鉴权**，和 whistle-rs 的整个 web UI 一样。原版有 `inheritAuth` 可以让插件页面
+  继承 web UI 的登录态；这里的 web UI 本身还没有登录态，所以没有可继承的东西。
+- 不支持从 UI 路由升级 WebSocket。
+
+### Rust 插件
+
+```rust
+fn ui(&self, req: &UiReq) -> UiResp {
+    match req.path.as_str() {
+        "/" => UiResp::html("<h1>hi</h1>"),
+        "/stats.json" => UiResp::json(&serde_json::json!({ "ok": true })),
+        _ => UiResp::not_found(),
+    }
+}
+```
+
+`UiReq` 只有 `method` / `path` / `query` / `headers` / `body`（外加 `req.param("k")`），
+与上面那条「UI 请求拿不到被代理的请求」是同一件事。往页面里插流量里来的字符串时用
+`plugins::ui::escape_html`。
+
+---
+
 ## 上下文 API
 
 ### 通用（两个钩子都有）
@@ -444,15 +688,18 @@ SERVER  saw cont   fin=true  "ment"
 
 1. 规则解析 → 得到本次请求的规则集
 2. **若有插件声明 `requestBody`** → 缓冲请求体
-3. **`onRequest`**（按规则中出现的顺序遍历所有匹配插件）
-   - `setRules` 注入的规则合并进规则集
-   - `respond()` 一旦调用，立即返回，**后续插件不再执行**
+3. **请求阶段**（按规则中出现的顺序遍历所有匹配插件，每个插件内部依次是）
+   - **`onAuth`** —— 拦下就立即返回，**后续插件一律不执行**（连同它自己的 `onRequest`）
+   - **`onReqStats`** —— 发出去就不管
+   - **`onRequest`**
+     - `setRules` 注入的规则合并进规则集
+     - `respond()` 一旦调用，立即返回，**后续插件不再执行**
 4. 规则算子应用到请求上（`reqHeaders` 等）
 5. 插件的 `setHeaders` / `removeHeaders` 应用 —— **在算子之后**，所以插件可以覆盖规则
 6. **`pipeRequest`** 接入请求体（多个 `pipe://` 按规则顺序串联，后一个吃前一个的输出）
 7. 请求发往上游
 8. 规则算子应用到响应上（`resHeaders` 等）
-9. **`onResponse`**
+9. **响应阶段** —— **`onResStats`**（发出去就不管），然后 **`onResponse`**
    - 未声明 `responseBody` 的插件先跑，响应**保持流式**
    - 声明了的插件在 body 就绪后跑
 10. **`pipeResponse`** 接入响应体 —— 在「是否缓冲」的判断**之前**，所以接了管道的响应仍然走流式分支
@@ -475,6 +722,9 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 
 流式钩子的降级规则不同，见 [流式钩子 · 出错了会怎样](#出错了会怎样)：**握手成功之前**任何失败都零代价（body 原样放行，记一行 `WARN`）；**握手成功之后**插件挂掉会让 body 出错。
 
+**认证钩子是唯一的例外**：它失败就拦截，见 [失败即拦截](#失败即拦截fail-closed)。SDK 里的
+`onAuth` 抛异常会返回 `500`（而不是像其它钩子那样返回 `200 {}`），代理据此给出 `502`。
+
 ---
 
 ## 内置 Rust 插件
@@ -488,8 +738,12 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 | `plugin://stamp[/<值>]` | 给响应加 `x-stamped-by` 头，演示**响应钩子**且不索取 body |
 | `pipe://upper` | 把 body 逐帧转大写，演示**流式钩子**（请求、响应两个方向都接） |
 | `pipe://ws-upper` | 把 WebSocket 文本帧转大写，演示**帧钩子**（双向；二进制与分片不碰） |
+| `plugin://gate[/<令牌>]` | 校验 `x-gate-token`，演示**认证 + 统计 + 页面**三个钩子 |
 
-写一个 Rust 插件只需实现 `name` 与 `on_request`，其余方法都有默认实现 —— 以后给协议加钩子不会破坏已有插件。`pipe` 的默认实现是恒等变换。
+> `plugin://gate` **默认拦截** —— 没有 `x-gate-token` 就是 `401`。同名的自定义插件
+> （`--node-plugin gate=…`）会覆盖内置的这一个，覆盖方向是「用户的赢」。
+
+写一个 Rust 插件只需实现 `name` 与 `on_request`，其余方法都有默认实现 —— 以后给协议加钩子不会破坏已有插件。`pipe` 的默认实现是恒等变换，`auth` 的默认实现是放行。
 
 ---
 
@@ -507,13 +761,16 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 {
   "name": "my-plugin",
   "version": "1.0.0",
-  "hooks": ["request", "response", "pipeRequest", "pipeResponse", "wsFrame"],
+  "hooks": ["request", "response", "pipeRequest", "pipeResponse", "wsFrame",
+            "auth", "reqStats", "resStats", "ui"],
   "requestBody": false,
   "responseBody": true
 }
 ```
 
-`hooks` 决定哪些端点会被调用；两个 body 开关决定是否缓冲并投递 body（只对 `request` / `response` 有意义 —— 流式钩子和帧钩子从不缓冲，也就无需声明）。
+`hooks` 决定哪些端点会被调用；两个 body 开关决定是否缓冲并投递 body（只对 `request` / `response` 有意义 —— 流式钩子、帧钩子、认证钩子和统计钩子都不缓冲，也就无需声明）。
+
+**声明 `auth` 是一个承诺**：从此这个插件命中的请求必须拿到它的裁决才能继续，拿不到就是拦截。不打算做认证就别声明。
 
 **不提供 `/manifest` 的插件按 v1 协议处理**：只有请求钩子，无 body，分发到 `POST /`。老插件因此无需改动即可继续工作。
 
@@ -545,6 +802,45 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 ```json
 { "statusCode": 201, "setHeaders": {}, "removeHeaders": [], "body": "…" }
 ```
+
+### `POST /auth` —— 认证
+
+请求体与 `POST /request` 相同，**减去 body**：
+
+```json
+{ "id": 42, "method": "GET", "url": "http://…", "headers": [["k","v"]],
+  "clientIp": "1.2.3.4", "param": "extra/after/name" }
+```
+
+应答 `200`：
+
+```json
+{ "allow": false, "statusCode": 403, "login": false,
+  "html": "<h1>no</h1>", "redirect": "http://…", "url": "http://…",
+  "setHeaders": { "x-whistle-user": "bob" } }
+```
+
+- `allow` 缺省视为 `true`（没有意见 = 放行）；`setHeaders` 只在放行时生效，且只保留
+  `x-whistle-*` 与 `proxy-authorization`。
+- 拦截时 `redirect` > `url` > `html`（与原版读取顺序一致），`statusCode` 只接受 `300`–`599`。
+- **`200` 且正文为空、或 `204`/`304`** —— 放行。
+- **其它任何情况（连不上、超时 5 秒、非 200、正文不是 JSON 对象）—— 拦截**，`502`。
+
+### `POST /stats` —— 统计（发完不管）
+
+```json
+{ "phase": "response", "id": 42, "method": "GET", "url": "http://…",
+  "statusCode": 200, "headers": [["k","v"]], "param": "…" }
+```
+
+`phase` 是 `request` 或 `response`（`statusCode` 仅响应阶段）。**应答会被直接丢弃**，
+返回什么都行，代理不会等。
+
+### `GET|POST|… /ui/<path>` —— 插件页面
+
+不是 JSON 协议：浏览器的请求原样转发，`/plugin/<name>` 被摘掉、`/ui` 被补上，
+逐跳头（`connection`、`transfer-encoding`、`content-length`、`host` 等）由代理重建。
+应答的状态码、头、body 流式回传给浏览器。
 
 ### `POST /pipe/request`、`POST /pipe/response` —— 流式钩子
 
@@ -680,8 +976,37 @@ whistle-rs --plugin name=127.0.0.1:9000
 - **原版插件不兼容** —— 原版的 `wsReqRead` / `wsReqWrite` / `wsResRead` / `wsResWrite`
   建立在 CONNECT + 装饰过的 socket 上，与这里的协议无关。语义搬了，线上格式没搬。
 
+### 认证钩子的边界
+
+- **不覆盖未被解密的 CONNECT 隧道** —— 认证跑在请求上，隧道里没有请求可看。被 MITM 解密的
+  HTTPS 请求（包括 WebSocket 握手）会正常过门；按规则直通的隧道不会。原版可以对隧道整体
+  返回 `407`，这里不行。
+- **升级请求能被拦，但拿不到注入的头** —— WebSocket 握手会正常过门（拦下就是一个普通的
+  `401`/`403` 响应，`101` 不会发生），只是升级分支在插件头被应用到出站请求之前就分岔了，
+  所以放行时 `setHeader` 的头不会出现在转发出去的握手里。这是升级路径既有的性质。
+- **拿不到请求体** —— 见上文，这是取舍不是遗漏。
+- **多个门是串行的** —— 命中 N 个带认证的插件就是 N 次串行往返，第一个说拦的终止其余。
+  原版是并发发起、任一拒绝即拦截。顺序换来的是「谁拦的」是确定的，代价是延迟叠加。
+- **超时固定 5 秒**，不可配置。
+- **放行时注入的头，后面的插件看不到** —— 它们在规则算子之后才被应用到出站请求上，而同一轮里
+  后续插件拿到的是这一轮开始时的请求头快照。上游服务器看到的是最终结果，插件之间看不到。
+
+### 插件页面的边界
+
+- **没有鉴权** —— 与整个 web UI 一致；原版的 `inheritAuth` 没有可继承的对象。
+- **只有相对链接可用**，且必须带尾斜杠访问（无尾斜杠会被 302）。
+- **没有 `/whistle.<name>/` 别名**，也没有把插件页面嵌进 Network 面板的菜单/检查器扩展点
+  （原版的 `MENU_URL` / `INSPECTOR_URL`）。
+- **不能从 UI 路由升级 WebSocket。**
+
+### 统计钩子的边界
+
+- **不保证送达，也不保证顺序** —— 这是「发完不管」的定义，不是缺陷。
+- **只有元信息** —— 没有耗时、没有字节数、没有 body。响应阶段在**响应头**就绪时触发，
+  那时 body 还没走完。
+- **没走到那一步就不会上报** —— 被拦截、被 `abort`、被规则短路的请求没有响应阶段。
+
 ### 其它
 
-- **插件自带 UI / 统计页**（原版的 `uiServer` / `statsServer`）。
 - **`sniCallback`** —— 需要在 TLS SNI 阶段介入选证书，早于按请求的规则解析，当前 MITM 架构不可达。
 - **npm `whistle.*` 包兼容** —— 明确的非目标，见本文开头。
