@@ -27,12 +27,15 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/mod.rs` | `lib/index.js`, `lib/tunnel.js` | Server, forward proxy, CONNECT + MITM, WebSocket, capture log, status page/PAC |
 | `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split), upstream HTTP/SOCKS proxies |
 | `src/proxy/apply.rs` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations |
+| `src/proxy/template.rs` | `lib/handlers/file-proxy.js` (`render`) | `tpl`/`dust`/`jsonp` two-pass rendering + `${var}` variables |
+| `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation) |
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
 | `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
 | `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + capturing/`frameScript` tunnel |
 | `src/proxy/webui.rs` | `biz/webui` | Built-in web UI + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
-| `src/plugins/mod.rs` | `lib/plugins/` | Unified plugin registry + remote (Node/HTTP) JSON protocol |
-| `src/plugins/builtin.rs` | (examples) | Built-in Rust example plugins (`echo`, `tag`) |
+| `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
+| `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`) |
+| `sdk/whistle-rs-plugin.js` | `lib/plugins/load-plugin.js` | Zero-dependency JS/TS plugin SDK (+ `.d.ts` types) |
 | `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
 | `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
 
@@ -56,12 +59,17 @@ serve(Mitm) ──────────────────────�
         │
         ├─ build ReqInfo (scheme, host, port, path, full_url)
         ├─ RuleManager::resolve(&ReqInfo) → Resolved
-        ├─ apply::short_circuit? ── yes ──▶ 302 / mock status / file  ─▶ response
+        ├─ buffer request body?  ── only if a matched plugin's manifest asks
+        ├─ plugin onRequest ── responded? ──▶ mock response
+        │        │  else: merge injected rules, collect header rewrites
+        ├─ apply::short_circuit? ── yes ──▶ 302 / mock status / file / template ─▶ response
         │        no
         ├─ apply::resolve_target (host:// override; keep SNI)
-        ├─ apply::apply_request (headers, ua, method, …)
+        ├─ apply::apply_request (headers, ua, method, …) + plugin header rewrites
         ├─ upstream::forward (own TCP/TLS conn) ──▶ Response<Incoming>
-        └─ apply::apply_response (status, headers, cors) ──▶ response
+        ├─ apply::apply_response (status, headers, cors)
+        ├─ plugin onResponse ── body-less plugins run here; response keeps streaming
+        └─ buffer response body? ── only if a rule or a plugin needs it ──▶ response
 ```
 
 The two entry origins (`Forward`, `Mitm`) converge on the same `serve()` pipeline;
@@ -166,8 +174,14 @@ whistle-rs/
 ├── rules.txt              # example rules
 ├── docs/
 │   ├── RULES.md           # rule syntax reference
+│   ├── TEMPLATES.md       # local files + template rendering
+│   ├── PLUGINS.md         # plugin system + wire protocol
+│   ├── LINE_PROPS.md      # per-line rule properties
 │   ├── CERTIFICATES.md    # root CA install guide
+│   ├── ROADMAP.md         # what is and isn't ported
 │   └── ARCHITECTURE.md    # this file
+├── sdk/                   # JS/TS plugin SDK (zero deps) + .d.ts types
+├── examples/plugins/      # hello.js, body-rewrite.js, typed.ts
 └── src/
     ├── main.rs            # CLI
     ├── lib.rs             # module root
@@ -180,6 +194,8 @@ whistle-rs/
     └── proxy/
         ├── mod.rs
         ├── apply.rs
+        ├── template.rs    # tpl/dust/jsonp rendering + ${var} variables
+        ├── persist.rs     # session persistence (JSONL)
         ├── upstream.rs
         ├── socks.rs       # inbound SOCKS5 server
         ├── script.rs      # JS engine (resScript/frameScript/pac)
@@ -187,3 +203,14 @@ whistle-rs/
         ├── webui.rs       # built-in web UI + API
         └── body.rs
 ```
+
+## Where to look first
+
+| I want to… | Start at |
+|---|---|
+| add a rule operator | `src/rules/protocols.rs` (register), then `src/proxy/apply.rs` (act on it) |
+| change how rules match | `src/rules/matcher.rs` |
+| write a plugin | [`PLUGINS.md`](PLUGINS.md), then `sdk/whistle-rs-plugin.d.ts` |
+| add a plugin hook | `src/plugins/mod.rs` (protocol + trait), `src/proxy/mod.rs` (call site) |
+| touch the request pipeline | `serve()` in `src/proxy/mod.rs` — the one place every request flows through |
+| add a UI page or endpoint | the route match at the top of `src/proxy/webui.rs` |

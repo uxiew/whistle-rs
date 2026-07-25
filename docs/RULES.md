@@ -540,9 +540,13 @@ so OpenSSL cipher-suite strings and older-than-1.2 pins are not honoured.
 The local-file family serves from disk: `file`/`rawfile` serve bytes (`rawfile`
 parses a full HTTP response file — status line + headers + body); the `x`/`xs`
 variants (`xfile`, `xrawfile`, …) serve the file **if it exists** and otherwise fall
-through to the real server; `tpl`/`jsonp`/`dust` substitute `{name}`/`{{name}}` from
-the query (`jsonp` wraps the result in the `callback` query param). whistle's full
-dust/handlebars template engines are approximated by variable substitution.
+through to the real server.
+
+`tpl`, `dust` and `jsonp` render a template — and are **byte-identical to each other**,
+exactly as upstream: whistle has no template engine, and `jsonp` does no callback
+wrapping of its own. Rendering is two passes: `{name}`/`{{name}}` from the query
+string, then `${var}` runtime variables. See
+[`TEMPLATES.md`](TEMPLATES.md) for the variable table and the gotchas.
 
 WebSocket frames are captured too: every intercepted `ws://`/`wss://` connection is
 recorded as a session (status `101`) and each frame (both directions) is surfaced —
