@@ -53,7 +53,7 @@ pub const MAX_SESSIONS: usize = 500;
 /// tooling — deliberately exercise an `internal` rule.
 ///
 /// Any non-empty value marks the request. The header is removed before the
-/// rules run, so it never reaches a `filter://h:` condition, the session
+/// rules run, so it never reaches a `includeFilter://reqH.` condition, the session
 /// capture, or the origin server.
 pub const INTERNAL_REQ_HEADER: &str = "x-whistle-internal-req";
 
@@ -1835,7 +1835,7 @@ mod internal_req_tests {
     }
 
     /// The marker flags the request *and* is consumed, so nothing downstream —
-    /// a `filter://h:` condition, a plugin, the capture, the origin server —
+    /// a `includeFilter://reqH.` condition, a plugin, the capture, the origin server —
     /// ever sees it.
     #[test]
     fn marker_is_consumed() {
