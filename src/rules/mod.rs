@@ -225,6 +225,11 @@ pub struct Rule {
     pub res_phase_ops: bool,
     /// Precomputed: might one of its filters need the response head?
     pub res_dependent: bool,
+    /// Precomputed: does one of its filters read the request body (`b:`)?
+    /// Upstream keeps the same fact as a separate `_bodyFilters` rule list
+    /// (`_original/lib/rules/rules.js:1390-1392`), for the same reason: the body
+    /// has to be buffered before resolution, and only these lines can ask.
+    pub has_body_filter: bool,
 }
 
 impl Rule {
@@ -360,6 +365,16 @@ pub enum Cond {
     RemoteAddress(CondValue),
     /// `remotePort:54321` — the client socket's port, as above.
     RemotePort(CondValue),
+    /// `b:keyword` / `body:/re/` — the request body, by containment (or by
+    /// regexp). Answerable only when the body was buffered before resolution;
+    /// see [`ReqInfo::req_body`].
+    Body(CondValue),
+    /// `env:KEY=value` — one of **whistle's own process environment**
+    /// variables (`env = process.env`, `_original/lib/rules/rules.js:14`,
+    /// consulted at `:1961`). Not a plugin store, despite the name: the key is
+    /// case-**sensitive** and the value is compared by containment, like a
+    /// header's.
+    Env { name: String, value: CondValue },
     /// A URL pattern, written exactly like a rule's own pattern (regexp,
     /// wildcard, or scheme/host/path prefix). This is the fallback for anything
     /// that is not a recognised condition name.
@@ -417,10 +432,6 @@ impl Cond {
 /// its filter fail closed. `docs/RULES.md` lists what each one would need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deferred {
-    /// `b:` / `body:` — needs the request body buffered before rules resolve.
-    Body,
-    /// `env:` — needs the plugin environment store.
-    Env,
     /// `from:` — needs the request's origin flags (tunnel, composer, SNI, …).
     From,
 }
@@ -517,6 +528,15 @@ pub struct ReqInfo {
     /// request phase, which is what makes every response-phase condition fail
     /// closed there.
     pub res: Option<ResInfo>,
+    /// The request body, buffered **before** the rules resolved because some
+    /// line carries a `b:` filter whose pattern matches this request.
+    ///
+    /// `None` means nothing asked for it, and a `b:` condition is then
+    /// unanswerable and fails closed — upstream's state too, where `matchFilter`
+    /// bails on `typeof req._reqBody !== 'string'`
+    /// (`_original/lib/rules/rules.js:1903-1906`). See
+    /// [`RuleManager::needs_request_body`] for who decides.
+    pub req_body: Option<String>,
 }
 
 impl ReqInfo {
@@ -712,6 +732,11 @@ pub struct RuleGroup {
     /// lines cost and not what the whole group costs: a rules file with a
     /// thousand lines and one `includeFilter://s:` walks one rule.
     res_candidates: Vec<u32>,
+    /// Indices into `rules` of the lines carrying a `b:` filter — upstream's
+    /// `_bodyFilters` (`_original/lib/rules/rules.js:1390-1392`). Empty for
+    /// every rules file that never mentions the body, which is what lets the
+    /// request path skip buffering entirely.
+    body_candidates: Vec<u32>,
 }
 
 impl RuleGroup {
@@ -722,6 +747,7 @@ impl RuleGroup {
             text: text.to_string(),
             enabled,
             res_candidates: res_candidates(&rules),
+            body_candidates: body_candidates(&rules),
             rules,
         }
     }
@@ -730,6 +756,7 @@ impl RuleGroup {
     fn reparse(&mut self) {
         self.rules = parse_text(&self.text);
         self.res_candidates = res_candidates(&self.rules);
+        self.body_candidates = body_candidates(&self.rules);
     }
 
     /// Number of parsed rules in this group.
@@ -745,6 +772,16 @@ fn res_candidates(rules: &[Rule]) -> Vec<u32> {
         .iter()
         .enumerate()
         .filter(|(_, rule)| rule.may_need_response_phase())
+        .map(|(i, _)| i as u32)
+        .collect()
+}
+
+/// Which of `rules` carry a `b:` filter — see [`RuleGroup::body_candidates`].
+fn body_candidates(rules: &[Rule]) -> Vec<u32> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.has_body_filter)
         .map(|(i, _)| i as u32)
         .collect()
 }
@@ -837,6 +874,26 @@ impl RuleManager {
         self.groups
             .iter()
             .any(|g| g.enabled && !g.res_candidates.is_empty())
+    }
+
+    /// Must this request's body be buffered before the rules resolve?
+    ///
+    /// True when some enabled line carries a `b:` filter *and* would match this
+    /// request but for that filter — upstream's `resolveBodyFilter`, which runs
+    /// the same pattern test over its separate `_bodyFilters` list before the
+    /// payload is read (`_original/lib/rules/rules.js:2455-2465`,
+    /// `lib/inspectors/rules.js:193-205`).
+    ///
+    /// The two-stage shape is the whole point: buffering a request body is the
+    /// one thing on this path that cannot be undone, so a rules file with no
+    /// `b:` in it answers `false` after one `is_empty()` per group and the body
+    /// keeps streaming. A file that does have one pays for those lines only.
+    pub fn needs_request_body(&self, req: &ReqInfo, is_internal_req: bool) -> bool {
+        self.groups.iter().filter(|g| g.enabled).any(|group| {
+            group.body_candidates.iter().any(|&i| {
+                matcher::matches_but_for_body(&group.rules[i as usize], req, is_internal_req)
+            })
+        })
     }
 
     /// Resolve the response-phase operators the request pass withheld, given a
@@ -1092,6 +1149,7 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
         .iter()
         .any(|op| protocols::is_res_phase(&op.protocol) || op.protocol == "ignore");
     let res_dependent = filters.iter().any(|f| f.cond.may_need_response());
+    let has_body_filter = filters.iter().any(|f| matches!(f.cond, Cond::Body(_)));
 
     pattern_toks
         .into_iter()
@@ -1107,6 +1165,7 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
                 props: props.clone(),
                 res_phase_ops,
                 res_dependent,
+                has_body_filter,
             })
         })
         .collect()
@@ -1144,6 +1203,10 @@ enum CondKind {
     /// A header condition, in one of the three scopes upstream distinguishes.
     Header(HeaderScope),
     Chance,
+    /// `b:` / `body:` — the request body.
+    Body,
+    /// `env:` — one of whistle's own process environment variables.
+    Env,
     /// Recognised, but unanswerable here — see [`Deferred`].
     Later(Deferred),
 }
@@ -1187,8 +1250,8 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("probability", CondKind::Chance, true, true),
     ("s", CondKind::StatusCode, true, false),
     ("statusCode", CondKind::StatusCode, true, true),
-    ("b", CondKind::Later(Deferred::Body), true, false),
-    ("body", CondKind::Later(Deferred::Body), true, false),
+    ("b", CondKind::Body, true, false),
+    ("body", CondKind::Body, true, false),
     ("res", CondKind::Header(HeaderScope::Response), true, true),
     ("resH", CondKind::Header(HeaderScope::Response), true, true),
     ("resHeader", CondKind::Header(HeaderScope::Response), true, true),
@@ -1199,7 +1262,7 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("serverPort", CondKind::ServerPort, true, true),
     ("remoteAddress", CondKind::RemoteAddress, true, true),
     ("remotePort", CondKind::RemotePort, true, true),
-    ("env", CondKind::Later(Deferred::Env), true, true),
+    ("env", CondKind::Env, true, true),
     ("from", CondKind::Later(Deferred::From), true, true),
 ];
 
@@ -1342,6 +1405,20 @@ fn build_cond(kind: CondKind, rest: &str) -> Option<(Cond, bool)> {
         CondKind::Chance => {
             let (key, key_negate, _) = split_keyed_value(rest, false)?;
             return Some((Cond::Chance(parse_probability(key)), negate != key_negate));
+        }
+        CondKind::Body => Cond::Body(CondValue::parse(rest, false)),
+        // `env` takes the same shape as a header condition but is *not* one:
+        // `isHeader` is false for it upstream, so the key keeps its case and
+        // only `=` separates it (`_original/lib/rules/rules.js:1648-1653`).
+        CondKind::Env => {
+            let (key, key_negate, value) = split_keyed_value(rest, false)?;
+            return Some((
+                Cond::Env {
+                    name: key.to_string(),
+                    value: CondValue::parse(value, false),
+                },
+                negate != key_negate,
+            ));
         }
         CondKind::Later(what) => Cond::Deferred(what),
     };
@@ -2062,17 +2139,31 @@ mod filter_parse_tests {
     /// it cannot be mistaken for a URL pattern.
     #[test]
     fn deferred_conditions_are_recognised() {
-        let cases = [
-            ("filter://b:keyword", Deferred::Body),
-            ("filter://body:keyword", Deferred::Body),
-            ("filter://env:x=1", Deferred::Env),
-            ("filter://from:composer", Deferred::From),
-        ];
+        let cases = [("filter://from:composer", Deferred::From)];
         for (token, want) in cases {
             match cond_of(token).cond {
                 Cond::Deferred(got) => assert_eq!(got, want, "{token}"),
                 other => panic!("{token} parsed as {other:?}"),
             }
+        }
+    }
+
+    /// `b:` / `body:` and `env:` are now answered rather than deferred.
+    #[test]
+    fn body_and_env_conditions_parse() {
+        for token in ["filter://b:keyword", "filter://body:keyword"] {
+            assert!(matches!(cond_of(token).cond, Cond::Body(_)), "{token}");
+        }
+        // `env` keeps its key's case — upstream lower-cases header keys only
+        // (`isHeader` is false for it, `_original/lib/rules/rules.js:1648-1653`).
+        match cond_of("filter://env:MyVar=1").cond {
+            Cond::Env { name, .. } => assert_eq!(name, "MyVar"),
+            other => panic!("parsed as {other:?}"),
+        }
+        // …and only `=` separates it, so a colon stays in the key.
+        match cond_of("filter://env:A:B=1").cond {
+            Cond::Env { name, .. } => assert_eq!(name, "A:B"),
+            other => panic!("parsed as {other:?}"),
         }
     }
 

@@ -885,8 +885,22 @@ fn resolve_response_phase(
     resolved: &mut Resolved,
     res: crate::rules::ResInfo,
     is_internal_req: bool,
+    merged: &[crate::rules::RuleManager],
 ) {
     info.res = Some(res);
+    // Rules merged in mid-request get the same second pass. Upstream re-resolves
+    // its `pRules`/`fRules`/`hRules` here too
+    // (`_original/lib/plugins/index.js:1326-1335`); each manager answers from
+    // its own precomputed flags, so a text with no response-dependent line
+    // costs one comparison.
+    if let Some(mut extra) = apply::response_phase_of(merged, info, is_internal_req) {
+        {
+            let values = state.values.read().unwrap();
+            apply::substitute_values(&mut extra, &values);
+        }
+        apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
+        resolved.merge_response_phase(extra);
+    }
     let extra = {
         let rules = state.rules.read().unwrap();
         rules.resolve_response(info, is_internal_req)
@@ -1004,17 +1018,59 @@ async fn serve(
     );
     // The accepted socket's port, for `clientPort:` / `remotePort:` filters.
     info.client_port = Some(peer.port());
+
+    // A `b:` filter reads the request body, so the body has to be in hand
+    // *before* the rules resolve. Whether any line asks is answered from the
+    // per-group candidate list each group precomputes; a rules file that never
+    // mentions the body costs one `is_empty()` per group and the body keeps
+    // streaming untouched.
+    //
+    // Locking: the read guard is dropped before the `.await` below — no guard
+    // may cross one here, which is also why this cannot share the acquisition
+    // with the resolution that follows.
+    let needs_req_body = {
+        let rules = state.rules.read().unwrap();
+        rules.needs_request_body(&info, is_internal_req)
+    };
+    // Normalising to `DynBody` here rather than at the plugin hook lets both
+    // reasons to buffer share one decision point.
+    let (req, prebuffered): (Request<DynBody>, Option<Bytes>) = {
+        let (parts, incoming) = req.into_parts();
+        if needs_req_body {
+            let bytes = incoming.collect().await?.to_bytes();
+            (
+                Request::from_parts(parts, body::full(bytes.clone())),
+                Some(bytes),
+            )
+        } else {
+            (
+                Request::from_parts(parts, body::from_incoming(incoming)),
+                None,
+            )
+        }
+    };
+    if let Some(bytes) = &prebuffered {
+        // Set even when empty: upstream's `req._reqBody` is a string either way,
+        // so `b:!x` holds for a request with no body rather than failing closed.
+        info.req_body = Some(String::from_utf8_lossy(bytes).into_owned());
+    }
+
     let mut resolved = state
         .rules
         .read()
         .unwrap()
         .resolve_scoped(&info, is_internal_req);
-    {
+    // Rules merged in mid-request — a `rule://` value, the `rulesFile://` join,
+    // and any a plugin injects below. Their parsed form is kept because the
+    // response phase resolves them a second time, exactly as it does the
+    // top-level rules (`apply::merge_response_phase_of`).
+    let mut merged_rules: Vec<crate::rules::RuleManager> = {
         let values = state.values.read().unwrap();
         apply::substitute_values(&mut resolved, &values);
-        apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
+        let managers = apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
         apply::substitute_values(&mut resolved, &values);
-    }
+        managers
+    };
     apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
     let started = Instant::now();
     let time_ms = now_ms();
@@ -1044,26 +1100,26 @@ async fn serve(
     // only assigned once a transaction is recorded, which is too late here.
     let plugin_req_id = next_plugin_req_id();
 
-    // Normalise the request body to `DynBody` so a plugin can optionally be
-    // handed it. Buffering happens *only* when a matched plugin's manifest
-    // declares `requestBody` — otherwise the body stays a lazy stream and the
-    // proxy's streaming fast path is untouched.
+    // Hand a plugin the request body if its manifest declares `requestBody`.
+    // Buffering happens *only* then — otherwise the body stays a lazy stream and
+    // the proxy's streaming fast path is untouched. A `b:` filter may already
+    // have bought the bytes above, in which case this costs nothing but the
+    // manifest lookup.
     let (req, plugin_req_body): (Request<DynBody>, Option<Bytes>) = {
-        let (parts, incoming) = req.into_parts();
         let wants_body = !plugin_matches.is_empty()
-            && has_request_body(&parts.headers)
+            && has_request_body(req.headers())
             && state.plugins.any_wants_request_body(&plugin_names).await;
-        if wants_body {
-            let bytes = incoming.collect().await?.to_bytes();
-            (
-                Request::from_parts(parts, body::full(bytes.clone())),
-                Some(bytes),
-            )
-        } else {
-            (
-                Request::from_parts(parts, body::from_incoming(incoming)),
-                None,
-            )
+        match (wants_body, prebuffered) {
+            (false, _) => (req, None),
+            (true, Some(bytes)) => (req, Some(bytes)),
+            (true, None) => {
+                let (parts, body) = req.into_parts();
+                let bytes = collect_body(body).await?;
+                (
+                    Request::from_parts(parts, body::full(bytes.clone())),
+                    Some(bytes),
+                )
+            }
         }
     };
 
@@ -1091,7 +1147,12 @@ async fn serve(
                 continue;
             };
             if let Some(rules) = result.rules {
-                apply::merge_rules_text(&mut resolved, &info, &rules, is_internal_req);
+                merged_rules.push(apply::merge_rules_text(
+                    &mut resolved,
+                    &info,
+                    &rules,
+                    is_internal_req,
+                ));
                 let values = state.values.read().unwrap();
                 apply::substitute_values(&mut resolved, &values);
             }
@@ -1147,6 +1208,7 @@ async fn serve(
             &mut resolved,
             apply::build_res_info(parts.status.as_u16(), &parts.headers, None, None),
             is_internal_req,
+            &merged_rules,
         );
         apply::apply_response_for(&mut parts, &resolved, Some(&info));
         let resp = Response::from_parts(parts, body);
@@ -1220,8 +1282,6 @@ async fn serve(
     // handle this request already returned above; any rules they injected have
     // been merged into `resolved`.)
     let (mut parts, incoming) = req.into_parts();
-    let new_path = apply::rewrite_path(&info.path, &resolved);
-    parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, &host, port, &scheme);
     parts.headers.remove("proxy-connection");
     mark_stripped_tls(&mut parts.headers, &target);
@@ -1256,15 +1316,26 @@ async fn serve(
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // Read after the request operators, because `method://` and `reqType://`
+    // decide whether `params://` addresses the body or the query string — as
+    // they do upstream (`_original/lib/inspectors/req.js:536,560-561`). That is
+    // also why the path is rewritten here rather than before `apply_request`.
+    let req_method = parts.method.to_string();
+    let body_ctx = apply::ReqBodyCtx {
+        method: &req_method,
+        content_type: req_ct.as_deref(),
+    };
+    let new_path = apply::rewrite_path(&info.path, &resolved, body_ctx);
+    parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     let req_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     let mut req_body_cap: Option<Capture> = None;
-    let req_body: DynBody = if apply::wants_req_body(&resolved)
+    let req_body: DynBody = if apply::wants_req_body(&resolved, body_ctx)
         || req_speed.is_some()
         || req_write.is_some()
         || req_write_raw.is_some()
     {
         let bytes = collect_body(incoming).await?;
-        let new = apply::transform_req_body(bytes, &resolved, req_ct.as_deref());
+        let new = apply::transform_req_body(bytes, &resolved, body_ctx);
         if let Some(path) = &req_write {
             write_body_file(path, &new);
         }
@@ -1350,6 +1421,7 @@ async fn serve(
             Some(target.connect_port),
         ),
         is_internal_req,
+        &merged_rules,
     );
 
     if let Some(ms) = apply::res_delay_ms(&resolved) {
@@ -1414,8 +1486,8 @@ async fn serve(
     .await;
 
     let res_speed = apply::res_speed_kbps(&resolved);
-    let res_script = resolved
-        .value("resScript")
+    let res_script = apply::res_script_op(&resolved)
+        .map(|op| op.value.as_str())
         .and_then(script::load_script);
     let weinre = resolved.value("weinre").map(|s| s.to_string());
     let location_href = resolved.value("locationHref").map(|s| s.to_string());
@@ -1690,9 +1762,10 @@ async fn serve_upgrade(
         .unwrap_or_default();
     let client_upgrade = hyper::upgrade::on(&mut req);
 
-    // Build the upstream handshake request (upgrades carry no body).
+    // Build the upstream handshake request (upgrades carry no body, so
+    // `params://` can only address the query string here).
     let (mut parts, _body) = req.into_parts();
-    let new_path = apply::rewrite_path(&info.path, resolved);
+    let new_path = apply::rewrite_path(&info.path, resolved, apply::ReqBodyCtx::default());
     parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, host, port, scheme);
     parts.headers.remove("proxy-connection");

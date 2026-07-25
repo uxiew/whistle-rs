@@ -22,7 +22,25 @@ pub fn matches(rule: &Rule, req: &ReqInfo) -> bool {
     if !pattern_matches(rule, req) {
         return false;
     }
-    filters_match(&rule.filters, req)
+    filters_match(&rule.filters, req, false)
+}
+
+/// Would this rule match if its `b:` conditions were satisfied?
+///
+/// The question the proxy has to answer *before* it reads the body: is it worth
+/// buffering at all. Every other condition is evaluated as usual — a `b:` line
+/// scoped to one host, or to `POST`, costs nothing on the requests it excludes —
+/// and only the body conditions are assumed true, because assuming them false
+/// would mean never buffering and so never being able to answer them.
+///
+/// Mirrors upstream's `resolveBodyFilter`, which runs `getRule` over the
+/// `_bodyFilters` list while `req._reqBody` is still undefined; its body arm
+/// returns `false` there, so the same optimism is spelled as skipping the arm
+/// (`_original/lib/rules/rules.js:1903-1906,2455-2465`).
+pub fn matches_but_for_body(rule: &Rule, req: &ReqInfo, is_internal_req: bool) -> bool {
+    rule.props.allows_scope(is_internal_req)
+        && pattern_matches(rule, req)
+        && filters_match(&rule.filters, req, true)
 }
 
 /// Does the rule's pattern accept `req`? `!`-prefixed patterns invert the
@@ -123,15 +141,15 @@ fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
 /// Once either verdict is settled the remaining filters of that kind are not
 /// evaluated — upstream guards its loop the same way, which matters for a
 /// `chance:` filter: it must draw no more random numbers than upstream does.
-fn filters_match(filters: &[Filter], req: &ReqInfo) -> bool {
+fn filters_match(filters: &[Filter], req: &ReqInfo, assume_body: bool) -> bool {
     let mut has_include = false;
     let (mut include, mut exclude) = (false, false);
     for f in filters {
         if f.exclude {
-            exclude = exclude || filter_holds(f, req);
+            exclude = exclude || filter_holds(f, req, assume_body);
         } else {
             has_include = true;
-            include = include || filter_holds(f, req);
+            include = include || filter_holds(f, req, assume_body);
         }
     }
     if has_include && !include {
@@ -147,8 +165,8 @@ fn filters_match(filters: &[Filter], req: &ReqInfo) -> bool {
 /// before it ever consults `not`. So a condition this port cannot evaluate
 /// leaves an include filter unsatisfied *and* an exclude filter inert, however
 /// it is written — the subsystem fails closed in both directions.
-fn filter_holds(f: &Filter, req: &ReqInfo) -> bool {
-    match cond_holds(&f.cond, req) {
+fn filter_holds(f: &Filter, req: &ReqInfo, assume_body: bool) -> bool {
+    match cond_holds(&f.cond, req, assume_body) {
         Some(held) => held != f.negate,
         None => false,
     }
@@ -157,7 +175,7 @@ fn filter_holds(f: &Filter, req: &ReqInfo) -> bool {
 /// Evaluate one condition. `None` means "not knowable" — either the fact has no
 /// equivalent here at all ([`crate::rules::Deferred`]) or it belongs to the
 /// response and this is the request phase, where [`ReqInfo::res`] is `None`.
-fn cond_holds(cond: &Cond, req: &ReqInfo) -> Option<bool> {
+fn cond_holds(cond: &Cond, req: &ReqInfo, assume_body: bool) -> Option<bool> {
     match cond {
         Cond::Method(v) => Some(v.matches(&req.method)),
         Cond::Host(v) => Some(v.matches(&req.host)),
@@ -189,6 +207,21 @@ fn cond_holds(cond: &Cond, req: &ReqInfo) -> Option<bool> {
             .as_ref()
             .and_then(|r| r.server_port)
             .map(|p| v.matches(&p.to_string())),
+        // The body, when it was buffered for exactly this. `assume_body` is the
+        // pre-resolution question "would this line want it?", which cannot
+        // answer with the body it is asking for.
+        Cond::Body(v) => match assume_body {
+            true => Some(true),
+            false => req.req_body.as_deref().map(|b| v.matches_header(b)),
+        },
+        // whistle's own process environment (`env = process.env`,
+        // `_original/lib/rules/rules.js:14`). A variable that is not set is a
+        // *known* `false`, exactly as an absent header is, so `env:X!=v` holds
+        // for a process without `X`.
+        Cond::Env { name, value } => Some(match std::env::var(name) {
+            Ok(actual) => value.matches_header(&actual),
+            Err(_) => false,
+        }),
         Cond::Deferred(_) => None,
     }
 }
@@ -307,11 +340,16 @@ pub fn resolve_refs_scoped(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool
 /// Like [`resolve_refs_scoped`] for a rule set that is resolved *once*: nothing
 /// is withheld, because no response phase will follow to supply it.
 ///
-/// This is how rules that arrive mid-request are resolved — a plugin's, or a
-/// `rule://` / `rulesFile://` include. They are merged into the request's
-/// resolved set and then forgotten, so a response-phase operator withheld from
-/// them would never come back. Their response conditions fail closed instead,
-/// which is where the whole subsystem sat before the response phase existed.
+/// This is for a rule set the caller will not keep — the WebSocket frame plan's,
+/// which is built from a manager that is dropped immediately. A response-phase
+/// operator withheld from such a set would never come back; its response
+/// conditions fail closed instead.
+///
+/// Rules merged into a request mid-flight — a plugin's, a `rule://` or
+/// `rulesFile://` include — do **not** use this: their manager is kept and
+/// resolved again in the response phase
+/// (`crate::proxy::apply::response_phase_of`), so they take the same two-pass
+/// treatment as the top-level rules.
 pub fn resolve_refs_once(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> Resolved {
     resolve_walk(rules, req, is_internal_req, false)
 }
@@ -1543,6 +1581,162 @@ mod response_phase_tests {
             );
             assert_eq!(r.value("resHeaders"), Some("x-always=1"));
         }
+    }
+}
+
+
+/// `b:` — the request body condition, and the two-stage decision that feeds it.
+#[cfg(test)]
+mod body_filter_tests {
+    use super::*;
+    use crate::rules::RuleManager;
+
+    fn post(url: &str, body: Option<&str>) -> ReqInfo {
+        let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+        let (host, path) = match rest.find('/') {
+            Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+            None => (rest.to_string(), "/".to_string()),
+        };
+        ReqInfo {
+            method: "POST".into(),
+            scheme: scheme.into(),
+            host,
+            port: 80,
+            path,
+            full_url: url.into(),
+            req_body: body.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn mgr(text: &str) -> RuleManager {
+        let mut m = RuleManager::new();
+        m.set_text(text);
+        m
+    }
+
+    /// A rules file that never mentions the body never asks for it, so the
+    /// request keeps streaming.
+    #[test]
+    fn no_body_filter_means_no_buffering() {
+        for text in [
+            "example.com host://1.1.1.1\n",
+            "example.com resHeaders://x=1 includeFilter://m:POST\n",
+            "example.com resBody://x\n",
+        ] {
+            assert!(
+                !mgr(text).needs_request_body(&post("http://example.com/", None), false),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A `b:` line asks for the body only on the requests its *other* conditions
+    /// already let through — the pattern, the method, everything but the body
+    /// itself.
+    #[test]
+    fn a_body_filter_asks_only_where_it_could_apply() {
+        let m = mgr("example.com/api resBody://hit includeFilter://b:secret\n");
+        assert!(m.needs_request_body(&post("http://example.com/api/x", None), false));
+        assert!(!m.needs_request_body(&post("http://other.test/api/x", None), false));
+        assert!(!m.needs_request_body(&post("http://example.com/other", None), false));
+
+        // An exclude filter vetoes the line, so the body is not read for it.
+        // (A second *include* filter would not: include filters are or-ed, so
+        // the line could still apply on the body condition alone.)
+        let m = mgr("example.com resBody://hit includeFilter://b:secret excludeFilter://m:POST\n");
+        assert!(!m.needs_request_body(&post("http://example.com/", None), false));
+    }
+
+    /// The condition compares by containment, like a header's, and a `/re/`
+    /// value is matched against the body as it arrived.
+    #[test]
+    fn the_body_condition_matches_by_containment() {
+        let m = mgr("example.com resBody://hit includeFilter://b:SEcReT\n");
+        let hit = m.resolve(&post("http://example.com/", Some("id=1&token=secret")));
+        assert_eq!(hit.value("resBody"), Some("hit"));
+        let miss = m.resolve(&post("http://example.com/", Some("id=1")));
+        assert!(miss.value("resBody").is_none());
+
+        let m = mgr("example.com resBody://hit includeFilter://b:/\"id\":\\d+/\n");
+        assert_eq!(
+            m.resolve(&post("http://example.com/", Some("{\"id\":42}")))
+                .value("resBody"),
+            Some("hit")
+        );
+        assert!(
+            m.resolve(&post("http://example.com/", Some("{\"id\":\"x\"}")))
+                .value("resBody")
+                .is_none()
+        );
+    }
+
+    /// With no body buffered the condition is unknown and fails closed, in both
+    /// directions — upstream bails before it consults `not`
+    /// (`_original/lib/rules/rules.js:1903-1906`).
+    #[test]
+    fn an_unbuffered_body_fails_closed() {
+        for text in [
+            "example.com resBody://hit includeFilter://b:secret\n",
+            "example.com resBody://hit includeFilter://b:!secret\n",
+        ] {
+            assert!(
+                mgr(text)
+                    .resolve(&post("http://example.com/", None))
+                    .value("resBody")
+                    .is_none(),
+                "{text:?}"
+            );
+        }
+        // An *exclude* filter is inert instead, so the rule still applies.
+        assert_eq!(
+            mgr("example.com resBody://hit excludeFilter://b:secret\n")
+                .resolve(&post("http://example.com/", None))
+                .value("resBody"),
+            Some("hit")
+        );
+    }
+
+    /// An empty body is still a body: `!` flips it, because the answer is known.
+    #[test]
+    fn an_empty_body_is_a_known_answer() {
+        let m = mgr("example.com resBody://hit includeFilter://b:!secret\n");
+        assert_eq!(
+            m.resolve(&post("http://example.com/", Some("")))
+                .value("resBody"),
+            Some("hit")
+        );
+    }
+
+    /// `env:` reads whistle's own process environment
+    /// (`env = process.env`, `_original/lib/rules/rules.js:14,1961`).
+    #[test]
+    fn env_reads_the_process_environment() {
+        // Scoped to this test's own variable name so nothing else can collide.
+        let key = "WHISTLE_RS_ENV_FILTER_TEST";
+        unsafe { std::env::set_var(key, "production") };
+        let m = mgr(&format!(
+            "example.com resBody://hit includeFilter://env:{key}=produc\n"
+        ));
+        assert_eq!(
+            m.resolve(&post("http://example.com/", None)).value("resBody"),
+            Some("hit"),
+            "compared by containment, like a header"
+        );
+
+        // An unset variable is a *known* false, so `!` flips it.
+        let m = mgr("example.com resBody://hit includeFilter://env:WHISTLE_RS_UNSET_XYZ=v\n");
+        assert!(
+            m.resolve(&post("http://example.com/", None))
+                .value("resBody")
+                .is_none()
+        );
+        let m = mgr("example.com resBody://hit includeFilter://env:WHISTLE_RS_UNSET_XYZ!=v\n");
+        assert_eq!(
+            m.resolve(&post("http://example.com/", None)).value("resBody"),
+            Some("hit")
+        );
+        unsafe { std::env::remove_var(key) };
     }
 }
 

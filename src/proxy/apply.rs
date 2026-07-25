@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 
 use super::body::{self, DynBody};
 use super::upstream::{ProxyKind, Target, parse_proxy, parse_proxy_rule};
-use crate::rules::{LineProps, ReqInfo, Resolved, RuleManager};
+use crate::rules::{LineProps, ReqInfo, Resolved, RuleManager, RuleOp};
 
 /// Build the request facts the matcher needs.
 pub fn build_req_info(
@@ -56,9 +56,11 @@ pub fn build_req_info(
         headers: hdrs,
         client_ip,
         // Set by the caller when it knows them: the client's port comes from the
-        // accepted socket, the response head only exists later.
+        // accepted socket, the response head only exists later, and the body is
+        // buffered only when a `b:` filter has asked for it.
         client_port: None,
         res: None,
+        req_body: None,
     }
 }
 
@@ -155,10 +157,71 @@ fn replace_ci(haystack: &str, needle: &str, repl: &str) -> String {
 /// `is_internal_req` carries the request's origin through, so an
 /// `internal`/`internalOnly` line inside injected rules is scoped exactly as it
 /// would be at top level.
-pub fn merge_rules_text(resolved: &mut Resolved, info: &ReqInfo, text: &str, is_internal_req: bool) {
+///
+/// The manager is **returned, not dropped**: it holds the parsed rules the
+/// response phase resolves a second time — see [`merge_response_phase_of`].
+#[must_use = "the caller must keep this for the response phase"]
+pub fn merge_rules_text(
+    resolved: &mut Resolved,
+    info: &ReqInfo,
+    text: &str,
+    is_internal_req: bool,
+) -> RuleManager {
     let mut mgr = RuleManager::new();
     mgr.set_text(text);
-    merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
+    merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+    mgr
+}
+
+/// Resolve a rules text merged mid-request a second time, now that the response
+/// head is in, and fold what it withheld into `resolved`.
+///
+/// Upstream re-resolves exactly these managers in its response phase —
+/// `pRules` (a plugin's rules), `fRules` (the `rulesFile://` manager) and
+/// `hRules`, each through `resolveResRules(req, true)`
+/// (`_original/lib/plugins/index.js:1326-1335`). This port resolved them once,
+/// so a `resHeaders://x=1 includeFilter://s:404` inside an included file never
+/// fired.
+///
+/// The two passes are the same pair the top-level rules take, which is what
+/// makes this safe: the request pass **withheld** precisely what this resolves,
+/// so nothing is applied twice and nothing is re-decided. (Re-resolving the
+/// whole text instead would re-roll a `chance:` on it, and would discard a
+/// request-phase verdict the request has already acted on.)
+///
+/// Costs nothing when the text has no response-dependent line: `resolve_response`
+/// answers from the flags its groups precomputed, so `None` here is one
+/// comparison per merged text.
+///
+/// The managers are folded into **one** set rather than merged one at a time, so
+/// that the caller can substitute values into it and hand it to
+/// [`Resolved::merge_response_phase`] once — which is what lets an `ignore://`
+/// inside an included file reach the request phase's operators.
+pub fn response_phase_of(
+    managers: &[RuleManager],
+    info: &ReqInfo,
+    is_internal_req: bool,
+) -> Option<Resolved> {
+    let mut out: Option<Resolved> = None;
+    for mgr in managers {
+        let Some(extra) = mgr.resolve_response(info, is_internal_req) else {
+            continue;
+        };
+        let acc = out.get_or_insert_with(Resolved::default);
+        // Merged rules sort behind everything either pass of the file they were
+        // merged into resolved, in the request phase and in this one alike.
+        for (protocol, mut op) in extra.single {
+            op.order = u64::MAX;
+            acc.single.entry(protocol).or_insert(op);
+        }
+        for (protocol, ops) in extra.multi {
+            acc.multi.entry(protocol).or_default().extend(ops.into_iter().map(|mut op| {
+                op.order = u64::MAX;
+                op
+            }));
+        }
+    }
+    out
 }
 
 /// Fold a resolution of *another* rules text into `resolved`: existing
@@ -184,28 +247,99 @@ fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
 
 /// Merge the rules pulled in by `rule://<name>` (from the values store) and
 /// `rulesFile://<path>` (from disk), resolved in the request's own scope.
+///
+/// The managers are returned so the response phase can resolve them again —
+/// see [`merge_response_phase_of`].
+#[must_use = "the caller must keep these for the response phase"]
 pub fn merge_included_rules(
     resolved: &mut Resolved,
     info: &ReqInfo,
     values: &HashMap<String, String>,
     is_internal_req: bool,
-) {
+) -> Vec<RuleManager> {
     let mut texts: Vec<String> = Vec::new();
     if let Some(name) = resolved.value("rule") {
         if let Some(content) = values.get(name) {
             texts.push(content.clone());
         }
     }
-    if let Some(path) = resolved.value("rulesFile") {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            texts.push(content);
-        }
+    // Every `rulesFile://` line contributes, joined into one rules text — see
+    // `accumulated_script_ops`.
+    let joined = rules_file_ops(resolved)
+        .iter()
+        .filter_map(|op| std::fs::read_to_string(&op.value).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !joined.trim().is_empty() {
+        texts.push(joined);
     }
-    for text in texts {
-        let mut mgr = RuleManager::new();
-        mgr.set_text(&text);
-        merge_resolved(resolved, mgr.resolve_once(info, is_internal_req));
-    }
+    texts
+        .into_iter()
+        .map(|text| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(&text);
+            merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+            mgr
+        })
+        .collect()
+}
+
+/// The `rulesFile://` operators whose contents make up the included rules text.
+pub fn rules_file_ops(resolved: &Resolved) -> Vec<&RuleOp> {
+    accumulated_script_ops(resolved, "rulesFile", "reqRules")
+}
+
+/// The `resScript://` operator that names a script, if any.
+///
+/// Upstream's `resScript` list can hold *rules text* as well as a script — the
+/// `resRules://` spelling marks the former — and only the first entry that is
+/// not so marked is ever executed (`_original/lib/rules/rules.js:2258-2272`).
+/// This port used the first entry whatever its spelling, so a file of rules
+/// written ahead of the script was handed to the JS engine instead of it.
+///
+/// The `resRules://` entries themselves are **not** applied here: upstream folds
+/// them into a rules text that the response phase parses, whereas this port's
+/// `resScript` is a JavaScript hook that mutates the response directly. See
+/// `docs/ROADMAP.md`.
+pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
+    accumulated_script_ops(resolved, "resScript", "resRules")
+        .into_iter()
+        .find(|op| raw_protocol(op) != Some("resRules"))
+}
+
+/// The entries upstream keeps for `rulesFile` / `resScript`
+/// (`_original/lib/rules/rules.js:2258-2272`).
+///
+/// Both protocols accumulate, but the list is filtered before it is read: every
+/// line written with the `pure_spelling` alias (`reqRules://` for `rulesFile`,
+/// `resRules://` for `resScript`) is kept, because it can only be rules text,
+/// while **at most one** line written any other way survives — that one is the
+/// candidate *script*, and a second script would have no defined meaning.
+///
+/// `RuleOp::raw` is what makes the distinction visible after parsing: the
+/// aliases all fold to one canonical protocol name, but `raw` still carries the
+/// spelling the rules file used.
+fn accumulated_script_ops<'a>(
+    resolved: &'a Resolved,
+    protocol: &str,
+    pure_spelling: &str,
+) -> Vec<&'a RuleOp> {
+    let mut seen_script = false;
+    resolved
+        .all(protocol)
+        .iter()
+        .filter(|op| {
+            if raw_protocol(op) == Some(pure_spelling) {
+                return true;
+            }
+            !std::mem::replace(&mut seen_script, true)
+        })
+        .collect()
+}
+
+/// The protocol an operator was *written* with, before alias folding.
+fn raw_protocol(op: &RuleOp) -> Option<&str> {
+    op.raw.split_once("://").map(|(proto, _)| proto)
 }
 
 /// How to reach the proxy each upstream-proxy operator names.
@@ -1035,11 +1169,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(xff) = resolved.value("forwardedFor") {
         set_header(&mut parts.headers, "x-forwarded-for", xff);
     }
-    if let Some(origin) = resolved.value("reqCors") {
-        if !origin.is_empty() {
-            set_header(&mut parts.headers, "origin", origin);
-        }
-    }
+    apply_req_cors(&mut parts.headers, resolved);
     apply_req_cookies(&mut parts.headers, resolved);
     let del = Deletions::of(resolved, true);
     // `reqCharset` and the type/charset deletions are one operation upstream
@@ -1463,6 +1593,36 @@ fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
     }
 }
 
+/// `reqCors://…` — the request half of whistle's CORS negotiation
+/// (`setReqCors`, `_original/lib/util/index.js:2899-2921`).
+///
+/// The value takes the same four shorthand spellings as `resCors` and folds the
+/// same way, but only three of the resulting keys mean anything on a request:
+/// `origin` (a URL, reduced to its origin, or `*`), `method` and `headers`,
+/// which become the two preflight headers. Notably `enable` sets **nothing** —
+/// there is no request origin to echo back — so `reqCors://enable` is inert
+/// upstream, and is here.
+fn apply_req_cors(headers: &mut HeaderMap, resolved: &Resolved) {
+    let spec = merge_cors_ops(resolved, "reqCors");
+    if spec.is_empty() {
+        return;
+    }
+    match spec.get("origin").map(String::as_str) {
+        Some("*") => set_header(headers, "origin", "*"),
+        Some(url) if is_http_url(url) => set_header(headers, "origin", &parse_origin(url)),
+        // `cors['*'] === ''` — the `resCors://*` shorthand — is the other way
+        // to ask for a wildcard origin.
+        _ if spec.get("*").is_some_and(String::is_empty) => set_header(headers, "origin", "*"),
+        _ => {}
+    }
+    if let Some(method) = spec.get("method") {
+        set_header(headers, "access-control-request-method", method);
+    }
+    if let Some(list) = spec.get("headers") {
+        set_header(headers, "access-control-request-headers", list);
+    }
+}
+
 /// `resCors://…` — the response half of whistle's CORS negotiation
 /// (`setResCors`, `_original/lib/util/index.js:2923-2975`).
 ///
@@ -1476,10 +1636,7 @@ fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
 /// Without `info` the request-dependent half is skipped: the origin cannot be
 /// echoed and a preflight cannot be recognised.
 fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&ReqInfo>) {
-    let mut spec: HashMap<String, String> = HashMap::new();
-    for value in collect_values(resolved, "resCors") {
-        spec.extend(parse_cors(value));
-    }
+    let mut spec = merge_cors_ops(resolved, "resCors");
     // whistle has no `enable://cors`; whistle-rs keeps it as an alias for
     // `resCors://enable` so existing rule files still mean something, rather
     // than blasting `*` at every header as it used to.
@@ -1533,6 +1690,22 @@ fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&Re
     if let Some(max_age) = spec.get("maxage") {
         set_header(headers, "access-control-max-age", max_age);
     }
+}
+
+/// Collapse every line of a CORS protocol into one option map.
+///
+/// The same `parseRuleJson` fold as headers and cookies, with a key contested
+/// by two lines taken from the **first**. The keys are looked up by name below,
+/// never walked in order, so unlike [`merge_line_maps`] this can stay a
+/// `HashMap`: extending in reverse line order leaves the first line's value in
+/// place, which is what upstream's `result.reverse()` + `extend` produces
+/// (`_original/lib/util/index.js:1305-1316`).
+fn merge_cors_ops(resolved: &Resolved, protocol: &str) -> HashMap<String, String> {
+    let mut spec: HashMap<String, String> = HashMap::new();
+    for op in resolved.all(protocol).iter().rev() {
+        spec.extend(parse_cors(&op.value));
+    }
+    spec
 }
 
 /// Parse one `resCors` value into whistle's lower-cased option map.
@@ -1838,10 +2011,14 @@ pub fn res_write_raw_path(resolved: &Resolved) -> Option<String> {
 }
 
 /// Build the response trailer headers from `trailers://` operators.
+///
+/// `trailers` is one of `parseRuleJson`'s arguments (`_original/lib/inspectors/res.js:845-855`),
+/// so several lines fold into one map with the first line winning a contested
+/// name, exactly as `resHeaders` does.
 pub fn build_trailers(resolved: &Resolved) -> HeaderMap {
     let mut h = HeaderMap::new();
-    for value in collect_values(resolved, "trailers") {
-        apply_header_value(&mut h, value);
+    for (name, value) in merge_header_ops(resolved, "trailers") {
+        set_header(&mut h, &name, &value);
     }
     h
 }
@@ -2154,9 +2331,95 @@ fn merge_json_patches(resolved: &Resolved, protocol: &str) -> Option<serde_json:
     Some(target)
 }
 
+/// The request facts `params://` needs to pick its destination.
+///
+/// Both are read *after* the request operators have run, because `reqType://`
+/// and `method://` are applied before `handleParams` decides
+/// (`_original/lib/inspectors/req.js:536,560-561`) — a `reqType://json` line
+/// therefore sends the params into the body.
+#[derive(Clone, Copy, Default)]
+pub struct ReqBodyCtx<'a> {
+    /// The method as forwarded (after `method://`).
+    pub method: &'a str,
+    /// The `Content-Type` as forwarded (after `reqType://` and `reqHeaders://`).
+    pub content_type: Option<&'a str>,
+}
+
+/// Which kind of request body `params://` merges into, if any.
+///
+/// `None` means the params address the query string instead — upstream's
+/// `hasBody` flag (`handleParams`, `_original/lib/inspectors/req.js:157-232`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParamsBody {
+    /// `application/json` (and anything else `getContentType` calls JSON).
+    Json,
+    /// `application/x-www-form-urlencoded` — **POST only**, as upstream has it.
+    Form,
+    /// `multipart/…` with a boundary; the boundary is read back from the type.
+    Multipart,
+}
+
+/// Where `params://` lands for this request, given what the rules resolved.
+///
+/// Answering `None` when no `params://` (and no `delete://reqBody.…`) matched is
+/// what keeps this off the hot path: an unmatched request never looks at its own
+/// content type. Both guards are map lookups — `Deletions::of`, which walks and
+/// allocates, is reached only once a `delete://` has actually matched.
+fn params_body_kind(resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> Option<ParamsBody> {
+    let asks = !resolved.all("params").is_empty()
+        || (!resolved.all("delete").is_empty()
+            && !Deletions::of(resolved, true).body_props.is_empty());
+    asks.then(|| request_body_kind(ctx)).flatten()
+}
+
+/// Classify a request body by method and content type, the way `handleParams`
+/// branches on it.
+fn request_body_kind(ctx: ReqBodyCtx<'_>) -> Option<ParamsBody> {
+    let ct = ctx.content_type?;
+    // `isMultipart` tests the content type alone — no method, no body check
+    // (`_original/lib/util/index.js:1724-1727`) — and the boundary must be
+    // spelled out for the parts to be found at all.
+    if ct.to_ascii_lowercase().contains("multipart") {
+        return multipart_boundary(ct).map(|_| ParamsBody::Multipart);
+    }
+    // `isUrlEncoded` is POST-only (`_original/lib/util/common.js:692-695`),
+    // while `isJSONContent` accepts any method that may carry a body.
+    if ct.to_ascii_lowercase().contains("application/x-www-form-urlencoded") {
+        return ctx.method.eq_ignore_ascii_case("POST").then_some(ParamsBody::Form);
+    }
+    if method_has_body(ctx.method) && matches!(res_class(ct), Some(ResClass::Json)) {
+        return Some(ParamsBody::Json);
+    }
+    None
+}
+
+/// `hasRequestBody` (`_original/lib/util/common.js:1591-1604`) — the methods
+/// whistle will look for a body on.
+fn method_has_body(method: &str) -> bool {
+    !matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS" | "CONNECT"
+    )
+}
+
+/// The `boundary=` of a multipart content type (`BUOUNDARY_RE`,
+/// `_original/lib/inspectors/req.js:19`), quoted or bare.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    let lower = content_type.to_ascii_lowercase();
+    let at = lower.find("boundary=")? + "boundary=".len();
+    let rest = &content_type[at..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        return (end > 0).then(|| quoted[..end].to_string());
+    }
+    let end = rest.find(';').unwrap_or(rest.len());
+    let bare = rest[..end].trim();
+    (!bare.is_empty()).then(|| bare.to_string())
+}
+
 /// True if any request-body operator applies (so the body must be buffered).
-pub fn wants_req_body(resolved: &Resolved) -> bool {
-    body_ops_present(resolved, "req")
+pub fn wants_req_body(resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> bool {
+    body_ops_present(resolved, "req") || params_body_kind(resolved, ctx).is_some()
 }
 
 /// True if any response-body operator applies (so the body must be buffered).
@@ -2170,14 +2433,11 @@ pub fn wants_res_body(resolved: &Resolved) -> bool {
 /// (`handleReq` adds the transform, then `handleReplace`,
 /// `_original/lib/inspectors/req.js:129-130,573`), so a substitution *does* see
 /// what `reqPrepend`/`reqAppend` put there — the opposite of the response side.
-pub fn transform_req_body(
-    body: Bytes,
-    resolved: &Resolved,
-    content_type: Option<&str>,
-) -> Bytes {
+pub fn transform_req_body(body: Bytes, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> Bytes {
+    let del = Deletions::of(resolved, true);
     // `delete://body` wipes the body *and* anything an operator meant to put
     // around it (`removeBody`, `_original/lib/util/index.js:3592-3598`).
-    if Deletions::of(resolved, true).drop_body {
+    if del.drop_body {
         return Bytes::new();
     }
     // Request bodies are never injection-gated: whistle's request transform
@@ -2185,13 +2445,213 @@ pub fn transform_req_body(
     let gate = InjectionGate::plain(resolved);
     let mut injection = Injection::default();
     collect_generic(&mut injection, &gate, "req");
-    let data = injection.apply(body.to_vec(), false);
+    let mut data = injection.apply(body.to_vec(), false);
+    if let Some(kind) = params_body_kind(resolved, ctx) {
+        data = merge_params_into_body(data, resolved, &del, kind, ctx);
+    }
     // whistle gates `reqReplace` on the request's own content type, exactly as
     // it gates `resReplace` on the response's (`_original/lib/inspectors/req.js`
     // mirrors `res.js:129-132`): a request with no `content-type`, or an image
     // one, is left alone.
-    let class = content_type.and_then(res_class);
+    let class = ctx.content_type.and_then(res_class);
     Bytes::from(apply_replace(data, resolved, "reqReplace", class))
+}
+
+/// `params://` merged into the request body, and `delete://reqBody.…` applied
+/// alongside it (`handleParams`, `_original/lib/inspectors/req.js:157-232`).
+///
+/// The two ride the same transform upstream, which is why the deletions land
+/// here rather than in a pass of their own: they are only ever applied to a body
+/// whose shape whistle recognises.
+fn merge_params_into_body(
+    data: Vec<u8>,
+    resolved: &Resolved,
+    del: &Deletions,
+    kind: ParamsBody,
+    ctx: ReqBodyCtx<'_>,
+) -> Vec<u8> {
+    if kind == ParamsBody::Multipart {
+        let Some(boundary) = ctx.content_type.and_then(multipart_boundary) else {
+            return data;
+        };
+        return merge_params_into_multipart(data, resolved, del, &boundary);
+    }
+    // Not UTF-8 means bytes whistle's text transforms never see. (Upstream tries
+    // GB18030 first and re-encodes afterwards; this port stays UTF-8, as it does
+    // for every other text transform.)
+    let mut text = match String::from_utf8(data) {
+        Ok(text) => text,
+        Err(e) => return e.into_bytes(),
+    };
+    match kind {
+        ParamsBody::Json => {
+            let params = merge_params_values(resolved, "params");
+            // An empty body becomes the params outright — `JSON.stringify(params)`
+            // on the no-buffer branch (`req.js:214-218`).
+            if text.trim().is_empty() {
+                let mut obj = serde_json::Value::Object(params.into_iter().collect());
+                delete_json_props(&mut obj, &del.body_props);
+                return serde_json::to_vec(&obj).unwrap_or_default();
+            }
+            // Only the first JSON-looking span is patched, so a body wrapped in
+            // something else keeps its wrapper (`JSON_RE`, `req.js:18,193`).
+            let Some((start, end)) = json_span(&text) else {
+                return text.into_bytes();
+            };
+            let Ok(mut base) = serde_json::from_str::<serde_json::Value>(&text[start..end]) else {
+                return text.into_bytes();
+            };
+            // `extend(true, obj, params)` — deep, unlike the fold that built it.
+            for (key, value) in params {
+                json_deep_merge_key(&mut base, &key, value);
+            }
+            delete_json_props(&mut base, &del.body_props);
+            let Ok(merged) = serde_json::to_string(&base) else {
+                return text.into_bytes();
+            };
+            format!("{}{merged}{}", &text[..start], &text[end..]).into_bytes()
+        }
+        ParamsBody::Form => {
+            let params = merge_params_pairs(resolved, "params");
+            text = merge_query_string(&text, &params, &del.body_props);
+            text.into_bytes()
+        }
+        ParamsBody::Multipart => unreachable!("handled above"),
+    }
+}
+
+/// `params://` merged into a `multipart/form-data` body.
+///
+/// Upstream rewrites this one *streaming*, part by part, so it never holds a
+/// file upload in memory (`_original/lib/inspectors/req.js:226-410`). This port
+/// has the whole body in hand already — every other request-body operator
+/// buffers — so it splits on the boundary instead, which is far less code for
+/// the same result on a well-formed body:
+///
+/// * a part whose `name=` is in `params` has its **whole** part replaced, so an
+///   uploaded file named by a param becomes a plain field (upstream's
+///   `toMultipart(name, params[name])` does exactly this);
+/// * a part named by `delete://reqBody.<name>` is dropped;
+/// * params that matched no part are appended as new parts, in fold order.
+///
+/// A body that does not start with the boundary is left alone — upstream's
+/// `badMultipart` path, which passes the bytes through untouched.
+fn merge_params_into_multipart(
+    data: Vec<u8>,
+    resolved: &Resolved,
+    del: &Deletions,
+    boundary: &str,
+) -> Vec<u8> {
+    let start = format!("--{boundary}\r\n").into_bytes();
+    if !data.starts_with(&start) {
+        return data;
+    }
+    let sep = format!("\r\n--{boundary}").into_bytes();
+    let mut params = merge_params_pairs(resolved, "params");
+
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut rest = &data[start.len()..];
+    loop {
+        let Some(at) = find_bytes(rest, &sep) else {
+            // No closing boundary: not a body this can rewrite safely.
+            return data;
+        };
+        let part = &rest[..at];
+        let name = multipart_part_name(part);
+        let deleted = name
+            .as_deref()
+            .is_some_and(|n| del.body_props.iter().any(|d| d == n));
+        // `params[name] = undefined` marks the param consumed, so it is not
+        // appended again at the end.
+        let replacement = name
+            .as_deref()
+            .and_then(|n| params.iter().position(|(k, _)| k == n))
+            .map(|i| params.remove(i));
+        if !deleted {
+            match replacement {
+                Some((k, v)) => push_multipart_part(&mut out, boundary, &k, &v),
+                None => push_multipart_raw(&mut out, boundary, part),
+            }
+        }
+        rest = &rest[at + sep.len()..];
+        // `--` after the boundary ends the body; `\r\n` starts the next part.
+        if rest.starts_with(b"--") {
+            break;
+        }
+        match rest.strip_prefix(b"\r\n".as_slice()) {
+            Some(next) => rest = next,
+            None => return data,
+        }
+    }
+    for (name, value) in &params {
+        push_multipart_part(&mut out, boundary, name, value);
+    }
+    if out.is_empty() {
+        // Every part was deleted and nothing replaced them: emit an empty body
+        // rather than a lone terminator.
+        return Vec::new();
+    }
+    out.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
+    out
+}
+
+/// Append one already-encoded part, with the separator it needs.
+fn push_multipart_raw(out: &mut Vec<u8>, boundary: &str, part: &[u8]) {
+    match out.is_empty() {
+        true => out.extend_from_slice(format!("--{boundary}\r\n").as_bytes()),
+        false => out.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes()),
+    }
+    out.extend_from_slice(part);
+}
+
+/// Append a plain `name`/`value` field (`toMultipart`,
+/// `_original/lib/inspectors/req.js:61-95` — the string branch).
+fn push_multipart_part(out: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    let part = format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}");
+    push_multipart_raw(out, boundary, part.as_bytes());
+}
+
+/// The `name=` of a multipart part, read from the headers ahead of its blank
+/// line (`getName` over `NAME_RE`, `_original/lib/inspectors/req.js:41-59`).
+fn multipart_part_name(part: &[u8]) -> Option<String> {
+    let at = find_bytes(part, b"\r\n\r\n")?;
+    let headers = std::str::from_utf8(&part[..at]).ok()?;
+    let start = headers.to_ascii_lowercase().find("name=")? + "name=".len();
+    let rest = &headers[start..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return quoted.find('"').map(|end| quoted[..end].to_string());
+    }
+    let end = rest.find([';', '\r']).unwrap_or(rest.len());
+    let bare = rest[..end].trim();
+    // A `'`-quoted name is unwrapped too (`getName`'s second branch).
+    let bare = bare
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(bare);
+    (!bare.is_empty()).then(|| bare.to_string())
+}
+
+/// Index of `needle` in `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Deep-merge one `params` entry into a JSON value at the top level.
+fn json_deep_merge_key(base: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+    let serde_json::Value::Object(map) = base else {
+        return;
+    };
+    match map.get_mut(key) {
+        Some(slot) => json_deep_merge(slot, &value),
+        None => {
+            map.insert(key.to_string(), value);
+        }
+    }
 }
 
 /// Transform a buffered response body; `content_type` decides which typed-body
@@ -2606,10 +3066,13 @@ fn merge_rule_maps(resolved: &Resolved, protocol: &str) -> Vec<(String, String)>
 
 /// The `extend`-over-the-reversed-list core of [`merge_rule_maps`], over lines
 /// already parsed into pairs.
-fn merge_line_maps(
-    lines: impl DoubleEndedIterator<Item = Vec<(String, String)>>,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+///
+/// Generic in the value so that `params://` can fold as JSON — the flat
+/// `String` view cannot carry a nested object into a JSON request body.
+fn merge_line_maps<V>(
+    lines: impl DoubleEndedIterator<Item = Vec<(String, V)>>,
+) -> Vec<(String, V)> {
+    let mut out: Vec<(String, V)> = Vec::new();
     for pairs in lines.rev() {
         for (key, value) in pairs {
             match out.iter_mut().find(|(k, _)| *k == key) {
@@ -2746,7 +3209,7 @@ fn apply_str_replace(text: &str, pairs: &[(String, String)]) -> String {
 }
 
 /// Rewrite the request path+query per `urlReplace`, `params`, and `urlParams`.
-pub fn rewrite_path(path: &str, resolved: &Resolved) -> String {
+pub fn rewrite_path(path: &str, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> String {
     let mut p = path.to_string();
     let replacements = merge_rule_maps(resolved, "urlReplace");
     if !replacements.is_empty() {
@@ -2763,43 +3226,73 @@ pub fn rewrite_path(path: &str, resolved: &Resolved) -> String {
     }
     // Each protocol collapses to one map of its own, then `urlParams` is laid
     // over `params` (`extend(_params, urlParams)`,
-    // `_original/lib/inspectors/req.js:425`).
+    // `_original/lib/inspectors/req.js:425`). `params` is skipped entirely when
+    // the body claimed it — `_params = hasBody ? null : params` (`req.js:421`);
+    // `urlParams` always addresses the query.
     let mut params: Vec<(String, String)> = Vec::new();
-    for key in ["params", "urlParams"] {
-        params.extend(merge_line_maps(
-            resolved.all(key).iter().map(|op| parse_query_pairs(&op.value)),
-        ));
+    if params_body_kind(resolved, ctx).is_none() {
+        params.extend(merge_params_pairs(resolved, "params"));
     }
+    params.extend(merge_params_pairs(resolved, "urlParams"));
     if !params.is_empty() {
         p = merge_query(&p, &params);
     }
     p
 }
 
-/// Parse `k=v&k2=v2` or `{json}` into query pairs.
-fn parse_query_pairs(value: &str) -> Vec<(String, String)> {
+/// The `params`/`urlParams` lines of one protocol folded into a flat map, first
+/// line winning a contested name.
+fn merge_params_pairs(resolved: &Resolved, protocol: &str) -> Vec<(String, String)> {
+    merge_params_values(resolved, protocol)
+        .into_iter()
+        .map(|(k, v)| (k, json_to_param_string(v)))
+        .collect()
+}
+
+/// The same fold, keeping each value as JSON so a nested object survives into a
+/// JSON request body.
+fn merge_params_values(resolved: &Resolved, protocol: &str) -> Vec<(String, serde_json::Value)> {
+    merge_line_maps(
+        resolved
+            .all(protocol)
+            .iter()
+            .map(|op| parse_param_values(&op.value)),
+    )
+}
+
+/// Parse `k=v&k2=v2` or `{json}` into `name` → JSON value pairs.
+fn parse_param_values(value: &str) -> Vec<(String, serde_json::Value)> {
     let value = value.trim();
     if value.starts_with('{') {
         if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            return map
-                .into_iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        serde_json::Value::String(s) => s,
-                        other => other.to_string(),
-                    };
-                    (k, val)
-                })
-                .collect();
+            return map.into_iter().collect();
         }
     }
     value
         .split('&')
         .filter_map(|kv| {
             let (k, v) = kv.split_once('=')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
+            Some((
+                k.trim().to_string(),
+                serde_json::Value::String(v.trim().to_string()),
+            ))
         })
         .collect()
+}
+
+/// A param value as it appears in a query string or a form body: a JSON string
+/// unquoted, anything else serialised.
+///
+/// Upstream reaches the same place by a different road — `qs.stringify` would
+/// spell a nested object `a[b]=1` — so a `params://{"a":{"b":1}}` written
+/// against a *form* body differs. Against a JSON body, which is where a nested
+/// value belongs, both implementations merge the structure.
+fn json_to_param_string(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 /// Merge `params` into the query string of `path`, overriding same-named keys.
@@ -2808,27 +3301,42 @@ fn merge_query(path: &str, params: &[(String, String)]) -> String {
         Some((b, q)) => (b, q),
         None => (path, ""),
     };
+    let merged = merge_query_string(query, params, &[]);
+    if merged.is_empty() {
+        return base.to_string();
+    }
+    format!("{base}?{merged}")
+}
+
+/// `replaceQueryString` (`_original/lib/util/index.js:1738-1800`): overlay
+/// `params` on a `k=v&…` string, dropping the names in `del`.
+///
+/// The surviving original pairs keep their position and order; each replaced or
+/// new name is appended in `params` order. Shared by the query string and the
+/// urlencoded request body, which upstream runs through the same function.
+fn merge_query_string(query: &str, params: &[(String, String)], del: &[String]) -> String {
+    let deleted = |name: &str| del.iter().any(|d| d == name);
     let mut pairs: Vec<(String, String)> = query
         .split('&')
         .filter(|s| !s.is_empty())
-        .filter_map(|kv| {
+        .map(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            Some((k.to_string(), v.to_string()))
+            (k.to_string(), v.to_string())
         })
+        .filter(|(k, _)| !deleted(k))
         .collect();
     for (k, v) in params {
+        if deleted(k) {
+            continue;
+        }
         pairs.retain(|(ek, _)| ek != k);
         pairs.push((k.clone(), v.clone()));
     }
-    if pairs.is_empty() {
-        return base.to_string();
-    }
-    let q = pairs
+    pairs
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
-        .join("&");
-    format!("{base}?{q}")
+        .join("&")
 }
 
 /// Remove length/encoding headers so hyper recomputes them for a rewritten body.
@@ -2840,6 +3348,18 @@ pub fn strip_length_headers(headers: &mut HeaderMap) {
 /// Collect every value for a protocol, in resolution order.
 fn collect_values<'a>(resolved: &'a Resolved, protocol: &str) -> Vec<&'a str> {
     resolved.all(protocol).iter().map(|o| o.value.as_str()).collect()
+}
+
+/// Collapse every line of a cookie protocol into one ordered `name` → `value`
+/// map, first line winning a contested name — the `parseRuleJson` fold, as for
+/// headers (`_original/lib/inspectors/req.js:459-468`).
+fn merge_cookie_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, String)> {
+    merge_line_maps(
+        resolved
+            .all(protocol)
+            .iter()
+            .map(|op| parse_cookie_ops(&op.value)),
+    )
 }
 
 /// Parse a `reqCookies`/`resCookies` value into `name` → `value` pairs.
@@ -2883,7 +3403,7 @@ fn parse_cookie_ops(value: &str) -> Vec<(String, String)> {
 /// position of a cookie the request already carried (`setReqCookies`,
 /// `_original/lib/util/index.js:3053-3092`).
 fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
-    let ops = collect_values(resolved, "reqCookies");
+    let ops = merge_cookie_ops(resolved, "reqCookies");
     if ops.is_empty() {
         return;
     }
@@ -2903,14 +3423,12 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
         })
         .unwrap_or_default();
 
-    for value in ops {
-        for (name, val) in parse_cookie_ops(value) {
-            let name = escape_cookie(&name, true);
-            let val = escape_cookie(&val, false);
-            match cookies.iter_mut().find(|(k, _)| *k == name) {
-                Some(slot) => slot.1 = val,
-                None => cookies.push((name, val)),
-            }
+    for (name, val) in ops {
+        let name = escape_cookie(&name, true);
+        let val = escape_cookie(&val, false);
+        match cookies.iter_mut().find(|(k, _)| *k == name) {
+            Some(slot) => slot.1 = val,
+            None => cookies.push((name, val)),
         }
     }
 
@@ -2925,7 +3443,7 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
 /// Emit `Set-Cookie` headers for `resCookies` operators, **replacing** any the
 /// response already sent under the same name rather than adding a second one.
 fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
-    let ops = collect_values(resolved, "resCookies");
+    let ops = merge_cookie_ops(resolved, "resCookies");
     if ops.is_empty() {
         return;
     }
@@ -2939,14 +3457,12 @@ fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
         })
         .collect();
 
-    for value in ops {
-        for (name, val) in parse_cookie_ops(value) {
-            let name = escape_cookie(&name, true);
-            let cookie = format!("{name}={}", escape_cookie(&val, false));
-            match existing.iter_mut().find(|(k, _)| *k == name) {
-                Some(slot) => slot.1 = cookie,
-                None => existing.push((name, cookie)),
-            }
+    for (name, val) in ops {
+        let name = escape_cookie(&name, true);
+        let cookie = format!("{name}={}", escape_cookie(&val, false));
+        match existing.iter_mut().find(|(k, _)| *k == name) {
+            Some(slot) => slot.1 = cookie,
+            None => existing.push((name, cookie)),
         }
     }
 
@@ -2980,40 +3496,54 @@ fn escape_cookie(s: &str, is_name: bool) -> String {
 }
 
 /// Apply every value of a header multi-match protocol.
-/// Supports `name=value`, `name:value`, and a JSON object of pairs.
+///
+/// The lines are collapsed into **one** map first ([`merge_line_maps`]), so a
+/// header named on two lines takes the first line's value — see that function
+/// for why the fold, not a top-to-bottom apply, is what upstream does.
 fn apply_header_ops(headers: &mut HeaderMap, resolved: &Resolved, protocol: &str) {
-    for op in resolved.all(protocol) {
-        apply_header_value(headers, &op.value);
+    for (name, value) in merge_header_ops(resolved, protocol) {
+        set_header(headers, &name, &value);
     }
 }
 
-/// Apply one header operator value: `{json}`, or a query string of `name=value`
-/// pairs (`resHeaders://x-a=1&x-b=2` is two headers, as `parseQuery` has it).
-/// The `name:value` spelling is a whistle-rs convenience, not upstream syntax.
-fn apply_header_value(headers: &mut HeaderMap, value: &str) {
+/// Collapse every line of a header protocol into one ordered `name` → `value`
+/// map, first line winning a contested name.
+fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, String)> {
+    merge_line_maps(
+        resolved
+            .all(protocol)
+            .iter()
+            .map(|op| parse_header_pairs(&op.value)),
+    )
+}
+
+/// Parse one header operator value into `name` → `value` pairs: `{json}`, or a
+/// query string of `name=value` pairs (`resHeaders://x-a=1&x-b=2` is two
+/// headers, as `parseQuery` has it). The `name:value` spelling is a whistle-rs
+/// convenience, not upstream syntax.
+fn parse_header_pairs(value: &str) -> Vec<(String, String)> {
     let value = value.trim();
     if value.starts_with('{') {
         if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            for (k, v) in map {
-                if let Some(s) = v.as_str() {
-                    set_header(headers, &k, s);
-                } else {
-                    set_header(headers, &k, &v.to_string());
-                }
-            }
-            return;
+            return map
+                .into_iter()
+                .map(|(k, v)| match v {
+                    serde_json::Value::String(s) => (k, s),
+                    other => (k, other.to_string()),
+                })
+                .collect();
         }
     }
     if value.contains('=') {
-        for pair in value.split('&') {
-            if let Some((name, val)) = pair.split_once('=') {
-                set_header(headers, name.trim(), val.trim());
-            }
-        }
-        return;
+        return value
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(name, val)| (name.trim().to_string(), val.trim().to_string()))
+            .collect();
     }
-    if let Some((name, val)) = value.split_once(':') {
-        set_header(headers, name.trim(), val.trim());
+    match value.split_once(':') {
+        Some((name, val)) => vec![(name.trim().to_string(), val.trim().to_string())],
+        None => Vec::new(),
     }
 }
 
@@ -3074,6 +3604,35 @@ mod tests {
             None,
         );
         m.resolve(&info)
+    }
+
+    /// Request facts for the body operators: a POST carrying `content_type`.
+    fn body_ctx(content_type: Option<&str>) -> ReqBodyCtx<'_> {
+        ReqBodyCtx { method: "POST", content_type }
+    }
+
+    /// As [`resolve`], returning the [`ReqInfo`] as well for the callers that
+    /// need it (the include merge, which resolves the included text in the
+    /// request's own scope).
+    fn resolve_with_info(rules: &str, url: &str) -> (ReqInfo, Resolved) {
+        let mut m = RuleManager::new();
+        m.set_text(rules);
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let info = build_req_info(
+            "GET",
+            scheme,
+            host,
+            if scheme == "https" { 443 } else { 80 },
+            path,
+            &HeaderMap::new(),
+            None,
+        );
+        let resolved = m.resolve(&info);
+        (info, resolved)
     }
 
     /// `reqCookies` merges into the existing header: a name already present
@@ -3198,8 +3757,8 @@ mod tests {
 
         // `req.body` is the request's alone.
         let resolved = resolve("example.com/x delete://req.body\n", "http://example.com/x");
-        assert!(wants_req_body(&resolved) && !wants_res_body(&resolved));
-        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved, Some("text/plain"))[..], b"");
+        assert!(wants_req_body(&resolved, body_ctx(None)) && !wants_res_body(&resolved));
+        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved, body_ctx(Some("text/plain")))[..], b"");
     }
 
     /// The `/regexp/flags` form follows JavaScript's `String#replace`: without
@@ -3309,10 +3868,10 @@ mod tests {
     #[test]
     fn req_body_replaced_only_when_present() {
         let none = resolve("example.com host://1.1.1.1\n", "http://example.com/");
-        assert!(!wants_req_body(&none));
+        assert!(!wants_req_body(&none, body_ctx(None)));
         let some = resolve("example.com reqBody://HELLO\n", "http://example.com/");
-        assert!(wants_req_body(&some));
-        let out = transform_req_body(Bytes::from_static(b"orig"), &some, Some("text/plain"));
+        assert!(wants_req_body(&some, body_ctx(None)));
+        let out = transform_req_body(Bytes::from_static(b"orig"), &some, body_ctx(Some("text/plain")));
         assert_eq!(&out[..], b"HELLO");
     }
 
@@ -3356,7 +3915,7 @@ mod tests {
             "example.com/api urlReplace://v1=v2\nexample.com/api params://token=abc\n",
             "http://example.com/api/v1/users?a=1",
         );
-        let out = rewrite_path("/api/v1/users?a=1", &resolved);
+        let out = rewrite_path("/api/v1/users?a=1", &resolved, body_ctx(None));
         assert!(out.starts_with("/api/v2/users?"));
         assert!(out.contains("a=1"));
         assert!(out.contains("token=abc"));
@@ -3365,10 +3924,184 @@ mod tests {
     #[test]
     fn params_override_existing_key() {
         let resolved = resolve("example.com params://a=2\n", "http://example.com/p?a=1&b=3");
-        let out = rewrite_path("/p?a=1&b=3", &resolved);
+        let out = rewrite_path("/p?a=1&b=3", &resolved, body_ctx(None));
         assert!(out.contains("b=3"));
         assert!(out.contains("a=2"));
         assert!(!out.contains("a=1"));
+    }
+
+    // ── `params://` merged into the request body ──
+
+    /// `transform_req_body` for a POST carrying `ct`.
+    fn merged_body(rules: &str, ct: Option<&str>, body: &str) -> String {
+        let resolved = resolve(rules, "http://example.com/p");
+        let out = transform_req_body(Bytes::from(body.to_string()), &resolved, body_ctx(ct));
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A form body takes the params, and the query string does **not** — the
+    /// two are exclusive upstream (`_params = hasBody ? null : params`,
+    /// `_original/lib/inspectors/req.js:421`). `urlParams` still goes to the
+    /// query either way.
+    #[test]
+    fn params_merge_into_a_form_body() {
+        const FORM: &str = "application/x-www-form-urlencoded";
+        assert_eq!(
+            merged_body("example.com params://b=2\n", Some(FORM), "a=1"),
+            "a=1&b=2"
+        );
+        // A name already in the body is replaced in place.
+        assert_eq!(
+            merged_body("example.com params://a=9\n", Some(FORM), "a=1&b=2"),
+            "b=2&a=9"
+        );
+        // An empty body becomes the params outright.
+        assert_eq!(merged_body("example.com params://a=1\n", Some(FORM), ""), "a=1");
+
+        let resolved = resolve(
+            "example.com params://b=2 urlParams://c=3\n",
+            "http://example.com/p?a=1",
+        );
+        let ctx = body_ctx(Some(FORM));
+        assert_eq!(rewrite_path("/p?a=1", &resolved, ctx), "/p?a=1&c=3");
+        // Without a body to take them, the params land in the query as before.
+        assert_eq!(
+            rewrite_path("/p?a=1", &resolved, body_ctx(None)),
+            "/p?a=1&b=2&c=3"
+        );
+    }
+
+    /// `isUrlEncoded` is POST-only upstream
+    /// (`_original/lib/util/common.js:692-695`), so the same rule on a PUT sends
+    /// the params to the query string. Odd, and reproduced.
+    #[test]
+    fn a_form_body_takes_params_only_on_post() {
+        const FORM: &str = "application/x-www-form-urlencoded";
+        let resolved = resolve("example.com params://b=2\n", "http://example.com/p");
+        let put = ReqBodyCtx { method: "PUT", content_type: Some(FORM) };
+        assert!(!wants_req_body(&resolved, put));
+        assert_eq!(rewrite_path("/p", &resolved, put), "/p?b=2");
+
+        let post = ReqBodyCtx { method: "POST", content_type: Some(FORM) };
+        assert!(wants_req_body(&resolved, post));
+        assert_eq!(rewrite_path("/p", &resolved, post), "/p");
+    }
+
+    /// A JSON body is patched, deeply, and only across its first JSON-looking
+    /// span so a wrapper survives (`JSON_RE`, `_original/lib/inspectors/req.js:18`).
+    #[test]
+    fn params_merge_into_a_json_body() {
+        const JSON: &str = "application/json";
+        assert_eq!(
+            merged_body("example.com params://b=2\n", Some(JSON), "{\"a\":1}"),
+            "{\"a\":1,\"b\":\"2\"}"
+        );
+        // A `{json}` value keeps its structure and merges deeply — the flat
+        // `name=value` view could only have inserted a string.
+        assert_eq!(
+            merged_body(
+                "example.com params://{\"a\":{\"y\":2}}\n",
+                Some(JSON),
+                "{\"a\":{\"x\":1}}"
+            ),
+            "{\"a\":{\"x\":1,\"y\":2}}"
+        );
+        // The wrapper around the JSON span is untouched.
+        assert_eq!(
+            merged_body("example.com params://b=2\n", Some(JSON), "cb({\"a\":1})"),
+            "cb({\"a\":1,\"b\":\"2\"})"
+        );
+        // An empty body becomes the params, serialised as JSON.
+        assert_eq!(
+            merged_body("example.com params://a=1\n", Some(JSON), ""),
+            "{\"a\":\"1\"}"
+        );
+        // A GET carries no body upstream, so the params address the query.
+        let resolved = resolve("example.com params://b=2\n", "http://example.com/p");
+        let get = ReqBodyCtx { method: "GET", content_type: Some(JSON) };
+        assert_eq!(rewrite_path("/p", &resolved, get), "/p?b=2");
+    }
+
+    /// `delete://reqBody.<path>` rides the same transform upstream, so it only
+    /// ever reaches a body whose shape whistle recognises.
+    #[test]
+    fn delete_req_body_props() {
+        assert_eq!(
+            merged_body(
+                "example.com delete://reqBody.a.x\n",
+                Some("application/json"),
+                "{\"a\":{\"x\":1,\"y\":2}}"
+            ),
+            "{\"a\":{\"y\":2}}"
+        );
+        assert_eq!(
+            merged_body(
+                "example.com delete://reqBody.a\n",
+                Some("application/x-www-form-urlencoded"),
+                "a=1&b=2"
+            ),
+            "b=2"
+        );
+    }
+
+    /// A multipart body: a part named by a param is replaced whole, one named
+    /// by `delete://reqBody.` is dropped, and an unmatched param is appended.
+    #[test]
+    fn params_merge_into_a_multipart_body() {
+        const CT: &str = "multipart/form-data; boundary=X";
+        let body = "--X\r\n\
+                    Content-Disposition: form-data; name=\"keep\"\r\n\r\nkept\r\n\
+                    --X\r\n\
+                    Content-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n\
+                    Content-Type: application/octet-stream\r\n\r\nRAW\r\n\
+                    --X\r\n\
+                    Content-Disposition: form-data; name=\"gone\"\r\n\r\nbye\r\n\
+                    --X--";
+        let out = merged_body(
+            "example.com params://file=replaced&extra=new delete://reqBody.gone\n",
+            Some(CT),
+            body,
+        );
+        assert_eq!(
+            out,
+            "--X\r\n\
+             Content-Disposition: form-data; name=\"keep\"\r\n\r\nkept\r\n\
+             --X\r\n\
+             Content-Disposition: form-data; name=\"file\"\r\n\r\nreplaced\r\n\
+             --X\r\n\
+             Content-Disposition: form-data; name=\"extra\"\r\n\r\nnew\r\n\
+             --X--"
+        );
+        // A body that does not open with the boundary is passed through, which
+        // is upstream's `badMultipart` path.
+        assert_eq!(
+            merged_body("example.com params://a=1\n", Some(CT), "not multipart"),
+            "not multipart"
+        );
+        // No boundary in the content type means no parts to find, so the params
+        // fall back to the query string.
+        let resolved = resolve("example.com params://a=1\n", "http://example.com/p");
+        let no_boundary = ReqBodyCtx {
+            method: "POST",
+            content_type: Some("multipart/form-data"),
+        };
+        assert!(!wants_req_body(&resolved, no_boundary));
+        assert_eq!(rewrite_path("/p", &resolved, no_boundary), "/p?a=1");
+    }
+
+    /// A request no `params://` line matched never looks at its own body: the
+    /// buffering decision is answered from the resolved set alone.
+    #[test]
+    fn params_cost_nothing_when_no_rule_asks() {
+        let resolved = resolve("example.com host://1.1.1.1\n", "http://example.com/p");
+        for ct in [
+            None,
+            Some("application/json"),
+            Some("application/x-www-form-urlencoded"),
+            Some("multipart/form-data; boundary=X"),
+        ] {
+            assert!(!wants_req_body(&resolved, body_ctx(ct)));
+        }
     }
 
     #[test]
@@ -3640,6 +4373,197 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Every `reqRules://` line contributes to the included rules text, and at
+    /// most one line spelled any other way — upstream's filter over the
+    /// accumulated list (`_original/lib/rules/rules.js:2258-2272`). This port
+    /// used to read only the first line whatever its spelling.
+    #[test]
+    fn rules_file_lines_accumulate() {
+        let fx = Fixtures::new("rulesfile-accum");
+        let a = fx.write("a.txt", b"example.com resHeaders://x-a=1\n");
+        let b = fx.write("b.txt", b"example.com resHeaders://x-b=2\n");
+        let c = fx.write("c.txt", b"example.com resHeaders://x-c=3\n");
+
+        let merged = |rules: &str| {
+            let (info, mut resolved) = resolve_with_info(rules, "http://example.com/");
+            let _ = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+            let mut h = HeaderMap::new();
+            apply_header_ops(&mut h, &resolved, "resHeaders");
+            h
+        };
+
+        // Two `reqRules://` lines: both are rules text, so both apply.
+        let h = merged(&format!(
+            "example.com reqRules://{a}\nexample.com reqRules://{b}\n"
+        ));
+        assert_eq!(h.get("x-a").unwrap(), "1");
+        assert_eq!(h.get("x-b").unwrap(), "2");
+
+        // Two `rulesFile://` lines: each is a *candidate script*, and upstream
+        // keeps only the first. The second is dropped, not merged.
+        let h = merged(&format!(
+            "example.com rulesFile://{a}\nexample.com rulesFile://{b}\n"
+        ));
+        assert_eq!(h.get("x-a").unwrap(), "1");
+        assert!(h.get("x-b").is_none());
+
+        // Mixed: every `reqRules://` line plus the first other one.
+        let h = merged(&format!(
+            "example.com reqRules://{a}\n\
+             example.com rulesFile://{b}\n\
+             example.com rulesFile://{c}\n"
+        ));
+        assert_eq!(h.get("x-a").unwrap(), "1");
+        assert_eq!(h.get("x-b").unwrap(), "2");
+        assert!(h.get("x-c").is_none());
+
+        // The pieces are joined into *one* rules text, so a single-value
+        // protocol contested across two files is decided by their order.
+        let host_a = fx.write("host-a.txt", b"example.com host://1.1.1.1\n");
+        let host_b = fx.write("host-b.txt", b"example.com host://2.2.2.2\n");
+        let (info, mut resolved) = resolve_with_info(
+            &format!("example.com reqRules://{host_a}\nexample.com reqRules://{host_b}\n"),
+            "http://example.com/",
+        );
+        let _ = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        assert_eq!(resolved.value("host"), Some("1.1.1.1"));
+    }
+
+    /// Rules merged in mid-request take the same two passes the top-level rules
+    /// do: a response condition inside a `rulesFile://` include (or a plugin's
+    /// injected rules) is now answered rather than failing closed.
+    ///
+    /// Upstream re-resolves the same managers in its response phase
+    /// (`_original/lib/plugins/index.js:1326-1335`).
+    #[test]
+    fn merged_rules_get_the_response_phase_too() {
+        let fx = Fixtures::new("merged-res-phase");
+        let inc = fx.write(
+            "inc.txt",
+            b"example.com resHeaders://x-late=1 includeFilter://s:404\n\
+              example.com resHeaders://x-always=1\n",
+        );
+
+        // `merge_included_rules` + `response_phase_of` is exactly what
+        // `serve`'s two phases compose; `status` drives the second.
+        let resolve_at = |rules: &str, status: Option<u16>| {
+            let (mut info, mut resolved) = resolve_with_info(rules, "http://example.com/");
+            let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+            if let Some(status) = status {
+                info.res = Some(build_res_info(status, &HeaderMap::new(), None, None));
+                if let Some(extra) = response_phase_of(&merged, &info, false) {
+                    resolved.merge_response_phase(extra);
+                }
+            }
+            let mut h = HeaderMap::new();
+            apply_header_ops(&mut h, &resolved, "resHeaders");
+            h
+        };
+
+        let rules = format!("example.com rulesFile://{inc}\n");
+        // The unconditional line applies from the request phase on.
+        assert_eq!(resolve_at(&rules, None).get("x-always").unwrap(), "1");
+        assert!(resolve_at(&rules, None).get("x-late").is_none());
+        // The conditional one waits for the status, and then holds — or not.
+        let on_404 = resolve_at(&rules, Some(404));
+        assert_eq!(on_404.get("x-late").unwrap(), "1");
+        assert_eq!(on_404.get("x-always").unwrap(), "1");
+        assert!(resolve_at(&rules, Some(200)).get("x-late").is_none());
+
+        // The same for rules a plugin injects.
+        let (mut info, mut resolved) = resolve_with_info("example.com/x\n", "http://example.com/x");
+        let merged = vec![merge_rules_text(
+            &mut resolved,
+            &info,
+            "example.com resHeaders://x-plugin=1 includeFilter://s:500\n",
+            false,
+        )];
+        info.res = Some(build_res_info(500, &HeaderMap::new(), None, None));
+        let extra = response_phase_of(&merged, &info, false).expect("a second pass");
+        resolved.merge_response_phase(extra);
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &resolved, "resHeaders");
+        assert_eq!(h.get("x-plugin").unwrap(), "1");
+    }
+
+    /// Nothing is applied twice: the request pass withholds exactly what the
+    /// second one resolves, so a line whose *exclude* filter is inert in the
+    /// request phase does not contribute its operator in both.
+    #[test]
+    fn a_merged_rule_is_not_resolved_twice() {
+        let fx = Fixtures::new("merged-res-phase-once");
+        let inc = fx.write(
+            "inc.txt",
+            b"example.com resHeaders://x-a=1 excludeFilter://s:404\n",
+        );
+        let (mut info, mut resolved) = resolve_with_info(
+            &format!("example.com rulesFile://{inc}\n"),
+            "http://example.com/",
+        );
+        let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        assert!(
+            resolved.all("resHeaders").is_empty(),
+            "withheld until the status is known"
+        );
+        info.res = Some(build_res_info(200, &HeaderMap::new(), None, None));
+        let extra = response_phase_of(&merged, &info, false).expect("a second pass");
+        resolved.merge_response_phase(extra);
+        assert_eq!(resolved.all("resHeaders").len(), 1);
+
+        // …and the exclude filter still fires when it should.
+        let (mut info, mut resolved) = resolve_with_info(
+            &format!("example.com rulesFile://{inc}\n"),
+            "http://example.com/",
+        );
+        let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        info.res = Some(build_res_info(404, &HeaderMap::new(), None, None));
+        assert!(response_phase_of(&merged, &info, false).is_some_and(|e| e.all("resHeaders").is_empty()));
+    }
+
+    /// An included file that says nothing about the response gets no second
+    /// pass at all — the manager answers from its precomputed flags.
+    #[test]
+    fn a_merged_rule_with_no_response_condition_skips_the_second_pass() {
+        let fx = Fixtures::new("merged-res-phase-skip");
+        let inc = fx.write("inc.txt", b"example.com resHeaders://x-a=1\n");
+        let (mut info, mut resolved) = resolve_with_info(
+            &format!("example.com rulesFile://{inc}\n"),
+            "http://example.com/",
+        );
+        let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        info.res = Some(build_res_info(200, &HeaderMap::new(), None, None));
+        assert!(response_phase_of(&merged, &info, false).is_none());
+    }
+
+    /// `resScript` picks the first line **not** spelled `resRules://` — the only
+    /// one upstream ever executes. Before this, a rules file written above the
+    /// script was handed to the JS engine in its place.
+    #[test]
+    fn res_script_skips_the_rules_spelling() {
+        let resolved = resolve(
+            "example.com resRules:///rules.txt resScript:///script.js\n",
+            "http://example.com/",
+        );
+        assert_eq!(
+            res_script_op(&resolved).map(|op| op.value.as_str()),
+            Some("/script.js")
+        );
+        // With no script at all there is nothing to run, rather than the rules
+        // file being evaluated as JavaScript.
+        let only_rules = resolve("example.com resRules:///rules.txt\n", "http://example.com/");
+        assert!(res_script_op(&only_rules).is_none());
+        // A second script is dropped before the search, so it can never be
+        // reached even if the first is a `resRules://` line.
+        let two = resolve(
+            "example.com resScript:///one.js resScript:///two.js\n",
+            "http://example.com/",
+        );
+        assert_eq!(
+            res_script_op(&two).map(|op| op.value.as_str()),
+            Some("/one.js")
+        );
     }
 
     /// Serve a file rule for `GET http://x.com/`, returning status, content type
@@ -4652,7 +5576,7 @@ mod tests {
             "example.com/api urlReplace://v1=v2\nexample.com/api urlReplace://old=new\n",
             "http://example.com/api/v1/old",
         );
-        assert_eq!(rewrite_path("/api/v1/old", &resolved), "/api/v2/new");
+        assert_eq!(rewrite_path("/api/v1/old", &resolved, body_ctx(None)), "/api/v2/new");
     }
 
     /// The request side accumulates through the same code path.
@@ -4663,7 +5587,7 @@ mod tests {
              example.com reqAppend://a1\nexample.com reqAppend://a2\n",
             "http://example.com/",
         );
-        let out = transform_req_body(Bytes::from_static(b"BODY"), &resolved, Some("text/plain"));
+        let out = transform_req_body(Bytes::from_static(b"BODY"), &resolved, body_ctx(Some("text/plain")));
         assert_eq!(out, Bytes::from_static(b"p1\r\np2BODYa1\r\na2"));
     }
 
@@ -4779,6 +5703,130 @@ mod tests {
         // A comma is not a separator upstream, so it stays part of the name.
         let commas = resolve("example.com enable://p,q\n", "http://example.com/");
         assert!(enabled_flags(&commas).contains("p,q"));
+    }
+
+    /// Request parts for the operator tests below.
+    fn req_parts(headers: &[(&str, &str)]) -> request::Parts {
+        let mut builder = hyper::Request::builder().uri("http://example.com/");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    /// Two lines naming the **same** header: the first one wins.
+    ///
+    /// This is the `parseRuleJson` fold (`_original/lib/util/index.js:1305-1316`),
+    /// not a top-to-bottom apply — upstream reverses the list and `extend`s it,
+    /// so the highest-priority line's value survives, consistent with
+    /// first-match-wins everywhere else. Lines naming *different* headers all
+    /// contribute.
+    #[test]
+    fn contested_header_takes_the_first_line() {
+        let resolved = resolve(
+            "example.com resHeaders://x-a=first&x-only-1=1\n\
+             example.com resHeaders://x-a=second&x-only-2=2\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &resolved, "resHeaders");
+        assert_eq!(h.get("x-a").unwrap(), "first");
+        assert_eq!(h.get("x-only-1").unwrap(), "1");
+        assert_eq!(h.get("x-only-2").unwrap(), "2");
+
+        // `important` reorders the lines, and the fold follows the resolution
+        // order rather than the source order.
+        let important = resolve(
+            "example.com resHeaders://x-a=plain\n\
+             example.com resHeaders://x-a=important lineProps://important\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &important, "resHeaders");
+        assert_eq!(h.get("x-a").unwrap(), "important");
+    }
+
+    /// The same fold reaches `reqHeaders`, `trailers`, and both cookie
+    /// operators — every protocol upstream hands to `parseRuleJson`
+    /// (`_original/lib/inspectors/req.js:459-468`, `res.js:845-855`).
+    #[test]
+    fn contested_key_takes_the_first_line_everywhere() {
+        let resolved = resolve(
+            "example.com reqHeaders://x-a=first  reqCookies://sid=first  trailers://x-t=first\n\
+             example.com reqHeaders://x-a=second reqCookies://sid=second trailers://x-t=second\n",
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &resolved);
+        assert_eq!(parts.headers.get("x-a").unwrap(), "first");
+        assert_eq!(parts.headers.get("cookie").unwrap(), "sid=first");
+        assert_eq!(build_trailers(&resolved).get("x-t").unwrap(), "first");
+
+        let res = resolve(
+            "example.com resCookies://sid=first\nexample.com resCookies://sid=second\n",
+            "http://example.com/",
+        );
+        let mut parts = res_parts(&[]);
+        apply_response(&mut parts, &res);
+        assert_eq!(parts.headers.get("set-cookie").unwrap(), "sid=first");
+    }
+
+    /// `resCors` folds too: the first line's `origin` wins, and a key only a
+    /// later line mentions still lands.
+    #[test]
+    fn contested_cors_key_takes_the_first_line() {
+        let resolved = resolve(
+            "example.com resCors://{\"origin\":\"http://a.test\"}\n\
+             example.com resCors://origin=http://b.test&methods=GET\n",
+            "http://example.com/",
+        );
+        let mut parts = res_parts(&[]);
+        apply_response(&mut parts, &resolved);
+        assert_eq!(
+            parts.headers.get("access-control-allow-origin").unwrap(),
+            "http://a.test"
+        );
+        assert_eq!(
+            parts.headers.get("access-control-allow-methods").unwrap(),
+            "GET"
+        );
+    }
+
+    /// `reqCors` is `setReqCors` (`_original/lib/util/index.js:2899-2921`): a
+    /// URL origin is reduced to its origin, `*` passes through, and `method` /
+    /// `headers` become the preflight request headers. `enable` sets nothing —
+    /// there is no origin to echo on the request side.
+    #[test]
+    fn req_cors_sets_origin_and_preflight_headers() {
+        let resolved = resolve(
+            "example.com reqCors://http://a.test/page?q=1\n",
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &resolved);
+        assert_eq!(parts.headers.get("origin").unwrap(), "http://a.test");
+
+        let star = resolve(
+            "example.com reqCors://* reqCors://method=PUT&headers=x-a\n",
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &star);
+        assert_eq!(parts.headers.get("origin").unwrap(), "*");
+        assert_eq!(
+            parts.headers.get("access-control-request-method").unwrap(),
+            "PUT"
+        );
+        assert_eq!(
+            parts.headers.get("access-control-request-headers").unwrap(),
+            "x-a"
+        );
+
+        // `enable` is the response-side spelling; on a request it is inert.
+        let enable = resolve("example.com reqCors://enable\n", "http://example.com/");
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &enable);
+        assert!(parts.headers.get("origin").is_none());
     }
 
     // ── response header operators ──
@@ -5081,17 +6129,17 @@ mod tests {
         let body = || Bytes::from_static(b"old");
 
         assert_eq!(
-            &transform_req_body(body(), &resolved, Some("text/plain"))[..],
+            &transform_req_body(body(), &resolved, body_ctx(Some("text/plain")))[..],
             b"new",
             "text is rewritten"
         );
         assert_eq!(
-            &transform_req_body(body(), &resolved, None)[..],
+            &transform_req_body(body(), &resolved, body_ctx(None))[..],
             b"old",
             "no content-type: left alone"
         );
         assert_eq!(
-            &transform_req_body(body(), &resolved, Some("image/png"))[..],
+            &transform_req_body(body(), &resolved, body_ctx(Some("image/png")))[..],
             b"old",
             "images are left alone"
         );
@@ -5121,3 +6169,5 @@ mod tests {
         assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x%3BSecure");
     }
 }
+
+

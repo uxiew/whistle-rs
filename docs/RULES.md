@@ -386,7 +386,8 @@ Still missing: a `user@` prefix on the PAC URL is not read as a proxy credential
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `urlReplace` | `from=to` (or `/regex/[i]=to`) | Substitute inside the request path+query (accumulates) |
-| `params` / `urlParams` | `k=v&k2=v2` or `{json}` | Add/override query params (accumulates) |
+| `params` | `k=v&k2=v2` or `{json}` | Add/override params — in the **request body** when the request has one whistle recognises, otherwise in the query string (accumulates) |
+| `urlParams` | `k=v&k2=v2` or `{json}` | Add/override **query** params, always (accumulates) |
 
 ```
 example.com/api    urlReplace://v1=v2                 # /api/v1/x -> /api/v2/x
@@ -396,6 +397,38 @@ example.com        params://debug=1&trace=on
 
 > Note the `/regex/` convention: since paths start with `/`, write literals without
 > surrounding slashes (`urlReplace://old=new`) and reserve `/…/` for regexes.
+
+#### Where `params://` lands
+
+`params` addresses **one** place, never both — upstream's `_params = hasBody ? null :
+params` (`handleParams`, `_original/lib/inspectors/req.js:157-232,421`). The request's
+method and `Content-Type`, *as forwarded* (so after `method://`, `reqType://` and
+`reqHeaders://`), decide which:
+
+| Request | Where the params go |
+|---|---|
+| `Content-Type: multipart/…` **with a `boundary=`** | the body: a part with a matching `name=` is replaced whole, the rest are appended as new parts |
+| `Content-Type: application/x-www-form-urlencoded`, **POST only** | the body, as a query string |
+| a JSON content type, on any method that may carry a body (not `GET`/`HEAD`/`OPTIONS`/`CONNECT`) | the body, **deep**-merged into its first JSON-looking span |
+| anything else | the query string |
+
+The POST-only rule for form bodies is upstream's `isUrlEncoded`
+(`_original/lib/util/common.js:692-695`); the same rule on a `PUT` sends the params to
+the query string in both implementations.
+
+`delete://reqBody.<path>` rides the same transform, so it too applies only to a body of
+one of those three kinds: a dotted path out of a JSON body, a name out of a form body
+or a multipart part.
+
+An empty body becomes the params outright — `{"a":"1"}` for JSON, `a=1` for a form.
+`params://{"a":{"b":1}}` keeps its structure into a JSON body; against a form body it is
+serialised (whistle writes `a[b]=1` there instead).
+
+```
+api.example.com   params://uid=42            # POSTed form/JSON body gains uid
+api.example.com   urlParams://trace=1        # ?trace=1, whatever the body is
+api.example.com   delete://reqBody.password  # dropped from the body
+```
 
 ### Filter conditions
 
@@ -443,6 +476,8 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 | Server address | `serverIp:<v>`, `serverIP:` | the address the request was actually sent to — the upstream proxy's when one was used (response phase) |
 | Server port | `serverPort:<v>` | the port the request was sent to (response phase) |
 | Host | `host:<v>`, `host=<v>` | request host |
+| Request body | `b:<v>`, `body:<v>` | the request body **contains** `<v>` — see [the body condition](#the-body-condition) |
+| Environment | `env:<KEY>=<v>` | whistle's own process environment variable `<KEY>` contains `<v>`. The key is case-**sensitive**, and only `=` separates it |
 | Sampling | `chance:<p>`, `chance:<n>%`, `probability:` | a random fraction of requests (`Math.random() < p`) |
 | URL | anything else | the full request URL, using the same pattern engine as a rule's own [pattern](#patterns) — regexp, wildcard or prefix |
 
@@ -533,10 +568,19 @@ phase. A rules file that never mentions the response skips the second pass entir
 (measured at ~2 ns per response, against ~2.4 µs for a 500-rule request pass), and a
 file that does pays for those lines only — one conditional line in 500 costs ~24 ns.
 
-**Not covered by the second pass:** rules pulled in by `rule://` / `rulesFile://` and
-rules injected by a plugin are resolved once, in the request phase. Upstream
-re-resolves those managers too (`fRules`/`pRules`/`hRules` in `getResRules`).
-WebSocket and tunnelled (`CONNECT`) traffic have no response phase here either.
+**Rules merged in mid-request take both passes too.** A `rule://` value, the
+`rulesFile://` join and the rules a plugin injects are each kept in parsed form and
+resolved a second time when the head arrives — upstream re-resolves the same managers
+(`fRules`/`pRules`/`hRules` in `getResRules`,
+`_original/lib/plugins/index.js:1326-1335`). They keep their place *behind* everything
+the file that pulled them in resolved, in both passes. Cost per response: ~7 ns with
+nothing merged, ~9 ns for a merged text with no response-dependent line, ~250 ns for one
+that has one.
+
+**Not covered by the second pass:** WebSocket and tunnelled (`CONNECT`) traffic have no
+response phase here. Neither do the three paths that answer without touching the
+response operators at all — a `plugin://` that answered the request itself, a self-loop
+redirect, and an `enable://abort` — which is equally true of the top-level rules.
 
 `serverIp:` is answered from the **connected socket**, so a named origin is answered too:
 the address is read back off the connection rather than guessed by asking the resolver a
@@ -545,6 +589,43 @@ When the request went through an upstream proxy the address is the **proxy's** �
 also what whistle reports, since it sets `req.hostIp` from the resolved proxy address
 whenever a proxy rule matched (`_original/lib/inspectors/res.js:238,:259`). A request
 that never connected at all leaves the condition unanswerable, and it fails closed.
+
+#### The body condition
+
+`b:` / `body:` reads the **request body**, which means the body has to be buffered
+before the rules resolve — the one thing on the request path that cannot be undone
+once it is done. Both implementations therefore decide it in two stages, and
+whistle-rs follows upstream's:
+
+1. every line carrying a `b:` filter is collected at parse time into a list of its
+   own (upstream's `_bodyFilters`, `_original/lib/rules/rules.js:1390-1392`);
+2. before resolution, the proxy asks whether any of those lines would match this
+   request *but for* the body condition — pattern, method, headers, everything else
+   is evaluated as usual. Only then is the body read
+   (`resolveBodyFilter` → `req.getPayload`, `rules.js:2455-2465`,
+   `lib/inspectors/rules.js:193-205`).
+
+So a rules file with no `b:` in it never touches a body, and one that has a `b:`
+scoped to a host or a method pays nothing on the requests it excludes. Measured on a
+500-rule file: **4.2 ns** per request with no `b:` line, **11 ns** with one that does
+not match this request, **12 ns** with one that does (plus the buffering itself) —
+against ~2.8 µs for the resolution that follows.
+
+```
+example.com  resBody://blocked  includeFilter://b:password
+example.com  resBody://blocked  includeFilter://b:/"role"\s*:\s*"admin"/
+```
+
+The comparison is by **containment**, case-insensitively, like a header's; a `/re/`
+value is matched against the body as it arrived. An empty body is still a body, so
+`b:!x` holds for a request that has none. If nothing caused the body to be buffered —
+a `b:` inside a `rulesFile://` include, which is resolved after the decision — the
+condition is unknown and fails closed, exactly as upstream's does when
+`req._reqBody` is not a string (`rules.js:1903-1906`).
+
+Unlike upstream there is no ceiling on how much is buffered: whistle stops at
+`MAX_REQ_SIZE` (2 MB, or 16 MB under `reqMergeBigData`) and matches against the
+prefix.
 
 #### Conditions that still cannot be evaluated
 
@@ -557,8 +638,6 @@ in the request phase this is also how every response condition above behaves.
 
 | Condition | Would need |
 |---|---|
-| `b:<v>`, `body:<v>` | the request body buffered *before* rules resolve (upstream pre-reads it when a line carries a body filter) |
-| `env:<key>=<v>` | the plugin environment store |
 | `from:<v>` | the request's origin flags (`tunnel`, `composer`, `sni`, …), which the proxy layer knows but does not pass to the matcher |
 
 #### Remaining divergences from upstream
@@ -618,7 +697,7 @@ example.com/app.js     file:///Users/me/dev/app.js
 | `method` | HTTP method | Override the request method |
 | `reqType` | MIME type or short name | Set the request `Content-Type` (`reqType://json`, `reqType://form`, …) |
 | `reqCharset` | charset | Set the charset on the request `Content-Type` |
-| `reqCors` | origin | Set the request `Origin` header |
+| `reqCors` | origin URL, `*`, or `method=…&headers=…` | Set the request `Origin`, and the `Access-Control-Request-Method` / `-Headers` preflight headers. A URL is reduced to its origin. `enable` is the *response*-side spelling and does nothing here. |
 | `auth` | `user:pass` | Add an HTTP Basic `Authorization` header |
 | `forwardedFor` | IP | Set the `X-Forwarded-For` header |
 | `reqWrite` | file path | Append the request body to a file |
@@ -714,7 +793,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
 | `responseFor` | a URL | Prefetch the URL; annotate the request with `x-whistle-response-for-*` |
 | `rule` | value name | Include the named value's rules and apply them too |
-| `rulesFile` | file path | Include rules from a file and apply them too |
+| `rulesFile` | file path | Include rules from a file and apply them too. Also spelled `reqRules://`, `ruleFile://`, `ruleScript://`, `rulesScript://`, `reqScript://` — see below |
 | `pipe` | plugin name | Route through a registered server (like `plugin`) |
 
 `{name}` anywhere in an operator value is replaced with the content of the named value
@@ -730,6 +809,33 @@ page.example.com    responseFor://http://auth.internal/verify
 example.com         resBody://{mockJson}        # {mockJson} from the values store
 example.com         rulesFile:///etc/whistle/extra.rules
 ```
+
+#### How several `rulesFile://` lines combine
+
+`rulesFile` accumulates, but its list is filtered before the files are read
+(`_original/lib/rules/rules.js:2258-2272`), and the filter turns on how the line was
+*spelled*:
+
+* `reqRules://<path>` says "this file is rules" — **every** such line is kept;
+* any other spelling (`rulesFile://`, `ruleFile://`, `ruleScript://`,
+  `rulesScript://`, `reqScript://`) marks a *candidate script*, and **only the first**
+  survives. A second one is dropped silently.
+
+The surviving files are concatenated, in resolution order, and parsed as **one** rules
+text — so a single-value protocol contested between two of them is decided by the
+order they were included in, not by which file it came from.
+
+```
+example.com   reqRules:///etc/whistle/a.rules     # kept
+example.com   reqRules:///etc/whistle/b.rules     # kept
+example.com   rulesFile:///etc/whistle/c.rules    # kept (first non-reqRules line)
+example.com   rulesFile:///etc/whistle/d.rules    # dropped
+```
+
+> whistle additionally *executes* the surviving candidate when its content looks like
+> JavaScript rather than rules (`isRulesContent`, `_original/lib/rules/index.js:41`),
+> and splices the rules the script emits into the join. whistle-rs has no dynamic-rules
+> script: every kept file is read as rules text.
 
 ### Delays & throttling
 
@@ -990,7 +1096,8 @@ The operators that consume the whole list combine it differently per family:
 | `reqReplace` / `resReplace` / `urlReplace` | Collapsed into **one pattern map**. Every pattern applies; a pattern written on two lines takes the **first** line's replacement. The map's order is the last line's patterns first, then whatever each earlier line adds — so substitutions chain in that order. |
 | `resMerge` | Collapsed into **one patch**, first line winning a contested key. The fold is **shallow** unless one of the lines is the literal `resMerge://true`, whistle's marker for a deep fold; that line contributes no data of its own. The combined patch is then deep-merged into the body. |
 | `params` / `urlParams` | Collapsed into one map each, first line winning a contested key; `urlParams` is then laid over `params`. |
-| `reqHeaders` / `resHeaders` / `reqCookies` / `resCookies` / `reqCors` / `resCors` / `trailers` / `headerReplace` | Applied in turn, top to bottom. |
+| `reqHeaders` / `resHeaders` / `reqCookies` / `resCookies` / `reqCors` / `resCors` / `trailers` | Collapsed into **one map**, first line winning a contested name. These are `parseRuleJson`'s own arguments (`_original/lib/inspectors/req.js:459-468`, `res.js:845-855`), so they take the same fold as `resMerge` and `params`. |
+| `headerReplace` | Applied in turn, top to bottom. |
 
 ```
 example.com/x  resPrepend://<!--head-->
@@ -1087,10 +1194,14 @@ Notes: `http2https-proxy`/`https2http-proxy` and the `internal-*` family do
 convert the origin scheme, and the stripped-TLS hop carries whistle's
 `x-whistle-https-request` marker (see [Upstream proxy](#upstream-proxy)); what is
 still missing from the `internal-*` family is the rest of whistle's
-whistle-to-whistle handshake — the client-id and intercept-policy headers. The
-`x`-prefixed variants (`xproxy://`, `xsocks://`, …) are aliases of their base
-proxy: upstream falls back to a **direct** connection when the proxy fails, this
-port does not and returns 502. `enable`/`disable` apply a curated flag set (see the
+whistle-to-whistle handshake — the client-id and intercept-policy headers. **Every** upstream-proxy name also accepts an `x` prefix — `xproxy`, `xsocks`,
+`xhttp-proxy`, `xhttps-proxy`, `xinternal-proxy`, `xinternal-http-proxy`,
+`xinternal-https-proxy`, `xhttps2http-proxy`, `xhttp2https-proxy` — which is
+upstream's one optional `x?` over the whole family (`PROXY_RE`,
+`_original/lib/rules/rules.js:37-38`) and is parsed here as an alias of the base
+name. Like upstream, an `x`-prefixed proxy that cannot be **established** falls
+back to a direct connection — see [the upstream-proxy section](#upstream-proxy)
+for what the retry does and does not cover. `enable`/`disable` apply a curated flag set (see the
 [Flags](#flags-includes--values) table — others are inert); `pipe` routes to a
 registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
 extra rules from the values store / a file; `{name}` in any operator value is
@@ -1177,18 +1288,12 @@ in upstream whistle.
 
 Known gaps in the operator layer, deliberately left:
 
-- **Header-shaped operators apply last-line-wins, first-line-wins upstream.**
-  `reqHeaders`, `resHeaders`, `reqCookies`, `resCookies`, `reqCors`, `resCors`
-  and `trailers` accumulate correctly, but whistle collapses them into one map
-  the way it does `resReplace` (see [How several lines of one operator
-  combine](#how-several-lines-of-one-operator-combine)), so a header named on two
-  lines takes the *first* line's value there and the *last* line's here. Lines
-  naming different headers behave identically.
-- **`rulesFile` and `resScript` accumulate upstream but not here.** whistle
-  concatenates every matching `rulesFile://` and keeps the first *script* among
-  them; whistle-rs reads only the winning line of each.
-- **`params://` merged into a request body is not ported** (see below), so its
-  multi-line fold only reaches the query string.
+- **`resRules://` entries of a `resScript` list are not applied.** Upstream folds
+  them into a rules text the response phase parses; whistle-rs's `resScript` is a
+  JavaScript hook that mutates the response directly, so it has nowhere to put
+  them. They are *skipped* rather than run as JavaScript — the script whistle-rs
+  executes is the first entry not spelled `resRules://`, which is the one
+  upstream executes too.
 - **`attachment://` with no value** cannot derive a filename from the request URL
   yet — it emits a bare `Content-Disposition: attachment` where upstream would say
   `filename="report.csv"`. Give the name explicitly to be sure.
@@ -1196,8 +1301,14 @@ Known gaps in the operator layer, deliberately left:
   live path for the same reason; the explicit forms (`*`, a URL, `methods=…`) work.
 - **Injected text is UTF-8.** whistle re-encodes it into the response's declared
   charset; a `charset=gbk` page will see mojibake in the injected fragment.
-- **`params://` on a request body** is treated as query parameters only. whistle
-  also merges them into a form, multipart or JSON request body.
+- **`params://` into a body is buffered, not streamed.** whistle rewrites a
+  multipart body part by part so an upload never lands in memory; whistle-rs has
+  the body in hand already (every other request-body operator buffers) and splits
+  on the boundary. Same result on a well-formed body, more memory on a large one.
+  Upstream's `reqMergeBigData` / `MAX_REQ_SIZE` ceilings have no counterpart here.
+- **A non-UTF-8 request body is left alone** by the `params://` merge. whistle
+  tries GB18030 and re-encodes afterwards; this port stays UTF-8, as it does for
+  every other text transform.
 - **`delete://resCookies.x`** does not emit the expiring `Set-Cookie` upstream
   writes, and `delete://trailer.x` is not applied.
 - **A cookie declared as a JSON object** (`resCookies://{"sid":{"value":"x","httpOnly":true}}`)
