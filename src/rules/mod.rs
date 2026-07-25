@@ -7,6 +7,7 @@
 //! * pattern kinds: regexp (`/re/i`), wildcard (`*`), and scheme/host/path
 //!   prefix matching
 //! * operator parsing for the full protocol set (see [`protocols`])
+//! * per-line properties (`lineProps://…`, see [`LineProps`])
 //! * per-request resolution with first-match-wins (and multi-match for the
 //!   protocols whistle allows to repeat)
 //!
@@ -18,10 +19,123 @@ pub mod protocols;
 pub mod storage;
 
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+
+/// Every line property whistle's editor offers
+/// (`LINE_PROPS_HINTS` in `_original/biz/webui/htdocs/src/js/rules-hint.js:69`),
+/// plus the spellings only the runtime knows about. Unknown actions are kept
+/// too — whistle never validates them — so this list is documentation, not a
+/// filter. See `docs/LINE_PROPS.md` for what each one does and which are wired
+/// up in this port.
+pub const LINE_PROP_ACTIONS: &[&str] = &[
+    "important",
+    "safeHtml",
+    "strictHtml",
+    "disableAutoCors",
+    "disableUserLogin",
+    "enableUserLogin",
+    "internal",
+    "internalOnly",
+    "internalProxy",
+    "proxyFirst",
+    "proxyHost",
+    "proxyHostOnly",
+    "proxyTunnel",
+    "weakRule",
+    "enableBigData",
+    // Undocumented but honoured by the original runtime.
+    "disabledAutoCors",
+    "originUrl",
+];
+
+/// Per-line properties declared with `lineProps://<action>[|&<action>…]`.
+///
+/// `lineProps` (`resolveMatchFilter` in `_original/lib/rules/rules.js:1552`,
+/// `parseLineProps` in `_original/lib/util/index.js:1877`) is the line-scoped
+/// counterpart of the global `enable://`/`disable://` switches: the actions
+/// listed on a rule line only affect the operators written on *that* line.
+/// Every operator of a line therefore carries a copy — see [`RuleOp::props`].
+///
+/// Actions are stored verbatim, exactly like the original's `{action: true}`
+/// map, so spellings this port does not act on still reach consumers that do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineProps {
+    actions: BTreeSet<String>,
+}
+
+/// Shared empty set, so [`Resolved::props`] can hand out a reference for
+/// protocols that never matched.
+static NO_PROPS: LineProps = LineProps {
+    actions: BTreeSet::new(),
+};
+
+impl LineProps {
+    /// Merge one `lineProps://` payload. Separators are `|` and `&`
+    /// (`SEP_RE = /[|&]/` in the original); empty segments are dropped, so
+    /// `lineProps://`, `lineProps://|` and `lineProps://a||b` all behave.
+    fn merge(&mut self, spec: &str) {
+        for action in spec.split(['|', '&']) {
+            if !action.is_empty() {
+                self.actions.insert(action.to_string());
+            }
+        }
+    }
+
+    /// Is `action` set on this line?
+    pub fn has(&self, action: &str) -> bool {
+        self.actions.contains(action)
+    }
+
+    /// True when the line declared no properties at all.
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
+    /// The declared actions, in sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.actions.iter().map(String::as_str)
+    }
+
+    /// `important` — like CSS's `!important`, this line's operators outrank the
+    /// same protocol from non-important lines regardless of file position
+    /// (`isImportant` in `_original/lib/util/index.js:2141`).
+    pub fn important(&self) -> bool {
+        self.has("important")
+    }
+
+    /// `internal` / `internalOnly` — whether a rule carrying these properties
+    /// applies to a request with this origin. `internalOnly` restricts the line
+    /// to whistle's own outgoing requests, `internal` widens it to both.
+    /// Ported from `checkInternal` (`_original/lib/rules/rules.js:910`).
+    pub fn allows_scope(&self, is_internal_req: bool) -> bool {
+        if is_internal_req {
+            self.has("internal") || self.has("internalOnly")
+        } else {
+            !self.has("internalOnly")
+        }
+    }
+
+    /// `safeHtml` / `strictHtml` — should this line's `htmlXxx`/`jsXxx`/`cssXxx`
+    /// content be injected into `body`?
+    ///
+    /// Ported from `WhistleTransform#allowInject` + `filterHtml`
+    /// (`_original/lib/util/whistle-transform.js:47`). A body whose first
+    /// non-whitespace byte is `<` (or which is blank) is proper markup and
+    /// always accepts injection; otherwise `strictHtml` refuses outright and
+    /// `safeHtml` refuses only JSON-looking bodies (`{`/`[`). Callers must gate
+    /// on the response actually being HTML — non-HTML bodies never reach this.
+    pub fn allows_injection(&self, body: &[u8]) -> bool {
+        let first = body.iter().find(|b| !b.is_ascii_whitespace());
+        match first {
+            None | Some(b'<') => true,
+            Some(b'{') | Some(b'[') => !self.has("strictHtml") && !self.has("safeHtml"),
+            Some(_) => !self.has("strictHtml"),
+        }
+    }
+}
 
 /// One resolved operator on a rule line, e.g. `host://127.0.0.1:8080`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RuleOp {
     /// Protocol name (`host`, `resHeaders`, `redirect`, …).
     pub protocol: String,
@@ -29,6 +143,10 @@ pub struct RuleOp {
     pub value: String,
     /// The original token as written, for diagnostics.
     pub raw: String,
+    /// Properties of the line this operator was written on. Copied per operator
+    /// so that resolution — which mixes operators from many lines — keeps each
+    /// one's line scope.
+    pub props: LineProps,
 }
 
 /// How a rule's pattern decides whether a request matches.
@@ -62,6 +180,18 @@ pub struct Rule {
     pub important: bool,
     /// Extra `filter`/`includeFilter`/`excludeFilter` conditions.
     pub filters: Vec<Filter>,
+    /// `lineProps://…` declared on this line (also mirrored onto every op).
+    pub props: LineProps,
+}
+
+impl Rule {
+    /// Effective importance: whistle's `lineProps://important`, plus this port's
+    /// `$`-prefix shorthand. Important rules are resolved before normal ones,
+    /// per protocol — mirroring the original, which splices important rules to
+    /// the front of each protocol's rule list (`_original/lib/rules/rules.js:1393`).
+    pub fn is_important(&self) -> bool {
+        self.important || self.props.important()
+    }
 }
 
 /// A `filter`/`includeFilter`/`excludeFilter` match condition on a rule.
@@ -123,6 +253,23 @@ impl Resolved {
     }
     pub fn all(&self, protocol: &str) -> &[RuleOp] {
         self.multi.get(protocol).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Line properties of the winning operator for `protocol` (empty when the
+    /// protocol did not match). This is how `lineProps` stays *line*-scoped
+    /// after resolution: the original consults `req.rules.<protocol>.lineProps`,
+    /// i.e. the properties of the line that won that protocol — never a union
+    /// across lines.
+    pub fn props(&self, protocol: &str) -> &LineProps {
+        self.single
+            .get(protocol)
+            .map(|o| &o.props)
+            .unwrap_or(&NO_PROPS)
+    }
+
+    /// Shorthand for `props(protocol).has(action)`.
+    pub fn has_prop(&self, protocol: &str, action: &str) -> bool {
+        self.props(protocol).has(action)
     }
 }
 
@@ -222,13 +369,20 @@ impl RuleManager {
     /// Resolve the winning operators for a request, considering only enabled
     /// groups. Rules from earlier groups take precedence.
     pub fn resolve(&self, req: &ReqInfo) -> Resolved {
+        self.resolve_scoped(req, false)
+    }
+
+    /// Like [`resolve`](Self::resolve) for a request whose origin is known, so
+    /// that the `internal`/`internalOnly` line properties can be honoured. Pass
+    /// `true` for requests whistle itself issues (plugin calls, internal paths).
+    pub fn resolve_scoped(&self, req: &ReqInfo, is_internal_req: bool) -> Resolved {
         let all_rules: Vec<&Rule> = self
             .groups
             .iter()
             .filter(|g| g.enabled)
             .flat_map(|g| &g.rules)
             .collect();
-        matcher::resolve_refs(&all_rules, req)
+        matcher::resolve_refs_scoped(&all_rules, req, is_internal_req)
     }
 
     // ── Group management API ──
@@ -340,18 +494,26 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Option<Rule> {
     let important = pattern_tok.starts_with('$');
     let pattern = parse_pattern(pattern_tok)?;
 
-    // Separate filter conditions from ordinary operators.
+    // Separate line properties, filter conditions and ordinary operators.
+    let mut props = LineProps::default();
     let mut ops: Vec<RuleOp> = Vec::new();
     let mut filters: Vec<Filter> = Vec::new();
     for t in &op_toks {
-        if let Some(f) = parse_filter(t) {
+        if let Some(spec) = line_props_spec(t) {
+            props.merge(spec);
+        } else if let Some(f) = parse_filter(t) {
             filters.push(f);
         } else if let Some(op) = parse_op(t) {
             ops.push(op);
         }
     }
+    // `lineProps` is a modifier, not an operator: a line carrying nothing else
+    // configures nothing (the original drops it the same way).
     if ops.is_empty() && filters.is_empty() {
         return None;
+    }
+    for op in &mut ops {
+        op.props = props.clone();
     }
     Some(Rule {
         pattern,
@@ -359,7 +521,24 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Option<Rule> {
         raw_line: raw_line.to_string(),
         important,
         filters,
+        props,
     })
+}
+
+/// The `lineProps://…` payload of `tok`, if it declares line properties.
+///
+/// Also recognises the two legacy spellings `includeFilter://safeHtml` and
+/// `includeFilter://strictHtml`, which the original rewrites to `lineProps://`
+/// before parsing (`formatShorthand`, `_original/lib/rules/rules.js:224`).
+fn line_props_spec(tok: &str) -> Option<&str> {
+    if let Some(spec) = tok.strip_prefix("lineProps://") {
+        return Some(spec);
+    }
+    match tok {
+        "includeFilter://safeHtml" => Some("safeHtml"),
+        "includeFilter://strictHtml" => Some("strictHtml"),
+        _ => None,
+    }
 }
 
 /// Parse a `filter://` / `includeFilter://` / `excludeFilter://` token.
@@ -403,6 +582,11 @@ fn looks_like_pattern(tok: &str) -> bool {
     if t.starts_with('/') {
         return true; // regexp
     }
+    // A line-property token is neither pattern nor operator; classifying it as a
+    // pattern would hijack the reversed (operators-first) form.
+    if line_props_spec(t).is_some() {
+        return false;
+    }
     // An operator has a known `protocol://` prefix.
     if let Some((proto, _)) = split_protocol(t) {
         if protocols::is_protocol(proto) {
@@ -439,6 +623,9 @@ fn is_host_shorthand(tok: &str) -> bool {
 
 /// Parse one operator token into a [`RuleOp`].
 /// Mirrors `formatShorthand` + operator handling in the original.
+///
+/// Line properties are left at their default here and stamped on by
+/// [`parse_line`], which is the only place that has seen the whole line.
 fn parse_op(tok: &str) -> Option<RuleOp> {
     if let Some((proto, rest)) = split_protocol(tok) {
         if protocols::is_protocol(proto) {
@@ -448,6 +635,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
                 protocol: canon.to_string(),
                 value: rest.to_string(),
                 raw: tok.to_string(),
+                props: LineProps::default(),
             });
         }
         // Unknown scheme (e.g. a plain proxy target) — treat as a proxy URL.
@@ -455,6 +643,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
             protocol: proto.to_string(),
             value: rest.to_string(),
             raw: tok.to_string(),
+            props: LineProps::default(),
         });
     }
     if is_host_shorthand(tok) {
@@ -462,6 +651,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
             protocol: "host".to_string(),
             value: tok.to_string(),
             raw: tok.to_string(),
+            props: LineProps::default(),
         });
     }
     // Bare path / file shorthand → file operator.
@@ -470,6 +660,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
             protocol: "file".to_string(),
             value: tok.to_string(),
             raw: tok.to_string(),
+            props: LineProps::default(),
         });
     }
     None
@@ -638,3 +829,169 @@ mod group_tests {
     }
 }
 
+
+#[cfg(test)]
+mod line_props_tests {
+    use super::*;
+
+    fn req(url: &str) -> ReqInfo {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (host, path) = match rest.find('/') {
+            Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+            None => (rest.to_string(), "/".to_string()),
+        };
+        let port = if scheme == "https" { 443 } else { 80 };
+        ReqInfo {
+            method: "GET".into(),
+            scheme: scheme.into(),
+            host,
+            port,
+            path,
+            full_url: url.into(),
+            client_ip: None,
+            headers: Default::default(),
+        }
+    }
+
+    fn one(text: &str) -> Rule {
+        let rules = parse_text(text);
+        assert_eq!(rules.len(), 1, "expected exactly one rule from {text:?}");
+        rules.into_iter().next().unwrap()
+    }
+
+    // ── parsing ──
+
+    /// Separators are `|` *and* `&` (`SEP_RE = /[|&]/`), and empty segments
+    /// are dropped rather than stored as an empty action.
+    #[test]
+    fn both_separators_and_empty_segments() {
+        let r = one("example.com file:///tmp/x lineProps://a|b&c||d");
+        let got: Vec<&str> = r.props.iter().collect();
+        assert_eq!(got, vec!["a", "b", "c", "d"]);
+    }
+
+    /// Several `lineProps://` tokens on one line merge, like the original's
+    /// repeated `extend(lineProps, …)`.
+    #[test]
+    fn multiple_tokens_merge() {
+        let r = one("example.com file:///tmp/x lineProps://important lineProps://safeHtml");
+        assert!(r.props.has("important"));
+        assert!(r.props.has("safeHtml"));
+    }
+
+    /// `lineProps://` with an empty payload is a no-op, not an empty action.
+    #[test]
+    fn empty_payload_is_noop() {
+        let r = one("example.com file:///tmp/x lineProps://");
+        assert!(r.props.is_empty());
+        assert_eq!(r.ops.len(), 1, "lineProps must not become an operator");
+    }
+
+    /// whistle never validates action names — unknown ones are kept so that
+    /// consumers this port does not implement still receive them.
+    #[test]
+    fn unknown_actions_preserved() {
+        let r = one("example.com file:///tmp/x lineProps://totallyMadeUp");
+        assert!(r.props.has("totallyMadeUp"));
+    }
+
+    /// A line whose only non-pattern token is `lineProps://` configures nothing.
+    #[test]
+    fn line_props_alone_is_not_a_rule() {
+        assert!(parse_text("example.com lineProps://important").is_empty());
+    }
+
+    /// Every operator on the line carries the line's properties, since
+    /// resolution mixes operators from many lines.
+    #[test]
+    fn props_copied_onto_every_op() {
+        let r = one("example.com host://1.2.3.4 resType://json lineProps://safeHtml");
+        assert_eq!(r.ops.len(), 2);
+        assert!(r.ops.iter().all(|op| op.props.has("safeHtml")));
+    }
+
+    // ── important ──
+
+    /// `lineProps://important` outranks an earlier normal line for the same
+    /// protocol, exactly like the `$` prefix already does.
+    #[test]
+    fn important_wins_over_earlier_normal_line() {
+        let rules = parse_text(
+            "example.com host://1.1.1.1\n\
+             example.com host://2.2.2.2 lineProps://important",
+        );
+        let refs: Vec<&Rule> = rules.iter().collect();
+        let r = matcher::resolve_refs(&refs, &req("http://example.com/"));
+        assert_eq!(r.single.get("host").map(|o| o.value.as_str()), Some("2.2.2.2"));
+    }
+
+    /// Without it, first-match-wins still holds.
+    #[test]
+    fn without_important_first_line_wins() {
+        let rules = parse_text(
+            "example.com host://1.1.1.1\n\
+             example.com host://2.2.2.2",
+        );
+        let refs: Vec<&Rule> = rules.iter().collect();
+        let r = matcher::resolve_refs(&refs, &req("http://example.com/"));
+        assert_eq!(r.single.get("host").map(|o| o.value.as_str()), Some("1.1.1.1"));
+    }
+
+    // ── internal / internalOnly scoping ──
+
+    #[test]
+    fn internal_only_is_hidden_from_client_requests() {
+        let rules = parse_text("example.com host://1.1.1.1 lineProps://internalOnly");
+        let refs: Vec<&Rule> = rules.iter().collect();
+        let info = req("http://example.com/");
+
+        assert!(matcher::resolve_refs_scoped(&refs, &info, false).single.is_empty());
+        assert!(matcher::resolve_refs_scoped(&refs, &info, true).single.contains_key("host"));
+    }
+
+    #[test]
+    fn internal_applies_to_both_origins() {
+        let rules = parse_text("example.com host://1.1.1.1 lineProps://internal");
+        let refs: Vec<&Rule> = rules.iter().collect();
+        let info = req("http://example.com/");
+
+        assert!(matcher::resolve_refs_scoped(&refs, &info, false).single.contains_key("host"));
+        assert!(matcher::resolve_refs_scoped(&refs, &info, true).single.contains_key("host"));
+    }
+
+    /// A plain line is invisible to whistle's own outgoing requests.
+    #[test]
+    fn plain_line_is_client_only() {
+        let rules = parse_text("example.com host://1.1.1.1");
+        let refs: Vec<&Rule> = rules.iter().collect();
+        let info = req("http://example.com/");
+
+        assert!(matcher::resolve_refs_scoped(&refs, &info, false).single.contains_key("host"));
+        assert!(matcher::resolve_refs_scoped(&refs, &info, true).single.is_empty());
+    }
+
+    // ── safeHtml / strictHtml injection gating ──
+
+    #[test]
+    fn injection_gating() {
+        let plain = LineProps::default();
+        let mut safe = LineProps::default();
+        safe.merge("safeHtml");
+        let mut strict = LineProps::default();
+        strict.merge("strictHtml");
+
+        // Real markup: everyone injects.
+        for p in [&plain, &safe, &strict] {
+            assert!(p.allows_injection(b"  <html></html>"));
+        }
+        // JSON-looking: safeHtml and strictHtml both refuse.
+        assert!(plain.allows_injection(b"{\"a\":1}"));
+        assert!(!safe.allows_injection(b"{\"a\":1}"));
+        assert!(!strict.allows_injection(b"[1,2]"));
+        // Bare text: only strictHtml refuses.
+        assert!(safe.allows_injection(b"hello"));
+        assert!(!strict.allows_injection(b"hello"));
+        // Empty body counts as markup.
+        assert!(strict.allows_injection(b""));
+    }
+}
