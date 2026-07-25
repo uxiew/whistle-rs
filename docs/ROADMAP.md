@@ -26,7 +26,8 @@
 | Web UI 过滤/搜索 | ✅ 按 URL/方法/状态/目标 |
 | Body 预览上限可配置（`--body-preview-limit`） | ✅ |
 | `internal-http-proxy` / `internal-https-proxy` | ✅ |
-| `x`/`xs` 前缀代理变体 | ✅ 以基础代理近似 |
+| `x` 前缀代理变体 | ✅ 握手无法建立时回退直连 |
+| 代理 URL 的 `?host=` / `proxyTunnel` 链式 CONNECT | ✅ |
 | `locationHref` 算子 | ✅ HTML 注入跳转脚本 |
 | 流量落盘持久化 | ✅ JSONL 追加写入 + 每日轮转 + 启动恢复 (`--no-persist` / `--persist-days`) |
 | 请求重放 | ✅ `POST /api/replay` self-loopback + UI ↻ 按钮 |
@@ -66,11 +67,10 @@
 
 ### 响应阶段（已完成，遗留一项）
 
-- [ ] **`serverIp:` 对具名源站不可判定** —— IP 字面量或 `host://` 覆盖时可答；具名源站
-      本移植把主机名交给 `TcpStream::connect`，看不到实际选中的地址，重查 DNS 可能得到
-      不同结果（轮询 DNS），因此保持不可判定并失败关闭，而非匹配一个猜测。
-      需 `upstream::forward` 回传 socket 对端地址（`origin_stream` 在 `TcpStream::connect`
-      处已持有），会波及 `ws.rs` 等调用点。
+- [x] ~~**`serverIp:` 对具名源站不可判定**~~ → 已修：`upstream::forward_with_addr` 回传
+      socket 对端地址，具名源站也可判定，且不需要重查 DNS（轮询 DNS 下会答出请求从未
+      到达的地址）。经代理时该地址是**代理的**地址 —— 上游亦然
+      （`req.hostIp` 取自解析后的代理地址，`res.js:238,:259`）。
 - [ ] `rule://` / `rulesFile://` 与插件注入的规则仍只解析一次（上游会重解析这些管理器）。
 
 ### 上游代理 / PAC / SOCKS / CA（本轮首次审计）
@@ -98,9 +98,29 @@
 - [x] ~~**`pac://` 远程抓取与辅助函数缺失**~~ → 已修。另**刻意偏离上游**：
       PAC 抛错时返回 502 而非静默直连 —— 抛错的脚本没有说「走直连」，它什么都没说。
 - [x] ~~**空 `proxy://` 静默直连**~~ → 已修：无法兑现的代理规则返回 502。
-- [ ] 失败关闭若干：`x`/`xs` 代理失败时不回退直连、代理 URL 的 `?host=` 被忽略、
-      `internal-*` 未走 whistle 间的 `x-whistle-https-request` 握手、`proxyTunnel` 未实现、
-      代理选择按固定协议优先级而非规则顺序。
+- [x] ~~`x` 代理失败时不回退直连~~ → 已修：`xproxy://`、`xsocks://` 等在**握手无法建立**时
+      回退直连（`X_RE`，`res.js:31,:546-560`）。请求一旦写上 socket 就不再重试 —— 无法重放，
+      上游同样以 `piped` 设防（`res.js:529`）。
+- [x] ~~代理 URL 的 `?host=` 被忽略~~ → 已修：`P_HOST_RE`（`lib/rules/index.js:81,:243`）。
+      `host://` 规则优先；两者都会把该跳转成 CONNECT。
+- [x] ~~`proxyTunnel` 未实现~~ → 已实现：带地址覆盖时对上游代理再发一层 CONNECT，
+      内层带 `x-whistle-policy: intercept`（`lib/tunnel.js:535-537`，`lib/util/patch.js:120-140`）。
+      仅 HTTP/HTTPS 代理，SOCKS 跳不理会该标志（与上游一致）。
+- [x] ~~代理选择按固定协议优先级而非规则顺序~~ → 已修：上游把所有拼法归入同一 `proxy` 键
+      （`PROXY_RE` → `protocol = 'proxy'`，`lib/rules/rules.js:1286`），因此**先写的行胜出**。
+      本移植按算子的解析顺序（`RuleOp::order`）取最小者。
+- [x] ~~`internal-*` 未走 whistle 间的 `x-whistle-https-request` 握手~~ → 该项**记录有误**：
+      握手早已实现（`mark_stripped_tls` / `take_https_marker`），本轮实测两个 whistle-rs
+      串联，far 端确实按 `https://` 解析规则。握手中其余部分依赖本移植没有的机制：
+      `x-whistle-client-id`（无 client-id 概念）、`x-whistle-policy: intercept`（本移植
+      对 CONNECT 一律 MITM，无需协商，仅 `proxyTunnel` 内层发送）、`x-forwarded-from-whistle-<uid>`
+      （值含每进程 uid，不可移植）、`x-whistle-request-tunnel-ack` 流控。
+
+以下需要规则层配合，本轮未做（属 `src/rules/*`）：
+
+- [ ] `canonical()` 只认 `xproxy` / `xhttp-proxy` / `xhttps-proxy` / `xsocks` / `xinternal-proxy`，
+      缺 `xinternal-http-proxy` / `xinternal-https-proxy` / `xhttps2http-proxy` / `xhttp2https-proxy`。
+- [ ] `xhost://` 的直连回退（`retryXHost`，`res.js:571-600`）未实现。
 
 > 未改动并记录：上游把根 CA 密钥复用为每张叶证书的密钥（`ca.js:203-260`），
 > 本移植为每张叶证书新生成密钥 —— **严格更强**，故不对齐。
@@ -162,8 +182,10 @@
   （实测每响应约 2ns，对照 500 条规则的请求遍约 2.4µs）；500 条里有 1 条相关时约 24ns。
 - 尚未覆盖：`rule://` / `rulesFile://` 引入的规则与插件注入的规则只解析一遍
   （上游会一并重解析）；WebSocket 与 `CONNECT` 隧道没有响应阶段。
-- `serverIp:` 仅在目标地址**确切已知**时求值（IP 字面量或 `host://` 覆盖）。域名源站的
-  实际连接地址本移植看不到，再查一次 DNS 可能得到不同答案，因此保持「未知」并失败关闭。
+- `serverIp:` 取自**已建立的 socket**（`upstream::forward_with_addr` 回传对端地址），
+  域名源站同样可判定，且不必重查 DNS —— 轮询 DNS 下重查可能答出请求从未到达的地址。
+  经上游代理时该地址是**代理的**地址，与上游一致（`res.js:238,:259`）。
+  完全没有建立连接时仍为「未知」并失败关闭。
 
 ### 观测与持久化
 

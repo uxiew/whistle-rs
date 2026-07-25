@@ -192,10 +192,16 @@ Route the forwarded request through another proxy. The address is
 | `https2http-proxy` / `internal-proxy` / `internal-http-proxy` | `[user[:pass]@]host[:port]` | HTTP proxy to another whistle: an `https://` origin's TLS is **stripped** for the hop |
 | `internal-https-proxy` | `[user[:pass]@]host[:port]` | The same, with a TLS connection to the proxy |
 
+Each of these also has an `x`-prefixed spelling — `xproxy://`, `xsocks://`,
+`xhttp-proxy://`, `xhttps-proxy://`, `xinternal-proxy://` — which means the same
+thing but **falls back to a direct connection** when the hop cannot be made. See
+"If the upstream proxy is unreachable" below.
+
 ```
 example.com        proxy://127.0.0.1:8888
 .internal.corp     http-proxy://user:pass@10.0.0.1:3128
 secure.example.com socks://127.0.0.1:1080
+flaky.example.com  xproxy://127.0.0.1:8888     # via the proxy, or direct if it is down
 ```
 
 **Scheme-converting proxies.** Two families change what the *origin* connection
@@ -215,8 +221,9 @@ speaks, which is the whole point of their names:
 
 **How the hop is made.** Only a plain HTTP proxy fetching a plain HTTP origin
 sends the request in absolute-form (`GET http://host/path`); a TLS origin, a
-SOCKS proxy, an HTTPS proxy, and a `host://` override travelling with the proxy
-each open a `CONNECT` tunnel instead. The absolute-form URI names the host from
+SOCKS proxy, an HTTPS proxy, and an address override travelling with the proxy
+(a `host://` rule or the proxy URL's own `?host=`) each open a `CONNECT` tunnel
+instead. The absolute-form URI names the host from
 the request's `Host` header, so a `reqHeaders://` rule that rewrote `Host` is
 honoured and a `host://` override is never handed to the upstream proxy.
 
@@ -229,11 +236,20 @@ password (`proxy://user@host`) is base64'd verbatim, matching whistle: it sends
 credential at the first colon and sends an empty password. Hostnames are handed
 to the proxy unresolved (SOCKS5 address type 3), so the proxy does the DNS.
 
-If the upstream proxy is unreachable or refuses the `CONNECT`, the request
-fails with a 502 — it is never retried directly. The same goes for a proxy
-operator whose value is empty or unusable (`proxy://`, `socks://@`): the request
-fails with `proxy:// is not a usable proxy address` rather than quietly becoming
-a direct connection. whistle drops such a rule and connects direct; a rule that
+**If the upstream proxy is unreachable** or refuses the `CONNECT`, the request
+fails with a 502 — the plain spellings are never retried directly. The
+`x`-prefixed spellings are the ones that ask for the fallback (`X_RE`,
+`_original/lib/inspectors/res.js:31,:546-560`): `xproxy://127.0.0.1:8888` goes
+through the proxy when it can and straight to the origin when it cannot. The
+retry only covers a hop that could not be **established** — a refused connection
+to the proxy, a rejected `CONNECT`, a failed SOCKS handshake. Once the request
+has been written to the socket it cannot be replayed, so a proxy that accepts
+the tunnel and then fails is reported rather than retried; whistle guards its own
+retry the same way (`piped`, `res.js:529`).
+
+A proxy operator whose value is empty or unusable (`proxy://`, `socks://@`) fails
+with `proxy:// is not a usable proxy address` rather than quietly becoming a
+direct connection. whistle drops such a rule and connects direct; a rule that
 names a proxy and is silently ignored is exactly the failure this port refuses
 to reproduce.
 
@@ -274,9 +290,46 @@ pinned.test        http-proxy://127.0.0.1:8888?proxyHost
 pinned.test        host://10.0.0.9
 ```
 
-Precedence when several proxy operators match: `socks` > `https-proxy` >
-`http-proxy` > `proxy` > `internal-https-proxy` > `internal-proxy` >
-`internal-http-proxy` > `https2http-proxy` > `http2https-proxy` > `pac`.
+A proxy URL can carry the same override itself, as `?host=<host[:port]>`
+(`P_HOST_RE`, `_original/lib/rules/index.js:81,:243`) — no separate `host://`
+line and no `proxyHost` needed, since the query says outright that the proxy is
+to be used. A matching `host://` rule wins over it. The port may be left out, in
+which case the request's own port is kept.
+
+```
+pinned.test        http-proxy://127.0.0.1:8888?host=10.0.0.9
+```
+
+Either way the hop switches to `CONNECT`, and the address is what the proxy is
+asked to reach — the request inside the tunnel still carries the original `Host`.
+
+**`proxyTunnel`.** With an override in play, `lineProps://proxyTunnel` (or
+`enable://proxyTunnel`, or the property on the `host://` line) says the
+overridden address is *itself* a proxy: whistle-rs `CONNECT`s to it through the
+first proxy, then sends a second `CONNECT` **inside** that tunnel naming the real
+origin, marked `x-whistle-policy: intercept` so a whistle at the far end
+intercepts rather than blindly relays
+(`_original/lib/tunnel.js:535-537`, `lib/util/patch.js:120-140`). Both halves are
+required: without an override there is nothing to tunnel through and the flag
+does nothing. HTTP and HTTPS proxies only — a SOCKS hop ignores it, as upstream's
+does.
+
+```
+# via 127.0.0.1:8888, on to 10.0.0.9:8899, and out to the origin from there
+chained.test       proxy://127.0.0.1:8888?host=10.0.0.9:8899 lineProps://proxyTunnel
+```
+
+**When several proxy operators match**, the one written **first** wins, whatever
+its spelling. whistle files every spelling under a single `proxy` key
+(`PROXY_RE` → `protocol = 'proxy'`, `_original/lib/rules/rules.js:1286`), so
+`socks://` and `proxy://` compete as one operator and rule order decides — with
+`important` lines first, as everywhere else. `pac://` is consulted only when no
+proxy operator matched at all.
+
+```
+example.com        proxy://127.0.0.1:8888     # this one is used
+example.com        socks://127.0.0.1:1080     # …and this one is not
+```
 
 #### PAC
 
@@ -378,7 +431,7 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 | Client IP | `clientIp:<v>`, `clientIP:`, `remoteAddress:<v>` | the client's IP |
 | Client or server IP | `i:<v>`, `ip:<v>` | the client's IP — see the note below |
 | Client port | `clientPort:<v>`, `remotePort:<v>` | the client socket's port |
-| Server address | `serverIp:<v>`, `serverIP:` | the address the request was sent to, when it is known exactly (response phase) |
+| Server address | `serverIp:<v>`, `serverIP:` | the address the request was actually sent to — the upstream proxy's when one was used (response phase) |
 | Server port | `serverPort:<v>` | the port the request was sent to (response phase) |
 | Host | `host:<v>`, `host=<v>` | request host |
 | Sampling | `chance:<p>`, `chance:<n>%`, `probability:` | a random fraction of requests (`Math.random() < p`) |
@@ -476,11 +529,13 @@ rules injected by a plugin are resolved once, in the request phase. Upstream
 re-resolves those managers too (`fRules`/`pRules`/`hRules` in `getResRules`).
 WebSocket and tunnelled (`CONNECT`) traffic have no response phase here either.
 
-`serverIp:` is answered when the address the request went to is known **exactly** — an
-IP-literal origin, or a `host://` override naming an address. For a named origin this
-port hands the name to the connect call and never sees which address it picked; asking
-the resolver a second time could answer differently, so the condition stays
-unanswerable and fails closed rather than matching a guess.
+`serverIp:` is answered from the **connected socket**, so a named origin is answered too:
+the address is read back off the connection rather than guessed by asking the resolver a
+second time (which, under round-robin DNS, could name a host the request never reached).
+When the request went through an upstream proxy the address is the **proxy's** — that is
+also what whistle reports, since it sets `req.hostIp` from the resolved proxy address
+whenever a proxy rule matched (`_original/lib/inspectors/res.js:238,:259`). A request
+that never connected at all leaves the condition unanswerable, and it fails closed.
 
 #### Conditions that still cannot be evaluated
 
