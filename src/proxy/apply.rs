@@ -377,6 +377,13 @@ pub fn disabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> 
     flag_set(resolved, "disable")
 }
 
+/// `disable://<flag>` — with the escape hatch upstream gives it: an
+/// `enable://<flag>` on the same request wins (`isDisable`,
+/// `_original/lib/util/index.js:681-683`).
+fn is_disabled(resolved: &Resolved, flag: &str) -> bool {
+    disabled_flags(resolved).contains(flag) && !enabled_flags(resolved).contains(flag)
+}
+
 /// True if the request should be aborted (`enable://abort`/`abortReq`/`abortRes`).
 pub fn is_aborted(resolved: &Resolved) -> bool {
     let e = enabled_flags(resolved);
@@ -1204,6 +1211,188 @@ fn body_ops_present(resolved: &Resolved, prefix: &str) -> bool {
         })
 }
 
+/// whistle's coarse content classes (`getContentType`,
+/// `_original/lib/util/index.js:1475-1510`).
+///
+/// The order of the tests is upstream's and is load-bearing: `javascript` is
+/// looked for before `css`, which is looked for before `html`, so a type that
+/// mentions two of them resolves to the first. Only the media type is examined —
+/// parameters after the first `;` are dropped before the substring tests, so a
+/// `charset=` value cannot smuggle a class in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResClass {
+    Js,
+    Css,
+    Html,
+    Json,
+    Xml,
+    Text,
+    Img,
+}
+
+/// Classify a `Content-Type` header the way whistle does. `None` covers both a
+/// missing header and a type in none of the classes (e.g. `image/…` aside,
+/// `application/octet-stream`).
+fn res_class(content_type: &str) -> Option<ResClass> {
+    let raw = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(if raw.contains("javascript") {
+        ResClass::Js
+    } else if raw.contains("css") {
+        ResClass::Css
+    } else if raw.contains("html") {
+        ResClass::Html
+    } else if raw.contains("json") {
+        ResClass::Json
+    } else if raw.contains("xml") {
+        ResClass::Xml
+    } else if raw.contains("text/") {
+        ResClass::Text
+    } else if raw.contains("image/") {
+        ResClass::Img
+    } else {
+        return None;
+    })
+}
+
+/// Which typed-body families a response accepts.
+///
+/// The nuance that makes `jsAppend` useful at all: **an HTML response accepts
+/// the JS *and* the CSS families too** — `isJs = isHtml || resType === 'JS'`
+/// (`_original/lib/inspectors/res.js:952-954`). `jsAppend://alert(1)` on a page
+/// is the canonical whistle one-liner; it works because the injected script is
+/// wrapped in `<script>` before it reaches the markup (see [`wrap_js`]).
+#[derive(Clone, Copy)]
+struct BodyFamilies {
+    html: bool,
+    js: bool,
+    css: bool,
+}
+
+impl BodyFamilies {
+    fn of(class: Option<ResClass>) -> BodyFamilies {
+        let html = class == Some(ResClass::Html);
+        BodyFamilies {
+            html,
+            js: html || class == Some(ResClass::Js),
+            css: html || class == Some(ResClass::Css),
+        }
+    }
+}
+
+/// A URL written where whistle expects script or stylesheet source
+/// (`GEN_URL_RE`, `_original/lib/util/index.js:44`). Such a value is linked
+/// rather than inlined.
+static GEN_URL_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"(?i)^\s*(?:https?:)?//\w\S*\s*$").expect("static regex"));
+
+/// `<script>` attributes contributed by the injecting line's properties
+/// (`getScriptProps`, `_original/lib/util/index.js:277-303`). The groups are
+/// exclusive in upstream's order: the first `crossorigin` spelling wins, and
+/// `module` outranks `importmap` outranks `speculationrules`.
+fn script_props(props: &LineProps) -> String {
+    let mut out = String::new();
+    if props.has("use-credentials") || props.has("useCredentials") {
+        out.push_str(" crossorigin=\"use-credentials\"");
+    } else if props.has("anonymous") {
+        out.push_str(" crossorigin=\"anonymous\"");
+    } else if props.has("crossorigin") {
+        out.push_str(" crossorigin");
+    }
+    for flag in ["defer", "async", "nomodule"] {
+        if props.has(flag) {
+            out.push(' ');
+            out.push_str(flag);
+        }
+    }
+    if props.has("module") {
+        out.push_str(" type=\"module\"");
+    } else if props.has("importmap") {
+        out.push_str(" type=\"importmap\"");
+    } else if props.has("speculationrules") {
+        out.push_str(" type=\"speculationrules\"");
+    }
+    out
+}
+
+/// Wrap a `jsXxx` value for injection into markup (`wrapJs`,
+/// `_original/lib/util/index.js:305-313`): a bare URL becomes a `src=` script
+/// tag, anything else an inline one.
+fn wrap_js(js: &str, props: &LineProps) -> String {
+    let attrs = script_props(props);
+    match GEN_URL_RE.is_match(js) {
+        true => format!("<script{attrs} src=\"{}\"></script>", js.trim()),
+        false => format!("<script{attrs}>{js}</script>"),
+    }
+}
+
+/// Wrap a `cssXxx` value for injection into markup (`wrapCss`,
+/// `_original/lib/util/index.js:315-322`). Line properties do not apply here —
+/// upstream passes none.
+fn wrap_css(css: &str) -> String {
+    match GEN_URL_RE.is_match(css) {
+        true => format!("<link rel=\"stylesheet\" href=\"{}\" />", css.trim()),
+        false => format!("<style>{css}</style>"),
+    }
+}
+
+/// The separator whistle puts between several values landing in the same slot
+/// (`joinData`, `_original/lib/util/file-mgr.js:93-109`).
+const CRLF: &[u8] = b"\r\n";
+
+/// Prepended to a non-empty `top` on an HTML response unless `disable://doctype`
+/// (`_original/lib/util/whistle-transform.js:6,116-118`). Surprising but real:
+/// any `resPrepend`/`htmlPrepend` on a page also stamps a doctype in front of it.
+const DOCTYPE: &[u8] = b"<!DOCTYPE html>\r\n";
+
+/// The three slots whistle's `WhistleTransform` writes around a body: `top`
+/// before it, `body` *instead* of it, `bottom` after it
+/// (`_original/lib/util/whistle-transform.js:88-127`).
+///
+/// Each slot is a list because several operators feed it and are joined with
+/// CRLF — kept as a list rather than a string so an operator that matched with
+/// an empty value still counts as occupying its slot.
+#[derive(Default)]
+struct Injection {
+    top: Vec<Vec<u8>>,
+    body: Vec<Vec<u8>>,
+    bottom: Vec<Vec<u8>>,
+}
+
+impl Injection {
+    /// Wrap `data` in whatever the slots hold.
+    fn apply(self, data: Vec<u8>, doctype: bool) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        if !self.top.is_empty() && doctype {
+            out.extend_from_slice(DOCTYPE);
+        }
+        join_into(&mut out, self.top);
+        match self.body.is_empty() {
+            true => out.extend_from_slice(&data),
+            false => join_into(&mut out, self.body),
+        }
+        join_into(&mut out, self.bottom);
+        out
+    }
+}
+
+/// Append `pieces` to `out`, CRLF-separated.
+fn join_into(out: &mut Vec<u8>, pieces: Vec<Vec<u8>>) {
+    for (i, piece) in pieces.into_iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(CRLF);
+        }
+        out.extend(piece);
+    }
+}
+
 /// Deep-merge `patch` (a JSON object) into `target`; objects merge recursively,
 /// other values are overwritten. Ported from whistle's `resMerge`.
 fn json_deep_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -1228,13 +1417,108 @@ pub fn wants_res_body(resolved: &Resolved) -> bool {
 }
 
 /// Transform a buffered request body per the resolved operators.
+///
+/// The request pipeline runs the injection first and `reqReplace` after it
+/// (`handleReq` adds the transform, then `handleReplace`,
+/// `_original/lib/inspectors/req.js:129-130,573`), so a substitution *does* see
+/// what `reqPrepend`/`reqAppend` put there — the opposite of the response side.
 pub fn transform_req_body(body: Bytes, resolved: &Resolved) -> Bytes {
-    transform_body(body, resolved, "req", None)
+    // Request bodies are never injection-gated: whistle's request transform
+    // leaves `isHtml` unset, so `allowInject` lets every operator through.
+    let gate = InjectionGate::plain(resolved);
+    let mut injection = Injection::default();
+    collect_generic(&mut injection, &gate, "req");
+    let data = injection.apply(body.to_vec(), false);
+    // whistle gates `reqReplace` on the *request's* content type, which this
+    // entry point is not given; `Text` is the class that never refuses, so the
+    // gap is a request with no `content-type` (or an image one) being rewritten
+    // where upstream would leave it alone.
+    Bytes::from(apply_replace(data, resolved, "reqReplace", Some(ResClass::Text)))
 }
 
-/// Transform a buffered response body; `content_type` gates css/html/js ops.
+/// Transform a buffered response body; `content_type` decides which typed-body
+/// families apply and whether injected content is wrapped as markup.
+///
+/// Operators run in whistle's pipeline order, which is *not* the order they are
+/// written: the text transforms (`resMerge`, then `resReplace`) sit ahead of the
+/// injecting `WhistleTransform` in the response stream
+/// (`_original/lib/inspectors/res.js:1041,1114-1120`; `addTextTransform` splices
+/// its sub-pipeline in at the head, `_original/lib/init.js:135-141`). So a
+/// substitution never sees prepended or appended content, and `resBody`
+/// discards whatever `resMerge`/`resReplace` produced.
 pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option<&str>) -> Bytes {
-    transform_body(body, resolved, "res", content_type)
+    let class = content_type.and_then(res_class);
+    let families = BodyFamilies::of(class);
+    // The gate is built from the body as it arrived: whistle decides once, from
+    // the *original* first non-whitespace byte, whether injection is allowed.
+    let gate = InjectionGate::new(resolved, families.html, &body);
+
+    let mut data = apply_res_merge(body.to_vec(), resolved, class);
+    data = apply_replace(data, resolved, "resReplace", class);
+
+    let injection = collect_res_injection(&gate, families);
+    // Only an HTML response gets the doctype, and `disable://doctype` opts out.
+    let doctype = families.html && !is_disabled(resolved, "doctype");
+    Bytes::from(injection.apply(data, doctype))
+}
+
+/// Fill the `res*` slots, shared by both sides.
+fn collect_generic(injection: &mut Injection, gate: &InjectionGate<'_>, prefix: &str) {
+    // `*Body` occupies its slot even when empty — upstream substitutes an empty
+    // buffer for a blank value (`data.body = resBody || util.EMPTY_BUFFER`,
+    // `_original/lib/inspectors/res.js:1005`), so `resBody://` empties the body.
+    if let Some(v) = gate.value(&format!("{prefix}Body")) {
+        injection.body.push(v.as_bytes().to_vec());
+    }
+    if let Some(v) = gate.value(&format!("{prefix}Prepend")).filter(|v| !v.is_empty()) {
+        injection.top.push(v.as_bytes().to_vec());
+    }
+    if let Some(v) = gate.value(&format!("{prefix}Append")).filter(|v| !v.is_empty()) {
+        injection.bottom.push(v.as_bytes().to_vec());
+    }
+}
+
+/// Fill all three slots for a response, in whistle's order: the generic `res*`
+/// operators first, then `css*`, `html*` and `js*`
+/// (`_original/lib/inspectors/res.js:1063-1072`).
+///
+/// On an HTML response the `js*`/`css*` values are markup-wrapped, since raw
+/// JavaScript pasted into a page would only render as text.
+fn collect_res_injection(gate: &InjectionGate<'_>, families: BodyFamilies) -> Injection {
+    let mut injection = Injection::default();
+    collect_generic(&mut injection, gate, "res");
+
+    let html = families.html;
+    for (family, enabled) in [
+        ("css", families.css),
+        ("html", families.html),
+        ("js", families.js),
+    ] {
+        if !enabled {
+            continue;
+        }
+        // whistle orders the families css → html → js in every slot, so the two
+        // wrapped families bracket the raw markup one.
+        for (suffix, slot) in [
+            ("Body", &mut injection.body),
+            ("Prepend", &mut injection.top),
+            ("Append", &mut injection.bottom),
+        ] {
+            let protocol = format!("{family}{suffix}");
+            // Unlike `resBody`, a blank typed value contributes nothing: the
+            // HTML branch filters empty entries out before joining
+            // (`readRuleList`, `_original/lib/util/index.js:1320-1322`).
+            let Some(value) = gate.value(&protocol).filter(|v| !v.is_empty()) else {
+                continue;
+            };
+            slot.push(match (html, family) {
+                (true, "js") => wrap_js(value, gate.props(&protocol)).into_bytes(),
+                (true, "css") => wrap_css(value).into_bytes(),
+                _ => value.as_bytes().to_vec(),
+            });
+        }
+    }
+    injection
 }
 
 /// Decides, per operator, whether its content may be injected into a response
@@ -1264,15 +1548,7 @@ struct InjectionGate<'a> {
 }
 
 impl<'a> InjectionGate<'a> {
-    fn new(
-        resolved: &'a Resolved,
-        prefix: &str,
-        content_type: Option<&str>,
-        body: &'a [u8],
-    ) -> Self {
-        // Request bodies are never gated: whistle's request transform leaves
-        // `isHtml` unset, so `allowInject` lets every operator through.
-        let html = prefix == "res" && content_type.and_then(typed_body_kind) == Some("html");
+    fn new(resolved: &'a Resolved, html: bool, body: &'a [u8]) -> Self {
         let global = if html {
             let enabled = enabled_flags(resolved);
             LineProps::from_actions(
@@ -1291,6 +1567,11 @@ impl<'a> InjectionGate<'a> {
         }
     }
 
+    /// A gate that refuses nothing, for the request side.
+    fn plain(resolved: &'a Resolved) -> Self {
+        InjectionGate::new(resolved, false, &[])
+    }
+
     /// The value of an injecting operator, unless its line (or a request-wide
     /// `enable://`) refuses to inject it into this body.
     fn value(&self, protocol: &str) -> Option<&'a str> {
@@ -1302,123 +1583,254 @@ impl<'a> InjectionGate<'a> {
             && self.global.allows_injection(self.body);
         allowed.then_some(value)
     }
+
+    /// The line properties of the operator's winning line, which decide the
+    /// attributes of a wrapped `<script>`.
+    fn props(&self, protocol: &str) -> &'a LineProps {
+        self.resolved.props(protocol)
+    }
 }
 
-/// Apply `*Body` → `*Replace` → `*Prepend` → `*Append`, then content-type-specific
-/// (`css`/`html`/`js`) `Body`/`Prepend`/`Append` for the response.
-fn transform_body(
-    body: Bytes,
-    resolved: &Resolved,
-    prefix: &str,
-    content_type: Option<&str>,
-) -> Bytes {
-    // Built before anything is rewritten: whistle decides once, from the body as
-    // it arrived, whether injected content is allowed at all.
-    let gate = InjectionGate::new(resolved, prefix, content_type, &body);
-
-    let mut data: Vec<u8> = match gate.value(&format!("{prefix}Body")) {
-        Some(new) => new.as_bytes().to_vec(),
-        None => body.to_vec(),
+/// `resMerge` — deep-merge a JSON patch into a JSON response body
+/// (`_original/lib/inspectors/res.js:1022-1069`).
+///
+/// The gate is narrower than it looks. Upstream only builds the merge transform
+/// for a response that is JS, HTML, JSON, or has no `content-type` at all
+/// (`res.js:1022`) — so `resMerge` on a `text/plain` body is inert — and it
+/// merges into the **first JSON-looking substring** rather than the whole body
+/// (`JSON_RE`, `res.js:846`), which is what lets it patch a JSONP payload
+/// without disturbing the callback wrapper.
+fn apply_res_merge(data: Vec<u8>, resolved: &Resolved, class: Option<ResClass>) -> Vec<u8> {
+    let Some(patch_src) = resolved.value("resMerge") else {
+        return data;
     };
+    let applies = matches!(
+        class,
+        None | Some(ResClass::Js) | Some(ResClass::Html) | Some(ResClass::Json)
+    );
+    if !applies {
+        return data;
+    }
+    let Ok(patch) = serde_json::from_str::<serde_json::Value>(patch_src) else {
+        return data;
+    };
+    let text = match String::from_utf8(data) {
+        Ok(text) => text,
+        // Not text at all; whistle's transforms only ever see decoded strings.
+        Err(e) => return e.into_bytes(),
+    };
+    // An empty body is replaced by the patch outright (`res.js:1049-1054`).
+    if text.is_empty() {
+        return serde_json::to_vec(&patch).unwrap_or_default();
+    }
+    // For HTML (and for a typeless response) whistle gives up unless the body
+    // *starts* like JSON — `LIKE_JSON_RE`, `res.js:1029`.
+    let like_json = text.trim_start().starts_with(['{', '[']);
+    if matches!(class, None | Some(ResClass::Html)) && !like_json {
+        return text.into_bytes();
+    }
+    let Some((start, end)) = json_span(&text) else {
+        return text.into_bytes();
+    };
+    let Ok(mut base) = serde_json::from_str::<serde_json::Value>(&text[start..end]) else {
+        return text.into_bytes();
+    };
+    json_deep_merge(&mut base, &patch);
+    let Ok(merged) = serde_json::to_string(&base) else {
+        return text.into_bytes();
+    };
+    format!("{}{merged}{}", &text[..start], &text[end..]).into_bytes()
+}
 
-    if let Some(spec) = resolved.value(&format!("{prefix}Replace")) {
-        data = apply_body_replace(data, spec);
-    }
-    if let Some(pre) = gate.value(&format!("{prefix}Prepend")) {
-        let mut v = pre.as_bytes().to_vec();
-        v.extend_from_slice(&data);
-        data = v;
-    }
-    if let Some(app) = gate.value(&format!("{prefix}Append")) {
-        data.extend_from_slice(app.as_bytes());
-    }
-
-    // resMerge: deep-merge a JSON patch into a JSON response body.
-    if prefix == "res" {
-        if let Some(patch_src) = resolved.value("resMerge") {
-            if let (Ok(mut base), Ok(patch)) = (
-                serde_json::from_slice::<serde_json::Value>(&data),
-                serde_json::from_str::<serde_json::Value>(patch_src),
-            ) {
-                json_deep_merge(&mut base, &patch);
-                if let Ok(s) = serde_json::to_vec(&base) {
-                    data = s;
-                }
-            }
+/// The span whistle's `JSON_RE` (`/{[\w\W]*}|\[[\w\W]*\]/`, `res.js:846`) picks
+/// out of a body: from the first `{` to the last `}`, or — only when there is no
+/// `{` at all — from the first `[` to the last `]`. Greedy on purpose, so a
+/// JSONP wrapper's parentheses stay outside.
+fn json_span(text: &str) -> Option<(usize, usize)> {
+    if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}')) {
+        if s < e {
+            return Some((s, e + 1));
         }
     }
+    let (s, e) = (text.find('[')?, text.rfind(']')?);
+    (s < e).then_some((s, e + 1))
+}
 
-    // Content-type-specific ops (cssBody/htmlPrepend/jsAppend, …).
-    if prefix == "res" {
-        if let Some(kind) = content_type.and_then(typed_body_kind) {
-            if let Some(new) = gate.value(&format!("{kind}Body")) {
-                data = new.as_bytes().to_vec();
-            }
-            if let Some(pre) = gate.value(&format!("{kind}Prepend")) {
-                let mut v = pre.as_bytes().to_vec();
-                v.extend_from_slice(&data);
-                data = v;
-            }
-            if let Some(app) = gate.value(&format!("{kind}Append")) {
-                data.extend_from_slice(app.as_bytes());
-            }
+/// `resReplace` / `reqReplace` — substitute inside a body.
+///
+/// The value is a list of `pattern=replacement` pairs (`a=1&b=2`) or a JSON
+/// object, each applied in turn (`parseRuleJson` → `handleReplace`,
+/// `_original/lib/inspectors/res.js:124-145`). Upstream skips the whole
+/// operator for a response with no `content-type` or an image one, so those
+/// bodies are handed back untouched.
+fn apply_replace(
+    data: Vec<u8>,
+    resolved: &Resolved,
+    protocol: &str,
+    class: Option<ResClass>,
+) -> Vec<u8> {
+    let Some(spec) = resolved.value(protocol) else {
+        return data;
+    };
+    // Upstream refuses the whole operator for a response with no `content-type`
+    // or an image one (`handleReplace`, `_original/lib/inspectors/res.js:129-132`).
+    if matches!(class, None | Some(ResClass::Img)) {
+        return data;
+    }
+    let pairs = parse_replace_pairs(spec);
+    if pairs.is_empty() {
+        return data;
+    }
+    // Not UTF-8 means a binary body, which whistle's text transforms never see.
+    let mut text = match String::from_utf8(data) {
+        Ok(text) => text,
+        Err(e) => return e.into_bytes(),
+    };
+    for (pattern, value) in pairs {
+        text = replace_once_or_all(&text, &pattern, &value);
+    }
+    text.into_bytes()
+}
+
+/// Split a `*Replace` value into `pattern` → `replacement` pairs.
+///
+/// `parseQuery` (via `tryParseMatcher`) splits on `&` then on the first `=`, so
+/// `resReplace://a=1&b=2` is two substitutions, not one that inserts `1&b=2`.
+/// A `{json}` value is an object of the same shape.
+fn parse_replace_pairs(spec: &str) -> Vec<(String, String)> {
+    let spec = spec.trim();
+    if spec.starts_with('{') {
+        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(spec) {
+            return map
+                .into_iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        serde_json::Value::String(s) => s,
+                        serde_json::Value::Null => String::new(),
+                        other => other.to_string(),
+                    };
+                    (k, val)
+                })
+                .collect();
         }
     }
-    Bytes::from(data)
+    spec.split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
-/// Map a content type to a typed-body prefix (`html`/`css`/`js`).
-fn typed_body_kind(content_type: &str) -> Option<&'static str> {
-    let ct = content_type.to_ascii_lowercase();
-    if ct.contains("html") {
-        Some("html")
-    } else if ct.contains("css") {
-        Some("css")
-    } else if ct.contains("javascript") || ct.contains("ecmascript") {
-        Some("js")
-    } else {
-        None
+/// Apply one `pattern` → `value` substitution the way whistle's transforms do.
+///
+/// A pattern spelled `/…/[gimu]` is a regular expression (`ORIG_REG_EXP`,
+/// `_original/lib/util/index.js:611`), and follows JavaScript's rule that
+/// **without the `g` flag only the first match is replaced**. Anything else —
+/// including a half-formed `/a/x` — is a literal replace-all
+/// (`str.split(key).join(value)`, `_original/lib/util/index.js:2267`).
+fn replace_once_or_all(text: &str, pattern: &str, value: &str) -> String {
+    let Some((source, flags)) = split_regexp(pattern) else {
+        return text.replace(pattern, value);
+    };
+    // `/.*/ ` and `/.+/` mean "replace the whole body", special-cased upstream
+    // so the empty trailing match cannot duplicate the replacement
+    // (`ALL_RE`, `_original/lib/util/replace-pattern-transform.js:7,24-27`).
+    if matches!(source, ".*" | ".+") {
+        return value.to_string();
     }
-}
-
-/// `*Replace` on a body: `from=to`, literal or `/regex/[i]`. Binary bodies untouched.
-fn apply_body_replace(data: Vec<u8>, spec: &str) -> Vec<u8> {
-    match String::from_utf8(data) {
-        Ok(text) => apply_str_replace(&text, spec).into_bytes(),
-        Err(e) => e.into_bytes(), // not UTF-8 text; leave binary body untouched
+    let mut prefix = String::new();
+    if flags.contains('i') {
+        prefix.push_str("(?i)");
     }
-}
-
-/// Substitute `from=to` in `text`. If `from` is `/regex/[i]`, use a regex; else a
-/// literal replace-all. Shared by body `*Replace` and `urlReplace`.
-fn apply_str_replace(text: &str, spec: &str) -> String {
-    let Some((from, to)) = spec.split_once('=') else {
+    if flags.contains('m') {
+        prefix.push_str("(?m)");
+    }
+    let Ok(re) = regex::Regex::new(&format!("{prefix}{source}")) else {
         return text.to_string();
     };
-    if from.starts_with('/') && from.len() > 1 {
-        if let Some(end) = from.rfind('/') {
-            if end > 0 {
-                let body = &from[1..end];
-                let flags = &from[end + 1..];
-                let pat = if flags.contains('i') {
-                    format!("(?i){body}")
-                } else {
-                    body.to_string()
-                };
-                if let Ok(re) = regex::Regex::new(&pat) {
-                    return re.replace_all(text, to).into_owned();
-                }
+    let value = js_replacement(value);
+    match flags.contains('g') {
+        true => re.replace_all(text, value.as_str()).into_owned(),
+        false => re.replace(text, value.as_str()).into_owned(),
+    }
+}
+
+/// Split `/source/flags` into its two halves, or `None` when the pattern is not
+/// that shape. Mirrors `ORIG_REG_EXP = /^\/(.+)\/([igmu]{0,4})$/`: the source is
+/// greedy (so `/a\/b/` keeps its inner slash) and every flag character must be
+/// one of `igmu`.
+fn split_regexp(pattern: &str) -> Option<(&str, &str)> {
+    let rest = pattern.strip_prefix('/')?;
+    let end = rest.rfind('/')?;
+    let (source, flags) = (&rest[..end], &rest[end + 1..]);
+    let ok = !source.is_empty()
+        && flags.len() <= 4
+        && flags.chars().all(|c| matches!(c, 'i' | 'g' | 'm' | 'u'));
+    ok.then_some((source, flags))
+}
+
+/// Rewrite a JavaScript replacement string into the `regex` crate's spelling.
+///
+/// `$&` is the whole match and `$1`…`$9` are groups in both, but Rust reads
+/// `$1x` as a capture *named* `1x`, so every reference is braced. `\$` escapes a
+/// reference upstream (`replacePattern`,
+/// `_original/lib/util/replace-pattern-transform.js:64-91`); the `$$`-prefixed
+/// URL-encoding form is not ported.
+fn js_replacement(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'$') {
+            chars.next();
+            out.push_str("$$"); // an escaped `$` is literal
+            continue;
+        }
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('&') => {
+                chars.next();
+                out.push_str("${0}");
             }
+            Some(d) if d.is_ascii_digit() => {
+                let d = *d;
+                chars.next();
+                out.push_str(&format!("${{{d}}}"));
+            }
+            // A lone `$` (or `$$`) is literal; `$$` is Rust's own escape.
+            _ => out.push_str("$$"),
         }
     }
-    text.replace(from, to)
+    out
+}
+
+/// Substitute a `from=to` list in `text`, shared by `urlReplace` and the body
+/// `*Replace` operators.
+fn apply_str_replace(text: &str, spec: &str) -> String {
+    let mut out = text.to_string();
+    for (pattern, value) in parse_replace_pairs(spec) {
+        out = replace_once_or_all(&out, &pattern, &value);
+    }
+    out
 }
 
 /// Rewrite the request path+query per `urlReplace`, `params`, and `urlParams`.
 pub fn rewrite_path(path: &str, resolved: &Resolved) -> String {
     let mut p = path.to_string();
     if let Some(spec) = resolved.value("urlReplace") {
-        p = apply_str_replace(&p, spec);
+        // whistle substitutes into the path *without* its leading slash — it
+        // slices the URL from one character past the host's `/`
+        // (`parsePathReplace`, `_original/lib/util/index.js:1009-1013`), so a
+        // pattern anchored with `^/` matches in neither implementation.
+        let rest = p.strip_prefix('/');
+        let replaced = apply_str_replace(rest.unwrap_or(&p), spec);
+        p = match rest.is_some() {
+            true => format!("/{replaced}"),
+            false => replaced,
+        };
     }
     let mut params: Vec<(String, String)> = Vec::new();
     for key in ["params", "urlParams"] {
@@ -1693,15 +2105,55 @@ mod tests {
         assert_eq!(&out[..], b"NEW");
     }
 
+    /// `resReplace` runs *before* the injection — its transform sits ahead of
+    /// the `WhistleTransform` in whistle's response pipeline — so it rewrites
+    /// the upstream body but never the prepended or appended text.
     #[test]
     fn res_body_prepend_append_replace() {
         let resolved = resolve(
-            "example.com/x resPrepend://<!--top-->\nexample.com/x resAppend://<!--end-->\nexample.com/x resReplace://foo=bar\n",
+            "example.com/x resPrepend://<!--foo-->\nexample.com/x resAppend://<!--foo-->\nexample.com/x resReplace://foo=bar\n",
             "http://example.com/x",
         );
         assert!(wants_res_body(&resolved));
-        let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved, None);
-        assert_eq!(&out[..], b"<!--top-->a bar b<!--end-->");
+        let out = transform_res_body(
+            Bytes::from_static(b"a foo b"),
+            &resolved,
+            Some("text/plain"),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "<!--foo-->a bar b<!--foo-->",
+            "the substitution must not reach the injected text"
+        );
+    }
+
+    /// A response with no `content-type` (or an image one) is skipped outright
+    /// by `handleReplace` (`_original/lib/inspectors/res.js:129-132`).
+    #[test]
+    fn res_replace_needs_a_replaceable_content_type() {
+        let resolved = resolve("example.com/x resReplace://foo=bar\n", "http://example.com/x");
+        for ct in [None, Some("image/png")] {
+            let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved, ct);
+            assert_eq!(&out[..], b"a foo b", "{ct:?} should not be rewritten");
+        }
+        let out = transform_res_body(
+            Bytes::from_static(b"a foo b"),
+            &resolved,
+            Some("text/plain"),
+        );
+        assert_eq!(&out[..], b"a bar b");
+    }
+
+    /// The value is a `&`-separated list of `pattern=replacement` pairs, each
+    /// applied in turn (`parseQuery` via `tryParseMatcher`).
+    #[test]
+    fn res_replace_applies_every_pair() {
+        let resolved = resolve(
+            "example.com/x resReplace://a=1&b=2\n",
+            "http://example.com/x",
+        );
+        let out = transform_res_body(Bytes::from_static(b"a b a"), &resolved, Some("text/plain"));
+        assert_eq!(&out[..], b"1 2 1");
     }
 
     #[test]
@@ -1722,11 +2174,108 @@ mod tests {
         assert_eq!(v["c"]["e"], 2); // kept (deep merge)
     }
 
+    /// The `/regexp/flags` form follows JavaScript's `String#replace`: without
+    /// the `g` flag only the **first** match is substituted.
+    /// `resMerge` only builds its transform for a JS, HTML, JSON or typeless
+    /// response (`_original/lib/inspectors/res.js:1022`).
     #[test]
-    fn res_body_regex_replace() {
-        let resolved = resolve("example.com/x resReplace:///\\d+/=N\n", "http://example.com/x");
-        let out = transform_res_body(Bytes::from_static(b"id=123 and 45"), &resolved, None);
+    fn res_merge_is_gated_on_the_content_type() {
+        let resolved = resolve(
+            "example.com/x resMerge://{\"a\":2}\n",
+            "http://example.com/x",
+        );
+        let body = br#"{"a":1}"#;
+        for ct in ["application/json", "text/html", "application/javascript"] {
+            let out = transform_res_body(Bytes::from_static(body), &resolved, Some(ct));
+            assert_eq!(&out[..], br#"{"a":2}"#, "{ct} should merge");
+        }
+        for ct in ["text/plain", "application/xml", "image/png"] {
+            let out = transform_res_body(Bytes::from_static(body), &resolved, Some(ct));
+            assert_eq!(&out[..], body, "{ct} should be left alone");
+        }
+    }
+
+    /// The patch lands in the first JSON-looking *substring*, so a JSONP
+    /// wrapper survives (`JSON_RE`, `_original/lib/inspectors/res.js:846`).
+    #[test]
+    fn res_merge_patches_a_json_substring() {
+        let resolved = resolve(
+            "example.com/x resMerge://{\"a\":2}\n",
+            "http://example.com/x",
+        );
+        let out = transform_res_body(
+            Bytes::from_static(br#"cb({"a":1});"#),
+            &resolved,
+            Some("application/javascript"),
+        );
+        assert_eq!(String::from_utf8_lossy(&out), r#"cb({"a":2});"#);
+        // An empty body is replaced by the patch outright.
+        let out = transform_res_body(Bytes::new(), &resolved, Some("application/json"));
+        assert_eq!(&out[..], br#"{"a":2}"#);
+        // An HTML body that does not *start* like JSON is left alone.
+        let out = transform_res_body(
+            Bytes::from_static(br#"<p>{"a":1}</p>"#),
+            &resolved,
+            Some("text/html"),
+        );
+        assert_eq!(String::from_utf8_lossy(&out), r#"<p>{"a":1}</p>"#);
+    }
+
+    #[test]
+    fn res_body_regex_replace_honours_the_g_flag() {
+        let once = resolve("example.com/x resReplace:///\\d+/=N\n", "http://example.com/x");
+        let out = transform_res_body(
+            Bytes::from_static(b"id=123 and 45"),
+            &once,
+            Some("text/plain"),
+        );
+        assert_eq!(&out[..], b"id=N and 45");
+
+        let all = resolve("example.com/x resReplace:///\\d+/g=N\n", "http://example.com/x");
+        let out = transform_res_body(
+            Bytes::from_static(b"id=123 and 45"),
+            &all,
+            Some("text/plain"),
+        );
         assert_eq!(&out[..], b"id=N and N");
+    }
+
+    /// A pattern that is not exactly `/source/[igmu]` is a literal string, not
+    /// a regexp — `ORIG_REG_EXP` anchors both ends and admits only those flags.
+    #[test]
+    fn a_half_formed_regexp_is_a_literal_pattern() {
+        assert_eq!(split_regexp("/\\d+/g"), Some(("\\d+", "g")));
+        assert_eq!(split_regexp("/a\\/b/"), Some(("a\\/b", "")));
+        assert_eq!(split_regexp("/a/x"), None, "`x` is not a whistle flag");
+        assert_eq!(split_regexp("/a/gimux"), None);
+        assert_eq!(split_regexp("//"), None, "an empty source is not a regexp");
+        assert_eq!(split_regexp("a/b"), None);
+
+        let resolved = resolve("example.com/x resReplace:////=Z\n", "http://example.com/x");
+        let out = transform_res_body(
+            Bytes::from_static(b"a // b // c"),
+            &resolved,
+            Some("text/plain"),
+        );
+        assert_eq!(&out[..], b"a Z b Z c", "a literal pattern replaces them all");
+    }
+
+    /// `$&` and `$1` reach the replacement, and `/.*/ ` swaps the whole body.
+    #[test]
+    fn regex_replacement_back_references() {
+        let resolved = resolve(
+            "example.com/x resReplace:///(\\w+)@(\\w+)/g=$2.$1x\n",
+            "http://example.com/x",
+        );
+        let out = transform_res_body(Bytes::from_static(b"a@b c@d"), &resolved, Some("text/plain"));
+        assert_eq!(&out[..], b"b.ax d.cx", "`$1x` is group 1 then a literal x");
+
+        assert_eq!(js_replacement("[$&]"), "[${0}]");
+        assert_eq!(js_replacement("\\$1"), "$$1");
+
+        let all = resolve("example.com/x resReplace:///.*/g=ONLY\n", "http://example.com/x");
+        let out = transform_res_body(Bytes::from_static(b"whatever"), &all, Some("text/plain"));
+        assert_eq!(&out[..], b"ONLY", "`/.*/ ` replaces the body exactly once");
     }
 
     #[test]
@@ -2395,7 +2944,7 @@ mod tests {
     fn gating_is_per_line() {
         let out = inject(
             "example.com/x htmlAppend://<!--guarded--> lineProps://safeHtml\n\
-             example.com/x htmlPrepend://<!--free-->\n",
+             example.com/x htmlPrepend://<!--free--> disable://doctype\n",
             "{\"a\":1}",
             HTML,
         );
@@ -2447,6 +2996,175 @@ mod tests {
             HTML,
         );
         assert_eq!(out, "hello");
+    }
+
+    // ── typed body operators (html/js/css) ──
+
+    /// `jsXxx`/`cssXxx` reach an **HTML** response too, not just a JS or CSS
+    /// one: `isJs = isHtml || resType === 'JS'`
+    /// (`_original/lib/inspectors/res.js:952-954`). Raw JavaScript cannot go
+    /// into markup as-is, so it arrives wrapped.
+    #[test]
+    fn js_and_css_operators_reach_html_responses() {
+        let out = inject(
+            "example.com/x jsAppend://alert(1) disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(out, "<p>hi</p><script>alert(1)</script>");
+
+        let out = inject(
+            "example.com/x cssPrepend://body{color:red} disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(out, "<style>body{color:red}</style><p>hi</p>");
+    }
+
+    /// A bare URL is linked rather than inlined (`GEN_URL_RE` → `wrapJs`/`wrapCss`).
+    #[test]
+    fn a_url_value_becomes_a_script_or_link_tag() {
+        let out = inject(
+            "example.com/x jsAppend://https://cdn.test/a.js disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(out, "<p>hi</p><script src=\"https://cdn.test/a.js\"></script>");
+
+        let out = inject(
+            "example.com/x cssAppend:////cdn.test/a.css disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(
+            out,
+            "<p>hi</p><link rel=\"stylesheet\" href=\"//cdn.test/a.css\" />"
+        );
+        // Not a URL: an inline script that merely starts with a comment.
+        assert!(!GEN_URL_RE.is_match("// just a comment"));
+    }
+
+    /// Line properties become `<script>` attributes (`getScriptProps`).
+    #[test]
+    fn line_props_become_script_attributes() {
+        let out = inject(
+            "example.com/x jsAppend://https://cdn.test/a.js lineProps://defer|module|anonymous disable://doctype\n",
+            "<p>hi</p>",
+            HTML,
+        );
+        assert_eq!(
+            out,
+            "<p>hi</p><script crossorigin=\"anonymous\" defer type=\"module\" src=\"https://cdn.test/a.js\"></script>"
+        );
+        assert_eq!(script_props(&LineProps::default()), "");
+        // The crossorigin spellings are exclusive, most specific first.
+        let props = LineProps::from_actions(["useCredentials", "anonymous", "crossorigin"]);
+        assert_eq!(script_props(&props), " crossorigin=\"use-credentials\"");
+    }
+
+    /// On a JS or CSS response the value goes in raw — there is no markup to
+    /// wrap it into — and the generic `res*` operator comes first, CRLF-joined.
+    #[test]
+    fn typed_operators_are_unwrapped_outside_html() {
+        let out = inject(
+            "example.com/x jsAppend://alert(1)\nexample.com/x resAppend:///*tail*/\n",
+            "var a;",
+            "application/javascript",
+        );
+        assert_eq!(out, "var a;/*tail*/\r\nalert(1)");
+        // A CSS response ignores the JS family entirely.
+        let out = inject(
+            "example.com/x jsAppend://alert(1)\nexample.com/x cssAppend://a{}\n",
+            "b{}",
+            "text/css",
+        );
+        assert_eq!(out, "b{}a{}");
+    }
+
+    /// Every slot orders its contributors `res*` → `css*` → `html*` → `js*`
+    /// (`_original/lib/inspectors/res.js:1063-1072`), joined with CRLF.
+    #[test]
+    fn html_slots_keep_the_upstream_family_order() {
+        let out = inject(
+            "example.com/x resAppend://R\nexample.com/x cssAppend://C\n\
+             example.com/x htmlAppend://H\nexample.com/x jsAppend://J\n\
+             example.com/x disable://doctype\n",
+            "<p></p>",
+            HTML,
+        );
+        assert_eq!(
+            out,
+            "<p></p>R\r\n<style>C</style>\r\nH\r\n<script>J</script>"
+        );
+    }
+
+    /// A `*Body` operator replaces the body while `top`/`bottom` still wrap it.
+    #[test]
+    fn body_operators_replace_and_stay_wrapped() {
+        let out = inject(
+            "example.com/x htmlBody://<b>new</b>\nexample.com/x resPrepend://<!--t-->\n\
+             example.com/x resAppend://<!--b-->\nexample.com/x disable://doctype\n",
+            "<p>old</p>",
+            HTML,
+        );
+        assert_eq!(out, "<!--t--><b>new</b><!--b-->");
+        // A blank `resBody` empties the body (`resBody || util.EMPTY_BUFFER`).
+        assert_eq!(inject("example.com/x resBody://\n", "keep?", "text/plain"), "");
+    }
+
+    /// whistle stamps a doctype in front of any `top` it injects into an HTML
+    /// response (`_original/lib/util/whistle-transform.js:116-118`), and
+    /// `disable://doctype` is the only way out.
+    #[test]
+    fn html_prepends_carry_a_doctype() {
+        assert_eq!(
+            inject("example.com/x resPrepend://<!--t-->\n", "<p></p>", HTML),
+            "<!DOCTYPE html>\r\n<!--t--><p></p>"
+        );
+        assert_eq!(
+            inject(
+                "example.com/x resPrepend://<!--t--> disable://doctype\n",
+                "<p></p>",
+                HTML
+            ),
+            "<!--t--><p></p>"
+        );
+        // `enable://` wins over `disable://` for the same flag (`isDisable`).
+        assert_eq!(
+            inject(
+                "example.com/x resPrepend://<!--t--> disable://doctype enable://doctype\n",
+                "<p></p>",
+                HTML
+            ),
+            "<!DOCTYPE html>\r\n<!--t--><p></p>"
+        );
+        // Only HTML, and only when something is actually prepended.
+        assert_eq!(
+            inject("example.com/x resAppend://<!--t-->\n", "<p></p>", HTML),
+            "<p></p><!--t-->"
+        );
+        assert_eq!(
+            inject("example.com/x resPrepend://x\n", "y", "text/plain"),
+            "xy"
+        );
+    }
+
+    /// The content classes, in upstream's test order.
+    #[test]
+    fn content_classes_match_upstream() {
+        assert_eq!(res_class("text/html; charset=utf-8"), Some(ResClass::Html));
+        assert_eq!(res_class("application/javascript"), Some(ResClass::Js));
+        assert_eq!(res_class("text/css"), Some(ResClass::Css));
+        assert_eq!(res_class("application/json"), Some(ResClass::Json));
+        assert_eq!(res_class("image/png"), Some(ResClass::Img));
+        assert_eq!(res_class("text/plain"), Some(ResClass::Text));
+        assert_eq!(res_class("application/octet-stream"), None);
+        assert_eq!(res_class(""), None);
+        // Parameters are stripped before the substring tests, so a filename in
+        // the type cannot promote an opaque body to HTML.
+        assert_eq!(res_class("application/octet-stream; name=a.html"), None);
+        // `application/ecmascript` is not `javascript` to whistle.
+        assert_eq!(res_class("application/ecmascript"), None);
     }
 
     #[test]
