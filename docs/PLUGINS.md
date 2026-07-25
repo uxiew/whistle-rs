@@ -362,7 +362,7 @@ continuation 改成 text，或者把一条分片消息拆散，是稳定的自�
 `RustPlugin::on_ws_frame` 默认是恒等，覆盖它即可：
 
 ```rust
-fn on_ws_frame(&self, _meta: &FrameMeta, frame: &HookFrame<'_>) -> Verdict {
+fn on_ws_frame(&self, _meta: &FrameMeta, frame: &HookFrame) -> Verdict {
     if frame.opcode != 0x1 || !frame.fin {
         return Verdict::Keep;
     }
