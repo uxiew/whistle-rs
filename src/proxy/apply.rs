@@ -4064,6 +4064,22 @@ mod tests {
         let t = target("example.com proxy://127.0.0.1:8888\n", "https://example.com/");
         assert!(t.tls);
         assert!(!t.origin_tls_stripped);
+
+        // The conversion belongs to the proxy, so a proxy that lost to a
+        // `host://` rule cannot convert anything on its way out.
+        let t = target(
+            "example.com http2https-proxy://127.0.0.1:8888\nexample.com host://10.0.0.9\n",
+            "http://example.com/",
+        );
+        assert!(t.proxy.is_none(), "host:// wins by default");
+        assert!(!t.tls, "no proxy survived, so no scheme upgrade");
+        let t = target(
+            "example.com https2http-proxy://127.0.0.1:8888\nexample.com host://10.0.0.9\n",
+            "https://example.com/",
+        );
+        assert!(t.proxy.is_none());
+        assert!(t.tls, "…and none to strip either");
+        assert!(!t.origin_tls_stripped);
     }
 
     /// Every protocol in the family list is one `find_proxy` actually reads,
