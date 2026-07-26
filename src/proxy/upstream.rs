@@ -587,7 +587,12 @@ pub async fn forward_with_addr(
 enum RetryableError {
     /// The connection was never established, so nothing was sent and the
     /// request is handed back intact for another attempt.
-    Connect(UnsentRequest),
+    ///
+    /// Boxed because it carries a whole `Request` (248 bytes against the other
+    /// variant's 8). Unboxed it sets the size of the `Result` every successful
+    /// forward returns — 248 bytes for a 184-byte payload — to pay for a case
+    /// that only arises when a connection fails.
+    Connect(Box<UnsentRequest>),
     /// The request is gone — written to the wire, or consumed by a failed
     /// handshake. Retrying it is not possible, only reporting it.
     Sent(anyhow::Error),
@@ -630,10 +635,10 @@ async fn forward_once(
     // more helpfully checks [`self_loop`] itself; this is the backstop on the
     // one path every request takes into the network.
     if let Some(addr) = self_loop(target).await {
-        return Err(RetryableError::Connect(UnsentRequest {
+        return Err(RetryableError::Connect(Box::new(UnsentRequest {
             error: anyhow!("Self loop ({addr})"),
             request: req,
-        }));
+        })));
     }
     let hop = Hop::from_request(&req);
 
@@ -643,7 +648,12 @@ async fn forward_once(
     // rather than one already rewritten for a proxy that is not there.
     let (stream, peer) = match origin_stream(target, &hop).await {
         Ok(out) => out,
-        Err(error) => return Err(RetryableError::Connect(UnsentRequest { error, request: req })),
+        Err(error) => {
+            return Err(RetryableError::Connect(Box::new(UnsentRequest {
+                error,
+                request: req,
+            })));
+        }
     };
 
     // A plain HTTP proxy fetching an http origin uses absolute-form + Proxy-Auth.
