@@ -154,6 +154,9 @@ pub struct PluginManifest {
     /// Serves `POST /auth` — the gate that decides whether a request proceeds.
     /// The only hook whose failure blocks rather than degrades; see [`auth`].
     pub auth: bool,
+    /// Serves `POST /sni` — the certificate chooser, consulted during the TLS
+    /// handshake of an intercepted connection. See [`sni`].
+    pub sni: bool,
     /// Serves the fire-and-forget request-phase `POST /stats`.
     pub req_stats: bool,
     /// Serves the fire-and-forget response-phase `POST /stats`.
@@ -199,6 +202,7 @@ impl PluginManifest {
             pipe_response: false,
             ws_frame: false,
             auth: false,
+            sni: false,
             req_stats: false,
             res_stats: false,
             ui: false,
@@ -251,6 +255,7 @@ impl PluginManifest {
             pipe_response: has("piperesponse"),
             ws_frame: has("wsframe"),
             auth,
+            sni: has("sni"),
             req_stats,
             res_stats,
             ui: has("ui"),
@@ -320,6 +325,24 @@ fn parse_match(value: &str, via_pipe: bool) -> Option<PluginMatch> {
         pipe_value: None,
         via_pipe,
     })
+}
+
+/// Parse an `sniCallback://[whistle.|plugin.]<name>(<value>)` rule value into
+/// the plugin name and its argument.
+///
+/// Shares [`split_pipe_arg`] and [`clean_name`] with `pipe://` because it is
+/// literally the same grammar — upstream writes it out twice, as `PIPE_PLUGIN_RE`
+/// and as `SNI_CALLBACK_RE` (`_original/lib/https/load-cert.js:7-8`), with the
+/// same package prefixes and the same greedy `([\s\S]*)` argument. An absent
+/// `(…)` gives an empty value, which is what a plugin sees as `ctx.value`.
+pub fn parse_sni_rule(value: &str) -> Option<(String, String)> {
+    let value = value.trim();
+    let (head, arg) = match split_pipe_arg(value) {
+        Some((head, arg)) => (head, arg.to_string()),
+        None => (value, String::new()),
+    };
+    let name = clean_name(head);
+    (!name.is_empty()).then_some((name, arg))
 }
 
 /// Split `name(value)`, the `pipe://` argument grammar. The argument runs to the
@@ -430,6 +453,17 @@ pub trait RustPlugin: Send + Sync {
     /// when the manifest declares [`PluginManifest::auth`].
     fn auth(&self, _req: &PluginReq) -> auth::AuthVerdict {
         auth::AuthVerdict::Allow(Vec::new())
+    }
+
+    /// Choose the certificate for an intercepted TLS connection, or decline the
+    /// interception. Default: no opinion.
+    ///
+    /// Runs inside the handshake, before any request exists, so an
+    /// implementation must be quick — the client is waiting on it. Only
+    /// consulted when the manifest declares [`PluginManifest::sni`] and an
+    /// `sniCallback://` rule named this plugin. See [`sni`].
+    fn sni(&self, _req: &sni::SniReq) -> sni::SniVerdict {
+        sni::SniVerdict::Generated
     }
 
     /// Told that a request went past, before it is forwarded. Default: ignore.
@@ -629,6 +663,22 @@ impl RemotePlugin {
                 "no verdict within {:?}",
                 auth::AUTH_TIMEOUT
             ))),
+        }
+    }
+
+    /// Ask for a certificate. `Err` is "could not ask", which is not the same as
+    /// "had nothing to say" — see [`sni`] for what each one costs.
+    async fn sni_cert(&self, req: &sni::SniReq) -> Result<sni::SniVerdict, String> {
+        let body = sni::payload(req).to_string();
+        let call = self.post_status("/sni", &body);
+        match tokio::time::timeout(sni::SNI_TIMEOUT, call).await {
+            Ok(Ok((200, bytes))) => Ok(sni::parse_reply(&bytes)),
+            // This protocol's "nothing to say", which here is a real answer:
+            // the plugin is not supplying a certificate for this name.
+            Ok(Ok((204, _))) | Ok(Ok((304, _))) => Ok(sni::SniVerdict::Generated),
+            Ok(Ok((status, _))) => Err(format!("returned {status}")),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(_) => Err(format!("no answer within {:?}", sni::SNI_TIMEOUT)),
         }
     }
 
@@ -974,6 +1024,41 @@ impl Plugins {
         }
     }
 
+    /// Ask plugin `name` which certificate to present for an intercepted TLS
+    /// connection.
+    ///
+    /// `Err` means the plugin could not be asked — unregistered, silent, slow,
+    /// or answering something that is not a reply. The caller distinguishes it
+    /// from [`sni::SniVerdict::Generated`] ("asked, nothing to say") because the
+    /// two do different things to the cached certificate; see
+    /// [`crate::proxy::sni::decide`].
+    ///
+    /// A plugin that does not declare the hook is *not* an error: a rule can
+    /// name a plugin that has no `sni` hook, and that means the same thing as
+    /// having no opinion.
+    pub async fn sni_cert(
+        &self,
+        name: &str,
+        req: &sni::SniReq,
+    ) -> Result<sni::SniVerdict, String> {
+        let Some(plugin) = self.map.get(name) else {
+            return Err(format!("no plugin named {name}"));
+        };
+        match plugin {
+            PluginKind::Rust(p) => Ok(if p.manifest().sni {
+                p.sni(req)
+            } else {
+                sni::SniVerdict::Generated
+            }),
+            PluginKind::Remote(r) => {
+                if !r.manifest().await.sni {
+                    return Ok(sni::SniVerdict::Generated);
+                }
+                r.sni_cert(req).await
+            }
+        }
+    }
+
     /// Serve one of plugin `name`'s own pages.
     ///
     /// `None` means "not a plugin UI": no such plugin, or one that declares no
@@ -1108,6 +1193,7 @@ impl Plugins {
 pub mod auth;
 pub mod builtin;
 pub mod pipe;
+pub mod sni;
 pub mod stats;
 pub mod ui;
 pub mod wsframe;

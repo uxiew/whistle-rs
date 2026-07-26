@@ -796,6 +796,13 @@ pub struct RuleGroup {
     /// every rules file that never mentions the body, which is what lets the
     /// request path skip buffering entirely.
     body_candidates: Vec<u32>,
+    /// Does any line here carry an `sniCallback://` operator?
+    ///
+    /// Precomputed for the same reason [`res_candidates`] is, but the stakes are
+    /// higher: this one is read inside the TLS handshake of *every* intercepted
+    /// connection, before a single certificate has been chosen. A rules file
+    /// with no `sniCallback://` in it has to cost one `bool`, not a resolution.
+    has_sni_callback: bool,
 }
 
 impl RuleGroup {
@@ -807,6 +814,7 @@ impl RuleGroup {
             enabled,
             res_candidates: res_candidates(&rules),
             body_candidates: body_candidates(&rules),
+            has_sni_callback: has_sni_callback(&rules),
             rules,
         }
     }
@@ -816,6 +824,7 @@ impl RuleGroup {
         self.rules = parse_text(&self.text);
         self.res_candidates = res_candidates(&self.rules);
         self.body_candidates = body_candidates(&self.rules);
+        self.has_sni_callback = has_sni_callback(&self.rules);
     }
 
     /// Number of parsed rules in this group.
@@ -840,6 +849,14 @@ fn res_candidates(rules: &[Rule]) -> Vec<u32> {
         .filter(|(_, rule)| rule.may_need_response_phase())
         .map(|(i, _)| i as u32)
         .collect()
+}
+
+/// Whether any of `rules` writes an `sniCallback://` operator — see
+/// [`RuleGroup::has_sni_callback`].
+fn has_sni_callback(rules: &[Rule]) -> bool {
+    rules
+        .iter()
+        .any(|rule| rule.ops.iter().any(|op| op.protocol == "sniCallback"))
 }
 
 /// Which of `rules` carry a `b:` filter — see [`RuleGroup::body_candidates`].
@@ -940,6 +957,19 @@ impl RuleManager {
         self.groups
             .iter()
             .any(|g| g.enabled && !g.res_candidates.is_empty())
+    }
+
+    /// Could any enabled rule choose the certificate for an intercepted TLS
+    /// connection (`sniCallback://`)?
+    ///
+    /// Read once per intercepted connection, from inside the handshake, and
+    /// answered from a flag each group precomputes when it parses. The whole
+    /// point is the negative answer: a rules file that never mentions
+    /// `sniCallback` costs one comparison per group, and the connection then
+    /// takes exactly the path it took before the hook existed. See
+    /// [`crate::proxy::sni::decide`].
+    pub fn has_sni_callback(&self) -> bool {
+        self.groups.iter().any(|g| g.enabled && g.has_sni_callback)
     }
 
     /// Must this request's body be buffered before the rules resolve?

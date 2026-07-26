@@ -26,24 +26,36 @@ use crate::config::Config;
 /// without limit.
 const MAX_CACHED_HOSTS: usize = 5120;
 
-/// Bounded cache of per-host TLS acceptors.
+/// Bounded per-host cache.
 ///
 /// Eviction is first-in-first-out rather than least-recently-used: the entries
 /// are interchangeable (regenerating one costs a single signature) and FIFO
 /// keeps the hot path a plain hash lookup with no bookkeeping write.
-#[derive(Default)]
-struct AcceptorCache {
-    by_host: HashMap<String, TlsAcceptor>,
+struct HostCache<V> {
+    by_host: HashMap<String, V>,
     inserted: VecDeque<String>,
 }
 
-impl AcceptorCache {
-    fn get(&self, host: &str) -> Option<TlsAcceptor> {
+/// The generated leaf certificates, one acceptor per signed name.
+type AcceptorCache = HostCache<TlsAcceptor>;
+
+// Derived `Default` would demand `V: Default`, which neither value here has.
+impl<V> Default for HostCache<V> {
+    fn default() -> Self {
+        HostCache {
+            by_host: HashMap::new(),
+            inserted: VecDeque::new(),
+        }
+    }
+}
+
+impl<V: Clone> HostCache<V> {
+    fn get(&self, host: &str) -> Option<V> {
         self.by_host.get(host).cloned()
     }
 
-    fn insert(&mut self, host: String, acceptor: TlsAcceptor) {
-        if self.by_host.insert(host.clone(), acceptor).is_none() {
+    fn insert(&mut self, host: String, value: V) {
+        if self.by_host.insert(host.clone(), value).is_none() {
             self.inserted.push_back(host);
         }
         while self.inserted.len() > MAX_CACHED_HOSTS {
@@ -52,15 +64,47 @@ impl AcceptorCache {
             }
         }
     }
+
+    fn remove(&mut self, host: &str) {
+        if self.by_host.remove(host).is_some() {
+            self.inserted.retain(|h| h != host);
+        }
+    }
 }
 
-/// The root CA plus a cache of per-host TLS acceptors.
+/// A certificate a `sniCallback` plugin supplied, kept so the next connection
+/// to the same server name does not have to ask again.
+///
+/// Upstream keeps the same thing, under the same name and for the same reason
+/// (`ca.remoteCerts`, `_original/lib/https/ca.js`; read and written by
+/// `lib/https/load-cert.js:12,:38-50`). Holding the PEM alongside the built
+/// acceptor is what makes "the plugin sent the same certificate again" a string
+/// comparison instead of a second parse and key check.
+#[derive(Clone)]
+struct RemoteCert {
+    /// Which plugin supplied it — reported back to that plugin as
+    /// `certCacheName`, and the reason a *different* plugin's rule never sees a
+    /// cache hit it did not put there.
+    plugin: String,
+    /// The `mtime` the plugin stamped on it, reported back as `certCacheTime`.
+    mtime: u64,
+    cert_pem: String,
+    key_pem: String,
+    acceptor: TlsAcceptor,
+}
+
+/// The root CA, a cache of per-host TLS acceptors, and the certificates
+/// `sniCallback` plugins have supplied.
 pub struct CertAuthority {
     ca_cert: Certificate,
     ca_key: KeyPair,
     /// PEM of the root certificate (for serving to the user to install).
     ca_cert_pem: String,
     acceptors: Mutex<AcceptorCache>,
+    /// Plugin-supplied certificates, keyed by the server name they were
+    /// supplied for. Bounded the same way the generated ones are, and for the
+    /// same reason: one entry per made-up SNI name would otherwise grow forever.
+    remote_certs: Mutex<HostCache<RemoteCert>>,
 }
 
 impl CertAuthority {
@@ -99,12 +143,18 @@ impl CertAuthority {
             ca_key,
             ca_cert_pem,
             acceptors: Mutex::new(AcceptorCache::default()),
+            remote_certs: Mutex::new(HostCache::default()),
         }))
     }
 
     /// PEM of the root certificate.
     pub fn root_cert_pem(&self) -> &str {
         &self.ca_cert_pem
+    }
+
+    /// DER of the root certificate, for a client that has to be told to trust it.
+    pub fn root_cert_der(&self) -> CertificateDer<'static> {
+        self.ca_cert.der().clone()
     }
 
     /// A `TlsAcceptor` presenting a leaf certificate for `host`.
@@ -131,13 +181,68 @@ impl CertAuthority {
 
     fn build_acceptor(&self, host: &str) -> Result<TlsAcceptor> {
         let (chain, key) = self.sign_leaf(host)?;
-        let mut cfg = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(chain, key)
-            .context("building server config for intercepted host")?;
-        // Offer HTTP/2 and HTTP/1.1; the negotiated protocol is checked after accept.
-        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        Ok(TlsAcceptor::from(Arc::new(cfg)))
+        acceptor_from_der(chain, key).context("building server config for intercepted host")
+    }
+
+    /// What this proxy currently holds for `host` from the `sniCallback` plugin
+    /// `plugin`, as `(mtime, acceptor)`.
+    ///
+    /// Scoped to one plugin deliberately: the cache entry is *that plugin's*
+    /// answer, so a different plugin matching the same name must not be told it
+    /// has a certificate cached, nor be able to reuse one it never issued.
+    pub fn plugin_cert(&self, host: &str, plugin: &str) -> Option<(u64, TlsAcceptor)> {
+        let cache = self.remote_certs.lock().unwrap();
+        let entry = cache.by_host.get(&host.to_ascii_lowercase())?;
+        (entry.plugin == plugin).then(|| (entry.mtime, entry.acceptor.clone()))
+    }
+
+    /// Adopt the certificate `plugin` supplied for `host`.
+    ///
+    /// Returns an error when the material does not form a usable certificate and
+    /// key pair; the caller falls back to the generated certificate, so a plugin
+    /// cannot take the listener down by answering with rubbish. Re-supplying
+    /// byte-identical material costs a string comparison rather than a parse and
+    /// a key check — the same short-circuit upstream takes
+    /// (`lib/https/load-cert.js:37-42`).
+    pub fn set_plugin_cert(
+        &self,
+        host: &str,
+        plugin: &str,
+        cert_pem: &str,
+        key_pem: &str,
+        mtime: u64,
+    ) -> Result<TlsAcceptor> {
+        let host = host.to_ascii_lowercase();
+        {
+            let cache = self.remote_certs.lock().unwrap();
+            if let Some(entry) = cache.by_host.get(&host)
+                && entry.plugin == plugin
+                && entry.cert_pem == cert_pem
+                && entry.key_pem == key_pem
+            {
+                return Ok(entry.acceptor.clone());
+            }
+        }
+        let acceptor = acceptor_from_pem(cert_pem, key_pem)?;
+        self.remote_certs.lock().unwrap().insert(
+            host,
+            RemoteCert {
+                plugin: plugin.to_string(),
+                mtime,
+                cert_pem: cert_pem.to_string(),
+                key_pem: key_pem.to_string(),
+                acceptor: acceptor.clone(),
+            },
+        );
+        Ok(acceptor)
+    }
+
+    /// Drop the plugin-supplied certificate for `host`, if any.
+    pub fn forget_plugin_cert(&self, host: &str) {
+        self.remote_certs
+            .lock()
+            .unwrap()
+            .remove(&host.to_ascii_lowercase());
     }
 
     /// Sign a leaf certificate for `host`, returning a rustls cert chain + key.
@@ -186,6 +291,47 @@ impl CertAuthority {
 
 /// Seconds in a day, for the certificate validity windows.
 const ONE_DAY: u64 = 24 * 60 * 60;
+
+/// Build the TLS acceptor whistle-rs presents to an intercepted client.
+///
+/// One place, so a certificate that came from a plugin is offered under exactly
+/// the same terms as one this CA generated — same ALPN list above all. A plugin
+/// that could silently narrow the offer to HTTP/1.1 would change how every
+/// request on that connection is proxied, which is not what "choose a
+/// certificate" is supposed to mean.
+fn acceptor_from_der(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<TlsAcceptor, rustls::Error> {
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?;
+    // Offer HTTP/2 and HTTP/1.1; the negotiated protocol is checked after accept.
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(cfg)))
+}
+
+/// Parse a PEM certificate chain and private key into a TLS acceptor.
+///
+/// This is the validation boundary for certificate material that came from a
+/// plugin, so every failure has to be an `Err` and none of them may be a panic:
+/// the reply is attacker-adjacent input arriving in the middle of a handshake,
+/// and the listener has to survive it. rustls does the load-bearing check —
+/// `with_single_cert` refuses a key whose `SubjectPublicKeyInfo` does not match
+/// the leaf certificate's, so a valid-looking pair that does not actually go
+/// together is rejected here rather than at handshake time on every connection.
+pub fn acceptor_from_pem(cert_pem: &str, key_pem: &str) -> Result<TlsAcceptor> {
+    let chain = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parsing the plugin's certificate")?;
+    if chain.is_empty() {
+        anyhow::bail!("the plugin's `cert` holds no CERTIFICATE block");
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .context("parsing the plugin's private key")?
+        .ok_or_else(|| anyhow::anyhow!("the plugin's `key` holds no PRIVATE KEY block"))?;
+    acceptor_from_der(chain, key).context("the plugin's certificate and key do not form a pair")
+}
 
 /// The name to put on the certificate for `host`, which may be a wildcard
 /// shared with the host's siblings.

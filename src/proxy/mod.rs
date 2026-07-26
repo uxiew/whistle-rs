@@ -9,6 +9,7 @@ mod bench;
 pub mod body;
 pub mod persist;
 pub mod script;
+pub mod sni;
 pub mod socks;
 pub mod template;
 pub mod upstream;
@@ -921,7 +922,7 @@ fn handle_connect(
 /// Shared by CONNECT interception and the SOCKS server.
 pub(crate) async fn serve_tunnel<S>(
     state: Arc<AppState>,
-    stream: S,
+    mut stream: S,
     host: String,
     port: u16,
     peer: SocketAddr,
@@ -931,7 +932,23 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if tls {
-        let acceptor = state.ca.acceptor_for(&host)?;
+        // Read the ClientHello before deciding anything, because two decisions
+        // depend on it: which name the certificate has to be for, and what an
+        // `sniCallback://` plugin is being asked about. The bytes are replayed
+        // either way — see [`sni`].
+        let hello = sni::peek_client_hello(&mut stream).await;
+        let has_sni = hello.server_name.is_some();
+        // The name the client will check is the one it asked for; the tunnel's
+        // own hostname is only the fallback for a client that asked for nothing
+        // (upstream's `useSNI || socket.tunnelHostname`).
+        let servername = hello.server_name.unwrap_or_else(|| host.clone());
+        let stream = sni::Prefixed::new(hello.prefix, stream);
+        let acceptor =
+            match sni::decide(&state, &servername, &host, port, peer, has_sni).await {
+                sni::Decision::Generated => state.ca.acceptor_for(&servername)?,
+                sni::Decision::Plugin(acceptor) => acceptor,
+                sni::Decision::Bypass => return sni::relay(stream, &host, port).await,
+            };
         let tls_stream = acceptor.accept(stream).await?;
         let conn = tls_stream.get_ref().1;
         let is_h2 = conn.alpn_protocol() == Some(b"h2");

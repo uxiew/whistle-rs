@@ -9,6 +9,7 @@ use serde_json::json;
 
 use super::auth::{AuthVerdict, Denial, DenyPage};
 use super::pipe::{Dir, PipeMeta};
+use super::sni::{SniReq, SniVerdict};
 use super::ui::{escape_html, UiReq, UiResp};
 use super::wsframe::{FrameMeta, HookFrame, Verdict};
 use super::{
@@ -25,6 +26,7 @@ pub fn all() -> Vec<Box<dyn RustPlugin>> {
         Box::new(UpperPlugin),
         Box::new(WsUpperPlugin),
         Box::<GatePlugin>::default(),
+        Box::new(NoMitmPlugin),
     ]
 }
 
@@ -336,5 +338,45 @@ impl RustPlugin for GatePlugin {
             "/stats.json" => UiResp::json(&value),
             _ => UiResp::not_found(),
         }
+    }
+}
+
+/// `sniCallback://no-mitm` — decline to intercept, whatever the host.
+///
+/// The one certificate answer that needs no certificate, and the one nothing
+/// else in this proxy can express: the connection stays encrypted between the
+/// client and the origin, and whistle-rs relays the bytes without looking. Use
+/// it for the hosts that pin their certificates, or that no one is debugging.
+///
+/// ```text
+/// pinned.example.com  sniCallback://no-mitm
+/// ```
+///
+/// The rule is matched against `https://<the name in the ClientHello>`, so it
+/// takes ordinary host patterns — and, because the decision is made before any
+/// request exists, that name is all there is to match on.
+struct NoMitmPlugin;
+
+impl RustPlugin for NoMitmPlugin {
+    fn name(&self) -> &str {
+        "no-mitm"
+    }
+
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            sni: true,
+            ..PluginManifest::none(self.name())
+        }
+    }
+
+    fn sni(&self, _req: &SniReq) -> SniVerdict {
+        SniVerdict::Bypass
+    }
+
+    /// Declared for the trait, never reached: this plugin's manifest offers no
+    /// request hook, so `plugin://no-mitm` matches nothing to run.
+    fn on_request(&self, _req: &PluginReq) -> PluginResult {
+        PluginResult::default()
     }
 }
