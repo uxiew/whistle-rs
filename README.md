@@ -219,10 +219,10 @@ cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
   `/proxy.pac`
 - `@`-includes (pull rules from a URL/file) and `${port}`/`${version}` config variables
 
-Only **3** operators remain unimplemented — `sniCallback` (MITM cert hook fixed at
-SNI time before rule resolution, needing the Node plugin loader), `G` (global-rule
-marker), and `style` (rule colour in the UI) — each documented with its reason in the
-coverage table.
+Only **2** operators remain unimplemented — `G` (global-rule marker) and `style`
+(rule colour in the UI) — each documented with its reason in the coverage table.
+`sniCallback` used to be a third: it is now implemented, and the record calling it
+architecturally unreachable was wrong rather than merely out of date.
 
 **Plugins** are whistle-rs's own system, with two runtimes sharing one contract
 (`plugin://name`): **Rust** in-process plugins (the `RustPlugin` trait) and **JS/TS**
@@ -231,7 +231,9 @@ definitions. whistle-rs can spawn the Node process (`--node-plugin`) or point at
 running one (`--plugin`). A plugin can inject rules, answer a request directly,
 rewrite request headers, and rewrite the response status, headers and body. Whether a
 body is delivered is driven by the plugin's capability manifest, so plugins that do
-not ask for one keep the proxy's streaming fast path. See
+not ask for one keep the proxy's streaming fast path. One hook is not about a request
+at all: `sniCallback://name` runs during the TLS handshake and picks the certificate
+an intercepted connection is served — or declines to intercept it. See
 [`docs/PLUGINS.md`](docs/PLUGINS.md).
 
 This is not a reimplementation of the original's plugin API, so `npm i whistle.xxx`

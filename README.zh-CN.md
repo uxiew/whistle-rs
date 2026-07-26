@@ -202,15 +202,16 @@ $example.com          host://2.2.2.2
   `/frames.json`、`/sessions.har`（HAR 导出）、`/proxy.pac`
 - `@`-includes（从 URL/文件引入规则）与 `${port}`/`${version}` 配置变量
 
-仅剩 **3** 个算子未实现 —— `sniCallback`（MITM 证书回调，在规则解析前的 SNI 阶段固定，
-且依赖 Node 插件加载器）、`G`（全局规则标记）、`style`（界面里的规则颜色）—— 每个都在
-覆盖表中注明了原因。
+仅剩 **2** 个算子未实现 —— `G`（全局规则标记）与 `style`（界面里的规则颜色）——
+每个都在覆盖表中注明了原因。`sniCallback` 曾是第三个：它现在已实现，而那条
+「架构不可达」的记录本身是错的，不只是过时。
 
 **插件**是 whistle-rs 自研的体系，两种运行时共用同一套契约（`plugin://name`）：
 **Rust** 进程内插件（`RustPlugin` trait）与 **JS/TS** 插件（`sdk/` 提供零依赖运行时
 与 `.d.ts` 类型）—— whistle-rs 可拉起 Node 进程（`--node-plugin`）或指向已运行的
 进程（`--plugin`）。插件可以注入规则、直接应答、改写请求头，以及改写响应的状态码/头/体；
-是否投递 body 由插件的能力清单决定，未声明的插件保持流式零开销。
+是否投递 body 由插件的能力清单决定，未声明的插件保持流式零开销。还有一个钩子根本不作用在
+请求上：`sniCallback://name` 在 TLS 握手期决定被拦截的连接拿到哪张证书 —— 或者干脆不拦。
 详见 [`docs/PLUGINS.md`](docs/PLUGINS.md)。
 
 这不是原版插件 API 的复刻，现成的 `npm i whistle.xxx` 包无法直接运行 —— 这是有意的取舍，

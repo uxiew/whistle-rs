@@ -11,6 +11,7 @@ whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 - **流式改写 body** —— 边收边改，全程不落内存（`pipe://`）
 - **拦改 WebSocket 帧** —— 逐帧、双向，可改写也可丢弃
 - **决定放不放行** —— 认证钩子，**唯一一个失败即拦截**的钩子
+- **挑 TLS 证书** —— 在握手期决定这条连接用哪张证书，**甚至可以决定不拦截**
 - **上报统计** —— 请求/响应两个阶段各一次，发完不管
 - **自带页面** —— 在 `/plugin/<name>/` 下服务插件自己的 UI
 
@@ -29,13 +30,16 @@ whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 | `pipe://<name>[(<value>)]` | `pipeRequest` / `pipeResponse` | **流式，永不缓冲** |
 | 两者皆可，命中 WebSocket 时 | `onWsFrame` | 逐帧，一次一帧 |
 
-另有三个**不改写流量**的钩子：
+另有四个**不改写流量**的钩子：
 
 | 钩子 | 由什么触发 | 说明 |
 |------|-----------|------|
 | [`onAuth`](#认证钩子--onauth) | 同上两种规则，跑在所有请求钩子**之前** | 决定这个请求放不放行 |
+| [`sniCallback`](#证书钩子--snicallback) | `sniCallback://<name>` 规则，在 **TLS 握手期** | 决定这条连接用哪张证书，或者干脆不拦截 |
 | [`onReqStats` / `onResStats`](#统计钩子--onreqstats--onresstats) | 同上，两个阶段各一次 | 只上报，不等回应 |
 | [`onUi`](#插件页面--onui) | 浏览器访问 `/plugin/<name>/…` | 插件自己的页面，与代理流量无关 |
+
+`sniCallback` 是这一族里唯一**不作用在请求上**的钩子 —— 它跑的时候还没有请求。
 
 `pipe://` 指向一个没有声明任何流式钩子的插件时，退化为 `plugin://` —— 与流式钩子出现之前的语义一致，老规则不会失效。
 
@@ -546,6 +550,236 @@ fn auth(&self, req: &PluginReq) -> AuthVerdict {
 
 ---
 
+## 证书钩子 / `sniCallback`
+
+在一条被拦截的 TLS 连接的**握手期**，由插件决定这条连接用哪张证书 —— 或者**根本不拦它**。
+
+```js
+const { start } = require('whistle-rs/sdk/whistle-rs-plugin');
+
+start({
+  name: 'certs',
+
+  sniCallback(ctx) {
+    if (ctx.value === 'skip') return false;        // 不拦截，原样透传
+    if (ctx.hasCachedCert) return ctx.reuse();     // 你手上那张还能用
+    return { key: keyPem, cert: certPem, mtime: issuedAt };
+  },
+});
+```
+
+```
+api.example.com      sniCallback://certs(staging)
+pinned.example.com   sniCallback://no-mitm        # 内置，永远返回 false
+```
+
+完整示例见 [`examples/plugins/sni-certs.js`](../examples/plugins/sni-certs.js)；
+Rust 版本见 [`src/plugins/builtin.rs`](../src/plugins/builtin.rs) 里的 `sniCallback://no-mitm`。
+
+### 它和别的钩子不一样在哪
+
+**它跑的时候还没有请求。** 握手还没做完，所以没有 method、没有 URL、没有头、没有 body，
+以后也不会有。`ctx` 就是握手能知道的那点东西：
+
+| 成员 | 说明 |
+|------|------|
+| `ctx.servername` | 客户端 ClientHello 里要的名字；客户端没发 SNI 时退回隧道的主机名 |
+| `ctx.value` | `sniCallback://name(value)` 里的 `value`，没有就是 `''` |
+| `ctx.tunnelHost` / `ctx.port` | 隧道**开到**的地址。与 `servername` 可能不同 |
+| `ctx.clientIp` | 客户端地址 |
+| `ctx.certCacheName` | 代理手上这个名字的证书是**你**给的时，等于你自己的插件名；否则 undefined |
+| `ctx.certCacheTime` | 那张证书带的 `mtime`（没带就是 `0`） |
+| `ctx.hasCachedCert` | 上面那条的布尔简写 |
+
+规则匹配的是 `https://<ctx.servername>[:<port>]` —— 那是握手期唯一存在的 URL。所以：
+**端口是 pattern 的一部分**（ClientHello 里没有端口，但隧道的端口是知道的），而任何问
+method / 路径 / 头 / body 的筛选器都不会命中一条 `sniCallback` 行。
+
+### 四种返回值
+
+| 返回 | 结果 |
+|------|------|
+| `false` | **不拦截。** 连接原样中继到源站，客户端和源站之间自己协商 TLS，代理看不见里面 |
+| `true` | 拦截，用 whistle-rs 自己签的证书（和没有这条规则时一样）；并**作废**你之前给的那张 |
+| `{key, cert, mtime?}` | 拦截，用这张证书。两个字段都必须是非空字符串（PEM） |
+| `ctx.reuse()` | 拦截，用**你上次给的那张**。代理没有缓存时退回自签的那张 |
+| 不返回 / 返回别的 | 等同于 `true` |
+
+`false` 是这一整套插件系统里**唯一**能关掉拦截的开关 —— 别的钩子都跑在拦截之后，那时
+已经太晚了。
+
+> 与原版的对应：原版的 `true` 是「保留缓存的那张」，也就是这里的 `ctx.reuse()`；原版的
+> 空 body 是「删掉缓存、用自签的」，也就是这里的 `true`。原版把「保留」和「作废」分别绑在
+> `true` 和「什么都不返回」上（`lib/https/load-cert.js:31-53`），于是**出错**和**明确表态**
+> 走进了同一个分支。这里把两件事拆开命名，语义一一对应，但拼法不同。
+
+### 证书缓存
+
+代理会记住每个 `servername` 上**哪个插件**给过哪张证书，下次握手时把 `certCacheName` /
+`certCacheTime` 告诉那个插件 —— 这就是 `ctx.reuse()` 存在的理由：证书是几 KB 的 PEM，
+而握手期客户端正等着。
+
+缓存是**按插件隔离**的：另一个插件的规则命中同一个名字时，既看不到 `certCacheName`，
+`reuse()` 也拿不到别人的证书。
+
+什么时候变：
+
+- 插件给出**能用**的证书 → 写入；
+- 插件说 `ctx.reuse()` → 读取；
+- 插件说 `true`（或没话说）→ **作废** —— 这是插件主动收回它给过的证书；
+- 插件**问不到**（连不上 / 超时 / 非 200）→ 不动，而且这次握手就用缓存里那张。一个本地
+  进程重启不该改变一个活着的客户端正在看到的证书。
+
+### 出错了会怎样 —— 以及为什么这是一次**政策选择**
+
+**结论先说：任何失败都退回「whistle-rs 自签的那张证书」**，也就是和没有这条规则时一模一样，
+日志里留一行 `WARN` 写清是哪个插件、哪个名字。畸形的证书材料（PEM 解析不了、key 和 cert
+不配对）同样如此 —— rustls 在**采用之前**就会拒绝它，所以一个乱答的插件弄不垮监听器。
+
+这一条与本项目其它安全相关路径的取向**不一致**，所以要把理由摆出来：坏掉的认证门是拦截，
+失败的 PAC 是 502，源站 TLS 默认校验 —— 都是 fail closed。这里没有照做，是因为「closed」
+在这个位置有**两个方向相反**的读法：
+
+- *不要拿出运维没有批准的证书* → 失败就该**停止拦截**（等同于插件说了 `false`）；
+- *不要悄悄停止抓取运维要求抓的流量* → 失败就该**照常拦截**，用本来就会用的那张证书。
+
+whistle-rs 选了后者，理由有两条：退回去的那张证书是**它自己的**、由用户亲手装进信任库的
+根签的 —— 它不是第三方的身份，而且给每一个别的主机拿出来的正是这张；另一条是，选前者会让
+一次插件重启在抓包里凿出一个**看起来完全正常**的洞。原版落在同一处
+（`loadCert` 的错误分支保留缓存、否则落到自签，`lib/plugins/index.js:245-247`）。
+
+**如果你的部署需要另一种读法**（插件挂了就不拦截、让流量原样过去），今天做不到 —— 这不是
+可配置项。这一条记在[边界](#证书钩子的边界)里，而不是假装它不存在。
+
+注意这与认证钩子并不矛盾：认证钩子是一道**门**，坏掉的门必须关上；证书钩子不是门，它退回去
+的是一个**默认值**，没有任何检查因此被放过。
+
+### 代价
+
+握手在**每一条 HTTPS 连接**的关键路径上，所以这里的开销分两笔算：**重构本身**的，和
+**插件往返**的。
+
+重构的部分是：ClientHello 现在由代理先读一遍（用 rustls 自己的解析器），再把原样的字节
+交还给真正的握手。也就是说 rustls 会解析两次 ClientHello。这一次解析单独量出来是
+**1.6–2.0µs**（244 字节的 hello，release 构建）：
+
+```
+$ cargo test --release -- --ignored --nocapture bench::client_hello_peek_cost
+ClientHello: 244 bytes
+Reading one ClientHello  (5000 samples per row)
+  configuration                mean        p50        p95    vs. first
+  copy the bytes only      358.0ns   375.0ns   500.0ns       +0.0ns
+  peek (parse + copy)        2.0µs     2.1µs     2.8µs       +1.6µs
+```
+
+放回一次真实握手里（四种配置在同一个循环里轮转，客户端和代理都在本机）：
+
+```
+$ cargo test --release -- --ignored --nocapture bench::tls_handshake_latency
+TLS handshake through the SNI stage  (400 samples per row)
+  configuration                mean        p50        p95    vs. first
+  eager (pre-change)       173.1µs   170.3µs   188.1µs       +0.0ns
+  read + replay, no parse  173.0µs   170.1µs   187.4µs      -53.0ns
+  peek + replay            173.7µs   170.7µs   190.5µs     +612.0ns
+  peek + rule miss         174.1µs   171.6µs   189.2µs     +994.0ns
+  peek + rust plugin       175.3µs   172.0µs   190.2µs       +2.2µs
+```
+
+三件事：
+
+1. **第一行是硬要求。** 没有 `sniCallback://` 规则的连接与加这个钩子之前**一模一样** ——
+   规则文件里有没有这个协议名，是每个规则组一个**解析期就算好的 `bool`**，答案是「没有」时
+   连插件注册表都不会碰。第二行（只读不解析）说明「读一次 + 回放」这层管道本身在噪声里。
+2. **解析那一次约 +0.6µs（p50）**，对着一个 170µs 的握手 —— 密钥交换和签名才是这里的钱。
+3. **进程内 Rust 插件约 +2.2µs**；换成 Node 插件要再加一次本机 HTTP 往返（约 +0.2ms，与
+   本文其它远程钩子同价），**每条连接一次**，不是每请求、更不是每帧。
+
+端到端对着**基线二进制**（`fcda35b`）复核过同一件事：同一个根 CA、同一个源站，一条没有规则
+的连接在两个二进制上拿到的证书 subject / issuer / SAN / 有效期完全相同，响应逐字节相同，
+握手延迟 p50 0.445ms vs 0.447ms。
+
+### 实测
+
+三条连接穿过**真的二进制**（`--node-plugin certs=examples/plugins/sni-certs.js`），
+源站是一个自己有证书的 Node HTTPS server，规则按端口区分三种情形：
+
+```
+--- rules ---
+localhost:19443   sniCallback://certs(mine)
+localhost:19444   sniCallback://certs
+
+--- the three connections ---
+[1] sniCallback://certs(mine)   the plugin supplies a certificate
+   SNI sent    localhost
+   subject     CN=localhost,O=whistle-rs sniCallback example
+   issuer      CN=localhost,O=whistle-rs sniCallback example
+   response    HTTP/1.1 200 OK  {"origin":true,"port":19443,"url":"/hello",…}
+
+[2] sniCallback://certs         the plugin declines interception
+   SNI sent    localhost
+   subject     CN=localhost,O=THE REAL ORIGIN
+   issuer      CN=localhost,O=THE REAL ORIGIN
+   response    HTTP/1.1 200 OK  {"origin":true,"port":19444,"url":"/hello",…}
+
+[3] no rule                     control, untouched
+   SNI sent    localhost
+   subject     CN=localhost
+   issuer      CN=whistle-rs Root CA,O=whistle-rs
+   response    HTTP/1.1 200 OK  {"origin":true,"port":19445,"url":"/hello",…}
+
+--- what the proxy captured ---
+   200 GET https://localhost:19445/hello
+   200 GET https://localhost:19443/hello
+```
+
+三张证书各不相同，而且**第二条拿到的是源站自己的那张** —— 那正是「没被拦截」长什么样。
+抓取列表里也只有 19443 和 19445 两条：被放弃的那条连接对代理自始至终是一团密文。
+三条请求都是 `200`，也就是说「不拦截」不是「断开」。
+
+### 传输：一次 JSON 往返
+
+和缓冲钩子同一条线：`POST /sni`，JSON 进 JSON 出。理由很直接 —— 这个钩子搬的是**几个标量
+和一小份文档**，没有流、没有分帧问题要解决，`pipe://` 和帧钩子各自发明传输是因为它们有；
+这个没有。它与别的钩子的差别在**什么时候跑**，不在搬多少东西。
+
+单位是**一条连接**，不是一个请求，也不是一帧 —— 这一族里最便宜的成本模型。应答上限 72 KB
+（与原版 `MAX_CERT_SIZE` 同值），超过就当没答；超时 5 秒，与认证钩子同一个预算。
+
+### 为什么这曾被记成「架构不可达」
+
+路线图里长期写着：MITM acceptor 在 SNI 阶段按域名构建、早于按请求的规则解析，因此不可达。
+**描述属实，结论不成立** —— 那描述的是当时的代码，不是架构。真正的障碍只有一个：
+`sniCallback` 的 `false` 意味着「把这条连接原样中继出去」，而那要求**已经被读走的
+ClientHello 字节还能拿回来**。
+
+`tokio-rustls` 的 `LazyConfigAcceptor` 能在 ClientHello 之后插入任意异步工作，四种返回值里
+它能满足三种；唯独 `false` 不行 —— 它接管 socket 之后不再交还，也没有任何 rustls API 能
+复现它吃掉的字节，被插件拒绝的连接就只能被丢掉，而那不是「拒绝」的意思。
+
+所以字节由代理自己读、留着、再回放：拦截时回放给 rustls，不拦截时回放给源站。解析仍然是
+rustls 的（`rustls::server::Acceptor` 当成纯解析器用完就扔），这里没有一个字节的 TLS 是由
+自己写的代码解释的。原版从同一个约束走到同一个安排（自己 peek 第一个 chunk、自己解析 SNI、
+拒绝时 `next(chunk)` 放回去，`lib/https/index.js:1281-1308`）。
+
+代价就是上面那 0.6µs。
+
+### Rust 插件
+
+```rust
+fn manifest(&self) -> PluginManifest {
+    PluginManifest { sni: true, ..PluginManifest::none(self.name()) }
+}
+
+fn sni(&self, _req: &SniReq) -> SniVerdict {
+    SniVerdict::Bypass
+}
+```
+
+内置的 `sniCallback://no-mitm` 就是这么实现的 —— 那张不需要证书的答案，也是别处给不出的
+那一个。
+
+---
+
 ## 统计钩子 / `onReqStats` / `onResStats`
 
 告诉插件「有什么东西过去了」。**发完不管**：应答被丢弃，请求路径上没有任何东西等它。
@@ -684,6 +918,10 @@ fn ui(&self, req: &UiReq) -> UiResp {
 
 ## 执行顺序
 
+HTTPS 的话，第 0 步发生在**连接**上而不是请求上：CONNECT（或 SOCKS）之后、任何请求存在之前，
+代理读 ClientHello，按 `https://<其中的名字>` 解析 `sniCallback://` 规则，握手才开始。
+这一步说「不拦截」，下面这一整张表就都不会发生 —— 那条连接对代理是一团密文。
+
 一次请求里发生的事，按顺序：
 
 1. 规则解析 → 得到本次请求的规则集
@@ -725,6 +963,10 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 **认证钩子是唯一的例外**：它失败就拦截，见 [失败即拦截](#失败即拦截fail-closed)。SDK 里的
 `onAuth` 抛异常会返回 `500`（而不是像其它钩子那样返回 `200 {}`），代理据此给出 `502`。
 
+**证书钩子的降级方向是一次政策选择**，不是实现细节：它失败时连接**照常被拦截**，用代理本来
+就会生成的那张证书。为什么不像认证钩子那样 fail closed，见
+[出错了会怎样](#出错了会怎样--以及为什么这是一次政策选择)。
+
 ---
 
 ## 内置 Rust 插件
@@ -739,6 +981,7 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 | `pipe://upper` | 把 body 逐帧转大写，演示**流式钩子**（请求、响应两个方向都接） |
 | `pipe://ws-upper` | 把 WebSocket 文本帧转大写，演示**帧钩子**（双向；二进制与分片不碰） |
 | `plugin://gate[/<令牌>]` | 校验 `x-gate-token`，演示**认证 + 统计 + 页面**三个钩子 |
+| `sniCallback://no-mitm` | 对命中的主机**放弃拦截**，演示**证书钩子**（不需要任何证书材料） |
 
 > `plugin://gate` **默认拦截** —— 没有 `x-gate-token` 就是 `401`。同名的自定义插件
 > （`--node-plugin gate=…`）会覆盖内置的这一个，覆盖方向是「用户的赢」。
@@ -762,7 +1005,7 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
   "name": "my-plugin",
   "version": "1.0.0",
   "hooks": ["request", "response", "pipeRequest", "pipeResponse", "wsFrame",
-            "auth", "reqStats", "resStats", "ui"],
+            "auth", "sni", "reqStats", "resStats", "ui"],
   "requestBody": false,
   "responseBody": true
 }
@@ -825,6 +1068,35 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 - 拦截时 `redirect` > `url` > `html`（与原版读取顺序一致），`statusCode` 只接受 `300`–`599`。
 - **`200` 且正文为空、或 `204`/`304`** —— 放行。
 - **其它任何情况（连不上、超时 5 秒、非 200、正文不是 JSON 对象）—— 拦截**，`502`。
+
+### `POST /sni` —— 挑证书
+
+在一条被拦截的 TLS 连接的握手期发出，**每条连接一次**。请求体里没有任何请求上下文，
+因为那时还没有请求：
+
+```json
+{ "servername": "api.example.com", "value": "staging",
+  "tunnelHost": "api.example.com", "port": 443, "clientIp": "127.0.0.1",
+  "certCacheName": "certs", "certCacheTime": 1737849600 }
+```
+
+`certCacheName` / `certCacheTime` 只在代理手上有**这个插件**给过的证书时出现。
+
+应答 `200`，四种形状：
+
+```json
+{"intercept": true}                        // 用 whistle-rs 自签的那张
+{"intercept": false}                       // 不拦截，原样中继
+{"key": "…", "cert": "…", "mtime": 0}      // 用这张（PEM，两个字段都必须非空）
+{"reuse": true}                            // 用这个插件上次给的那张
+```
+
+裸的 JSON `true` / `false` 等价于前两种（原版就是这么写在线上的）。
+
+- **`204`/`304`/空 body/认不出的字段** —— 「没话说」，等同于 `{"intercept": true}`。
+- **连不上、超时 5 秒、非 200、正文超过 72 KB、PEM 不合法或 key 与 cert 不配对** ——
+  一律退回自签的那张（有缓存时用缓存的），并留一行 `WARN`。理由见
+  [出错了会怎样](#出错了会怎样--以及为什么这是一次政策选择)。
 
 ### `POST /stats` —— 统计（发完不管）
 
@@ -999,6 +1271,27 @@ whistle-rs --plugin name=127.0.0.1:9000
   （原版的 `MENU_URL` / `INSPECTOR_URL`）。
 - **不能从 UI 路由升级 WebSocket。**
 
+### 证书钩子的边界
+
+- **失败的方向不可配置** —— 插件挂了就是「用自签的证书照常拦截」。想要相反的读法
+  （插件挂了就不拦截）今天没有开关。理由见
+  [出错了会怎样](#出错了会怎样--以及为什么这是一次政策选择)，但**这是一次政策选择，
+  不是一条物理定律** —— 换一种部署可能需要另一个答案。
+- **被放弃的连接不经过任何规则** —— `false` 之后是一条直连到「隧道开到的那个地址」的
+  中继。本移植没有针对不透明隧道的规则管线，所以 `proxy://`、`host://` 对它不生效。
+  原版的 `next(chunk)` 会汇入它自己的隧道处理，那里还能再匹配一轮规则。
+- **拿不到 ClientHello 的其余部分** —— 钩子只被告知 servername。ALPN 提议、cipher 列表、
+  扩展列表都不在 `ctx` 里。加进去很容易，但至今没有哪个用例需要它。
+- **不能换 ALPN，也不能要求客户端证书** —— 插件给的是一张证书，不是一份 `ServerConfig`。
+  代理用同一套条件把它端出去（`h2` + `http/1.1`），因为「挑一张证书」不该悄悄改变这条连接
+  上每个请求怎么被代理。
+- **一个 servername 一次决定** —— 判决作用于整条连接。同一条连接上后续请求的 `Host` 头
+  再怎么变，证书都已经定了。
+- **没有并发去重** —— 同一个名字上同时来 N 条连接就是 N 次插件调用。原版会把它们合并到
+  一个回调列表里（`certCallbacks`，`lib/https/load-cert.js:26-29,:60-67`）；这里靠证书
+  缓存把稳态摊平，但第一波并发不会被合并。
+- **只作用于被拦截的 TLS** —— 明文隧道没有 ClientHello，转发代理请求没有握手。
+
 ### 统计钩子的边界
 
 - **不保证送达，也不保证顺序** —— 这是「发完不管」的定义，不是缺陷。
@@ -1008,5 +1301,4 @@ whistle-rs --plugin name=127.0.0.1:9000
 
 ### 其它
 
-- **`sniCallback`** —— 需要在 TLS SNI 阶段介入选证书，早于按请求的规则解析，当前 MITM 架构不可达。
 - **npm `whistle.*` 包兼容** —— 明确的非目标，见本文开头。

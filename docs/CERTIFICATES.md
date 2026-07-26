@@ -132,15 +132,44 @@ and you'll see the injected header appear — proof the tunnel was decrypted.
 ## How it works
 
 1. The client sends `CONNECT example.com:443` to the proxy.
-2. whistle-rs replies `200`, upgrades the socket, and **TLS-accepts** it using a leaf
-   certificate for `example.com` signed on the fly by the root CA (cached per host).
-3. The now-decrypted request is matched against your rules and forwarded to the real
+2. whistle-rs replies `200`, upgrades the socket, and reads the client's
+   **ClientHello** — without consuming it, so the same bytes can still start a
+   handshake afterwards.
+3. It **TLS-accepts** the connection using a leaf certificate for the name the
+   ClientHello asked for, signed on the fly by the root CA (cached per host).
+4. The now-decrypted request is matched against your rules and forwarded to the real
    server over a **new** TLS connection. The upstream SNI and certificate check use
    the **original** hostname even if a `host://` rule changed the destination IP, so
    real servers still see a valid handshake.
 
-Implementation: `src/ca.rs` (CA + signing) and `src/proxy/mod.rs` (`handle_connect`,
-`mitm_serve`).
+Implementation: `src/ca.rs` (CA + signing), `src/proxy/sni.rs` (the ClientHello and
+the certificate decision) and `src/proxy/mod.rs` (`handle_connect`, `serve_tunnel`).
+
+### Which name the certificate is for
+
+Step 3 signs for the name in the **ClientHello**, not the address the tunnel was
+opened to, because the ClientHello name is the one the client will check. The two
+are the same almost always, and where they are not, using the tunnel's address
+produced a certificate the client rejected:
+
+```
+$ curl --socks5 127.0.0.1:1080 https://localhost:9443/     # curl resolves the name itself
+   certificate served: subject=CN=127.0.0.1  san=IP Address:127.0.0.1   <- before
+   certificate served: subject=CN=localhost  san=DNS:localhost          <- now
+```
+
+`--socks5` (as opposed to `--socks5-hostname`) makes curl resolve DNS and open the
+tunnel to an address, while its ClientHello still asks for the hostname. A client
+that pins an IP does the same thing over `CONNECT`. When the client sends no SNI at
+all — an old client, or a connection to a literal IP — the tunnel's own address is
+still the fallback, which is what it always was.
+
+### Letting a plugin choose
+
+A `sniCallback://` rule hands step 3 to a plugin, which may supply its own
+certificate or decline the interception entirely (leaving the connection encrypted
+end to end). See [`RULES.md`](RULES.md#choosing-the-mitm-certificate) and
+[`PLUGINS.md`](PLUGINS.md#证书钩子--snicallback).
 
 ---
 

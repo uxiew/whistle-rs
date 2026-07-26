@@ -29,16 +29,18 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/apply.rs` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations |
 | `src/proxy/template.rs` | `lib/handlers/file-proxy.js` (`render`) | `tpl`/`dust`/`jsonp` two-pass rendering + `${var}` variables |
 | `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation) |
+| `src/proxy/sni.rs` | `lib/https/index.js:1281`, `lib/https/load-cert.js` | The SNI stage: peek the ClientHello, pick the certificate, or relay the connection untouched |
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
 | `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
 | `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks |
 | `src/proxy/webui.rs` | `biz/webui` | Built-in web UI + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
 | `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
-| `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`, `upper`, `ws-upper`, `gate`) |
+| `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`, `upper`, `ws-upper`, `gate`, `no-mitm`) |
 | `src/plugins/pipe.rs` | `lib/util/transproto.js` | Streaming body transport (`pipe://`), chunked HTTP rather than upstream's framing |
 | `src/plugins/wsframe.rs` | `load-plugin.js` (ws hooks) | Per-frame WebSocket transport, one long-lived record-framed connection per direction |
 | `src/plugins/auth.rs` | `load-plugin.js:1746`, `plugins/index.js:831` | Auth gate — fails **closed**: a broken gate is 502, a refusal 403 |
 | `src/plugins/ui.rs` | `biz/webui/lib/index.js:466` | `/plugin/<name>/…` served from the plugin's own pages |
+| `src/plugins/sni.rs` | `plugins/index.js:228`, `load-plugin.js:1841` | `sniCallback` — the certificate a connection is served, or no interception at all |
 | `src/plugins/stats.rs` | `plugins/index.js:1369` | Fire-and-forget per-phase stats |
 | `sdk/whistle-rs-plugin.js` | `lib/plugins/load-plugin.js` | Zero-dependency JS/TS plugin SDK (+ `.d.ts` types) |
 | `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
@@ -56,9 +58,12 @@ client ── TCP ──▶ hyper http1 serve_connection ──▶ top_level(req
 handle_connect     serve(Forward)                serve(Forward)   local_ui
    │ 200 + upgrade     │                              │            (status page,
    ▼                   │                              │             /rootCA.crt)
-mitm_serve             │                              │
+serve_tunnel           │                              │
+   │ peek ClientHello  │                              │
+   ├─ sni::decide ─ "do not intercept" ──▶ sni::relay (opaque, no rules)
    │ TLS-accept        │                              │
-   │ (leaf cert)       │                              │
+   │ (leaf for the SNI,│                              │
+   │  or a plugin's)   │                              │
    ▼                   ▼                              ▼
 serve(Mitm) ──────────────────────────────────────────
         │

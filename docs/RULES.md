@@ -799,6 +799,45 @@ to transform an *upstream* response. Upstream would run them, since it establish
 response pipes for every matched plugin regardless of which one produced the bytes; the
 divergence is the remaining half of this gap.
 
+### Choosing the MITM certificate
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `sniCallback` | `name[(value)]` | Ask a plugin which certificate to present for an intercepted TLS connection — or whether to intercept it at all |
+
+```
+api.example.com      sniCallback://certs(staging)
+pinned.example.com   sniCallback://no-mitm
+```
+
+This operator is resolved at a different time from every other one on this page:
+during the **TLS handshake**, before there is a request. So it matches on the one
+thing that exists by then — the name in the client's ClientHello, as
+`https://<that name>` — plus the client's address and port. There is no method,
+no path, no header and no body, so a filter that asks about any of those never
+matches an `sniCallback` line.
+
+The plugin can answer four ways: present whistle-rs's own generated certificate,
+present one of its own, reuse the one it supplied last time, or **decline the
+interception entirely** — in which case the connection is relayed to the origin
+still encrypted and nothing about it is captured. Writing the plugin is covered
+in [`PLUGINS.md`](PLUGINS.md#证书钩子--snicallback); the built-in
+`sniCallback://no-mitm` needs no plugin at all and always declines.
+
+Three consequences worth knowing:
+
+- **The port is part of the pattern**, because the URL the rule matches carries
+  it: `localhost:9443 sniCallback://certs` and `localhost:9444 …` are different
+  rules, even though the ClientHello is identical.
+- **A declined connection is not proxied by any rule.** whistle-rs has no
+  rule pipeline for an opaque tunnel, so the relay goes straight to the address
+  the tunnel was opened to — a `proxy://` or `host://` line does not apply to it.
+- **A failing plugin does not decline.** Unreachable, slow or incomprehensible
+  all mean "the certificate whistle-rs would have generated anyway", with a
+  `WARN` naming the plugin. See
+  [`PLUGINS.md`](PLUGINS.md#证书钩子--snicallback) for why this one hook does not
+  fail closed the way `onAuth` does.
+
 ### Scripting
 
 | Operator | Value | Effect |
@@ -1241,7 +1280,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Short-circuit / flags | `redirect`, `location`, `locationHref`, `statusCode` mock, `enable`, `disable` |
 | Local file / template | `file`, `rawfile`, `tpl`, `jsonp`, `dust`, and their `x`/`xs` fallback variants (`xfile`, `xrawfile`, …) |
 | Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
-| TLS | `cipher` (upstream TLS version pin) |
+| TLS | `cipher` (upstream TLS version pin), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
 **Rule-file features:** a line `@<url>` or `@<file>` includes rules fetched/read from
@@ -1335,11 +1374,10 @@ This mirrors upstream exactly, including its sharp edge: a `#` inside a URL
 fragment is also treated as a comment, so `example.com/a#b file:///x` loses the
 `#b`.
 
-### Parsed but not applied (3)
+### Parsed but not applied (2)
 
 | Operator(s) | Why / note |
 |-------------|-----------|
-| `sniCallback` | JS hook at SNI time to choose the MITM certificate — resolved before per-request rules, and needs the Node plugin loader |
 | `G` | Global-rule marker (a rule-precedence concept, not a per-request traffic effect) |
 | `style` | Rule colour in whistle's rule list — the built-in UI is a plain editor with no per-rule rendering |
 

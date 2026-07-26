@@ -43,6 +43,8 @@
 | tee 抓取开销剖析 | ✅ 每帧约 6.5 ns、过上限即常数、端到端不可测；见 [`ARCHITECTURE.md`](ARCHITECTURE.md#what-the-capture-costs) |
 | 预览解码器内存修复 | ✅ 剖析查出：解压缓冲随 capture 滞留在 500 条 session 环里，现于预览填满 / tee drop 时释放 |
 | clippy 零告警 + 门禁 | ✅ 54 → 0；`[lints.clippy] all = "deny"` 覆盖全部 target |
+| `sniCallback` 证书钩子 | ✅ 握手期读 ClientHello 并回放；插件可自带证书或**拒绝拦截**；曾被误记为架构不可达 |
+| MITM 证书按 SNI 签发 | ✅ 修正：此前按 CONNECT 权威地址签，两者不同时握手直接失败 |
 
 ---
 
@@ -65,7 +67,11 @@
       （`POST /ws/frames`），逐帧一进一出；控制帧不交付，帧类型与分片结构不可改，
       插件出错只丢钩子不丢连接。实测每帧约 38µs（p50），不挂插件的会话零开销。
 - [x] ~~**更多插件钩子**：`uiServer`/`statsServer`、`auth`~~ → 已完成，见
-      [`PLUGINS.md`](PLUGINS.md)。`sniCallback` 仍受架构限制，单列于下。
+      [`PLUGINS.md`](PLUGINS.md)。
+- [x] ~~**`sniCallback`**~~ → 已完成，见 [`PLUGINS.md`](PLUGINS.md#证书钩子--snicallback)。
+      握手期由插件挑证书，四种答案（自签 / 自带 / 复用 / **不拦截**），
+      规则按 `https://<ClientHello 里的名字>` 匹配。此前被记成「架构不可达」，
+      那条记录是错的 —— 详见下方 [架构受限](#架构受限rustls--mitm-时序)。
 
 ### 规则解析（本轮审计修复）
 
@@ -305,8 +311,28 @@
 
 ### 架构受限（rustls / MITM 时序）
 
-- [ ] **`sniCallback`** —— 在 TLS SNI 阶段用插件选证书。我们的 MITM acceptor 在 SNI 阶段
-      按域名构建，早于按请求的规则解析，且需插件运行时在该时点介入；当前架构下不可达。
+- [x] ~~**`sniCallback`** —— 在 TLS SNI 阶段用插件选证书。我们的 MITM acceptor 在 SNI 阶段
+      按域名构建，早于按请求的规则解析，且需插件运行时在该时点介入；当前架构下不可达。~~
+      → **这条判断是错的，现已实现**，见 [`PLUGINS.md`](PLUGINS.md#证书钩子--snicallback)。
+      本条不是「后来做到了」，而是**当初就不该这么记**：它描述的是当时的代码
+      （`acceptor_for(host)` 从 CONNECT 权威地址**急切**构建），不是架构的约束。
+      `tokio-rustls` 的 `LazyConfigAcceptor` 一直提供着 ClientHello 之后插入异步工作的接口。
+
+      真正存在的障碍只有一个，而且比记的那个窄得多：`sniCallback` 的 `false` 意思是
+      「这条连接原样中继出去」，那要求**已经被读走的 ClientHello 字节还能拿回来**，而
+      `LazyConfigAcceptor` 接管 socket 之后不再交还。所以字节改由代理自己读、留着、再回放
+      （拦截时回放给 rustls，不拦截时回放给源站），解析仍然用 `rustls::server::Acceptor`。
+      原版从同一个约束走到同一个安排（`lib/https/index.js:1281-1308`）。
+
+      代价量过：ClientHello 多解析一次，**p50 +0.6µs**，对着一个 170µs 的握手；没有
+      `sniCallback://` 规则的连接一个 `bool` 就退出，与基线二进制逐字节相同。
+- [x] ~~MITM 证书按 **CONNECT 权威地址**签发，而不是客户端 ClientHello 里的名字~~ →
+      **已修**（与上一条同批）。两者不一致时旧行为是**握手直接失败**：客户端校验的是它
+      自己要的名字。自己做 DNS 解析的 SOCKS5 客户端就会踩到 ——
+      `curl --socks5`（区别于 `--socks5-hostname`）把隧道开到 `127.0.0.1`，ClientHello 里
+      仍然要 `localhost`，于是拿到一张 `CN=127.0.0.1 / SAN=IP:127.0.0.1` 的证书。
+      现在按 ClientHello 里的名字签，客户端没发 SNI 时才退回隧道地址 ——
+      也就是上游的 `useSNI || socket.tunnelHostname`（`lib/https/index.js:1281-1296`）。
 - [ ] **`cipher` 扩展** —— rustls 只暴露 TLS 1.2/1.3、不接受 OpenSSL cipher 字符串，故只支持
       版本固定（已实现），无法完整对齐 Node 的 TLS 选项。
 
@@ -361,10 +387,14 @@
 ## 参与
 
 规则/筛选/上游层的对齐清单至此清空：**每一个会解析的筛选器条件都能求值**，
-每一条会产生响应的出口都跑响应期算子。真正被架构挡住的只剩 **`sniCallback`** ——
-它要在 TLS SNI 阶段挑证书，早于按请求的规则解析，当前 MITM 结构够不着。
-已知的剩余小口子有一处：插件自己的响应钩子（`POST /response` / `pipe://`）在
-「插件直接应答」这条出口上不触发，上游会触发。
+每一条会产生响应的出口都跑响应期算子。**`sniCallback` 也不再是缺口** —— 它曾被记成
+「架构不可达」，而那条记录经核查是错的：障碍不在架构，在于当时的 acceptor 构建得太早。
+现在 ClientHello 由代理先读、保留、再回放，插件因而能在握手期挑证书，甚至拒绝拦截。
+
+被架构真正挡住的只剩 `cipher://` 的完整 OpenSSL 语义（rustls 不暴露 cipher 字符串）。
+已知的剩余小口子有两处：插件自己的响应钩子（`POST /response` / `pipe://`）在
+「插件直接应答」这条出口上不触发，上游会触发；以及 `sniCallback` 说「不拦截」之后的那条
+中继是直连的 —— 本移植没有针对不透明隧道的规则管线，`proxy://` / `host://` 对它不生效。
 
 模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
 插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，
