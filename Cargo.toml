@@ -3,6 +3,13 @@ name = "whistle-rs"
 version = "0.1.0"
 edition = "2024"
 
+# `cargo clippy --all-targets` is expected to be silent, and a regression should
+# fail rather than scroll past. This table covers every target in the package
+# (lib, bin, tests), which a crate-root `#![deny]` in lib.rs would not — main.rs
+# is its own crate. `cargo build` is unaffected: rustc never evaluates these.
+[lints.clippy]
+all = "deny"
+
 [dependencies]
 anyhow = "1.0.103"
 base64 = "0.22.1"
