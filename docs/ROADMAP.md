@@ -56,8 +56,8 @@
       [`PLUGINS.md`](PLUGINS.md#websocket-帧钩子--onwsframe)。每会话每方向一条长连接
       （`POST /ws/frames`），逐帧一进一出；控制帧不交付，帧类型与分片结构不可改，
       插件出错只丢钩子不丢连接。实测每帧约 38µs（p50），不挂插件的会话零开销。
-- [ ] **更多插件钩子**：`uiServer`/`statsServer`（插件自带 UI/统计页）、`auth`、
-      `sniCallback`。
+- [x] ~~**更多插件钩子**：`uiServer`/`statsServer`、`auth`~~ → 已完成，见
+      [`PLUGINS.md`](PLUGINS.md)。`sniCallback` 仍受架构限制，单列于下。
 
 ### 规则解析（本轮审计修复）
 
@@ -132,7 +132,6 @@
       （`is_protocol` 要查 `canonical`），因此这四条规则不产生任何代理算子、请求**直连**
       —— **失败开放**，已实测（改前 200 直连，改后按规则走代理）。现按上游 `PROXY_RE`
       的 `x?` 前缀从 `UPSTREAM_PROXY_PROTOCOLS` 推导，不再手写。
-- [ ] `xhost://` 的直连回退（`retryXHost`，`res.js:571-600`）未实现。
 
 > 未改动并记录：上游把根 CA 密钥复用为每张叶证书的密钥（`ca.js:203-260`），
 > 本移植为每张叶证书新生成密钥 —— **严格更强**，故不对齐。
