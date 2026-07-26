@@ -1399,11 +1399,6 @@ Known gaps in the operator layer, deliberately left:
   them. They are *skipped* rather than run as JavaScript — the script whistle-rs
   executes is the first entry not spelled `resRules://`, which is the one
   upstream executes too.
-- **`attachment://` with no value** cannot derive a filename from the request URL
-  yet — it emits a bare `Content-Disposition: attachment` where upstream would say
-  `filename="report.csv"`. Give the name explicitly to be sure.
-- **`resCors` cannot echo the request's `Origin` or recognise a preflight** on the
-  live path for the same reason; the explicit forms (`*`, a URL, `methods=…`) work.
 - **Injected text is UTF-8.** whistle re-encodes it into the response's declared
   charset; a `charset=gbk` page will see mojibake in the injected fragment.
 - **`params://` into a body is buffered, not streamed.** whistle rewrites a
