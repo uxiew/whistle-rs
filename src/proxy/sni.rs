@@ -126,10 +126,13 @@ where
         if prefix.len() >= MAX_HELLO_BYTES {
             return Hello { prefix, server_name: None };
         }
-        let mut chunk = [0u8; PEEK_CHUNK];
-        match stream.read(&mut chunk).await {
+        // Straight into the buffer's spare capacity: a stack array here would be
+        // zeroed on every pass *and* would make this future — which is held for
+        // the life of the connection — carry it.
+        prefix.reserve(PEEK_CHUNK);
+        match stream.read_buf(&mut prefix).await {
             Ok(0) | Err(_) => return Hello { prefix, server_name: None },
-            Ok(n) => prefix.extend_from_slice(&chunk[..n]),
+            Ok(_) => {}
         }
     }
 }

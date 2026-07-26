@@ -634,3 +634,267 @@ fn proxied_request_latency() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// What reading the ClientHello costs.
+// ---------------------------------------------------------------------------
+
+/// A plugin that answers the certificate hook with "no opinion", in process.
+///
+/// It is here to price the *dispatch* — the rule resolution, the manifest check,
+/// the call — with nothing on the other side of it. A remote plugin adds one
+/// local HTTP round trip on top, which is the same price every other remote hook
+/// in this system pays and is measured with those.
+struct SilentSni;
+
+impl crate::plugins::RustPlugin for SilentSni {
+    fn name(&self) -> &str {
+        "bench-sni"
+    }
+
+    fn manifest(&self) -> crate::plugins::PluginManifest {
+        crate::plugins::PluginManifest {
+            sni: true,
+            ..crate::plugins::PluginManifest::none(self.name())
+        }
+    }
+
+    fn sni(
+        &self,
+        _req: &crate::plugins::sni::SniReq,
+    ) -> crate::plugins::sni::SniVerdict {
+        crate::plugins::sni::SniVerdict::Generated
+    }
+
+    fn on_request(&self, _req: &crate::plugins::PluginReq) -> crate::plugins::PluginResult {
+        crate::plugins::PluginResult::default()
+    }
+}
+
+/// The name every handshake in these benchmarks asks for.
+const BENCH_SNI: &str = "bench.example.com";
+
+/// How an intercepted connection's TLS is set up.
+#[derive(Clone, Copy)]
+enum Setup {
+    /// The pre-change path: build the acceptor from the tunnel's hostname and
+    /// hand rustls the socket.
+    Eager,
+    /// Read the ClientHello first, replay it into the handshake. No
+    /// `sniCallback://` rule exists, so the decision is one `bool`.
+    Peek,
+    /// As above, with an `sniCallback://` rule in the file that does not match
+    /// this connection — the flag is set, so the rules actually resolve.
+    RuleMiss,
+    /// A matching rule, dispatched to an in-process plugin that has no opinion.
+    Plugin,
+    /// One socket read and the replay wrapper, with no ClientHello parse at
+    /// all. It separates what the *plumbing* of the restructure costs from what
+    /// rustls parsing the hello a second time costs.
+    RawRead,
+}
+
+fn bench_state(
+    setup: Setup,
+    dir: &std::path::Path,
+    ca: Arc<CertAuthority>,
+) -> Arc<super::AppState> {
+    let label = match setup {
+        Setup::Eager => "eager",
+        Setup::Peek => "peek",
+        Setup::RuleMiss => "miss",
+        Setup::Plugin => "plugin",
+        Setup::RawRead => "rawread",
+    };
+    let config = Config {
+        storage_dir: dir.join(label),
+        persist_sessions: false,
+        ..Config::default()
+    };
+    let mut rules = RuleManager::new();
+    match setup {
+        Setup::Eager | Setup::Peek | Setup::RawRead => {}
+        Setup::RuleMiss => rules.set_text("somewhere.else sniCallback://bench-sni"),
+        Setup::Plugin => rules.set_text("bench.example.com sniCallback://bench-sni"),
+    }
+    let mut plugins = crate::plugins::Plugins::new();
+    plugins.register_rust(Box::new(SilentSni));
+    Arc::new(super::AppState::with_plugins(config, rules, ca, plugins))
+}
+
+/// Serve one handshake the way `serve_tunnel` would under `setup`.
+async fn bench_accept(setup: Setup, state: &Arc<super::AppState>, stream: TcpStream) {
+    // A fixed address rather than `peer_addr()`: the real caller already has it,
+    // so charging this measurement a syscall the proxy does not make would be
+    // measuring the harness.
+    let peer: std::net::SocketAddr = "127.0.0.1:51234".parse().unwrap();
+    if let Setup::Eager = setup {
+        let acceptor = state.ca.acceptor_for(BENCH_SNI).expect("acceptor");
+        acceptor.accept(stream).await.ok();
+        return;
+    }
+    let mut stream = stream;
+    // The plumbing on its own: read once, replay, hand rustls the socket.
+    if let Setup::RawRead = setup {
+        let mut prefix = Vec::with_capacity(8192);
+        tokio::io::AsyncReadExt::read_buf(&mut stream, &mut prefix).await.ok();
+        let s = super::sni::Prefixed::new(prefix, stream);
+        let acceptor = state.ca.acceptor_for(BENCH_SNI).expect("acceptor");
+        acceptor.accept(s).await.ok();
+        return;
+    }
+    let hello = super::sni::peek_client_hello(&mut stream).await;
+    let has_sni = hello.server_name.is_some();
+    let name = hello.server_name.unwrap_or_else(|| BENCH_SNI.to_string());
+    let stream = super::sni::Prefixed::new(hello.prefix, stream);
+    let acceptor = match super::sni::decide(state, &name, &name, 443, peer, has_sni).await {
+        super::sni::Decision::Generated => state.ca.acceptor_for(&name).expect("acceptor"),
+        super::sni::Decision::Plugin(a) => a,
+        super::sni::Decision::Bypass => return,
+    };
+    acceptor.accept(stream).await.ok();
+}
+
+/// What the restructure costs a real TLS handshake.
+///
+/// The question this answers is narrow on purpose: reading the ClientHello
+/// ourselves means rustls parses it twice, and this says what that is worth
+/// against the key exchange and signature that follow. Four configurations run
+/// round robin inside one loop, so a scheduler hiccup lands on all of them.
+#[test]
+#[ignore = "measurement, not an assertion; needs --release"]
+fn tls_handshake_latency() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = std::env::temp_dir().join(format!("whistle-rs-sni-bench-{}", std::process::id()));
+
+    rt.block_on(async {
+        let setups = [Setup::Eager, Setup::RawRead, Setup::Peek, Setup::RuleMiss, Setup::Plugin];
+        let labels = [
+            "eager (pre-change)",
+            "read + replay, no parse",
+            "peek + replay",
+            "peek + rule miss",
+            "peek + rust plugin",
+        ];
+        // One CA for every configuration: separate roots would put a different
+        // certificate on each row and measure the client's verifier as much as
+        // the server's SNI stage.
+        let ca_config = Config {
+            storage_dir: dir.join("ca"),
+            persist_sessions: false,
+            ..Config::default()
+        };
+        let ca = CertAuthority::load_or_create(&ca_config).expect("root CA");
+        ca.acceptor_for(BENCH_SNI).expect("warm the cert cache");
+
+        let mut ports = Vec::new();
+        for setup in setups {
+            let state = bench_state(setup, &dir, ca.clone());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            ports.push(listener.local_addr().unwrap().port());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let _ = sock.set_nodelay(true);
+                    let state = state.clone();
+                    tokio::spawn(async move { bench_accept(setup, &state, sock).await });
+                }
+            });
+        }
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.root_cert_der()).expect("trust the root");
+        let mut cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        // Every row serves the same name, so a ticket from one server would be
+        // offered to the next. Resuming half the time and not the other half is
+        // not a difference between these configurations.
+        cfg.resumption = rustls::client::Resumption::disabled();
+        let client_cfg = Arc::new(cfg);
+
+        let mut runs: Vec<Samples> = labels.iter().map(|l| Samples::new(l)).collect();
+        let iterations = 400usize;
+        for i in 0..iterations + 20 {
+            for k in 0..ports.len() {
+                let slot = (i + k) % ports.len();
+                let name = rustls::pki_types::ServerName::try_from(BENCH_SNI).unwrap();
+                // The TCP connection is set up outside the timed region: an
+                // ephemeral port and a SYN exchange are the same for every row,
+                // and at this sample count they are the loudest thing in it.
+                let sock = TcpStream::connect(("127.0.0.1", ports[slot]))
+                    .await
+                    .expect("connect");
+                let _ = sock.set_nodelay(true);
+                let start = Instant::now();
+                tokio_rustls::TlsConnector::from(client_cfg.clone())
+                    .connect(name, sock)
+                    .await
+                    .expect("handshake");
+                let dt = start.elapsed();
+                if i >= 20 {
+                    runs[slot].times.push(dt);
+                }
+            }
+        }
+        report("TLS handshake through the SNI stage", None, &runs);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The ClientHello parse on its own, with no socket and no handshake around it.
+///
+/// This is the honest price of the restructure: everything else in the
+/// handshake is unchanged, so whatever this costs is what a connection with no
+/// `sniCallback://` rule now pays that it did not before. The first row is the
+/// same loop without the parse, so the harness itself is subtracted out.
+#[test]
+#[ignore = "measurement, not an assertion; needs --release"]
+fn client_hello_peek_cost() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        // A real ClientHello, produced by rustls rather than hand-written.
+        let cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from(BENCH_SNI).unwrap();
+        let mut conn = rustls::ClientConnection::new(Arc::new(cfg), name).expect("client");
+        let mut hello = Vec::new();
+        conn.write_tls(&mut hello).expect("hello");
+        println!("\nClientHello: {} bytes", hello.len());
+
+        let mut runs = vec![Samples::new("copy the bytes only"), Samples::new("peek (parse + copy)")];
+        for i in 0..5_000 + 200 {
+            for k in 0..2 {
+                let slot = (i + k) % 2;
+                let start = Instant::now();
+                if slot == 0 {
+                    let mut cursor = std::io::Cursor::new(hello.clone());
+                    let mut sink = Vec::new();
+                    tokio::io::AsyncReadExt::read_to_end(&mut cursor, &mut sink)
+                        .await
+                        .expect("read");
+                    std::hint::black_box(sink);
+                } else {
+                    let mut cursor = std::io::Cursor::new(hello.clone());
+                    let peeked = super::sni::peek_client_hello(&mut cursor).await;
+                    assert_eq!(peeked.server_name.as_deref(), Some(BENCH_SNI));
+                    std::hint::black_box(peeked.prefix);
+                }
+                let dt = start.elapsed();
+                if i >= 200 {
+                    runs[slot].times.push(dt);
+                }
+            }
+        }
+        report("Reading one ClientHello", None, &runs);
+    });
+}
