@@ -98,6 +98,26 @@ fn take_https_marker(headers: &mut hyper::HeaderMap) -> bool {
     }
 }
 
+/// Request header saying "the Web UI replayed this" — whistle's
+/// `config.FROM_COM_HEADER` (`'x-whistle-composer-<uid>'`,
+/// `_original/lib/config.js:93`), the marker behind `from:composer`.
+///
+/// Sent by [`webui::do_replay`] on the loopback hop through our own port and
+/// consumed here, so it reaches neither the rules' header conditions nor the
+/// origin — whistle deletes its own the same way
+/// (`parseClientInfo`, `_original/lib/util/index.js:3391-3396`). The name is
+/// fixed rather than per-process for the same reason the internal marker's is:
+/// a stable one is what lets a client exercise the condition deliberately.
+pub const COMPOSER_REQ_HEADER: &str = "x-whistle-composer";
+
+/// Strip the composer marker, reporting whether it was present.
+fn take_composer_marker(headers: &mut hyper::HeaderMap) -> bool {
+    match headers.remove(COMPOSER_REQ_HEADER) {
+        Some(v) => !v.is_empty(),
+        None => false,
+    }
+}
+
 /// Maximum number of captured WebSocket frames kept in memory (across all
 /// connections). Whistle surfaces every frame; we keep a bounded ring buffer.
 const MAX_FRAMES: usize = 2000;
@@ -664,8 +684,15 @@ enum Origin {
     /// A normal absolute-form forward-proxy request.
     Forward,
     /// A request seen inside an intercepted tunnel (CONNECT or SOCKS). `tls`
-    /// indicates the tunnel was TLS-decrypted (scheme https) vs. plain (http).
-    Mitm { host: String, port: u16, tls: bool },
+    /// indicates the tunnel was TLS-decrypted (scheme https) vs. plain (http);
+    /// `sni` says the ClientHello named a server, which is what `from:sni`
+    /// asks (`checkSNI`, `_original/lib/https/index.js:1281`).
+    Mitm {
+        host: String,
+        port: u16,
+        tls: bool,
+        sni: bool,
+    },
 }
 
 /// Start the proxy and serve until the process exits.
@@ -794,14 +821,21 @@ where
     if tls {
         let acceptor = state.ca.acceptor_for(&host)?;
         let tls_stream = acceptor.accept(stream).await?;
-        let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        let conn = tls_stream.get_ref().1;
+        let is_h2 = conn.alpn_protocol() == Some(b"h2");
+        // Read once, off the completed handshake: whether the client named a
+        // server in its ClientHello. Costs nothing — rustls already parsed it to
+        // pick a certificate.
+        let sni = conn.server_name().is_some();
         if is_h2 {
-            serve_intercepted_h2(state, TokioIo::new(tls_stream), host, port, peer).await
+            serve_intercepted_h2(state, TokioIo::new(tls_stream), host, port, peer, sni).await
         } else {
-            serve_intercepted(state, TokioIo::new(tls_stream), host, port, peer, true).await
+            serve_intercepted(state, TokioIo::new(tls_stream), host, port, peer, true, sni).await
         }
     } else {
-        serve_intercepted(state, TokioIo::new(stream), host, port, peer, false).await
+        // No handshake, so no SNI — a plain-HTTP tunnel is `from:tunnel` but
+        // never `from:sni`.
+        serve_intercepted(state, TokioIo::new(stream), host, port, peer, false, false).await
     }
 }
 
@@ -813,6 +847,7 @@ async fn serve_intercepted_h2<I>(
     host: String,
     port: u16,
     peer: SocketAddr,
+    sni: bool,
 ) -> Result<()>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -823,6 +858,7 @@ where
             host: host.clone(),
             port,
             tls: true,
+            sni,
         };
         async move { Ok::<_, Infallible>(guard(serve(state, req, origin, peer).await)) }
     });
@@ -834,6 +870,7 @@ where
 }
 
 /// Run the HTTP/1.1 server over an already-prepared tunnel IO.
+#[allow(clippy::too_many_arguments)]
 async fn serve_intercepted<I>(
     state: Arc<AppState>,
     io: I,
@@ -841,6 +878,7 @@ async fn serve_intercepted<I>(
     port: u16,
     peer: SocketAddr,
     tls: bool,
+    sni: bool,
 ) -> Result<()>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -851,6 +889,7 @@ where
             host: host.clone(),
             port,
             tls,
+            sni,
         };
         async move { Ok::<_, Infallible>(guard(serve(state, req, origin, peer).await)) }
     });
@@ -1193,6 +1232,9 @@ async fn serve(
     // Consumed here too: an upstream whistle stripped this request's TLS for the
     // hop, and the scheme it arrived under is not the one the rules should see.
     let was_https = take_https_marker(req.headers_mut());
+    // Consumed here too, and for the same reason: it is this proxy's own marker,
+    // not the client's, so nothing downstream may see it.
+    let from_composer = take_composer_marker(req.headers_mut());
 
     // Derive scheme/host/port/path for matching.
     let (scheme, host, port, path) = match &origin {
@@ -1214,7 +1256,7 @@ async fn serve(
                 .unwrap_or_else(|| "/".to_string());
             (scheme, host, port, path)
         }
-        Origin::Mitm { host, port, tls } => {
+        Origin::Mitm { host, port, tls, .. } => {
             let path = req
                 .uri()
                 .path_and_query()
@@ -1236,6 +1278,14 @@ async fn serve(
     );
     // The accepted socket's port, for `clientPort:` / `remotePort:` filters.
     info.client_port = Some(peer.port());
+    // Where the request came from, for `from:`. All of it is known before the
+    // rules resolve — which is what makes `from:!tunnel` a real answer rather
+    // than a filter that fails closed.
+    info.from = crate::rules::ReqOrigin {
+        tunnel: matches!(origin, Origin::Mitm { .. }),
+        sni: matches!(origin, Origin::Mitm { sni: true, .. }),
+        composer: from_composer,
+    };
 
     // A `b:` filter reads the request body, so the body has to be in hand
     // *before* the rules resolve. Whether any line asks is answered from the
@@ -2482,3 +2532,52 @@ mod local_response_tests {
         assert_eq!(body, Bytes::from_static(b"base+more"));
     }
 }
+
+#[cfg(test)]
+mod req_origin_tests {
+    use super::*;
+
+    /// The composer marker is consumed exactly like the internal one: the rules'
+    /// header conditions, the plugins, the capture and the origin must never see
+    /// this proxy's own bookkeeping. whistle deletes its `FROM_COM_HEADER` on
+    /// arrival for the same reason (`_original/lib/util/index.js:3391-3396`).
+    #[test]
+    fn the_composer_marker_is_consumed() {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(COMPOSER_REQ_HEADER, "1".parse().unwrap());
+        assert!(take_composer_marker(&mut h));
+        assert!(h.get(COMPOSER_REQ_HEADER).is_none());
+
+        assert!(!take_composer_marker(&mut hyper::HeaderMap::new()));
+        let mut h = hyper::HeaderMap::new();
+        h.insert(COMPOSER_REQ_HEADER, "".parse().unwrap());
+        assert!(!take_composer_marker(&mut h));
+        assert!(h.get(COMPOSER_REQ_HEADER).is_none());
+    }
+
+    /// `from:tunnel` and `from:sni` are read off the origin, and they are not the
+    /// same fact: a tunnel carrying plain HTTP has no ClientHello to have named a
+    /// server, and a forward-proxy request has no tunnel.
+    #[test]
+    fn the_origin_decides_tunnel_and_sni() {
+        let of = |origin: &Origin| crate::rules::ReqOrigin {
+            tunnel: matches!(origin, Origin::Mitm { .. }),
+            sni: matches!(origin, Origin::Mitm { sni: true, .. }),
+            composer: false,
+        };
+        let mitm = |tls, sni| Origin::Mitm {
+            host: "example.com".into(),
+            port: 443,
+            tls,
+            sni,
+        };
+        assert_eq!(of(&mitm(true, true)), crate::rules::ReqOrigin {
+            tunnel: true, sni: true, composer: false,
+        });
+        assert_eq!(of(&mitm(false, false)), crate::rules::ReqOrigin {
+            tunnel: true, sni: false, composer: false,
+        });
+        assert_eq!(of(&Origin::Forward), crate::rules::ReqOrigin::default());
+    }
+}
+

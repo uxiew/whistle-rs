@@ -729,6 +729,10 @@ async fn do_replay(
             builder = builder.header(n, v);
         }
     }
+    // Mark the hop as the Composer's, so a `from:composer` rule can tell a
+    // replay from the traffic it was captured from. Consumed on arrival, like
+    // whistle's own `FROM_COM_HEADER` — see `proxy::COMPOSER_REQ_HEADER`.
+    builder = builder.header(super::COMPOSER_REQ_HEADER, "1");
     let req = builder
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();

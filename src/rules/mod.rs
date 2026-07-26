@@ -289,7 +289,9 @@ pub struct Filter {
     /// key (`reqH.x-tag!:v`) inverts the condition
     /// (`_original/lib/rules/rules.js:1565,1652`).
     ///
-    /// It only ever inverts a *known* answer — see [`Cond::Deferred`].
+    /// It only ever inverts a *known* answer: a condition this port cannot
+    /// evaluate leaves an include filter unsatisfied *and* an exclude filter
+    /// inert, however it is written (`matcher::filter_holds`).
     pub negate: bool,
     pub cond: Cond,
 }
@@ -375,13 +377,54 @@ pub enum Cond {
     /// case-**sensitive** and the value is compared by containment, like a
     /// header's.
     Env { name: String, value: CondValue },
+    /// `from:tunnel` — where the request came from. See [`FromMarker`].
+    From(FromMarker),
     /// A URL pattern, written exactly like a rule's own pattern (regexp,
     /// wildcard, or scheme/host/path prefix). This is the fallback for anything
     /// that is not a recognised condition name.
     Url(Pattern),
-    /// Recognised, but the fact it tests does not exist while rules are being
-    /// resolved. Never matches; see [`Deferred`].
-    Deferred(Deferred),
+}
+
+/// The origin markers `from:` accepts (`_original/lib/rules/rules.js:1834-1859`).
+///
+/// whistle lowercases the value at parse time (`value = value.toLowerCase()`,
+/// `rules.js:1610`) and then compares it against a fixed list. One entry on that
+/// list is `'internalPath'`, which no lowercased value can ever equal — the
+/// branch is dead upstream, and `from:internalPath` is [`Self::Unknown`] here
+/// for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FromMarker {
+    /// Out of an intercepted tunnel — [`ReqOrigin::tunnel`].
+    Tunnel,
+    /// From the Web UI's replay — [`ReqOrigin::composer`].
+    Composer,
+    /// The TLS handshake carried an SNI — [`ReqOrigin::sni`].
+    Sni,
+    /// Recognised by whistle, and a known **false** in this port: `test` needs
+    /// whistle's test header, which this port neither sends nor honours, and
+    /// the three server markers need the *extra* HTTP/HTTPS listeners whistle
+    /// can open beside its proxy port (`config.httpPort`/`httpsPort`,
+    /// `_original/lib/index.js:96-111`), which this port does not have. On a
+    /// whistle started without them the answer is the same `false`, so
+    /// `from:!httpserver` holds in both.
+    NeverHere,
+    /// Anything else. Upstream's chain ends in `return false` *before* it
+    /// consults `filter.not`, so an unrecognised marker satisfies no filter
+    /// however it is written — which is what [`Cond`] reports by answering
+    /// "unknown".
+    Unknown,
+}
+
+impl FromMarker {
+    fn parse(value: &str) -> FromMarker {
+        match value.to_ascii_lowercase().as_str() {
+            "tunnel" => FromMarker::Tunnel,
+            "composer" => FromMarker::Composer,
+            "sni" => FromMarker::Sni,
+            "test" | "httpserver" | "httpsserver" | "httpsport" => FromMarker::NeverHere,
+            _ => FromMarker::Unknown,
+        }
+    }
 }
 
 impl Cond {
@@ -422,18 +465,6 @@ impl Cond {
                 }
         )
     }
-}
-
-/// Conditions this port parses but cannot answer at all.
-///
-/// Rather than let such a condition fall through to the URL-pattern fallback —
-/// where it would be a nonsense regexp that quietly matches nothing (or, worse,
-/// something) — it is parsed, recorded, and evaluated as "unknown", which makes
-/// its filter fail closed. `docs/RULES.md` lists what each one would need.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Deferred {
-    /// `from:` — needs the request's origin flags (tunnel, composer, SNI, …).
-    From,
 }
 
 /// The right-hand side of a filter condition.
@@ -537,6 +568,34 @@ pub struct ReqInfo {
     /// (`_original/lib/rules/rules.js:1903-1906`). See
     /// [`RuleManager::needs_request_body`] for who decides.
     pub req_body: Option<String>,
+    /// Where the request came from, for the `from:` condition — see
+    /// [`ReqOrigin`].
+    pub from: ReqOrigin,
+}
+
+/// The origin markers `from:` tests (`_original/lib/rules/rules.js:1834-1859`).
+///
+/// whistle stamps these on the request as it arrives, so all of them are known
+/// by the time rules resolve. That makes `from:` a *known* answer in both
+/// directions: `from:!tunnel` holds for a request that did not come through one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReqOrigin {
+    /// The request arrived inside a tunnel this proxy intercepted (CONNECT or
+    /// SOCKS), rather than as a plain forward-proxy request.
+    ///
+    /// whistle reaches the same conclusion the long way round: after decrypting
+    /// a tunnel it re-injects its own client-info header into the request bytes
+    /// and feeds them back to its HTTP server (`addClientInfo`,
+    /// `_original/lib/https/index.js:1203-1210`), and it is that header that
+    /// sets `req.fromTunnel` (`parseClientInfo`, `lib/util/index.js:3397-3410`).
+    pub tunnel: bool,
+    /// The intercepted TLS handshake carried an SNI extension — whistle's
+    /// `useSNI` (`checkSNI`, `_original/lib/https/index.js:1281,:1296`).
+    /// False for a plain-HTTP tunnel and for a forward-proxy request.
+    pub sni: bool,
+    /// The request was replayed from the built-in Web UI — whistle's Composer
+    /// (`FROM_COM_HEADER`, `_original/lib/util/index.js:3391-3396`).
+    pub composer: bool,
 }
 
 impl ReqInfo {
@@ -1207,8 +1266,8 @@ enum CondKind {
     Body,
     /// `env:` — one of whistle's own process environment variables.
     Env,
-    /// Recognised, but unanswerable here — see [`Deferred`].
-    Later(Deferred),
+    /// `from:` — one of whistle's origin markers.
+    From,
 }
 
 /// Every condition spelling whistle understands: `(name, kind, props, pure)`.
@@ -1263,7 +1322,7 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("remoteAddress", CondKind::RemoteAddress, true, true),
     ("remotePort", CondKind::RemotePort, true, true),
     ("env", CondKind::Env, true, true),
-    ("from", CondKind::Later(Deferred::From), true, true),
+    ("from", CondKind::From, true, true),
 ];
 
 /// `Some(excludes)` when `proto` is one of the filter operators.
@@ -1420,7 +1479,10 @@ fn build_cond(kind: CondKind, rest: &str) -> Option<(Cond, bool)> {
                 negate != key_negate,
             ));
         }
-        CondKind::Later(what) => Cond::Deferred(what),
+        // The value is a bare word, not a pattern: whistle lowercases it and
+        // compares it against a fixed list (`_original/lib/rules/rules.js:1608-1611`),
+        // so `/re/` is not accepted here as it is elsewhere.
+        CondKind::From => Cond::From(FromMarker::parse(rest)),
     };
     Some((cond, negate))
 }
@@ -2135,17 +2197,31 @@ mod filter_parse_tests {
         ));
     }
 
-    /// Every condition this port still cannot answer at all is recognised, so
-    /// it cannot be mistaken for a URL pattern.
+    /// `from:` takes a bare word out of a fixed list, and anything else is an
+    /// [`FromMarker::Unknown`] that satisfies no filter — never a URL pattern.
     #[test]
-    fn deferred_conditions_are_recognised() {
-        let cases = [("filter://from:composer", Deferred::From)];
+    fn from_markers_parse_to_their_fixed_list() {
+        let cases = [
+            ("filter://from:tunnel", FromMarker::Tunnel),
+            ("filter://from:Composer", FromMarker::Composer),
+            ("filter://from:sni", FromMarker::Sni),
+            ("filter://from:test", FromMarker::NeverHere),
+            ("filter://from:httpsPort", FromMarker::NeverHere),
+            // Upstream lowercases the value, so its own `internalPath` branch
+            // is unreachable — reproduced rather than fixed.
+            ("filter://from:internalPath", FromMarker::Unknown),
+            ("filter://from:nonsense", FromMarker::Unknown),
+        ];
         for (token, want) in cases {
             match cond_of(token).cond {
-                Cond::Deferred(got) => assert_eq!(got, want, "{token}"),
+                Cond::From(got) => assert_eq!(got, want, "{token}"),
                 other => panic!("{token} parsed as {other:?}"),
             }
         }
+        // `!` still lands on the filter, not on the marker.
+        let f = cond_of("filter://from:!tunnel");
+        assert!(f.negate);
+        assert!(matches!(f.cond, Cond::From(FromMarker::Tunnel)));
     }
 
     /// `b:` / `body:` and `env:` are now answered rather than deferred.

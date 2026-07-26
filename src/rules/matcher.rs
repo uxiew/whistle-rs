@@ -11,8 +11,8 @@
 //! * multi-match protocols accumulate every matching value in order
 
 use super::{
-    Cond, CondValue, Filter, HeaderScope, Pattern, ReqInfo, Resolved, Rule, RuleOp, order_key,
-    protocols,
+    Cond, CondValue, Filter, FromMarker, HeaderScope, Pattern, ReqInfo, Resolved, Rule, RuleOp,
+    order_key, protocols,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -173,7 +173,7 @@ fn filter_holds(f: &Filter, req: &ReqInfo, assume_body: bool) -> bool {
 }
 
 /// Evaluate one condition. `None` means "not knowable" — either the fact has no
-/// equivalent here at all ([`crate::rules::Deferred`]) or it belongs to the
+/// equivalent here at all (an unrecognised [`FromMarker`]) or it belongs to the
 /// response and this is the request phase, where [`ReqInfo::res`] is `None`.
 fn cond_holds(cond: &Cond, req: &ReqInfo, assume_body: bool) -> Option<bool> {
     match cond {
@@ -222,7 +222,18 @@ fn cond_holds(cond: &Cond, req: &ReqInfo, assume_body: bool) -> Option<bool> {
             Ok(actual) => value.matches_header(&actual),
             Err(_) => false,
         }),
-        Cond::Deferred(_) => None,
+        // Where the request came from. Every marker whistle recognises is a
+        // *known* answer here, so `from:!tunnel` holds for a request that did
+        // not come through one; an unrecognised marker satisfies no filter
+        // however it is written, which is upstream's `return false` reached
+        // before it consults `filter.not` (`rules.js:1858`).
+        Cond::From(marker) => match marker {
+            FromMarker::Tunnel => Some(req.from.tunnel),
+            FromMarker::Composer => Some(req.from.composer),
+            FromMarker::Sni => Some(req.from.sni),
+            FromMarker::NeverHere => Some(false),
+            FromMarker::Unknown => None,
+        },
     }
 }
 
@@ -1740,3 +1751,86 @@ mod body_filter_tests {
     }
 }
 
+
+#[cfg(test)]
+mod from_tests {
+    use super::*;
+    use crate::rules::{ReqOrigin, RuleManager};
+
+    fn req_from(from: ReqOrigin) -> ReqInfo {
+        ReqInfo {
+            method: "GET".into(),
+            scheme: "https".into(),
+            host: "example.com".into(),
+            port: 443,
+            path: "/".into(),
+            full_url: "https://example.com/".into(),
+            from,
+            ..Default::default()
+        }
+    }
+
+    fn tagged(rules: &str, from: ReqOrigin) -> bool {
+        let mut m = RuleManager::new();
+        m.set_text(rules);
+        m.resolve(&req_from(from)).value("resHeaders").is_some()
+    }
+
+    /// The three markers this port can answer, in both directions. whistle
+    /// applies `filter.not` inline for a recognised marker
+    /// (`_original/lib/rules/rules.js:1835-1857`), so the negated spellings are
+    /// real answers rather than filters that fail closed.
+    #[test]
+    fn the_answerable_markers_hold_both_ways() {
+        let tunnel = ReqOrigin { tunnel: true, sni: true, composer: false };
+        let forward = ReqOrigin::default();
+        let composer = ReqOrigin { composer: true, ..Default::default() };
+
+        let rule = |m: &str| format!("example.com resHeaders://x=1 includeFilter://from:{m}\n");
+        assert!(tagged(&rule("tunnel"), tunnel));
+        assert!(!tagged(&rule("tunnel"), forward));
+        assert!(!tagged(&rule("!tunnel"), tunnel));
+        assert!(tagged(&rule("!tunnel"), forward));
+
+        assert!(tagged(&rule("sni"), tunnel));
+        // A plain-HTTP tunnel is `from:tunnel` without being `from:sni`.
+        assert!(!tagged(&rule("sni"), ReqOrigin { tunnel: true, ..Default::default() }));
+
+        assert!(tagged(&rule("composer"), composer));
+        assert!(!tagged(&rule("composer"), forward));
+    }
+
+    /// The markers whistle recognises that are structurally absent here are a
+    /// known **false**, not an unknown: this port opens no extra HTTP/HTTPS
+    /// server ports and honours no test header, which is the same state a
+    /// whistle started without them is in. So `from:!httpserver` holds.
+    #[test]
+    fn the_structurally_absent_markers_are_a_known_false() {
+        for marker in ["test", "httpserver", "httpsserver", "httpsport"] {
+            let yes = format!("example.com resHeaders://x=1 includeFilter://from:{marker}\n");
+            let no = format!("example.com resHeaders://x=1 includeFilter://from:!{marker}\n");
+            assert!(!tagged(&yes, ReqOrigin::default()), "from:{marker}");
+            assert!(tagged(&no, ReqOrigin::default()), "from:!{marker}");
+        }
+    }
+
+    /// An unrecognised marker satisfies no filter however it is written —
+    /// upstream's chain ends in `return false` before it looks at `filter.not`.
+    /// `internalPath` is one of them: whistle lowercases the value, so its own
+    /// branch for it is unreachable.
+    #[test]
+    fn an_unknown_marker_never_matches_and_never_excludes() {
+        for marker in ["internalPath", "nonsense"] {
+            for spelling in [marker.to_string(), format!("!{marker}")] {
+                let include =
+                    format!("example.com resHeaders://x=1 includeFilter://from:{spelling}\n");
+                assert!(!tagged(&include, ReqOrigin::default()), "include from:{spelling}");
+                // …and as an exclude filter it is equally inert, so the rule
+                // still applies.
+                let exclude =
+                    format!("example.com resHeaders://x=1 excludeFilter://from:{spelling}\n");
+                assert!(tagged(&exclude, ReqOrigin::default()), "exclude from:{spelling}");
+            }
+        }
+    }
+}
