@@ -391,7 +391,16 @@ pub async fn relay<S>(mut client: Prefixed<S>, host: &str, port: u16) -> Result<
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut origin = TcpStream::connect((host, port)).await?;
+    let mut origin = match TcpStream::connect((host, port)).await {
+        Ok(s) => s,
+        // Louder than the caller's `debug`: a plugin deliberately asked for this
+        // connection to be passed through, so failing to pass it through is not
+        // the routine "a client went away" this path otherwise sees.
+        Err(e) => {
+            tracing::warn!("sniCallback: relaying to {host}:{port} failed: {e}");
+            return Err(e.into());
+        }
+    };
     origin.set_nodelay(true).ok();
     tokio::io::copy_bidirectional(&mut client, &mut origin).await?;
     Ok(())
@@ -701,6 +710,32 @@ mod tests {
             assert!(plugin.paths().is_empty(), "the plugin was contacted: {:?}", plugin.paths());
             assert!(!state.rules.read().unwrap().has_sni_callback());
         });
+    }
+
+    /// The flag is a cache, so it has to be rebuilt every time the rules are.
+    /// A stale `false` would silently disable the hook; a stale `true` would put
+    /// a rule resolution back inside every handshake.
+    #[test]
+    fn editing_the_rules_updates_the_flag() {
+        let mut mgr = crate::rules::RuleManager::new();
+        assert!(!mgr.has_sni_callback());
+        mgr.set_text("a.com sniCallback://certs");
+        assert!(mgr.has_sni_callback());
+        mgr.set_text("a.com resHeaders://x=1");
+        assert!(!mgr.has_sni_callback(), "the rule was edited away");
+        mgr.append_text("b.com sniCallback://certs");
+        assert!(mgr.has_sni_callback(), "appended into the default group");
+
+        // A second group, and the enabled flag it is read through.
+        let mut mgr = crate::rules::RuleManager::new();
+        mgr.add_group("extra", "c.com sniCallback://certs", true);
+        assert!(mgr.has_sni_callback());
+        mgr.toggle_group("extra");
+        assert!(!mgr.has_sni_callback(), "a disabled group does not choose certificates");
+        mgr.toggle_group("extra");
+        assert!(mgr.has_sni_callback());
+        mgr.update_group("extra", "c.com resHeaders://x=1");
+        assert!(!mgr.has_sni_callback(), "the group's text was replaced");
     }
 
     /// A rule that exists but matches a different name is the same answer, and

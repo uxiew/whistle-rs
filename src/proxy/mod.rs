@@ -954,7 +954,9 @@ where
         let is_h2 = conn.alpn_protocol() == Some(b"h2");
         // Read once, off the completed handshake: whether the client named a
         // server in its ClientHello. Costs nothing — rustls already parsed it to
-        // pick a certificate.
+        // pick a certificate. Deliberately not taken from `has_sni` above, so
+        // `from:sni` keeps answering off the handshake rustls actually
+        // completed, exactly as it did before the peek existed.
         let sni = conn.server_name().is_some();
         if is_h2 {
             serve_intercepted_h2(state, TokioIo::new(tls_stream), host, port, peer, sni).await

@@ -1290,6 +1290,8 @@ whistle-rs --plugin name=127.0.0.1:9000
 - **没有并发去重** —— 同一个名字上同时来 N 条连接就是 N 次插件调用。原版会把它们合并到
   一个回调列表里（`certCallbacks`，`lib/https/load-cert.js:26-29,:60-67`）；这里靠证书
   缓存把稳态摊平，但第一波并发不会被合并。
+- **被放弃的连接不会出现在抓取列表里** —— 它对代理是密文，没有请求、没有帧可记。
+  只有日志里那一行 `INFO sniCallback <plugin>: not intercepting <name>`。
 - **只作用于被拦截的 TLS** —— 明文隧道没有 ClientHello，转发代理请求没有握手。
 
 ### 统计钩子的边界
