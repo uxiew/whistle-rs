@@ -171,11 +171,23 @@ list** at parse time, and applies essentially all of the common operators at run
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `host` | `ip` / `ip:port` / `host:port` / `:port` | Rewrite the upstream destination. The **Host header and TLS SNI keep the original hostname**, only the socket destination changes. `:port` keeps the host, changes the port. |
+| `xhost` | as `host` | The **pass-through** spelling: the address is used when it works and *ignored* when the connection cannot be made, where `host://` fails the request. |
 
 ```
 api.example.com   host://127.0.0.1:9000
 .example.com      host://:8443            # same host, force port 8443
+api.example.com   xhost://127.0.0.1:9000  # …unless nothing is listening there
 ```
+
+`xhost://` retries **once**, against the host and port the request actually asked for,
+and only when the connection could not be *established* — once the request has been
+written to a socket it cannot be replayed, which is the same guard the `x`-prefixed
+[proxy spellings](#upstream-proxy) carry (`retryXHost`,
+`_original/lib/inspectors/res.js:571-600`). A request with any proxy rule never takes
+this path: whistle checks the proxy rule first and the host rule in its `else if`, so
+the connection that failed was to the proxy. Upstream retries the dead address once
+before consulting DNS (`if (retryXHost > 1)`, where `>= 1` was surely meant); this port
+skips that wasted attempt.
 
 ### Upstream proxy
 
@@ -478,6 +490,7 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 | Host | `host:<v>`, `host=<v>` | request host |
 | Request body | `b:<v>`, `body:<v>` | the request body **contains** `<v>` — see [the body condition](#the-body-condition) |
 | Environment | `env:<KEY>=<v>` | whistle's own process environment variable `<KEY>` contains `<v>`. The key is case-**sensitive**, and only `=` separates it |
+| Origin | `from:<marker>`, `from=<marker>` | where the request came from — see [origin markers](#origin-markers) |
 | Sampling | `chance:<p>`, `chance:<n>%`, `probability:` | a random fraction of requests (`Math.random() < p`) |
 | URL | anything else | the full request URL, using the same pattern engine as a rule's own [pattern](#patterns) — regexp, wildcard or prefix |
 
@@ -577,10 +590,18 @@ the file that pulled them in resolved, in both passes. Cost per response: ~7 ns 
 nothing merged, ~9 ns for a merged text with no response-dependent line, ~250 ns for one
 that has one.
 
-**Not covered by the second pass:** WebSocket and tunnelled (`CONNECT`) traffic have no
-response phase here. Neither do the three paths that answer without touching the
-response operators at all — a `plugin://` that answered the request itself, a self-loop
-redirect, and an `enable://abort` — which is equally true of the top-level rules.
+**Covered on every path that produces a response**, including the two that do not go
+upstream: a `plugin://` hook that answered the request, and a short-circuit rule
+(`file://`, `tpl://`, `redirect://`, `statusCode://`). Both are resolved against the
+head as produced, before any operator has touched it — so `s:404` sees the plugin's own
+404, not the `replaceStatus://200` on the same line. whistle reaches its response
+inspectors on both paths too: a `plugin://` rule is a proxy hop to the plugin's own
+server, so the answer arrives as an ordinary response
+(`_original/lib/inspectors/res.js:825`).
+
+**Not covered:** WebSocket and tunnelled (`CONNECT`) traffic have no response phase
+here. Neither do the two paths that produce no response of their own — a self-loop
+redirect and an `enable://abort` — which is equally true of the top-level rules.
 
 `serverIp:` is answered from the **connected socket**, so a named origin is answered too:
 the address is read back off the connection rather than guessed by asking the resolver a
@@ -627,18 +648,47 @@ Unlike upstream there is no ceiling on how much is buffered: whistle stops at
 `MAX_REQ_SIZE` (2 MB, or 16 MB under `reqMergeBigData`) and matches against the
 prefix.
 
-#### Conditions that still cannot be evaluated
+#### Origin markers
 
-These are **parsed and recognised**, so they are never mistaken for a URL pattern, but
-they evaluate to "unknown". Upstream's `getFilterResult`
-(`_original/lib/rules/rules.js:1809`) turns an unknown answer into `false` *before* it
-consults `!`, and this port does the same: an include filter is never satisfied, an
-exclude filter never fires, and no `!` can flip either. The subsystem fails closed —
-in the request phase this is also how every response condition above behaves.
+`from:` takes a bare word out of a fixed list — not a pattern, and not a `/re/`:
+whistle lowercases the value and compares it (`_original/lib/rules/rules.js:1608-1611,
+:1834-1859`). Every marker is known before the rules resolve, so the negated spellings
+are real answers rather than filters that fail closed.
 
-| Condition | Would need |
+| Marker | True when |
 |---|---|
-| `from:<v>` | the request's origin flags (`tunnel`, `composer`, `sni`, …), which the proxy layer knows but does not pass to the matcher |
+| `tunnel` | the request came out of a tunnel this proxy intercepted — a `CONNECT`, or a SOCKS connection |
+| `sni` | the intercepted TLS handshake named a server. A tunnel carrying plain HTTP is `tunnel` without being `sni` |
+| `composer` | the built-in Web UI replayed the request (the ↻ button / `POST /api/replay`) |
+| `test`, `httpserver`, `httpsserver`, `httpsport` | never, here — see below |
+
+```
+example.com  resHeaders://x-src=tunnel  includeFilter://from:tunnel
+example.com  statusCode://403           includeFilter://from:!composer
+```
+
+The last four are recognised and answer a known **`false`**, so `from:!httpserver`
+holds. `test` needs whistle's test header, which this port neither sends nor honours;
+the three server markers need the extra HTTP/HTTPS listeners whistle can open beside
+its proxy port (`config.httpPort`/`httpsPort`, `_original/lib/index.js:96-111`), which
+this port does not have. A whistle started without them answers the same `false`.
+
+`from:composer` is marked with an `x-whistle-composer` request header on the loopback
+hop, consumed on arrival so it reaches neither a `reqH.` condition nor the origin. Like
+`x-whistle-internal-req` ([`LINE_PROPS.md`](LINE_PROPS.md)) the name is fixed rather than
+per-process: the marker labels traffic, it does not guard anything, and a stable name
+is what lets a client exercise the condition deliberately.
+
+Two upstream behaviours are **reproduced rather than fixed**:
+
+- `from:internalPath` never matches. whistle lowercases the value before comparing, so
+  its own `'internalPath'` branch cannot be reached.
+- an unrecognised marker satisfies no filter **however it is written**. Upstream's chain
+  ends in `return false` before it consults `!`, so `from:!nonsense` is false too. Here
+  that is modelled as an "unknown" answer, which leaves an include filter unsatisfied
+  and an exclude filter inert.
+
+Every other condition this port parses now evaluates.
 
 #### Remaining divergences from upstream
 
@@ -732,6 +782,22 @@ plugins here are any HTTP server.)
 ```
 api.example.com   plugin://mock
 ```
+
+A plugin that answers the request is **not** the last word: the response operators on
+the line still run over its answer, and so does the [response phase](#the-response-phase)
+— the same as for the origin's answer, and the same as upstream, where a `plugin://`
+rule is a proxy hop to the plugin's own server and its answer comes back through the
+ordinary response inspectors (`_original/lib/inspectors/res.js:825`).
+
+```
+api.example.com   plugin://mock  resHeaders://x-mocked=1  replaceStatus://503
+```
+
+Not covered on that path: the plugins' own response hooks (`POST /response` and the
+streaming `pipe://` ones), which are still skipped when a plugin answered — they exist
+to transform an *upstream* response. Upstream would run them, since it establishes its
+response pipes for every matched plugin regardless of which one produced the bytes; the
+divergence is the remaining half of this gap.
 
 ### Scripting
 
@@ -1183,7 +1249,8 @@ that source at load time; `${port}` and `${version}` in operator values are subs
 (case-insensitive); `locationHref://` injects a client-side redirect into HTML responses.
 
 **Alias operators** are normalised to their canonical form, so all of these work too:
-`hosts→host`, `xhost→host`, `html→htmlAppend`, `js→jsAppend`, `css→cssAppend`,
+`hosts→host`, `xhost→host` (same operator, but the `x` spelling also falls back — see
+[Destination](#destination)), `html→htmlAppend`, `js→jsAppend`, `css→cssAppend`,
 `download→attachment`, `status→statusCode`, `skip→ignore`, `tlsOptions→cipher`,
 `pathReplace→urlReplace`, `reqMerge→params`, `resRules→resScript`,
 `ruleFile`/`ruleScript`/`rulesScript`/`reqScript`/`reqRules`→`rulesFile`, `P→G`.
@@ -1315,6 +1382,15 @@ Known gaps in the operator layer, deliberately left:
   is serialised rather than expanded into `Set-Cookie` attributes.
 - **`headerReplace`'s `$$`-prefixed URL-encoding form** and its quirk of letting an
   unprefixed key inherit the previous key's scope are not ported.
+- **`{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` are not substituted**, and
+  are a non-goal rather than a gap. Upstream substitutes them into the `rules.txt` /
+  `_rules.txt` / `resRules.txt` / `_values.txt` files it reads out of an installed
+  npm package's directory, with the package's own `package.json` as the source
+  (`renderPluginRules`, `_original/lib/util/index.js:3533-3542`;
+  `lib/plugins/get-plugins-sync.js:184-206`). Plugins here are external HTTP servers
+  speaking this port's own protocol: there is no package directory, no `package.json`,
+  and no static rules file — a plugin injects rules by returning them from its request
+  hook, where it already knows its own name. There is nothing to substitute from.
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.

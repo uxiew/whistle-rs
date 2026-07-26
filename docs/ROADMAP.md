@@ -7,7 +7,8 @@
 
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
-> 单元测试 **390** 项全绿、构建 0 警告。
+> **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
+> 单元测试 **410** 项全绿、构建 0 警告。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
 > HAR 导出、`cipher` TLS 版本固定、流量落盘持久化、请求重放、规则分组管理。
@@ -35,6 +36,9 @@
 | 自研插件体系 v2 | ✅ 能力清单 (`GET /manifest`)、请求/响应双钩子、请求头改写、按需 body 投递 |
 | JS / TS 插件 SDK | ✅ 零依赖运行时 + `.d.ts` 类型定义（`sdk/`），`satisfies Plugin` 可用 |
 | 响应阶段规则二次解析 | ✅ `s:` / `resH.` / `serverIp:` 等条件在响应到达后真正求值；无相关规则时零开销 |
+| 插件直接应答的响应期算子 | ✅ 与短路出口共用 `finish_local_response`；短路出口顺带补上 body 算子 |
+| `xhost://` 直连回退 | ✅ 与 `xproxy://` 同一约束：仅握手无法建立时重试一次 |
+| `from:` 筛选条件 | ✅ `tunnel` / `sni` / `composer` 可判定，其余四个为已知 false；未知标记不满足任何筛选器 |
 
 ---
 
@@ -174,12 +178,29 @@
       不对齐处：上游按块流式改写 multipart，本移植缓冲后整体改写（其余请求体算子本来就缓冲），
       因此没有 `reqMergeBigData` / `MAX_REQ_SIZE` 上限；非 UTF-8 请求体不处理（上游试 GB18030）。
 
-### 待跟进（本轮发现，超出当轮范围）
+### 待跟进（上轮发现，本轮已闭环）
 
-- [ ] **插件直接应答的出口不应用任何响应期算子** —— `src/proxy/mod.rs:1146` 直接返回
-      `plugin_response(resp)`，因此 `resHeaders://`、`replaceStatus://`、trailers 等
-      对插件产生的响应全部不生效；上游会对这条路径跑 `getResRules`。
-- [ ] `xhost://` 的直连回退（`retryXHost`，`res.js:571-600`）。
+- [x] ~~**插件直接应答的出口不应用任何响应期算子**~~ → 已修。此前直接返回
+      `plugin_response(resp)`，`resHeaders://`、`replaceStatus://`、`resType://`、
+      `trailers://`、`resDelay://`、`resSpeed://`、`resScript://` 以及整个 body 家族
+      对插件产生的响应**全部静默失效**；响应期二次解析也一并缺席，因此这条路径上
+      `s:` / `resH.` 条件同样答不出来。上游对该路径照跑 `getResRules`——`plugin://`
+      在上游就是一次到插件自有 server 的代理跳，插件的应答以普通响应身份走完
+      `handleResponse`（`_original/lib/inspectors/res.js:825`）。
+      本移植两条「自产响应」出口（插件应答、短路规则）现共用一个 `finish_local_response`：
+      顺带补上了短路出口**此前只跑头部算子、不跑 body 算子**的缺口，并给插件应答
+      补了会话 body 预览。没有任何算子命中的响应原样返回（含 `content-length`），
+      流式路径不受影响。
+      **仍未覆盖**：插件自身的响应钩子（`POST /response` 与 `pipe://`）在这条出口上
+      仍不触发；上游会触发（它按所有命中插件建立响应管道，不看是谁产生的字节）。
+- [x] ~~`xhost://` 的直连回退（`retryXHost`，`res.js:571-600`）~~ → 已实现。
+      `xhost://` 是 `host://` 的**穿透版**：地址能连就用，连不上就忽略该规则走原始地址
+      （`docs/docs/rules/xhost.md`），此前本移植两者等同，连不上即 502。
+      约束与已落地的 `xproxy://` 回退一致：只有**握手无法建立**才重试，请求一旦写上
+      socket 就无法重放。两者现由同一个 `Target::fallback_target` 给出，其中也编码了
+      上游的 `else if`——有任何代理规则时永不走 host 回退（失败的是到代理的连接）。
+      **刻意偏离**：只重试一次。上游 `if (retryXHost > 1)` 让**第一次**重试打同一个死地址、
+      第二次才查 DNS（写成 `>= 1` 才对），照抄只会让每个失败的 `xhost://` 多一次无谓连接。
 
 ### 筛选器（本轮审计发现）
 
@@ -207,10 +228,25 @@
       `env:` 读的是 **whistle 自己的进程环境变量**（`env = process.env`，`rules.js:14,:1961`），
       不是插件环境 —— 此前本文件的描述有误。键**区分大小写**、只用 `=` 分隔。
       不对齐：上游缓冲有 `MAX_REQ_SIZE`（2MB / `reqMergeBigData` 16MB）上限并按前缀匹配，本移植不设上限。
-- [ ] `from:`（`tunnel`/`composer`/`sni` 等来源标记）。
+- [x] ~~`from:`（`tunnel`/`composer`/`sni` 等来源标记）~~ → 已实现，上游的整套标记
+      （`_original/lib/rules/rules.js:1834-1859`）：
+      `tunnel`（请求出自本代理拦截的隧道，CONNECT 或 SOCKS —— 上游是绕道达成的：
+      解密后把自己的 client-info 头重新注入字节流再喂回自己的 HTTP server，
+      `addClientInfo`，`lib/https/index.js:1203-1210`）、
+      `sni`（被拦截的 ClientHello 带了 SNI；rustls 为选证书本就解析过，握手后读一次）、
+      `composer`（Web UI 重放，回环跳上带 `x-whistle-composer`，到达即消费）；
+      `test` / `httpserver` / `httpsserver` / `httpsport` 识别但恒为**已知的 false** ——
+      本移植不认测试头、也不开代理端口之外的额外 HTTP/HTTPS 监听
+      （`config.httpPort`/`httpsPort`，`lib/index.js:96-111`），与没开这两个端口的上游同解，
+      因此 `from:!httpserver` 成立。
+      **照抄的两处上游怪癖**：`from:internalPath` 永不命中（上游比较前先 `toLowerCase`，
+      自己那条分支不可达）；不认识的标记**无论怎么写都不满足任何筛选器**（上游在读
+      `filter.not` 之前就 `return false`），因此建模为「未知」——include 不满足、exclude 不生效。
+      **开销**：composer 标记每请求一次 `HeaderMap::remove` 未命中，实测 30ns（对照
+      500 条规则解析约 2.6µs）；来源标志的构造低于计时精度；500 条规则里有一条命中的
+      `from:` 行是 2.56µs，没有是 2.62µs，即落在噪声内。
 
-未知条件会落到 URL 正则回退，因此不支持的筛选器让规则**惰性失效**而非错误命中 ——
-失败是保守的，但静默。
+至此**每一个本移植会解析的筛选器条件都能求值**，`Deferred` 机制已无使用者，随之删除。
 
 ### 响应阶段（本轮实现）
 
@@ -230,8 +266,12 @@
 - `rule://` / `rulesFile://` 引入的规则与插件注入的规则**同样走两遍**：它们的已解析
   管理器被保留到响应阶段（上游对 `pRules`/`fRules`/`hRules` 亦然）。开销：无合并规则时
   约 7ns/响应，合并了但无响应相关行时约 9ns，有一行时约 250ns。
-- 尚未覆盖：WebSocket 与 `CONNECT` 隧道没有响应阶段；插件直接应答 / 自循环 302 /
-  `enable://abort` 三条出口不应用任何响应期算子（顶层规则同理）。
+- 覆盖每一条会产生响应的出口，包括不走上游的两条：插件直接应答、短路规则
+  （`file://` / `tpl://` / `redirect://` / `statusCode://`）。二者都按**产生时**的头解析，
+  早于任何算子动手 —— 所以 `s:404` 看到的是插件自己的 404，而不是同一行
+  `replaceStatus://200` 之后的值。
+- 尚未覆盖：WebSocket 与 `CONNECT` 隧道没有响应阶段；自循环 302 与 `enable://abort`
+  本就不产生自己的响应（顶层规则同理）。
 - `serverIp:` 取自**已建立的 socket**（`upstream::forward_with_addr` 回传对端地址），
   域名源站同样可判定，且不必重查 DNS —— 轮询 DNS 下重查可能答出请求从未到达的地址。
   经上游代理时该地址是**代理的**地址，与上游一致（`res.js:238,:259`）。
@@ -251,7 +291,8 @@
       现已实现（封闭白名单 + `.key` 子路径 + `${{var}}` URI 编码）。同时修正了三个缺陷：
       未知占位符曾被置空（上游是原样保留）、`jsonp://` 的 callback 包装是本移植凭空发明的
       （已移除）、第一遍正则曾每请求重新编译。
-- [ ] `{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量（与插件运行时耦合）。
+- [x] ~~`{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量~~ → **本移植无物可替，
+      按非目标关闭**（理由见下方 Non-goals）。
 - [x] ~~`lineProps`（whistle 规则行级属性系统）~~ → 见 [`LINE_PROPS.md`](LINE_PROPS.md)。
       解析层与原版完全对齐；`important`、`safeHtml`/`strictHtml` 注入门禁、
       `internal`/`internalOnly` 作用域、`proxyFirst`/`proxyHost`/`proxyHostOnly`、
@@ -286,12 +327,24 @@
 - **`G` / `style` 算子的「流量效果」** —— `G` 是全局插件变量基础设施、`style` 是规则列表
   配色，二者都不是逐请求的流量算子；保持「解析但不产生效果」。
 
+- **`{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量** —— 上游把它们替换进
+  **已安装 npm 包目录**里的 `rules.txt` / `_rules.txt` / `resRules.txt` / `_values.txt`，
+  取值源是该包自己的 `package.json`（`renderPluginRules`，
+  `_original/lib/util/index.js:3533-3542`；`lib/plugins/get-plugins-sync.js:184-206`）。
+  本移植的插件是讲自研协议的外部 HTTP server：没有包目录、没有 `package.json`、
+  也没有静态规则文件 —— 插件是从请求钩子**返回**规则文本的，而它本来就知道自己的名字。
+  **没有可替换的来源**，因此这不是「待补的缺口」而是非目标。若硬要在插件返回的规则文本上
+  做替换，等于凭空发明一个包概念，还会让代理去改写插件刻意产出的文本。
+
 ---
 
 ## 参与
 
-剩下的多为增量工作。真正被架构挡住的只剩 **`sniCallback`** —— 它要在 TLS SNI 阶段挑证书，
-早于按请求的规则解析，当前 MITM 结构够不着。
+规则/筛选/上游层的对齐清单至此清空：**每一个会解析的筛选器条件都能求值**，
+每一条会产生响应的出口都跑响应期算子。真正被架构挡住的只剩 **`sniCallback`** ——
+它要在 TLS SNI 阶段挑证书，早于按请求的规则解析，当前 MITM 结构够不着。
+已知的剩余小口子有一处：插件自己的响应钩子（`POST /response` / `pipe://`）在
+「插件直接应答」这条出口上不触发，上游会触发。
 
 模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
 插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，
