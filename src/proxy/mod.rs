@@ -4,6 +4,8 @@
 //! Ported from `_original/lib/index.js`, `lib/tunnel.js` and the handlers.
 
 pub mod apply;
+#[cfg(test)]
+mod bench;
 pub mod body;
 pub mod persist;
 pub mod script;
