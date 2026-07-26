@@ -50,10 +50,9 @@ use std::task::{Context, Poll};
 
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
-use super::AppState;
+use super::{AppState, upstream};
 use crate::plugins::sni::{SniReq, SniVerdict};
 
 /// Ceiling on the bytes held while waiting for a complete ClientHello.
@@ -217,8 +216,16 @@ pub enum Decision {
     Generated,
     /// Intercept, presenting a certificate a plugin chose.
     Plugin(TlsAcceptor),
-    /// Do not intercept: relay the connection to the origin opaquely.
-    Bypass,
+    /// Do not intercept: relay the connection opaquely to the carried target,
+    /// which is where this connection's `host://` and proxy rules have landed.
+    ///
+    /// Boxed because a `Target` is an order of magnitude larger than the other
+    /// variants' payloads, and this one is reached only when a plugin declines.
+    Bypass(Box<upstream::Target>),
+    /// The rules for this connection cannot be honoured — a proxy rule matched
+    /// and no proxy could be derived from it. Nothing is served: failing open
+    /// would put the bytes on the wire the rule said to divert.
+    Unroutable(String),
 }
 
 /// Consult the `sniCallback://` rules for this connection.
@@ -236,17 +243,18 @@ pub async fn decide(
     peer: SocketAddr,
     has_sni: bool,
 ) -> Decision {
-    // Scoped so the read guard cannot cross the `.await` below.
-    let matched = {
+    // Scoped so the read guard cannot cross the `.await` below. `Resolved` owns
+    // its contents, so it outlives the guard and is kept: a declined connection
+    // still has to be routed, and re-resolving would mean matching twice.
+    let (matched, info, resolved) = {
         let rules = state.rules.read().unwrap();
         if !rules.has_sni_callback() {
             return Decision::Generated;
         }
         let info = connection_req_info(servername, port, peer, has_sni);
-        rules
-            .resolve(&info)
-            .value("sniCallback")
-            .and_then(parse_rule)
+        let resolved = rules.resolve(&info);
+        let matched = resolved.value("sniCallback").and_then(parse_rule);
+        (matched, info, resolved)
     };
     let Some((plugin, value)) = matched else {
         return Decision::Generated;
@@ -264,10 +272,18 @@ pub async fn decide(
     };
 
     match state.plugins.sni_cert(&plugin, &req).await {
-        // The plugin declined the interception.
+        // The plugin declined the interception. The connection still obeys its
+        // rules about *where it goes* — declining to read a connection is not
+        // declining to route it, and whistle's declined path is literally its
+        // ordinary tunnel path (`next(chunk)` → `rollBackTunnel` →
+        // `handleTunnel`, `_original/lib/tunnel.js:259-271,:298`), which resolves
+        // `host://` and the proxy family through `rules.getProxy`.
         Ok(SniVerdict::Bypass) => {
             tracing::info!("sniCallback {plugin}: not intercepting {servername}");
-            Decision::Bypass
+            match super::apply::resolve_target(&info, &resolved).await {
+                Ok(target) => Decision::Bypass(Box::new(target)),
+                Err(err) => Decision::Unroutable(format!("{err:#}")),
+            }
         }
         Ok(SniVerdict::Cert(cert)) => {
             match state.ca.set_plugin_cert(
@@ -383,25 +399,33 @@ fn parse_rule(value: &str) -> Option<(String, String)> {
 /// same session tickets — and the TLS session that results is between those two
 /// and no one else.
 ///
-/// The origin is the address the tunnel was opened to, and it is reached
-/// directly. No rule has been resolved for a connection at this point beyond the
-/// one that got us here, so there is no `proxy://` or `host://` to honour, and
-/// pretending otherwise would mean resolving a request that does not exist.
-pub async fn relay<S>(mut client: Prefixed<S>, host: &str, port: u16) -> Result<()>
+/// `target` is where the connection goes, and it comes from the rules that
+/// matched it: `host://` redirects the address, the `proxy://` family routes the
+/// hop through an upstream proxy. Declining to *read* a connection is not
+/// declining to route it, and whistle's declined path is its ordinary tunnel path
+/// (`_original/lib/tunnel.js:259-271`), which resolves both.
+///
+/// What a relayed connection does *not* get is anything that would require
+/// reading it: no capture, no request rules, no response phase. There is no
+/// request here — only bytes we agreed not to look at.
+pub async fn relay<S>(mut client: Prefixed<S>, target: &upstream::Target) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut origin = match TcpStream::connect((host, port)).await {
+    let mut origin = match upstream::tunnel_stream(target).await {
         Ok(s) => s,
         // Louder than the caller's `debug`: a plugin deliberately asked for this
         // connection to be passed through, so failing to pass it through is not
         // the routine "a client went away" this path otherwise sees.
         Err(e) => {
-            tracing::warn!("sniCallback: relaying to {host}:{port} failed: {e}");
-            return Err(e.into());
+            tracing::warn!(
+                "sniCallback: relaying to {}:{} failed: {e:#}",
+                target.connect_host,
+                target.connect_port
+            );
+            return Err(e);
         }
     };
-    origin.set_nodelay(true).ok();
     tokio::io::copy_bidirectional(&mut client, &mut origin).await?;
     Ok(())
 }
@@ -410,6 +434,7 @@ where
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -776,7 +801,125 @@ mod tests {
         rt().block_on(async {
             let plugin = FakeSni::start(200, r#"{"intercept":false}"#).await;
             let state = state_with("example.com sniCallback://certs", Some(&plugin));
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Bypass));
+            assert!(matches!(decide_for(&state, "example.com").await, Decision::Bypass(_)));
+        });
+    }
+
+    /// Declining to *read* a connection is not declining to *route* it. Upstream's
+    /// declined path is its ordinary tunnel path, which resolves `host://`
+    /// (`rollBackTunnel` → `handleTunnel` → `rules.getProxy`,
+    /// `_original/lib/tunnel.js:259-271,:436`), and so does this one.
+    #[test]
+    fn a_declined_connection_still_honours_host() {
+        rt().block_on(async {
+            let plugin = FakeSni::start(200, r#"{"intercept":false}"#).await;
+            let state = state_with(
+                "example.com sniCallback://certs\n\
+                 example.com host://127.0.0.1:8443\n",
+                Some(&plugin),
+            );
+            let Decision::Bypass(target) = decide_for(&state, "example.com").await else {
+                panic!("the plugin declined");
+            };
+            assert_eq!(target.connect_host, "127.0.0.1");
+            assert_eq!(target.connect_port, 8443);
+            // The name is still the one the client asked for — `host://` moves
+            // the address, not the identity, and the client is about to do its
+            // own handshake against that identity.
+            assert_eq!(target.sni, "example.com");
+            assert_eq!(target.request_port, 443);
+        });
+    }
+
+    /// And the proxy family: a declined connection routed through an upstream
+    /// proxy reaches the proxy, not the origin.
+    #[test]
+    fn a_declined_connection_still_honours_a_proxy_rule() {
+        rt().block_on(async {
+            let plugin = FakeSni::start(200, r#"{"intercept":false}"#).await;
+            let state = state_with(
+                "example.com sniCallback://certs\n\
+                 example.com proxy://127.0.0.1:9999\n",
+                Some(&plugin),
+            );
+            let Decision::Bypass(target) = decide_for(&state, "example.com").await else {
+                panic!("the plugin declined");
+            };
+            let proxy = target.proxy.expect("the proxy rule must survive");
+            assert_eq!(proxy.host, "127.0.0.1");
+            assert_eq!(proxy.port, 9999);
+        });
+    }
+
+    /// A proxy rule that cannot be honoured closes the connection. Sending the
+    /// bytes direct instead would put them on exactly the wire the rule said to
+    /// divert them from — the same reason the request path answers 502 here.
+    #[test]
+    fn a_declined_connection_with_an_unhonourable_proxy_is_refused() {
+        rt().block_on(async {
+            let plugin = FakeSni::start(200, r#"{"intercept":false}"#).await;
+            let state = state_with(
+                "example.com sniCallback://certs\n\
+                 example.com proxy://\n",
+                Some(&plugin),
+            );
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Unroutable(_)
+            ));
+        });
+    }
+
+    /// The relay reaches the address the rules chose, and the ClientHello is the
+    /// first thing that arrives there — the origin has to see the connection the
+    /// client actually opened.
+    #[test]
+    fn the_relay_reaches_the_address_the_rules_chose() {
+        rt().block_on(async {
+            // Stands in for the origin at the address `host://` names.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let seen = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                let mut buf = vec![0u8; 5];
+                tokio::io::AsyncReadExt::read_exact(&mut sock, &mut buf)
+                    .await
+                    .expect("read");
+                buf
+            });
+
+            // A client socket whose "already read" prefix is the ClientHello.
+            let hello = client_hello_for("example.com");
+            let (client, mut peer_end) = tokio::io::duplex(4096);
+            let prefixed = Prefixed::new(hello.clone(), client);
+
+            let target = upstream::Target {
+                connect_host: addr.ip().to_string(),
+                connect_port: addr.port(),
+                // Set on purpose, to pin that the relay ignores it: the client is
+                // doing the handshake, so a second one from this end would serve
+                // it our certificate for a connection we declined to intercept.
+                tls: true,
+                origin_tls_stripped: false,
+                sni: "example.com".to_string(),
+                request_port: 443,
+                proxy: None,
+                tls_versions: upstream::TlsVersions::Default,
+                host_fallback_direct: false,
+            };
+            let relaying = tokio::spawn(async move { relay(prefixed, &target).await });
+
+            assert_eq!(
+                seen.await.expect("origin task"),
+                hello[..5].to_vec(),
+                "the origin must see the client's own ClientHello first"
+            );
+            // Close the client end so the copy finishes rather than hanging.
+            tokio::io::AsyncWriteExt::shutdown(&mut peer_end).await.ok();
+            drop(peer_end);
+            relaying.await.expect("relay task").ok();
         });
     }
 
@@ -980,7 +1123,7 @@ mod tests {
     fn the_builtin_declines_interception() {
         rt().block_on(async {
             let state = state_with("pinned.example.com sniCallback://no-mitm", None);
-            assert!(matches!(decide_for(&state, "pinned.example.com").await, Decision::Bypass));
+            assert!(matches!(decide_for(&state, "pinned.example.com").await, Decision::Bypass(_)));
             assert!(matches!(decide_for(&state, "other.example.com").await, Decision::Generated));
         });
     }
@@ -993,7 +1136,7 @@ mod tests {
             let state = state_with("pinned.example.com sniCallback://no-mitm", None);
             // Tunnel opened to an address, SNI naming the pinned host.
             let d = decide(&state, "pinned.example.com", "93.184.216.34", 443, peer(), true).await;
-            assert!(matches!(d, Decision::Bypass));
+            assert!(matches!(d, Decision::Bypass(_)));
             // Same tunnel address, a different name asked for.
             let d = decide(&state, "www.example.com", "93.184.216.34", 443, peer(), true).await;
             assert!(matches!(d, Decision::Generated));

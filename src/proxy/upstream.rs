@@ -459,7 +459,7 @@ fn client_config_for(versions: TlsVersions) -> Arc<ClientConfig> {
 trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
-struct BoxedIo(Box<dyn IoStream>);
+pub(crate) struct BoxedIo(Box<dyn IoStream>);
 
 impl AsyncRead for BoxedIo {
     fn poll_read(
@@ -581,6 +581,58 @@ pub async fn forward_with_addr(
         }
         Err(err) => Err(err.into_inner()),
     }
+}
+
+/// Open an opaque byte pipe to `target`, through an upstream proxy when one is
+/// configured — the tunnel counterpart of [`forward`].
+///
+/// The origin leg stays **raw** whatever the target says: on this path the client
+/// is performing its own TLS handshake, so wrapping the leg in a second one would
+/// hand the client our certificate for a connection we just agreed not to
+/// intercept. whistle arrives at the same arrangement by construction — its
+/// tunnel path always CONNECTs and never wraps the origin leg itself
+/// (`_original/lib/tunnel.js:436-470`).
+///
+/// The `x`-prefixed rules keep their forgiveness: a connection that cannot be
+/// *established* is retried once against [`Target::fallback_target`], which is
+/// what whistle's tunnel path does too (`retryXHost`, `lib/tunnel.js:570-617`).
+pub(crate) async fn tunnel_stream(target: &Target) -> Result<BoxedIo> {
+    let mut target = target.clone();
+    target.tls = false;
+    target.origin_tls_stripped = false;
+    let fallback = target.fallback_target();
+    match tunnel_once(&target).await {
+        Ok(io) => Ok(io),
+        Err(err) => match fallback {
+            None => Err(err),
+            Some(next) => {
+                tracing::debug!(
+                    "tunnel to {}:{} failed ({err:#}); falling back to {}:{}",
+                    target.connect_host,
+                    target.connect_port,
+                    next.connect_host,
+                    next.connect_port
+                );
+                tunnel_once(&next).await
+            }
+        },
+    }
+}
+
+/// One attempt at [`tunnel_stream`], with no fallback of its own.
+///
+/// Nothing is ever written on this path, so unlike [`forward_once`] there is no
+/// request to hand back: every failure here is a failure to connect.
+async fn tunnel_once(target: &Target) -> Result<BoxedIo> {
+    if let Some(addr) = self_loop(target).await {
+        return Err(anyhow!("Self loop ({addr})"));
+    }
+    // No request exists on this path, so the CONNECT to an upstream proxy carries
+    // no `User-Agent` or client `Proxy-Authorization` to echo. The proxy URL's own
+    // credentials still apply, which is how a proxy rule normally carries them.
+    origin_stream(target, &Hop::default())
+        .await
+        .map(|(io, _)| io)
 }
 
 /// A failure from [`forward_once`], tagged with whether the request survived it.

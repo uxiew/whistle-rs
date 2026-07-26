@@ -8,7 +8,7 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **446** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **451** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -46,6 +46,7 @@
 | 预览解码器内存修复 | ✅ 剖析查出：解压缓冲随 capture 滞留在 500 条 session 环里，现于预览填满 / tee drop 时释放 |
 | clippy 零告警 + 门禁 | ✅ 54 → 0；`[lints.clippy] all = "deny"` 覆盖全部 target |
 | `sniCallback` 证书钩子 | ✅ 握手期读 ClientHello 并回放；插件可自带证书或**拒绝拦截**；曾被误记为架构不可达 |
+| 被放弃连接的路由 | ✅ `sniCallback` 说不拦截后，`host://` / `proxy://` 仍照常路由；代理不可兑现即关闭 |
 | MITM 证书按 SNI 签发 | ✅ 修正：此前按 CONNECT 权威地址签，两者不同时握手直接失败 |
 
 ---
@@ -74,6 +75,20 @@
       握手期由插件挑证书，四种答案（自签 / 自带 / 复用 / **不拦截**），
       规则按 `https://<ClientHello 里的名字>` 匹配。此前被记成「架构不可达」，
       那条记录是错的 —— 详见下方 [架构受限](#架构受限rustls--mitm-时序)。
+- [x] ~~**「不拦截」之后的中继不走规则管线**~~ → 已修（本轮）。此前 `false` 之后是一条
+      到「隧道开到的那个地址」的**直连**，`host://`、`proxy://` 一族全部失效 —— 而原版的
+      `next(chunk)` 恰恰是汇入它自己的隧道处理（`rollBackTunnel` → `handleTunnel` →
+      `rules.getProxy`，`_original/lib/tunnel.js:259-271,:436`），那里照常解析地址与代理。
+      现在同一轮解析出的 `Resolved` 被保留下来（`Resolved` 是自有值，可越过读锁），
+      交给 `apply::resolve_target` 得出目标，再由 `upstream::tunnel_stream` 建连。
+      **三处刻意的约束**：源站那一段恒为明文（TLS 由客户端与源站自己谈，我们再包一层
+      就等于把自签证书塞给一条已答应不拦截的连接 —— 原版的隧道路径同样只 CONNECT、
+      从不自己包 TLS）；`xhost://` / `xproxy://` 的一次性回退保留（对应隧道路径的
+      `retryXHost`，`tunnel.js:570-617`）；代理规则**无法兑现**时关闭连接而非改走直连
+      （新增 `Decision::Unroutable`，与请求路径答 502 是同一判断）。
+      **不覆盖**：中继到上游代理的 CONNECT 不带客户端 UA 与 `Proxy-Authorization` ——
+      这条路径上没有请求可回显；代理 URL 自带的凭据照常使用。
+      被放弃的连接依旧**不抓包、不跑任何请求/响应算子**：那些都需要读取内容。
 
 ### 规则解析（本轮审计修复）
 
@@ -416,7 +431,9 @@
 
 被架构真正挡住的只剩 `cipher://` 的完整 OpenSSL 语义（rustls 不暴露 cipher 字符串）。
 **插件的响应钩子不再有缺口** —— `POST /response` 与 `pipe://` 已覆盖两条自产响应出口，
-认证拦截则按上游的 `ignore://!…` 语义原样钉死。
+认证拦截则按上游的 `ignore://!…` 语义原样钉死。**被放弃的连接也不再是缺口** ——
+`sniCallback` 说「不拦截」之后，`host://` 与 `proxy://` 照常路由；它拿不到的只是那些
+需要读取内容才成立的东西。
 
 模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
 插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，

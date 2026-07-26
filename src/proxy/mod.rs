@@ -951,7 +951,13 @@ where
             match sni::decide(&state, &servername, &host, port, peer, has_sni).await {
                 sni::Decision::Generated => state.ca.acceptor_for(&servername)?,
                 sni::Decision::Plugin(acceptor) => acceptor,
-                sni::Decision::Bypass => return sni::relay(stream, &host, port).await,
+                sni::Decision::Bypass(target) => return sni::relay(stream, &target).await,
+                // A proxy rule that cannot be honoured closes the connection
+                // rather than quietly sending the bytes direct — the same call
+                // the request path makes, where it answers 502.
+                sni::Decision::Unroutable(why) => {
+                    return Err(anyhow::anyhow!("tunnel to {host}:{port} not routable: {why}"));
+                }
             };
         let tls_stream = acceptor.accept(stream).await?;
         let conn = tls_stream.get_ref().1;
