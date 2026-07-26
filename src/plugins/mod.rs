@@ -412,6 +412,17 @@ pub struct PluginResult {
     pub set_headers: Vec<(String, String)>,
     /// Headers to strip from the outgoing request.
     pub remove_headers: Vec<String>,
+    /// This [`response`](Self::response) is a **refusal** from the [`auth`] gate,
+    /// not an answer the plugin chose to give.
+    ///
+    /// The difference is who may still touch it. An answer is an ordinary
+    /// response and every response hook runs over it; a refusal is pinned as
+    /// produced, because a gate another plugin can rewrite is not a gate.
+    /// Upstream pins it the same way and for the same reason — it hands the
+    /// denial back as `* ignore://!statusCode|!resBody|!resType|!resCharset …`,
+    /// which ignores every other rule on the request
+    /// (`_original/lib/plugins/index.js:936-959`).
+    pub blocked: bool,
 }
 
 /// What a plugin's response hook returns. All fields optional — an empty result
@@ -605,6 +616,7 @@ impl RemotePlugin {
                     }
                     return PluginResult {
                         response: Some(auth::deny_response(&self.name, &denial).await),
+                        blocked: true,
                         ..Default::default()
                     };
                 }
@@ -793,6 +805,10 @@ fn parse_request_result(bytes: &[u8]) -> PluginResult {
         response,
         set_headers: parse_headers_value(v.get("setHeaders")),
         remove_headers: parse_string_list(v.get("removeHeaders")),
+        // A response the request hook chose to send is an answer, never a
+        // refusal: refusals come from the `auth` gate, which is a different
+        // route with a verdict of its own.
+        blocked: false,
     }
 }
 
@@ -990,6 +1006,7 @@ impl Plugins {
                             tracing::info!("auth {name}: blocked {} {}", req.method, req.url);
                             return Some(PluginResult {
                                 response: Some(auth::deny_response(name, &denial).await),
+                                blocked: true,
                                 ..Default::default()
                             });
                         }
@@ -1552,6 +1569,28 @@ mod tests {
             200,
             format!(r#"{{"name":"p","version":"1","hooks":[{hooks}]}}"#),
         )
+    }
+
+    /// A refusal and an answer are both a `response`, and the proxy has to tell
+    /// them apart: every response hook runs over an answer, none over a refusal.
+    /// Pinning the classification here means the exit only has a flag to read.
+    #[test]
+    fn a_refusal_is_marked_and_an_answer_is_not() {
+        rt().block_on(async {
+            let p = Plugins::new();
+            // `gate` refuses a request that carries no token.
+            let denied = p.on_request("gate", &req()).await.expect("registered");
+            assert!(denied.response.is_some(), "the gate refused");
+            assert!(denied.blocked, "a refusal must be marked as one");
+
+            // `echo` answers every request, by choice.
+            let answered = p.on_request("echo", &req()).await.expect("registered");
+            assert!(answered.response.is_some(), "echo answers");
+            assert!(
+                !answered.blocked,
+                "an answer is an ordinary response, not a refusal"
+            );
+        });
     }
 
     /// The fail-closed property, stated as a test: a plugin that declares `auth`

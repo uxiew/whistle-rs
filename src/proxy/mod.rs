@@ -667,20 +667,24 @@ fn has_request_body(headers: &hyper::HeaderMap) -> bool {
         || headers.contains_key(hyper::header::TRANSFER_ENCODING)
 }
 
-/// Convert a plugin-produced response into a real HTTP response head plus its
-/// body. The two are kept apart because every response operator still has to run
-/// over them — see [`finish_local_response`].
-fn plugin_response(resp: crate::plugins::PluginResp) -> (hyper::http::response::Parts, Bytes) {
+/// Convert a plugin-produced response into a real HTTP response, body and all.
+///
+/// The body stays a `Bytes` rather than becoming a stream because every response
+/// operator and every plugin response hook still has to run over it — see
+/// [`finish_local_response`].
+fn plugin_response(resp: crate::plugins::PluginResp) -> Response<Bytes> {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let mut builder = Response::builder().status(status);
     for (k, v) in &resp.headers {
         builder = builder.header(k, v);
     }
     let body = Bytes::from(resp.body);
-    let head = builder
-        .body(())
-        .unwrap_or_else(|_| Response::builder().status(StatusCode::OK).body(()).unwrap());
-    (head.into_parts().0, body)
+    builder.body(body.clone()).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .unwrap()
+    })
 }
 
 /// One captured WebSocket frame, as surfaced in the Network view.
@@ -1264,6 +1268,47 @@ fn finish_res_body(
     }
 }
 
+/// The plugin audience a locally produced response still owes its hooks to.
+///
+/// [`Default`] is nobody — two empty slices — which is what a path with no
+/// plugin in sight passes, so the hook loops below cost one `is_empty` each.
+#[derive(Default)]
+struct ResHooks<'a> {
+    /// Plugins matched for this request, in rule order: the `POST /response`
+    /// audience. Held as `(name, param)` because that is what the request hook
+    /// already built.
+    plugins: &'a [(String, String)],
+    /// `pipe://` plugins matched for this request, in rule order.
+    pipes: &'a [crate::plugins::PluginMatch],
+    /// Correlation id, shared with the request hook of the same request.
+    req_id: u64,
+    /// The client address, as the request hook reported it.
+    client_ip: Option<String>,
+}
+
+/// Serve an [`auth`](crate::plugins::auth) gate's refusal exactly as the gate
+/// produced it: no response-phase rules, no response operators, no plugin hooks.
+///
+/// Upstream pins it the same way, and this is what its pinning *means*: the
+/// denial comes back as `* ignore://!statusCode|!resBody|!resType|!resCharset …`
+/// (`_original/lib/plugins/index.js:936-959`), and `ignore://!x` is an inverted
+/// whitelist — `ignoreRules` walks every resolved rule and deletes all but the
+/// excluded names, plugin rules included (`lib/util/index.js:2068-2092,:2008`).
+/// So on a refusal no user rule applies, which is the property worth keeping: a
+/// gate a `resHeaders://` line or another plugin can rewrite is not a gate.
+///
+/// Returns the response and the body preview to record with it, like
+/// [`finish_local_response`] — the transaction is still logged.
+fn pin_refusal(state: &AppState, res: Response<Bytes>) -> (Response<DynBody>, Option<Capture>) {
+    let (parts, bytes) = res.into_parts();
+    let ct = header_str(&parts.headers, hyper::header::CONTENT_TYPE);
+    let enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
+    let capture = (!bytes.is_empty()).then(|| {
+        Capture::from_bytes(&bytes, ct, enc.as_deref(), state.config.body_preview_cap)
+    });
+    (Response::from_parts(parts, body::full(bytes)), capture)
+}
+
 /// Finish a response this proxy produced itself — a `plugin://` hook's answer,
 /// or a short-circuit rule's — by resolving the response phase and running every
 /// response operator over it.
@@ -1276,6 +1321,17 @@ fn finish_res_body(
 /// as produced, before any operator has touched it — which is what lets `s:`
 /// filter on a `statusCode://404` this port answered.
 ///
+/// `hooks` is the plugin audience for the finished response. Upstream reaches its
+/// response-side plugin machinery on both these paths as well: a `plugin://`
+/// answer travels back as an ordinary response and goes through `handleResponse`
+/// (`_original/lib/inspectors/res.js:825`), and a `pipe://` plugin is resolved
+/// from its own rule with no regard for who produced the bytes
+/// (`resolvePipePlugin`, `_original/lib/plugins/index.js:1173`).
+///
+/// `res` is the response as produced, body and all — it is wholly in memory on
+/// both these paths, which is what lets the body operators and the buffered hooks
+/// run over it without waiting on anything.
+///
 /// Returns the finished response and the body preview to record with it.
 async fn finish_local_response(
     state: &Arc<AppState>,
@@ -1283,10 +1339,10 @@ async fn finish_local_response(
     resolved: &mut Resolved,
     merged_rules: &[crate::rules::RuleManager],
     is_internal_req: bool,
-    parts: hyper::http::response::Parts,
-    bytes: Bytes,
+    res: Response<Bytes>,
+    hooks: ResHooks<'_>,
 ) -> (Response<DynBody>, Option<Capture>) {
-    let mut parts = parts;
+    let (mut parts, bytes) = res.into_parts();
     resolve_response_phase(
         state,
         info,
@@ -1302,6 +1358,80 @@ async fn finish_local_response(
     }
     apply::apply_response_for(&mut parts, resolved, Some(info));
 
+    // Response hook, part 1: plugins that did not ask for the body. Such a
+    // plugin may still replace it outright — that needs no knowledge of the
+    // original. The plugin that produced this response is in the audience too:
+    // upstream builds the response pipeline from *every* matched plugin, so one
+    // that both answers and hooks the response does see its own answer.
+    let mut bytes = bytes;
+    let mut hook_replaced = false;
+    let mut wants_body = false;
+    for (name, param) in hooks.plugins {
+        let Some(manifest) = state.plugins.manifest(name).await else {
+            continue;
+        };
+        if !manifest.on_response {
+            continue;
+        }
+        if manifest.response_body {
+            wants_body = true;
+            continue; // handled below, once the body is in hand
+        }
+        let pres = crate::plugins::PluginRes {
+            id: hooks.req_id,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            status: parts.status.as_u16(),
+            headers: header_pairs(&parts.headers),
+            param: param.clone(),
+            body: None,
+        };
+        if let Some(result) = state.plugins.on_response(name, &pres).await
+            && let Some(new) = apply_plugin_res_result(&mut parts, result)
+        {
+            bytes = Bytes::from(new);
+            hook_replaced = true;
+        }
+    }
+
+    // Streaming hook: a `pipe://` plugin transforms the bytes on their way out.
+    // The body is wholly in memory on this path — a plugin's answer, or a mocked
+    // response — so it is framed, piped and collected straight back. That is the
+    // same work the streaming path does, in a different order, and it keeps one
+    // implementation of the hook rather than two.
+    if !hooks.pipes.is_empty() {
+        let piped = pipe_body(
+            state,
+            hooks.pipes,
+            crate::plugins::pipe::Dir::Response,
+            crate::plugins::pipe::PipeMeta {
+                id: hooks.req_id,
+                method: info.method.clone(),
+                url: info.full_url.clone(),
+                client_ip: hooks.client_ip.clone(),
+                headers: header_pairs(&parts.headers),
+                status: Some(parts.status.as_u16()),
+                ..Default::default()
+            },
+            &mut parts.headers,
+            body::full(bytes.clone()),
+        )
+        .await;
+        // A plugin that serves no response pipe hands the body back untouched,
+        // so this collects the same bytes. One that takes it may change the
+        // length — `pipe_body` has already dropped the headers for that.
+        match collect_body(piped).await {
+            Ok(new) => bytes = new,
+            // The transform broke mid-stream. There is nothing left to send but
+            // what the pipe managed to produce, which is nothing.
+            Err(err) => {
+                tracing::debug!("response pipe failed: {err:#}");
+                bytes = Bytes::new();
+                hook_replaced = true;
+            }
+        }
+    }
+
     let ops = ResBodyOps::of(resolved);
     let res_ct = parts
         .headers
@@ -1309,8 +1439,35 @@ async fn finish_local_response(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
-    let new = if ops.needs_body() {
-        let new = apply::transform_res_body(bytes, resolved, res_ct.as_deref());
+    let new = if ops.needs_body() || wants_body {
+        let mut new = apply::transform_res_body(bytes, resolved, res_ct.as_deref());
+
+        // Response hook, part 2: plugins that asked for the body. It sits
+        // between the content operators and the injections — the same slot the
+        // streaming path gives it.
+        for (name, param) in hooks.plugins {
+            let Some(manifest) = state.plugins.manifest(name).await else {
+                continue;
+            };
+            if !manifest.on_response || !manifest.response_body {
+                continue;
+            }
+            let pres = crate::plugins::PluginRes {
+                id: hooks.req_id,
+                method: info.method.clone(),
+                url: info.full_url.clone(),
+                status: parts.status.as_u16(),
+                headers: header_pairs(&parts.headers),
+                param: param.clone(),
+                body: Some(new.to_vec()),
+            };
+            if let Some(result) = state.plugins.on_response(name, &pres).await
+                && let Some(replaced) = apply_plugin_res_result(&mut parts, result)
+            {
+                new = Bytes::from(replaced);
+                hook_replaced = true;
+            }
+        }
         inject_res_body(state, &mut parts, new, &ops, info)
     } else {
         bytes
@@ -1327,7 +1484,14 @@ async fn finish_local_response(
     // still has correctly set — so only take that route when something did.
     let body = match ops.needs_body() {
         true => finish_res_body(&mut parts, new, ops),
-        false => body::full(new),
+        false => {
+            // A hook that replaced the body invalidated the length its producer
+            // declared; dropping the header lets hyper write the true one.
+            if hook_replaced {
+                apply::strip_length_headers(&mut parts.headers);
+            }
+            body::full(new)
+        }
     };
     (Response::from_parts(parts, body), capture)
 }
@@ -1557,25 +1721,37 @@ async fn serve(
             }
             plugin_set_headers.extend(result.set_headers);
             plugin_remove_headers.extend(result.remove_headers);
+            let blocked = result.blocked;
             if let Some(resp) = result.response {
                 tracing::info!("{} {} -> plugin {name}", info.method, info.full_url);
                 let target = format!("plugin:{name}");
-                let (parts, bytes) = plugin_response(resp);
                 // The plugin answered, but it is not the last word: every
                 // response operator still runs, exactly as it does over the
                 // origin's answer. Skipping this left `resHeaders://`,
                 // `replaceStatus://`, `resType://`, `trailers://` and the whole
                 // body family silently inert on a path users reach on purpose.
-                let (response, res_body) = finish_local_response(
-                    &state,
-                    &mut info,
-                    &mut resolved,
-                    &merged_rules,
-                    is_internal_req,
-                    parts,
-                    bytes,
-                )
-                .await;
+                // An answer is an ordinary response: every response operator and
+                // every response hook runs over it. A *refusal* from the auth
+                // gate is served as produced — see [`pin_refusal`].
+                let (response, res_body) = if blocked {
+                    pin_refusal(&state, plugin_response(resp))
+                } else {
+                    finish_local_response(
+                        &state,
+                        &mut info,
+                        &mut resolved,
+                        &merged_rules,
+                        is_internal_req,
+                        plugin_response(resp),
+                        ResHooks {
+                            plugins: &plugin_matches,
+                            pipes: &pipe_matches,
+                            req_id: plugin_req_id,
+                            client_ip: client_ip.clone(),
+                        },
+                    )
+                    .await
+                };
                 state.record(Session {
                     id: 0,
                     time_ms,
@@ -1627,8 +1803,13 @@ async fn serve(
             &mut resolved,
             &merged_rules,
             is_internal_req,
-            parts,
-            bytes,
+            Response::from_parts(parts, bytes),
+            ResHooks {
+                plugins: &plugin_matches,
+                pipes: &pipe_matches,
+                req_id: plugin_req_id,
+                client_ip: client_ip.clone(),
+            },
         )
         .await;
         state.record(Session {
@@ -2575,15 +2756,14 @@ mod local_response_tests {
                     .collect(),
                 body: body.as_bytes().to_vec(),
             };
-            let (parts, bytes) = plugin_response(resp);
             let (resp, _) = finish_local_response(
                 &state,
                 &mut info,
                 &mut resolved,
                 &[],
                 false,
-                parts,
-                bytes,
+                plugin_response(resp),
+                ResHooks::default(),
             )
             .await;
             let (parts, body) = resp.into_parts();
@@ -2663,6 +2843,283 @@ mod local_response_tests {
         );
         assert_eq!(parts.status, StatusCode::OK);
         assert_eq!(body, Bytes::from_static(b"base+more"));
+    }
+
+    /// A refusal from the auth gate is served as produced. The contrast is the
+    /// point: the very same rules that rewrite an *answer* must not touch a
+    /// refusal — which is what upstream's `ignore://!statusCode|…` pinning says.
+    #[test]
+    fn a_refusal_is_served_as_produced() {
+        let rules = "example.com plugin://gate resHeaders://x-late=1 \
+                     replaceStatus://200 resAppend://!\n";
+
+        // The answer path: every operator lands, 403 included.
+        let (parts, body) = finish(rules, 403, &[], "denied");
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(parts.headers.get("x-late").unwrap(), "1");
+        assert_eq!(body, Bytes::from_static(b"denied!"));
+
+        // The refusal path: nothing lands — not the header, not the append, and
+        // above all not the status rewrite that would have made a 403 a 200.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (parts, body) = rt.block_on(async {
+            let state = state_with(rules);
+            let res = plugin_response(crate::plugins::PluginResp {
+                status: 403,
+                headers: vec![("content-length".to_string(), "6".to_string())],
+                body: b"denied".to_vec(),
+            });
+            let (resp, capture) = pin_refusal(&state, res);
+            assert!(capture.is_some(), "a refusal is still recorded");
+            let (parts, body) = resp.into_parts();
+            (parts, collect_body(body).await.expect("body"))
+        });
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+        assert!(parts.headers.get("x-late").is_none());
+        assert_eq!(body, Bytes::from_static(b"denied"));
+        // And its framing survives: nothing rewrote the body, so the length the
+        // gate declared is still the truth.
+        assert_eq!(parts.headers.get("content-length").unwrap(), "6");
+    }
+
+    // -- the plugin response hooks on a locally produced response -------------
+
+    /// A plugin that hooks the response **with the body**. No built-in does, and
+    /// the buffered half of the hook is the half that rewrites bytes.
+    struct BodyHookPlugin;
+
+    impl crate::plugins::RustPlugin for BodyHookPlugin {
+        fn name(&self) -> &str {
+            "bodyhook"
+        }
+
+        fn manifest(&self) -> crate::plugins::PluginManifest {
+            crate::plugins::PluginManifest {
+                on_response: true,
+                response_hook: true,
+                response_body: true,
+                ..crate::plugins::PluginManifest::none(self.name())
+            }
+        }
+
+        fn on_request(&self, _req: &crate::plugins::PluginReq) -> crate::plugins::PluginResult {
+            crate::plugins::PluginResult::default()
+        }
+
+        fn on_response(
+            &self,
+            res: &crate::plugins::PluginRes,
+        ) -> crate::plugins::PluginResResult {
+            // The header proves the body arrived; the body proves what comes
+            // back replaces it.
+            let seen = res.body.clone().unwrap_or_default();
+            crate::plugins::PluginResResult {
+                set_headers: vec![("x-saw-body".to_string(), seen.len().to_string())],
+                body: Some([b"<", seen.as_slice(), b">"].concat()),
+                ..Default::default()
+            }
+        }
+    }
+
+    /// As [`finish`], but passing the plugin audience `serve` passes: the matched
+    /// `plugin://` and `pipe://` sets, split the same way and resolved from the
+    /// same rules.
+    fn finish_hooked(
+        rules: &str,
+        extra: Option<Box<dyn crate::plugins::RustPlugin>>,
+        status: u16,
+        res_headers: &[(&str, &str)],
+        body: &str,
+    ) -> (hyper::http::response::Parts, Bytes) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let state = {
+                let base = state_with(rules);
+                match extra {
+                    None => base,
+                    // `AppState` owns its registry, so an extra plugin means
+                    // building one — same config, same rules, same CA.
+                    Some(plugin) => {
+                        let mut plugins = crate::plugins::Plugins::new();
+                        plugins.register_rust(plugin);
+                        let mut mgr = RuleManager::new();
+                        mgr.set_text(rules);
+                        Arc::new(AppState::with_plugins(
+                            base.config.clone(),
+                            mgr,
+                            base.ca.clone(),
+                            plugins,
+                        ))
+                    }
+                }
+            };
+            let mut info = apply::build_req_info(
+                "GET",
+                "http",
+                "example.com",
+                80,
+                "/",
+                &hyper::HeaderMap::new(),
+                Some("127.0.0.1".to_string()),
+            );
+            let mut resolved = state.rules.read().unwrap().resolve_scoped(&info, false);
+
+            // The same split `serve` does: a `pipe://` naming a plugin with a
+            // streaming hook drives the stream, everything else the buffered hook.
+            let mut plugins: Vec<(String, String)> = Vec::new();
+            let mut pipes: Vec<crate::plugins::PluginMatch> = Vec::new();
+            for m in crate::plugins::matched(&resolved) {
+                if !state.plugins.contains(&m.name) {
+                    continue;
+                }
+                let streams = m.via_pipe
+                    && matches!(state.plugins.manifest(&m.name).await, Some(mf) if mf.has_pipe_hook());
+                if streams {
+                    pipes.push(m);
+                } else {
+                    plugins.push((m.name.clone(), m.param.clone()));
+                }
+            }
+
+            let resp = crate::plugins::PluginResp {
+                status,
+                headers: res_headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                body: body.as_bytes().to_vec(),
+            };
+            let (resp, _) = finish_local_response(
+                &state,
+                &mut info,
+                &mut resolved,
+                &[],
+                false,
+                plugin_response(resp),
+                ResHooks {
+                    plugins: &plugins,
+                    pipes: &pipes,
+                    req_id: 7,
+                    client_ip: Some("127.0.0.1".to_string()),
+                },
+            )
+            .await;
+            let (parts, body) = resp.into_parts();
+            let bytes = collect_body(body).await.expect("body");
+            (parts, bytes)
+        })
+    }
+
+    /// The gap this closes: a plugin's own response hook never ran over a
+    /// response the proxy produced itself. Upstream reaches it — a `plugin://`
+    /// answer comes back from the plugin's server as an ordinary response, so
+    /// the response-side plugin machinery runs over it like any other.
+    #[test]
+    fn a_local_answer_reaches_the_buffered_response_hook() {
+        // `stamp` declares the response hook without the body, so it runs in
+        // part 1, before the body is even looked at.
+        let (parts, body) = finish_hooked(
+            "example.com plugin://echo plugin://stamp\n",
+            None,
+            200,
+            &[],
+            "answered",
+        );
+        assert_eq!(
+            parts.headers.get("x-stamped-by").map(|v| v.to_str().unwrap()),
+            Some("whistle-rs"),
+            "the response hook of a matched plugin must see a local answer"
+        );
+        assert_eq!(body, Bytes::from_static(b"answered"));
+    }
+
+    /// The same for a short-circuit rule's response: nothing about
+    /// `statusCode://` makes it invisible to a matched plugin.
+    #[test]
+    fn a_short_circuit_answer_reaches_the_buffered_response_hook() {
+        let (parts, _) = finish_hooked(
+            "example.com statusCode://204 plugin://stamp\n",
+            None,
+            204,
+            &[],
+            "",
+        );
+        assert!(parts.headers.get("x-stamped-by").is_some());
+    }
+
+    /// Part 2 of the hook: a plugin that asked for the body gets it, and what it
+    /// returns replaces it — with the framing corrected, because the length the
+    /// producer declared is no longer the truth.
+    #[test]
+    fn the_body_half_of_the_hook_rewrites_a_local_answer() {
+        let (parts, body) = finish_hooked(
+            "example.com plugin://bodyhook\n",
+            Some(Box::new(BodyHookPlugin)),
+            200,
+            &[("content-length", "8")],
+            "answered",
+        );
+        assert_eq!(parts.headers.get("x-saw-body").unwrap(), "8");
+        assert_eq!(body, Bytes::from_static(b"<answered>"));
+        // The stale `content-length: 8` must not survive a body that is now 10
+        // bytes long; hyper writes the true one from a measurable body.
+        assert!(
+            parts.headers.get(hyper::header::CONTENT_LENGTH).is_none(),
+            "a hook that replaced the body invalidated the declared length"
+        );
+    }
+
+    /// The streaming hook reaches this path too. `pipe://upper` never sees a
+    /// whole body — it maps frames — so this also pins that a local answer is
+    /// handed to it as a body rather than as bytes.
+    #[test]
+    fn a_local_answer_reaches_the_streaming_response_hook() {
+        let (_, body) = finish_hooked(
+            "example.com plugin://echo pipe://upper\n",
+            None,
+            200,
+            &[],
+            "answered",
+        );
+        assert_eq!(body, Bytes::from_static(b"ANSWERED"));
+    }
+
+    /// Hooks and operators compose in the documented order: the operators run
+    /// first (they are the response's own rules), then the plugin sees what they
+    /// produced.
+    #[test]
+    fn the_operators_run_before_the_hook_sees_the_response() {
+        let (parts, body) = finish_hooked(
+            "example.com plugin://bodyhook resAppend://!\n",
+            Some(Box::new(BodyHookPlugin)),
+            200,
+            &[],
+            "answered",
+        );
+        assert_eq!(body, Bytes::from_static(b"<answered!>"));
+        assert_eq!(parts.headers.get("x-saw-body").unwrap(), "9");
+    }
+
+    /// And a response with no plugin in the audience is still handed back
+    /// untouched — the hooks cost an `is_empty` check, not a copy.
+    #[test]
+    fn no_plugin_means_no_change_and_no_lost_framing() {
+        let (parts, body) = finish_hooked(
+            "example.com statusCode://200\n",
+            None,
+            200,
+            &[("content-length", "2"), ("x-mock", "yes")],
+            "hi",
+        );
+        assert_eq!(parts.headers.get("content-length").unwrap(), "2");
+        assert_eq!(parts.headers.get("x-mock").unwrap(), "yes");
+        assert_eq!(body, Bytes::from_static(b"hi"));
     }
 }
 

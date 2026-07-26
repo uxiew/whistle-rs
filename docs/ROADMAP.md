@@ -8,7 +8,7 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **413** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **446** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -38,6 +38,8 @@
 | JS / TS 插件 SDK | ✅ 零依赖运行时 + `.d.ts` 类型定义（`sdk/`），`satisfies Plugin` 可用 |
 | 响应阶段规则二次解析 | ✅ `s:` / `resH.` / `serverIp:` 等条件在响应到达后真正求值；无相关规则时零开销 |
 | 插件直接应答的响应期算子 | ✅ 与短路出口共用 `finish_local_response`；短路出口顺带补上 body 算子 |
+| 自产响应也跑插件响应钩子 | ✅ `POST /response` 与 `pipe://` 覆盖插件应答与短路两条出口 |
+| 认证拦截不再被规则改写 | ✅ 按上游 `ignore://!…` 语义原样送出（`pin_refusal`），仍记会话 |
 | `xhost://` 直连回退 | ✅ 与 `xproxy://` 同一约束：仅握手无法建立时重试一次 |
 | `from:` 筛选条件 | ✅ `tunnel` / `sni` / `composer` 可判定，其余四个为已知 false；未知标记不满足任何筛选器 |
 | tee 抓取开销剖析 | ✅ 每帧约 6.5 ns、过上限即常数、端到端不可测；见 [`ARCHITECTURE.md`](ARCHITECTURE.md#what-the-capture-costs) |
@@ -92,8 +94,9 @@
       也不会把 `chance:` 重掷一次（整体重解析就会）。合并进来的算子在两遍里都排在
       引入它们的文件之后。**开销**：无合并规则时约 7ns/响应，合并了但没有响应相关行时
       约 9ns，有一行时约 250ns。
-      仍不覆盖：WebSocket / `CONNECT` 隧道没有响应阶段；插件直接应答、自循环 302、
-      `enable://abort` 三条出口本来就不应用任何响应期算子（顶层规则同理）。
+      仍不覆盖：WebSocket / `CONNECT` 隧道没有响应阶段；自循环 302、`enable://abort`
+      与认证拦截三条出口不应用任何响应期算子（前两条不产生自己的响应，第三条按上游的
+      `ignore://!…` 原样钉死；顶层规则同理）。
 
 ### 上游代理 / PAC / SOCKS / CA（本轮首次审计）
 
@@ -201,8 +204,28 @@
       顺带补上了短路出口**此前只跑头部算子、不跑 body 算子**的缺口，并给插件应答
       补了会话 body 预览。没有任何算子命中的响应原样返回（含 `content-length`），
       流式路径不受影响。
-      **仍未覆盖**：插件自身的响应钩子（`POST /response` 与 `pipe://`）在这条出口上
-      仍不触发；上游会触发（它按所有命中插件建立响应管道，不看是谁产生的字节）。
+- [x] ~~**插件自身的响应钩子在这条出口上不触发**~~ → 已修（本轮）。`POST /response`
+      与 `pipe://` 现在覆盖两条自产响应出口，见
+      [`PLUGINS.md`](PLUGINS.md#本地产生的响应也走响应阶段)。上游那边这是结构性的：
+      `plugin://` 是一次到插件自有 server 的代理跳，应答以普通响应身份回到
+      `handleResponse`（`res.js:825`），而 `pipe://` 从它自己那条规则解析、不看字节
+      是谁产生的（`resolvePipePlugin`，`plugins/index.js:1173`）。
+      三处需要留意：
+      **(1)** `respond()` 终止的是请求阶段 —— 后续插件的 `onRequest` 不再执行，但
+      **全部**命中插件的 `onResponse` 都会看到这个应答，包括应答者自己（上游亦然，
+      它按全部命中插件建管道）。
+      **(2)** body 已在内存，故 `pipe://` 在此是「装帧 → 过管道 → 收回」，
+      钩子只有一套实现；管道改了长度即去掉 `content-length`。
+      **(3)** **认证拦截是例外**，见下条。
+- [x] ~~**认证拦截的响应会被其它规则改写**~~ → 已修（本轮，顺带发现）。`onAuth` 的拒绝
+      此前也走 `finish_local_response`，于是 `resHeaders://`、`replaceStatus://`、
+      `resAppend://` 都能改写它 —— `replaceStatus://200` 可以把一条 403 拦截变成 200。
+      上游把拦截钉死为 `* ignore://!statusCode|!resBody|!resType|!resCharset …`
+      （`plugins/index.js:936-959`），而 `ignore://!x` 是**反向白名单**：`ignoreRules`
+      遍历全部已解析规则、除排除项外一律删除，**插件规则也删**
+      （`util/index.js:2068-2092,:2008`）。也就是说拦截响应上**没有任何用户规则生效**。
+      现按此对齐：拒绝走 `pin_refusal`，原样送出（仍然记会话）。区分「拒绝」与「应答」
+      的是裁决来源而非状态码 —— 插件用 `respond()` 主动返回 403 仍是应答，照跑钩子。
 - [x] ~~`xhost://` 的直连回退（`retryXHost`，`res.js:571-600`）~~ → 已实现。
       `xhost://` 是 `host://` 的**穿透版**：地址能连就用，连不上就忽略该规则走原始地址
       （`docs/docs/rules/xhost.md`），此前本移植两者等同，连不上即 502。
@@ -392,9 +415,8 @@
 现在 ClientHello 由代理先读、保留、再回放，插件因而能在握手期挑证书，甚至拒绝拦截。
 
 被架构真正挡住的只剩 `cipher://` 的完整 OpenSSL 语义（rustls 不暴露 cipher 字符串）。
-已知的剩余小口子有两处：插件自己的响应钩子（`POST /response` / `pipe://`）在
-「插件直接应答」这条出口上不触发，上游会触发；以及 `sniCallback` 说「不拦截」之后的那条
-中继是直连的 —— 本移植没有针对不透明隧道的规则管线，`proxy://` / `host://` 对它不生效。
+**插件的响应钩子不再有缺口** —— `POST /response` 与 `pipe://` 已覆盖两条自产响应出口，
+认证拦截则按上游的 `ignore://!…` 语义原样钉死。
 
 模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
 插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，
