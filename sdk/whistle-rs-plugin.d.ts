@@ -265,6 +265,72 @@ export interface AuthCtx extends BaseCtx {
   set(name: string, value: string): this;
 }
 
+/**
+ * Context passed to `sniCallback` — everything a TLS handshake knows about
+ * itself before there is a request.
+ *
+ * There is deliberately no method, URL, header or body here: this hook runs
+ * during the handshake, and none of those exist yet.
+ */
+export interface SniCtx {
+  /**
+   * The name the client asked for in its ClientHello, falling back to the host
+   * the tunnel was opened to when it sent no SNI. This is the name the
+   * certificate has to satisfy.
+   */
+  readonly servername: string;
+  /** The `sniCallback://<name>(<value>)` argument. `''` when the rule had none. */
+  readonly value: string;
+  /** The host the tunnel was opened to. May differ from `servername`. */
+  readonly tunnelHost: string;
+  /** The port the tunnel was opened to. */
+  readonly port: number;
+  /** The client's IP, when known. */
+  readonly clientIp?: string;
+  /**
+   * Set when whistle-rs is holding a certificate **this plugin** supplied for
+   * `servername` — its value is this plugin's own name. Undefined otherwise.
+   */
+  readonly certCacheName?: string;
+  /** The `mtime` that cached certificate carried, or `0`. */
+  readonly certCacheTime: number;
+  /** Whether whistle-rs holds a certificate of ours for this name. */
+  readonly hasCachedCert: boolean;
+  /** Return this to keep serving the certificate we supplied last time. */
+  reuse(): SniReuse;
+}
+
+/** Certificate material for `sniCallback` to return. Both fields are required. */
+export interface SniCert {
+  /** PEM private key (PKCS#8, PKCS#1 or SEC1). */
+  key: string;
+  /** PEM certificate — a leaf, optionally followed by its chain. */
+  cert: string;
+  /**
+   * When this certificate was issued. Echoed back as `ctx.certCacheTime` next
+   * time, so the hook can tell whether what the proxy holds is current.
+   */
+  mtime?: number;
+}
+
+/** "Keep the one you already have from me." Produced by `ctx.reuse()`. */
+export interface SniReuse {
+  reuse: true;
+}
+
+/**
+ * What `sniCallback` may return.
+ *
+ * * `true` — intercept, with the certificate whistle-rs would have generated.
+ * * `false` — **do not intercept**: the connection is relayed to the origin
+ *   encrypted, and whistle-rs never sees inside it.
+ * * `SniCert` — intercept, presenting this certificate.
+ * * `ctx.reuse()` — intercept, with the certificate this plugin supplied last
+ *   time for this name.
+ * * nothing — no opinion, which means the generated certificate.
+ */
+export type SniVerdict = boolean | SniCert | SniReuse | void;
+
 /** Context passed to the stats hooks: what happened, with nothing to answer. */
 export interface StatsCtx extends BaseCtx {
   /** Which phase this ping reports. */
@@ -336,6 +402,20 @@ export interface Plugin {
    * Reached by `plugin://<name>` or `pipe://<name>`.
    */
   onAuth?(ctx: AuthCtx): boolean | void | Promise<boolean | void>;
+
+  /**
+   * Choose the certificate for an intercepted TLS connection, or decline the
+   * interception entirely. Reached by `sniCallback://<name>[(<value>)]`, matched
+   * against `https://<the name in the ClientHello>`.
+   *
+   * Runs **inside the handshake**, before any request exists, so it gets no
+   * request context and a client is waiting on every millisecond it spends.
+   *
+   * Failure degrades to the generated certificate — throwing, hanging or being
+   * unreachable means the connection is intercepted as it would have been with
+   * no rule at all. It is not a gate, so this is not an admission.
+   */
+  sniCallback?(ctx: SniCtx): SniVerdict | Promise<SniVerdict>;
 
   /**
    * Told that a request went past, before it is forwarded. Fire-and-forget: the

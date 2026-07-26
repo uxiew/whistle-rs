@@ -56,6 +56,22 @@
 // declares it and then throws, hangs or dies blocks the requests it matched.
 // A gate that admits everything when it breaks is not a gate.
 //
+// One hook is not about a request at all. `sniCallback` runs during the TLS
+// handshake of an intercepted connection, and picks the certificate — or
+// declines the interception, which nothing else here can do:
+//
+//   start({
+//     name: 'certs',
+//     sniCallback(ctx) {
+//       if (ctx.servername.endsWith('.pinned.example')) return false;  // don't look
+//       if (ctx.hasCachedCert) return ctx.reuse();                     // still good
+//       return { key: myKeyPem, cert: myCertPem, mtime: Date.now() };
+//     },
+//   });
+//
+// It is reached by `sniCallback://<name>` and gets no request context, because
+// at that point there is no request.
+//
 // TypeScript users: see whistle-rs-plugin.d.ts. The same entry point works for
 // `export default { … }` — an ES module default export is unwrapped.
 
@@ -79,6 +95,7 @@ const HOOKS = [
   ['pipeResponse', 'pipeResponse'],
   ['onWsFrame', 'wsFrame'],
   ['onAuth', 'auth'],
+  ['sniCallback', 'sni'],
   ['onReqStats', 'reqStats'],
   ['onResStats', 'resStats'],
   ['onUi', 'ui'],
@@ -145,6 +162,9 @@ function start(plugin, opts) {
       if (route === '/auth') {
         return serveAuth(plugin, name, payload, res);
       }
+      if (route === '/sni') {
+        return serveSni(plugin, name, payload, res);
+      }
       if (route === '/stats') {
         return serveStats(plugin, name, payload, res);
       }
@@ -202,6 +222,88 @@ function serveAuth(plugin, name, payload, res) {
       console.error(`[${name}] onAuth threw:`, e);
       sendJson(res, 500, { error: String((e && e.message) || e) });
     });
+}
+
+// ---------------------------------------------------------------------------
+// The certificate chooser
+// ---------------------------------------------------------------------------
+
+/**
+ * Serve one certificate decision.
+ *
+ * This hook runs *inside a TLS handshake*, before there is a request — a client
+ * is sitting on an open socket waiting for it, so be quick and cache your own
+ * certificates. `ctx.certCacheName` tells you what whistle-rs already holds
+ * from you for this name; returning `ctx.reuse()` when it is still good saves
+ * both sides the work of shipping and parsing it again.
+ *
+ * A throwing hook answers `200` with nothing to say, which whistle-rs reads as
+ * "use the certificate you would have generated". That is the same degradation
+ * every hook here has except `onAuth` — and unlike `onAuth`, this one is not a
+ * gate: falling back means the connection is intercepted with whistle-rs's own
+ * certificate, not that anything is let past a check.
+ */
+function serveSni(plugin, name, payload, res) {
+  const ctx = new SniCtx(payload);
+  Promise.resolve()
+    .then(() => plugin.sniCallback.call(plugin, ctx))
+    .then((out) => sendJson(res, 200, sniReply(out)))
+    .catch((e) => {
+      console.error(`[${name}] sniCallback threw:`, e);
+      sendJson(res, 200, {});
+    });
+}
+
+/** Normalise whatever the hook returned into the wire's four shapes. */
+function sniReply(out) {
+  if (out === false) return { intercept: false };
+  if (out === true) return { intercept: true };
+  if (out && typeof out === 'object') {
+    if (out.reuse === true) return { reuse: true };
+    if (typeof out.key === 'string' && typeof out.cert === 'string' && out.key && out.cert) {
+      const reply = { key: out.key, cert: out.cert };
+      if (out.mtime > 0) reply.mtime = out.mtime;
+      return reply;
+    }
+  }
+  // Undefined, null, or a shape we do not recognise: no opinion.
+  return {};
+}
+
+/**
+ * Context for the certificate hook. Everything a TLS handshake knows about
+ * itself before the first byte of the first request — which is not much, and
+ * deliberately not dressed up as more.
+ */
+class SniCtx {
+  constructor(payload) {
+    /** The name in the client's ClientHello, or the tunnel's host if it sent none. */
+    this.servername = payload.servername || '';
+    /** The `sniCallback://name(value)` argument. Empty string when absent. */
+    this.value = payload.value || '';
+    /** The host the tunnel was opened to — may differ from `servername`. */
+    this.tunnelHost = payload.tunnelHost || '';
+    /** The port the tunnel was opened to. */
+    this.port = payload.port;
+    this.clientIp = payload.clientIp || undefined;
+    /**
+     * The plugin whose certificate whistle-rs holds for `servername` — this
+     * plugin's own name when it holds one of yours, undefined otherwise.
+     */
+    this.certCacheName = payload.certCacheName;
+    /** The `mtime` that certificate carried (`0` if it carried none). */
+    this.certCacheTime = payload.certCacheTime || 0;
+  }
+
+  /** Is the certificate whistle-rs already holds for this name ours? */
+  get hasCachedCert() {
+    return this.certCacheName != null;
+  }
+
+  /** Keep using the certificate we supplied last time for this name. */
+  reuse() {
+    return { reuse: true };
+  }
 }
 
 // ---------------------------------------------------------------------------
