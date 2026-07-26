@@ -8,7 +8,8 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **410** 项全绿、构建 0 警告。
+> 单元测试 **413** 项全绿；`cargo build --all-targets` 与
+> `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
 > HAR 导出、`cipher` TLS 版本固定、流量落盘持久化、请求重放、规则分组管理。
@@ -39,6 +40,9 @@
 | 插件直接应答的响应期算子 | ✅ 与短路出口共用 `finish_local_response`；短路出口顺带补上 body 算子 |
 | `xhost://` 直连回退 | ✅ 与 `xproxy://` 同一约束：仅握手无法建立时重试一次 |
 | `from:` 筛选条件 | ✅ `tunnel` / `sni` / `composer` 可判定，其余四个为已知 false；未知标记不满足任何筛选器 |
+| tee 抓取开销剖析 | ✅ 每帧约 6.5 ns、过上限即常数、端到端不可测；见 [`ARCHITECTURE.md`](ARCHITECTURE.md#what-the-capture-costs) |
+| 预览解码器内存修复 | ✅ 剖析查出：解压缓冲随 capture 滞留在 500 条 session 环里，现于预览填满 / tee drop 时释放 |
+| clippy 零告警 + 门禁 | ✅ 54 → 0；`[lints.clippy] all = "deny"` 覆盖全部 target |
 
 ---
 
@@ -308,8 +312,24 @@
 
 ### 非功能项
 
-- [ ] 性能剖析（大响应体、并发连接下 tee 抓取开销）。
-- [ ] 清理较新工具链带来的 clippy 风格提示（`collapsible_if` 等）。
+- [x] ~~性能剖析（大响应体、并发连接下 tee 抓取开销）~~ → 结论与数据见
+      [`ARCHITECTURE.md` 的 “What the capture costs”](ARCHITECTURE.md#what-the-capture-costs)，
+      测量代码在 `src/proxy/bench.rs`（`cargo test --release -- --ignored --nocapture bench::`）。
+      **吞吐上无需处理**：每帧约 6.5 ns（一次无竞争加锁），过了预览上限即变为常数——
+      16 MiB 与 1 MiB 相比只多 0.7–0.9 µs；每个 body 各持有自己的 capture，并发之间不存在锁竞争。
+      端到端（1 / 32 并发，4 KiB 与 1 MiB，identity 与 gzip）下默认配置与「只计数不复制」
+      无法区分，差值落在噪声内并会变号。唯一显著的是**去掉上限**：1 MiB gzip 从 6.0 ms 涨到 9.5 ms。
+      对照物：本移植不做上游连接池，每请求 1.00 条上游连接，一次握手就比 tee 高出几个数量级。
+      **但剖析查出一个内存问题并已修复**：预览解码器（`flate2` 写端）会把解压出的全部字节
+      留在内部缓冲里，而它随 capture 一起活在 500 条的 session 环里 —— 一个 16 MiB 的高压缩比
+      响应会因此长期占住 16 MiB。现已在预览填满、以及 tee 被 drop 时释放解码器。
+- [x] ~~清理较新工具链带来的 clippy 风格提示（`collapsible_if` 等）~~ ——
+      `cargo clippy --all-targets` 从 54 条告警清零：40 处 `collapsible_if` 全部借
+      edition 2024 的 let-chain 合并（逐处核对过注释归属，无一处需要 `#[allow]`），
+      另有 9 类零散提示。其中 `large_enum_variant` 确有实质：`RetryableError::Connect`
+      内含整个待重试的 `Request`，使每次成功转发返回的 `Result` 都是 248 字节
+      （载荷本身只有 184），已装箱。防回归的门禁放在 `Cargo.toml` 的 `[lints.clippy]`
+      （`all = "deny"`，覆盖 lib/bin/tests 全部 target；`cargo build` 不受影响）。
 
 ---
 
