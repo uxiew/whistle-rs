@@ -251,6 +251,20 @@ enum BodyDecoder {
     Brotli(Box<brotli::DecompressorWriter<Vec<u8>>>),
     /// A decode error occurred — stop decoding this body.
     Failed,
+    /// Nothing left to decode: the preview filled up, or the body ended. The
+    /// decompressor has been dropped, and with it the decompressed bytes it
+    /// was holding — see [`CaptureState::release_decoder`].
+    Done,
+}
+
+impl BodyDecoder {
+    /// Whether this variant owns a decompressor (and therefore a buffer).
+    fn is_decompressor(&self) -> bool {
+        matches!(
+            self,
+            BodyDecoder::Gzip(_) | BodyDecoder::Deflate(_) | BodyDecoder::Brotli(_)
+        )
+    }
 }
 
 /// Build a decoder for a `Content-Encoding` value (identity for none/unknown).
@@ -320,7 +334,9 @@ impl CaptureState {
         self.total += bytes.len();
         let cap = self.cap();
         if self.data.len() >= cap {
-            return; // preview already full — stop decoding/copying
+            // Preview already full — stop decoding/copying. `release_decoder`
+            // has already run, so there is no buffer left to grow either.
+            return;
         }
         let mut failed = false;
         match &mut self.decoder {
@@ -329,7 +345,7 @@ impl CaptureState {
                 let take = room.min(bytes.len());
                 self.data.extend_from_slice(&bytes[..take]);
             }
-            BodyDecoder::Failed => {}
+            BodyDecoder::Failed | BodyDecoder::Done => {}
             BodyDecoder::Gzip(d) => {
                 failed = !drain_decoder(d, |d| d.get_ref(), bytes, &mut self.data, cap)
             }
@@ -342,6 +358,26 @@ impl CaptureState {
         }
         if failed {
             self.decoder = BodyDecoder::Failed;
+        } else if self.data.len() >= cap {
+            self.release_decoder();
+        }
+    }
+
+    /// Drop the decompressor once it can contribute nothing further.
+    ///
+    /// A `write`-side decompressor accumulates *everything* it has inflated in
+    /// an internal `Vec`, which [`drain_decoder`] only ever reads a bounded
+    /// prefix of. Holding one after the preview is complete pins the whole
+    /// decompressed body: a 16 MiB response of highly compressible bytes
+    /// arrives as one 16 KiB frame that inflates in full before the 16 KiB
+    /// preview is taken off the front of it. The capture then lives on in the
+    /// session ring — 500 entries deep — still holding all 16 MiB.
+    ///
+    /// Only a decompressor is released. `Identity` stays as it is, because
+    /// [`Capture::snapshot`] reads that variant to decide `truncated`.
+    fn release_decoder(&mut self) {
+        if self.decoder.is_decompressor() {
+            self.decoder = BodyDecoder::Done;
         }
     }
 }
@@ -371,8 +407,21 @@ impl Capture {
         cap: usize,
     ) -> Self {
         let c = Capture::new(content_type, content_encoding, cap);
-        c.0.lock().unwrap().append(bytes);
+        {
+            let mut st = c.0.lock().unwrap();
+            st.append(bytes);
+            // The whole body was in `bytes`; nothing follows it.
+            st.release_decoder();
+        }
         c
+    }
+
+    /// The body has ended, so no further bytes can arrive. Releases the
+    /// decompressor for a body that finished before filling the preview —
+    /// without this, every small compressed response leaves an inflate state
+    /// and its buffer alive for as long as the session is retained.
+    pub fn finish(&self) {
+        self.0.lock().unwrap().release_decoder();
     }
 
     /// Append streamed bytes to the shared state.
@@ -488,6 +537,71 @@ mod capture_tests {
         assert_eq!(len, 10);
         assert!(!trunc);
         assert_eq!(text, "plain body");
+    }
+
+    /// Bytes the capture's decompressor is still holding.
+    fn decoder_bytes(cap: &Capture) -> usize {
+        match &cap.0.lock().unwrap().decoder {
+            BodyDecoder::Gzip(d) => d.get_ref().len(),
+            BodyDecoder::Deflate(d) => d.get_ref().len(),
+            BodyDecoder::Brotli(d) => d.get_ref().len(),
+            _ => 0,
+        }
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// A `write`-side decompressor keeps everything it has inflated, and the
+    /// capture outlives the body by up to [`MAX_SESSIONS`] entries. Once the
+    /// preview is full the decompressor must be let go, or one highly
+    /// compressible response pins its whole decompressed size for as long as
+    /// the session is retained.
+    #[test]
+    fn a_full_preview_releases_the_decompressor() {
+        let body = gzip(&vec![b'a'; 8 * 1024 * 1024]);
+        assert!(body.len() < BODY_PREVIEW_CAP, "8 MiB of 'a' fits in one frame");
+        let cap = Capture::new(Some("text/plain".into()), Some("gzip"), BODY_PREVIEW_CAP);
+        cap.append(&body);
+
+        let (len, truncated, text) = cap.snapshot();
+        assert_eq!(len, body.len(), "len still counts wire bytes");
+        assert!(truncated);
+        assert_eq!(text.len(), BODY_PREVIEW_CAP, "the preview is still filled");
+        assert!(text.bytes().all(|b| b == b'a'), "and still decoded");
+        assert_eq!(
+            decoder_bytes(&cap),
+            0,
+            "8 MiB of inflated bytes must not outlive the preview that needed 16 KiB of them"
+        );
+    }
+
+    /// A body that ends before filling the preview never trips the cap, so the
+    /// release has to happen at end-of-stream too.
+    #[test]
+    fn a_finished_body_releases_the_decompressor() {
+        let cap = Capture::new(Some("text/plain".into()), Some("gzip"), BODY_PREVIEW_CAP);
+        cap.append(&gzip(b"small enough to fit"));
+        assert!(decoder_bytes(&cap) > 0, "still decoding: the body may continue");
+
+        cap.finish();
+        assert_eq!(decoder_bytes(&cap), 0);
+        let (_, _, text) = cap.snapshot();
+        assert_eq!(text, "small enough to fit", "the preview survives the release");
+    }
+
+    /// Releasing must not disturb an identity capture: [`Capture::snapshot`]
+    /// reads that variant to decide whether the preview was truncated.
+    #[test]
+    fn releasing_leaves_an_identity_capture_alone() {
+        let cap = Capture::new(Some("text/plain".into()), None, 8);
+        cap.append(b"0123456789");
+        cap.finish();
+        let (len, truncated, text) = cap.snapshot();
+        assert_eq!((len, truncated, text.as_str()), (10, true, "01234567"));
     }
 
     #[test]

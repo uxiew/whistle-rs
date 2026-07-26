@@ -117,6 +117,16 @@ impl Body for TeeBody {
     }
 }
 
+impl Drop for TeeBody {
+    /// Nothing more can reach the capture once the tee is gone, whether the
+    /// body ran to its end or the client hung up part-way through it. Release
+    /// the preview decompressor here rather than at end-of-stream, so an
+    /// abandoned body does not leave its buffer pinned in the session ring.
+    fn drop(&mut self) {
+        self.capture.finish();
+    }
+}
+
 /// A body that emits `data` in paced chunks to cap throughput at `kb_per_sec`
 /// (whistle's `reqSpeed`/`resSpeed`, in KB/s).
 pub fn throttled<T: Into<Bytes>>(data: T, kb_per_sec: f64) -> DynBody {
