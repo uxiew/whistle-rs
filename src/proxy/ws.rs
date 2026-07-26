@@ -272,13 +272,12 @@ async fn pump<R, W>(
         let mut payload = Bytes::from(frame.payload);
         if frame.opcode == OPCODE_TEXT {
             // Text frame: allow the script to rewrite it.
-            if let Some(script) = &script {
-                if let Some(new) = std::str::from_utf8(&payload)
+            if let Some(script) = &script
+                && let Some(new) = std::str::from_utf8(&payload)
                     .ok()
                     .and_then(|text| crate::proxy::script::run_frame_script(script, direction, text))
-                {
-                    payload = Bytes::from(new);
-                }
+            {
+                payload = Bytes::from(new);
             }
         }
         if !hooks.is_empty() && is_data_frame(frame.opcode) {

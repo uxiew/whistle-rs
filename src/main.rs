@@ -145,10 +145,10 @@ async fn main() -> Result<()> {
     if let Some(path) = &cli.rules {
         rules_text = std::fs::read_to_string(path)
             .with_context(|| format!("reading rules file {}", path.display()))?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                base_dir = parent.to_path_buf();
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            base_dir = parent.to_path_buf();
         }
     }
     if let Some(inline) = &cli.rule {

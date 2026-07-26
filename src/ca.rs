@@ -256,12 +256,14 @@ mod tests {
     /// A CA over a storage directory nobody else touches — two of these running
     /// concurrently must not race to write the same root key.
     fn ca(label: &str) -> Arc<CertAuthority> {
-        let mut config = Config::default();
-        config.storage_dir = std::env::temp_dir().join(format!(
-            "whistle-rs-ca-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let config = Config {
+            storage_dir: std::env::temp_dir().join(format!(
+                "whistle-rs-ca-{label}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            )),
+            ..Config::default()
+        };
         CertAuthority::load_or_create(&config).expect("root CA")
     }
 

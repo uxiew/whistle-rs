@@ -678,7 +678,8 @@ impl Query {
 /// verbatim (Node's decoder throws and `querystring` then falls back to the raw
 /// text); invalid UTF-8 is replaced rather than dropped.
 fn percent_decode(s: &str, plus_to_space: bool) -> String {
-    if !s.contains('%') && !(plus_to_space && s.contains('+')) {
+    // Nothing to decode: no escape, and no `+` that this mode would rewrite.
+    if !(s.contains('%') || (plus_to_space && s.contains('+'))) {
         return s.to_string();
     }
     let bytes = s.as_bytes();

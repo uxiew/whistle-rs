@@ -822,6 +822,13 @@ impl RuleGroup {
     pub fn len(&self) -> usize {
         self.rules.len()
     }
+
+    /// Whether the group's text parsed to no rules at all — an empty group is
+    /// still a group (it keeps its name and enabled flag), so this is not the
+    /// same as the group being absent.
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
 }
 
 /// Which of `rules` might need the response phase — see
@@ -1121,10 +1128,10 @@ fn merge_lines(text: &str) -> String {
         }
     }
     // An unterminated block still yields its rule rather than vanishing.
-    if let Some(parts) = block {
-        if !parts.is_empty() {
-            out.push(parts.join(" "));
-        }
+    if let Some(parts) = block
+        && !parts.is_empty()
+    {
+        out.push(parts.join(" "));
     }
     out.join("\n")
 }
@@ -1545,10 +1552,10 @@ fn looks_like_pattern(tok: &str) -> bool {
         return false;
     }
     // An operator has a known `protocol://` prefix.
-    if let Some((proto, _)) = split_protocol(t) {
-        if protocols::is_protocol(proto) {
-            return false;
-        }
+    if let Some((proto, _)) = split_protocol(t)
+        && protocols::is_protocol(proto)
+    {
+        return false;
     }
     // A bare host:port / ip is an operator (hosts shorthand), not a pattern.
     if is_host_shorthand(t) {
@@ -1663,20 +1670,20 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
     let tok = tok.strip_prefix('$').unwrap_or(tok);
 
     // Regexp pattern: /body/flags
-    if tok.starts_with('/') && tok.len() > 1 {
-        if let Some(end) = tok.rfind('/') {
-            if end > 0 {
-                let body = &tok[1..end];
-                let flags = &tok[end + 1..];
-                let mut pat = String::new();
-                if flags.contains('i') {
-                    pat.push_str("(?i)");
-                }
-                pat.push_str(body);
-                if let Ok(re) = Regex::new(&pat) {
-                    return done(Pattern::Regex(re), important);
-                }
-            }
+    if tok.starts_with('/')
+        && tok.len() > 1
+        && let Some(end) = tok.rfind('/')
+        && end > 0
+    {
+        let body = &tok[1..end];
+        let flags = &tok[end + 1..];
+        let mut pat = String::new();
+        if flags.contains('i') {
+            pat.push_str("(?i)");
+        }
+        pat.push_str(body);
+        if let Ok(re) = Regex::new(&pat) {
+            return done(Pattern::Regex(re), important);
         }
     }
 

@@ -239,20 +239,16 @@ pub const BODY_PREVIEW_CAP: usize = 16 * 1024;
 
 /// A streaming decompressor for the capture preview. It decodes `Content-Encoding`
 /// so the preview shows readable text; the *proxied* body is never touched.
+#[derive(Default)]
 enum BodyDecoder {
     /// No (or unknown) encoding — bytes stored verbatim.
+    #[default]
     Identity,
     Gzip(flate2::write::GzDecoder<Vec<u8>>),
     Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
     Brotli(Box<brotli::DecompressorWriter<Vec<u8>>>),
     /// A decode error occurred — stop decoding this body.
     Failed,
-}
-
-impl Default for BodyDecoder {
-    fn default() -> Self {
-        BodyDecoder::Identity
-    }
 }
 
 /// Build a decoder for a `Content-Encoding` value (identity for none/unknown).
@@ -1063,10 +1059,10 @@ fn inject_res_body(
             &hv,
             &body_str,
         ) {
-            if let Some(st) = r.status {
-                if let Ok(s) = StatusCode::from_u16(st) {
-                    parts.status = s;
-                }
+            if let Some(st) = r.status
+                && let Ok(s) = StatusCode::from_u16(st)
+            {
+                parts.status = s;
             }
             for (k, v) in r.headers {
                 set_header_raw(&mut parts.headers, &k, &v);
@@ -1077,20 +1073,20 @@ fn inject_res_body(
         }
     }
     // weinre: inject a debug <script> into HTML responses.
-    if let Some(id) = &ops.weinre {
-        if is_html(&parts.headers) {
-            let src = weinre_src(id, &state.config);
-            let tag = format!("<script src=\"{src}\"></script>");
-            new = inject_into_html(&new, &tag);
-        }
+    if let Some(id) = &ops.weinre
+        && is_html(&parts.headers)
+    {
+        let src = weinre_src(id, &state.config);
+        let tag = format!("<script src=\"{src}\"></script>");
+        new = inject_into_html(&new, &tag);
     }
     // locationHref: inject a client-side redirect into HTML responses.
-    if let Some(url) = &ops.location_href {
-        if is_html(&parts.headers) {
-            let safe = url.replace('\\', "\\\\").replace('\'', "\\'");
-            let tag = format!("<script>location.href='{safe}'</script>");
-            new = inject_into_html(&new, &tag);
-        }
+    if let Some(url) = &ops.location_href
+        && is_html(&parts.headers)
+    {
+        let safe = url.replace('\\', "\\\\").replace('\'', "\\'");
+        let tag = format!("<script>location.href='{safe}'</script>");
+        new = inject_into_html(&new, &tag);
     }
     if let Some(path) = &ops.write {
         write_body_file(path, &new);
@@ -1584,16 +1580,16 @@ async fn serve(
         set_header_raw(&mut parts.headers, k, v);
     }
     // responseFor: prefetch another URL and annotate this request with its result.
-    if let Some(url) = resolved.value("responseFor") {
-        if let Ok((status, body)) = upstream::simple_get(url).await {
-            set_header_raw(&mut parts.headers, "x-whistle-response-for-url", url);
-            set_header_raw(&mut parts.headers, "x-whistle-response-for-status", &status.to_string());
-            set_header_raw(
-                &mut parts.headers,
-                "x-whistle-response-for-length",
-                &body.len().to_string(),
-            );
-        }
+    if let Some(url) = resolved.value("responseFor")
+        && let Ok((status, body)) = upstream::simple_get(url).await
+    {
+        set_header_raw(&mut parts.headers, "x-whistle-response-for-url", url);
+        set_header_raw(&mut parts.headers, "x-whistle-response-for-status", &status.to_string());
+        set_header_raw(
+            &mut parts.headers,
+            "x-whistle-response-for-length",
+            &body.len().to_string(),
+        );
     }
 
     // Buffer + transform the request body only when a body/speed/write operator applies.
@@ -1745,10 +1741,10 @@ async fn serve(
             param: param.clone(),
             body: None,
         };
-        if let Some(result) = state.plugins.on_response(name, &pres).await {
-            if let Some(new) = apply_plugin_res_result(&mut parts, result) {
-                plugin_res_override = Some(new);
-            }
+        if let Some(result) = state.plugins.on_response(name, &pres).await
+            && let Some(new) = apply_plugin_res_result(&mut parts, result)
+        {
+            plugin_res_override = Some(new);
         }
     }
 
@@ -1811,10 +1807,10 @@ async fn serve(
                     param: param.clone(),
                     body: Some(new.to_vec()),
                 };
-                if let Some(result) = state.plugins.on_response(name, &pres).await {
-                    if let Some(replaced) = apply_plugin_res_result(&mut parts, result) {
-                        new = Bytes::from(replaced);
-                    }
+                if let Some(result) = state.plugins.on_response(name, &pres).await
+                    && let Some(replaced) = apply_plugin_res_result(&mut parts, result)
+                {
+                    new = Bytes::from(replaced);
                 }
             }
             let new = inject_res_body(&state, &mut parts, new, &ops, &info);
@@ -1903,10 +1899,10 @@ fn apply_plugin_res_result(
     parts: &mut hyper::http::response::Parts,
     result: crate::plugins::PluginResResult,
 ) -> Option<Vec<u8>> {
-    if let Some(code) = result.status {
-        if let Ok(s) = StatusCode::from_u16(code) {
-            parts.status = s;
-        }
+    if let Some(code) = result.status
+        && let Ok(s) = StatusCode::from_u16(code)
+    {
+        parts.status = s;
     }
     for name in &result.remove_headers {
         parts.headers.remove(name.to_ascii_lowercase().as_str());
@@ -1961,9 +1957,11 @@ async fn serve_upgrade(
     // Which plugins may hook this session's frames. Resolving the plan contacts
     // nothing and allocates nothing unless a rule named a registered plugin;
     // the plugins themselves are dialled later, from inside the tunnel.
-    let frame_plan = websocket
-        .then(|| ws::FramePlan::new(&state.plugins, resolved, info))
-        .unwrap_or_default();
+    let frame_plan = if websocket {
+        ws::FramePlan::new(&state.plugins, resolved, info)
+    } else {
+        ws::FramePlan::default()
+    };
     let client_upgrade = hyper::upgrade::on(&mut req);
 
     // Build the upstream handshake request (upgrades carry no body, so
@@ -2123,15 +2121,15 @@ fn inject_into_html(body: &Bytes, tag: &str) -> Bytes {
         out.push_str(&text[i..]);
         return Bytes::from(out);
     }
-    if let Some(i) = lower.find("<body") {
-        if let Some(close) = text[i..].find('>') {
-            let pos = i + close + 1;
-            let mut out = String::with_capacity(text.len() + tag.len());
-            out.push_str(&text[..pos]);
-            out.push_str(tag);
-            out.push_str(&text[pos..]);
-            return Bytes::from(out);
-        }
+    if let Some(i) = lower.find("<body")
+        && let Some(close) = text[i..].find('>')
+    {
+        let pos = i + close + 1;
+        let mut out = String::with_capacity(text.len() + tag.len());
+        out.push_str(&text[..pos]);
+        out.push_str(tag);
+        out.push_str(&text[pos..]);
+        return Bytes::from(out);
     }
     let mut out = String::with_capacity(text.len() + tag.len());
     out.push_str(tag);

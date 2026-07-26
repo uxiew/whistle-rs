@@ -92,10 +92,10 @@ fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
             port,
             path,
         } => {
-            if let Some(s) = scheme {
-                if !scheme_matches(s, &req.scheme) {
-                    return false;
-                }
+            if let Some(s) = scheme
+                && !scheme_matches(s, &req.scheme)
+            {
+                return false;
             }
             if !host.is_empty() {
                 if *host_suffix {
@@ -108,10 +108,10 @@ fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
                 }
             }
             // An explicit port in the pattern scopes the rule to it.
-            if let Some(p) = port {
-                if req.port != *p {
-                    return false;
-                }
+            if let Some(p) = port
+                && req.port != *p
+            {
+                return false;
             }
             if !path.is_empty() {
                 if !req.path.starts_with(path.as_str()) {

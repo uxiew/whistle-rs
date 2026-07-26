@@ -417,14 +417,14 @@ fn store_pac(url: &str, body: Arc<str>) {
     let Ok(mut cache) = PAC_CACHE.lock() else {
         return;
     };
-    if !cache.contains_key(url) && cache.len() >= PAC_CACHE_MAX {
-        if let Some(oldest) = cache
+    if !cache.contains_key(url)
+        && cache.len() >= PAC_CACHE_MAX
+        && let Some(oldest) = cache
             .iter()
             .min_by_key(|(_, v)| v.at)
             .map(|(k, _)| k.clone())
-        {
-            cache.remove(&oldest);
-        }
+    {
+        cache.remove(&oldest);
     }
     cache.insert(
         url.to_string(),
@@ -441,10 +441,10 @@ fn store_pac(url: &str, body: Arc<str>) {
 /// (`_original/lib/rules/index.js:257-275`). This port used to hand the URL
 /// straight to the JS engine, where it threw and left the request going direct.
 async fn fetch_pac(url: &str) -> Result<Arc<str>> {
-    if let Some((body, fresh)) = cached_pac(url) {
-        if fresh {
-            return Ok(body);
-        }
+    if let Some((body, fresh)) = cached_pac(url)
+        && fresh
+    {
+        return Ok(body);
     }
     let fetched = super::upstream::simple_get(url).await;
     let stale = || cached_pac(url).map(|(body, _)| body);

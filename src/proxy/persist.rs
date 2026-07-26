@@ -218,14 +218,14 @@ async fn writer_task(
             file = open_append(&jsonl_path(&dir, &current_tag));
             prune_old_files(&dir, retain_days);
         }
-        if let Some(f) = &mut file {
-            if let Ok(line) = serde_json::to_string(&snap) {
-                let _ = writeln!(f, "{line}");
-                write_count += 1;
-                // Flush every 10 writes for durability without per-line fsync.
-                if write_count % 10 == 0 {
-                    let _ = f.flush();
-                }
+        if let Some(f) = &mut file
+            && let Ok(line) = serde_json::to_string(&snap)
+        {
+            let _ = writeln!(f, "{line}");
+            write_count += 1;
+            // Flush every 10 writes for durability without per-line fsync.
+            if write_count.is_multiple_of(10) {
+                let _ = f.flush();
             }
         }
     }

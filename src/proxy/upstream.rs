@@ -667,13 +667,12 @@ async fn forward_once(
             .unwrap_or_else(|| join_host_port(&target.connect_host, target.connect_port, 80));
         let abs = format!("http://{authority}{path}");
         *req.uri_mut() = abs.parse::<Uri>().unwrap_or_else(|_| req.uri().clone());
-        if let Some(proxy) = &target.proxy {
-            if let Some(v) = hop.proxy_auth(proxy) {
-                if let Ok(v) = hyper::header::HeaderValue::from_str(&v) {
-                    req.headers_mut()
-                        .insert(hyper::header::PROXY_AUTHORIZATION, v);
-                }
-            }
+        if let Some(proxy) = &target.proxy
+            && let Some(auth) = hop.proxy_auth(proxy)
+            && let Ok(v) = hyper::header::HeaderValue::from_str(&auth)
+        {
+            req.headers_mut()
+                .insert(hyper::header::PROXY_AUTHORIZATION, v);
         }
     }
 
@@ -847,15 +846,15 @@ async fn http_connect(
     let mut req = format!(
         "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n"
     );
-    if let Some(ua) = &hop.user_agent {
-        if is_header_value(ua) {
-            req.push_str(&format!("User-Agent: {ua}\r\n"));
-        }
+    if let Some(ua) = &hop.user_agent
+        && is_header_value(ua)
+    {
+        req.push_str(&format!("User-Agent: {ua}\r\n"));
     }
-    if let Some(auth) = hop.proxy_auth(proxy) {
-        if is_header_value(&auth) {
-            req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
-        }
+    if let Some(auth) = hop.proxy_auth(proxy)
+        && is_header_value(&auth)
+    {
+        req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
     }
     if inner {
         req.push_str(&format!("{POLICY_HEADER}: intercept\r\n"));
@@ -1387,7 +1386,7 @@ mod tests {
             tokio::spawn(async move {
                 let (mut s, _) = origin.accept().await.unwrap();
                 let head = read_head(&mut s).await;
-                let body = format!("{}", head.lines().next().unwrap_or(""));
+                let body = head.lines().next().unwrap_or("").to_string();
                 s.write_all(
                     format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
                         .as_bytes(),

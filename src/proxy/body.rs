@@ -157,10 +157,10 @@ impl Body for TrailersBody {
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        if let Some(data) = this.data.take() {
-            if !data.is_empty() {
-                return Poll::Ready(Some(Ok(Frame::data(data))));
-            }
+        if let Some(data) = this.data.take()
+            && !data.is_empty()
+        {
+            return Poll::Ready(Some(Ok(Frame::data(data))));
         }
         if let Some(trailers) = this.trailers.take() {
             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));

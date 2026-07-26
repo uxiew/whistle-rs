@@ -97,10 +97,10 @@ pub fn build_res_info(
 /// (whistle's Values store references).
 pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, String>) {
     fn sub(value: &mut String, values: &HashMap<String, String>) {
-        if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            if let Some(content) = values.get(name) {
-                *value = content.clone();
-            }
+        if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
+            && let Some(content) = values.get(name)
+        {
+            *value = content.clone();
         }
     }
     for op in resolved.single.values_mut() {
@@ -260,10 +260,10 @@ pub fn merge_included_rules(
     is_internal_req: bool,
 ) -> Vec<RuleManager> {
     let mut texts: Vec<String> = Vec::new();
-    if let Some(name) = resolved.value("rule") {
-        if let Some(content) = values.get(name) {
-            texts.push(content.clone());
-        }
+    if let Some(name) = resolved.value("rule")
+        && let Some(content) = values.get(name)
+    {
+        texts.push(content.clone());
     }
     // Every `rulesFile://` line contributes, joined into one rules text — see
     // `accumulated_script_ops`.
@@ -729,10 +729,10 @@ pub fn short_circuit(
         );
     }
 
-    if let Some((proto, value)) = find_file_rule(resolved) {
-        if !weak_rule_yields(resolved, proto) {
-            return serve_file_family(proto, value, info, env);
-        }
+    if let Some((proto, value)) = find_file_rule(resolved)
+        && !weak_rule_yields(resolved, proto)
+    {
+        return serve_file_family(proto, value, info, env);
     }
 
     None
@@ -766,7 +766,7 @@ const FILE_PROTOS: &[&str] = &[
 ];
 
 /// Find a matched local-file/template rule (`file`/`tpl`/`xfile`/…) if any.
-fn find_file_rule<'a>(resolved: &'a Resolved) -> Option<(&'static str, &'a str)> {
+fn find_file_rule(resolved: &Resolved) -> Option<(&'static str, &str)> {
     FILE_PROTOS
         .iter()
         .find_map(|&p| resolved.value(p).map(|v| (p, v)))
@@ -976,27 +976,28 @@ fn read_cached(path: &Path) -> Option<Arc<Vec<u8>>> {
     let mtime = meta.modified().ok();
 
     // A file we cannot stat for mtime is never cached — correctness first.
-    if let (Some(mtime), true) = (mtime, len <= MAX_CACHED_FILE) {
-        if let Ok(mut cache) = FILE_CACHE.lock() {
-            if let Some(hit) = cache.get(path) {
-                if hit.mtime == mtime && hit.len == len {
-                    return Some(Arc::clone(&hit.data));
-                }
-            }
-            let data = Arc::new(std::fs::read(path).ok()?);
-            if cache.len() >= MAX_CACHE_ENTRIES {
-                cache.clear();
-            }
-            cache.insert(
-                path.to_path_buf(),
-                CachedFile {
-                    mtime,
-                    len,
-                    data: Arc::clone(&data),
-                },
-            );
-            return Some(data);
+    if let (Some(mtime), true) = (mtime, len <= MAX_CACHED_FILE)
+        && let Ok(mut cache) = FILE_CACHE.lock()
+    {
+        if let Some(hit) = cache.get(path)
+            && hit.mtime == mtime
+            && hit.len == len
+        {
+            return Some(Arc::clone(&hit.data));
         }
+        let data = Arc::new(std::fs::read(path).ok()?);
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_path_buf(),
+            CachedFile {
+                mtime,
+                len,
+                data: Arc::clone(&data),
+            },
+        );
+        return Some(data);
     }
     std::fs::read(path).ok().map(Arc::new)
 }
@@ -1158,10 +1159,10 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(referer) = resolved.value("referer") {
         set_header(&mut parts.headers, "referer", referer);
     }
-    if let Some(m) = resolved.value("method") {
-        if let Ok(method) = m.to_uppercase().parse() {
-            parts.method = method;
-        }
+    if let Some(m) = resolved.value("method")
+        && let Ok(method) = m.to_uppercase().parse()
+    {
+        parts.method = method;
     }
     if let Some(ct) = resolved.value("reqType") {
         set_content_type(&mut parts.headers, ct, req_type_alias);
@@ -1447,16 +1448,15 @@ fn set_content_type(headers: &mut HeaderMap, value: &str, alias: fn(&str) -> Opt
         parts[0] = lookup_type(&name, alias).to_string();
     }
     let mut new_type = parts.join(";");
-    if !new_type.contains(';') {
-        if let Some(current) = headers
+    if !new_type.contains(';')
+        && let Some(current) = headers
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .filter(|c| c.contains(';'))
-        {
-            let mut kept: Vec<String> = current.split(';').map(str::to_string).collect();
-            kept[0] = new_type;
-            new_type = kept.join(";");
-        }
+    {
+        let mut kept: Vec<String> = current.split(';').map(str::to_string).collect();
+        kept[0] = new_type;
+        new_type = kept.join(";");
     }
     set_header(headers, "content-type", &new_type);
 }
@@ -1531,16 +1531,14 @@ pub fn apply_response_for(
     if let Some(code) = resolved
         .value("replaceStatus")
         .or_else(|| resolved.value("statusCode"))
-    {
-        if let Some(status) = code
+        && let Some(status) = code
             .trim()
             .parse::<u16>()
             .ok()
             .and_then(|c| StatusCode::from_u16(c).ok())
-        {
-            parts.status = status;
-            handle_status_code(&mut parts.headers, status);
-        }
+    {
+        parts.status = status;
+        handle_status_code(&mut parts.headers, status);
     }
     apply_res_cookies(&mut parts.headers, resolved);
     apply_res_cors(&mut parts.headers, resolved, info);
@@ -1683,19 +1681,19 @@ fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&Re
     if let Some(list) = spec.get("headers") {
         let op = if is_options { "allow" } else { "expose" };
         set_header(headers, &format!("access-control-{op}-headers"), list);
-    } else if auto {
-        if let Some(list) = req_header(info, "access-control-request-headers") {
-            set_header(headers, "access-control-allow-headers", list);
-        }
+    } else if auto
+        && let Some(list) = req_header(info, "access-control-request-headers")
+    {
+        set_header(headers, "access-control-allow-headers", list);
     }
     if let Some(credentials) = spec.get("credentials") {
         set_header(headers, "access-control-allow-credentials", credentials);
-    } else if auto {
-        if let Some(method) = req_header(info, "access-control-request-method") {
-            // Singular, and not a real CORS header — upstream's typo, kept so
-            // both implementations emit the same thing.
-            set_header(headers, "access-control-allow-method", method);
-        }
+    } else if auto
+        && let Some(method) = req_header(info, "access-control-request-method")
+    {
+        // Singular, and not a real CORS header — upstream's typo, kept so
+        // both implementations emit the same thing.
+        set_header(headers, "access-control-allow-method", method);
     }
     if let Some(max_age) = spec.get("maxage") {
         set_header(headers, "access-control-max-age", max_age);
@@ -1818,7 +1816,8 @@ fn apply_cache(headers: &mut HeaderMap, resolved: &Resolved) {
     let lower = value.to_ascii_lowercase();
     let no_cache = matches!(lower.as_str(), "no" | "no-cache" | "no-store")
         || max_age.is_some_and(|n| n < 0);
-    if !no_cache && !max_age.is_some_and(|n| n >= 0) {
+    // Neither a no-cache spelling nor a usable max-age: nothing to write.
+    if !no_cache && max_age.is_none_or(|n| n < 0) {
         return;
     }
     let cache_control = match (no_cache, lower == "no-store") {
@@ -2975,10 +2974,10 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
                         map.remove(key);
                     }
                     serde_json::Value::Array(list) => {
-                        if let Ok(i) = key.parse::<usize>() {
-                            if i < list.len() {
-                                list.remove(i);
-                            }
+                        if let Ok(i) = key.parse::<usize>()
+                            && i < list.len()
+                        {
+                            list.remove(i);
                         }
                     }
                     _ => {}
@@ -3005,10 +3004,10 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
 /// `{` at all — from the first `[` to the last `]`. Greedy on purpose, so a
 /// JSONP wrapper's parentheses stay outside.
 fn json_span(text: &str) -> Option<(usize, usize)> {
-    if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}')) {
-        if s < e {
-            return Some((s, e + 1));
-        }
+    if let (Some(s), Some(e)) = (text.find('{'), text.rfind('}'))
+        && s < e
+    {
+        return Some((s, e + 1));
     }
     let (s, e) = (text.find('[')?, text.rfind(']')?);
     (s < e).then_some((s, e + 1))
@@ -3101,20 +3100,20 @@ fn merge_line_maps<V>(
 /// A `{json}` value is an object of the same shape.
 fn parse_replace_pairs(spec: &str) -> Vec<(String, String)> {
     let spec = spec.trim();
-    if spec.starts_with('{') {
-        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(spec) {
-            return map
-                .into_iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        serde_json::Value::String(s) => s,
-                        serde_json::Value::Null => String::new(),
-                        other => other.to_string(),
-                    };
-                    (k, val)
-                })
-                .collect();
-        }
+    if spec.starts_with('{')
+        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(spec)
+    {
+        return map
+            .into_iter()
+            .map(|(k, v)| {
+                let val = match v {
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                (k, val)
+            })
+            .collect();
     }
     spec.split('&')
         .filter_map(|pair| {
@@ -3273,10 +3272,10 @@ fn merge_params_values(resolved: &Resolved, protocol: &str) -> Vec<(String, serd
 /// Parse `k=v&k2=v2` or `{json}` into `name` → JSON value pairs.
 fn parse_param_values(value: &str) -> Vec<(String, serde_json::Value)> {
     let value = value.trim();
-    if value.starts_with('{') {
-        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            return map.into_iter().collect();
-        }
+    if value.starts_with('{')
+        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+    {
+        return map.into_iter().collect();
     }
     value
         .split('&')
@@ -3380,23 +3379,23 @@ fn merge_cookie_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, String)
 /// `delete://reqCookies.<name>`.
 fn parse_cookie_ops(value: &str) -> Vec<(String, String)> {
     let value = value.trim();
-    if value.starts_with('{') {
-        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            return map
-                .into_iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        serde_json::Value::String(s) => s,
-                        serde_json::Value::Null => String::new(),
-                        // A cookie declared as an object carries attributes
-                        // upstream (`getCookieItem`); whistle-rs writes only
-                        // its serialised form.
-                        other => other.to_string(),
-                    };
-                    (k, val)
-                })
-                .collect();
-        }
+    if value.starts_with('{')
+        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+    {
+        return map
+            .into_iter()
+            .map(|(k, v)| {
+                let val = match v {
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Null => String::new(),
+                    // A cookie declared as an object carries attributes
+                    // upstream (`getCookieItem`); whistle-rs writes only
+                    // its serialised form.
+                    other => other.to_string(),
+                };
+                (k, val)
+            })
+            .collect();
     }
     value
         .split('&')
@@ -3533,16 +3532,16 @@ fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, String)
 /// convenience, not upstream syntax.
 fn parse_header_pairs(value: &str) -> Vec<(String, String)> {
     let value = value.trim();
-    if value.starts_with('{') {
-        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
-            return map
-                .into_iter()
-                .map(|(k, v)| match v {
-                    serde_json::Value::String(s) => (k, s),
-                    other => (k, other.to_string()),
-                })
-                .collect();
-        }
+    if value.starts_with('{')
+        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+    {
+        return map
+            .into_iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => (k, s),
+                other => (k, other.to_string()),
+            })
+            .collect();
     }
     if value.contains('=') {
         return value
