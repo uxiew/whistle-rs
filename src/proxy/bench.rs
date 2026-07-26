@@ -7,23 +7,38 @@
 //! cargo test --release -- --ignored --nocapture bench::
 //! ```
 //!
-//! Method, in all three: the configurations under test are driven **round
-//! robin within one loop**, so a scheduler hiccup or a thermal excursion lands
-//! on every configuration rather than on whichever one happened to run during
-//! it. Each iteration's wall time is kept, and the report gives mean/p50/p95
-//! over the whole run so the noise floor stays visible instead of being
-//! averaged away. The bodies are pre-built `Bytes` sliced per frame, so a
-//! refcount bump is all that separates the measurement from the tee itself.
+//! Method, throughout: the configurations under test are driven **round robin
+//! within one loop**, so a scheduler hiccup or a thermal excursion lands on
+//! every configuration rather than on whichever one happened to run during it.
+//! Each iteration's wall time is kept, and the report gives mean/p50/p95 over
+//! the whole run so the noise floor stays visible instead of being averaged
+//! away. The bodies are pre-built `Bytes` sliced per frame, so a refcount bump
+//! is all that separates the measurement from the tee itself.
+//!
+//! [`proxied_request_latency`] is the end-to-end counterpart: real proxies,
+//! real sockets, concurrent clients. It compares preview caps rather than tee
+//! against no-tee, because there is no configuration that removes the tee — at
+//! a cap of 0 it still counts the body's bytes, which is what the session list
+//! shows as the body size. The microbenchmarks above are where tee-against-no-
+//! tee is measured; this one says what that difference is worth against a
+//! socket.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use super::Capture;
 use super::body::{BodyError, DynBody, tee};
+use crate::ca::CertAuthority;
+use crate::config::Config;
+use crate::rules::RuleManager;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * 1024;
@@ -112,31 +127,61 @@ impl Samples {
 }
 
 /// Print one table: every configuration's mean/p50/p95, and what the mean costs
-/// over the first row, per body and per frame.
+/// over the first row, which is always the cheapest configuration. `frames`
+/// divides that delta down to a per-frame figure where the number of frames is
+/// the interesting axis; pass `None` where it is not.
 ///
-/// Deliberately no throughput column. The baseline body hands out slices of a
-/// buffer that is already resident, so its "GB/s" describes the poll loop and
-/// nothing a network could do; the honest quantity is the delta the tee adds.
-fn report(title: &str, frames: usize, runs: &[Samples]) {
-    println!("\n{title}  ({} iterations)", runs[0].times.len());
+/// Deliberately no throughput column for the microbenchmarks. Their baseline
+/// body hands out slices of a buffer that is already resident, so its "GB/s"
+/// would describe the poll loop and nothing a network could do; the honest
+/// quantity is the delta the tee adds.
+fn report(title: &str, frames: Option<usize>, runs: &[Samples]) {
+    println!("\n{title}  ({} samples per row)", runs[0].times.len());
     println!(
         "  {:<22} {:>10} {:>10} {:>10} {:>12} {:>12}",
-        "configuration", "mean", "p50", "p95", "vs. no tee", "per frame"
+        "configuration",
+        "mean",
+        "p50",
+        "p95",
+        "vs. first",
+        if frames.is_some() { "per frame" } else { "" }
     );
     let base = runs[0].stats().0;
     for r in runs {
         let (mean, p50, p95) = r.stats();
         let delta = mean.as_secs_f64() - base.as_secs_f64();
+        let per_frame = match frames {
+            Some(f) => format!("{:>9.1} ns", delta * 1e9 / f as f64),
+            None => String::new(),
+        };
         println!(
-            "  {:<22} {:>9.1?} {:>9.1?} {:>9.1?} {:>+11.1?} {:>9.1} ns",
+            "  {:<22} {:>9.1?} {:>9.1?} {:>9.1?} {:>12} {per_frame:>12}",
             r.label,
             mean,
             p50,
             p95,
-            Duration::from_secs_f64(delta.max(0.0)),
-            delta * 1e9 / frames as f64
+            signed(delta),
         );
     }
+}
+
+/// A signed duration. The delta against the baseline can come out negative —
+/// that is what the noise floor looks like — and clamping it at zero would
+/// quietly turn "indistinguishable" into "free".
+fn signed(secs: f64) -> String {
+    let sign = if secs < 0.0 { "-" } else { "+" };
+    format!("{sign}{:.1?}", Duration::from_secs_f64(secs.abs()))
+}
+
+/// The configurations paired with their slot, starting from `offset` and
+/// wrapping — see the call sites for why the order rotates.
+fn rotated<T: Copy>(configs: &[T], offset: usize) -> Vec<(usize, T)> {
+    (0..configs.len())
+        .map(|k| {
+            let slot = (offset + k) % configs.len();
+            (slot, configs[slot])
+        })
+        .collect()
 }
 
 /// Body of `size` bytes that does not compress to nothing, so a gzip capture
@@ -179,11 +224,14 @@ fn tee_overhead_by_body_size() {
         // Warmup, then the measured loop. Round robin: one iteration of each
         // configuration before the next iteration of the first.
         for i in 0..iterations + 20 {
-            for (slot, cap) in [None, Some(0), Some(16 * KIB), Some(size)].iter().enumerate() {
+            // Rotate the order each iteration. A fixed order would hand every
+            // per-iteration warm-up cost to whichever configuration is always
+            // first, which is the baseline every other row is measured against.
+            for (slot, cap) in rotated(&[None, Some(0), Some(16 * KIB), Some(size)], i) {
                 let body = ChunkedBody::new(src.clone(), chunk).boxed();
                 let body = match cap {
                     None => body,
-                    Some(cap) => tee(body, Capture::new(Some("text/plain".into()), None, *cap)),
+                    Some(cap) => tee(body, Capture::new(Some("text/plain".into()), None, cap)),
                 };
                 let t = Instant::now();
                 let seen = drain(body);
@@ -201,7 +249,7 @@ fn tee_overhead_by_body_size() {
                 chunk / KIB,
                 size.div_ceil(chunk)
             ),
-            size.div_ceil(chunk),
+            Some(size.div_ceil(chunk)),
             &runs,
         );
     }
@@ -219,11 +267,11 @@ fn tee_overhead_by_frame_size() {
     for &chunk in &[64 * KIB, 16 * KIB, 4 * KIB, 512] {
         let mut runs = vec![Samples::new("no tee"), Samples::new("tee, cap 16 KiB")];
         for i in 0..iterations + 20 {
-            for (slot, cap) in [None, Some(16 * KIB)].iter().enumerate() {
+            for (slot, cap) in rotated(&[None, Some(16 * KIB)], i) {
                 let body = ChunkedBody::new(src.clone(), chunk).boxed();
                 let body = match cap {
                     None => body,
-                    Some(cap) => tee(body, Capture::new(Some("text/plain".into()), None, *cap)),
+                    Some(cap) => tee(body, Capture::new(Some("text/plain".into()), None, cap)),
                 };
                 let t = Instant::now();
                 let seen = drain(body);
@@ -240,7 +288,7 @@ fn tee_overhead_by_frame_size() {
                 size.div_ceil(chunk),
                 human(chunk)
             ),
-            size.div_ceil(chunk),
+            Some(size.div_ceil(chunk)),
             &runs,
         );
     }
@@ -264,14 +312,11 @@ fn tee_overhead_when_decoding() {
             Samples::new("tee, gzip decode"),
         ];
         for i in 0..iterations + 20 {
-            for (slot, enc) in [None, Some(None), Some(Some("gzip"))].iter().enumerate() {
+            for (slot, enc) in rotated(&[None, Some(None), Some(Some("gzip"))], i) {
                 let body = ChunkedBody::new(src.clone(), chunk).boxed();
                 let body = match enc {
                     None => body,
-                    Some(enc) => tee(
-                        body,
-                        Capture::new(Some("text/plain".into()), *enc, 16 * KIB),
-                    ),
+                    Some(enc) => tee(body, Capture::new(Some("text/plain".into()), enc, 16 * KIB)),
                 };
                 let t = Instant::now();
                 let seen = drain(body);
@@ -289,7 +334,7 @@ fn tee_overhead_when_decoding() {
                 human(wire),
                 chunk / KIB
             ),
-            wire.div_ceil(chunk),
+            Some(wire.div_ceil(chunk)),
             &runs,
         );
     }
@@ -352,4 +397,240 @@ fn human(n: usize) -> String {
     } else {
         format!("{n} B")
     }
+}
+
+// ---------------------------------------------------------------------------
+// End to end: real proxies, real sockets, concurrent clients.
+// ---------------------------------------------------------------------------
+
+/// A canned origin. Answers every request with the same pre-rendered response,
+/// so the server side contributes a `write` and nothing else to the timings.
+async fn origin(response: Bytes, accepted: Arc<AtomicUsize>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            accepted.fetch_add(1, Ordering::Relaxed);
+            let response = response.clone();
+            tokio::spawn(async move {
+                let _ = sock.set_nodelay(true);
+                let mut buf = [0u8; 8192];
+                let mut pending = Vec::new();
+                loop {
+                    // Keep-alive: one response per request line seen.
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    pending.extend_from_slice(&buf[..n]);
+                    while let Some(end) = find_headers_end(&pending) {
+                        pending.drain(..end);
+                        if sock.write_all(&response).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Start a proxy with the given preview cap, returning the port it listens on.
+async fn proxy_with_cap(cap: usize, dir: &std::path::Path) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("probe bind");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener); // hand the port to the proxy itself
+
+    let config = Config {
+        port,
+        host: Some("127.0.0.1".parse().unwrap()),
+        storage_dir: dir.join(format!("cap-{cap}")),
+        body_preview_cap: cap,
+        intercept_https: false,
+        ..Config::default()
+    };
+    let ca = CertAuthority::load_or_create(&config).expect("root CA");
+    let state = Arc::new(super::AppState::new(config, RuleManager::new(), ca));
+    tokio::spawn(async move {
+        let _ = super::run(state).await;
+    });
+    // Wait for the listener to be up rather than sleeping a guessed interval.
+    for _ in 0..200 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return port;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("proxy on {port} never came up");
+}
+
+/// One keep-alive client connection to `proxy_port`, fetching from `origin_port`
+/// in absolute form (which is what a forward proxy expects).
+struct Client {
+    sock: TcpStream,
+    request: Vec<u8>,
+    buf: Vec<u8>,
+}
+
+impl Client {
+    async fn connect(proxy_port: u16, origin_port: u16) -> Client {
+        let sock = TcpStream::connect(("127.0.0.1", proxy_port))
+            .await
+            .expect("connect to proxy");
+        let _ = sock.set_nodelay(true);
+        let request = format!(
+            "GET http://127.0.0.1:{origin_port}/body HTTP/1.1\r\n\
+             Host: 127.0.0.1:{origin_port}\r\n\
+             Connection: keep-alive\r\n\r\n"
+        )
+        .into_bytes();
+        Client {
+            sock,
+            request,
+            buf: Vec::with_capacity(64 * KIB),
+        }
+    }
+
+    /// Issue one request and read the whole response. Returns its duration.
+    async fn round_trip(&mut self) -> Duration {
+        let start = Instant::now();
+        self.sock.write_all(&self.request).await.expect("write");
+        self.buf.clear();
+        let mut chunk = [0u8; 32 * KIB];
+        let mut want: Option<usize> = None;
+        loop {
+            let n = self.sock.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "proxy closed the connection mid-response");
+            self.buf.extend_from_slice(&chunk[..n]);
+            if want.is_none()
+                && let Some(head) = find_headers_end(&self.buf)
+            {
+                let headers = String::from_utf8_lossy(&self.buf[..head]).to_ascii_lowercase();
+                let len: usize = headers
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|s| s.split("\r\n").next())
+                    .and_then(|s| s.trim().parse().ok())
+                    .expect("a content-length on the proxied response");
+                want = Some(head + len);
+            }
+            if want.is_some_and(|w| self.buf.len() >= w) {
+                return start.elapsed();
+            }
+        }
+    }
+}
+
+/// Build the canned origin response for a body of `size`, optionally gzipped.
+fn canned_response(size: usize, gzip: bool) -> Bytes {
+    let raw = payload(size);
+    let (body, enc) = if gzip {
+        (gzipped(&raw), "Content-Encoding: gzip\r\n")
+    } else {
+        (raw, "")
+    };
+    let mut out = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{enc}Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&body);
+    Bytes::from(out)
+}
+
+/// What the capture costs a request that actually crosses a socket, under
+/// concurrency, at preview caps spanning the body size.
+#[test]
+#[ignore = "measurement, not an assertion; needs --release"]
+fn proxied_request_latency() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = std::env::temp_dir().join(format!("whistle-rs-bench-{}", std::process::id()));
+
+    rt.block_on(async {
+        // One proxy per configuration, all live at once, so a client can send
+        // successive requests to each and no run is measured at a different
+        // moment from the others.
+        let caps = [0usize, 16 * KIB, MIB];
+        let labels = ["cap 0 (count only)", "cap 16 KiB (default)", "cap 1 MiB"];
+        let mut ports = Vec::new();
+        for cap in caps {
+            ports.push(proxy_with_cap(cap, &dir).await);
+        }
+
+        for &(size, gzip) in &[(4 * KIB, false), (MIB, false), (MIB, true)] {
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let origin_port = origin(canned_response(size, gzip), accepted.clone()).await;
+            for &concurrency in &[1usize, 32] {
+                // whistle-rs opens a fresh upstream connection per request (no
+                // pooling — `upstream.rs:3`), so every request costs an
+                // ephemeral port for the length of TIME_WAIT. The counts here
+                // are what a 16 K port range will bear for one run; they are
+                // the reason this sweep is not larger.
+                let requests = if concurrency == 1 { 150 } else { 25 };
+                let before = accepted.load(Ordering::Relaxed);
+                let mut workers = Vec::new();
+                for _ in 0..concurrency {
+                    let ports = ports.clone();
+                    workers.push(tokio::spawn(async move {
+                        let mut clients = Vec::new();
+                        for &p in &ports {
+                            clients.push(Client::connect(p, origin_port).await);
+                        }
+                        let mut times = vec![Vec::new(); ports.len()];
+                        // Warmup, then measure. Round robin over the
+                        // configurations inside the request loop.
+                        for i in 0..requests + 10 {
+                            for k in 0..clients.len() {
+                                let slot = (i + k) % clients.len();
+                                let dt = clients[slot].round_trip().await;
+                                if i >= 10 {
+                                    times[slot].push(dt);
+                                }
+                            }
+                        }
+                        times
+                    }));
+                }
+
+                let mut runs: Vec<Samples> = labels.iter().map(|l| Samples::new(l)).collect();
+                for w in workers {
+                    for (slot, times) in w.await.expect("worker").into_iter().enumerate() {
+                        runs[slot].times.extend(times);
+                    }
+                }
+                let issued = concurrency * (requests + 10) * ports.len();
+                let upstream = accepted.load(Ordering::Relaxed) - before;
+                report(
+                    &format!(
+                        "GET {} {} body, {concurrency} concurrent connection(s)",
+                        human(size),
+                        if gzip { "gzip" } else { "identity" },
+                    ),
+                    None,
+                    &runs,
+                );
+                println!(
+                    "    {upstream} upstream connections for {issued} requests \
+                     ({:.2} per request)",
+                    upstream as f64 / issued as f64
+                );
+                // Let TIME_WAIT drain before the next round claims more ports.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    });
+    let _ = std::fs::remove_dir_all(&dir);
 }
