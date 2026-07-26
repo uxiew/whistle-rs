@@ -2296,6 +2296,7 @@ mod internal_req_tests {
             request_port: 443,
             proxy: None,
             tls_versions: upstream::TlsVersions::Default,
+            host_fallback_direct: false,
         };
 
         let mut h = hyper::HeaderMap::new();

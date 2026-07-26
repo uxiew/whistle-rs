@@ -482,7 +482,8 @@ pub async fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Result<Targe
     let mut connect_host = info.host.clone();
     let mut connect_port = info.port;
 
-    let host_rule = resolved.value("host");
+    let host_op = resolved.get("host");
+    let host_rule = host_op.map(|op| op.value.as_str());
     if let Some(value) = host_rule {
         let (h, p) = parse_host_value(value, info.port);
         if let Some(h) = h {
@@ -492,6 +493,12 @@ pub async fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Result<Targe
             connect_port = p;
         }
     }
+    // `xhost://` is the pass-through spelling: the address is used if it works
+    // and ignored if it does not, where plain `host://` fails the request
+    // (`retryXHost`, `_original/lib/inspectors/res.js:571-600`). The `x` is only
+    // visible on the matcher as written — both spellings resolve to the same
+    // `host` operator (`xhost: 'host'`, `_original/lib/rules/protocols.js:145`).
+    let host_fallback_direct = host_op.is_some_and(|op| op.raw.starts_with('x'));
 
     let matched = find_proxy(info, resolved)
         .await?
@@ -517,6 +524,7 @@ pub async fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Result<Targe
             .value("cipher")
             .map(parse_cipher_versions)
             .unwrap_or_default(),
+        host_fallback_direct,
     })
 }
 
@@ -4829,6 +4837,25 @@ mod tests {
         let t = target(HOST_AND_PROXY, "http://example.com/");
         assert_eq!(t.connect_host, "1.2.3.4");
         assert!(t.proxy.is_none(), "the proxy must lose to the host rule");
+    }
+
+    /// `xhost://` resolves to the same `host` operator as `host://`
+    /// (`xhost: 'host'`, `_original/lib/rules/protocols.js:145`) — the only
+    /// thing that tells them apart is the matcher as written, which is what
+    /// carries the pass-through behaviour to the forwarding layer.
+    #[test]
+    fn only_the_x_spelling_of_host_falls_back() {
+        let t = target("example.com xhost://10.0.0.9:8443\n", "http://example.com/");
+        assert_eq!((t.connect_host.as_str(), t.connect_port), ("10.0.0.9", 8443));
+        assert!(t.host_fallback_direct, "xhost:// is the pass-through spelling");
+
+        let t = target("example.com host://10.0.0.9:8443\n", "http://example.com/");
+        assert_eq!((t.connect_host.as_str(), t.connect_port), ("10.0.0.9", 8443));
+        assert!(!t.host_fallback_direct, "host:// fails the request instead");
+
+        // `hosts://` is the third spelling and is *not* the x one.
+        let t = target("example.com hosts://10.0.0.9\n", "http://example.com/");
+        assert!(!t.host_fallback_direct);
     }
 
     /// A proxy rule with no host rule to lose to is used as-is.

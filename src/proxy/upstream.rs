@@ -152,6 +152,11 @@ pub struct Target {
     pub proxy: Option<ProxyConfig>,
     /// TLS version constraint for the origin handshake (`cipher` operator).
     pub tls_versions: TlsVersions,
+    /// True when [`Self::connect_host`] came from an `xhost://` rule rather than
+    /// a `host://` one: the address is a preference, not a requirement, and a
+    /// connection that cannot be *established* to it is retried against the
+    /// requested host (`retryXHost`, `_original/lib/inspectors/res.js:571-600`).
+    pub host_fallback_direct: bool,
 }
 
 impl Target {
@@ -193,6 +198,33 @@ impl Target {
     /// upstream to tunnel through, and the flag does nothing.
     fn uses_proxy_tunnel(&self) -> bool {
         self.proxy.as_ref().is_some_and(|p| p.tunnel) && self.has_host_override()
+    }
+
+    /// The second, forgiving attempt an `x`-prefixed rule buys — or `None` when
+    /// no rule on this request asked for one.
+    ///
+    /// Two rules do, and whistle keeps them strictly apart: the proxy check runs
+    /// first and the host check is its `else if`, so a request with any proxy
+    /// rule never takes the `xhost://` path (`_original/lib/inspectors/res.js:545-573`).
+    ///
+    /// * `xproxy://` &co. — drop the hop and go straight to the origin;
+    /// * `xhost://` — drop the address override and go to the host that was
+    ///   requested, on the port that was requested (whistle re-resolves it with
+    ///   `lookupHost`, which does *not* re-apply host rules, and restores
+    ///   `originPort`, `res.js:571-591`).
+    fn fallback_target(&self) -> Option<Target> {
+        if let Some(proxy) = &self.proxy {
+            return proxy.fallback_direct.then(|| Target {
+                proxy: None,
+                ..self.clone()
+            });
+        }
+        self.host_fallback_direct.then(|| Target {
+            connect_host: self.sni.clone(),
+            connect_port: self.request_port,
+            host_fallback_direct: false,
+            ..self.clone()
+        })
     }
 }
 
@@ -525,25 +557,25 @@ pub async fn forward_with_addr(
     target: &Target,
     req: Request<DynBody>,
 ) -> Result<(Response<Incoming>, Option<SocketAddr>)> {
-    let fallback = target
-        .proxy
-        .as_ref()
-        .is_some_and(|proxy| proxy.fallback_direct);
+    let fallback = target.fallback_target();
     match forward_once(target, req).await {
         Ok(out) => Ok(out),
-        // `xproxy://` and friends mean "through this proxy, or straight there if
-        // that fails" (`X_RE`, `_original/lib/inspectors/res.js:546-560`). Only a
-        // failure to *establish* the hop retries: past that point the request has
-        // been written to a socket the caller no longer owns a copy of, and
-        // whistle's own retry is likewise guarded on the connection not having
-        // been piped yet (`piped`, `res.js:529,:673-680`).
-        Err(RetryableError::Connect(err)) if fallback => {
-            tracing::debug!("proxy hop failed ({err:#}); falling back to a direct connection");
-            let direct = Target {
-                proxy: None,
-                ..target.clone()
-            };
-            forward_once(&direct, err.into_request())
+        // `xproxy://` and `xhost://` mean "this way, or the ordinary way if that
+        // fails" (`X_RE`, `_original/lib/inspectors/res.js:546-560,:571-600`).
+        // Only a failure to *establish* the connection retries: past that point
+        // the request has been written to a socket the caller no longer owns a
+        // copy of, and whistle's own retry is likewise guarded on the connection
+        // not having been piped yet (`piped`, `res.js:529,:673-680`).
+        Err(RetryableError::Connect(err)) if fallback.is_some() => {
+            let next = fallback.expect("checked");
+            tracing::debug!(
+                "{}:{} failed ({err:#}); falling back to {}:{}",
+                target.connect_host,
+                target.connect_port,
+                next.connect_host,
+                next.connect_port
+            );
+            forward_once(&next, err.into_request())
                 .await
                 .map_err(RetryableError::into_inner)
         }
@@ -980,6 +1012,7 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
         request_port: port,
         proxy: None,
         tls_versions: TlsVersions::Default,
+        host_fallback_direct: false,
     };
     Ok((target, path.to_string()))
 }
@@ -1152,6 +1185,7 @@ mod tests {
             request_port: port,
             proxy,
             tls_versions: TlsVersions::Default,
+            host_fallback_direct: false,
         }
     }
 
@@ -1728,6 +1762,77 @@ mod tests {
                 .unwrap_err();
             assert!(format!("{err:#}").contains("connecting to proxy"), "{err:#}");
         });
+    }
+
+    /// `xhost://` is the pass-through spelling of `host://`: when the address it
+    /// names cannot be reached, the request goes to the host that was actually
+    /// asked for instead of failing (`retryXHost`,
+    /// `_original/lib/inspectors/res.js:571-600`). Plain `host://` still fails.
+    #[test]
+    fn an_x_host_falls_back_to_the_requested_address() {
+        rt().block_on(async {
+            let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin.local_addr().unwrap().port();
+            let seen = tokio::spawn(async move {
+                let (mut s, _) = origin.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                head
+            });
+            // A port nothing listens on: bind it, read the port, drop it.
+            let dead_port = {
+                let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                l.local_addr().unwrap().port()
+            };
+
+            // The request asked for 127.0.0.1:<origin>; the rule redirected it
+            // to the dead port.
+            let mut t = target("127.0.0.1", origin_port, None);
+            t.connect_port = dead_port;
+            t.host_fallback_direct = true;
+            let resp = forward(&t, get("/x", "example.com"))
+                .await
+                .expect("falls back to the requested host");
+            assert_eq!(resp.status(), 204);
+            // The retry carries the request the client wrote, untouched.
+            let head = seen.await.unwrap();
+            assert!(head.starts_with("GET /x HTTP/1.1\r\n"), "{head:?}");
+
+            // `host://` — the same address, without the pass-through — fails closed.
+            t.host_fallback_direct = false;
+            assert!(forward(&t, get("/x", "example.com")).await.is_err());
+        });
+    }
+
+    /// whistle checks the proxy rule first and the host rule in its `else if`
+    /// (`res.js:545-573`), so a request with *any* proxy rule never takes the
+    /// `xhost://` fallback — the connection it failed to make was to the proxy,
+    /// not to the address `xhost://` named.
+    #[test]
+    fn a_proxy_rule_takes_the_x_host_fallback_off_the_table() {
+        let mut cfg = parse_proxy(ProxyKind::Http, "127.0.0.1:1").unwrap();
+        cfg.fallback_direct = false;
+        let mut t = target("10.0.0.9", 80, Some(cfg.clone()));
+        t.host_fallback_direct = true;
+        assert!(t.fallback_target().is_none());
+
+        // An `xproxy://` still falls back, and to the origin — not to a target
+        // that also dropped the host override.
+        cfg.fallback_direct = true;
+        let mut t = target("10.0.0.9", 80, Some(cfg));
+        t.host_fallback_direct = true;
+        let next = t.fallback_target().expect("the proxy hop falls back");
+        assert!(next.proxy.is_none());
+        assert_eq!(next.connect_host, "10.0.0.9");
+
+        // With no proxy at all, `xhost://` restores the requested address.
+        let mut t = target("example.com", 443, None);
+        t.connect_host = "10.0.0.9".into();
+        t.connect_port = 8443;
+        t.host_fallback_direct = true;
+        let next = t.fallback_target().expect("the host override falls back");
+        assert_eq!((next.connect_host.as_str(), next.connect_port), ("example.com", 443));
+        assert!(!next.host_fallback_direct, "one retry, not a loop");
     }
 
     /// A proxy that answers and *then* fails is not retried: the request has
