@@ -534,21 +534,20 @@ fn has_request_body(headers: &hyper::HeaderMap) -> bool {
         || headers.contains_key(hyper::header::TRANSFER_ENCODING)
 }
 
-/// Convert a plugin-produced response into a real HTTP response.
-fn plugin_response(resp: crate::plugins::PluginResp) -> Response<DynBody> {
+/// Convert a plugin-produced response into a real HTTP response head plus its
+/// body. The two are kept apart because every response operator still has to run
+/// over them — see [`finish_local_response`].
+fn plugin_response(resp: crate::plugins::PluginResp) -> (hyper::http::response::Parts, Bytes) {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
     let mut builder = Response::builder().status(status);
     for (k, v) in &resp.headers {
         builder = builder.header(k, v);
     }
-    builder
-        .body(body::full(Bytes::from(resp.body)))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(body::empty())
-                .unwrap()
-        })
+    let body = Bytes::from(resp.body);
+    let head = builder
+        .body(())
+        .unwrap_or_else(|_| Response::builder().status(StatusCode::OK).body(()).unwrap());
+    (head.into_parts().0, body)
 }
 
 /// One captured WebSocket frame, as surfaced in the Network view.
@@ -944,6 +943,225 @@ fn known_server_ip(target: &upstream::Target, reached: Option<SocketAddr>) -> Op
     })
 }
 
+/// The response-side operators that act on the body once it is in hand.
+///
+/// Gathered in one place because more than one exit produces a response: the
+/// origin's, a `plugin://` hook's, and a short-circuit rule's. whistle runs the
+/// same response inspectors over all three (`_original/lib/inspectors/res.js`
+/// is reached whether the bytes came from a server, a plugin, or a local file),
+/// so they must run the same set here too.
+struct ResBodyOps {
+    /// `resSpeed://` — throttle, in kB/s.
+    speed: Option<f64>,
+    /// `resScript://` — the loaded source, not the rule value.
+    script: Option<String>,
+    /// `weinre://` — debug-agent id to inject.
+    weinre: Option<String>,
+    /// `locationHref://` — client-side redirect to inject.
+    location_href: Option<String>,
+    /// `resWrite://` / `resWriteRaw://` — dump paths.
+    write: Option<String>,
+    write_raw: Option<String>,
+    /// `trailers://` — trailing headers to append after the body.
+    trailers: hyper::HeaderMap,
+    /// Any content operator (`resReplace`, `htmlAppend`, `resBody`, …).
+    content: bool,
+}
+
+impl ResBodyOps {
+    fn of(resolved: &Resolved) -> Self {
+        ResBodyOps {
+            speed: apply::res_speed_kbps(resolved),
+            script: apply::res_script_op(resolved)
+                .map(|op| op.value.as_str())
+                .and_then(script::load_script),
+            weinre: resolved.value("weinre").map(|s| s.to_string()),
+            location_href: resolved.value("locationHref").map(|s| s.to_string()),
+            write: apply::res_write_path(resolved),
+            write_raw: apply::res_write_raw_path(resolved),
+            trailers: apply::build_trailers(resolved),
+            content: apply::wants_res_body(resolved),
+        }
+    }
+
+    /// True when at least one of these needs the whole body in memory. A
+    /// response no operator touches never gets collected — that is what keeps
+    /// the streaming path streaming.
+    fn needs_body(&self) -> bool {
+        self.content
+            || self.speed.is_some()
+            || self.script.is_some()
+            || self.weinre.is_some()
+            || self.location_href.is_some()
+            || self.write.is_some()
+            || self.write_raw.is_some()
+            || !self.trailers.is_empty()
+    }
+}
+
+/// The operators that rewrite an already-transformed body: `resScript://`, the
+/// two HTML injections, and the two dump paths. Runs after
+/// [`apply::transform_res_body`] and after any plugin response-body hook.
+fn inject_res_body(
+    state: &AppState,
+    parts: &mut hyper::http::response::Parts,
+    mut new: Bytes,
+    ops: &ResBodyOps,
+    info: &ReqInfo,
+) -> Bytes {
+    if let Some(src) = &ops.script {
+        let hv: Vec<(String, String)> = parts
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let body_str = String::from_utf8_lossy(&new).into_owned();
+        if let Some(r) = script::run_res_script(
+            src,
+            &info.method,
+            &info.full_url,
+            parts.status.as_u16(),
+            &hv,
+            &body_str,
+        ) {
+            if let Some(st) = r.status {
+                if let Ok(s) = StatusCode::from_u16(st) {
+                    parts.status = s;
+                }
+            }
+            for (k, v) in r.headers {
+                set_header_raw(&mut parts.headers, &k, &v);
+            }
+            if let Some(b) = r.body {
+                new = Bytes::from(b);
+            }
+        }
+    }
+    // weinre: inject a debug <script> into HTML responses.
+    if let Some(id) = &ops.weinre {
+        if is_html(&parts.headers) {
+            let src = weinre_src(id, &state.config);
+            let tag = format!("<script src=\"{src}\"></script>");
+            new = inject_into_html(&new, &tag);
+        }
+    }
+    // locationHref: inject a client-side redirect into HTML responses.
+    if let Some(url) = &ops.location_href {
+        if is_html(&parts.headers) {
+            let safe = url.replace('\\', "\\\\").replace('\'', "\\'");
+            let tag = format!("<script>location.href='{safe}'</script>");
+            new = inject_into_html(&new, &tag);
+        }
+    }
+    if let Some(path) = &ops.write {
+        write_body_file(path, &new);
+    }
+    if let Some(path) = &ops.write_raw {
+        let head = format!(
+            "HTTP/1.1 {}\r\n{}",
+            parts.status,
+            header_dump(&parts.headers)
+        );
+        write_raw_file(path, &head, &new);
+    }
+    new
+}
+
+/// Frame a finished in-memory body: drop the now-stale length headers, then
+/// hand it to whichever of `trailers://` / `resSpeed://` asked for it.
+fn finish_res_body(
+    parts: &mut hyper::http::response::Parts,
+    new: Bytes,
+    ops: ResBodyOps,
+) -> DynBody {
+    apply::strip_length_headers(&mut parts.headers);
+    if !ops.trailers.is_empty() {
+        // Trailers need chunked transfer; ensure HTTP/1.1 (upstream may be 1.0).
+        parts.version = hyper::Version::HTTP_11;
+        let names = ops
+            .trailers
+            .keys()
+            .map(|k| k.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        set_header_raw(&mut parts.headers, "trailer", &names);
+        body::with_trailers(new, ops.trailers)
+    } else {
+        match ops.speed {
+            Some(kbps) => body::throttled(new, kbps),
+            None => body::full(new),
+        }
+    }
+}
+
+/// Finish a response this proxy produced itself — a `plugin://` hook's answer,
+/// or a short-circuit rule's — by resolving the response phase and running every
+/// response operator over it.
+///
+/// whistle reaches its response inspectors on both paths: a `plugin://` rule
+/// proxies the request to the plugin's own server, so the plugin's answer comes
+/// back as an ordinary response and goes through `handleResponse`
+/// (`pluginMgr.getResRules`, `_original/lib/inspectors/res.js:825`), and a
+/// locally served `file://` takes the same route. `res` is built from the head
+/// as produced, before any operator has touched it — which is what lets `s:`
+/// filter on a `statusCode://404` this port answered.
+///
+/// Returns the finished response and the body preview to record with it.
+async fn finish_local_response(
+    state: &Arc<AppState>,
+    info: &mut ReqInfo,
+    resolved: &mut Resolved,
+    merged_rules: &[crate::rules::RuleManager],
+    is_internal_req: bool,
+    parts: hyper::http::response::Parts,
+    bytes: Bytes,
+) -> (Response<DynBody>, Option<Capture>) {
+    let mut parts = parts;
+    resolve_response_phase(
+        state,
+        info,
+        resolved,
+        // No connection was made, so `serverIp:`/`serverPort:` stay unanswerable
+        // and fail closed rather than matching on a guess.
+        apply::build_res_info(parts.status.as_u16(), &parts.headers, None, None),
+        is_internal_req,
+        merged_rules,
+    );
+    if let Some(ms) = apply::res_delay_ms(resolved) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    apply::apply_response_for(&mut parts, resolved, Some(info));
+
+    let ops = ResBodyOps::of(resolved);
+    let res_ct = parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
+    let new = if ops.needs_body() {
+        let new = apply::transform_res_body(bytes, resolved, res_ct.as_deref());
+        inject_res_body(state, &mut parts, new, &ops, info)
+    } else {
+        bytes
+    };
+    let capture = (!new.is_empty()).then(|| {
+        Capture::from_bytes(
+            &new,
+            res_ct,
+            res_enc.as_deref(),
+            state.config.body_preview_cap,
+        )
+    });
+    // `finish_res_body` drops the length headers, which a body nothing rewrote
+    // still has correctly set — so only take that route when something did.
+    let body = match ops.needs_body() {
+        true => finish_res_body(&mut parts, new, ops),
+        false => body::full(new),
+    };
+    (Response::from_parts(parts, body), capture)
+}
+
 /// Turn an internal error into a 502 so the service signature stays infallible.
 fn guard(result: Result<Response<DynBody>>) -> Response<DynBody> {
     match result {
@@ -1160,7 +1378,23 @@ async fn serve(
             plugin_remove_headers.extend(result.remove_headers);
             if let Some(resp) = result.response {
                 tracing::info!("{} {} -> plugin {name}", info.method, info.full_url);
-                let response = plugin_response(resp);
+                let target = format!("plugin:{name}");
+                let (parts, bytes) = plugin_response(resp);
+                // The plugin answered, but it is not the last word: every
+                // response operator still runs, exactly as it does over the
+                // origin's answer. Skipping this left `resHeaders://`,
+                // `replaceStatus://`, `resType://`, `trailers://` and the whole
+                // body family silently inert on a path users reach on purpose.
+                let (response, res_body) = finish_local_response(
+                    &state,
+                    &mut info,
+                    &mut resolved,
+                    &merged_rules,
+                    is_internal_req,
+                    parts,
+                    bytes,
+                )
+                .await;
                 state.record(Session {
                     id: 0,
                     time_ms,
@@ -1168,10 +1402,11 @@ async fn serve(
                     url: info.full_url.clone(),
                     status: response.status().as_u16(),
                     client_ip: client_ip.clone(),
-                    target: format!("plugin:{name}"),
+                    target,
                     duration_ms: started.elapsed().as_millis(),
                     log: log_labels(&resolved),
                     res_headers: header_pairs(response.headers()),
+                    res_body,
                     ..Default::default()
                 });
                 return Ok(response);
@@ -1201,17 +1436,20 @@ async fn serve(
         // it does over real ones, so `resHeaders://` and friends must land here
         // as well — and so must the response-phase rules, which is why a
         // `statusCode://404` this port answered can be filtered on with `s:404`.
-        let (mut parts, body) = resp.into_parts();
-        resolve_response_phase(
+        // Every short-circuit body is already in memory, so collecting it costs
+        // nothing but lets the body operators run over it as well.
+        let (parts, body) = resp.into_parts();
+        let bytes = collect_body(body).await?;
+        let (resp, res_body) = finish_local_response(
             &state,
             &mut info,
             &mut resolved,
-            apply::build_res_info(parts.status.as_u16(), &parts.headers, None, None),
-            is_internal_req,
             &merged_rules,
-        );
-        apply::apply_response_for(&mut parts, &resolved, Some(&info));
-        let resp = Response::from_parts(parts, body);
+            is_internal_req,
+            parts,
+            bytes,
+        )
+        .await;
         state.record(Session {
             id: 0,
             time_ms,
@@ -1223,6 +1461,7 @@ async fn serve(
             duration_ms: started.elapsed().as_millis(),
             log: log_labels(&resolved),
             res_headers: header_pairs(resp.headers()),
+            res_body,
             ..Default::default()
         });
         return Ok(resp);
@@ -1485,15 +1724,7 @@ async fn serve(
     )
     .await;
 
-    let res_speed = apply::res_speed_kbps(&resolved);
-    let res_script = apply::res_script_op(&resolved)
-        .map(|op| op.value.as_str())
-        .and_then(script::load_script);
-    let weinre = resolved.value("weinre").map(|s| s.to_string());
-    let location_href = resolved.value("locationHref").map(|s| s.to_string());
-    let res_write = apply::res_write_path(&resolved);
-    let res_write_raw = apply::res_write_raw_path(&resolved);
-    let trailers = apply::build_trailers(&resolved);
+    let ops = ResBodyOps::of(&resolved);
     let res_ct = parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
@@ -1501,104 +1732,42 @@ async fn serve(
         .map(|s| s.to_string());
     let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     let mut res_body_cap: Option<Capture> = None;
-    let res_body: DynBody = if apply::wants_res_body(&resolved)
-        || res_speed.is_some()
-        || res_script.is_some()
-        || weinre.is_some()
-        || location_href.is_some()
-        || res_write.is_some()
-        || res_write_raw.is_some()
-        || !trailers.is_empty()
-        || plugin_wants_res_body
-        || plugin_res_override.is_some()
-    {
-        // A plugin that replaced the body outright makes the upstream bytes
-        // irrelevant — don't wait on them.
-        let bytes = match &plugin_res_override {
-            Some(new) => Bytes::from(new.clone()),
-            None => collect_body(body).await?,
-        };
-        let mut new = apply::transform_res_body(bytes, &resolved, res_ct.as_deref());
+    let res_body: DynBody =
+        if ops.needs_body() || plugin_wants_res_body || plugin_res_override.is_some() {
+            // A plugin that replaced the body outright makes the upstream bytes
+            // irrelevant — don't wait on them.
+            let bytes = match &plugin_res_override {
+                Some(new) => Bytes::from(new.clone()),
+                None => collect_body(body).await?,
+            };
+            let mut new = apply::transform_res_body(bytes, &resolved, res_ct.as_deref());
 
-        // Response hook, part 2: plugins that asked for the body.
-        for (name, param) in plugin_matches.iter() {
-            let Some(manifest) = state.plugins.manifest(name).await else {
-                continue;
-            };
-            if !manifest.on_response || !manifest.response_body {
-                continue;
-            }
-            let pres = crate::plugins::PluginRes {
-                id: plugin_req_id,
-                method: info.method.clone(),
-                url: info.full_url.clone(),
-                status: parts.status.as_u16(),
-                headers: header_pairs(&parts.headers),
-                param: param.clone(),
-                body: Some(new.to_vec()),
-            };
-            if let Some(result) = state.plugins.on_response(name, &pres).await {
-                if let Some(replaced) = apply_plugin_res_result(&mut parts, result) {
-                    new = Bytes::from(replaced);
+            // Response hook, part 2: plugins that asked for the body. It sits
+            // between the content operators and the injections, which is why
+            // those two halves are separate functions.
+            for (name, param) in plugin_matches.iter() {
+                let Some(manifest) = state.plugins.manifest(name).await else {
+                    continue;
+                };
+                if !manifest.on_response || !manifest.response_body {
+                    continue;
                 }
-            }
-        }
-            if let Some(src) = &res_script {
-                let hv: Vec<(String, String)> = parts
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                    .collect();
-                let body_str = String::from_utf8_lossy(&new).into_owned();
-                if let Some(r) = script::run_res_script(
-                    src,
-                    &info.method,
-                    &info.full_url,
-                    parts.status.as_u16(),
-                    &hv,
-                    &body_str,
-                ) {
-                    if let Some(st) = r.status {
-                        if let Ok(s) = StatusCode::from_u16(st) {
-                            parts.status = s;
-                        }
-                    }
-                    for (k, v) in r.headers {
-                        set_header_raw(&mut parts.headers, &k, &v);
-                    }
-                    if let Some(b) = r.body {
-                        new = Bytes::from(b);
+                let pres = crate::plugins::PluginRes {
+                    id: plugin_req_id,
+                    method: info.method.clone(),
+                    url: info.full_url.clone(),
+                    status: parts.status.as_u16(),
+                    headers: header_pairs(&parts.headers),
+                    param: param.clone(),
+                    body: Some(new.to_vec()),
+                };
+                if let Some(result) = state.plugins.on_response(name, &pres).await {
+                    if let Some(replaced) = apply_plugin_res_result(&mut parts, result) {
+                        new = Bytes::from(replaced);
                     }
                 }
             }
-            // weinre: inject a debug <script> into HTML responses.
-            if let Some(id) = &weinre {
-                if is_html(&parts.headers) {
-                    let src = weinre_src(id, &state.config);
-                    let tag = format!("<script src=\"{src}\"></script>");
-                    new = inject_into_html(&new, &tag);
-                }
-            }
-            // locationHref: inject a client-side redirect into HTML responses.
-            if let Some(url) = &location_href {
-                if is_html(&parts.headers) {
-                    let safe = url.replace('\\', "\\\\").replace('\'', "\\'");
-                    let tag = format!("<script>location.href='{safe}'</script>");
-                    new = inject_into_html(&new, &tag);
-                }
-            }
-            if let Some(path) = &res_write {
-                write_body_file(path, &new);
-            }
-            if let Some(path) = &res_write_raw {
-                let head = format!(
-                    "HTTP/1.1 {}\r\n{}",
-                    parts.status,
-                    header_dump(&parts.headers)
-                );
-                write_raw_file(path, &head, &new);
-            }
-            apply::strip_length_headers(&mut parts.headers);
+            let new = inject_res_body(&state, &mut parts, new, &ops, &info);
             if !new.is_empty() {
                 res_body_cap = Some(Capture::from_bytes(
                     &new,
@@ -1607,22 +1776,7 @@ async fn serve(
                     state.config.body_preview_cap,
                 ));
             }
-            if !trailers.is_empty() {
-                // Trailers need chunked transfer; ensure HTTP/1.1 (upstream may be 1.0).
-                parts.version = hyper::Version::HTTP_11;
-                let names = trailers
-                    .keys()
-                    .map(|k| k.as_str().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                set_header_raw(&mut parts.headers, "trailer", &names);
-                body::with_trailers(new, trailers)
-            } else {
-                match res_speed {
-                    Some(kbps) => body::throttled(new, kbps),
-                    None => body::full(new),
-                }
-            }
+            finish_res_body(&mut parts, new, ops)
         } else {
             // No transform: stream through, copying a bounded preview for inspection.
             let cap = Capture::new(res_ct.clone(), res_enc.as_deref(), state.config.body_preview_cap);
@@ -2179,5 +2333,151 @@ mod internal_req_tests {
         );
         assert_eq!(mgr.resolve_scoped(&info, false).value("host"), Some("1.1.1.1"));
         assert_eq!(mgr.resolve_scoped(&info, true).value("host"), Some("2.2.2.2"));
+    }
+}
+
+#[cfg(test)]
+mod local_response_tests {
+    use super::*;
+
+    /// State with `rules` loaded, on a storage dir of its own — these tests run
+    /// in parallel and sharing one made them race to write the root CA.
+    fn state_with(rules: &str) -> Arc<AppState> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let config = Config {
+            storage_dir: std::env::temp_dir().join(format!(
+                "whistle-rs-local-res-tests-{}-{unique}",
+                std::process::id()
+            )),
+            persist_sessions: false,
+            ..Config::default()
+        };
+        let ca = CertAuthority::load_or_create(&config).expect("ca");
+        let mut mgr = RuleManager::new();
+        mgr.set_text(rules);
+        Arc::new(AppState::new(config, mgr, ca))
+    }
+
+    /// Run `rules` against a locally produced response, exactly as `serve`'s
+    /// plugin and short-circuit exits do.
+    fn finish(
+        rules: &str,
+        status: u16,
+        res_headers: &[(&str, &str)],
+        body: &str,
+    ) -> (hyper::http::response::Parts, Bytes) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let state = state_with(rules);
+            let mut info = apply::build_req_info(
+                "GET",
+                "http",
+                "example.com",
+                80,
+                "/",
+                &hyper::HeaderMap::new(),
+                Some("127.0.0.1".to_string()),
+            );
+            let mut resolved = state.rules.read().unwrap().resolve_scoped(&info, false);
+            let resp = crate::plugins::PluginResp {
+                status,
+                headers: res_headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                body: body.as_bytes().to_vec(),
+            };
+            let (parts, bytes) = plugin_response(resp);
+            let (resp, _) = finish_local_response(
+                &state,
+                &mut info,
+                &mut resolved,
+                &[],
+                false,
+                parts,
+                bytes,
+            )
+            .await;
+            let (parts, body) = resp.into_parts();
+            let bytes = collect_body(body).await.expect("body");
+            (parts, bytes)
+        })
+    }
+
+    /// The fix: a plugin's answer is not the last word. Response-side operators
+    /// run over it, as they do over the origin's answer — upstream reaches its
+    /// response inspectors on this path too, because a `plugin://` rule is a
+    /// proxy hop to the plugin's own server.
+    #[test]
+    fn a_plugin_answer_takes_the_response_operators() {
+        let (parts, body) = finish(
+            "example.com plugin://echo resHeaders://x-late=1 replaceStatus://503 \
+             resType://json resAppend://!\n",
+            200,
+            &[("content-type", "text/plain")],
+            "answered",
+        );
+        assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(parts.headers.get("x-late").unwrap(), "1");
+        assert!(
+            parts
+                .headers
+                .get(hyper::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("application/json"),
+            "resType:// applies to a plugin's answer"
+        );
+        assert_eq!(body, Bytes::from_static(b"answered!"));
+    }
+
+    /// And the *response phase* runs on it: a filter about the response can be
+    /// answered, because the plugin's head is in hand before any operator has
+    /// touched it. `s:404` here sees the plugin's own 404, not the 200 the
+    /// `replaceStatus://` on the same line would later write.
+    #[test]
+    fn a_plugin_answer_gets_the_response_phase() {
+        let rules = "example.com plugin://echo\n\
+                     example.com resHeaders://x-notfound=1 includeFilter://s:404\n";
+        let (parts, _) = finish(rules, 404, &[], "");
+        assert_eq!(parts.headers.get("x-notfound").unwrap(), "1");
+        let (parts, _) = finish(rules, 200, &[], "");
+        assert!(parts.headers.get("x-notfound").is_none());
+    }
+
+    /// A response no operator touches is handed back byte-for-byte, with its
+    /// framing headers intact — nothing here may cost a plugin its `content-length`.
+    #[test]
+    fn an_untouched_answer_keeps_its_framing() {
+        let (parts, body) = finish(
+            "example.com plugin://echo\n",
+            201,
+            &[("content-length", "2"), ("x-plugin", "yes")],
+            "hi",
+        );
+        assert_eq!(parts.status, StatusCode::CREATED);
+        assert_eq!(parts.headers.get("content-length").unwrap(), "2");
+        assert_eq!(parts.headers.get("x-plugin").unwrap(), "yes");
+        assert_eq!(body, Bytes::from_static(b"hi"));
+    }
+
+    /// The short-circuit exit shares the same finisher, so a mocked response
+    /// now takes the body operators too — not just the header ones.
+    #[test]
+    fn a_short_circuit_answer_takes_the_body_operators() {
+        let (parts, body) = finish(
+            "example.com statusCode://200 resBody://base\n\
+             example.com resAppend://+more\n",
+            200,
+            &[],
+            "",
+        );
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(body, Bytes::from_static(b"base+more"));
     }
 }
