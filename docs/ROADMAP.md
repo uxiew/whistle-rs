@@ -482,6 +482,12 @@
 `sniCallback` 说「不拦截」之后，`host://` 与 `proxy://` 照常路由；它拿不到的只是那些
 需要读取内容才成立的东西。
 
+算子层本轮清掉四条**静默失效**（都是「解析了但不产生效果」，最坏情况是用户以为写了却没写）：
+cookie 的属性对象与数组形式、`delete://resCookies.x` 的过期 cookie、`delete://trailer.x`、
+`headerReplace` 的 `$$` 编码引用与无前缀键的作用域继承。仍然刻意保留的是四条有意的取舍
+（注入文本按 UTF-8、`params://` 缓冲改写、非 UTF-8 请求体不处理、`resScript` 里的
+`resRules://` 条目无处安放），理由都写在 [`RULES.md`](RULES.md) 的对应条目里。
+
 模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
 插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，
 规则行级属性见 [`LINE_PROPS.md`](LINE_PROPS.md)。
