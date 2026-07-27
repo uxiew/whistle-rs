@@ -1024,6 +1024,8 @@ nothing — you need a scope.
 | `reqHeaders.x` and the same variants | that request header |
 | `headers.x` | the header on both sides (this spelling is case-**sensitive** and must be plural) |
 | `reqCookies.x` / `cookies.x` | that cookie from the request `Cookie` header |
+| `resCookies.x` / `cookies.x` | that cookie **in the client** — see below |
+| `trailer.x` | that trailing header (this key takes no `req`/`res` scope) |
 | `resType` / `res.type`, `reqType` / `req.type` | the media type (a `charset` parameter survives) |
 | `resCharset` / `res.charset`, `reqCharset` / `req.charset` | the charset parameter |
 | `body`, `res.body`, `req.body` | the whole body, including anything an operator injects |
@@ -1034,6 +1036,16 @@ example.com   delete://resHeaders.server|resHeaders.x-powered-by
 example.com   delete://reqCookies.tracking
 example.com   delete://resBody.debug&resBody.internal.token
 ```
+
+A response cannot reach into the browser and remove a cookie, so
+`delete://resCookies.x` sends back one that has **already expired**
+(`Max-Age=0` with a past `Expires`). Two go out per name, plain and `Secure`,
+because a `Secure` cookie is not overwritten by a non-`Secure` one and the proxy
+cannot tell which is out there. A request that arrived through an intercepted
+tunnel gets two more, scoped to the parent domain, for a cookie set on
+`.example.com` rather than on the host — matching upstream, which reads a
+hostname only set on that path. The deletion **wins** over a `resCookies://`
+naming the same cookie on the same request.
 
 ### Cookies
 
@@ -1438,8 +1450,6 @@ Known gaps in the operator layer, deliberately left:
 - **A non-UTF-8 request body is left alone** by the `params://` merge. whistle
   tries GB18030 and re-encodes afterwards; this port stays UTF-8, as it does for
   every other text transform.
-- **`delete://resCookies.x`** does not emit the expiring `Set-Cookie` upstream
-  writes, and `delete://trailer.x` is not applied.
 - **`headerReplace`'s `$$`-prefixed URL-encoding form** and its quirk of letting an
   unprefixed key inherit the previous key's scope are not ported.
 - **`{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` are not substituted**, and

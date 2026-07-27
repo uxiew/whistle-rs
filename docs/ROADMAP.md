@@ -8,7 +8,7 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **455** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **458** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -178,6 +178,23 @@
       上游对取反的字面量/通配 pattern 是在解析期直接丢弃的（`rules.js:1259-1268`），本移植照做。
 
 ### 多值算子（已完成）
+
+- [x] ~~cookie 的属性对象被序列化进值、`delete://resCookies.x` 不发过期 cookie、
+      `delete://trailer.x` 不生效~~ → 均已修（本轮）。
+      **属性对象**：`resCookies://{"sid":{"value":"x","httpOnly":true,"maxAge":600}}` 现在按
+      `getCookieItem`（`_original/lib/util/index.js:3093-3117`）展开为 `Set-Cookie` 属性，
+      顺序、大小写变体（`maxAge`/`Max-Age`/`max-age` 等）、JS 的真值语义、`parseInt` 的
+      宽松解析都照抄；此前整个对象被 `to_string()` 塞进 cookie 值里，属性一个都不生效。
+      **数组形式**：一个名字可带多条 `Set-Cookie`（`addMapArr`，`index.js:3119-3123`），
+      规则替换的是该名字的**整组**而非其中一条。请求侧只取 `.value`，与上游同。
+      **`delete://resCookies.x`**：响应无法删掉客户端已有的 cookie，只能回一条**已过期**的
+      —— 每个名字发两条（plain 与 `Secure`，因为 `Secure` 不会被非 `Secure` 覆盖，
+      而代理无从得知是哪种）；隧道请求再加两条按父域限定的（`getDomain`，`index.js:2758-2774`；
+      上游的 `req._w2hostname` 只在隧道路径设置，`lib/https/index.js:707`，故普通正向代理
+      请求只有两条）。删除**压过**同一请求上写同名 cookie 的 `resCookies://`
+      （上游 `extend(cookies, delKeys)`）。
+      **`delete://trailer.x`**：在 `trailers://` 折叠**之后**生效（`res.js:1275-1280`），
+      且这个键**不带** `req`/`res` 作用域 —— `TRAILER_RE` 前端不锚定，照抄。
 
 - [x] ~~**同名 header 的争用优先级相反**~~ → 已修。`reqHeaders`/`resHeaders`/`reqCookies`/
       `resCookies`/`reqCors`/`resCors`/`trailers` 现在与上游一样走 `parseRuleJson` 折叠

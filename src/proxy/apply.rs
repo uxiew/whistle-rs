@@ -1191,7 +1191,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
         del.drop_type,
         del.drop_charset,
     );
-    apply_deletes(&mut parts.headers, &del);
+    apply_deletes(&mut parts.headers, &del, true);
     apply_header_replace(&mut parts.headers, resolved, true);
 }
 
@@ -1207,8 +1207,17 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
 struct Deletions {
     /// Header names to remove from this side.
     headers: Vec<String>,
-    /// Cookie names to remove (request side only).
+    /// Cookie names to remove.
+    ///
+    /// On the request side this drops the cookie from the outgoing `Cookie`
+    /// header. On the response side there is nothing to drop — the cookie lives
+    /// in the *client*, so it is removed by sending an already-expired
+    /// `Set-Cookie` back ([`expiring_cookies`]).
     cookies: Vec<String>,
+    /// `delete://trailer.x` — trailing header names to drop after the body
+    /// (`TRAILER_RE`, `_original/lib/util/index.js:2663,:2812`). Response side
+    /// only, and unlike every other key here it is *not* scoped by `req`/`res`.
+    trailers: Vec<String>,
     /// `delete://resType` — drop the media type, keeping any charset.
     drop_type: bool,
     /// `delete://resCharset` — drop the charset, keeping the media type.
@@ -1249,9 +1258,18 @@ impl Deletions {
                 {
                     // `cookies.x` with no side is honoured on both
                     // (`COOKIE_RE`, `_original/lib/util/index.js:2669`).
-                    if request_side {
-                        del.cookies.push(name.to_string());
-                    }
+                    del.cookies.push(name.to_string());
+                } else if !request_side
+                    && let Some(name) = key
+                        .to_ascii_lowercase()
+                        .find("trailer.")
+                        .map(|i| &key[i + "trailer.".len()..])
+                        .filter(|n| !n.is_empty())
+                {
+                    // `TRAILER_RE` is unanchored at the front, so `resTrailer.x`
+                    // and a bare `trailer.x` both match — and so, upstream, does
+                    // anything else ending in `trailer.<name>`.
+                    del.trailers.push(name.to_string());
                 } else if let Some(path) = strip_del_scope(key, side, "B", "ody") {
                     del.body_props.push(path.to_string());
                 } else if key == format!("{side}Type") || key == format!("{side}.type") {
@@ -1289,12 +1307,17 @@ fn strip_del_scope<'a>(key: &'a str, side: &str, initial: &str, rest: &str) -> O
 }
 
 /// Apply the header and cookie deletions for one side.
-fn apply_deletes(headers: &mut HeaderMap, del: &Deletions) {
+fn apply_deletes(headers: &mut HeaderMap, del: &Deletions, request_side: bool) {
     for name in &del.headers {
         remove_header(headers, name);
     }
-    for name in &del.cookies {
-        remove_cookie(headers, name);
+    // Only the request side has a cookie to strip: on the response side the
+    // cookie is already in the client, and the deletion is a `Set-Cookie` that
+    // expires it instead — see [`expiring_cookies`].
+    if request_side {
+        for name in &del.cookies {
+            remove_cookie(headers, name);
+        }
     }
 }
 
@@ -1540,7 +1563,10 @@ pub fn apply_response_for(
         parts.status = status;
         handle_status_code(&mut parts.headers, status);
     }
-    apply_res_cookies(&mut parts.headers, resolved);
+    // Resolved before the cookies, because `delete://resCookies.x` is *served*
+    // as a cookie rather than applied as a removal — see [`expiring_cookies`].
+    let del = Deletions::of(resolved, false);
+    apply_res_cookies(&mut parts.headers, resolved, &del, info);
     apply_res_cors(&mut parts.headers, resolved, info);
 
     apply_header_ops(&mut parts.headers, resolved, "resHeaders");
@@ -1550,7 +1576,6 @@ pub fn apply_response_for(
     if let Some(ct) = resolved.value("resType") {
         set_content_type(&mut parts.headers, ct, no_type_alias);
     }
-    let del = Deletions::of(resolved, false);
     set_charset(
         &mut parts.headers,
         resolved.value("resCharset"),
@@ -1558,7 +1583,7 @@ pub fn apply_response_for(
         del.drop_charset,
     );
     apply_header_replace(&mut parts.headers, resolved, false);
-    apply_deletes(&mut parts.headers, &del);
+    apply_deletes(&mut parts.headers, &del, false);
 
     // Injected content is useless behind a CSP that forbids it, or cached for
     // the next load; whistle strips both (`res.js:1093-1101`).
@@ -2024,10 +2049,18 @@ pub fn res_write_raw_path(resolved: &Resolved) -> Option<String> {
 /// `trailers` is one of `parseRuleJson`'s arguments (`_original/lib/inspectors/res.js:845-855`),
 /// so several lines fold into one map with the first line winning a contested
 /// name, exactly as `resHeaders` does.
+///
+/// `delete://trailer.<name>` then removes one, and it applies *after* the
+/// operators — upstream deletes from the merged map on the way out
+/// (`delProps.trailers`, `_original/lib/inspectors/res.js:1275-1280`), so a
+/// request carrying both spellings of a name ends up without it.
 pub fn build_trailers(resolved: &Resolved) -> HeaderMap {
     let mut h = HeaderMap::new();
     for (name, value) in merge_header_ops(resolved, "trailers") {
         set_header(&mut h, &name, &value);
+    }
+    for name in &Deletions::of(resolved, false).trailers {
+        remove_header(&mut h, name);
     }
     h
 }
@@ -3616,10 +3649,85 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
     set_header(headers, "cookie", &joined);
 }
 
+/// The `Set-Cookie` entries that delete a cookie in the client
+/// (`parseDelResCookies`, `_original/lib/util/index.js:2776-2795`).
+///
+/// A response cannot remove a cookie the client already holds; it can only send
+/// one back that has already expired. whistle sends **two** per name — plain and
+/// `Secure` — because a `Secure` cookie is not overwritten by a non-`Secure` one
+/// of the same name, and it cannot tell which kind is out there.
+///
+/// `host` adds two more, scoped to the parent domain, for a cookie that was set
+/// on `.example.com` rather than on the host itself. It is `Some` only for a
+/// request that arrived through an intercepted tunnel: upstream reads
+/// `req._w2hostname`, which is set on the tunnel path alone
+/// (`_original/lib/https/index.js:707`), so a plain forward-proxy request gets
+/// the two host-scoped entries and no more.
+fn expiring_cookies(names: &[String], host: Option<&str>) -> Vec<(String, CookieValue)> {
+    let expired = |secure: bool, domain: Option<&str>| {
+        let mut map = serde_json::Map::new();
+        map.insert("maxAge".into(), serde_json::json!(EXPIRED_MAX_AGE));
+        map.insert("path".into(), serde_json::json!("/"));
+        if secure {
+            map.insert("secure".into(), serde_json::json!(true));
+        }
+        if let Some(d) = domain {
+            map.insert("domain".into(), serde_json::json!(d));
+        }
+        CookieValue::Attrs(map)
+    };
+    let domain = host.and_then(parent_domain);
+    names
+        .iter()
+        .map(|name| {
+            let mut list = vec![expired(false, None), expired(true, None)];
+            if let Some(d) = &domain {
+                list.push(expired(false, Some(d)));
+                list.push(expired(true, Some(d)));
+            }
+            (name.clone(), CookieValue::List(list))
+        })
+        .collect()
+}
+
+/// The domain a cookie on this host may have been scoped to (`getDomain`,
+/// `_original/lib/util/index.js:2758-2774`).
+///
+/// Fewer than three labels has no parent worth naming, so `example.com` gets
+/// nothing. Exactly three keeps the leading dot (`.example.com`, written by
+/// emptying the first label); more drops the first label outright
+/// (`a.b.example.com` → `b.example.com`).
+fn parent_domain(host: &str) -> Option<String> {
+    let labels: Vec<&str> = host.split('.').collect();
+    match labels.len() {
+        0..=2 => None,
+        3 => Some(format!(".{}", labels[1..].join("."))),
+        _ => Some(labels[1..].join(".")),
+    }
+}
+
 /// Emit `Set-Cookie` headers for `resCookies` operators, **replacing** any the
 /// response already sent under the same name rather than adding a second one.
-fn apply_res_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
-    let ops = merge_cookie_ops(resolved, "resCookies");
+fn apply_res_cookies(
+    headers: &mut HeaderMap,
+    resolved: &Resolved,
+    del: &Deletions,
+    info: Option<&ReqInfo>,
+) {
+    let mut ops = merge_cookie_ops(resolved, "resCookies");
+    // A `delete://resCookies.x` becomes an expiring cookie, and it *wins* over
+    // a `resCookies://x=…` on the same request: upstream folds the deletions in
+    // with `extend(cookies, delKeys)`, so they overwrite (`index.js:3127-3129`).
+    if !del.cookies.is_empty() {
+        // Only a tunnelled request has a hostname here; see `expiring_cookies`.
+        let host = info.filter(|i| i.from.tunnel).map(|i| i.host.as_str());
+        for (name, value) in expiring_cookies(&del.cookies, host) {
+            match ops.iter_mut().find(|(k, _)| *k == name) {
+                Some(slot) => slot.1 = value,
+                None => ops.push((name, value)),
+            }
+        }
+    }
     if ops.is_empty() {
         return;
     }
@@ -4305,7 +4413,7 @@ mod tests {
         h.insert("x-req", "1".parse().unwrap());
         h.insert("x-keep", "2".parse().unwrap());
         h.insert(hyper::header::COOKIE, "sid=abc; keep=1".parse().unwrap());
-        apply_deletes(&mut h, &Deletions::of(&resolved, true));
+        apply_deletes(&mut h, &Deletions::of(&resolved, true), true);
         assert!(h.get("x-req").is_none());
         assert!(h.get("x-keep").is_some());
         let c = h.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
@@ -6364,7 +6472,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append(hyper::header::SET_COOKIE, "sid=old; Path=/".parse().unwrap());
         headers.append(hyper::header::SET_COOKIE, "other=1".parse().unwrap());
-        apply_res_cookies(&mut headers, &resolved);
+        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
         let vals: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
@@ -6375,7 +6483,7 @@ mod tests {
         // A `;` in a value would end the cookie early, so it is encoded.
         let resolved = resolve("example.com resCookies://a=x;Secure\n", "http://example.com/");
         let mut headers = HeaderMap::new();
-        apply_res_cookies(&mut headers, &resolved);
+        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
         assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x%3BSecure");
     }
 
@@ -6386,7 +6494,7 @@ mod tests {
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
-        apply_res_cookies(&mut headers, &resolved);
+        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
         headers
             .get(hyper::header::SET_COOKIE)
             .expect("a cookie")
@@ -6436,7 +6544,7 @@ mod tests {
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
-        apply_res_cookies(&mut headers, &resolved);
+        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
         let vals: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
@@ -6449,7 +6557,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append(hyper::header::SET_COOKIE, "sid=old".parse().unwrap());
         headers.append(hyper::header::SET_COOKIE, "keep=1".parse().unwrap());
-        apply_res_cookies(&mut headers, &resolved);
+        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
         let vals: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
@@ -6460,6 +6568,121 @@ mod tests {
             ["sid=a; Path=/", "sid=b; Secure", "keep=1"],
             "the replaced name keeps its position, and an untouched one survives"
         );
+    }
+
+    /// `delete://resCookies.x` cannot remove a cookie the client already holds,
+    /// so it sends one back that has already expired — twice per name, plain and
+    /// `Secure`, because a `Secure` cookie is not overwritten by a plain one
+    /// (`parseDelResCookies`, `_original/lib/util/index.js:2776-2795`).
+    /// Previously the key was parsed and then dropped on the response side, so
+    /// the rule did nothing at all.
+    #[test]
+    fn deleting_a_response_cookie_expires_it() {
+        let lines = |rule: &str, info: Option<&ReqInfo>| {
+            let resolved = resolve(
+                &format!("example.com delete://{rule}\n"),
+                "http://example.com/",
+            );
+            let mut headers = HeaderMap::new();
+            apply_res_cookies(
+                &mut headers,
+                &resolved,
+                &Deletions::of(&resolved, false),
+                info,
+            );
+            headers
+                .get_all(hyper::header::SET_COOKIE)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let out = lines("resCookies.sid", None);
+        assert_eq!(out.len(), 2, "one plain and one Secure: {out:?}");
+        assert!(out[0].starts_with("sid=; Expires="), "{:?}", out[0]);
+        assert!(out[0].ends_with("; Max-Age=0; Path=/"), "{:?}", out[0]);
+        assert!(out[1].contains("; Secure; Path=/"), "{:?}", out[1]);
+        // The `Expires` is in the past, which together with `Max-Age=0` is what
+        // actually drops the cookie. Compared against a date this proxy renders
+        // itself rather than a literal, which would rot.
+        let expires = out[0]
+            .split("; Expires=")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("an Expires");
+        assert_ne!(expires, http_date(0), "an expiry now is not an expiry");
+        assert_eq!(expires, http_date(EXPIRED_MAX_AGE * 1000));
+
+        // A bare `cookies.x` is honoured on this side too (`COOKIE_RE`).
+        assert_eq!(lines("cookies.sid", None).len(), 2);
+        // …and the request-side spelling is not.
+        assert!(lines("reqCookies.sid", None).is_empty());
+
+        // A tunnelled request adds two domain-scoped entries, because the
+        // cookie may have been set on the parent domain.
+        let mut info = build_req_info(
+            "GET",
+            "https",
+            "a.b.example.com",
+            443,
+            "/",
+            &HeaderMap::new(),
+            None,
+        );
+        info.from.tunnel = true;
+        let out = lines("resCookies.sid", Some(&info));
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert!(out[2].contains("Domain=b.example.com"), "{:?}", out[2]);
+        // Three labels keep the leading dot; two have no parent at all.
+        assert_eq!(parent_domain("b.example.com").as_deref(), Some(".example.com"));
+        assert_eq!(parent_domain("example.com"), None);
+        // A forward-proxy request gets no domain-scoped entries.
+        info.from.tunnel = false;
+        assert_eq!(lines("resCookies.sid", Some(&info)).len(), 2);
+    }
+
+    /// The deletion wins over a `resCookies://` for the same name on the same
+    /// request: upstream folds the deletions in *over* the operators
+    /// (`extend(cookies, delKeys)`, `_original/lib/util/index.js:3127-3129`).
+    #[test]
+    fn deleting_a_cookie_beats_setting_it() {
+        let resolved = resolve(
+            "example.com resCookies://sid=new delete://resCookies.sid\n",
+            "http://example.com/",
+        );
+        let mut headers = HeaderMap::new();
+        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
+        let out: Vec<_> = headers
+            .get_all(hyper::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(out.len(), 2, "the expiring pair, not the value: {out:?}");
+        assert!(out.iter().all(|c| c.contains("Max-Age=0")), "{out:?}");
+    }
+
+    /// `delete://trailer.x` drops a trailing header, and unlike every other
+    /// delete key it is not scoped by `req`/`res` (`TRAILER_RE` is unanchored).
+    #[test]
+    fn deleting_a_trailer_drops_it() {
+        let resolved = resolve(
+            "example.com trailers://x-a=1&x-b=2 delete://trailer.x-a\n",
+            "http://example.com/",
+        );
+        let t = build_trailers(&resolved);
+        assert!(t.get("x-a").is_none(), "the deleted trailer is gone");
+        assert_eq!(t.get("x-b").unwrap(), "2", "the other one stays");
+
+        // The deletion applies after the operators, so both spellings of a
+        // name on one request end up without it.
+        let resolved = resolve(
+            "example.com trailers://x-a=1 delete://resTrailer.x-a\n",
+            "http://example.com/",
+        );
+        assert!(build_trailers(&resolved).get("x-a").is_none());
+        // It is not a response *header* deletion.
+        let resolved = resolve("example.com delete://trailer.x-a\n", "http://example.com/");
+        assert!(Deletions::of(&resolved, false).headers.is_empty());
     }
 
     /// `maxAge` emits the `Expires`/`Max-Age` pair, and the sentinel whistle
