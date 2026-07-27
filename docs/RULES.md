@@ -1053,6 +1053,35 @@ example.com   delete://reqCookies.tracking   # this is how you drop one
 example.com   resCookies://theme=dark
 ```
 
+#### Cookie attributes
+
+The `{json}` spelling of `resCookies` may give a cookie an object instead of a
+value, and its fields become `Set-Cookie` attributes:
+
+```
+example.com   resCookies://{"sid":{"value":"abc","httpOnly":true,"secure":true,"path":"/","sameSite":"Lax","maxAge":600}}
+```
+
+```
+Set-Cookie: sid=abc; Expires=<now+600s>; Max-Age=600; Secure; HttpOnly; Path=/; SameSite=Lax
+```
+
+`value`, `maxAge`, `secure`, `httpOnly`, `partitioned`, `path`, `domain` and
+`sameSite` are recognised, each in the spellings upstream accepts (`maxAge` also
+as `maxage` / `MaxAge` / `Max-Age` / `max-age`, and so on). A field that is
+absent or falsy is not written, and `maxAge` emits the `Expires`/`Max-Age` pair
+together. The order above is upstream's `getCookieItem` order.
+
+An **array** gives one name several `Set-Cookie` lines, which is how you set the
+same cookie under more than one scope:
+
+```
+example.com   resCookies://{"sid":[{"value":"abc","path":"/a"},{"value":"abc","path":"/b"}]}
+```
+
+On the **request** side an object contributes its `value` alone — a `Cookie`
+header has nowhere to put attributes, and upstream drops them here too.
+
 ### Body
 
 | Operator | Value | Effect |
@@ -1411,8 +1440,6 @@ Known gaps in the operator layer, deliberately left:
   every other text transform.
 - **`delete://resCookies.x`** does not emit the expiring `Set-Cookie` upstream
   writes, and `delete://trailer.x` is not applied.
-- **A cookie declared as a JSON object** (`resCookies://{"sid":{"value":"x","httpOnly":true}}`)
-  is serialised rather than expanded into `Set-Cookie` attributes.
 - **`headerReplace`'s `$$`-prefixed URL-encoding form** and its quirk of letting an
   unprefixed key inherit the previous key's scope are not ported.
 - **`{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` are not substituted**, and
