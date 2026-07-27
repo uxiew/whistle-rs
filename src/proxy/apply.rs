@@ -1192,7 +1192,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
         del.drop_charset,
     );
     apply_deletes(&mut parts.headers, &del, true);
-    apply_header_replace(&mut parts.headers, resolved, true);
+    apply_header_replace(&mut parts.headers, resolved, HeaderScope::Request);
 }
 
 /// The `delete://` keys that apply to one side, already classified.
@@ -1335,32 +1335,65 @@ fn remove_header(headers: &mut HeaderMap, name: &str) {
 /// `_original/lib/util/index.js:2219-2223`), so `reqHeaders.` is not one of
 /// them. The pattern follows the same rule as the body operators: `/…/flags` is
 /// a regular expression, anything else is a literal.
-fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, request_side: bool) {
-    let scopes: [&str; 2] = match request_side {
-        true => ["req.", "reqH."],
-        false => ["res.", "resH."],
-    };
+fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, want: HeaderScope) {
+    let want = want.key();
     for value in collect_values(resolved, "headerReplace") {
-        let value = value.trim();
-        let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
-        else {
+        // Order matters here, and `serde_json::Map` sorts: a key with no scope
+        // prefix inherits the *previous* key's scope, so the entries have to be
+        // seen in the order they were written.
+        let Some(entries) = json_object_in_order(value.trim()) else {
             continue;
         };
-        for (key, repl) in map {
+        // Carried over from the last key that named a scope — *both* the scope
+        // and the header name, which is the quirk: upstream writes
+        // `name = name || key.substring(…)`, and only a key that named a scope
+        // resets `name` to null. So an unscoped key reuses the previous key's
+        // header name and contributes nothing but its own pattern.
+        //
+        // Both start unset, which is upstream's `else if (!prop) return`: a
+        // leading unscoped key is dropped rather than defaulting to a side.
+        let mut carried: Option<(&str, String)> = None;
+        for (key, repl) in &entries {
             let repl = repl.as_str().unwrap_or("");
-            if !scopes.iter().any(|s| key.starts_with(s)) {
-                continue;
-            }
+            // The five prefixes upstream recognises, and the only ones: a
+            // `resHeaders.` key matches none of them and is inert.
+            let named = [
+                ("req.", "req"),
+                ("reqH.", "req"),
+                ("res.", "res"),
+                ("resH.", "res"),
+                ("trailer.", "trailer"),
+            ]
+            .into_iter()
+            .find(|(prefix, _)| key.starts_with(prefix))
+            .map(|(_, s)| s);
             // A key with no `:` has no pattern and is dropped: upstream slices
             // the name up to `indexOf(':')`, which is then empty.
             let Some(colon) = key.find(':') else {
                 continue;
             };
-            let dot = key.find('.').map(|i| i + 1).unwrap_or(0);
-            let name = key[dot..colon].trim();
-            if name.is_empty() {
+            let (scope, name) = match named {
+                // This key names its own scope, so the prefix is sliced off and
+                // the name is taken from it.
+                Some(scope) => {
+                    let name = key[key.find('.').map(|i| i + 1).unwrap_or(0)..colon].trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    carried = Some((scope, name.to_string()));
+                    (scope, name.to_string())
+                }
+                // It does not, so it inherits — and its own name portion is
+                // ignored entirely, however it is spelled.
+                None => match &carried {
+                    Some((scope, name)) => (*scope, name.clone()),
+                    None => continue,
+                },
+            };
+            if scope != want {
                 continue;
             }
+            let name = name.as_str();
             let pattern = &key[colon + 1..];
             // An absent or empty header is left alone (`handleHeaderReplace`).
             if let Some(cur) = headers
@@ -1371,6 +1404,61 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, request_si
             {
                 set_header(headers, name, &replace_once_or_all(&cur, pattern, repl));
             }
+        }
+    }
+}
+
+/// Parse a JSON object into its entries **in source order**.
+///
+/// `serde_json::Map` is a `BTreeMap` by default, which sorts — fine everywhere a
+/// key is looked up by name, wrong wherever one entry's meaning depends on the
+/// one before it (see [`apply_header_replace`]). Returns `None` for anything
+/// that is not a JSON object.
+fn json_object_in_order(text: &str) -> Option<Vec<(String, serde_json::Value)>> {
+    use serde::de::{MapAccess, Visitor};
+
+    struct Ordered;
+
+    impl<'de> Visitor<'de> for Ordered {
+        type Value = Vec<(String, serde_json::Value)>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut out = Vec::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
+                out.push((k, v));
+            }
+            Ok(out)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(text);
+    serde::Deserializer::deserialize_map(&mut de, Ordered).ok()
+}
+
+/// Which set of headers a `headerReplace://` key addresses.
+///
+/// Upstream keys these by string (`result.req` / `result.res` / `result.trailer`,
+/// `_original/lib/util/index.js:2207-2254`) and applies each set where those
+/// headers exist: the request head, the response head, and the trailers that go
+/// out after the body (`res.js:945,:1281`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HeaderScope {
+    Request,
+    Response,
+    Trailer,
+}
+
+impl HeaderScope {
+    /// The scope name upstream's keys carry.
+    fn key(self) -> &'static str {
+        match self {
+            HeaderScope::Request => "req",
+            HeaderScope::Response => "res",
+            HeaderScope::Trailer => "trailer",
         }
     }
 }
@@ -1582,7 +1670,7 @@ pub fn apply_response_for(
         del.drop_type,
         del.drop_charset,
     );
-    apply_header_replace(&mut parts.headers, resolved, false);
+    apply_header_replace(&mut parts.headers, resolved, HeaderScope::Response);
     apply_deletes(&mut parts.headers, &del, false);
 
     // Injected content is useless behind a CSP that forbids it, or cached for
@@ -2059,6 +2147,9 @@ pub fn build_trailers(resolved: &Resolved) -> HeaderMap {
     for (name, value) in merge_header_ops(resolved, "trailers") {
         set_header(&mut h, &name, &value);
     }
+    // `headerReplace://trailer.x:…` rewrites a trailer, then the deletions run,
+    // which is upstream's order on the way out (`res.js:1275-1281`).
+    apply_header_replace(&mut h, resolved, HeaderScope::Trailer);
     for name in &Deletions::of(resolved, false).trailers {
         remove_header(&mut h, name);
     }
@@ -3183,10 +3274,13 @@ fn replace_once_or_all(text: &str, pattern: &str, value: &str) -> String {
     let Ok(re) = regex::Regex::new(&format!("{prefix}{source}")) else {
         return text.to_string();
     };
-    let value = js_replacement(value);
+    // Expanded by hand rather than through the `regex` crate's own replacement
+    // syntax: `$$1` has to percent-encode the group, and no replacement string
+    // can express that. See [`expand_replacement`].
+    let expand = |caps: &regex::Captures<'_>| expand_replacement(value, caps);
     match flags.contains('g') {
-        true => re.replace_all(text, value.as_str()).into_owned(),
-        false => re.replace(text, value.as_str()).into_owned(),
+        true => re.replace_all(text, expand).into_owned(),
+        false => re.replace(text, expand).into_owned(),
     }
 }
 
@@ -3204,38 +3298,91 @@ fn split_regexp(pattern: &str) -> Option<(&str, &str)> {
     ok.then_some((source, flags))
 }
 
-/// Rewrite a JavaScript replacement string into the `regex` crate's spelling.
+/// Expand a JavaScript replacement string against one regex match
+/// (`replacePattern`, `_original/lib/util/replace-pattern-transform.js:64-91`).
 ///
-/// `$&` is the whole match and `$1`…`$9` are groups in both, but Rust reads
-/// `$1x` as a capture *named* `1x`, so every reference is braced. `\$` escapes a
-/// reference upstream (`replacePattern`,
-/// `_original/lib/util/replace-pattern-transform.js:64-91`); the `$$`-prefixed
-/// URL-encoding form is not ported.
-fn js_replacement(value: &str) -> String {
+/// `$&` is the whole match and `$1`…`$9` are groups. The `$$`-prefixed spelling
+/// of either — `$$&`, `$$1` — inserts the same text **percent-encoded**, which
+/// is why this is expanded here instead of being handed to the `regex` crate as
+/// a replacement string: that syntax has no way to transform a group.
+///
+/// Backslashes in front of a reference are upstream's escape, and it reads at
+/// most two: `\$1` is the literal `$1`, `\\$1` is a backslash then the group.
+/// A `$b`-prefixed reference (`$b1`) names a *value* list that only whistle's
+/// streaming body transform has, so here it is left as written — which is what
+/// upstream does too when it calls this with no value list.
+fn expand_replacement(value: &str, caps: &regex::Captures<'_>) -> String {
+    let group = |n: usize| caps.get(n).map(|m| m.as_str()).unwrap_or("");
+    let bytes = value.as_bytes();
     let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' && chars.peek() == Some(&'$') {
-            chars.next();
-            out.push_str("$$"); // an escaped `$` is literal
+    let mut i = 0;
+    while i < bytes.len() {
+        // At most two, matching `\\{0,2}` — a third backslash is literal.
+        let slashes = bytes[i..].iter().take_while(|b| **b == b'\\').count().min(2);
+        let rest = &bytes[i + slashes..];
+        // `$`, an optional second `$` (encode), an optional `b`, then `&` or a digit.
+        let (encode, after_dollars) = match rest {
+            [b'$', b'$', tail @ ..] => (true, tail),
+            [b'$', tail @ ..] => (false, tail),
+            _ => {
+                // Not a reference: emit one byte and re-scan, so the slashes we
+                // counted are not consumed by a match that did not happen.
+                out.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+        };
+        let (is_vals, after_b) = match after_dollars {
+            [b'b', tail @ ..] => (true, tail),
+            tail => (false, tail),
+        };
+        let Some((selector, consumed)) = (match after_b {
+            [b'&', ..] => Some((0usize, 1)),
+            [d, ..] if d.is_ascii_digit() => Some(((d - b'0') as usize, 1)),
+            _ => None,
+        }) else {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        };
+        let reference_len = slashes + if encode { 2 } else { 1 } + usize::from(is_vals) + consumed;
+        let reference = &value[i + slashes..i + reference_len];
+        if is_vals {
+            // No value list here, so the whole thing stays as it was written —
+            // slashes included (upstream returns `$1 + $2`).
+            out.push_str(&value[i..i + reference_len]);
+            i += reference_len;
             continue;
         }
-        if c != '$' {
-            out.push(c);
-            continue;
+        match slashes {
+            // `\$1` escapes the reference: the `$1` is literal.
+            1 => out.push_str(reference),
+            _ => {
+                // `\\$1` keeps one backslash and expands.
+                if slashes == 2 {
+                    out.push('\\');
+                }
+                let text = group(selector);
+                match encode && !text.is_empty() {
+                    true => out.push_str(&encode_uri_component(text)),
+                    false => out.push_str(text),
+                }
+            }
         }
-        match chars.peek() {
-            Some('&') => {
-                chars.next();
-                out.push_str("${0}");
-            }
-            Some(d) if d.is_ascii_digit() => {
-                let d = *d;
-                chars.next();
-                out.push_str(&format!("${{{d}}}"));
-            }
-            // A lone `$` (or `$$`) is literal; `$$` is Rust's own escape.
-            _ => out.push_str("$$"),
+        i += reference_len;
+    }
+    out
+}
+
+/// JavaScript's `encodeURIComponent`: everything outside the unreserved set
+/// `A-Za-z0-9-_.!~*'()` is percent-encoded.
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(b as char),
+            b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
@@ -4156,12 +4303,58 @@ mod tests {
         let out = transform_res_body(Bytes::from_static(b"a@b c@d"), &resolved, Some("text/plain"));
         assert_eq!(&out[..], b"b.ax d.cx", "`$1x` is group 1 then a literal x");
 
-        assert_eq!(js_replacement("[$&]"), "[${0}]");
-        assert_eq!(js_replacement("\\$1"), "$$1");
+        // `\$1` escapes the reference, so the literal `$1` survives.
+        let esc = resolve(
+            "example.com/x resReplace:///(\\w+)@/g=\\$1-$1\n",
+            "http://example.com/x",
+        );
+        let out = transform_res_body(Bytes::from_static(b"a@"), &esc, Some("text/plain"));
+        assert_eq!(&out[..], b"$1-a");
 
         let all = resolve("example.com/x resReplace:///.*/g=ONLY\n", "http://example.com/x");
         let out = transform_res_body(Bytes::from_static(b"whatever"), &all, Some("text/plain"));
         assert_eq!(&out[..], b"ONLY", "`/.*/ ` replaces the body exactly once");
+    }
+
+    /// The `$$`-prefixed spelling of a reference inserts the group
+    /// **percent-encoded** (`encode = $2[1] === '$'`,
+    /// `_original/lib/util/replace-pattern-transform.js:78-88`). Previously the
+    /// whole form was silently literal, so a rule asking for an encoded group
+    /// got the characters `$$1` in its output.
+    #[test]
+    fn an_encoding_back_reference_percent_encodes_the_group() {
+        let body = |rule: &str, input: &'static str| {
+            let resolved = resolve(
+                &format!("example.com/x resReplace://{rule}\n"),
+                "http://example.com/x",
+            );
+            let out =
+                transform_res_body(Bytes::from_static(input.as_bytes()), &resolved, Some("text/plain"));
+            String::from_utf8(out.to_vec()).expect("utf-8")
+        };
+
+        // A rule value cannot carry a space — the line parser splits on
+        // whitespace — so the space under test lives in the *input*.
+        //
+        // `$$1` encodes; a plain `$1` on the same line does not.
+        assert_eq!(body("/(.+)/=[$$1][$1]", "a b"), "[a%20b][a b]");
+        // `$$&` (the whole match, encoded) cannot travel through a rule value:
+        // `&` separates the pairs of a `resReplace`. Same expansion, called
+        // where the rule layer would have called it.
+        assert_eq!(replace_once_or_all("a b", "/a.b/", "$$&"), "a%20b");
+        // Reserved characters an encoded group is there to protect.
+        assert_eq!(body("/(.+)/=$$1", "x/y?z=1&w"), "x%2Fy%3Fz%3D1%26w");
+        // Non-ASCII goes out as UTF-8 percent-escapes, as in JavaScript.
+        assert_eq!(body("/(.+)/=$$1", "中"), "%E4%B8%AD");
+        // An empty group encodes to nothing rather than to a stray `%`.
+        assert_eq!(body("/x(z?)/=[$$1]", "x"), "[]");
+        // `\$$1` escapes the whole reference, `\\$$1` keeps one backslash
+        // and still encodes.
+        assert_eq!(body("/(.+)/=\\$$1", "a b"), "$$1");
+        assert_eq!(body("/(.+)/=\\\\$$1", "a b"), "\\a%20b");
+        // A `$b`-prefixed reference names a value list this port has no
+        // counterpart for, so it is left exactly as written.
+        assert_eq!(body("/(a)/=[$b1]", "a"), "[$b1]");
     }
 
     #[test]
@@ -4461,7 +4654,7 @@ mod tests {
             );
             let mut h = HeaderMap::new();
             h.insert("x-foo", value.parse().unwrap());
-            apply_header_replace(&mut h, &resolved, false);
+            apply_header_replace(&mut h, &resolved, HeaderScope::Response);
             h.get("x-foo").map(|v| v.to_str().unwrap().to_string())
         };
         assert_eq!(
@@ -4486,6 +4679,40 @@ mod tests {
         assert_eq!(
             replaced("{\"res.x-foo\":\"XX\"}", "bar"),
             Some("bar".to_string())
+        );
+    }
+
+    /// An unscoped key inherits the previous key's scope **and its header
+    /// name**, keeping only its own pattern — upstream nulls `name` when a key
+    /// names a scope and otherwise leaves it standing
+    /// (`parseHeaderReplace`, `_original/lib/util/index.js:2214-2233`). Two
+    /// substitutions on one header therefore need only name it once.
+    #[test]
+    fn an_unscoped_header_replace_key_inherits_the_previous_one() {
+        let replaced = |rule: &str, value: &str| {
+            let resolved = resolve(
+                &format!("example.com headerReplace://{rule}\n"),
+                "http://example.com/",
+            );
+            let mut h = HeaderMap::new();
+            h.insert("x-foo", value.parse().unwrap());
+            apply_header_replace(&mut h, &resolved, HeaderScope::Response);
+            h.get("x-foo").map(|v| v.to_str().unwrap().to_string())
+        };
+
+        // Both entries land on `x-foo`: the second names no header at all.
+        assert_eq!(
+            replaced(r#"{"res.x-foo:a":"1",":b":"2"}"#, "ab"),
+            Some("12".to_string())
+        );
+        // A leading unscoped key has nothing to inherit and is dropped.
+        assert_eq!(replaced(r#"{":a":"1"}"#, "ab"), Some("ab".to_string()));
+        // The inherited scope is the *previous* one, so a `req.` key in between
+        // takes the following unscoped key with it — away from this side.
+        assert_eq!(
+            replaced(r#"{"res.x-foo:a":"1","req.x-foo:b":"2",":a":"9"}"#, "aa"),
+            Some("11".to_string()),
+            "the trailing key inherited `req` and must not touch the response"
         );
     }
 

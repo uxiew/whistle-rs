@@ -904,12 +904,26 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 `{name}` anywhere in an operator value is replaced with the content of the named value
 (from `--value name=…` or the web UI's Values panel).
 
+`headerReplace` scopes are `req.` / `reqH.` (request), `res.` / `resH.` (response)
+and `trailer.`; a `resHeaders.` key matches none of them and does nothing. Two
+details are inherited from upstream and are easy to trip over:
+
+- A key with **no scope prefix** reuses the previous key's scope *and its header
+  name*, keeping only its own pattern — so
+  `{"resH.location:/^http:/":"https:","x:/y/":"z"}` runs both substitutions
+  against `location`, not against `x`. A leading unscoped key is dropped.
+- In the replacement, `$&` and `$1`…`$9` insert the match and its groups;
+  spelling either with a **double** `$` (`$$1`) inserts it **percent-encoded**.
+  A backslash escapes the reference (`\$1` is the literal `$1`), and two keep one
+  backslash and still substitute.
+
 ```
 api.example.com     enable://cors
 slow.example.com    enable://abort
 static.example.com  disable://cache
 example.com         trailers://x-checksum=abc123
 example.com         headerReplace://{"resH.set-cookie:/Domain=[^;]+/":"Domain=example.com"}
+example.com         headerReplace://{"resH.location:/^http:/":"https:"}
 page.example.com    responseFor://http://auth.internal/verify
 example.com         resBody://{mockJson}        # {mockJson} from the values store
 example.com         rulesFile:///etc/whistle/extra.rules
@@ -1450,8 +1464,6 @@ Known gaps in the operator layer, deliberately left:
 - **A non-UTF-8 request body is left alone** by the `params://` merge. whistle
   tries GB18030 and re-encodes afterwards; this port stays UTF-8, as it does for
   every other text transform.
-- **`headerReplace`'s `$$`-prefixed URL-encoding form** and its quirk of letting an
-  unprefixed key inherit the previous key's scope are not ported.
 - **`{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` are not substituted**, and
   are a non-goal rather than a gap. Upstream substitutes them into the `rules.txt` /
   `_rules.txt` / `resRules.txt` / `_values.txt` files it reads out of an installed

@@ -8,7 +8,7 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **458** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **460** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -178,6 +178,36 @@
       上游对取反的字面量/通配 pattern 是在解析期直接丢弃的（`rules.js:1259-1268`），本移植照做。
 
 ### 多值算子（已完成）
+
+- [x] ~~`headerReplace` 的 `$$` URL 编码形式与键的作用域继承未移植~~ → 均已实现（本轮）。
+      **`$$` 形式**：`$$1` / `$$&` 插入的是**百分号编码后**的捕获组
+      （`encode = $2[1] === '$'`，`_original/lib/util/replace-pattern-transform.js:78-88`）。
+      这一条无法交给 `regex` crate 的替换语法表达（它没有变换捕获组的手段），因此本轮把
+      上游的 `replacePattern` 整个移过来手工展开，顺带把反斜杠转义也对齐了：`\$1` 是字面
+      `$1`，`\\$1` 留一个反斜杠再替换，`$b1` 指向本移植没有的值列表故原样保留。
+      该展开对**所有** `*Replace` 算子生效，不只是 `headerReplace`。
+      **作用域继承**：不带前缀的键会沿用**上一个键的作用域和 header 名**、只保留自己的
+      pattern（上游 `name = name || …`，`index.js:2233`），因此
+      `{"resH.location:/^http:/":"https:","x:/y/":"z"}` 两次替换都作用在 `location` 上。
+      开头就不带前缀的键被丢弃（`else if (!prop) return`）。为此 JSON 改为**保序**解析
+      —— `serde_json::Map` 会按键排序，而继承依赖书写顺序。
+      顺带补上第三个作用域 `trailer.`，它作用于 `trailers://` 折叠后的结果
+      （`hr.trailer`，`res.js:1281`）。
+
+- [x] ~~`headerReplace` 的 `$$` URL 编码形式、以及无前缀键继承上一个键的作用域~~ → 均已实现（本轮）。
+      **`$$` 形式**：`$$1` / `$$&` 插入的是**百分号编码后**的捕获组
+      （`encode = $2[1] === '$'`，`_original/lib/util/replace-pattern-transform.js:78-88`）。
+      此前整个 `$$` 被当成转义后的字面 `$`，规则要一个编码过的组、拿到的是字符 `$1`。
+      顺带把 `replacePattern` 整个照抄了过来（不再借 `regex` crate 的替换语法 —— 它没有
+      任何写法能把一个组变换一下）：`\$1` 转义引用、`\\$1` 留一个反斜杠再展开、
+      `$b1` 指向的是流式 body 变换独有的取值表，本移植无对应物故**原样保留**（上游在不传
+      该表时同解）。
+      **作用域继承**：无前缀的键沿用上一个键的作用域**以及头名**，只保留自己的 pattern
+      （上游 `name = name || …`，`index.js:2233`）—— 所以
+      `{"resH.location:/^http:/":"https:","x:/y/":"z"}` 两条替换都打在 `location` 上，
+      而不是打在 `x` 上；开头就无前缀的键被丢弃（`if (!prop) return`）。
+      因此解析必须**保序**，而 `serde_json::Map` 会按键排序，改用保序解析。
+      顺带接上了第三个作用域 `trailer.`（`res.js:1281`），此前只认 req/res 两个。
 
 - [x] ~~cookie 的属性对象被序列化进值、`delete://resCookies.x` 不发过期 cookie、
       `delete://trailer.x` 不生效~~ → 均已修（本轮）。
