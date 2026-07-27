@@ -1193,6 +1193,16 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     );
     apply_deletes(&mut parts.headers, &del, true);
     apply_header_replace(&mut parts.headers, resolved, HeaderScope::Request);
+    // Last, so a `disable://` flag has the final say over what leaves here —
+    // including over a `reqHeaders://cookie=…` that set what it strips, which is
+    // upstream's order too (`disableReqProps` runs after `handleReq`,
+    // `_original/lib/inspectors/req.js:579-581`).
+    disable_req_props(&mut parts.headers, resolved);
+    // A rule that rewrites the response body cannot survive a `304`, so the
+    // request goes out unconditional even without `disable://cache`.
+    if res_body_forbids_cache(resolved) {
+        disable_req_cache(&mut parts.headers);
+    }
 }
 
 /// The `delete://` keys that apply to one side, already classified.
@@ -1712,6 +1722,100 @@ fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
     if dis.contains("keepAlive") || dis.contains("keepalive") {
         set_header(headers, "connection", "close");
     }
+}
+
+/// Strip the request headers a `disable://` flag names (`disableReqProps`,
+/// `_original/lib/util/index.js:2977-3009`).
+///
+/// Every one of these was silently inert before: a user who wrote
+/// `disable://cookie` still had the cookie forwarded to the origin, which for
+/// the privacy-shaped flags is the wrong way to fail.
+fn disable_req_props(headers: &mut HeaderMap, resolved: &Resolved) {
+    let dis = disabled_flags(resolved);
+    let en = enabled_flags(resolved);
+    let off = |name: &str| dis.contains(name);
+    if off("ua") {
+        headers.remove(hyper::header::USER_AGENT);
+    }
+    // `enable://captureStream` also drops it: whistle wants the origin's bytes
+    // uncompressed so it can stream them past the inspector. That one goes
+    // through `isEnable`, which a `disable://` of the same name cancels
+    // (`_original/lib/util/index.js:675-677`) — unlike the keys above, which
+    // upstream reads straight off `req.disable`.
+    if off("gzip") || (en.contains("captureStream") && !dis.contains("captureStream")) {
+        headers.remove(hyper::header::ACCEPT_ENCODING);
+    }
+    if ["cookie", "cookies", "reqCookie", "reqCookies"]
+        .iter()
+        .any(|f| off(f))
+    {
+        headers.remove(hyper::header::COOKIE);
+    }
+    // Both spellings, because whistle accepts the correct one and the common
+    // misspelling that matches the header's own name.
+    if off("referer") || off("referrer") {
+        headers.remove(hyper::header::REFERER);
+    }
+    if off("ajax") {
+        headers.remove("x-requested-with");
+    }
+    if off("cache") {
+        disable_req_cache(headers);
+    }
+}
+
+/// Make a request unconditional: drop the validators that let an origin answer
+/// `304 Not Modified` (`disableReqCache`, `_original/lib/util/index.js:974-982`).
+///
+/// A `304` has no body, so anything meant to rewrite one has nothing to work on.
+/// That is why whistle applies this whenever a **response-body operator**
+/// matched, not only for `disable://cache` — see [`res_body_forbids_cache`].
+fn disable_req_cache(headers: &mut HeaderMap) {
+    for name in [
+        "if-modified-since",
+        "if-none-match",
+        "last-modified",
+        "etag",
+    ] {
+        headers.remove(name);
+    }
+    set_header(headers, "pragma", "no-cache");
+    set_header(headers, "cache-control", "no-cache");
+}
+
+/// The response-body operators that make a conditional request unanswerable
+/// (`BODY_PROTOCOLS` + `notAllowCache`, `_original/lib/inspectors/res.js:33-60`,
+/// applied at `res.js:1328`).
+///
+/// Without this a rule works on the first load and silently stops working on a
+/// reload, because the origin answers `304` and there is no body to rewrite —
+/// intermittent in exactly the way that reads as a bug in the proxy.
+const BODY_PROTOCOLS: &[&str] = &[
+    "attachment",
+    "resReplace",
+    "resBody",
+    "resPrepend",
+    "resAppend",
+    "htmlBody",
+    "htmlPrepend",
+    "htmlAppend",
+    "jsBody",
+    "jsPrepend",
+    "jsAppend",
+    "cssBody",
+    "cssPrepend",
+    "cssAppend",
+    "resWrite",
+    "resWriteRaw",
+    "resMerge",
+];
+
+/// True when a rule on this request will want to rewrite the response body, and
+/// therefore cannot tolerate a `304`. See [`BODY_PROTOCOLS`].
+fn res_body_forbids_cache(resolved: &Resolved) -> bool {
+    BODY_PROTOCOLS
+        .iter()
+        .any(|p| resolved.value(p).is_some())
 }
 
 /// `reqCors://…` — the request half of whistle's CORS negotiation
@@ -6948,6 +7052,160 @@ mod tests {
         apply_req_cookies(&mut headers, &resolved);
         assert_eq!(headers.get(hyper::header::COOKIE).unwrap(), "sid=x");
     }
+
+    /// Every `disable://` flag that strips a request header
+    /// (`disableReqProps`, `_original/lib/util/index.js:2977-3009`). None of
+    /// these were applied before: the request went out with the cookie, the
+    /// referer and the user-agent a rule had asked to withhold, which is a
+    /// privacy promise the proxy was quietly breaking.
+    #[test]
+    fn disable_strips_request_headers() {
+        let sent = |rule: &str, name: &str| {
+            let resolved = resolve(
+                &format!("example.com {rule}\n"),
+                "http://example.com/",
+            );
+            let mut parts = req_parts(&[
+                ("cookie", "sid=secret"),
+                ("user-agent", "MyUA"),
+                ("referer", "http://ref.test/"),
+                ("accept-encoding", "gzip"),
+                ("x-requested-with", "XMLHttpRequest"),
+            ]);
+            apply_request(&mut parts, &resolved);
+            parts.headers.get(name).map(|v| v.to_str().unwrap().to_string())
+        };
+
+        assert_eq!(sent("disable://ua", "user-agent"), None);
+        assert_eq!(sent("disable://gzip", "accept-encoding"), None);
+        assert_eq!(sent("disable://referer", "referer"), None);
+        // whistle takes the misspelling too, because it matches the header name.
+        assert_eq!(sent("disable://referrer", "referer"), None);
+        assert_eq!(sent("disable://ajax", "x-requested-with"), None);
+        for spelling in ["cookie", "cookies", "reqCookie", "reqCookies"] {
+            assert_eq!(sent(&format!("disable://{spelling}"), "cookie"), None, "{spelling}");
+        }
+        // `enable://captureStream` drops the encoding too: whistle wants the
+        // origin's bytes uncompressed (`isEnable`, `util/index.js:675-677`).
+        assert_eq!(sent("enable://captureStream", "accept-encoding"), None);
+        // …unless the same request also disables it, which is what `isEnable`
+        // means — `enable` alone is not enough.
+        assert_eq!(
+            sent("enable://captureStream disable://captureStream", "accept-encoding"),
+            Some("gzip".to_string())
+        );
+        // A flag nobody set leaves everything alone.
+        assert_eq!(sent("host://1.1.1.1", "cookie"), Some("sid=secret".to_string()));
+    }
+
+    /// `disable://cache` strips the conditional headers *and* asks for no cache
+    /// (`disableReqCache`, `_original/lib/util/index.js:974-982`).
+    #[test]
+    fn disable_cache_strips_the_conditional_headers() {
+        let resolved = resolve("example.com disable://cache\n", "http://example.com/");
+        let mut parts = req_parts(&[
+            ("if-none-match", "\"v1\""),
+            ("if-modified-since", "Mon, 01 Jan 2024 00:00:00 GMT"),
+            ("etag", "\"v1\""),
+            ("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT"),
+        ]);
+        apply_request(&mut parts, &resolved);
+        for gone in ["if-none-match", "if-modified-since", "etag", "last-modified"] {
+            assert!(parts.headers.get(gone).is_none(), "{gone} must be stripped");
+        }
+        assert_eq!(parts.headers.get("pragma").unwrap(), "no-cache");
+        assert_eq!(parts.headers.get("cache-control").unwrap(), "no-cache");
+    }
+
+    /// The half that matters more, because nobody asks for it: **any** response
+    /// body operator busts the request's cache
+    /// (`notAllowCache(resRules) && disableReqCache(req.headers)`,
+    /// `_original/lib/inspectors/res.js:1328`).
+    ///
+    /// Without it a `resBody://` is silently inert on a reload: the conditional
+    /// request reaches the origin, the origin answers `304 Not Modified` with no
+    /// body, and there is nothing for the operator to rewrite. Measured against
+    /// a running proxy before the fix — the first load said `REWRITTEN`, the
+    /// reload said `304` — which is the worst shape of bug to be handed, an
+    /// operator that works until you press reload.
+    #[test]
+    fn a_response_body_operator_busts_the_request_cache() {
+        let conditional = || {
+            req_parts(&[
+                ("if-none-match", "\"v1\""),
+                ("if-modified-since", "Mon, 01 Jan 2024 00:00:00 GMT"),
+            ])
+        };
+        let survives = |rule: &str| {
+            let resolved = resolve(&format!("example.com {rule}\n"), "http://example.com/");
+            let mut parts = conditional();
+            apply_request(&mut parts, &resolved);
+            parts.headers.contains_key("if-none-match")
+        };
+
+        // Every operator on upstream's list, not just the obvious one.
+        for rule in [
+            "resBody://x",
+            "resPrepend://x",
+            "resAppend://x",
+            "resReplace://a=b",
+            "resMerge://{}",
+            "htmlAppend://x",
+            "jsPrepend://x",
+            "cssBody://x",
+            "attachment://f.txt",
+            "resWrite:///tmp/whistle-rs-test-write",
+            "resWriteRaw:///tmp/whistle-rs-test-write-raw",
+        ] {
+            assert!(!survives(rule), "{rule} must bust the cache");
+        }
+
+        // A rule that cannot change the body leaves the conditional request
+        // alone — this is not a blanket "disable caching for everything".
+        for rule in ["host://1.1.1.1", "resHeaders://x-a=1", "resType://json"] {
+            assert!(survives(rule), "{rule} must not touch the cache headers");
+        }
+    }
+
+    /// A response-body operator strips them too, without anyone asking
+    /// (`notAllowCache`, `_original/lib/inspectors/res.js:33-60,:1328`).
+    ///
+    /// This is the failure that looks like a bug rather than a gap: a rule that
+    /// rewrites the body works on the first request and silently does nothing on
+    /// a reload, because the origin answers `304` with no body to rewrite.
+    #[test]
+    fn a_body_operator_forbids_a_conditional_request() {
+        let conditional_survives = |rule: &str| {
+            let resolved = resolve(&format!("example.com {rule}\n"), "http://example.com/");
+            let mut parts = req_parts(&[("if-none-match", "\"v1\"")]);
+            apply_request(&mut parts, &resolved);
+            parts.headers.get("if-none-match").is_some()
+        };
+
+        // Every operator on upstream's list, spot-checked across its families.
+        for rule in [
+            "resBody://x",
+            "resReplace://a=b",
+            "resPrepend://x",
+            "resAppend://x",
+            "htmlAppend://x",
+            "jsPrepend://x",
+            "cssBody://x",
+            "resMerge://{}",
+            "attachment://f.txt",
+            "resWrite:///tmp/x",
+            "resWriteRaw:///tmp/x",
+        ] {
+            assert!(!conditional_survives(rule), "{rule} must forbid a 304");
+        }
+
+        // A rule that does not touch the body leaves the request conditional —
+        // stripping it unasked would cost every such request its 304.
+        for rule in ["host://1.1.1.1", "resHeaders://x-a=1", "replaceStatus://500"] {
+            assert!(conditional_survives(rule), "{rule} must keep the 304 path");
+        }
+    }
+
 }
 
 

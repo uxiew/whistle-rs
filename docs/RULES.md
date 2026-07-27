@@ -892,8 +892,8 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | `abort` (drop the request), `cors` (as `resCors://enable`), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
-| `disable` | flag(s) | `cache` (`no-cache`), `csp`, `cookies`, `doctype` (no doctype before an HTML prepend), `keepAlive` (`Connection: close`) |
+| `enable` | flag(s) | `abort` (drop the request), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
+| `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Emit HTTP response trailer headers (forces chunked) |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
 | `responseFor` | a URL | Prefetch the URL; annotate the request with `x-whistle-response-for-*` |
@@ -903,6 +903,38 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 
 `{name}` anywhere in an operator value is replaced with the content of the named value
 (from `--value name=…` or the web UI's Values panel).
+
+`disable://` takes one or more flags, `|`-separated. They strip something from
+the request on its way out, or from the response on its way back:
+
+| Flag | Strips from the request |
+|------|-------------------------|
+| `ua` | `User-Agent` |
+| `gzip` | `Accept-Encoding`, so the origin answers uncompressed |
+| `cookie` / `cookies` / `reqCookie` / `reqCookies` | `Cookie` |
+| `referer` / `referrer` | `Referer` (both spellings, since the misspelling matches the header) |
+| `ajax` | `X-Requested-With` |
+| `cache` | `If-None-Match`, `If-Modified-Since`, `ETag`, `Last-Modified`, and sets `Pragma`/`Cache-Control: no-cache` |
+
+| Flag | Changes in the response |
+|------|-------------------------|
+| `cookie` / `cookies` / `resCookie` / `resCookies` | drops `Set-Cookie` |
+| `cache` | `Cache-Control: no-cache` plus a past `Expires` and `Pragma` |
+| `csp` | drops the `Content-Security-Policy` headers |
+| `keepAlive` / `keepalive` | `Connection: close` |
+| `doctype` | no `<!DOCTYPE html>` before an HTML prepend |
+
+A flag this port does not recognise is **inert** — it parses and does nothing,
+rather than failing the rule.
+
+> **A response-body operator busts the request cache on its own.** Any of
+> `resBody`, `resPrepend`, `resAppend`, `resReplace`, `resMerge`, the
+> `html`/`js`/`css` variants, `attachment`, `resWrite` or `resWriteRaw` implies
+> the `disable://cache` treatment of the request, without being asked
+> (`notAllowCache`, `_original/lib/inspectors/res.js:54-60,:1328`). Without it a
+> conditional request answers `304 Not Modified` with no body, and the rewrite
+> silently does nothing — intermittently, since it depends on what the client
+> already holds.
 
 `headerReplace` scopes are `req.` / `reqH.` (request), `res.` / `resH.` (response)
 and `trailer.`; a `resHeaders.` key matches none of them and does nothing. Two
@@ -1362,8 +1394,9 @@ upstream's one optional `x?` over the whole family (`PROXY_RE`,
 `_original/lib/rules/rules.js:37-38`) and is parsed here as an alias of the base
 name. Like upstream, an `x`-prefixed proxy that cannot be **established** falls
 back to a direct connection — see [the upstream-proxy section](#upstream-proxy)
-for what the retry does and does not cover. `enable`/`disable` apply a curated flag set (see the
-[Flags](#flags-includes--values) table — others are inert); `pipe` routes to a
+for what the retry does and does not cover. `enable`/`disable` apply a curated flag set on both
+sides of the request (see the [Flags](#flags-includes--values) tables — others are
+inert); `pipe` routes to a
 registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
 extra rules from the values store / a file; `{name}` in any operator value is
 substituted from the values store. `cipher` honours the portable part of Node's TLS

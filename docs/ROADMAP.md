@@ -8,7 +8,7 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **460** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **464** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -176,6 +176,31 @@
 - [x] ~~`example.test:8080` 忽略端口~~ → `Pattern::Prefix` 现在携带 `port`，匹配时校验。
 - [x] ~~`!pattern` 取反~~ → 已支持，且与上游一致地**只作用于正则与端口 pattern**；
       上游对取反的字面量/通配 pattern 是在解析期直接丢弃的（`rules.js:1259-1268`），本移植照做。
+
+### 标志族 `enable://` / `disable://`（本轮审计发现）
+
+- [x] ~~**请求侧的 `disable://` 全部不生效**~~ → 已修（本轮）。上游每个请求都跑
+      `disableReqProps`（`_original/lib/util/index.js:2977-3009`，由 `req.js:580` 调用），
+      本移植**根本没有这个函数** —— `disabled_flags` 只在响应侧被用过一次。
+      因此 `disable://cookie`、`ua`、`referer`、`gzip`、`ajax`、`cache` 六类**逐字解析、
+      静默失效**：**失败开放**，且 cookie 那条是隐私问题。实测（改前）写着
+      `disable://cookie|ua|referer|gzip|ajax` 的请求，源站仍收到
+      `cookie: sid=secret` / `user-agent: MyUA` / `referer` / `accept-encoding` /
+      `x-requested-with` 一个不少；改后全部为空。
+      照抄的细节：`cookie` 四种拼写（`cookie`/`cookies`/`reqCookie`/`reqCookies`）、
+      `referer` 与 `referrer` 两种拼法、以及 `enable://captureStream` 也会去掉
+      `accept-encoding`（`isEnable` 含 disable 抵消，故 `enable` 单独出现才算）。
+      本层直读 `disable.x`，不走 `isDisable` 的转义机制 —— 与上游一致。
+
+- [x] ~~**响应体算子命中时未禁用请求缓存**~~ → 已修（本轮），比上一条更严重。
+      上游在请求发出前检查 `notAllowCache(resRules)`（`res.js:33-60,:1328`）：
+      17 个响应体算子（`resBody`/`resReplace`/`resPrepend`/`resAppend`/`attachment`/
+      `resMerge`/`resWrite`/`resWriteRaw` 及 html/js/css 家族）中任意一个命中，就顺带
+      `disableReqCache` —— 否则源站回 `304 Not Modified`，**响应体是空的，改写无从下手**。
+      本移植此前从不碰条件头。实测（改前）：同一条 `resBody://REWRITTEN` 规则，
+      普通请求得到 `200 REWRITTEN`，带 `If-None-Match: "v1"` 的请求（**浏览器重载就是这么发的**）
+      得到 `304` 空响应，改写静默消失 —— 表现为间歇性、极难归因的「规则有时不生效」。
+      改后两种请求都是 `200 REWRITTEN`。
 
 ### 多值算子（已完成）
 
