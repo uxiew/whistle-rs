@@ -8,7 +8,7 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **464** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **473** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -201,6 +201,35 @@
       普通请求得到 `200 REWRITTEN`，带 `If-None-Match: "v1"` 的请求（**浏览器重载就是这么发的**）
       得到 `304` 空响应，改写静默消失 —— 表现为间歇性、极难归因的「规则有时不生效」。
       改后两种请求都是 `200 REWRITTEN`。
+
+- [x] ~~**`enable://showHost` 不生效**~~ → 已修（本轮）。上游在响应头上写
+      `x-host-ip: req.hostIp || 127.0.0.1`（`_original/lib/inspectors/res.js:1197-1199`），
+      本移植此前完全不认这个标志。取值复用已有的 `known_server_ip` —— 也就是
+      `serverIp:` 筛选器读的那个**已建立 socket 的对端地址**，因此标志与条件不可能
+      互相矛盾；经上游代理时两者都是**代理的**地址。没有建立连接时按上游回退到
+      `127.0.0.1`（而不是省略这个头 —— 规则要求了它）。
+      顺序与上游一致：写在 `resHeaders://` **之后**，所以同一行的
+      `resHeaders://x-host-ip=mine` 会被标志覆盖。
+      本移植不认上游的 `_filters.showHost`（无 filters 概念），只认 `enable://`。
+
+### 压缩响应体的改写（本轮审计发现，最严重）
+
+- [x] ~~**对压缩响应的所有 body 改写静默失效**~~ → 已修（本轮）。`transform_res_body`
+      一直在**原始字节**上做替换，从不解压。真实站点绝大多数启用压缩，所以
+      `resBody`/`resReplace`/`resAppend`/注入/`resMerge` 等**在实践中大面积失效**。
+      实测（改前）：`resReplace://ORIGINAL=REPLACED` 对一个 gzip 响应输出与直连源站
+      一字不差；改后得到 `REPLACED` 且仍以 `content-encoding: gzip` 正确重压返回。
+      上游从另一端到达同一结果：任何 body 变换置 `_needGunzip`，于是 `getDecoder`
+      在前解压、`getEncoder` 在后重压（`_original/lib/inspectors/rules.js:60-140`、
+      `data.js`）。新增 `src/proxy/coding.rs` 做整体解压/重压（gzip/deflate/br，
+      deflate 兼容 zlib 包裹与裸流两种），接进上游响应与自产响应两条路径。
+      刻意的取舍：**无法往返的编码**（`compress`、双层 `gzip, br`）保持原样不动 ——
+      改写一个放不回去的体比不改更糟；此时算子照跑但匹配不到，即维持原来的「无效果」
+      而非损坏响应。
+- [x] ~~**`enable://gzip|br|deflate` 不生效**~~ → 已修（本轮，与上一条同一链路）。
+      `getEnableEncoding`（`_original/lib/util/index.js:1534-1548`）强制响应的**出站**
+      编码，优先级 `br` > `gzip` > `deflate`，是唯一「明文进、压缩出」的情形。实测
+      `enable://gzip` 把明文源站的响应压缩返回，且同一行的改写照常生效。
 
 ### 多值算子（已完成）
 

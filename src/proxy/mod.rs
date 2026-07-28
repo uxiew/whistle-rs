@@ -7,6 +7,7 @@ pub mod apply;
 #[cfg(test)]
 mod bench;
 pub mod body;
+pub mod coding;
 pub mod persist;
 pub mod script;
 pub mod sni;
@@ -1445,8 +1446,13 @@ async fn finish_local_response(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
-    let new = if ops.needs_body() || wants_body {
-        let mut new = apply::transform_res_body(bytes, resolved, res_ct.as_deref());
+    let (new, res_enc) = if ops.needs_body() || wants_body {
+        // Decode before rewriting, re-encode after — the same treatment the
+        // upstream path gives a compressed body. A plugin answer or a mocked
+        // response rarely arrives encoded, but `enable://gzip` can still ask for
+        // one on the way out, and a plugin is free to send `Content-Encoding`.
+        let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
+        let mut new = apply::transform_res_body(decoded.body, resolved, res_ct.as_deref());
 
         // Response hook, part 2: plugins that asked for the body. It sits
         // between the content operators and the injections — the same slot the
@@ -1474,9 +1480,13 @@ async fn finish_local_response(
                 hook_replaced = true;
             }
         }
-        inject_res_body(state, &mut parts, new, &ops, info)
+        let new = inject_res_body(state, &mut parts, new, &ops, info);
+        let (new, encoded_as) =
+            coding::reencode(new, decoded.restore, apply::forced_encoding(resolved));
+        coding::set_content_encoding(&mut parts.headers, encoded_as);
+        (new, encoded_as.header_value().map(str::to_string))
     } else {
-        bytes
+        (bytes, res_enc)
     };
     let capture = (!new.is_empty()).then(|| {
         Capture::from_bytes(
@@ -2108,7 +2118,16 @@ async fn serve(
                 Some(new) => Bytes::from(new.clone()),
                 None => collect_body(body).await?,
             };
-            let mut new = apply::transform_res_body(bytes, &resolved, res_ct.as_deref());
+            // Decompress before rewriting. Every body operator works on text,
+            // and most origins answer compressed — so without this a
+            // `resReplace://` against a gzipped page searched the deflate
+            // stream for its pattern, found nothing, and silently did nothing.
+            // whistle reaches the same place from the other end: any body
+            // transform sets `_needGunzip`, which puts a decoder in front of it
+            // and a re-encoder behind (`addZipTransform`,
+            // `_original/lib/inspectors/data.js:` and `inspectors/rules.js:60-140`).
+            let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
+            let mut new = apply::transform_res_body(decoded.body, &resolved, res_ct.as_deref());
 
             // Response hook, part 2: plugins that asked for the body. It sits
             // between the content operators and the injections, which is why
@@ -2136,11 +2155,21 @@ async fn serve(
                 }
             }
             let new = inject_res_body(&state, &mut parts, new, &ops, &info);
+            // Put the coding back on, so the client gets what the header
+            // promises. `enable://gzip|br|deflate` asks for a *different* one
+            // than arrived (`getEnableEncoding`,
+            // `_original/lib/util/index.js:1534-1548`) — the only case where the
+            // body leaves compressed that arrived plain.
+            let (new, encoded_as) =
+                coding::reencode(new, decoded.restore, apply::forced_encoding(&resolved));
+            coding::set_content_encoding(&mut parts.headers, encoded_as);
             if !new.is_empty() {
                 res_body_cap = Some(Capture::from_bytes(
                     &new,
                     res_ct.clone(),
-                    res_enc.as_deref(),
+                    // The preview decodes what it is told the body is, so it has
+                    // to be told what the body *now* is, not what arrived.
+                    encoded_as.header_value(),
                     state.config.body_preview_cap,
                 ));
             }

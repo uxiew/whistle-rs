@@ -892,7 +892,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | `abort` (drop the request), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
+| `enable` | flag(s) | `abort` (drop the request), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
 | `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Emit HTTP response trailer headers (forces chunked) |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
@@ -1156,6 +1156,17 @@ header has nowhere to put attributes, and upstream drops them here too.
 When any body operator applies, whistle-rs buffers that body, transforms it, and
 recomputes `Content-Length` (dropping any `Transfer-Encoding`). Requests and
 responses without a body operator are streamed through untouched.
+
+A **compressed response is decoded first**, transformed as text, then
+re-encoded under the same coding on the way out — `gzip`, `deflate` and `br` are
+round-tripped. Without this a `resReplace://` against a gzipped page would search
+the deflate stream for its pattern and silently find nothing, which is what most
+real sites (they compress) would have hit. A coding this port cannot round-trip
+(`compress`, a doubly-encoded `gzip, br`) is left alone, and the operators then
+run over bytes they will not usefully match — the same non-effect as before,
+rather than a corrupted body. `enable://gzip|br|deflate` forces the *outgoing*
+coding regardless of what arrived (`br` beats `gzip` beats `deflate`), so it can
+compress a body an origin sent in the clear.
 
 Every operator in this table accumulates: writing the same one on several
 matching lines makes them all contribute, joined per family — see

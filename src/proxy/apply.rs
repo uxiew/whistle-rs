@@ -652,6 +652,27 @@ pub fn is_aborted(resolved: &Resolved) -> bool {
     e.contains("abort") || e.contains("abortReq") || e.contains("abortRes")
 }
 
+/// The coding an `enable://gzip|br|deflate` flag demands the response leave under,
+/// or `None` when no such flag is set (`getEnableEncoding`,
+/// `_original/lib/util/index.js:1534-1548`).
+///
+/// The precedence is upstream's — `br` beats `gzip` beats `deflate` — and it is
+/// the one case where a body that arrived uncompressed goes out compressed. The
+/// caller hands this to [`coding::reencode`], which lets it win over the body's
+/// own coding.
+pub fn forced_encoding(resolved: &Resolved) -> Option<super::coding::Coding> {
+    let e = enabled_flags(resolved);
+    if e.contains("br") {
+        Some(super::coding::Coding::Brotli)
+    } else if e.contains("gzip") {
+        Some(super::coding::Coding::Gzip)
+    } else if e.contains("deflate") {
+        Some(super::coding::Coding::Deflate)
+    } else {
+        None
+    }
+}
+
 /// Parse a PAC `FindProxyForURL` return value into a proxy (first usable entry).
 ///
 /// `DIRECT` — anywhere in the list — yields `Ok(None)`: the script was asked
@@ -1697,6 +1718,7 @@ pub fn apply_response_for(
     }
 
     disable_res_props(&mut parts.headers, resolved);
+    apply_show_host(&mut parts.headers, resolved, info);
 }
 
 /// `disable://` flags with response-header effects (`disableResProps`,
@@ -1722,6 +1744,24 @@ fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
     if dis.contains("keepAlive") || dis.contains("keepalive") {
         set_header(headers, "connection", "close");
     }
+}
+
+/// `enable://showHost` — report the address the request was actually sent to,
+/// as `x-host-ip` (`_original/lib/inspectors/res.js:1197-1199`).
+///
+/// The value is the connected peer, which through an upstream proxy is the
+/// proxy's address — the same `req.hostIp` [`serverIp:`] filters on, so the
+/// header and the condition can never disagree. whistle falls back to
+/// `127.0.0.1` when it has no address at all, and so does this.
+fn apply_show_host(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&ReqInfo>) {
+    if !enabled_flags(resolved).contains("showHost") {
+        return;
+    }
+    let ip = info
+        .and_then(|i| i.res.as_ref())
+        .and_then(|r| r.server_ip.as_deref())
+        .unwrap_or("127.0.0.1");
+    set_header(headers, "x-host-ip", ip);
 }
 
 /// Strip the request headers a `disable://` flag names (`disableReqProps`,
@@ -4817,6 +4857,73 @@ mod tests {
             replaced(r#"{"res.x-foo:a":"1","req.x-foo:b":"2",":a":"9"}"#, "aa"),
             Some("11".to_string()),
             "the trailing key inherited `req` and must not touch the response"
+        );
+    }
+
+    /// `enable://gzip|br|deflate` forces the response's outgoing coding, with
+    /// upstream's `br` > `gzip` > `deflate` precedence (`getEnableEncoding`,
+    /// `_original/lib/util/index.js:1534-1548`).
+    #[test]
+    fn forced_encoding_follows_upstream_precedence() {
+        use super::super::coding::Coding;
+        let forced = |rule: &str| {
+            forced_encoding(&resolve(&format!("example.com {rule}\n"), "http://example.com/"))
+        };
+        assert_eq!(forced("host://1.1.1.1"), None);
+        assert_eq!(forced("enable://gzip"), Some(Coding::Gzip));
+        assert_eq!(forced("enable://deflate"), Some(Coding::Deflate));
+        assert_eq!(forced("enable://br"), Some(Coding::Brotli));
+        // br wins over gzip wins over deflate.
+        assert_eq!(forced("enable://gzip|deflate"), Some(Coding::Gzip));
+        assert_eq!(forced("enable://br|gzip|deflate"), Some(Coding::Brotli));
+    }
+
+    /// `enable://showHost` reports the address the request actually reached
+    /// (`req.hostIp || LOCALHOST`, `_original/lib/inspectors/res.js:1197-1199`).
+    /// Previously the flag was inert.
+    #[test]
+    fn enable_show_host_reports_the_address_reached() {
+        let header = |rules: &str, server_ip: Option<&str>| {
+            let resolved = resolve(rules, "http://example.com/");
+            let mut info = build_req_info(
+                "GET",
+                "http",
+                "example.com",
+                80,
+                "/",
+                &HeaderMap::new(),
+                None,
+            );
+            info.res = Some(build_res_info(
+                200,
+                &HeaderMap::new(),
+                server_ip.map(str::to_string),
+                Some(80),
+            ));
+            let mut parts = res_parts(&[]);
+            apply_response_for(&mut parts, &resolved, Some(&info));
+            parts.headers.get("x-host-ip").map(|v| v.to_str().unwrap().to_string())
+        };
+
+        assert_eq!(
+            header("example.com enable://showHost\n", Some("93.184.216.34")),
+            Some("93.184.216.34".to_string())
+        );
+        // No address — nothing connected — falls back to whistle's own literal
+        // rather than omitting the header the rule asked for.
+        assert_eq!(
+            header("example.com enable://showHost\n", None),
+            Some("127.0.0.1".to_string())
+        );
+        // Inert without the flag.
+        assert_eq!(header("example.com host://1.1.1.1\n", Some("1.1.1.1")), None);
+        // It runs after `resHeaders://`, as upstream does, so the flag wins.
+        assert_eq!(
+            header(
+                "example.com enable://showHost resHeaders://x-host-ip=mine\n",
+                Some("93.184.216.34")
+            ),
+            Some("93.184.216.34".to_string())
         );
     }
 
