@@ -8,7 +8,7 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **473** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **475** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -230,6 +230,27 @@
       `getEnableEncoding`（`_original/lib/util/index.js:1534-1548`）强制响应的**出站**
       编码，优先级 `br` > `gzip` > `deflate`，是唯一「明文进、压缩出」的情形。实测
       `enable://gzip` 把明文源站的响应压缩返回，且同一行的改写照常生效。
+
+### WebSocket 帧层（本轮审计发现）
+
+- [x] ~~**`enable://ignoreSend` / `enable://ignoreReceive` 不生效**~~ → 已修（本轮）。
+      上游 `initStatus`（`_original/lib/socket-mgr.js:86-97`）据此把某一方向置为
+      `IGNORE_STATUS`，丢弃该方向的全部数据帧。本移植此前两个标志逐字解析、静默失效。
+      照抄的两处语义：
+      **被丢的帧仍然抓取并带标记** —— 上游发给 UI 时带 `ignore: true`
+      （`socket-mgr.js:401,:531`），而不是让它凭空消失；否则一个会话看起来会像
+      对端什么都没发过。本移植为此给 `WsFrame` 加了 `ignored` 字段。
+      **控制帧豁免** —— `close` 被丢会让两端对「连接是否结束」的认知永久分叉，
+      `ping`/`pong` 被丢则破坏双方商定的保活；上游的 ignore 路径同样只扣留数据帧
+      （`opts.data`，`socket-mgr.js:249-274`）。
+      机制上复用了已有的逐帧裁决路径（原为插件帧钩子所建），只是新增了规则驱动的入口。
+- [ ] **`enable://pauseSend` / `enable://pauseReceive`** —— 上游是 `PAUSE_STATUS`：
+      帧被扣住，等人从 UI 里点击放行（`socket-mgr.js:60-80` 的 callback/drainData）。
+      本移植的 Web UI 没有这个控件，照搬只会得到一个**永远无人能解除的停顿**，
+      语义与「暂停」并不相同。按**非目标**处理：要么连 UI 控件一起做，要么不做。
+- [ ] **`disable://ping` / `disable://pong`** —— 上游在连接静默时自己往里打
+      PING/PONG 保活，这两个标志用于关掉它（`socket-mgr.js:367,:497`）。
+      本移植不做保活注入，**无物可禁**，因此这两个标志在这里没有对应语义。
 
 ### 多值算子（已完成）
 

@@ -703,6 +703,11 @@ pub struct WsFrame {
     pub len: usize,
     /// A short preview: UTF-8 text (truncated) for text frames, else hex.
     pub preview: String,
+    /// True when `enable://ignoreSend|ignoreReceive` discarded this frame: it
+    /// was seen and recorded, but never delivered to the peer. Upstream marks
+    /// the same thing (`ignore`, `_original/lib/socket-mgr.js:401,:531`) so the
+    /// view shows a dropped frame rather than a gap.
+    pub ignored: bool,
 }
 
 impl WsFrame {
@@ -733,6 +738,7 @@ impl WsFrame {
             opcode: name,
             len: payload.len(),
             preview,
+            ignored: false,
         }
     }
 }
@@ -2313,6 +2319,10 @@ async fn serve_upgrade(
     } else {
         ws::FramePlan::default()
     };
+    // Which directions `enable://ignoreSend|ignoreReceive` silences. Read here
+    // rather than inside the plan: the plan collapses to its default when no
+    // plugin is named, and these flags have to survive that.
+    let frame_ignore = ws::IgnoreDirs::of(resolved);
     let client_upgrade = hyper::upgrade::on(&mut req);
 
     // Build the upstream handshake request (upgrades carry no body, so
@@ -2373,7 +2383,16 @@ async fn serve_upgrade(
                     // Frame-aware tunnel: capture every frame, run the script on
                     // text frames when a frameScript rule matched, and offer each
                     // data frame to the plugins the plan named.
-                    ws::capturing_tunnel(c, u, frame_script, frame_plan, state, session_id).await;
+                    ws::capturing_tunnel(
+                        c,
+                        u,
+                        frame_script,
+                        frame_plan,
+                        frame_ignore,
+                        state,
+                        session_id,
+                    )
+                    .await;
                 } else {
                     // Non-WebSocket upgrade: opaque byte passthrough.
                     let mut c = c;

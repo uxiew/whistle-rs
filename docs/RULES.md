@@ -892,7 +892,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | `abort` (drop the request), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
+| `enable` | flag(s) | `abort` (drop the request), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
 | `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Emit HTTP response trailer headers (forces chunked) |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
@@ -1436,6 +1436,18 @@ string, then `${var}` runtime variables. See
 WebSocket frames are captured too: every intercepted `ws://`/`wss://` connection is
 recorded as a session (status `101`) and each frame (both directions) is surfaced —
 click the connection in the Network view, or fetch `/frames.json?id=<session>`.
+
+`enable://ignoreSend` and `enable://ignoreReceive` silence one direction of such a
+session: the frames are still **captured and flagged**, they are simply never
+delivered to the peer, so the view shows what was dropped instead of a gap.
+Control frames are exempt — withholding a `close` would leave the two ends
+disagreeing about whether the connection is over, and withholding a `ping`/`pong`
+breaks the keep-alive the endpoints agreed on; whistle likewise only ever
+withholds data frames.
+
+whistle's companion flags `pauseSend`/`pauseReceive` are **not** implemented:
+upstream holds the frame until someone releases it from its UI, and this port's UI
+has no such control, so a pause here would be a stall nobody could lift.
 
 ### Multiple patterns and multi-line blocks
 

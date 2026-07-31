@@ -217,6 +217,7 @@ pub async fn capturing_tunnel<A, B>(
     upstream: B,
     script: Option<String>,
     plan: FramePlan,
+    ignore: IgnoreDirs,
     state: Arc<AppState>,
     session: u64,
 ) where
@@ -232,36 +233,79 @@ pub async fn capturing_tunnel<A, B>(
     let up = tokio::spawn(pump(
         cr,
         uw,
-        Dir::Send,
-        script.clone(),
-        send_hooks,
+        Leg {
+            dir: Dir::Send,
+            script: script.clone(),
+            hooks: send_hooks,
+            ignore: ignore.send,
+        },
         state.clone(),
         session,
     ));
     let down = tokio::spawn(pump(
         ur,
         cw,
-        Dir::Receive,
-        script,
-        receive_hooks,
+        Leg {
+            dir: Dir::Receive,
+            script,
+            hooks: receive_hooks,
+            ignore: ignore.receive,
+        },
         state,
         session,
     ));
     let _ = tokio::join!(up, down);
 }
 
-async fn pump<R, W>(
-    mut r: R,
-    mut w: W,
+/// Which directions `enable://ignoreSend` / `enable://ignoreReceive` silence.
+///
+/// Kept apart from [`FramePlan`] deliberately: the plan collapses to
+/// [`FramePlan::default`] when no plugin is named, and folding the flags into it
+/// would lose them on exactly the sessions that have no plugin — which is most
+/// of the sessions anyone writes these rules for.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IgnoreDirs {
+    /// Discard frames travelling client → server.
+    pub send: bool,
+    /// Discard frames travelling server → client.
+    pub receive: bool,
+}
+
+impl IgnoreDirs {
+    /// Read both flags off a resolved rule set.
+    pub fn of(resolved: &Resolved) -> Self {
+        let (send, receive) = crate::proxy::apply::ignored_ws_dirs(resolved);
+        IgnoreDirs { send, receive }
+    }
+}
+
+/// How one direction of a session is to be treated: which way it flows, what may
+/// rewrite its frames, and whether they are delivered at all.
+///
+/// The two directions differ only in these four things, so they travel together
+/// rather than as four positional arguments that could be crossed over.
+struct Leg {
     dir: Dir,
+    /// `frameScript://`, applied to text frames.
     script: Option<String>,
-    mut hooks: Vec<FrameHook>,
-    state: Arc<AppState>,
-    session: u64,
-) where
+    /// The plugin hooks watching this direction, in rule order.
+    hooks: Vec<FrameHook>,
+    /// `enable://ignoreSend|ignoreReceive` — capture the frames but do not
+    /// deliver them.
+    ignore: bool,
+}
+
+async fn pump<R, W>(mut r: R, mut w: W, leg: Leg, state: Arc<AppState>, session: u64)
+where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let Leg {
+        dir,
+        script,
+        mut hooks,
+        ignore,
+    } = leg;
     let direction = dir.label();
     let to_server = dir == Dir::Send;
     loop {
@@ -288,8 +332,24 @@ async fn pump<R, W>(
                 None => continue,
             }
         }
-        // Capture the (possibly rewritten) frame for the Network view.
-        state.record_frame(WsFrame::new(session, direction, frame.opcode, &payload));
+        // Capture the (possibly rewritten) frame for the Network view. An
+        // ignored frame is recorded too, flagged — upstream does the same
+        // (`ignore`, `_original/lib/socket-mgr.js:401,:531`), so the view shows
+        // that a frame was dropped instead of just not showing it.
+        let mut record = WsFrame::new(session, direction, frame.opcode, &payload);
+
+        // `enable://ignoreSend|ignoreReceive` discards this direction's data
+        // frames. Control frames are exempt: dropping a `close` would leave the
+        // tunnel open with both ends believing otherwise, and dropping a
+        // `ping`/`pong` breaks the keep-alive the endpoints agreed on —
+        // upstream's ignore path likewise only ever withholds data
+        // (`opts.data`, `_original/lib/socket-mgr.js:249-274`).
+        if ignore && is_data_frame(frame.opcode) {
+            record.ignored = true;
+            state.record_frame(record);
+            continue;
+        }
+        state.record_frame(record);
         if write_frame(&mut w, frame.fin, frame.opcode, &payload, to_server)
             .await
             .is_err()
@@ -432,6 +492,16 @@ mod tests {
     }
 
     fn spawn_tunnel(state: &Arc<AppState>, plan: FramePlan, script: Option<String>) -> Wire {
+        spawn_tunnel_with(state, plan, script, IgnoreDirs::default())
+    }
+
+    /// As [`spawn_tunnel`], with the `ignore` flags a rule would supply.
+    fn spawn_tunnel_with(
+        state: &Arc<AppState>,
+        plan: FramePlan,
+        script: Option<String>,
+        ignore: IgnoreDirs,
+    ) -> Wire {
         let (client, client_io) = tokio::io::duplex(1 << 16);
         let (server, upstream_io) = tokio::io::duplex(1 << 16);
         let tunnel = tokio::spawn(capturing_tunnel(
@@ -439,6 +509,7 @@ mod tests {
             upstream_io,
             script,
             plan,
+            ignore,
             state.clone(),
             7,
         ));
@@ -638,6 +709,88 @@ mod tests {
             let frames = state.ws_frames.lock().unwrap();
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].preview, "public");
+        });
+    }
+
+    /// `enable://ignoreSend` discards what the client sends and leaves the
+    /// other direction alone. The frame is still *recorded*, flagged — upstream
+    /// reports it with `ignore: true` (`_original/lib/socket-mgr.js:401,:531`)
+    /// rather than omitting it, so the view shows a dropped frame instead of a
+    /// gap. Previously both flags parsed and did nothing.
+    #[test]
+    fn ignore_send_drops_one_direction_only() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://ignoreSend\n");
+            let mut wire = spawn_tunnel_with(
+                &state,
+                plan,
+                None,
+                IgnoreDirs { send: true, receive: false },
+            );
+
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"muted", true)
+                .await
+                .expect("client write");
+            // The origin must never see it, so prove the tunnel is still live by
+            // driving the *other* direction and reading that instead.
+            write_frame(&mut wire.server, true, OPCODE_TEXT, b"heard", false)
+                .await
+                .expect("server write");
+            let back = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            assert_eq!(back.payload, b"heard", "receive is untouched");
+            finish(wire).await;
+
+            let frames = state.ws_frames.lock().unwrap();
+            assert_eq!(frames.len(), 2, "both frames are captured");
+            let sent = frames.iter().find(|f| f.dir == "send").expect("send frame");
+            assert_eq!(sent.preview, "muted");
+            assert!(sent.ignored, "the dropped frame is flagged, not hidden");
+            let recv = frames.iter().find(|f| f.dir == "receive").expect("receive frame");
+            assert!(!recv.ignored);
+        });
+    }
+
+    /// The mirror image, and the control frames that survive either flag: a
+    /// `close` still closes and a `ping` still pings, because withholding those
+    /// breaks the connection rather than silencing the payload — upstream only
+    /// ever withholds data too (`opts.data`, `socket-mgr.js:249-274`).
+    #[test]
+    fn ignore_receive_spares_the_control_frames() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://ignoreReceive\n");
+            let mut wire = spawn_tunnel_with(
+                &state,
+                plan,
+                None,
+                IgnoreDirs { send: false, receive: true },
+            );
+
+            // Data from the origin is dropped…
+            write_frame(&mut wire.server, true, OPCODE_TEXT, b"dropped", false)
+                .await
+                .expect("server write");
+            // …but a ping is not, so this is what the client actually reads.
+            write_frame(&mut wire.server, true, 0x9, b"", false)
+                .await
+                .expect("server ping");
+            let got = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            assert_eq!(got.opcode, 0x9, "the ping got through; the text did not");
+
+            // The client's own direction is unaffected by this flag.
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"sent", true)
+                .await
+                .expect("client write");
+            let up = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            assert_eq!(up.payload, b"sent");
+            finish(wire).await;
+
+            let frames = state.ws_frames.lock().unwrap();
+            let dropped = frames.iter().find(|f| f.preview == "dropped").expect("recorded");
+            assert!(dropped.ignored);
+            assert!(frames.iter().any(|f| f.opcode == "ping" && !f.ignored));
+            assert!(frames.iter().any(|f| f.preview == "sent" && !f.ignored));
         });
     }
 

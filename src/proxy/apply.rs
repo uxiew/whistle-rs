@@ -646,6 +646,24 @@ fn is_disabled(resolved: &Resolved, flag: &str) -> bool {
     disabled_flags(resolved).contains(flag) && !enabled_flags(resolved).contains(flag)
 }
 
+/// `enable://ignoreSend` / `enable://ignoreReceive` — drop every data frame of
+/// one direction of a WebSocket session (`initStatus`,
+/// `_original/lib/socket-mgr.js:86-97`).
+///
+/// The frame is still *captured*: upstream records it with `ignore: true` so the
+/// Network view shows what was discarded rather than a silent gap
+/// (`socket-mgr.js:401,:531`). Discarding a frame without saying so would make a
+/// session look like the peer never sent anything.
+///
+/// whistle's companion flags `pauseSend`/`pauseReceive` are not here: pausing
+/// holds a frame until someone releases it from the UI, and this port's UI has
+/// no such control, so a pause would be an unbreakable stall rather than a
+/// pause. Left unimplemented on purpose — see `docs/ROADMAP.md`.
+pub fn ignored_ws_dirs(resolved: &Resolved) -> (bool, bool) {
+    let e = enabled_flags(resolved);
+    (e.contains("ignoreSend"), e.contains("ignoreReceive"))
+}
+
 /// True if the request should be aborted (`enable://abort`/`abortReq`/`abortRes`).
 pub fn is_aborted(resolved: &Resolved) -> bool {
     let e = enabled_flags(resolved);
