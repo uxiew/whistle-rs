@@ -1157,6 +1157,14 @@ When any body operator applies, whistle-rs buffers that body, transforms it, and
 recomputes `Content-Length` (dropping any `Transfer-Encoding`). Requests and
 responses without a body operator are streamed through untouched.
 
+**A `GET`, `HEAD`, `OPTIONS` or `CONNECT` request is never given a body.**
+`reqBody`/`reqPrepend`/`reqAppend` are dropped on those methods rather than
+applied, matching whistle — a GET carrying a payload is what some origins and
+CDNs answer with a `400`. The check reads the method being *forwarded*, so
+`method://post` alongside the injection restores it. `reqReplace` and
+`delete://reqBody.…` are unaffected: they rewrite a body that is already there,
+and on these methods there is none.
+
 A **compressed response is decoded first**, transformed as text, then
 re-encoded under the same coding on the way out — `gzip`, `deflate` and `br` are
 round-tripped. Without this a `resReplace://` against a gzipped page would search

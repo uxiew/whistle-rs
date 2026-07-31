@@ -2714,7 +2714,30 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
 
 /// True if any request-body operator applies (so the body must be buffered).
 pub fn wants_req_body(resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> bool {
+    // A method that carries no body has nothing to buffer *for*: its injections
+    // are dropped (see [`transform_req_body`]) and its rewrites have nothing to
+    // rewrite, so buffering would cost a copy to reach the same empty body.
+    if !method_allows_body(ctx.method) {
+        return false;
+    }
     body_ops_present(resolved, "req") || params_body_kind(resolved, ctx).is_some()
+}
+
+/// Whether a request with this method may carry a body at all
+/// (`hasRequestBody`, `_original/lib/util/common.js:1591-1605`).
+///
+/// The list is upstream's, and it is about the *method*, not about whether this
+/// particular request happens to have arrived with bytes: `GET`, `HEAD`,
+/// `OPTIONS` and `CONNECT` are the four whistle refuses to give a body to.
+///
+/// The method compared is the one being **forwarded** — after `method://` — so
+/// rewriting a `GET` into a `POST` makes the injection apply, which is the order
+/// upstream reads it in too (`handleReq` runs after the method is set).
+pub fn method_allows_body(method: &str) -> bool {
+    !matches!(
+        method.trim().to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS" | "CONNECT"
+    )
 }
 
 /// True if any response-body operator applies (so the body must be buffered).
@@ -2737,10 +2760,24 @@ pub fn transform_req_body(body: Bytes, resolved: &Resolved, ctx: ReqBodyCtx<'_>)
     }
     // Request bodies are never injection-gated: whistle's request transform
     // leaves `isHtml` unset, so `allowInject` lets every operator through.
-    let gate = InjectionGate::plain(resolved);
-    let mut injection = Injection::default();
-    collect_generic(&mut injection, &gate, "req");
-    let mut data = injection.apply(body.to_vec(), false);
+    //
+    // The method is the one gate. `GET`, `HEAD`, `OPTIONS` and `CONNECT` get no
+    // body, so `reqBody`/`reqPrepend`/`reqAppend` are dropped rather than
+    // applied (`delete data.top/bottom/body`,
+    // `_original/lib/inspectors/req.js:116-120`) — handing a GET eight bytes of
+    // payload is the kind of thing a CDN answers with a 400.
+    //
+    // Only the *injections* go. `reqReplace` and `delete://reqBody.x` rewrite a
+    // body that is already there, and on these methods there is nothing there to
+    // rewrite, so they are left to be no-ops of their own accord.
+    let mut data = if method_allows_body(ctx.method) {
+        let gate = InjectionGate::plain(resolved);
+        let mut injection = Injection::default();
+        collect_generic(&mut injection, &gate, "req");
+        injection.apply(body.to_vec(), false)
+    } else {
+        body.to_vec()
+    };
     if let Some(kind) = params_body_kind(resolved, ctx) {
         data = merge_params_into_body(data, resolved, &del, kind, ctx);
     }
@@ -4217,6 +4254,60 @@ mod tests {
     /// Request facts for the body operators: a POST carrying `content_type`.
     fn body_ctx(content_type: Option<&str>) -> ReqBodyCtx<'_> {
         ReqBodyCtx { method: "POST", content_type }
+    }
+
+    /// A method that carries no body is not given one
+    /// (`hasRequestBody` → `delete data.top/bottom/body`,
+    /// `_original/lib/inspectors/req.js:116-120`).
+    ///
+    /// Measured before the fix: a `GET` through a `reqBody://INJECTED` rule
+    /// reached the origin as `{"method":"GET","len":"8","body":"INJECTED"}`.
+    /// A GET with a payload is what a CDN answers with a 400.
+    #[test]
+    fn a_bodyless_method_is_not_given_a_body() {
+        let resolved = resolve(
+            "example.com reqBody://INJECTED\n",
+            "http://example.com/",
+        );
+        let sent = |method: &str| {
+            let ctx = ReqBodyCtx { method, content_type: None };
+            let out = transform_req_body(Bytes::new(), &resolved, ctx);
+            String::from_utf8(out.to_vec()).expect("utf-8")
+        };
+
+        // The four upstream refuses, in the spellings a client might send.
+        for method in ["GET", "HEAD", "OPTIONS", "CONNECT", "get", " Head "] {
+            assert_eq!(sent(method), "", "{method} must carry no body");
+        }
+        // …and the ones that do take one.
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert_eq!(sent(method), "INJECTED", "{method} takes the injection");
+        }
+
+        // Nothing is buffered for a method that will discard it anyway.
+        let get = ReqBodyCtx { method: "GET", content_type: None };
+        let post = ReqBodyCtx { method: "POST", content_type: None };
+        assert!(!wants_req_body(&resolved, get));
+        assert!(wants_req_body(&resolved, post));
+    }
+
+    /// The gate reads the method being **forwarded**, so `method://post` on a
+    /// GET restores the injection — upstream sets the method before
+    /// `handleReq` runs.
+    #[test]
+    fn rewriting_the_method_decides_whether_a_body_applies() {
+        let resolved = resolve(
+            "example.com reqBody://INJECTED method://post\n",
+            "http://example.com/",
+        );
+        // The caller passes the rewritten method, which is what `serve` does.
+        let ctx = ReqBodyCtx { method: "POST", content_type: None };
+        assert!(wants_req_body(&resolved, ctx));
+        assert_eq!(
+            &transform_req_body(Bytes::new(), &resolved, ctx)[..],
+            b"INJECTED"
+        );
+        assert!(method_allows_body("POST") && !method_allows_body("GET"));
     }
 
     /// As [`resolve`], returning the [`ReqInfo`] as well for the callers that

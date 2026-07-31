@@ -8,7 +8,7 @@
 > 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
 > （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
 > **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **475** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **477** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -230,6 +230,22 @@
       `getEnableEncoding`（`_original/lib/util/index.js:1534-1548`）强制响应的**出站**
       编码，优先级 `br` > `gzip` > `deflate`，是唯一「明文进、压缩出」的情形。实测
       `enable://gzip` 把明文源站的响应压缩返回，且同一行的改写照常生效。
+
+### 请求体（本轮审计发现）
+
+- [x] ~~**GET/HEAD 等无体方法仍被注入请求体**~~ → 已修（本轮）。上游
+      `req.js:116-120` 在 `hasRequestBody(req.method)` 为假时丢弃
+      `reqBody`/`reqPrepend`/`reqAppend` 并删掉 `content-length` —— 这四个方法
+      （`GET`/`HEAD`/`OPTIONS`/`CONNECT`）按语义不带体。本移植的 `wants_req_body`
+      不看方法，于是照注不误。实测（改前）：规则 `reqBody://INJECTED` 之下
+      `GET` 到达源站是 `{"method":"GET","len":"8","body":"INJECTED"}`；
+      改后 `len` 为 null、body 为空，`POST` 不受影响。
+      给 GET 强加 body 会被部分源站与 CDN 判成 `400`。
+      **判定用的是转发时的方法**（`method://` 改写之后），与上游 `handleReq`
+      的顺序一致：`method://post` 会让注入重新生效。
+      **只丢注入**：`reqReplace` 与 `delete://reqBody.x` 改写的是**已有**的体，
+      这些方法上本就无体可改，任其自然成为空操作。
+      顺带省掉一次缓冲 —— 无体方法不再为「注定要丢弃的注入」把 body 读进内存。
 
 ### WebSocket 帧层（本轮审计发现）
 
