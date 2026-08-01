@@ -173,6 +173,12 @@
 | `(inline)` 只对 file 族展开 | 上游 `getValue` 对**每个**算子展开（`rules.js:271-287`），`reqBody://(Hello)` 是它自己的文档示例，此前带括号原样发给源站。连带修掉一个**崩溃**：`fixed_value` 先按字节切括号再判断，值以多字节字符开头时 panic —— 这条路径现在每个算子都走 |
 | 同名 header 只发一条 | `qs.parse("a=1&a=2")` 得到数组，Node 逐元素各发一行。已按上游重新取回核对（非推断）。相邻的「不 trim 键名」一条**刻意不对齐**：`qs.parse` 会留下带尾随空格的键名，那不是合法 token，hyper 会拒绝、上游 `setHeader` 也会抛 —— 照抄等于把算子变成静默空操作 |
 | 控制台「Saved」是假的 | 默认组规则与整个 Values 只写内存；且即便存盘也读不回来（`load_groups` 用 `add_group` 恢复，而 "default" 永远已存在）。两者现已往返落盘，命令行优先 |
+| 命中的规则被丢弃 | `Resolved` 里有每个命中算子的协议、值、原始 token 与解析顺序，然后被整个丢掉；控制台仅存的 `log://` 标签又挂在一行读起来像「命中的规则」的标题下。现随 `Session` 一并记录，按解析顺序（important 行在前，其后源码顺序）排出，控制台新增 Rules 页签 |
+| mock 请求看不到客户端发了什么 | 短路（`file://`、`redirect://`、`statusCode://`、模板）与插件应答都不构建外发请求，两处记录点因而把 `req_headers`／`req_body` 留空 —— 控制台的请求头与请求体页签对**每一个** mock 请求都是空的。现按客户端**自己**的头记录：这条路径上没有转发那一跳，报出改写后的头等于命名一个从未发生的请求 |
+| `enable://gzip` 单独出现时不生效 | `needs_body` 不把强制编码算在内，响应因而走流式路径，`reencode` 根本到不了 —— 只有当同一行上碰巧另有算子把 body 缓冲下来时它才像是生效。它是唯一一个「要整个 body 却一个字节都不改写」的算子，现把 `force_encoding` 挂在 `ResBodyOps` 上让 `needs_body` 看得见；无 body 的响应仍不被拖上缓冲路径 |
+| 重放不带请求体 | `do_replay` 抄下每个抓到的请求头却发 `Empty::new()`：重放一个 POST 会声明 `content-length: 402` 而后面一个字节没有。现按抓到的**已解码**预览发送，`content-length` 按实发重算，`content-encoding` / `transfer-encoding` 随之去掉，截断与解不开两种情形逐条报给控制台 |
+| mock 请求不记请求侧 | 短路与插件应答两条路径不构造出站请求，于是 `req_headers`/`req_body` 全空 —— 控制台的「请求头」「请求体」两个页签对**每一个 mock 请求**都是空的。现记客户端自己的头与有界的体预览（不是被规则改写后的头：这条路径上根本没有那一跳） |
+| `enable://gzip\|br\|deflate` 单独出现时不生效 | `ResBodyOps::needs_body()` 不把强制编码算作「需要整体缓冲」的理由，于是响应走流式路径、`reencode` 根本到不了，这个标志只在同行**另有**算子替它缓冲时才像是生效。现算进该闸门。连带修掉一个更糟的：解不开的体（`zstd`、双层编码、坏流）此前会被 `set_content_encoding(Identity)` **摘掉原头** —— 客户端收到 zstd 字节却被告知是明文；现在原样奉还，头也不动 |
 
 ### 尚未修（8 条，其中 2 条是部分剩余）
 
@@ -183,14 +189,12 @@
 - **算子取值不支持从文件 / 远程 URL 读取**（`readRuleValue`，`util/index.js:1174-1198`）：
   `reqHeaders:///etc/whistle/headers.json` 什么也不设。需要一个值加载器贯穿规则层与算子层，
   且要在解析路径上做 I/O。（`(inline)` 那一半已完成 —— 见上表。）
-- **`enable://gzip|br|deflate` 单独出现时不生效**：需要把响应强制走缓冲路径。
-  （守卫本身已补 —— 见上表，现在对未解开的体一律拒绝强制编码。）
 - **反引号模板**（`renderTpl`，`rules.js:762-772`）：整值加反引号时对算子取值做模板渲染，
   需要在替换时点拿到请求上下文。`${key}` 那一半已完成。
 - **`skip://pattern=` / `operation=`、`ignore://pattern=` / `matcher=`**：上游用 `_skipProps`
   在扫描期跳过整条规则（`rules.js:1118-1147,:987-989`），需要一趟前置扫描。
 - **响应 abort 仅覆盖 HTTP**；上游隧道路径也有（`tunnel.js:749`、`https/index.js:184,:783`）。
-- **控制台**：无 Composer；重放丢请求体；**看不到命中了哪条规则**（数据在 `Resolved` 里但被丢弃）；
+- **控制台**：无 Composer；
   二进制 body 在序列化时即被替换成 `[binary, N bytes]`，因此图片/十六进制/下载做不了；
   无导入、导出仅 HAR；Values 无逐键编辑；无多选/标记；无时间线（Session 模型太薄）。
 - **`cipher://` 的完整 OpenSSL 语义**：rustls 不暴露 cipher 字符串（架构限制，非疏漏）。
