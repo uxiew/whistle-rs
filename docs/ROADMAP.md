@@ -13,7 +13,7 @@
 > **失败开放已清空**；余下 8 条逐条记录在下一节并说明原因，**未修的没有被略去**。
 > 不再维护一个精确的「已修 N 项」整数 —— 有两条发现是**部分**修完的（取值加载器修了
 > `(inline)` 一半、模板那条修了 `${key}` 一半），拿一个整数去追它只会算错；
-> 单元测试 **500** 项全绿；`cargo build --all-targets` 与
+> 单元测试 **574** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
