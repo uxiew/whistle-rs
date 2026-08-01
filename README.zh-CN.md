@@ -37,8 +37,10 @@ CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
 - **上游代理** —— 可经由另一个 HTTP/HTTPS 代理或 SOCKS5 代理转发。
 - **内建 SOCKS5 服务** —— 接受 SOCKS5 客户端（`--socks-port`）进入同一套拦截管线，
   自动识别 TLS 与明文 HTTP。
-- **规则引擎** —— whistle 规则语法：域名/前缀、前导点子域、通配符与正则模式；
-  `$` 高优先级；多命中累加。
+- **规则引擎** —— whistle 规则语法：域名/前缀、前导点子域、域名通配符、`^` 前缀的
+  路径/查询通配符（含 `$1`…`$9` 子匹配传值）与正则模式；`$` 高优先级；多命中累加。
+- **转发** —— 一个裸 URL 就把站点指向本地开发服务
+  （`www.example.com http://localhost:5173`），未命中的路径会自动拼接过去。
 - **目标改写**（`host://`）—— 改写目标 IP/端口，同时保留原始 `Host` 头与 TLS SNI ——
   这正是调试代理的核心行为。
 - **请求/响应改写** —— 头、Cookie、Body（替换/前插/追加/正则）、URL/查询串、
@@ -118,7 +120,10 @@ HTTPS 流量是加密的，要读取/改写它，whistle-rs 会出示一份自�
 每行形如 `pattern operator1 operator2 …`。几个例子：
 
 ```
-# 将域名映射到本地开发服务器（hosts 简写）
+# 把站点交给本地开发服务（剩余路径会跟着走）
+www.example.com       http://localhost:5173
+
+# 改写目标地址、保留 Host 头（hosts 简写）
 test.local            127.0.0.1:9099
 
 # 显式目标改写（同时作用于 http + https）
@@ -127,8 +132,11 @@ test.local            127.0.0.1:9099
 # 正则模式 → 设置响应 Content-Type
 /\.js(\?|$)/          resType://application/javascript
 
-# 通配符模式 → 重定向（短路上游）
-old.example.com/*     redirect://https://new.example.com/
+# 域名通配符 → 重定向（短路上游）
+*.old.example.com     redirect://https://new.example.com/
+
+# `^` 让每个 `*` 都成为通配符，$1… 就是它们匹配到的内容
+^http://*.example.com/v0/users/**   file:///mock/$1/$2
 
 # 注入头（同名规则跨行累加）
 example.com           reqHeaders://x-token=abc

@@ -55,6 +55,7 @@ example.com  htmlAppend:///tmp/x.html  lineProps://safeHtml&important
 | `proxyHost` | ✅ **已接线** | 让 `host` 与 `proxy` 同时生效：走代理，但代理连的是 `host://` 指定的地址 |
 | `proxyHostOnly` | ✅ **已接线** | 同上，但无 `host` 命中时丢弃 `proxy` |
 | `weakRule` | ✅ **已接线** | 反转默认优先级，使 `file` 族规则给命中的 `proxy`/`host` 让路 |
+| `originUrl` | ✅ **已接线** | **原版未文档化**：域名型 pattern（无自带路径）命中时，拼到转发/file 值后面的路径强制为 `/`，即只要目标自己的根（`lib/rules/rules.js:1105`）。带路径的 pattern 不受影响 —— 上游同样以 `rule.isDomain` 为前提 |
 | `disableAutoCors` | 仅暴露 | **本移植没有可抑制的对象**：`file`/`tpl`/`rawfile` 响应根本不会自动加 CORS 头（原版 `isAutoCors`，`lib/handlers/file-proxy.js:178-191`）。为了能"关掉"它而先实现自动 CORS 是本末倒置 |
 | `disabledAutoCors` | 仅暴露 | 原版接受的拼写错误别名，本移植一并解析；同上无效果 |
 | `enableBigData` | 仅暴露 | **本移植没有可抬高的上限**：`reqMerge`/`resMerge` 对整个已缓冲的 body 生效，不设 2MB 门槛（原版 `MAX_RES_SIZE`/`BIG_MAX_RES_SIZE`，`lib/inspectors/res.js:25-26,:1017`），等价于该开关恒为开 |
@@ -62,7 +63,7 @@ example.com  htmlAppend:///tmp/x.html  lineProps://safeHtml&important
 | `proxyTunnel` | 仅暴露 | 需要在 `upstream::Target` 上增加「明文请求也先 CONNECT」的开关，而 `src/proxy/upstream.rs` 不在本次改动范围内；且无法在没有上游代理的情况下做端到端验证 |
 | `enableUserLogin` | 不适用 | 本移植没有登录框，也没有 `disable://userLogin` |
 | `disableUserLogin` | 不适用 | 同上 |
-| `originUrl` | 仅暴露 | **原版未文档化**：域名型 pattern 命中时，把拼到算子值后面的路径强制为 `/`（`lib/rules/rules.js:1105`）。本移植根本不做「把命中后缀拼到算子值上」这件事，算子值一律按字面使用 |
+
 
 `LINE_PROP_ACTIONS` 常量列出全部已知动作，仅作文档用途 —— 它**不是过滤器**，未列出的动作
 同样会被保留。

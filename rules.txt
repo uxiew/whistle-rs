@@ -1,5 +1,7 @@
 # whistle-rs example rules — see README.md
-# map a domain to a local dev server (hosts shorthand)
+# serve a site from a local dev server; the request's remaining path follows
+www.example.dev       http://localhost:5173
+# map a domain to another address, keeping its Host header (hosts shorthand)
 test.local            127.0.0.1:9099
 # redirect (short-circuits before contacting upstream)
 example.dev/go        redirect://http://test.local/landing

@@ -5,10 +5,11 @@
 本文件诚实记录 **whistle-rs 相对原版 whistle 的对齐进度**：已完成的工作，以及仍
 **有意简化 / 尚未移植 / 架构受限**的更大子系统与少数边缘算子。
 
-> 现状快照：73 个注册算子中 **70 个**已在运行时应用，另有别名算子层、本地文件/模板家族
-> （含两遍替换与 `${var}` 运行时变量）、`@`-includes、规则行级属性；
-> **筛选器条件已全部可求值**（`from:` 是最后一个，本轮补上）；
-> 单元测试 **477** 项全绿；`cargo build --all-targets` 与
+> 现状快照：73 个注册算子中 **70 个**已在运行时应用，加上**转发规则**（原版无名的
+> `rule` 协议）、别名算子层、本地文件/模板家族（含两遍替换与 `${var}` 运行时变量）、
+> `@`-includes、规则行级属性；**筛选器条件已全部可求值**；
+> **pattern 层已按上游三种通配符语义重写，`$0`–`$9` 子匹配传值可用**；
+> 单元测试 **500** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
 > 自研插件体系 v2（Rust 进程内 + JS/TS SDK）、流量检查（头 + Body 预览 + gzip/br/deflate 解码）、
@@ -16,7 +17,70 @@
 
 ---
 
-## 已完成（本轮）
+## 已完成（本轮：pattern 与 destination 层）
+
+本轮审计的是**规则行怎么被切开**、以及**请求最终去哪**这两件事。四个缺口都属于
+「解析了但语义不同」或「根本没解析」，其中两个是**失败开放**。
+
+- [x] ~~**转发规则（原版的 `rule` 协议）根本不存在**~~ → 已实现（本轮）。原版把
+      **任何未知协议的 matcher** 归入 `rules.rule`（`_original/lib/rules/rules.js:1313-1316`），
+      其解析出的 URL 随后**整体替换请求 URL**（`util.rule.getUrl(req.rules.rule)` →
+      `req.options`，`lib/inspectors/rules.js:40-44`）。这是原版**最常用**的一条规则
+      —— 官方 getting-started 的第一个例子就是
+      `www.example.com http://localhost:5173`。本移植此前把这一行的两个 token
+      **都判成 pattern**，于是整行产生零个算子、**静默失效**。
+      新增 `src/proxy/dest.rs`：`Destination` 决定 socket 目标、`Host` 头、请求行路径
+      与 scheme；`host://` 仍在其之上覆盖 socket 地址而不动 `Host`（两者叠加的语义
+      与上游一致）。实测转发、路径拼接、`< >` 固定值、以及与 `host://` 的对比。
+      不覆盖：`http://` 用在 WebSocket 请求上不做 HTTP↔WS 协议转换，`tunnel://` 只
+      当作地址（scheme 沿用请求自身）。
+- [x] ~~**行切分算法与上游不同**~~ → 已按 `indexOfPattern`
+      （`rules.js:1449-1466,:1767-1793`）重写。上游的规则是**按位置**：`patternIndex === 0`
+      时第一个 token 是 pattern、**其余一律是算子**（无论长什么样）；只有算子在前的
+      「位置调换」写法才允许多个 pattern。本移植此前按 token 形状 `partition`，
+      因此 `example.com http://localhost:5173` 与 `a.com b.com host://x` 都被读错。
+      顺带修正 `isHost`：上游是 `net.isIP`，所以 `localhost:8080` **不是** hosts 简写而是
+      转发目标 —— 此前本移植把两者等同，等于悄悄保留了上游会改写的 `Host` 头。
+      每一条判定都用上游的分类器逐行核对过。
+- [x] ~~**命中后缀不拼到算子值上**~~ → 已实现 `joinUrl` / `joinQuery`
+      （`rules.js:334-366`，新增 `src/rules/url.rs`）。这是原版文档里的「路径自动拼接」：
+      `www.example.com file:///srv/static` 之下 `/js/app.js` 要落到
+      `/srv/static/js/app.js`。此前本移植**从不拼接**，于是**一个 `file://` 目录规则
+      对除根路径外的一切都 404**。拼接只作用于转发规则与 file 家族 —— 与上游一致
+      （只有 `rule.url` 与 `rule.files` 参与 `joinUrl`，其余算子读的是 `rule.matcher`）。
+      `|` 多路径按**每一条**分别拼接（上游先 split 再 map），否则第一条会丢掉路径。
+      顺带补上 `decodePath`：file 路径要去掉 query/fragment 并做百分号解码。
+- [x] ~~**通配符语义不同，且失败开放**~~ → 已按 `parseWildcard` / `isRegUrl` 重写
+      （新增 `src/rules/wildcard.rs`）。此前任何含 `*` 的 pattern 都被编译成
+      `^` + 把 `*` 换成 `.*` 的正则，**既没有 scheme 锚点、也不限制 `.` 与 `/`**：
+      `*.example.com` 因此会命中 `http://evil.test/?next=a.example.com` ——
+      一条只想作用于某站点的规则，作用到了任何**提到**该站点的请求上。**失败开放。**
+      现按上游分三种：普通 pattern 的 `*` **只在域名部分**是通配符
+      （`*`=`[^/?.]*`、`**`=`[^/?]*`，路径按字面前缀匹配）；`^` 前缀的 pattern 里
+      路径与 query 的 `*`/`**`/`***` 才是通配符，`$` 收尾；filter 的 URL pattern 走
+      `resolveFilterPattern`，**总是**按 `^` 解读（这也是 `includeFilter://*/cgi-*`
+      能通配路径而同名 rule pattern 不能的原因）。编译出的正则已与上游逐字符比对。
+- [x] ~~**`$0`–`$9` 子匹配传值不生效**~~ → 已实现。正则与通配符捕获的内容现在会代入
+      **同一行所有算子**的值（`replaceSubMatcher`，`rules.js:945-953`）。复用已有的
+      `replacePattern` 移植（提到 `src/rules/replace.rs` 共用），因此 `$$1` 的百分号
+      编码、`\$1` 转义一并生效。无捕获的 pattern 不做替换，值里的 `$1` 保持字面。
+- [x] ~~`proto://(inline)` 与 `proto://<verbatim>` 两种括号写法不认~~ → 已实现。
+      `(text)` 是内联响应体（`file://({"status":"ok"})` 此前会去找一个同名文件并 404），
+      `<path>` 是「就用这个值，不要拼路径」。**比上游窄**：上游对**每个**算子做这个判定，
+      于是 `htmlAppend://<script>…</script>` 会被吃掉最后一个 `>`；本移植只在文档描述
+      这两种写法的地方问这个问题（转发规则与 file 家族），注入的 HTML 不受影响。
+- [x] ~~`//host/path` 型 pattern 落到路径里~~ → 已修：`//` 前缀按 `NO_SCHEMA_RE` 剥离，
+      协议任意。此前 `//a.com/x` 会被解析成「任意 host + 路径前缀 `//a.com/x`」，
+      即匹配不到任何真实请求。
+- [x] ~~`lineProps://originUrl` 无物可接~~ → 已接线（拼接实现之后它才有意义）。
+      域名型 pattern 命中时把拼过去的路径强制为 `/`，见 [`LINE_PROPS.md`](LINE_PROPS.md)。
+- [x] ~~PAC 辅助函数测试依赖外部 DNS~~ → 已修。`dnsResolve('no-such-host.invalid') === null`
+      在任何**劫持 NXDOMAIN** 的解析器下都会失败（本机答 198.18.0.57，这是桌面 VPN
+      客户端 fake-ip 模式的常态）。改用一个根本到不了解析器的输入来验证同一条契约。
+
+---
+
+## 已完成（上一轮）
 
 | 领域 | 状态 |
 |------|------|
@@ -168,7 +232,7 @@
 > 未改动并记录：上游把根 CA 密钥复用为每张叶证书的密钥（`ca.js:203-260`），
 > 本移植为每张叶证书新生成密钥 —— **严格更强**，故不对齐。
 
-### 模式匹配（本轮审计修复）
+### 模式匹配（早期审计修复）
 
 同一个根因的三处实例，都是**失败开放**（规则悄悄匹配了不该匹配的请求）：
 
@@ -176,6 +240,9 @@
 - [x] ~~`example.test:8080` 忽略端口~~ → `Pattern::Prefix` 现在携带 `port`，匹配时校验。
 - [x] ~~`!pattern` 取反~~ → 已支持，且与上游一致地**只作用于正则与端口 pattern**；
       上游对取反的字面量/通配 pattern 是在解析期直接丢弃的（`rules.js:1259-1268`），本移植照做。
+
+第四处（通配符本身）见本轮的 [pattern 与 destination 层](#已完成本轮pattern-与-destination-层)：
+`*` 此前被编译成不带锚点的 `.*`，是同一类问题里影响面最大的一个。
 
 ### 标志族 `enable://` / `disable://`（本轮审计发现）
 
@@ -573,11 +640,23 @@
 `sniCallback` 说「不拦截」之后，`host://` 与 `proxy://` 照常路由；它拿不到的只是那些
 需要读取内容才成立的东西。
 
-算子层本轮清掉四条**静默失效**（都是「解析了但不产生效果」，最坏情况是用户以为写了却没写）：
+算子层此前清掉四条**静默失效**（都是「解析了但不产生效果」，最坏情况是用户以为写了却没写）：
 cookie 的属性对象与数组形式、`delete://resCookies.x` 的过期 cookie、`delete://trailer.x`、
 `headerReplace` 的 `$$` 编码引用与无前缀键的作用域继承。仍然刻意保留的是四条有意的取舍
 （注入文本按 UTF-8、`params://` 缓冲改写、非 UTF-8 请求体不处理、`resScript` 里的
 `resRules://` 条目无处安放），理由都写在 [`RULES.md`](RULES.md) 的对应条目里。
+
+**本轮把审计范围往前挪到了算子之前** —— 规则行怎么被切开、以及请求最终去哪。这一层
+之前没有被系统看过，结果是四个缺口里有两个**失败开放**，另有一个是原版**最常用**的
+那条规则从来不生效：
+
+- 转发规则（`example.com http://localhost:5173`）**整行被读成两个 pattern**，产生零个算子；
+- `*` 通配符被编译成不带锚点的 `.*`，于是 `*.example.com` 命中任何**提到**该域名的 URL；
+- 命中后缀从不拼接，于是 `file://` 指向目录的规则对根路径以外的一切都 404；
+- `$0`–`$9` 子匹配传值逐字发给源站。
+
+这一层的判定全部与上游的分类器/编译器**逐条比对**过（`indexOfPattern` 的分支、
+`parseWildcard` 与 `isRegUrl` 编译出的正则源码），而不是照着文档重写。
 
 模块地图见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，算子覆盖见 [`RULES.md`](RULES.md)，
 插件编写见 [`PLUGINS.md`](PLUGINS.md)，模板见 [`TEMPLATES.md`](TEMPLATES.md)，

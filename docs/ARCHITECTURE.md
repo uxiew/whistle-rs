@@ -23,10 +23,14 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/rules/protocols.rs` | `lib/rules/protocols.js` | The protocol registry + multi-match set |
 | `src/rules/mod.rs` | `lib/rules/rules.js` | Line parsing, pattern kinds, operator parsing |
 | `src/rules/matcher.rs` | `lib/rules/rules.js` (`resolveRules`) | Match a request, resolve per-protocol winners |
+| `src/rules/wildcard.rs` | `lib/rules/rules.js` (`parseWildcard`, `isRegUrl`) | The two wildcard pattern kinds, and a filter's own |
+| `src/rules/url.rs` | `lib/rules/rules.js` (`joinUrl`, `setProtocol`) | Where a destination's path comes from, and the bracket forms |
+| `src/rules/replace.rs` | `lib/util/replace-pattern-transform.js` | `$0`–`$9` expansion, for pattern captures and `*Replace` alike |
 | `src/ca.rs` | `lib/https/ca.js` | Root CA generation/persistence, per-host leaf signing |
 | `src/proxy/mod.rs` | `lib/index.js`, `lib/tunnel.js` | Server, forward proxy, CONNECT + MITM, WebSocket, capture log, status page/PAC |
 | `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split), upstream HTTP/SOCKS proxies |
 | `src/proxy/apply.rs` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations |
+| `src/proxy/dest.rs` | `lib/inspectors/rules.js:40` | Where the request is addressed once a URL-replacement rule has spoken |
 | `src/proxy/template.rs` | `lib/handlers/file-proxy.js` (`render`) | `tpl`/`dust`/`jsonp` two-pass rendering + `${var}` variables |
 | `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation) |
 | `src/proxy/sni.rs` | `lib/https/index.js:1281`, `lib/https/load-cert.js` | The SNI stage: peek the ClientHello, pick the certificate, or relay the connection untouched |
@@ -318,10 +322,14 @@ whistle-rs/
     ├── rules/
     │   ├── mod.rs
     │   ├── protocols.rs
-    │   └── matcher.rs
+    │   ├── matcher.rs
+    │   ├── wildcard.rs    # `*` in a host, and `^…$` everywhere else
+    │   ├── url.rs         # joinUrl/setProtocol + the (inline)/<verbatim> forms
+    │   └── replace.rs     # $0-$9 expansion
     └── proxy/
         ├── mod.rs
         ├── apply.rs
+        ├── dest.rs        # the URL a request is forwarded to
         ├── template.rs    # tpl/dust/jsonp rendering + ${var} variables
         ├── persist.rs     # session persistence (JSONL)
         ├── upstream.rs

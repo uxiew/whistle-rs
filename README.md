@@ -38,7 +38,10 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 - **Inbound SOCKS5 server** — accept SOCKS5 clients (`--socks-port`) into the same
   interception pipeline, auto-detecting TLS vs. plain HTTP.
 - **Rules engine** — whistle's rule syntax: domain/prefix, leading-dot subdomain,
-  wildcard, and regex patterns; `$`-important precedence; multi-match accumulation.
+  host wildcards, `^`-prefixed path/query wildcards with `$1`…`$9` captures, and regex
+  patterns; `$`-important precedence; multi-match accumulation.
+- **Forwarding** — point a site at a dev server with a bare URL
+  (`www.example.com http://localhost:5173`); the request's remaining path comes along.
 - **Destination override** (`host://`) that rewrites the target IP/port while keeping
   the original `Host` header and TLS SNI — the defining behaviour of a debug proxy.
 - **Request/response rewriting** — headers, cookies, body (replace/prepend/append/
@@ -126,7 +129,10 @@ signs itself. Your client must trust the root CA first:
 Each line is `pattern operator1 operator2 …`. A few examples:
 
 ```
-# map a domain to a local dev server (hosts shorthand)
+# serve a site from a local dev server (the path follows the request)
+www.example.com       http://localhost:5173
+
+# map a domain to another address, keeping its Host header (hosts shorthand)
 test.local            127.0.0.1:9099
 
 # explicit destination override (applies to http + https)
@@ -135,8 +141,11 @@ test.local            127.0.0.1:9099
 # regex pattern → set a response content-type
 /\.js(\?|$)/          resType://application/javascript
 
-# wildcard pattern → redirect (short-circuits upstream)
-old.example.com/*     redirect://https://new.example.com/
+# host wildcard → redirect (short-circuits upstream)
+*.old.example.com     redirect://https://new.example.com/
+
+# `^` makes every `*` a wildcard, and $1… are what they matched
+^http://*.example.com/v0/users/**   file:///mock/$1/$2
 
 # inject headers (these accumulate across lines)
 example.com           reqHeaders://x-token=abc
