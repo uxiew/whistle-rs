@@ -2716,8 +2716,13 @@ pub fn res_write_raw_path(resolved: &Resolved) -> Option<String> {
 /// request carrying both spellings of a name ends up without it.
 pub fn build_trailers(resolved: &Resolved) -> HeaderMap {
     let mut h = HeaderMap::new();
-    for (name, value) in merge_header_ops(resolved, "trailers") {
-        set_header(&mut h, &name, &value);
+    for (name, values) in merge_header_ops(resolved, "trailers") {
+        for (i, value) in values.iter().enumerate() {
+            match i {
+                0 => assign_header(&mut h, &name, value),
+                _ => append_header(&mut h, &name, value),
+            }
+        }
     }
     // `headerReplace://trailer.x:…` rewrites a trailer, then the deletions run,
     // which is upstream's order on the way out (`res.js:1275-1281`).
@@ -4721,14 +4726,115 @@ fn escape_cookie(s: &str, is_name: bool) -> String {
 /// header named on two lines takes the first line's value — see that function
 /// for why the fold, not a top-to-bottom apply, is what upstream does.
 fn apply_header_ops(headers: &mut HeaderMap, resolved: &Resolved, protocol: &str) {
-    for (name, value) in merge_header_ops(resolved, protocol) {
-        assign_header(headers, &name, &value);
+    let mut ops = merge_header_ops(resolved, protocol);
+    // `set-cookie` is not assigned like the others: upstream lifts it out of
+    // `data.headers` and *merges* it with what the response already sent
+    // (`setCookies`, `_original/lib/inspectors/res.js:89-122`, run at `:926`
+    // just before the `extend`), then deletes the key so the extend cannot
+    // clobber the result. Overwriting instead dropped every other cookie the
+    // origin set — the session cookie next to the one the rule named.
+    if protocol == "resHeaders"
+        && let Some(i) = ops.iter().position(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+        && merge_set_cookies(headers, &ops[i].1)
+    {
+        ops.remove(i);
+    }
+    for (name, values) in ops {
+        for (i, value) in values.iter().enumerate() {
+            // A JSON array is several headers of the same name, which is what
+            // Node does with `headers[name] = ['a', 'b']`.
+            match i {
+                0 => assign_header(headers, &name, value),
+                _ => append_header(headers, &name, value),
+            }
+        }
+    }
+}
+
+/// `setCookies` (`_original/lib/inspectors/res.js:89-122`) — fold a `set-cookie`
+/// written on `resHeaders://` into the response's own.
+///
+/// The rule's cookies come first, then every origin cookie whose **name** the
+/// rule did not also name. So a rule setting `sid` replaces the origin's `sid`
+/// and leaves its `csrf` alone; assigning the header instead would have thrown
+/// the `csrf` away, and a login flow with it.
+///
+/// Returns whether the merge consumed the key. It does not when there is
+/// nothing to merge — upstream returns before its `delete data.headers[…]`,
+/// leaving the key for the `extend` to assign like any other header, so
+/// `resHeaders://set-cookie=` does send one empty `Set-Cookie`.
+fn merge_set_cookies(headers: &mut HeaderMap, values: &HeaderValues) -> bool {
+    let mut cookies: Vec<String> = match values {
+        // A plain string is split on commas — `newCookies.split(',')`
+        // (`res.js:95`), which is how `resHeaders://set-cookie=a=1,b=2` becomes
+        // two cookies. It is also why an `Expires=Wed, 21 Oct …` attribute has
+        // to be written in the JSON array form, upstream and here.
+        HeaderValues::One(s) if s.is_empty() => return false,
+        HeaderValues::One(s) => s.split(',').map(str::to_string).collect(),
+        HeaderValues::Many(items) => items.clone(),
+    };
+    if cookies.is_empty() {
+        return false;
+    }
+    // A cookie with no `=` is keyed on its whole text. Upstream keys it on the
+    // string `"undefined"` instead — `var name = index == -1 ? name : …` reads
+    // the variable it is declaring — so two different attribute-less cookies
+    // collide there. Not reproduced: that is a name collision, not a rule.
+    let name_of = |c: &str| c.split_once('=').map_or(c, |(n, _)| n).to_string();
+    let claimed: Vec<String> = cookies.iter().map(|c| name_of(c)).collect();
+    for existing in headers
+        .get_all(hyper::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+    {
+        if !claimed.contains(&name_of(existing)) {
+            cookies.push(existing.to_string());
+        }
+    }
+    headers.remove(hyper::header::SET_COOKIE);
+    for cookie in cookies {
+        append_header(headers, "set-cookie", &cookie);
+    }
+    true
+}
+
+/// Add a header without replacing one already there.
+fn append_header(headers: &mut HeaderMap, name: &str, value: &str) {
+    let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+        return;
+    };
+    if let Ok(v) = HeaderValue::from_str(value) {
+        headers.append(name, v);
+    }
+}
+
+/// What one header operator says a header should be.
+///
+/// The two shapes are kept apart on purpose even when the list holds one
+/// element: `setCookies` splits a plain string on commas and never splits an
+/// array (`_original/lib/inspectors/res.js:91-96`), so
+/// `resHeaders://set-cookie=a=1,b=2` is two cookies and
+/// `resHeaders://{"set-cookie":["a=1,b=2"]}` is one.
+#[derive(Clone, Debug, PartialEq)]
+enum HeaderValues {
+    One(String),
+    /// The JSON array spelling, which Node writes as one header line per
+    /// element.
+    Many(Vec<String>),
+}
+
+impl HeaderValues {
+    fn iter(&self) -> std::slice::Iter<'_, String> {
+        match self {
+            HeaderValues::One(s) => std::slice::from_ref(s).iter(),
+            HeaderValues::Many(items) => items.iter(),
+        }
     }
 }
 
 /// Collapse every line of a header protocol into one ordered `name` → `value`
 /// map, first line winning a contested name.
-fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, String)> {
+fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, HeaderValues)> {
     merge_line_maps(
         resolved
             .all(protocol)
@@ -4741,7 +4847,11 @@ fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, String)
 /// query string of `name=value` pairs (`resHeaders://x-a=1&x-b=2` is two
 /// headers, as `parseQuery` has it). The `name:value` spelling is a whistle-rs
 /// convenience, not upstream syntax.
-fn parse_header_pairs(value: &str) -> Vec<(String, String)> {
+///
+/// A value is a *list* because the JSON spelling may give one: upstream assigns
+/// the array straight onto the header map, and Node then writes one header line
+/// per element. Every other spelling produces a list of one.
+fn parse_header_pairs(value: &str) -> Vec<(String, HeaderValues)> {
     let value = value.trim();
     if value.starts_with('{')
         && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
@@ -4749,8 +4859,12 @@ fn parse_header_pairs(value: &str) -> Vec<(String, String)> {
         return map
             .into_iter()
             .map(|(k, v)| match v {
-                serde_json::Value::String(s) => (k, s),
-                other => (k, other.to_string()),
+                serde_json::Value::String(s) => (k, HeaderValues::One(s)),
+                serde_json::Value::Array(items) => (
+                    k,
+                    HeaderValues::Many(items.iter().map(json_header_value).collect()),
+                ),
+                other => (k, HeaderValues::One(other.to_string())),
             })
             .collect();
     }
@@ -4758,12 +4872,29 @@ fn parse_header_pairs(value: &str) -> Vec<(String, String)> {
         return value
             .split('&')
             .filter_map(|pair| pair.split_once('='))
-            .map(|(name, val)| (name.trim().to_string(), val.trim().to_string()))
+            .map(|(name, val)| {
+                (
+                    name.trim().to_string(),
+                    HeaderValues::One(val.trim().to_string()),
+                )
+            })
             .collect();
     }
     match value.split_once(':') {
-        Some((name, val)) => vec![(name.trim().to_string(), val.trim().to_string())],
+        Some((name, val)) => vec![(
+            name.trim().to_string(),
+            HeaderValues::One(val.trim().to_string()),
+        )],
         None => Vec::new(),
+    }
+}
+
+/// One element of a JSON header array as it reaches the wire: a string as
+/// itself, anything else as JS would stringify it into a header slot.
+fn json_header_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -8079,6 +8210,93 @@ mod tests {
         // The classes that did already work still do.
         assert_eq!(sent("POST", Some("application/json")), "q=new");
         assert_eq!(sent("PUT", Some("text/plain")), "q=new");
+    }
+
+    /// A `set-cookie` written on `resHeaders://` **merges** with the response's
+    /// own, by cookie name (`setCookies`,
+    /// `_original/lib/inspectors/res.js:89-122`, run at `:926` just before the
+    /// `extend` that would otherwise clobber it).
+    ///
+    /// The port assigned the header instead, so a rule setting `sid` also threw
+    /// away the `csrf` cookie the origin sent beside it — and the JSON array
+    /// spelling was worse still: it stringified the array into the header value
+    /// and sent `Set-Cookie: ["sid=new","theme=dark"]`.
+    ///
+    /// Expectations are upstream's own output, from a verbatim `setCookies`.
+    #[test]
+    fn res_headers_set_cookie_merges_with_the_origins() {
+        let sent = |rule: &str, origin: &[&str]| {
+            let resolved = resolve(
+                &format!("example.com resHeaders://{rule}\n"),
+                "http://example.com/",
+            );
+            let mut parts = res_parts(&[]);
+            for c in origin {
+                parts
+                    .headers
+                    .append(hyper::header::SET_COOKIE, c.parse().unwrap());
+            }
+            apply_response(&mut parts, &resolved);
+            parts
+                .headers
+                .get_all(hyper::header::SET_COOKIE)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // The named cookie is replaced; the others survive, after it.
+        assert_eq!(
+            sent("set-cookie=sid=new", &["sid=old; Path=/", "csrf=abc"]),
+            ["sid=new", "csrf=abc"]
+        );
+        // The JSON array spelling is a list of cookies, not a header value.
+        assert_eq!(
+            sent(r#"{"set-cookie":["sid=new","theme=dark"]}"#, &["sid=old", "csrf=abc"]),
+            ["sid=new", "theme=dark", "csrf=abc"]
+        );
+        // A plain string is split on commas, so this is two cookies…
+        assert_eq!(sent("set-cookie=a=1,b=2", &["sid=old"]), ["a=1", "b=2", "sid=old"]);
+        // …and an array element is not, which is the only way to write a cookie
+        // whose attributes contain a comma (an `Expires=Wed, 21 Oct …`).
+        assert_eq!(
+            sent(r#"{"set-cookie":["a=1,b=2"]}"#, &["sid=old"]),
+            ["a=1,b=2", "sid=old"]
+        );
+        // Nothing to merge with.
+        assert_eq!(sent("set-cookie=sid=new", &[]), ["sid=new"]);
+        // A cookie with no `=` is a name of its own, and does not collide.
+        assert_eq!(sent("set-cookie=flag", &["sid=old"]), ["flag", "sid=old"]);
+        assert_eq!(sent("set-cookie=sid=new", &["sid=old", "flag"]), ["sid=new", "flag"]);
+        // An empty value is not a merge: it falls through to the assignment,
+        // like any other empty header value.
+        assert_eq!(sent("set-cookie=", &["sid=old"]), [""]);
+        // The name is matched however it is spelled on the rule.
+        assert_eq!(
+            sent(r#"{"Set-Cookie":"sid=new"}"#, &["sid=old", "csrf=abc"]),
+            ["sid=new", "csrf=abc"]
+        );
+    }
+
+    /// The JSON array spelling is several header lines for every header, not
+    /// only `set-cookie` — Node writes one line per element of
+    /// `headers[name] = ['a', 'b']`.
+    #[test]
+    fn a_json_array_header_value_is_several_headers() {
+        let resolved = resolve(
+            r#"example.com reqHeaders://{"x-a":["1","2"],"x-b":"3"}"#,
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[("x-a", "arrived")]);
+        apply_request(&mut parts, &resolved);
+        let values: Vec<_> = parts
+            .headers
+            .get_all("x-a")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(values, ["1", "2"], "the arrived value is replaced, not added to");
+        assert_eq!(parts.headers.get("x-b").unwrap(), "3");
     }
 
     #[test]

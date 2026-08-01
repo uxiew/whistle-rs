@@ -1187,7 +1187,7 @@ slow.example.com   resSpeed://20        # ~20 KB/s download
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `replaceStatus` / `statusCode` | status number | Replace the upstream response status (401/407 also send the matching auth challenge) |
-| `resHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace response headers (empty value deletes). Accumulates across lines. |
+| `resHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace response headers. An empty value sends an **empty header**, not a deletion — use `delete://resHeaders.x`. `set-cookie` merges instead of replacing; see below. Accumulates across lines. |
 | `resType` | MIME type or short name | Set the response `Content-Type` |
 | `resCharset` | charset | Set the charset on the response `Content-Type` |
 | `resCors` | origin, `*`, `enable`, `{json}` or `k=v&…` | Negotiate the CORS response headers |
@@ -1202,6 +1202,21 @@ cdn.example.com    resType://application/javascript
 example.com/404    replaceStatus://200
 example.com        cache://no
 ```
+
+**`set-cookie` on `resHeaders://` merges, it does not replace** (`setCookies`,
+`_original/lib/inspectors/res.js:89-122`). The rule's cookies go first, then
+every cookie the origin sent whose *name* the rule did not also name — so
+setting `sid` leaves the origin's `csrf` where it was. Two spellings, and they
+differ:
+
+```
+example.com   resHeaders://set-cookie=a=1,b=2            # two cookies: split on the comma
+example.com   resHeaders://{"set-cookie":["a=1,b=2"]}    # one cookie: an array is never split
+```
+
+The array form is the only way to write a cookie whose attributes contain a
+comma, such as an `Expires=Wed, 21 Oct …`. A JSON array is several header lines
+for **any** header, not only this one.
 
 **`resType` / `reqType`** take a short name as well as a full MIME type:
 `resType://json` sets `application/json`, `reqType://form` sets
