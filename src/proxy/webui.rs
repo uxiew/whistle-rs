@@ -379,6 +379,10 @@ async fn rules_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
     let count = {
         let mut mgr = state.rules.write().unwrap();
         mgr.set_text(&text);
+        // Persist, like every *named* group endpoint already does. Without this
+        // the default group — the one the console opens on — was in memory only:
+        // edit, restart, gone, having been told "Saved".
+        crate::rules::storage::save_groups(&rules_dir(state), &mgr);
         mgr.len()
     };
     tracing::info!("rules updated via UI: {count} rules");
@@ -390,6 +394,11 @@ async fn rules_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
 }
 
 // ── Rule group management API ──
+
+/// Where the values store is persisted — the storage root, beside `rules/`.
+fn values_dir(state: &Arc<AppState>) -> std::path::PathBuf {
+    state.config.data_dir().to_path_buf()
+}
 
 fn rules_dir(state: &Arc<AppState>) -> std::path::PathBuf {
     state.config.data_dir().join("rules")
@@ -691,6 +700,7 @@ async fn values_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<
     };
     match serde_json::from_slice::<std::collections::HashMap<String, String>>(&body) {
         Ok(map) => {
+            crate::rules::storage::save_values(&values_dir(state), &map);
             *state.values.write().unwrap() = map;
             Response::builder()
                 .status(StatusCode::OK)

@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let config = Config {
+    let mut config = Config {
         port: cli.port,
         host: cli.host,
         storage_dir,
@@ -183,6 +183,15 @@ async fn main() -> Result<()> {
     // Load any persisted rule groups from disk (added via the UI).
     let rules_dir = config.data_dir().join("rules");
     whistle_rs::rules::storage::load_groups(&rules_dir, &mut manager);
+
+    // Values persisted by the console, with anything named on the command line
+    // laid over them: `--value` is an instruction for this run and wins.
+    let persisted = whistle_rs::rules::storage::load_values(&config.data_dir());
+    if !persisted.is_empty() {
+        let mut merged = persisted;
+        merged.extend(config.values.clone());
+        config.values = merged;
+    }
     tracing::info!("loaded {} rules ({} groups)", manager.len(), manager.groups().len());
 
     let ca = CertAuthority::load_or_create(&config).context("initialising root CA")?;

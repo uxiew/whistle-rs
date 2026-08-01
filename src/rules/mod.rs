@@ -940,6 +940,18 @@ impl RuleManager {
         }
     }
 
+    /// Is the default group empty — i.e. did nothing on the command line or in
+    /// a rules file put anything there?
+    ///
+    /// Read by [`crate::rules::storage::load_groups`] to decide whether a
+    /// persisted default group may be restored over it.
+    pub fn default_is_empty(&self) -> bool {
+        self.groups
+            .iter()
+            .find(|g| g.name == "default")
+            .is_none_or(|g| g.text.trim().is_empty())
+    }
+
     /// Append rules parsed from `text` to the default group.
     pub fn append_text(&mut self, text: &str) {
         if let Some(g) = self.groups.iter_mut().find(|g| g.name == "default") {

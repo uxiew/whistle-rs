@@ -44,6 +44,20 @@ pub fn load_groups(dir: &Path, manager: &mut RuleManager) {
     for meta in &config.groups {
         let file = dir.join(format!("{}.rules", safe_filename(&meta.name)));
         let text = fs::read_to_string(&file).unwrap_or_default();
+        // The default group always exists by the time this runs — the manager is
+        // built with one — so `add_group` refuses it and what the console saved
+        // was silently dropped on the next start. It has to be *set*, not added.
+        //
+        // Unless the command line named rules explicitly: `-r`/`--rule` is an
+        // instruction for this run, and a file on disk from a previous session
+        // must not quietly override it.
+        if meta.name == "default" {
+            if !manager.default_is_empty() {
+                continue;
+            }
+            manager.set_text(&text);
+            continue;
+        }
         manager.add_group(&meta.name, &text, meta.enabled);
     }
 }
@@ -122,5 +136,31 @@ mod tests {
         assert!(mgr2.groups()[1].text.contains("test.local"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Where the named-values store lives on disk.
+fn values_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("values.json")
+}
+
+/// Load the persisted values store, if there is one.
+///
+/// Values were previously **command-line only**: the console's Values pane
+/// wrote to memory and said "Saved", and the next start had none of it. They
+/// are referenced by `{name}` from any operator, so losing them silently breaks
+/// every rule that used one.
+pub fn load_values(dir: &Path) -> std::collections::HashMap<String, String> {
+    fs::read_to_string(values_path(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Write the values store to disk.
+pub fn save_values(dir: &Path, values: &std::collections::HashMap<String, String>) {
+    fs::create_dir_all(dir).ok();
+    if let Ok(json) = serde_json::to_string_pretty(values) {
+        fs::write(values_path(dir), json).ok();
     }
 }
