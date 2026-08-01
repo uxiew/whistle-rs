@@ -81,6 +81,19 @@
       内联回单页 —— 仍是**一个请求就能打开**（控制台必须在它所检查的网络不通时也能加载）。
       表格新增 Up/Down 两列，取值是 body 字节数：头部字节本移植不在链路上计数，
       与其混入一个估计值，不如让这一列只报它真正量到的部分。
+- [x] ~~规则编辑器是纯文本框，看不出一行会被怎么解析~~ → 已加 CodeMirror（MIT，
+      vendored 到 `src/proxy/ui/vendor/`）与一个 **whistle 专用 mode**。
+      通用高亮对 whistle 没用 —— 它的行语法是**按位置**的，而位置从行本身看不出来：
+      `example.com http://localhost:5173` 是 pattern + 目标，`http://a.com/x host://1.2.3.4`
+      也是 pattern + 算子，但那里的 pattern 恰恰是**长得像算子取值**的那个 token。
+      写反是「规则静默不生效」最常见的成因，所以编辑器直接把答案画出来：被标成 pattern 的
+      就是代理会拿去匹配的。mode 跑的是解析器同一套 `index_of_pattern`，
+      并有测试（`proxy::webui::tests`，用本移植自带的 JS 引擎跑 mode）把两者钉住 ——
+      高亮器与解析器不一致，比没有高亮更糟。
+- [x] ~~控制台看不到运行时状态~~ → 新增 `GET /api/status` 与 Status 面板：端口、SOCKS、
+      是否拦截 HTTPS、**是否关闭了源站证书校验**、根证书路径、抓包与帧计数、规则数、
+      以及每个插件声明的钩子（从未应答过的远端插件没有 manifest，面板照实显示 ——
+      那正说明代理从未连上它）。这些此前只在启动日志里出现，而有疑问时日志早已滚走。
 - [x] ~~`lineProps://originUrl` 无物可接~~ → 已接线（拼接实现之后它才有意义）。
       域名型 pattern 命中时把拼过去的路径强制为 `/`，见 [`LINE_PROPS.md`](LINE_PROPS.md)。
 - [x] ~~PAC 辅助函数测试依赖外部 DNS~~ → 已修。`dnsResolve('no-such-host.invalid') === null`

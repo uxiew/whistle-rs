@@ -39,6 +39,8 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks |
 | `src/proxy/webui.rs` | `biz/webui` | The console's routes + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
 | `src/proxy/ui/` | `biz/webui/htdocs` | The console itself — `index.html` + `app.css` + `app.js`, inlined by `include_str!` |
+| `src/proxy/ui/mode-whistle.js` | — | A CodeMirror mode for rules; shares `index_of_pattern` with the parser, and a test holds the two together |
+| `src/proxy/ui/vendor/` | — | CodeMirror 5, vendored verbatim (MIT; see `LICENSE-CodeMirror`) |
 | `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
 | `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`, `upper`, `ws-upper`, `gate`, `no-mitm`) |
 | `src/plugins/pipe.rs` | `lib/util/transproto.js` | Streaming body transport (`pipe://`), chunked HTTP rather than upstream's framing |
@@ -338,7 +340,9 @@ whistle-rs/
         ├── script.rs      # JS engine (resScript/frameScript/pac)
         ├── ws.rs          # WebSocket frame codec + capturing tunnel (frameScript, frame hooks)
         ├── webui.rs       # console routes + API
-        ├── ui/            # index.html + app.css + app.js (inlined at compile time)
+        ├── ui/            # console assets, inlined at compile time
+        │   ├── mode-whistle.js   # rules syntax mode (agrees with the parser, by test)
+        │   └── vendor/           # CodeMirror 5 (MIT)
         └── body.rs
 ```
 
