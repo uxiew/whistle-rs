@@ -106,6 +106,32 @@ pub fn save_meta(dir: &Path, manager: &RuleManager) {
     }
 }
 
+/// Where the named-values store lives on disk.
+fn values_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("values.json")
+}
+
+/// Load the persisted values store, if there is one.
+///
+/// Values were previously **command-line only**: the console's Values pane
+/// wrote to memory and said "Saved", and the next start had none of it. They
+/// are referenced by `{name}` from any operator, so losing them silently breaks
+/// every rule that used one.
+pub fn load_values(dir: &Path) -> std::collections::HashMap<String, String> {
+    fs::read_to_string(values_path(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Write the values store to disk.
+pub fn save_values(dir: &Path, values: &std::collections::HashMap<String, String>) {
+    fs::create_dir_all(dir).ok();
+    if let Ok(json) = serde_json::to_string_pretty(values) {
+        fs::write(values_path(dir), json).ok();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,31 +162,5 @@ mod tests {
         assert!(mgr2.groups()[1].text.contains("test.local"));
 
         let _ = fs::remove_dir_all(&dir);
-    }
-}
-
-/// Where the named-values store lives on disk.
-fn values_path(dir: &Path) -> std::path::PathBuf {
-    dir.join("values.json")
-}
-
-/// Load the persisted values store, if there is one.
-///
-/// Values were previously **command-line only**: the console's Values pane
-/// wrote to memory and said "Saved", and the next start had none of it. They
-/// are referenced by `{name}` from any operator, so losing them silently breaks
-/// every rule that used one.
-pub fn load_values(dir: &Path) -> std::collections::HashMap<String, String> {
-    fs::read_to_string(values_path(dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// Write the values store to disk.
-pub fn save_values(dir: &Path, values: &std::collections::HashMap<String, String>) {
-    fs::create_dir_all(dir).ok();
-    if let Ok(json) = serde_json::to_string_pretty(values) {
-        fs::write(values_path(dir), json).ok();
     }
 }

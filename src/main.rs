@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
 
     // Values persisted by the console, with anything named on the command line
     // laid over them: `--value` is an instruction for this run and wins.
-    let persisted = whistle_rs::rules::storage::load_values(&config.data_dir());
+    let persisted = whistle_rs::rules::storage::load_values(config.data_dir());
     if !persisted.is_empty() {
         let mut merged = persisted;
         merged.extend(config.values.clone());
