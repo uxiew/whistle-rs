@@ -97,10 +97,25 @@ pub fn build_res_info(
 /// (whistle's Values store references).
 pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, String>) {
     fn sub(value: &mut String, values: &HashMap<String, String>) {
+        // The whole value is a reference: it is replaced by the content, which
+        // is how a mock body or a rules text gets in.
         if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
             && let Some(content) = values.get(name)
         {
             *value = content.clone();
+            return;
+        }
+        // `${name}` anywhere *inside* a value, which is the other half of
+        // `resolveVar` (`VAR_RE = /\${([^{}]+)}/g`,
+        // `_original/lib/rules/rules.js:39,:774-783`) and the half this port did
+        // not have. `resHeaders://x-v=${myval}` used to reach the origin with
+        // the six literal characters `${myval}` in it.
+        //
+        // A name with no value is left as written — upstream returns the whole
+        // match from its replacer when the lookup misses — so a typo shows up
+        // as itself rather than as an empty string.
+        if value.contains("${") {
+            *value = substitute_braced(value, |name| values.get(name).cloned());
         }
     }
     for op in resolved.single.values_mut() {
@@ -111,6 +126,39 @@ pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, Strin
             sub(&mut op.value, values);
         }
     }
+}
+
+/// Replace every `${name}` in `text` with whatever `lookup` returns for it,
+/// leaving a name it does not know exactly as written.
+///
+/// Upstream's `VAR_RE` is `/\${([^{}]+)}/g` — a name may not itself contain
+/// braces, which is what stops `${a${b}}` from being read as one reference.
+fn substitute_braced(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("${") {
+        let (before, from) = rest.split_at(at);
+        out.push_str(before);
+        let body = &from[2..];
+        match body.find(['{', '}']) {
+            // A closing brace with no opening one between: a complete reference.
+            Some(end) if body.as_bytes()[end] == b'}' && end > 0 => {
+                match lookup(&body[..end]) {
+                    Some(v) => out.push_str(&v),
+                    None => out.push_str(&from[..end + 3]),
+                }
+                rest = &body[end + 1..];
+            }
+            // Unterminated, empty, or nested — not a reference. Emit the `${`
+            // and carry on, so the scan cannot loop.
+            _ => {
+                out.push_str("${");
+                rest = body;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Substitute whistle config variables `${port}` / `${version}` (case-insensitive)
@@ -6207,6 +6255,54 @@ mod tests {
         assert_eq!(headers.get("x-src").map(|v| v.to_str().unwrap()), Some("inc"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `${name}` inside an operator's value reads the values store. This port
+    /// only ever replaced a value that *was* exactly `{name}`, so
+    /// `resHeaders://x-v=${myval}` reached the origin with the eight literal
+    /// characters in it — silently, which is the worst way for a value
+    /// reference to fail.
+    #[test]
+    fn a_braced_reference_reads_the_values_store() {
+        let values: HashMap<String, String> = [
+            ("myval".to_string(), "hello".to_string()),
+            ("host".to_string(), "10.0.0.9".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let of = |text: &str, proto: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info =
+                build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            let mut resolved = mgr.resolve(&info);
+            substitute_values(&mut resolved, &values);
+            resolved.value(proto).map(str::to_string)
+        };
+
+        // Inside a value, with text around it.
+        assert_eq!(
+            of("a.com resHeaders://x-v=${myval}\n", "resHeaders").as_deref(),
+            Some("x-v=hello")
+        );
+        // More than one, and one of them repeated.
+        assert_eq!(
+            of("a.com resHeaders://a=${myval}&b=${host}&c=${myval}\n", "resHeaders").as_deref(),
+            Some("a=hello&b=10.0.0.9&c=hello")
+        );
+        // The whole-value form still replaces with the content itself.
+        assert_eq!(of("a.com resBody://{myval}\n", "resBody").as_deref(), Some("hello"));
+        // A name with no value is left as written, so a typo shows as itself
+        // rather than as an empty string.
+        assert_eq!(
+            of("a.com resHeaders://x=${nope}\n", "resHeaders").as_deref(),
+            Some("x=${nope}")
+        );
+        // Shapes that are not references are not touched, and do not hang.
+        for text in ["x=$notabrace", "x=${", "x=${}", "x=${a${b}}", "x=}{"] {
+            let line = format!("a.com resHeaders://{text}\n");
+            assert_eq!(of(&line, "resHeaders").as_deref(), Some(text), "{text}");
+        }
     }
 
     #[test]
