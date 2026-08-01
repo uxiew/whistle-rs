@@ -1679,6 +1679,7 @@ async fn finish_local_response(
         // response rarely arrives encoded, but `enable://gzip` can still ask for
         // one on the way out, and a plugin is free to send `Content-Encoding`.
         let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
+        let restore = decoded.restore;
         let mut new = apply::transform_res_body(decoded.body, resolved, res_ct.as_deref());
 
         // Response hook, part 2: plugins that asked for the body. It sits
@@ -1709,7 +1710,7 @@ async fn finish_local_response(
         }
         let new = inject_res_body(state, &mut parts, new, &ops, info);
         let (new, encoded_as) =
-            coding::reencode(new, decoded.restore, apply::forced_encoding(resolved));
+            coding::reencode(new, restore, apply::forced_encoding(resolved));
         coding::set_content_encoding(&mut parts.headers, encoded_as);
         (new, encoded_as.header_value().map(str::to_string))
     } else {
@@ -2423,6 +2424,8 @@ async fn serve(
             // and a re-encoder behind (`addZipTransform`,
             // `_original/lib/inspectors/data.js:` and `inspectors/rules.js:60-140`).
             let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
+            let restore = decoded.restore;
+        let restore = decoded.restore;
             let mut new = apply::transform_res_body(decoded.body, &resolved, res_ct.as_deref());
 
             // Response hook, part 2: plugins that asked for the body. It sits
@@ -2457,7 +2460,7 @@ async fn serve(
             // `_original/lib/util/index.js:1534-1548`) — the only case where the
             // body leaves compressed that arrived plain.
             let (new, encoded_as) =
-                coding::reencode(new, decoded.restore, apply::forced_encoding(&resolved));
+                coding::reencode(new, restore, apply::forced_encoding(&resolved));
             coding::set_content_encoding(&mut parts.headers, encoded_as);
             if !new.is_empty() {
                 res_body_cap = Some(Capture::from_bytes(

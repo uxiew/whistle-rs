@@ -168,9 +168,23 @@ pub fn encode(coding: Coding, body: &[u8]) -> Option<Vec<u8>> {
 pub struct Decoded {
     /// The bytes an operator should see — plain text when the body was decoded.
     pub body: Bytes,
-    /// The coding to restore on the way out. [`Coding::Identity`] when nothing
-    /// was undone, including when a decode was attempted and failed.
-    pub restore: Coding,
+    /// What to put back on the way out.
+    pub restore: Restore,
+}
+
+/// What [`reencode`] needs to know about where a body came from.
+///
+/// The two fields exist separately because the coding alone cannot answer the
+/// question that matters. `Identity` means *both* "the body arrived
+/// uncompressed" and "we could not decompress it, so here it is as it came" —
+/// and those must not be confused on the way out, because re-encoding bytes
+/// that were never decoded produces a body compressed twice and labelled once.
+#[derive(Debug, Clone, Copy)]
+pub struct Restore {
+    /// The coding to put back, or [`Coding::Identity`] for none.
+    pub coding: Coding,
+    /// Are the bytes actually in the clear?
+    pub plain: bool,
 }
 
 /// Decompress `body` for rewriting, if it is compressed under a coding we can
@@ -186,13 +200,20 @@ pub fn decode_for_rewrite(body: Bytes, encoding: Option<&str>) -> Decoded {
     if !coding.needs_decoding() {
         return Decoded {
             body,
-            restore: Coding::Identity,
+            restore: Restore {
+                coding: Coding::Identity,
+                // Identity really is plain; a coding we cannot round-trip is not.
+                plain: coding == Coding::Identity,
+            },
         };
     }
     match decode(coding, &body) {
         Some(plain) => Decoded {
             body: Bytes::from(plain),
-            restore: coding,
+            restore: Restore {
+                coding,
+                plain: true,
+            },
         },
         None => {
             tracing::warn!(
@@ -203,7 +224,10 @@ pub fn decode_for_rewrite(body: Bytes, encoding: Option<&str>) -> Decoded {
             );
             Decoded {
                 body,
-                restore: Coding::Identity,
+                restore: Restore {
+                    coding: Coding::Identity,
+                    plain: false,
+                },
             }
         }
     }
@@ -220,8 +244,29 @@ pub fn decode_for_rewrite(body: Bytes, encoding: Option<&str>) -> Decoded {
 /// A compressor that fails leaves the body plain rather than failing the
 /// response, and the returned coding then says identity — so the header always
 /// describes the bytes that actually go out.
-pub fn reencode(body: Bytes, restore: Coding, forced: Option<Coding>) -> (Bytes, Coding) {
-    let want = forced.unwrap_or(restore);
+pub fn reencode(body: Bytes, restore: Restore, forced: Option<Coding>) -> (Bytes, Coding) {
+    // A forced coding may only be applied to bytes we actually hold in the
+    // clear. When the body arrived under a coding this proxy cannot undo —
+    // `zstd`, a stacked `gzip, br`, a corrupt stream — it is still compressed,
+    // and compressing it again while labelling the result `gzip` hands the
+    // client something no client can read: it inflates once and finds the
+    // original coding underneath.
+    //
+    // So the request is refused rather than half-honoured. The body goes out as
+    // it arrived, under the coding it arrived with, which is the same thing that
+    // happens to a body operator on such a response — see `decode_for_rewrite`.
+    let forced = match restore.plain {
+        true => forced,
+        false => {
+            if forced.is_some() {
+                tracing::warn!(
+                    "enable:// asked for a coding on a body that could not be decoded;                      leaving it as it arrived"
+                );
+            }
+            None
+        }
+    };
+    let want = forced.unwrap_or(restore.coding);
     if !want.needs_decoding() || body.is_empty() {
         // An empty body is left empty: gzipping nothing produces a 20-byte
         // header that says "nothing", which is worse than saying nothing.
@@ -298,12 +343,13 @@ mod tests {
     fn a_compressed_body_is_handed_over_as_text() {
         let d = decode_for_rewrite(Bytes::from(gzip(b"ORIGINAL")), Some("gzip"));
         assert_eq!(&d.body[..], b"ORIGINAL");
-        assert_eq!(d.restore, Coding::Gzip);
+        assert_eq!(d.restore.coding, Coding::Gzip);
+        assert!(d.restore.plain);
 
         // An identity body is not copied or changed, and needs no restoring.
         let d = decode_for_rewrite(Bytes::from_static(b"plain"), None);
         assert_eq!(&d.body[..], b"plain");
-        assert_eq!(d.restore, Coding::Identity);
+        assert_eq!(d.restore.coding, Coding::Identity);
     }
 
     /// A body that lies about its encoding must not break the response: the
@@ -313,7 +359,7 @@ mod tests {
         let d = decode_for_rewrite(Bytes::from_static(b"not actually gzip"), Some("gzip"));
         assert_eq!(&d.body[..], b"not actually gzip");
         assert_eq!(
-            d.restore,
+            d.restore.coding,
             Coding::Identity,
             "nothing was undone, so nothing may be redone"
         );
@@ -327,27 +373,27 @@ mod tests {
     #[test]
     fn reencode_restores_or_forces_a_coding() {
         // Restore the coding a body arrived under.
-        let (out, c) = reencode(Bytes::from_static(b"hello"), Coding::Gzip, None);
+        let (out, c) = reencode(Bytes::from_static(b"hello"), Restore { coding: Coding::Gzip, plain: true }, None);
         assert_eq!(c, Coding::Gzip);
         assert_eq!(decode(Coding::Gzip, &out).as_deref(), Some(&b"hello"[..]));
 
         // A forced coding wins over the arrived one (`enable://br` on a gzip body).
-        let (out, c) = reencode(Bytes::from_static(b"hello"), Coding::Gzip, Some(Coding::Brotli));
+        let (out, c) = reencode(Bytes::from_static(b"hello"), Restore { coding: Coding::Gzip, plain: true }, Some(Coding::Brotli));
         assert_eq!(c, Coding::Brotli);
         assert_eq!(decode(Coding::Brotli, &out).as_deref(), Some(&b"hello"[..]));
 
         // A body that arrived plain and stays plain is untouched.
-        let (out, c) = reencode(Bytes::from_static(b"hello"), Coding::Identity, None);
+        let (out, c) = reencode(Bytes::from_static(b"hello"), Restore { coding: Coding::Identity, plain: true }, None);
         assert_eq!(c, Coding::Identity);
         assert_eq!(&out[..], b"hello");
 
         // `enable://gzip` compresses a body that arrived plain.
-        let (out, c) = reencode(Bytes::from_static(b"hello"), Coding::Identity, Some(Coding::Gzip));
+        let (out, c) = reencode(Bytes::from_static(b"hello"), Restore { coding: Coding::Identity, plain: true }, Some(Coding::Gzip));
         assert_eq!(c, Coding::Gzip);
         assert_eq!(decode(Coding::Gzip, &out).as_deref(), Some(&b"hello"[..]));
 
         // An empty body is never compressed — the header would outweigh it.
-        let (out, c) = reencode(Bytes::new(), Coding::Gzip, None);
+        let (out, c) = reencode(Bytes::new(), Restore { coding: Coding::Gzip, plain: true }, None);
         assert_eq!(c, Coding::Identity);
         assert!(out.is_empty());
     }
@@ -377,5 +423,36 @@ mod tests {
             decode(Coding::Deflate, &raw).as_deref(),
             Some(&b"raw deflate body"[..])
         );
+    }
+
+    /// `enable://gzip` may not compress bytes the proxy never decompressed.
+    ///
+    /// `restore == Identity` means two different things — "arrived plain" and
+    /// "arrived under a coding we cannot undo, here it is as it came" — and
+    /// conflating them hands the client a body compressed twice and labelled
+    /// once: it inflates one layer and finds the original coding underneath.
+    #[test]
+    fn a_forced_coding_is_refused_on_a_body_that_was_never_decoded() {
+        let payload = Bytes::from_static(b"a body that is not really plain");
+
+        // Arrived under a coding we cannot round-trip: the force is refused and
+        // the bytes go out exactly as they came.
+        let opaque = Restore { coding: Coding::Identity, plain: false };
+        let (out, c) = reencode(payload.clone(), opaque, Some(Coding::Gzip));
+        assert_eq!(out, payload, "an undecodable body must not be re-encoded");
+        assert_eq!(c, Coding::Identity, "and must not be labelled as encoded");
+
+        // Genuinely plain: the force is honoured, which is the whole point of
+        // the flag.
+        let plain = Restore { coding: Coding::Identity, plain: true };
+        let (out, c) = reencode(payload.clone(), plain, Some(Coding::Gzip));
+        assert_eq!(c, Coding::Gzip);
+        assert_eq!(decode(Coding::Gzip, &out).as_deref(), Some(&payload[..]));
+
+        // And `decode_for_rewrite` reports the distinction in the first place.
+        assert!(!decode_for_rewrite(payload.clone(), Some("zstd")).restore.plain);
+        assert!(decode_for_rewrite(payload.clone(), None).restore.plain);
+        // A gzip header that does not decode is not plain either.
+        assert!(!decode_for_rewrite(payload, Some("gzip")).restore.plain);
     }
 }
