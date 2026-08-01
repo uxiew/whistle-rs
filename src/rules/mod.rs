@@ -1461,6 +1461,18 @@ fn is_filter_token(tok: &str) -> bool {
 /// drops those too (`resolveMatchFilter`, `_original/lib/rules/rules.js:1556`).
 fn parse_filter(tok: &str) -> Option<Filter> {
     let (proto, spec) = split_protocol(tok)?;
+    // A condition may be written inside brackets, which whistle strips before
+    // parsing (`INLINE_RE`, `_original/lib/rules/rules.js:62,:1549-1551`). The
+    // form exists so a condition containing characters that would otherwise end
+    // the token can be written at all. Unstripped, the payload fell through to
+    // the URL-pattern branch and could never hold, so an `includeFilter://(m:GET)`
+    // meant the rule never applied — silently.
+    let spec = match (spec.starts_with('(') && spec.ends_with(')'))
+        || (spec.starts_with('<') && spec.ends_with('>'))
+    {
+        true if spec.len() > 1 => &spec[1..spec.len() - 1],
+        _ => spec,
+    };
     let exclude = filter_excludes(proto)?;
     // `.`/`=` separated conditions are an includeFilter/excludeFilter-only form.
     let pure_ok = proto != "filter";
@@ -3055,6 +3067,30 @@ mod parse_text_tests {
         );
         // And it no longer matches an unrelated host that merely contains the path.
         assert_eq!(file_for(LINE, "http://cdn.test/Users/me/pic.png"), None);
+    }
+
+    /// A condition may be written inside brackets — the form that lets one
+    /// contain characters which would otherwise end the token. Unstripped, the
+    /// payload fell through to the URL-pattern branch and could never hold, so
+    /// the rule silently never applied.
+    #[test]
+    fn a_bracketed_filter_condition_is_unwrapped() {
+        let host_of = |text: &str, url: &str| {
+            let mut m = RuleManager::new();
+            m.set_text(text);
+            m.resolve(&req(url)).value("host").map(str::to_string)
+        };
+        // `(…)` and `<…>` both wrap.
+        for line in [
+            "example.com host://1.1.1.1 includeFilter://(m:GET)",
+            "example.com host://1.1.1.1 includeFilter://<m:GET>",
+        ] {
+            assert_eq!(host_of(line, "http://example.com/x").as_deref(), Some("1.1.1.1"), "{line}");
+        }
+        // The condition is still a condition — a GET filter excludes a POST.
+        let mut m = RuleManager::new();
+        m.set_text("example.com host://1.1.1.1 includeFilter://(m:POST)");
+        assert!(m.resolve(&req("http://example.com/x")).value("host").is_none());
     }
 
     /// `whistle.<name>://` and `plugin.<name>://` name a plugin. It is how every
