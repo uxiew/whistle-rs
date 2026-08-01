@@ -37,7 +37,8 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
 | `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
 | `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks |
-| `src/proxy/webui.rs` | `biz/webui` | Built-in web UI + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
+| `src/proxy/webui.rs` | `biz/webui` | The console's routes + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
+| `src/proxy/ui/` | `biz/webui/htdocs` | The console itself — `index.html` + `app.css` + `app.js`, inlined by `include_str!` |
 | `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
 | `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`, `upper`, `ws-upper`, `gate`, `no-mitm`) |
 | `src/plugins/pipe.rs` | `lib/util/transproto.js` | Streaming body transport (`pipe://`), chunked HTTP rather than upstream's framing |
@@ -336,7 +337,8 @@ whistle-rs/
         ├── socks.rs       # inbound SOCKS5 server
         ├── script.rs      # JS engine (resScript/frameScript/pac)
         ├── ws.rs          # WebSocket frame codec + capturing tunnel (frameScript, frame hooks)
-        ├── webui.rs       # built-in web UI + API
+        ├── webui.rs       # console routes + API
+        ├── ui/            # index.html + app.css + app.js (inlined at compile time)
         └── body.rs
 ```
 
@@ -349,4 +351,5 @@ whistle-rs/
 | write a plugin | [`PLUGINS.md`](PLUGINS.md), then `sdk/whistle-rs-plugin.d.ts` |
 | add a plugin hook | `src/plugins/mod.rs` (manifest + trait), then the call site — but check first whether the existing dispatch already suffices, as `auth` did |
 | touch the request pipeline | `serve()` in `src/proxy/mod.rs` — the one place every request flows through |
-| add a UI page or endpoint | the route match at the top of `src/proxy/webui.rs` |
+| add an endpoint | the route match at the top of `src/proxy/webui.rs` |
+| change the console | `src/proxy/ui/` — plain HTML/CSS/JS, no build step |

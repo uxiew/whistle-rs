@@ -47,15 +47,17 @@ CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
   User-Agent、方法、Content-Type、CORS、鉴权、延迟、状态码替换、重定向、本地文件服务。
 - **流量检查** —— 每条事务记录请求/响应头与有界的 Body 预览（通过流式 tee 抓取，
   因此分块 / SSE 响应也可查看且不破坏流式传输；`gzip`/`deflate`/`br` 压缩体会被解码后
-  预览）。可在界面展开/过滤，或访问 `/sessions.json`、`/session.json?id=`，也可导出为
+  预览）。可在控制台里过滤/排序，或访问 `/sessions.json`、`/session.json?id=`，也可导出为
   HAR 文件（`/sessions.har`）。
-- **Web 界面** —— 自包含单页（浏览器直接访问代理地址即可打开），含实时网络视图、
-  可编辑的规则面板与 Values 面板；规则改动即时生效。
+- **控制台** —— 自包含单页（浏览器直接访问代理地址即可打开）：左侧来源列表、上方可排序的
+  请求表格、下方详情面板（General / 请求头 / 响应头 / 请求体 / 响应体 / WebSocket 帧）。
+  规则分组与 Values 在同一套外壳里编辑，规则改动即时生效。
 - **流量持久化** —— 捕获的请求/响应以 JSONL 格式写入磁盘，每日自动轮转；重启后自动恢复
   历史流量。通过 `--no-persist` 关闭，`--persist-days` 控制保留天数。
-- **请求重放** —— 通过 `POST /api/replay` 或界面 ↻ 按钮重发已捕获的请求，走完整规则管线。
-- **规则分组** —— 在 UI 中管理多个命名规则集，每组可独立启用/禁用。分组持久化到
-  `storage_dir/rules/`。
+- **请求重放** —— 通过 `POST /api/replay` 或控制台的 Replay 按钮重发已捕获的请求，
+  走完整规则管线。
+- **规则分组** —— 多个命名规则集与默认组并列显示在控制台的来源列表里，每组可独立
+  启用/禁用（双击切换）。分组持久化到 `storage_dir/rules/`。
 - **单一静态二进制**，构建无需 C 工具链（固定使用 `ring` TLS provider）。
 
 ## 安装与构建
@@ -205,9 +207,10 @@ $example.com          host://2.2.2.2
   `skip`、`tlsOptions`、`pathReplace`、`reqMerge` 等），均归一化到规范名。
   完整映射见 [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage)。
 - 流量检查：逐事务的请求/响应头 + Body 预览
-- Web 界面：实时网络视图（过滤/搜索、可展开查看头 + 解码后的 Body 预览、逐连接的
-  WebSocket 帧）+ 可编辑的规则与 Values；`/sessions.json`、`/session.json?id=`、
-  `/frames.json`、`/sessions.har`（HAR 导出）、`/proxy.pac`
+- 三栏控制台：请求按客户端分组、表格可按任意列排序与过滤，详情面板含头、解码后的
+  Body 预览与逐连接的 WebSocket 帧；规则分组与 Values 在同一外壳内编辑。
+  `/sessions.json`、`/session.json?id=`、`/frames.json`、`/sessions.har`（HAR 导出）、
+  `/proxy.pac`
 - `@`-includes（从 URL/文件引入规则）与 `${port}`/`${version}` 配置变量
 
 仅剩 **2** 个算子未实现 —— `G`（全局规则标记）与 `style`（界面里的规则颜色）——
@@ -226,7 +229,7 @@ $example.com          host://2.2.2.2
 理由见[路线图的 Non-goals](docs/ROADMAP.md)。
 
 **相对原版的其他简化**（可用，但非逐字节移植）：whistle 的 React web UI（`biz/`）由一个
-轻量内建 UI 替代；weinre 仅做脚本注入（inspector 服务在外部）；流量抓取（含头、Body 与
+轻量内建控制台替代；weinre 仅做脚本注入（inspector 服务在外部）；流量抓取（含头、Body 与
 WebSocket 帧）保留在内存的环形缓冲中，可选落盘（`--no-persist` 关闭），Body 预览上限
 默认 16 KB（`--body-preview-limit` 可调），gzip/deflate/brotli 会为查看而解码。
 

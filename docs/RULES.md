@@ -776,7 +776,7 @@ are real answers rather than filters that fail closed.
 |---|---|
 | `tunnel` | the request came out of a tunnel this proxy intercepted — a `CONNECT`, or a SOCKS connection |
 | `sni` | the intercepted TLS handshake named a server. A tunnel carrying plain HTTP is `tunnel` without being `sni` |
-| `composer` | the built-in Web UI replayed the request (the ↻ button / `POST /api/replay`) |
+| `composer` | the built-in console replayed the request (the Replay button / `POST /api/replay`) |
 | `test`, `httpserver`, `httpsserver`, `httpsport` | never, here — see below |
 
 ```
@@ -1021,7 +1021,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 | `pipe` | plugin name | Route through a registered server (like `plugin`) |
 
 `{name}` anywhere in an operator value is replaced with the content of the named value
-(from `--value name=…` or the web UI's Values panel).
+(from `--value name=…` or the console's Values pane).
 
 `disable://` takes one or more flags, `|`-separated. They strip something from
 the request on its way out, or from the response on its way back:
@@ -1564,7 +1564,8 @@ string, then `${var}` runtime variables. See
 
 WebSocket frames are captured too: every intercepted `ws://`/`wss://` connection is
 recorded as a session (status `101`) and each frame (both directions) is surfaced —
-click the connection in the Network view, or fetch `/frames.json?id=<session>`.
+select the connection in the console and open its Frames tab, or fetch
+`/frames.json?id=<session>`.
 
 `enable://ignoreSend` and `enable://ignoreReceive` silence one direction of such a
 session: the frames are still **captured and flagged**, they are simply never
@@ -1621,7 +1622,7 @@ fragment is also treated as a comment, so `example.com/a#b file:///x` loses the
 | Operator(s) | Why / note |
 |-------------|-----------|
 | `G` | Global-rule marker (a rule-precedence concept, not a per-request traffic effect) |
-| `style` | Rule colour in whistle's rule list — the built-in UI is a plain editor with no per-rule rendering |
+| `style` | Rule colour in whistle's rule list — the console's rule editor is plain text with no per-rule rendering |
 
 ### Simplified vs. upstream
 
