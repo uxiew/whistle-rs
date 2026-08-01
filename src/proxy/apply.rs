@@ -1333,6 +1333,9 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     );
     apply_deletes(&mut parts.headers, &del, true);
     apply_header_replace(&mut parts.headers, resolved, HeaderScope::Request);
+    // Before the `disable://` pass, which is where upstream runs it
+    // (`_original/lib/inspectors/req.js:579-580`).
+    remove_unsupported_encodings(&mut parts.headers);
     // Last, so a `disable://` flag has the final say over what leaves here —
     // including over a `reqHeaders://cookie=…` that set what it strips, which is
     // upstream's order too (`disableReqProps` runs after `handleReq`,
@@ -2063,6 +2066,47 @@ fn disable_req_props(headers: &mut HeaderMap, resolved: &Resolved) {
     // (`res.js:268-270`).
     if off("keepAlive") || off("keepalive") {
         set_header(headers, "connection", "close");
+    }
+}
+
+/// Narrow `Accept-Encoding` to the codings this proxy can undo *and* redo
+/// (`removeUnsupportsHeaders`, `_original/lib/util/index.js:1549-1570`), which
+/// upstream runs on every request (`req.js:579`).
+///
+/// Without it a modern browser asks for `gzip, deflate, br, zstd`, the origin
+/// picks zstd, and every body operator silently dies: [`coding::Coding`] cannot
+/// round-trip zstd, so the body is passed through untouched and the rule looks
+/// like it never matched. That is the whole reason whistle narrows the header
+/// rather than trusting the origin to be conservative.
+///
+/// `deflate` is dropped even though this port can decode it, because upstream
+/// drops it too — `removeUnsupportsHeaders` only keeps `deflate` when its
+/// caller passes `supportsDeflate`, and `req.js:579` does not. Keeping it would
+/// invite the raw-vs-zlib deflate ambiguity back for no gain, since any origin
+/// that speaks deflate also speaks gzip.
+fn remove_unsupported_encodings(headers: &mut HeaderMap) {
+    let Some(value) = headers
+        .get(hyper::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return;
+    };
+    let kept = value
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        // The comparison is against the whole token, so a `q` parameter takes
+        // the coding down with it — `gzip;q=1.0` is not `gzip`. Upstream's, and
+        // it is why whistle's own requests carry a bare `gzip, br`.
+        .filter(|token| token == "gzip" || token == "br")
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A request that asked for *nothing* this proxy can undo keeps the header
+    // it arrived with: upstream only assigns when the filtered list is
+    // non-empty (`util/index.js:1567-1569`). An origin may still answer with a
+    // coding no operator can see through — but that is the client's own header,
+    // untouched, rather than one this proxy invented.
+    if !kept.is_empty() {
+        set_header(headers, "accept-encoding", &kept);
     }
 }
 
@@ -8103,6 +8147,59 @@ mod tests {
         let mut parts = req_parts(&[]);
         apply_request(&mut parts, &none);
         assert!(parts.headers.get("connection").is_none());
+    }
+
+    /// Every request's `Accept-Encoding` is narrowed to what this proxy can
+    /// round-trip (`removeUnsupportsHeaders`,
+    /// `_original/lib/util/index.js:1549-1570`, run at `req.js:579`).
+    ///
+    /// This was missing entirely, and it is the quiet reason a body operator
+    /// "stops working" on a modern browser: Chrome asks for
+    /// `gzip, deflate, br, zstd`, the origin answers zstd, `coding.rs` cannot
+    /// undo it, and `resReplace://` searches a compressed stream for its
+    /// pattern, finds nothing, and reports nothing.
+    #[test]
+    fn accept_encoding_is_narrowed_to_what_can_be_round_tripped() {
+        let sent = |arrived: &str| {
+            let resolved = resolve("example.com host://1.1.1.1\n", "http://example.com/");
+            let mut parts = req_parts(&[("accept-encoding", arrived)]);
+            apply_request(&mut parts, &resolved);
+            parts
+                .headers
+                .get("accept-encoding")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        // What a browser actually sends.
+        assert_eq!(sent("gzip, deflate, br, zstd"), Some("gzip, br".into()));
+        // Order is the client's, not a fixed one, and the separator is `, `.
+        assert_eq!(sent("br,gzip"), Some("br, gzip".into()));
+        assert_eq!(sent("  GZIP , BR  "), Some("gzip, br".into()));
+        // `deflate` goes, though this port could decode it — upstream's caller
+        // does not pass `supportsDeflate`.
+        assert_eq!(sent("deflate"), Some("deflate".into()), "left alone: nothing survived");
+        assert_eq!(sent("gzip, deflate"), Some("gzip".into()));
+        // A `q` parameter takes the coding with it: the comparison is against
+        // the whole token.
+        assert_eq!(sent("gzip;q=1.0, br;q=0.9"), Some("gzip;q=1.0, br;q=0.9".into()));
+        assert_eq!(sent("gzip;q=1.0, br"), Some("br".into()));
+        // Empty tokens are not codings.
+        assert_eq!(sent("gzip,,br"), Some("gzip, br".into()));
+        // A request that asked for nothing keeps its header, whatever it was.
+        assert_eq!(sent("zstd"), Some("zstd".into()));
+        assert_eq!(sent("identity"), Some("identity".into()));
+        // No header, nothing to narrow.
+        let resolved = resolve("example.com host://1.1.1.1\n", "http://example.com/");
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &resolved);
+        assert!(parts.headers.get("accept-encoding").is_none());
+
+        // `disable://gzip` still wins: it runs after this
+        // (`req.js:579-580`).
+        let off = resolve("example.com disable://gzip\n", "http://example.com/");
+        let mut parts = req_parts(&[("accept-encoding", "gzip, deflate, br, zstd")]);
+        apply_request(&mut parts, &off);
+        assert!(parts.headers.get("accept-encoding").is_none());
     }
 
     /// `disable://cache` strips the conditional headers *and* asks for no cache

@@ -1353,6 +1353,16 @@ rather than a corrupted body. `enable://gzip|br|deflate` forces the *outgoing*
 coding regardless of what arrived (`br` beats `gzip` beats `deflate`), so it can
 compress a body an origin sent in the clear.
 
+Which is why **every** request's `Accept-Encoding` is narrowed on the way out to
+the tokens this proxy can undo *and* redo — `gzip` and `br`
+(`removeUnsupportsHeaders`, `_original/lib/util/index.js:1549-1570`, run at
+`req.js:579`). A browser asks for `gzip, deflate, br, zstd`; left alone, the
+origin picks zstd, nothing here can decode it, and every body operator quietly
+does nothing. The narrowing is upstream's and so are its edges: the comparison
+is against the whole token, so `gzip;q=1.0` is not `gzip` and goes; and a
+request left with **no** acceptable coding keeps the header it arrived with
+rather than being given one it never asked for.
+
 Every operator in this table accumulates: writing the same one on several
 matching lines makes them all contribute, joined per family — see
 [How several lines of one operator combine](#how-several-lines-of-one-operator-combine).
