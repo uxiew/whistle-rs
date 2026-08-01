@@ -1446,12 +1446,35 @@ fn filter_excludes(proto: &str) -> Option<bool> {
     }
 }
 
+/// Does a `filter://` payload name a URL, rather than protocols to suppress?
+///
+/// Upstream's two shapes: ending in `/` or `/i` (`PATTERN_FILTER_RE`), or
+/// starting with one or more `*` followed by `/` (`PATTERN_WILD_FILTER_RE`,
+/// which also allows a leading `!`).
+fn is_url_filter_payload(spec: &str) -> bool {
+    let body = spec.strip_prefix('!').unwrap_or(spec);
+    if body.starts_with('*') {
+        let stars = body.bytes().take_while(|b| *b == b'*').count();
+        return body[stars..].starts_with('/');
+    }
+    body.ends_with('/') || body.ends_with("/i")
+}
+
 /// Is this token a filter condition (as opposed to an operator or a pattern)?
 ///
 /// Used by [`parse_line`] so that a filter whose condition does not parse is
 /// dropped instead of degrading into an operator named `includeFilter`.
 fn is_filter_token(tok: &str) -> bool {
-    split_protocol(tok).is_some_and(|(proto, _)| filter_excludes(proto).is_some())
+    let Some((proto, spec)) = split_protocol(tok) else {
+        return false;
+    };
+    if filter_excludes(proto).is_none() {
+        return false;
+    }
+    // The `filter://` that names protocols is an operator, not a filter — see
+    // [`parse_filter`]. Reporting it as a filter here would drop it, since
+    // `parse_filter` refuses it.
+    !(proto == "filter" && !is_url_filter_payload(spec) && split_cond_name(spec, true).is_none())
 }
 
 /// Parse a `filter://` / `includeFilter://` / `excludeFilter://` token.
@@ -1461,6 +1484,17 @@ fn is_filter_token(tok: &str) -> bool {
 /// drops those too (`resolveMatchFilter`, `_original/lib/rules/rules.js:1556`).
 fn parse_filter(tok: &str) -> Option<Filter> {
     let (proto, spec) = split_protocol(tok)?;
+    // `filter://` is two operators wearing one name. Only a payload that ends
+    // `/` (or `/i`) or begins `*/` is a **URL** filter — `PATTERN_FILTER_RE` and
+    // `PATTERN_WILD_FILTER_RE` (`_original/lib/rules/rules.js:54,:61`). Anything
+    // else that is not a named condition is the *other* `filter://`: an operator
+    // whose value names protocols to suppress, folded into the ignore set
+    // (`resolveFilter`, `rules.js:2188-2196`). This port treated every payload
+    // as a URL filter, so `filter://host` excluded nothing and the `host://` it
+    // was written to suppress went on applying.
+    if proto == "filter" && !is_url_filter_payload(spec) && split_cond_name(spec, true).is_none() {
+        return None;
+    }
     // A condition may be written inside brackets, which whistle strips before
     // parsing (`INLINE_RE`, `_original/lib/rules/rules.js:62,:1549-1551`). The
     // form exists so a condition containing characters that would otherwise end
@@ -1932,6 +1966,13 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
             return op("plugin", &value);
         }
         if protocols::is_protocol(proto) {
+            // A `filter://` that reached this far names protocols to suppress,
+            // and upstream folds its value into the very set `ignore://` builds
+            // (`resolveFilter`, `_original/lib/util/index.js:1945-1955`, called
+            // from `rules.js:2188-2196`). One mechanism, two spellings.
+            if proto == "filter" {
+                return op("ignore", rest);
+            }
             // Normalise alias protocols (e.g. `hosts` → `host`) to canonical names.
             return op(protocols::canonical(proto).unwrap_or(proto), rest);
         }
@@ -3091,6 +3132,37 @@ mod parse_text_tests {
         let mut m = RuleManager::new();
         m.set_text("example.com host://1.1.1.1 includeFilter://(m:POST)");
         assert!(m.resolve(&req("http://example.com/x")).value("host").is_none());
+    }
+
+    /// `filter://` is two operators sharing one name, and this port only knew
+    /// the one. A payload that is not a URL and not a named condition names
+    /// **protocols to suppress**, and upstream folds it into the very set
+    /// `ignore://` builds — so `filter://host` used to suppress nothing and the
+    /// `host://` beside it went on applying.
+    #[test]
+    fn filter_naming_a_protocol_suppresses_it() {
+        let host_of = |text: &str| {
+            let mut m = RuleManager::new();
+            m.set_text(text);
+            m.resolve(&req("http://example.com/x")).value("host").map(str::to_string)
+        };
+        assert_eq!(host_of("example.com host://1.1.1.1 filter://host"), None);
+        assert_eq!(host_of("example.com host://1.1.1.1 filter://ua").as_deref(), Some("1.1.1.1"));
+
+        // A URL payload is still a URL filter — it ends in `/`…
+        assert_eq!(host_of("example.com host://1.1.1.1 filter:///api/"), Some("1.1.1.1".into()));
+        // …and one that matches excludes the rule.
+        let mut m = RuleManager::new();
+        m.set_text("example.com host://1.1.1.1 filter:///x/");
+        assert!(m.resolve(&req("http://example.com/x/y")).value("host").is_none());
+
+        // And a named condition is still a condition. `filter://` excludes, so
+        // a condition that *holds* is what removes the rule.
+        let mut m = RuleManager::new();
+        m.set_text("example.com host://1.1.1.1 filter://m:GET");
+        assert!(m.resolve(&req("http://example.com/x")).value("host").is_none());
+        m.set_text("example.com host://1.1.1.1 filter://m:POST");
+        assert!(m.resolve(&req("http://example.com/x")).value("host").is_some());
     }
 
     /// `whistle.<name>://` and `plugin.<name>://` name a plugin. It is how every
