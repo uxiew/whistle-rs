@@ -492,6 +492,83 @@ impl Capture {
         };
         (st.total, truncated, text)
     }
+
+    /// What a replay can honestly re-send of this body — see [`ReplayBody`].
+    ///
+    /// Deliberately *not* built on [`Capture::snapshot`]: that renders the
+    /// preview for a human, lossily. `from_utf8_lossy` turns any byte that is
+    /// not valid UTF-8 into U+FFFD, and a non-textual content type is replaced
+    /// outright by a `[binary, N bytes]` marker — replaying either would send
+    /// a body the client never sent, under the original's `content-type`. The
+    /// stored bytes are neither: they are the body as decoded, byte for byte,
+    /// up to the preview cap.
+    pub fn replay_body(&self) -> ReplayBody {
+        let st = self.0.lock().unwrap();
+        if matches!(st.decoder, BodyDecoder::Failed) {
+            // The decompressor gave up part-way, so `data` is a prefix of
+            // something that was never the body. Sending it would be a lie the
+            // length header would make look deliberate.
+            return ReplayBody::Undecodable;
+        }
+        if st.data.is_empty() {
+            return ReplayBody::Empty;
+        }
+        let bytes = Bytes::copy_from_slice(&st.data);
+        // Same test as `snapshot`: the preview is short of the body either
+        // because it hit the cap, or because bytes went by uncompressed after
+        // it was full.
+        let complete = st.data.len() < st.cap()
+            && !(matches!(st.decoder, BodyDecoder::Identity) && st.total > st.data.len());
+        match complete {
+            true => ReplayBody::Whole(bytes),
+            false => ReplayBody::Partial { bytes, of: st.total },
+        }
+    }
+}
+
+/// What of a captured request body a replay can re-send.
+///
+/// The capture is a **bounded, decoded** preview, not the bytes that crossed the
+/// wire, so a replay is only ever as faithful as the preview is. Naming the
+/// cases is what lets [`webui`] set the framing headers to match what it
+/// actually sends, and lets the console say so when the two differ — before
+/// this, `do_replay` copied every captured header and sent an empty body, so
+/// replaying a POST re-sent its `content-length: 402` with zero bytes behind it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReplayBody {
+    /// Nothing was captured: the request had no body, or none was recorded.
+    Empty,
+    /// The whole body, decoded. Whatever `content-encoding` it arrived under has
+    /// been undone, so the header must go with it.
+    Whole(Bytes),
+    /// The first bytes of a body that did not fit the preview. `of` is the raw
+    /// (wire) byte count seen — which, for a body that arrived compressed, is
+    /// not the size of what is being sent.
+    Partial { bytes: Bytes, of: usize },
+    /// The capture cannot stand in for the body at all: decoding it failed
+    /// part-way, so it holds a prefix of nothing in particular.
+    Undecodable,
+}
+
+impl ReplayBody {
+    /// The bytes to send, if any.
+    pub fn bytes(&self) -> Option<&Bytes> {
+        match self {
+            ReplayBody::Whole(b) | ReplayBody::Partial { bytes: b, .. } => Some(b),
+            ReplayBody::Empty | ReplayBody::Undecodable => None,
+        }
+    }
+
+    /// A one-word name for the console, so a replay that differs from what was
+    /// captured says which way it differs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ReplayBody::Empty => "empty",
+            ReplayBody::Whole(_) => "whole",
+            ReplayBody::Partial { .. } => "partial",
+            ReplayBody::Undecodable => "undecodable",
+        }
+    }
 }
 
 impl serde::Serialize for Capture {
@@ -647,6 +724,74 @@ mod capture_tests {
         cap.finish();
         let (len, truncated, text) = cap.snapshot();
         assert_eq!((len, truncated, text.as_str()), (10, true, "01234567"));
+    }
+
+    /// A body that fitted the preview replays byte for byte.
+    #[test]
+    fn a_whole_body_replays_whole() {
+        let cap = Capture::from_bytes(b"name=third&tags=a", Some("text/plain".into()), None, 64);
+        assert_eq!(
+            cap.replay_body(),
+            ReplayBody::Whole(Bytes::from_static(b"name=third&tags=a"))
+        );
+    }
+
+    /// A body the preview could not hold replays as its prefix, and says so.
+    /// Sending it as if it were whole is the failure this case exists to
+    /// prevent: a 200 KB upload would be re-sent as its first 16 KB under a
+    /// `content-length` copied from the original, and nothing would say which
+    /// of the two the origin saw.
+    #[test]
+    fn a_capped_body_replays_as_a_prefix_that_admits_it() {
+        let cap = Capture::new(Some("text/plain".into()), None, 8);
+        cap.append(b"0123456789");
+        assert_eq!(
+            cap.replay_body(),
+            ReplayBody::Partial {
+                bytes: Bytes::from_static(b"01234567"),
+                of: 10,
+            }
+        );
+    }
+
+    /// The bytes, not the preview *text*. A JPEG is stored verbatim and shown
+    /// as `[binary, N bytes]`; a replay built on `snapshot` would have posted
+    /// that sentence to the origin under `image/jpeg`.
+    #[test]
+    fn a_binary_body_replays_as_its_bytes_not_as_its_marker() {
+        let raw = [0u8, 159, 146, 150];
+        let cap = Capture::from_bytes(&raw, Some("image/jpeg".into()), None, 64);
+        assert!(cap.snapshot().2.starts_with("[binary"));
+        assert_eq!(cap.replay_body(), ReplayBody::Whole(Bytes::from(raw.to_vec())));
+    }
+
+    /// A compressed body is replayed **decoded** — which is why the replay drops
+    /// `content-encoding` with it (see `webui::replay_request`).
+    #[test]
+    fn a_compressed_body_replays_decoded() {
+        let cap = Capture::new(Some("text/plain".into()), Some("gzip"), BODY_PREVIEW_CAP);
+        cap.append(&gzip(b"deflate me"));
+        cap.finish();
+        assert_eq!(
+            cap.replay_body(),
+            ReplayBody::Whole(Bytes::from_static(b"deflate me"))
+        );
+    }
+
+    /// A decode that failed leaves a prefix of something that was never a body.
+    /// Replaying it would be a fabrication the length header made look
+    /// deliberate, so nothing is sent and the console is told why.
+    #[test]
+    fn a_body_that_would_not_decode_is_not_replayed() {
+        let cap = Capture::new(Some("text/plain".into()), Some("gzip"), BODY_PREVIEW_CAP);
+        cap.append(b"this was never gzip");
+        assert_eq!(cap.replay_body(), ReplayBody::Undecodable);
+        assert_eq!(cap.replay_body().bytes(), None);
+    }
+
+    #[test]
+    fn a_request_without_a_body_replays_without_one() {
+        assert_eq!(Capture::default().replay_body(), ReplayBody::Empty);
     }
 
     #[test]

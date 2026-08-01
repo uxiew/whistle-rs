@@ -11,13 +11,14 @@ import { computed, reactive } from 'vue';
 import { api } from './api';
 import type {
   ProxyStatus,
+  ReplayedSession,
   RuleGroup,
   SessionDetail,
   SessionSummary,
   WsFrame,
 } from './api';
 import { COLUMNS } from './columns';
-import { clientOf } from './format';
+import { clientOf, fmtBytes } from './format';
 
 export type Pane = 'requests' | 'rules' | 'values' | 'status';
 export type DetailTab =
@@ -303,10 +304,33 @@ export async function clearSessions(): Promise<void> {
 export async function replaySelected(): Promise<void> {
   if (state.selected === null) return;
   const id = state.selected;
-  if (!(await reach(() => api.replay(id)))) return;
+  const res = await reach(() => api.replay(id));
+  if (!res) return;
+  flashNote(replayNote(res.sessions?.[0]));
   // The replay is fired off asynchronously by the proxy; give it a moment to
   // come back around through the capture before asking for the list again.
   setTimeout(() => void loadSessions(), 400);
+}
+
+/**
+ * What to say about a replay that went out.
+ *
+ * A replay is rebuilt from the *captured* body — a decoded, capped preview —
+ * so it is not always the request it was made from. Saying so is the point:
+ * a replay that silently dropped 190 KB of a 200 KB upload and came back 200
+ * would be read as proof the endpoint works.
+ */
+function replayNote(r: ReplayedSession | undefined): string {
+  switch (r?.body) {
+    case 'partial':
+      return `Replayed · body cut to ${fmtBytes(r.sent)} of ${fmtBytes(r.captured)}`;
+    case 'undecodable':
+      return 'Replayed without its body · the capture would not decode';
+    case 'whole':
+      return `Replayed with its ${fmtBytes(r.sent)} body`;
+    default:
+      return 'Replayed';
+  }
 }
 
 let noteTimer: number | undefined;

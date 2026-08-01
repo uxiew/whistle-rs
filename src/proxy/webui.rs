@@ -12,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use super::body::{self, DynBody};
-use super::{AppState, Session, WsFrame};
+use super::{AppState, ReplayBody, Session, WsFrame};
 
 /// Route a direct (non-proxied) request to the UI / API.
 pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
@@ -725,6 +725,12 @@ async fn values_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<
 
 /// Replay a captured session by re-sending it through the proxy's own port.
 /// Accepts `{ "id": N }` or `{ "ids": [N, M, ...] }` (batch, max 100).
+///
+/// The batch form has no caller: the console's request table is single-select,
+/// so `store.ts` only ever posts `{ "id": N }`. It is kept because it costs
+/// nothing and because multi-select is the obvious next thing the table grows —
+/// but it is untested by use, and the answer's `sessions` array is per-id
+/// precisely so a batch could report which of its members lost their bodies.
 async fn replay_session(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let body = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
@@ -778,6 +784,25 @@ async fn replay_session(state: &Arc<AppState>, req: Request<Incoming>) -> Respon
 
     let port = state.config.port;
     let replayed = sessions.len();
+    // What each replay will actually carry, decided *here* rather than inside
+    // the spawned task, so the answer can report it. A replay is fire-and-forget
+    // — this is the only moment the caller is still listening.
+    let report: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            let body = replay_body_of(s);
+            serde_json::json!({
+                "id": s.id,
+                "body": body.kind(),
+                // What is being sent, and what was seen. They differ whenever
+                // the preview was capped, and the console says so — a replay
+                // that silently drops 190 KB of a 200 KB upload is worse than
+                // one that refuses to run.
+                "sent": body.bytes().map(|b| b.len()).unwrap_or(0),
+                "captured": s.req_body.as_ref().map(|c| c.total()).unwrap_or(0),
+            })
+        })
+        .collect();
     // Fire-and-forget: spawn tasks that send requests through the proxy.
     for sess in sessions {
         tokio::spawn(async move {
@@ -786,13 +811,76 @@ async fn replay_session(state: &Arc<AppState>, req: Request<Incoming>) -> Respon
             }
         });
     }
-    let body_text = format!("{{\"replayed\":{replayed}}}");
+    let answer = serde_json::json!({ "replayed": replayed, "sessions": report });
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(body::full(Bytes::from(body_text)))
+        .body(body::full(Bytes::from(answer.to_string())))
         .unwrap()
 }
+
+/// What a replay of `sess` can re-send of its request body.
+///
+/// A session with no captured request body replays without one — which is
+/// correct for the GET it usually is, and is *not* the same thing as the old
+/// behaviour of sending nothing for every request alike.
+fn replay_body_of(sess: &Session) -> ReplayBody {
+    sess.req_body
+        .as_ref()
+        .map(|c| c.replay_body())
+        .unwrap_or(ReplayBody::Empty)
+}
+
+/// Rebuild a captured session's request, body and all, ready to be sent back
+/// through the proxy's own port.
+///
+/// Three headers are deliberately **not** copied from the capture, because all
+/// three describe a body that no longer exists:
+///
+/// * `content-length` — the captured value belongs to the body as it arrived.
+///   `do_replay` used to copy it and then send `Empty::new()`, so replaying a
+///   POST announced 402 bytes and sent none; the origin either hung waiting for
+///   them or read the next request off the socket as this one's body.
+/// * `transfer-encoding` — the replay is sent as one length-delimited body, so
+///   a copied `chunked` would frame it twice.
+/// * `content-encoding` — the capture is *decoded* ([`Capture::replay_body`]),
+///   so keeping the header would tell the origin to gunzip plain text.
+///
+/// Separate from [`do_replay`] so that what is sent can be asserted on without a
+/// socket — see the tests.
+fn replay_request(sess: &Session, body: &ReplayBody) -> hyper::Request<body::DynBody> {
+    let method: hyper::Method = sess.method.parse().unwrap_or(hyper::Method::GET);
+    let uri: hyper::Uri = sess.url.parse().unwrap_or_else(|_| "/".parse().unwrap());
+    let mut builder = hyper::Request::builder().method(method).uri(uri);
+    for (name, value) in &sess.req_headers {
+        if REPLAY_DROPPED_HEADERS
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h))
+        {
+            continue;
+        }
+        if let (Ok(n), Ok(v)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(n, v);
+        }
+    }
+    // Mark the hop as the Composer's, so a `from:composer` rule can tell a
+    // replay from the traffic it was captured from. Consumed on arrival, like
+    // whistle's own `FROM_COM_HEADER` — see `proxy::COMPOSER_REQ_HEADER`.
+    builder = builder.header(super::COMPOSER_REQ_HEADER, "1");
+    // The length of what is being sent, which is the only length that is true.
+    let bytes = body.bytes().cloned().unwrap_or_default();
+    builder = builder.header(hyper::header::CONTENT_LENGTH, bytes.len());
+    builder
+        .body(body::full(bytes))
+        .expect("a request rebuilt from a captured one")
+}
+
+/// Headers a replay sets for itself rather than copying — see [`replay_request`].
+const REPLAY_DROPPED_HEADERS: [&str; 3] =
+    ["content-length", "transfer-encoding", "content-encoding"];
 
 /// Send a captured session's request through the proxy's own port so it flows
 /// through the full rule-matching + forwarding pipeline again.
@@ -807,24 +895,7 @@ async fn do_replay(
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::spawn(conn);
 
-    let method: hyper::Method = sess.method.parse().unwrap_or(hyper::Method::GET);
-    let uri: hyper::Uri = sess.url.parse().unwrap_or_else(|_| "/".parse().unwrap());
-    let mut builder = hyper::Request::builder().method(method).uri(uri);
-    for (name, value) in &sess.req_headers {
-        if let (Ok(n), Ok(v)) = (
-            hyper::header::HeaderName::from_bytes(name.as_bytes()),
-            hyper::header::HeaderValue::from_str(value),
-        ) {
-            builder = builder.header(n, v);
-        }
-    }
-    // Mark the hop as the Composer's, so a `from:composer` rule can tell a
-    // replay from the traffic it was captured from. Consumed on arrival, like
-    // whistle's own `FROM_COM_HEADER` — see `proxy::COMPOSER_REQ_HEADER`.
-    builder = builder.header(super::COMPOSER_REQ_HEADER, "1");
-    let req = builder
-        .body(http_body_util::Empty::<Bytes>::new())
-        .unwrap();
+    let req = replay_request(sess, &replay_body_of(sess));
     let _resp = sender.send_request(req).await?;
     Ok(())
 }
@@ -863,6 +934,141 @@ fn index_html(state: &Arc<AppState>) -> String {
         .replace("__VERSION__", crate::config::VERSION)
         .replace("__HOST__", &host)
         .replace("__PORT__", &state.config.port.to_string())
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use crate::proxy::Capture;
+    use http_body_util::BodyExt;
+
+    /// A captured POST, with `headers` as forwarded and `body` as captured.
+    fn captured(headers: &[(&str, &str)], body: Option<Capture>) -> Session {
+        Session {
+            id: 1,
+            method: "POST".into(),
+            url: "http://example.com/api/items".into(),
+            req_headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            req_body: body,
+            ..Default::default()
+        }
+    }
+
+    /// What the replay would put on the wire.
+    async fn sent(sess: &Session) -> (Vec<(String, String)>, Bytes) {
+        let req = replay_request(sess, &replay_body_of(sess));
+        let headers = req
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap().to_string()))
+            .collect();
+        let bytes = req.into_body().collect().await.expect("a full body").to_bytes();
+        (headers, bytes)
+    }
+
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The bug this replaces: every captured header was copied and
+    /// `Empty::new()` was sent, so a replayed POST announced a body it did not
+    /// have. The origin then either waited for bytes that never came or read
+    /// the next request off the socket as this one's payload.
+    #[tokio::test]
+    async fn a_replayed_post_carries_its_body() {
+        let sess = captured(
+            &[
+                ("host", "example.com"),
+                ("content-type", "application/json"),
+                ("content-length", "402"),
+            ],
+            Some(Capture::from_bytes(
+                br#"{"name":"third"}"#,
+                Some("application/json".into()),
+                None,
+                4096,
+            )),
+        );
+        let (headers, body) = sent(&sess).await;
+        assert_eq!(body, Bytes::from_static(br#"{"name":"third"}"#));
+        // The stale 402 is gone; the length describes what is being sent.
+        assert_eq!(header(&headers, "content-length"), Some("16"));
+        // Everything else the capture recorded still goes out.
+        assert_eq!(header(&headers, "content-type"), Some("application/json"));
+        assert_eq!(header(&headers, "host"), Some("example.com"));
+    }
+
+    /// A GET replays with no body and a truthful zero length, rather than
+    /// whatever the capture's headers happened to say.
+    #[tokio::test]
+    async fn a_request_without_a_body_replays_without_one() {
+        let sess = captured(&[("host", "example.com")], None);
+        let (headers, body) = sent(&sess).await;
+        assert!(body.is_empty());
+        assert_eq!(header(&headers, "content-length"), Some("0"));
+    }
+
+    /// The capture is decoded, so the encoding header has to go with it — else
+    /// the origin is told to gunzip plain text and answers 400.
+    #[tokio::test]
+    async fn a_decoded_body_is_not_sent_under_the_encoding_it_arrived_in() {
+        let cap = Capture::new(Some("text/plain".into()), Some("gzip"), 4096);
+        cap.append(&{
+            use std::io::Write;
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(b"plain again").unwrap();
+            e.finish().unwrap()
+        });
+        cap.finish();
+        let sess = captured(
+            &[("content-encoding", "gzip"), ("content-length", "31")],
+            Some(cap),
+        );
+        let (headers, body) = sent(&sess).await;
+        assert_eq!(body, Bytes::from_static(b"plain again"));
+        assert_eq!(header(&headers, "content-encoding"), None);
+        assert_eq!(header(&headers, "content-length"), Some("11"));
+    }
+
+    /// A `transfer-encoding: chunked` copied from the capture would frame a
+    /// length-delimited body a second time.
+    #[tokio::test]
+    async fn a_replay_does_not_inherit_chunked_framing() {
+        let sess = captured(
+            &[("transfer-encoding", "chunked")],
+            Some(Capture::from_bytes(b"abc", Some("text/plain".into()), None, 4096)),
+        );
+        let (headers, _) = sent(&sess).await;
+        assert_eq!(header(&headers, "transfer-encoding"), None);
+        assert_eq!(header(&headers, "content-length"), Some("3"));
+    }
+
+    /// The replay is marked as the Composer's, so `from:composer` can tell it
+    /// apart from the traffic it was captured from.
+    #[tokio::test]
+    async fn a_replay_announces_itself() {
+        let (headers, _) = sent(&captured(&[], None)).await;
+        assert_eq!(header(&headers, super::super::COMPOSER_REQ_HEADER), Some("1"));
+    }
+
+    /// What the console is told, so it can warn rather than let a short replay
+    /// pass for the real thing.
+    #[test]
+    fn a_truncated_body_is_reported_as_partial() {
+        let cap = Capture::new(Some("text/plain".into()), None, 8);
+        cap.append(&[b'x'; 200]);
+        let sess = captured(&[], Some(cap));
+        let body = replay_body_of(&sess);
+        assert_eq!(body.kind(), "partial");
+        assert_eq!(body.bytes().map(|b| b.len()), Some(8));
+        assert_eq!(sess.req_body.as_ref().unwrap().total(), 200);
+    }
 }
 
 #[cfg(test)]

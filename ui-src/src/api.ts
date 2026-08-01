@@ -116,6 +116,32 @@ export interface OkResult {
   error?: string;
 }
 
+/**
+ * What one replayed request will actually carry.
+ *
+ * The proxy replays from the captured body preview, which is decoded and capped
+ * — so a replay is not always the request that was captured, and the console
+ * has to be able to say which. `sent` is what goes out, `captured` is what was
+ * seen on the wire.
+ */
+export interface ReplayedSession {
+  id: number;
+  /**
+   * `whole` — the body replays byte for byte.
+   * `partial` — only the prefix the preview held.
+   * `empty` — there was no body.
+   * `undecodable` — the capture's decoder failed; nothing is sent.
+   */
+  body: 'whole' | 'partial' | 'empty' | 'undecodable';
+  sent: number;
+  captured: number;
+}
+
+export interface ReplayResult {
+  replayed: number;
+  sessions?: ReplayedSession[];
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: ${res.status}`);
@@ -142,7 +168,9 @@ export const api = {
   session: (id: number) => getJson<SessionDetail | null>(`/session.json?id=${id}`),
   frames: (id: number) => getJson<WsFrame[]>(`/frames.json?id=${id}`),
   clearSessions: () => postJson<OkResult>('/api/sessions/clear', {}),
-  replay: (id: number) => postJson<{ replayed: number }>('/api/replay', { id }),
+  // The endpoint also takes `{ ids: [...] }` for a batch, which nothing calls:
+  // the request table is single-select. See `replay_session` in `webui.rs`.
+  replay: (id: number) => postJson<ReplayResult>('/api/replay', { id }),
 
   rules: async () => (await fetch('/api/rules')).text(),
   saveRules: (text: string) => postText<{ ok: boolean; rules: number }>('/api/rules', text),

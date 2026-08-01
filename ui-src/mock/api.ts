@@ -309,7 +309,26 @@ export function mockApi(): Plugin {
         const { id: want } = JSON.parse((await readBody(req)) || '{}');
         const src = sessions.find((x) => x.id === want);
         if (src) sessions.push({ ...src, id: nextId++, time_ms: Date.now(), target: src.target });
-        return reply({ replayed: src ? 1 : 0 });
+        // The proxy replays from the capture, which is decoded and capped, so
+        // it reports what the replay will actually carry — see `ReplayResult`.
+        const body = !src?.req_body
+          ? 'empty'
+          : src.req_body.truncated
+            ? 'partial'
+            : 'whole';
+        return reply({
+          replayed: src ? 1 : 0,
+          sessions: src
+            ? [
+                {
+                  id: src.id,
+                  body,
+                  sent: body === 'empty' ? 0 : src.req_body!.text.length,
+                  captured: src.req_body?.len ?? 0,
+                },
+              ]
+            : [],
+        });
       }
       case '/api/rules':
         if (method === 'POST') {
