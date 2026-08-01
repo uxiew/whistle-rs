@@ -51,6 +51,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/plugins/stats.rs` | `plugins/index.js:1369` | Fire-and-forget per-phase stats |
 | `sdk/whistle-rs-plugin.js` | `lib/plugins/load-plugin.js` | Zero-dependency JS/TS plugin SDK (+ `.d.ts` types) |
 | `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
+| `src/embed.rs` | — | The library facade: bind on port 0, observe sessions, swap rules, shut down |
 | `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
 
 ## Request lifecycle

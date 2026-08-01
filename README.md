@@ -18,6 +18,7 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 - [Configure your client](#configure-your-client)
 - [Intercepting HTTPS](#intercepting-https)
 - [Writing rules](#writing-rules)
+- [Use as a library](#use-as-a-library)
 - [CLI reference](#cli-reference)
 - [Documentation](#documentation)
 - [Scope: what's ported vs. stubbed](#scope-whats-ported-vs-stubbed)
@@ -165,6 +166,62 @@ $example.com          host://2.2.2.2
 
 **The full syntax — every pattern kind and operator, precedence rules, and a
 cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
+
+## Use as a library
+
+whistle-rs is a library with a binary on top, not the other way round. If you are
+building something that needs traffic interception or API debugging *inside* it —
+a proxy of your own, a test harness, a desktop app — embed it:
+
+```toml
+[dependencies]
+whistle-rs = { path = "…" }   # or a git/crates.io dependency
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+use whistle_rs::embed::Proxy;
+
+let proxy = Proxy::builder()
+    .port(0)                        // 0: the OS picks; addr() reports which
+    .host("127.0.0.1".parse()?)     // keep it off the network
+    .rules("api.example.com  http://127.0.0.1:3000")
+    .on_session(|s| println!("{} {} -> {}", s.method, s.url, s.status))
+    .start()
+    .await?;
+
+println!("point your client at {}", proxy.addr());
+proxy.set_rules("api.example.com  statusCode://503");   // live
+proxy.shutdown().await;
+```
+
+To *change* traffic rather than watch it, register an in-process hook. It is the
+same `RustPlugin` trait the built-in plugins use, so it can rewrite request
+headers, inject rules, answer the request outright, gate it, transform the
+response, or choose the TLS certificate:
+
+```rust
+struct MockApi;
+
+impl RustPlugin for MockApi {
+    fn name(&self) -> &str { "mock-api" }
+    fn on_request(&self, req: &PluginReq) -> PluginResult {
+        PluginResult {
+            response: Some(PluginResp { status: 200, headers: vec![], body: b"{}".to_vec() }),
+            ..Default::default()
+        }
+    }
+}
+
+Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
+```
+
+`cargo run --example embedded` runs all of the above end to end. The builder also
+covers a SOCKS5 port, the storage directory (two embedders sharing one share a
+CA), values, the body-capture cap, and `intercept_https(false)` for routing TLS
+without decrypting it. Anything past the facade is reachable through
+`proxy.state()` — the session ring, the rules manager, the plugin registry, the
+CA.
 
 ## CLI reference
 

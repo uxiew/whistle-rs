@@ -17,6 +17,7 @@ CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
 - [配置客户端](#配置客户端)
 - [拦截 HTTPS](#拦截-https)
 - [编写规则](#编写规则)
+- [作为库使用](#作为库使用)
 - [命令行参数](#命令行参数)
 - [文档](#文档)
 - [移植范围：已实现 vs. 简化](#移植范围已实现-vs-简化)
@@ -154,6 +155,57 @@ $example.com          host://2.2.2.2
 
 **完整语法 —— 每种模式与算子、优先级规则、以及速查手册 —— 见
 [`docs/RULES.md`](docs/RULES.md)。**
+
+## 作为库使用
+
+whistle-rs 是「一个库 + 一个跑在它上面的二进制」，而不是反过来。如果你要做的东西**自己内部**
+需要流量拦截或接口调试 —— 你自己的代理程序、测试夹具、桌面应用 —— 直接嵌进去：
+
+```toml
+[dependencies]
+whistle-rs = { path = "…" }   # 或 git / crates.io 依赖
+tokio = { version = "1", features = ["full"] }
+```
+
+```rust
+use whistle_rs::embed::Proxy;
+
+let proxy = Proxy::builder()
+    .port(0)                        // 0：由系统挑端口，addr() 告诉你挑了哪个
+    .host("127.0.0.1".parse()?)     // 不暴露到网络上
+    .rules("api.example.com  http://127.0.0.1:3000")
+    .on_session(|s| println!("{} {} -> {}", s.method, s.url, s.status))
+    .start()
+    .await?;
+
+println!("把客户端指向 {}", proxy.addr());
+proxy.set_rules("api.example.com  statusCode://503");   // 运行中热更新
+proxy.shutdown().await;
+```
+
+要**改**流量而不只是看，就注册一个进程内钩子。它就是内建插件用的那个 `RustPlugin` trait，
+因此可以改写请求头、注入规则、直接应答请求、做鉴权拦截、变换响应，或在握手期挑证书：
+
+```rust
+struct MockApi;
+
+impl RustPlugin for MockApi {
+    fn name(&self) -> &str { "mock-api" }
+    fn on_request(&self, req: &PluginReq) -> PluginResult {
+        PluginResult {
+            response: Some(PluginResp { status: 200, headers: vec![], body: b"{}".to_vec() }),
+            ..Default::default()
+        }
+    }
+}
+
+Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
+```
+
+`cargo run --example embedded` 会把上面这些端到端跑一遍。builder 还覆盖 SOCKS5 端口、
+存储目录（两个 embedder 共用同一目录即共用一份 CA）、values、Body 抓取上限，以及
+`intercept_https(false)` —— 只路由 TLS 而不解密。facade 之外的东西都可以从 `proxy.state()`
+拿到：会话环、规则管理器、插件注册表、CA。
 
 ## 命令行参数
 
