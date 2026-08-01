@@ -34,10 +34,10 @@ pub fn expand(value: &str, groups: &[&str]) -> String {
             [b'$', b'$', tail @ ..] => (true, tail),
             [b'$', tail @ ..] => (false, tail),
             _ => {
-                // Not a reference: emit one byte and re-scan, so the slashes we
-                // counted are not consumed by a match that did not happen.
-                out.push(bytes[i] as char);
-                i += 1;
+                // Not a reference: emit one character and re-scan, so the
+                // slashes we counted are not consumed by a match that did not
+                // happen.
+                i += emit_char(&mut out, value, i);
                 continue;
             }
         };
@@ -50,8 +50,7 @@ pub fn expand(value: &str, groups: &[&str]) -> String {
             [d, ..] if d.is_ascii_digit() => Some(((d - b'0') as usize, 1)),
             _ => None,
         }) else {
-            out.push(bytes[i] as char);
-            i += 1;
+            i += emit_char(&mut out, value, i);
             continue;
         };
         let reference_len = slashes + if encode { 2 } else { 1 } + usize::from(is_vals) + consumed;
@@ -83,6 +82,27 @@ pub fn expand(value: &str, groups: &[&str]) -> String {
     out
 }
 
+/// Copy one whole character from `value` at byte offset `at`, and report how
+/// many bytes it took.
+///
+/// The scan above walks **bytes**, because every marker it looks for (`$`, `\`,
+/// `&`, a digit, `b`) is ASCII and a UTF-8 continuation byte can never be
+/// mistaken for one. But emitting has to move a character at a time: pushing
+/// `bytes[i] as char` reinterprets each byte as a Latin-1 scalar, so `/搜索`
+/// came out as `/æ\u{90}\u{9c}ç´¢` — and that applies to *every* `$`-expanding
+/// replacement, not just the header one it was noticed on.
+fn emit_char(out: &mut String, value: &str, at: usize) -> usize {
+    match value[at..].chars().next() {
+        Some(c) => {
+            out.push(c);
+            c.len_utf8()
+        }
+        // Unreachable while `at` is on a boundary, but advancing keeps the loop
+        // total rather than trusting that.
+        None => 1,
+    }
+}
+
 /// JavaScript's `encodeURIComponent`: everything outside the unreserved set
 /// `A-Za-z0-9-_.!~*'()` is percent-encoded.
 fn encode_uri_component(s: &str) -> String {
@@ -112,4 +132,35 @@ pub fn has_reference(value: &str) -> bool {
                 Some(b'&') | Some(b'$') | Some(b'0'..=b'9')
             )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The expander scans bytes — every marker it looks for is ASCII — but it
+    /// has to *emit* whole characters. Pushing each byte as a `char` reads it as
+    /// a Latin-1 scalar, so any non-ASCII text in a replacement was mangled:
+    /// `/搜索` came out `/æ\u{90}\u{9c}ç´¢`. Every `$`-expanding operator was
+    /// affected, not only the header one where it was first seen.
+    #[test]
+    fn non_ascii_survives_expansion() {
+        let groups = ["whole", "one", "two"];
+        // Text with no reference at all passes through unchanged.
+        assert_eq!(expand("/搜索/结果", &groups), "/搜索/结果");
+        // …and so does the text around a reference.
+        assert_eq!(expand("/搜索/$1/尾", &groups), "/搜索/one/尾");
+        // A group's own content is inserted verbatim.
+        assert_eq!(expand("$1", &["", "中文"]), "中文");
+        // The escape forms still work with multi-byte text beside them.
+        assert_eq!(expand("中\\$1文", &groups), "中$1文");
+        // `$$` percent-encodes, which is byte-oriented by definition.
+        assert_eq!(expand("$$1", &["", "中"]), "%E4%B8%AD");
+        // `$1` followed by digits is still `$1` plus literal text, as in
+        // JavaScript — `"$100"` is group 1 then `00`.
+        assert_eq!(expand("价格$100", &groups), "价格one00");
+        // A `$` that references nothing is literal, and the character after it
+        // must not be swallowed with it.
+        assert_eq!(expand("价格$元", &groups), "价格$元");
+    }
 }
