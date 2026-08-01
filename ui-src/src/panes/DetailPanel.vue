@@ -6,6 +6,7 @@ import BodyDump from './BodyDump.vue';
 import FrameList from './FrameList.vue';
 import GeneralTab from './GeneralTab.vue';
 import HeaderList from './HeaderList.vue';
+import RulesTab from './RulesTab.vue';
 import { asCurl } from '../curl';
 import { hostOf } from '../format';
 import {
@@ -76,6 +77,10 @@ watch(
     <div class="detail-body">
       <div v-if="!session" class="empty">Nothing selected</div>
       <GeneralTab v-else-if="activeTab === 'general'" :session="session" :detail="state.detail" />
+      <!-- From the summary, not the detail: `/sessions.json` already carries
+           which rules matched, so the tab fills with the row rather than a
+           round trip after it. -->
+      <RulesTab v-else-if="activeTab === 'rules'" :rules="session.rules" />
       <HeaderList v-else-if="activeTab === 'req-head'" :pairs="state.detail?.req_headers" />
       <HeaderList v-else-if="activeTab === 'res-head'" :pairs="state.detail?.res_headers" />
       <BodyDump v-else-if="activeTab === 'req-body'" :body="state.detail?.req_body" />

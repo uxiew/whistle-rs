@@ -659,6 +659,31 @@ mod capture_tests {
     }
 }
 
+/// One operator a rule applied to a request, as recorded on its [`Session`].
+///
+/// This is the answer to "which rules matched?" — the question the console
+/// exists to answer and the one it could not, because [`Resolved`] was consulted
+/// for each decision and then dropped. What survived was the `log://` labels,
+/// which the General tab showed under a heading people read as the matched
+/// rules; a request whose `host://` rule never fired looked exactly like one
+/// whose did.
+///
+/// Only the three fields that identify an operator are kept, not the whole
+/// [`RuleOp`]: a session lives in a 500-deep ring, so what it holds is copied
+/// 500 times over.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MatchedOp {
+    /// Canonical protocol name (`host`, `resHeaders`, `redirect`, …) — the
+    /// alias in the file has already been resolved to it.
+    pub protocol: String,
+    /// The value the operator resolved to. It is not always what was written:
+    /// a `${name}` reference has been substituted by the time a request is
+    /// recorded, which is exactly the difference worth seeing next to `raw`.
+    pub value: String,
+    /// The token as written on the line, shorthand and all.
+    pub raw: String,
+}
+
 /// One captured request/response transaction.
 #[derive(Clone, Default, serde::Serialize)]
 pub struct Session {
@@ -673,8 +698,16 @@ pub struct Session {
     pub target: String,
     pub duration_ms: u128,
     /// `log://` channel labels attached to this request (whistle's log tags).
+    ///
+    /// Not "the rules that matched" — that is [`Session::rules`]. The two were
+    /// conflated by the console for as long as only this one existed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<String>,
+    /// Every operator that applied to this request, in resolution order — see
+    /// [`matched_ops`]. Empty when no rule matched, which is the common case and
+    /// costs nothing: an empty `Vec` allocates nothing and serializes to nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<MatchedOp>,
     /// Outgoing request headers (as forwarded upstream).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub req_headers: Vec<(String, String)>,
@@ -813,6 +846,162 @@ fn hex_preview(payload: &[u8]) -> String {
 /// Collect `log://` channel labels for a resolved request.
 fn log_labels(resolved: &Resolved) -> Vec<String> {
     resolved.all("log").iter().map(|o| o.value.clone()).collect()
+}
+
+/// Collect every operator that applied to a request, in the order the rules file
+/// would read them: important lines first, then source order — which is exactly
+/// what [`crate::rules::order_key`] encodes and what decided each contest.
+///
+/// Called once per recorded session, at the point the session is built, so the
+/// list is taken *after* the response phase has folded its operators in
+/// ([`Resolved::merge_response_phase`]). Reading it earlier would report a
+/// `resHeaders://` withheld by an `includeFilter://s:404` as never having
+/// matched, on the requests where it did.
+///
+/// **A request no rule matched pays nothing.** Both maps are empty, both loops
+/// run zero times, and `Vec::new` does not allocate — so the common case is two
+/// `HashMap::is_empty`-shaped walks and a null pointer, not a heap allocation
+/// holding nothing.
+///
+/// Ties are broken by protocol name so the list is stable between two identical
+/// requests: the operators come out of a `HashMap`, whose iteration order is not.
+/// Within one protocol the sort is stable, so several `reqHeaders://` written on
+/// one line keep the order they were written in — which is the order in which
+/// they are applied.
+fn matched_ops(resolved: &Resolved) -> Vec<MatchedOp> {
+    let mut ops: Vec<(u64, &crate::rules::RuleOp)> = Vec::new();
+    for op in resolved.single.values() {
+        ops.push((op.order, op));
+    }
+    for list in resolved.multi.values() {
+        ops.extend(list.iter().map(|op| (op.order, op)));
+    }
+    ops.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.protocol.cmp(&y.protocol)));
+    ops.into_iter()
+        .map(|(_, op)| MatchedOp {
+            protocol: op.protocol.clone(),
+            value: op.value.clone(),
+            raw: op.raw.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod matched_ops_tests {
+    use super::*;
+
+    /// Resolve `text` against `GET http://example.com/api` and record what
+    /// matched, the way a session does.
+    fn matched(text: &str) -> Vec<MatchedOp> {
+        let mut m = RuleManager::new();
+        m.set_text(text);
+        let info = apply::build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/api",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        matched_ops(&m.resolve(&info))
+    }
+
+    /// The list a session carries has to be readable as the rules file: the
+    /// important line first, then source order. Anything else and the console
+    /// would show a *set* of operators, leaving "which one won" — the question
+    /// two lines setting `host://` are asked about — unanswerable.
+    #[test]
+    fn the_operators_come_out_in_the_order_that_decided_them() {
+        let ops = matched(concat!(
+            "example.com reqHeaders://x-a=1\n",
+            "example.com resHeaders://x-b=2\n",
+            "$example.com reqHeaders://x-c=3\n",
+        ));
+        let seen: Vec<(&str, &str)> = ops
+            .iter()
+            .map(|o| (o.protocol.as_str(), o.value.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                // `$` marks the line important, so it resolves first.
+                ("reqHeaders", "x-c=3"),
+                ("reqHeaders", "x-a=1"),
+                ("resHeaders", "x-b=2"),
+            ]
+        );
+    }
+
+    /// Two `reqHeaders://` on one line share an order key, and the order they
+    /// are *applied* in is the order they were written in. A sort that lost it
+    /// would show the losing header on top for a line that sets the same name
+    /// twice.
+    #[test]
+    fn operators_sharing_a_line_keep_the_order_they_were_written_in() {
+        let ops = matched("example.com reqHeaders://x-a=1 reqHeaders://x-a=2\n");
+        let seen: Vec<&str> = ops.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(seen, ["x-a=1", "x-a=2"]);
+    }
+
+    /// The token as written is kept beside what it resolved to, because they
+    /// are not the same thing: a shorthand names a protocol it does not spell,
+    /// and `example.com 1.2.3.4` is the form most likely to be doubted.
+    #[test]
+    fn a_shorthand_is_reported_under_the_protocol_it_means() {
+        let ops = matched("example.com 1.2.3.4\n");
+        assert_eq!(
+            ops,
+            [MatchedOp {
+                protocol: "host".into(),
+                value: "1.2.3.4".into(),
+                raw: "1.2.3.4".into(),
+            }]
+        );
+    }
+
+    /// The hot path: a request no rule matched records an empty list, and an
+    /// empty `Vec` neither allocates nor serializes. This is the majority of
+    /// traffic through a proxy whose rules file names one host.
+    #[test]
+    fn a_request_no_rule_matched_carries_nothing() {
+        let ops = matched("other.example.net host://1.2.3.4\n");
+        assert!(ops.is_empty());
+        assert_eq!(ops.capacity(), 0, "an empty list must not have allocated");
+        let session = Session {
+            rules: ops,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&session).expect("a session serializes");
+        assert!(json.get("rules").is_none(), "{json}");
+    }
+
+    /// Which rules matched is the thing the detail view is for, so it has to
+    /// survive the trip through `/session.json`.
+    #[test]
+    fn the_operators_reach_the_console() {
+        let session = Session {
+            rules: matched("example.com http://localhost:5173 log://api\n"),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&session).expect("a session serializes");
+        let rules = json["rules"].as_array().expect("an array");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["protocol"] == "log" && r["value"] == "api"),
+            "{json}"
+        );
+        // …and the pair of fields earns its keep on the forwarding shorthand:
+        // `raw` is the token as typed, `value` is where the request was
+        // actually sent — path and all. Reporting only one of them would leave
+        // "why did /api go there" a question the console cannot answer.
+        let replace = rules
+            .iter()
+            .find(|r| r["raw"] == "http://localhost:5173")
+            .expect("the forwarding operator");
+        assert_eq!(replace["value"], "http://localhost:5173/api");
+    }
 }
 
 /// Milliseconds since the Unix epoch (best-effort).
@@ -2048,6 +2237,7 @@ async fn serve(
                     target,
                     duration_ms: started.elapsed().as_millis(),
                     log: log_labels(&resolved),
+                    rules: matched_ops(&resolved),
                     res_headers: header_pairs(response.headers()),
                     res_body,
                     ..Default::default()
@@ -2122,6 +2312,7 @@ async fn serve(
             target: "short-circuit".to_string(),
             duration_ms: started.elapsed().as_millis(),
             log: log_labels(&resolved),
+            rules: matched_ops(&resolved),
             res_headers: header_pairs(resp.headers()),
             res_body,
             ..Default::default()
@@ -2175,6 +2366,7 @@ async fn serve(
             target: format!("self-loop {addr}"),
             duration_ms: started.elapsed().as_millis(),
             log: log_labels(&resolved),
+            rules: matched_ops(&resolved),
             res_headers: header_pairs(resp.headers()),
             ..Default::default()
         });
@@ -2343,6 +2535,7 @@ async fn serve(
             target: format!("{}:{} (aborted)", target.connect_host, target.connect_port),
             duration_ms: started.elapsed().as_millis(),
             log: log_labels(&resolved),
+            rules: matched_ops(&resolved),
             req_headers: req_header_pairs,
             res_headers: header_pairs(&parts.headers),
             req_body: req_body_cap,
@@ -2519,6 +2712,7 @@ async fn serve(
         target: target_desc,
         duration_ms: started.elapsed().as_millis(),
         log: log_labels(&resolved),
+        rules: matched_ops(&resolved),
         req_headers: req_header_pairs,
         res_headers: header_pairs(&parts.headers),
         req_body: req_body_cap,
@@ -2675,6 +2869,7 @@ async fn serve_upgrade(
         target: target_desc,
         duration_ms: started.elapsed().as_millis(),
         log: log_labels(resolved),
+        rules: matched_ops(resolved),
         res_headers: header_pairs(resp.headers()),
         ..Default::default()
     });

@@ -591,6 +591,52 @@ pre.dump {
   word-break: break-all;
 }
 
+/* "No rule matched" is a sentence, not a label: let it breathe and wrap. */
+.empty.wide {
+  padding: 0 24px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+/* The Rules tab: one row per operator that applied, in resolution order. The
+   spelling uses the editor's own token palette (`.tok-*` above), so an operator
+   here and the line it came from in the Rules pane are coloured alike. */
+.ops {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 8px;
+}
+
+.op {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.op:nth-child(odd) { background: var(--bg-sub); }
+
+.op-spell {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-all;
+}
+
+/* The token as typed, when it is not what the row already says. Set back so it
+   reads as provenance rather than as a second operator. */
+.op-raw {
+  flex: 0 1 auto;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-faint);
+}
+
 .frames { font-family: var(--mono); font-size: 11.5px; }
 
 .frame {

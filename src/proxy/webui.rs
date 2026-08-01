@@ -191,6 +191,14 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
                     "target": s.target,
                     "duration_ms": s.duration_ms,
                     "log": s.log,
+                    // The operators that applied. Carried on the *summary*, not
+                    // only on the detail, because it is the one question a row
+                    // should be able to answer without being clicked — and
+                    // because it costs nothing to carry: the overwhelming
+                    // majority of requests match no rule at all, and an empty
+                    // list serializes to `[]`. A row that did match carries a
+                    // handful of short strings.
+                    "rules": s.rules,
                     // The traffic columns. Body bytes only: the head is a
                     // couple of hundred bytes that this port never counts on
                     // the wire, and reporting a guess for it would be worse

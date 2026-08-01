@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use super::Session;
+use super::{MatchedOp, Session};
 
 /// A JSON-serialisable snapshot of a [`Session`], with body captures flattened
 /// to their text previews (the `Arc<Mutex<CaptureState>>` is not serialisable).
@@ -28,6 +28,12 @@ pub struct PersistedSession {
     pub duration_ms: u128,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<String>,
+    /// The operators that applied — see [`MatchedOp`]. `default` so a file
+    /// written before the field existed still loads: which rules matched is
+    /// worth keeping across a restart, but not at the price of dropping every
+    /// session recorded yesterday.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<MatchedOp>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub req_headers: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -60,6 +66,7 @@ impl PersistedSession {
             target: s.target.clone(),
             duration_ms: s.duration_ms,
             log: s.log.clone(),
+            rules: s.rules.clone(),
             req_headers: s.req_headers.clone(),
             res_headers: s.res_headers.clone(),
             req_body_preview: s.req_body.as_ref().map(|c| {
@@ -95,6 +102,7 @@ impl PersistedSession {
             target: self.target,
             duration_ms: self.duration_ms,
             log: self.log,
+            rules: self.rules,
             req_headers: self.req_headers,
             res_headers: self.res_headers,
             req_body: self.req_body_preview.map(|snap| {
@@ -305,6 +313,11 @@ mod tests {
             target: "example.com:80".into(),
             duration_ms: 100,
             log: vec![],
+            rules: vec![MatchedOp {
+                protocol: "host".into(),
+                value: "1.2.3.4".into(),
+                raw: "host://1.2.3.4".into(),
+            }],
             req_headers: vec![("host".into(), "example.com".into())],
             res_headers: vec![],
             req_body_preview: None,
@@ -321,5 +334,21 @@ mod tests {
         let session = back.into_session();
         assert_eq!(session.id, 42);
         assert!(session.res_body.is_some());
+        // Which rules matched outlives the process too: a session reloaded
+        // after a restart that could not say what applied to it is a session
+        // the console cannot answer its central question about.
+        assert_eq!(session.rules[0].raw, "host://1.2.3.4");
+    }
+
+    /// A JSONL file written before `rules` existed still loads. Sessions are
+    /// kept for `persist_days`, so an upgrade lands on a directory full of
+    /// them — and a deserialization error would drop every line of the file,
+    /// not just the field.
+    #[test]
+    fn a_session_written_without_the_rules_field_still_loads() {
+        let line = r#"{"id":1,"time_ms":0,"method":"GET","url":"http://a/","status":200,
+            "client_ip":null,"target":"a:80","duration_ms":1}"#;
+        let back: PersistedSession = serde_json::from_str(line).expect("an older session");
+        assert!(back.rules.is_empty());
     }
 }

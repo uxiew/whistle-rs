@@ -15,10 +15,21 @@ const http = computed<Pair[]>(() => [
   ['Status', props.session.status || '—'],
 ]);
 
+// "Log tags" used to sit here alone, and people read it as the rules that
+// matched. It is nothing of the sort — it is the `log://` channel labels — so
+// it is now spelled as the protocol it comes from, with the real answer above
+// it and the Rules tab behind that.
 const policy = computed<Pair[]>(() => [
   ['Target', props.session.target],
-  ['Log tags', (props.session.log || []).join(', ')],
+  ['Rules', matched.value],
+  ['log:// tags', (props.session.log || []).join(', ')],
 ]);
+
+/** Never blank: "none" is the answer people come to this card for. */
+const matched = computed(() => {
+  const n = props.session.rules?.length || 0;
+  return n ? `${n} matched` : 'none matched';
+});
 
 const traffic = computed<Pair[]>(() => [
   ['Upload', fmtBytes(props.session.up)],

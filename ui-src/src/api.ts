@@ -4,6 +4,20 @@
 // actually emits. Fields the Rust side skips when empty (`skip_serializing_if`)
 // are optional here, which is why so many of them are.
 
+/**
+ * One operator a rule applied to a request.
+ *
+ * `raw` is the token as it was typed on the line; `value` is what it resolved
+ * to. They differ wherever the rules language does work between the two — a
+ * shorthand that names a protocol it does not spell (`1.2.3.4` → `host`), a
+ * `${name}` read out of the values store, a `$1` filled in from the pattern.
+ */
+export interface MatchedRule {
+  protocol: string;
+  value: string;
+  raw: string;
+}
+
 /** One row of `/sessions.json`. No headers or bodies — those are per-request. */
 export interface SessionSummary {
   id: number;
@@ -16,8 +30,14 @@ export interface SessionSummary {
   /** Where the request was sent, or "short-circuit". */
   target: string;
   duration_ms: number;
-  /** `log://` channel labels attached to this request. */
+  /** `log://` channel labels attached to this request — *not* the rules. */
   log?: string[];
+  /**
+   * Every operator that applied, in resolution order: important lines first,
+   * then the order they are written in. Absent when no rule matched, which is
+   * the common case and why the Rust side skips the field entirely.
+   */
+  rules?: MatchedRule[];
   /** Body bytes only; the head is never counted on this port. */
   up: number;
   down: number;

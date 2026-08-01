@@ -20,11 +20,22 @@ import { COLUMNS } from './columns';
 import { clientOf } from './format';
 
 export type Pane = 'requests' | 'rules' | 'values' | 'status';
-export type DetailTab = 'general' | 'req-head' | 'res-head' | 'req-body' | 'res-body' | 'frames';
+export type DetailTab =
+  | 'general'
+  | 'rules'
+  | 'req-head'
+  | 'res-head'
+  | 'req-body'
+  | 'res-body'
+  | 'frames';
 export type Theme = 'light' | 'dark';
 
+// Rules sits second, right after General: "which rules matched this request" is
+// the question the proxy exists to answer, and it used to be the one thing the
+// console could not tell you.
 export const DETAIL_TABS: { key: DetailTab; label: string }[] = [
   { key: 'general', label: 'General' },
+  { key: 'rules', label: 'Rules' },
   { key: 'req-head', label: 'Request Header' },
   { key: 'res-head', label: 'Response Header' },
   { key: 'req-body', label: 'Request Body' },
@@ -162,6 +173,10 @@ export const clientCounts = computed(() => {
  * A tab that would open on an empty panel is disabled instead: with the header
  * and body tabs sitting side by side, "did this request have a body" is a
  * question the tab strip can answer without being clicked.
+ *
+ * **Rules is the exception, deliberately.** "No rule matched" is an answer, and
+ * a greyed-out tab does not give it — it reads the same as a tab whose contents
+ * have not loaded. The panel says it in words instead.
  */
 export function tabEnabled(key: DetailTab): boolean {
   const s = selectedSession.value;

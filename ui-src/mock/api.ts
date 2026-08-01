@@ -13,6 +13,12 @@
 import type { Plugin } from 'vite';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
+interface MockRule {
+  protocol: string;
+  value: string;
+  raw: string;
+}
+
 interface MockSession {
   id: number;
   time_ms: number;
@@ -23,11 +29,18 @@ interface MockSession {
   target: string;
   duration_ms: number;
   log?: string[];
+  rules?: MockRule[];
   req_headers: [string, string][];
   res_headers: [string, string][];
   req_body?: { len: number; truncated: boolean; text: string };
   res_body?: { len: number; truncated: boolean; text: string };
 }
+
+/** `protocol://value` split the way the proxy records it, plus what was typed. */
+const rule = (spelled: string, raw = spelled): MockRule => {
+  const at = spelled.indexOf('://');
+  return { protocol: spelled.slice(0, at), value: spelled.slice(at + 3), raw };
+};
 
 const now = Date.now();
 
@@ -70,6 +83,16 @@ const FIXTURE: MockSession[] = [
     status: 201,
     target: '127.0.0.1:5173 (http://localhost:5173)',
     log: ['api', 'write'],
+    // Every shape the Rules tab has to render: a shorthand whose raw token
+    // does not spell its protocol, a `$1` already filled in, a `${name}`
+    // already substituted, and one written out in full.
+    rules: [
+      rule('host://127.0.0.1', '127.0.0.1'),
+      rule('reqHeaders://X-Tenant=acme', 'reqHeaders://X-Tenant=$1'),
+      rule('resBody://{"ok":true,"from":"values"}', 'resBody://{mock.json}'),
+      rule('log://api'),
+      rule('log://write'),
+    ],
     req_headers: [
       ['host', 'example.com'],
       ['content-type', 'application/json'],
@@ -103,6 +126,9 @@ const FIXTURE: MockSession[] = [
     target: 'api.example.com:443',
     duration_ms: 1204,
     log: ['errors'],
+    // A request whose only matched operator is one that fired in the response
+    // phase — the case where reading `Resolved` too early would report nothing.
+    rules: [rule('log://errors'), rule('resDelay://800')],
     res_headers: [['content-type', 'text/html']],
     res_body: { len: 92, truncated: false, text: '<html><body><h1>500 Internal Server Error</h1></body></html>' },
   }),
@@ -218,6 +244,7 @@ const summary = (s: MockSession) => ({
   target: s.target,
   duration_ms: s.duration_ms,
   ...(s.log?.length ? { log: s.log } : {}),
+  ...(s.rules?.length ? { rules: s.rules } : {}),
   up: s.req_body?.len ?? 0,
   down: s.res_body?.len ?? 0,
   has_req_body: !!s.req_body?.len,
