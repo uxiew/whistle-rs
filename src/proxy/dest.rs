@@ -131,8 +131,13 @@ impl Destination {
 /// (see [`protocols::URL_REPLACE`]), and upstream can only ever read it as the
 /// unusable URL `rule://<name>`.
 fn replacement_url(resolved: &Resolved) -> Option<&String> {
-    let op = resolved.get(protocols::URL_REPLACE)?;
-    (!op.raw.starts_with("rule://")).then_some(&op.value)
+    // The destination rewrite shares one slot with `file://`, `redirect://` and
+    // `statusCode://` — see `apply::slot_winner`. If one of those was written
+    // first it answers the request, and this rewrite does not happen at all.
+    // Reading the operator directly would forward the request *and* serve the
+    // mock's rule, which is neither behaviour.
+    let (proto, op) = crate::proxy::apply::slot_winner(resolved)?;
+    (proto == protocols::URL_REPLACE).then_some(&op.value)
 }
 
 /// Split an authority into host and port, unwrapping a bracketed IPv6 literal.

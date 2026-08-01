@@ -844,49 +844,91 @@ fn parse_host_value(value: &str, _default_port: u16) -> (Option<String>, Option<
     }
 }
 
+/// The operator families that share **one slot**.
+///
+/// None of these names is in upstream's `protocols` array, so `parseRule` files
+/// every one of them under the same `rule` list
+/// (`_original/lib/rules/rules.js:1313-1316`) and `getRule` returns the first
+/// match (`rules.js:799-800`). They cannot coexist: whichever line was written
+/// first wins outright and the rest do not apply.
+///
+/// This port keeps a key per protocol, so the slot has to be reconstructed —
+/// see [`slot_winner`]. Without it the port applied a fixed protocol priority
+/// (redirect, then statusCode, then file) *and* let a destination rewrite apply
+/// alongside a mock, so
+///
+/// ```text
+/// example.com      http://127.0.0.1:9000
+/// example.com/api  file:///mock/api.json
+/// ```
+///
+/// forwarded upstream in whistle and served the mock here — a silent
+/// disagreement in either direction depending on which line came first.
+fn slot_protocols() -> impl Iterator<Item = &'static str> {
+    ["redirect", "location", "statusCode"]
+        .into_iter()
+        .chain(FILE_PROTOS.iter().copied())
+        .chain(std::iter::once(crate::rules::protocols::URL_REPLACE))
+}
+
+/// Which of the shared-slot operators was written first, if any.
+///
+/// `RuleOp::order` is the resolution order — important lines first, then source
+/// order — which is exactly the sequence `getRule` walks.
+pub fn slot_winner(resolved: &Resolved) -> Option<(&'static str, &RuleOp)> {
+    slot_protocols()
+        .filter_map(|proto| resolved.get(proto).map(|op| (proto, op)))
+        // A `rule://<name>` is this port's values-store include, not a
+        // destination, so it is not competing for this slot.
+        .filter(|(proto, op)| {
+            *proto != crate::rules::protocols::URL_REPLACE || !op.raw.starts_with("rule://")
+        })
+        .min_by_key(|(_, op)| op.order)
+}
+
 /// Short-circuit responses produced without contacting upstream:
-/// `redirect`/`location`, mocked `statusCode`, and `file`.
+/// `redirect`/`location`, mocked `statusCode`, and the local-file family.
+///
+/// Only the operator that won the shared slot may answer — see [`slot_winner`].
 pub fn short_circuit(
     info: &ReqInfo,
     resolved: &Resolved,
     env: super::template::ProxyEnv<'_>,
 ) -> Option<Response<DynBody>> {
-    if let Some(url) = resolved
-        .value("redirect")
-        .or_else(|| resolved.value("location"))
-    {
-        let mut resp = Response::builder()
-            .status(StatusCode::FOUND)
-            .body(body::empty())
-            .unwrap();
-        if let Ok(v) = HeaderValue::from_str(url) {
-            resp.headers_mut().insert(hyper::header::LOCATION, v);
-        }
-        return Some(resp);
-    }
-
-    if let Some(code) = resolved.value("statusCode") {
-        let status = code
-            .trim()
-            .parse::<u16>()
-            .ok()
-            .and_then(|c| StatusCode::from_u16(c).ok())
-            .unwrap_or(StatusCode::OK);
-        return Some(
-            Response::builder()
-                .status(status)
+    let (proto, op) = slot_winner(resolved)?;
+    match proto {
+        "redirect" | "location" => {
+            let mut resp = Response::builder()
+                .status(StatusCode::FOUND)
                 .body(body::empty())
-                .unwrap(),
-        );
+                .unwrap();
+            if let Ok(v) = HeaderValue::from_str(&op.value) {
+                resp.headers_mut().insert(hyper::header::LOCATION, v);
+            }
+            Some(resp)
+        }
+        "statusCode" => {
+            let status = op
+                .value
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .and_then(|c| StatusCode::from_u16(c).ok())
+                .unwrap_or(StatusCode::OK);
+            Some(
+                Response::builder()
+                    .status(status)
+                    .body(body::empty())
+                    .unwrap(),
+            )
+        }
+        // The destination rewrite won: nothing is answered here, the request
+        // goes out to where it now points.
+        p if p == crate::rules::protocols::URL_REPLACE => None,
+        // A file rule, unless `weakRule` hands the request to a proxy instead.
+        _ if weak_rule_yields(resolved, proto) => None,
+        _ => serve_file_family(proto, op, info, env),
     }
-
-    if let Some((proto, op)) = find_file_rule(resolved)
-        && !weak_rule_yields(resolved, proto)
-    {
-        return serve_file_family(proto, op, info, env);
-    }
-
-    None
 }
 
 /// `weakRule` — the local-file rule steps aside for a matching `proxy`/`host`
@@ -916,12 +958,6 @@ const FILE_PROTOS: &[&str] = &[
     "xsfile", "xsrawfile", "xstpl", "xsjsonp", "xsdust",
 ];
 
-/// Find a matched local-file/template rule (`file`/`tpl`/`xfile`/…) if any.
-fn find_file_rule(resolved: &Resolved) -> Option<(&'static str, &RuleOp)> {
-    FILE_PROTOS
-        .iter()
-        .find_map(|&p| resolved.get(p).map(|op| (p, op)))
-}
 
 /// Serve a matched file-family rule. Returns `None` only for a `x`/`xs` (cross)
 /// variant whose file is missing — that falls through to the real server.
@@ -6320,6 +6356,52 @@ mod tests {
             let line = format!("a.com resHeaders://{text}\n");
             assert_eq!(of(&line, "resHeaders").as_deref(), Some(text), "{text}");
         }
+    }
+
+    /// `file://`, `redirect://`, `statusCode://` and a bare destination URL
+    /// share **one slot** upstream — none of their names is a protocol, so all
+    /// of them land in the same list and the first match wins outright.
+    ///
+    /// This port had a fixed protocol priority instead (redirect, statusCode,
+    /// file) *and* let a destination rewrite apply alongside a mock, so the two
+    /// implementations disagreed in whichever direction the file happened to be
+    /// written.
+    #[test]
+    fn the_short_circuit_family_shares_one_slot() {
+        let winner = |text: &str, url: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let (scheme, rest) = url.split_once("://").expect("absolute");
+            let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}")))
+                .unwrap_or((rest, "/".into()));
+            let info =
+                build_req_info("GET", scheme, host, 80, &path, &HeaderMap::new(), None);
+            let resolved = mgr.resolve(&info);
+            slot_winner(&resolved).map(|(p, _)| p)
+        };
+
+        // Written first wins, whatever the protocols are.
+        let forward_first = "example.com http://127.0.0.1:9000\nexample.com/api file:///mock.json\n";
+        assert_eq!(winner(forward_first, "http://example.com/api"), Some("rule"));
+        let mock_first = "example.com/api file:///mock.json\nexample.com http://127.0.0.1:9000\n";
+        assert_eq!(winner(mock_first, "http://example.com/api"), Some("file"));
+
+        // …including against the two that used to be hard-coded ahead of file.
+        let file_first = "a.com file:///mock.json\na.com redirect://http://x/\n";
+        assert_eq!(winner(file_first, "http://a.com/"), Some("file"));
+        let redirect_first = "a.com redirect://http://x/\na.com file:///mock.json\n";
+        assert_eq!(winner(redirect_first, "http://a.com/"), Some("redirect"));
+        let status_first = "a.com statusCode://204\na.com file:///mock.json\n";
+        assert_eq!(winner(status_first, "http://a.com/"), Some("statusCode"));
+
+        // An important line still wins over an earlier normal one — importance
+        // is part of the resolution order the slot is decided by.
+        let important = "a.com file:///mock.json\n$a.com statusCode://204\n";
+        assert_eq!(winner(important, "http://a.com/"), Some("statusCode"));
+
+        // `rule://<name>` is the values-store include, not a destination, so it
+        // does not compete.
+        assert_eq!(winner("a.com rule://mocks\n", "http://a.com/"), None);
     }
 
     #[test]
