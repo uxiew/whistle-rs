@@ -166,9 +166,6 @@
 | 合并规则优先级相反 | 上游 `mergeRule` 让**后并入的胜出**（`util/index.js:2147-2170`）：包含进来的文件覆盖包含它的文件。本移植是 `or_insert` + `extend`，于是「专门拉进来做覆盖的规则」输给了它要覆盖的东西 |
 | `${key}` 值引用 | 只认整值 `{name}`；上游 `resolveVar` 还替换值**内部**的 `${name}`（`rules.js:39,:774-783`），`resHeaders://x-v=${myval}` 此前带着八个字面字符发给源站 |
 | 内嵌值块 | ``` 围栏块声明命名值（`util/index.js:208-218`），此前围栏行被当成规则行、`{mock.json}` 解析为空。连带补上「值即内容」标记 —— 否则替换成功后 file 层会把 JSON 当**路径**去开 |
-| `reqDelay://` 跳过短路 | 上游在独立管线阶段延迟（`data.js:534`），先于 abort 与所有短路 |
-| `urlReplace` / `params` 顺序颠倒 | 上游先写 query 再替换（`req.js:561,:569`） |
-| `$` 展开打碎非 ASCII | `bytes[i] as char` 把每个 UTF-8 字节当 Latin-1 标量 |
 | `file`/`redirect`/`statusCode`/`tpl`/裸 URL 共用一个槽位 | 这五族在上游都不是协议名，`parseRule` 把它们归入同一个 `rule` 列表（`rules.js:1313-1316`），`getRule` 取**首个命中**（`:799-800`）—— 先写的胜出、其余完全不生效。本移植是固定协议优先级（redirect → statusCode → file）**且**允许目的地改写与 mock 并存，于是同一份文件在两边的行为按书写顺序往两个方向分歧 |
 | `(inline)` 只对 file 族展开 | 上游 `getValue` 对**每个**算子展开（`rules.js:271-287`），`reqBody://(Hello)` 是它自己的文档示例，此前带括号原样发给源站。连带修掉一个**崩溃**：`fixed_value` 先按字节切括号再判断，值以多字节字符开头时 panic —— 这条路径现在每个算子都走 |
 | 同名 header 只发一条 | `qs.parse("a=1&a=2")` 得到数组，Node 逐元素各发一行。已按上游重新取回核对（非推断）。相邻的「不 trim 键名」一条**刻意不对齐**：`qs.parse` 会留下带尾随空格的键名，那不是合法 token，hyper 会拒绝、上游 `setHeader` 也会抛 —— 照抄等于把算子变成静默空操作 |
@@ -179,7 +176,7 @@
 | `enable://gzip` 单独出现时不生效 | `needs_body` 不把强制编码算在内，响应因而走流式路径，`reencode` 根本到不了 —— 只有当同一行上碰巧另有算子把 body 缓冲下来时它才像是生效。它是唯一一个「要整个 body 却一个字节都不改写」的算子，现把 `force_encoding` 挂在 `ResBodyOps` 上让 `needs_body` 看得见；无 body 的响应仍不被拖上缓冲路径。连带修掉一个更糟的（它此前藏在这条路径走不到的地方）：**解不开的体会被摘掉原编码头**。`reencode` 对非明文的体拒绝强制编码并回报 `Identity`，而照此调用 `set_content_encoding` 是把 `content-encoding: zstd` **删掉** —— 客户端收到 zstd 字节却被告知是明文。现在这种响应连头带体原样奉还 |
 | 重放不带请求体 | `do_replay` 抄下每个抓到的请求头却发 `Empty::new()`：重放一个 POST 会声明 `content-length: 402` 而后面一个字节没有。现按抓到的**已解码**预览发送，`content-length` 按实发重算，`content-encoding` / `transfer-encoding` 随之去掉，截断与解不开两种情形逐条报给控制台 |
 
-### 尚未修（6 条，其中 2 条是部分剩余）
+### 尚未修（7 条，其中 2 条是部分剩余）
 
 **这些是结构性的，不是能顺手补的补丁**，逐条记明原因：
 
