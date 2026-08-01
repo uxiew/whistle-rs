@@ -52,6 +52,7 @@ const state = {
   group: 'default',    // the rule group being edited
   values: {},
   prettyBody: true,    // re-indent a JSON body dump
+  status: null,
 };
 
 /** The two CodeMirror instances, created once on first use of their pane. */
@@ -172,7 +173,30 @@ function renderSidebar() {
   bar.innerHTML = '';
   if (state.pane === 'requests') return renderClientList(bar);
   if (state.pane === 'rules') return renderGroupList(bar);
-  return renderValueList(bar);
+  if (state.pane === 'values') return renderValueList(bar);
+  return renderPluginList(bar);
+}
+
+function renderPluginList(bar) {
+  const plugins = (state.status && state.status.plugins) || [];
+  sideTitle(bar, 'Plugins');
+  if (!plugins.length) {
+    const empty = el('div', 'side-item');
+    empty.innerHTML = '<span class="side-name muted">none registered</span>';
+    bar.appendChild(empty);
+    return;
+  }
+  for (const p of plugins) {
+    // A remote plugin that has never answered has no manifest, and that is
+    // worth seeing: it means the proxy has never reached it.
+    const item = sideItem(bar, {
+      label: p.name,
+      count: p.hooks ? p.hooks.length : '?',
+      dot: true,
+      onClick: () => window.open('/plugin/' + encodeURIComponent(p.name) + '/', '_blank'),
+    });
+    item.title = p.hooks ? p.hooks.join(', ') : 'no manifest — never reached';
+  }
 }
 
 function sideTitle(bar, text) {
@@ -551,6 +575,42 @@ function saveValues() {
     .catch(() => { status.textContent = 'Save failed'; });
 }
 
+const YES_NO = (v) => (v ? 'yes' : 'no');
+
+function loadStatus() {
+  return fetch('/api/status').then((r) => r.json()).then((st) => {
+    state.status = st;
+    renderSidebar();
+    const proxyHost = (st.host || '127.0.0.1') + ':' + st.port;
+    $('status-body').innerHTML = '<div class="cards">' + [
+      card('Proxy', [
+        ['Version', st.version],
+        ['HTTP', proxyHost],
+        ['SOCKS', st.socks_port ? (st.host || '127.0.0.1') + ':' + st.socks_port : 'off'],
+        ['Idle timeout', st.timeout_ms + ' ms'],
+      ]),
+      card('TLS', [
+        ['Intercept HTTPS', YES_NO(st.intercept_https)],
+        ['Verify origin', st.insecure_upstream ? 'NO — --insecure-upstream' : 'yes'],
+        ['Root CA', st.root_ca],
+      ]),
+      card('Capture', [
+        ['Sessions held', st.sessions],
+        ['WS frames held', st.frames],
+        ['Body preview cap', fmtBytes(st.body_preview_cap)],
+        ['Persist', st.persist_sessions ? st.persist_days + ' days' : 'off'],
+      ]),
+      card('Rules', [
+        ['Active rules', st.rules],
+        ['Storage', st.storage_dir],
+      ]),
+    ].join('') + '</div>'
+      + '<p class="hint">Certificate: <a href="/rootCA.crt">download</a> · '
+      + 'PAC: <a href="/proxy.pac">/proxy.pac</a> · '
+      + 'Export: <a href="/sessions.har" download>HAR</a></p>';
+  });
+}
+
 function postJson(url, obj, method) {
   return fetch(url, {
     method: method || 'POST',
@@ -566,7 +626,7 @@ function showPane(name) {
   for (const btn of $('nav').children) {
     btn.setAttribute('aria-selected', String(btn.dataset.pane === name));
   }
-  for (const key of ['requests', 'rules', 'values']) {
+  for (const key of ['requests', 'rules', 'values', 'status']) {
     $('pane-' + key).hidden = key !== name;
   }
   // The whole control, not just the input: the magnifier is a pseudo-element
@@ -575,6 +635,7 @@ function showPane(name) {
   renderSidebar();
   if (name === 'rules') loadRules();
   if (name === 'values') loadValues();
+  if (name === 'status') loadStatus();
   // A CodeMirror that was resized while hidden has stale measurements.
   const cm = editors[name];
   if (cm) setTimeout(() => cm.refresh(), 0);

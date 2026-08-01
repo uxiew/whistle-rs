@@ -518,6 +518,10 @@ table.requests tbody tr[aria-selected="true"] .muted { color: var(--accent-fg); 
   padding: 0 14px 14px;
 }
 
+#pane-status .detail-body { padding: 14px; }
+
+#pane-status .hint a { color: var(--accent); }
+
 .empty {
   display: flex;
   align-items: center;

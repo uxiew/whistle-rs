@@ -15,6 +15,7 @@
     <button role="tab" data-pane="requests" aria-selected="true">Requests</button>
     <button role="tab" data-pane="rules" aria-selected="false">Rules</button>
     <button role="tab" data-pane="values" aria-selected="false">Values</button>
+    <button role="tab" data-pane="status" aria-selected="false">Status</button>
   </div>
   <span class="spacer"></span>
   <a class="icon-btn" href="/rootCA.crt" title="Download the root certificate">⛨</a>
@@ -74,6 +75,11 @@
         <span class="spacer"></span>
         <span class="status" id="rules-status"></span>
       </div>
+    </section>
+
+    <!-- ── Status ──────────────────────────────────────────────────── -->
+    <section class="pane" id="pane-status" hidden>
+      <div class="detail-body" id="status-body"><div class="empty">loading…</div></div>
     </section>
 
     <!-- ── Values ──────────────────────────────────────────────────── -->

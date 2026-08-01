@@ -42,6 +42,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("GET", "/api/rule-group") => rule_group_get(state, &req),
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
         ("POST", "/api/sessions/clear") => sessions_clear(state),
+        ("GET", "/api/status") => status_json(state).await,
         ("GET", "/plugin") => redirect_to("/plugin/"),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => not_found(),
@@ -595,6 +596,70 @@ fn json_error(msg: &str) -> Response<DynBody> {
         .status(StatusCode::BAD_REQUEST)
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(body)))
+        .unwrap()
+}
+
+/// The hooks a manifest declares, named the way the docs name them.
+fn hook_names(m: &crate::plugins::PluginManifest) -> Vec<&'static str> {
+    [
+        (m.request_hook, "request"),
+        (m.response_hook, "response"),
+        (m.pipe_request, "pipe/request"),
+        (m.pipe_response, "pipe/response"),
+        (m.ws_frame, "ws/frames"),
+        (m.auth, "auth"),
+        (m.sni, "sniCallback"),
+        (m.req_stats || m.res_stats, "stats"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect()
+}
+
+/// What this proxy is, right now.
+///
+/// Everything here is otherwise only visible in the startup log, which is gone
+/// by the time you have a question — "which port is SOCKS on", "is that plugin
+/// actually registered", "where does the root certificate live", "is upstream
+/// verification off". The console can answer them without a restart.
+async fn status_json(state: &Arc<AppState>) -> Response<DynBody> {
+    let cfg = &state.config;
+    let plugins: Vec<serde_json::Value> = {
+        let mut out = Vec::new();
+        for name in state.plugins.names() {
+            let manifest = state.plugins.manifest(&name).await;
+            out.push(serde_json::json!({
+                "name": name,
+                // A remote plugin that has never answered has no manifest yet,
+                // which is itself worth seeing.
+                "hooks": manifest.map(|m| hook_names(&m)),
+                "remote": cfg.plugins.get(&name),
+            }));
+        }
+        out
+    };
+    let body = serde_json::json!({
+        "version": crate::config::VERSION,
+        "port": cfg.port,
+        "host": cfg.host.map(|h| h.to_string()),
+        "socks_port": cfg.socks_port,
+        "intercept_https": cfg.intercept_https,
+        "insecure_upstream": super::upstream::insecure_upstream(),
+        "storage_dir": cfg.storage_dir.to_string_lossy(),
+        "root_ca": cfg.root_ca_cert_path().to_string_lossy(),
+        "body_preview_cap": cfg.body_preview_cap,
+        "persist_sessions": cfg.persist_sessions,
+        "persist_days": cfg.persist_days,
+        "timeout_ms": cfg.timeout_ms,
+        "rules": state.rules.read().unwrap().len(),
+        "sessions": state.sessions.lock().unwrap().len(),
+        "frames": state.ws_frames.lock().unwrap().len(),
+        "plugins": plugins,
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body.to_string())))
         .unwrap()
 }
 

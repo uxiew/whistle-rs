@@ -363,7 +363,10 @@ pub fn set_insecure_upstream(insecure: bool) {
     INSECURE_UPSTREAM.store(insecure, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn insecure_upstream() -> bool {
+/// Is origin certificate verification off? Read by the TLS builder, and by the
+/// console's status endpoint — a proxy running with verification disabled
+/// should be able to say so.
+pub fn insecure_upstream() -> bool {
     INSECURE_UPSTREAM.load(std::sync::atomic::Ordering::Relaxed)
 }
 
