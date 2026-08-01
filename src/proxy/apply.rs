@@ -1825,7 +1825,12 @@ pub fn apply_response_for(
 
     // Injected content is useless behind a CSP that forbids it, or cached for
     // the next load; whistle strips both (`res.js:1093-1101`).
-    if injects_into_body(&parts.headers, resolved) {
+    if injects_into_body(
+        &parts.headers,
+        resolved,
+        parts.status.as_u16(),
+        info.map_or("GET", |i| i.method.as_str()),
+    ) {
         if !enabled_flags(resolved).contains("keepCSP")
             && !enabled_flags(resolved).contains("keepAllCSP")
         {
@@ -2398,7 +2403,14 @@ fn encode_non_latin1(s: &str) -> String {
 /// runs — it looks only at whether a rule produced content
 /// (`_original/lib/inspectors/res.js:1093`) — so a refused injection still
 /// costs the response its CSP and its cacheability.
-fn injects_into_body(headers: &HeaderMap, resolved: &Resolved) -> bool {
+fn injects_into_body(headers: &HeaderMap, resolved: &Resolved, status: u16, method: &str) -> bool {
+    // A response with no body has nothing to inject into, so nothing to clear a
+    // CSP or a cache for either. Upstream's `hasResBody` gate covers both
+    // (`_original/lib/inspectors/res.js:1097-1113`); without it a `302` came
+    // back with `Cache-Control: no-store`, a past `Expires` and no CSP.
+    if !super::response_has_body(status, method) {
+        return false;
+    }
     let class = headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

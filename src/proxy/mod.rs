@@ -1205,8 +1205,9 @@ fn known_server_ip(target: &upstream::Target, reached: Option<SocketAddr>) -> Op
 /// same response inspectors over all three (`_original/lib/inspectors/res.js`
 /// is reached whether the bytes came from a server, a plugin, or a local file),
 /// so they must run the same set here too.
+#[derive(Default)]
 struct ResBodyOps {
-    /// `resSpeed://` — throttle, in kB/s.
+    /// `resSpeed://` — throttle, in kilobits/s.
     speed: Option<f64>,
     /// `resScript://` — the loaded source, not the rule value.
     script: Option<String>,
@@ -1224,7 +1225,28 @@ struct ResBodyOps {
 }
 
 impl ResBodyOps {
-    fn of(resolved: &Resolved) -> Self {
+    /// The body operators in force, given what the response *is*.
+    ///
+    /// `has_body` is whistle's `util.hasBody` (`_original/lib/util/common.js:370-380`):
+    /// false for a `HEAD` request and for a 1xx, 204 or **any 3xx** status. When
+    /// it is false upstream drops every body operator on the floor —
+    /// `getRuleValue(..., !hasResBody, ...)` returns `undefined` for each inject
+    /// value (`res.js:988` → `util/index.js:1394-1396`) and the speed/body/top/
+    /// bottom keys are deleted outright (`res.js:1106-1113`).
+    ///
+    /// This port had no such gate, so `resAppend://X` gave a `302` a body,
+    /// stripped its `Content-Length`, and — because the injection also stamps
+    /// `Cache-Control: no-store` and strips CSP — rewrote the headers of a
+    /// redirect the rule was never meant to touch.
+    fn of(resolved: &Resolved, has_body: bool) -> Self {
+        if !has_body {
+            // The trailers still apply: they are headers, not a body, and
+            // upstream folds them in after this gate (`res.js:1250-1290`).
+            return ResBodyOps {
+                trailers: apply::build_trailers(resolved),
+                ..ResBodyOps::default()
+            };
+        }
         ResBodyOps {
             speed: apply::res_speed_kbps(resolved),
             script: apply::res_script_op(resolved)
@@ -1252,6 +1274,20 @@ impl ResBodyOps {
             || self.write_raw.is_some()
             || !self.trailers.is_empty()
     }
+}
+
+/// Does this response carry a body a rule may rewrite? whistle's `hasBody`
+/// (`_original/lib/util/common.js:370-380`).
+///
+/// A `HEAD` answer, a 1xx, a 204 and every 3xx are excluded — a redirect with a
+/// body injected into it is not the redirect the origin sent, and the operators
+/// that come with an injection (the cache and CSP strips) have no business
+/// touching it either.
+pub(crate) fn response_has_body(status: u16, method: &str) -> bool {
+    if method.eq_ignore_ascii_case("HEAD") {
+        return false;
+    }
+    !(status == 204 || (300..400).contains(&status) || (100..200).contains(&status))
 }
 
 /// The operators that rewrite an already-transformed body: `resScript://`, the
@@ -1513,7 +1549,10 @@ async fn finish_local_response(
         }
     }
 
-    let ops = ResBodyOps::of(resolved);
+    let ops = ResBodyOps::of(
+        resolved,
+        response_has_body(parts.status.as_u16(), &info.method),
+    );
     let res_ct = parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
@@ -2171,7 +2210,10 @@ async fn serve(
     )
     .await;
 
-    let ops = ResBodyOps::of(&resolved);
+    let ops = ResBodyOps::of(
+        &resolved,
+        response_has_body(parts.status.as_u16(), &info.method),
+    );
     let res_ct = parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
@@ -2603,6 +2645,29 @@ fn authority_host_port(uri: &Uri) -> Option<(String, u16)> {
     let host = auth.host().to_string();
     let port = auth.port_u16().unwrap_or(443);
     Some((host, port))
+}
+
+#[cfg(test)]
+mod body_gate_tests {
+    /// A response with no body is not a response to inject into. whistle's
+    /// `hasBody` (`_original/lib/util/common.js:370-380`) excludes a `HEAD`
+    /// answer, 1xx, 204 and every 3xx — and a redirect that arrives with an
+    /// injected body, a stripped `Content-Length`, `Cache-Control: no-store` and
+    /// no CSP is not the redirect the origin sent.
+    #[test]
+    fn only_a_response_that_carries_a_body_may_be_rewritten() {
+        use super::response_has_body;
+
+        for status in [200, 201, 205, 400, 404, 500] {
+            assert!(response_has_body(status, "GET"), "{status}");
+        }
+        for status in [100, 101, 199, 204, 300, 301, 302, 304, 307, 399] {
+            assert!(!response_has_body(status, "GET"), "{status}");
+        }
+        // A HEAD answer never has one, whatever the status says.
+        assert!(!response_has_body(200, "HEAD"));
+        assert!(!response_has_body(200, "head"));
+    }
 }
 
 #[cfg(test)]
