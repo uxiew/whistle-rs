@@ -853,7 +853,12 @@ pub struct Session {
     /// costs nothing: an empty `Vec` allocates nothing and serializes to nothing.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<MatchedOp>,
-    /// Outgoing request headers (as forwarded upstream).
+    /// Request headers: the outgoing ones when the request was forwarded, and
+    /// the client's own when it was answered here.
+    ///
+    /// The two are the same list seen from the two sides of a hop that a mocked
+    /// request never makes — see [`capture_client_request`]. Which one a session
+    /// holds follows from its `target`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub req_headers: Vec<(String, String)>,
     /// Response headers (as returned to the client).
@@ -887,6 +892,70 @@ fn header_pairs(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
 fn has_request_body(headers: &hyper::HeaderMap) -> bool {
     headers.contains_key(hyper::header::CONTENT_LENGTH)
         || headers.contains_key(hyper::header::TRANSFER_ENCODING)
+}
+
+/// Capture what the client sent, on a path that answers without forwarding it.
+///
+/// A short-circuit (`file://`, `redirect://`, `statusCode://`, a template) and a
+/// plugin-answered request never build an outgoing request, so the recording
+/// sites there had nothing to put in `req_headers`/`req_body` and left both
+/// empty. The console's Request Header and Request Body tabs were therefore
+/// blank for **every mocked request** — and looking at what the client sent to
+/// an endpoint you have just mocked is an ordinary thing to want to do. It is an
+/// inspection gap in the primary tool, not merely a limit on replay.
+///
+/// The headers are the client's own rather than a forwarded request's, because
+/// on these paths there is no forwarded request to report. Showing the
+/// rule-rewritten headers instead would name a hop that never happened.
+///
+/// The body is read to its end and discarded, keeping only the bounded preview.
+/// Nothing downstream is waiting for these bytes, but the preview is what the
+/// console shows and the total is what the traffic column counts — and reading
+/// it is what a keep-alive connection needs anyway before the next request on it
+/// can be framed. Memory is the preview cap, not the upload: a 1 GB POST to a
+/// mocked endpoint costs 16 KiB here, because [`Capture`] stops copying once the
+/// preview is full.
+async fn capture_client_request(
+    req: &mut Request<DynBody>,
+    preview_cap: usize,
+) -> (Vec<(String, String)>, Option<Capture>) {
+    let headers = header_pairs(req.headers());
+    if !has_request_body(req.headers()) {
+        return (headers, None);
+    }
+    let capture = Capture::new(
+        header_str(req.headers(), hyper::header::CONTENT_TYPE),
+        header_str(req.headers(), hyper::header::CONTENT_ENCODING).as_deref(),
+        preview_cap,
+    );
+    // Taken out rather than moved out of the request: the plugin path answers
+    // from inside a loop over the matched plugins, where a move out of `req`
+    // would be a move in a previous iteration.
+    let body = std::mem::replace(req.body_mut(), body::empty());
+    drain_into_capture(body, &capture).await;
+    (headers, Some(capture))
+}
+
+/// Read `body` to its end, keeping only what `capture` has room for.
+///
+/// A client that hangs up mid-body ends the loop rather than failing the
+/// request: the answer is already decided on these paths, and what arrived is
+/// what there is to show.
+async fn drain_into_capture(mut body: DynBody, capture: &Capture) {
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    capture.append(data);
+                }
+            }
+            Err(err) => {
+                tracing::debug!("client body ended early: {err:#}");
+                break;
+            }
+        }
+    }
+    capture.finish();
 }
 
 /// Convert a plugin-produced response into a real HTTP response, body and all.
@@ -1029,6 +1098,108 @@ fn matched_ops(resolved: &Resolved) -> Vec<MatchedOp> {
             raw: op.raw.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod client_capture_tests {
+    use super::*;
+
+    /// A request with a body, as the client sent it.
+    fn posted(body: &'static [u8], content_type: &str) -> Request<DynBody> {
+        Request::builder()
+            .method("POST")
+            .uri("http://example.com/api/items")
+            .header("content-type", content_type)
+            .header("content-length", body.len())
+            .header("x-tenant", "acme")
+            .body(body::full(Bytes::from_static(body)))
+            .expect("a request")
+    }
+
+    /// The gap this closes: a mocked request recorded neither its headers nor
+    /// its body, so the console's Request Header and Request Body tabs were
+    /// blank for every request a rule answered locally.
+    #[tokio::test]
+    async fn a_request_answered_locally_still_records_what_the_client_sent() {
+        let mut req = posted(br#"{"name":"third"}"#, "application/json");
+        let (headers, body) = capture_client_request(&mut req, BODY_PREVIEW_CAP).await;
+
+        assert_eq!(
+            headers.iter().find(|(k, _)| k == "x-tenant").map(|(_, v)| v.as_str()),
+            Some("acme"),
+        );
+        let (len, truncated, text) = body.expect("a captured body").snapshot();
+        assert_eq!((len, truncated, text.as_str()), (16, false, r#"{"name":"third"}"#));
+    }
+
+    /// Memory is the preview cap, not the upload. A large POST to a mocked
+    /// endpoint must not be held whole just to be shown.
+    #[tokio::test]
+    async fn a_large_upload_costs_the_preview_not_the_body() {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("http://example.com/upload")
+            .header("content-type", "text/plain")
+            .header("content-length", 200_000)
+            .body(body::full(Bytes::from(vec![b'x'; 200_000])))
+            .expect("a request");
+        let (_, body) = capture_client_request(&mut req, 4096).await;
+
+        let capture = body.expect("a captured body");
+        let (len, truncated, text) = capture.snapshot();
+        // The total is honest — it is what the traffic column counts — while
+        // only the preview was kept.
+        assert_eq!(len, 200_000);
+        assert!(truncated);
+        assert_eq!(text.len(), 4096);
+    }
+
+    /// A `GET` has no body to capture, and must not be given an empty one: an
+    /// empty capture reads as "there was a body and it was empty".
+    #[tokio::test]
+    async fn a_request_without_a_body_captures_only_its_headers() {
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("http://example.com/")
+            .header("accept", "*/*")
+            .body(body::empty())
+            .expect("a request");
+        let (headers, body) = capture_client_request(&mut req, BODY_PREVIEW_CAP).await;
+        assert!(body.is_none());
+        assert_eq!(headers.len(), 1);
+    }
+
+    /// The body is taken out of the request, not left to be sent twice. The
+    /// plugin path answers from inside a loop and goes on to use `req`.
+    #[tokio::test]
+    async fn capturing_leaves_the_request_without_its_body() {
+        let mut req = posted(b"payload", "text/plain");
+        let _ = capture_client_request(&mut req, BODY_PREVIEW_CAP).await;
+        let left = collect_body(std::mem::replace(req.body_mut(), body::empty()))
+            .await
+            .expect("an empty body");
+        assert!(left.is_empty());
+    }
+
+    /// A compressed upload is previewed decoded, the same as on the forwarded
+    /// path — the tab shows what was sent, not the deflate stream.
+    #[tokio::test]
+    async fn a_compressed_upload_is_previewed_decoded() {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b"upload me").expect("gzip");
+        let gz = e.finish().expect("gzip");
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("http://example.com/api")
+            .header("content-type", "text/plain")
+            .header("content-encoding", "gzip")
+            .header("content-length", gz.len())
+            .body(body::full(Bytes::from(gz)))
+            .expect("a request");
+        let (_, body) = capture_client_request(&mut req, BODY_PREVIEW_CAP).await;
+        assert_eq!(body.expect("a captured body").snapshot().2, "upload me");
+    }
 }
 
 #[cfg(test)]
@@ -2288,7 +2459,7 @@ async fn serve(
     // the proxy's streaming fast path is untouched. A `b:` filter may already
     // have bought the bytes above, in which case this costs nothing but the
     // manifest lookup.
-    let (req, plugin_req_body): (Request<DynBody>, Option<Bytes>) = {
+    let (mut req, plugin_req_body): (Request<DynBody>, Option<Bytes>) = {
         let wants_body = !plugin_matches.is_empty()
             && has_request_body(req.headers())
             && state.plugins.any_wants_request_body(&plugin_names).await;
@@ -2372,6 +2543,10 @@ async fn serve(
                     )
                     .await
                 };
+                // What the client sent, which no outgoing request will carry
+                // here — see `capture_client_request`.
+                let (req_headers, req_body) =
+                    capture_client_request(&mut req, state.config.body_preview_cap).await;
                 state.record(Session {
                     id: 0,
                     time_ms,
@@ -2383,9 +2558,10 @@ async fn serve(
                     duration_ms: started.elapsed().as_millis(),
                     log: log_labels(&resolved),
                     rules: matched_ops(&resolved),
+                    req_headers,
                     res_headers: header_pairs(response.headers()),
+                    req_body,
                     res_body,
-                    ..Default::default()
                 });
                 return Ok(response);
             }
@@ -2447,6 +2623,10 @@ async fn serve(
             },
         )
         .await;
+        // What the client sent, which no outgoing request will carry here — see
+        // `capture_client_request`.
+        let (req_headers, req_body) =
+            capture_client_request(&mut req, state.config.body_preview_cap).await;
         state.record(Session {
             id: 0,
             time_ms,
@@ -2458,9 +2638,10 @@ async fn serve(
             duration_ms: started.elapsed().as_millis(),
             log: log_labels(&resolved),
             rules: matched_ops(&resolved),
+            req_headers,
             res_headers: header_pairs(resp.headers()),
+            req_body,
             res_body,
-            ..Default::default()
         });
         return Ok(resp);
     }
