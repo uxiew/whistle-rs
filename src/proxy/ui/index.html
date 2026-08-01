@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>whistle-rs</title>
+<style>/*__CM_CSS__*/</style>
 <style>/*__CSS__*/</style>
 </head>
 <body>
@@ -61,8 +62,7 @@
     <!-- ── Rules ───────────────────────────────────────────────────── -->
     <section class="pane" id="pane-rules" hidden>
       <div class="editor-wrap">
-        <textarea class="editor" id="rules-editor" spellcheck="false"
-                  placeholder="pattern  operator1  operator2  …"></textarea>
+        <textarea id="rules-editor" placeholder="pattern  operator1  operator2  …"></textarea>
         <p class="hint">One rule per line. <code>example.com http://localhost:5173</code> forwards a
           site; <code>host://1.2.3.4</code> only moves the socket. See <code>docs/RULES.md</code>.</p>
       </div>
@@ -76,8 +76,7 @@
     <!-- ── Values ──────────────────────────────────────────────────── -->
     <section class="pane" id="pane-values" hidden>
       <div class="editor-wrap">
-        <textarea class="editor" id="values-editor" spellcheck="false"
-                  placeholder='{ "mock.json": "{\"ok\":true}" }'></textarea>
+        <textarea id="values-editor" placeholder='{ "mock.json": "{\"ok\":true}" }'></textarea>
         <p class="hint">A JSON object of named values. Reference one from any operator as
           <code>{name}</code>, or pull a whole rules text in with <code>rule://name</code>.</p>
       </div>
@@ -90,6 +89,8 @@
   </div>
 </div>
 
+<script>/*__CM_JS__*/</script>
+<script>/*__MODE_JS__*/</script>
 <script>/*__JS__*/</script>
 </body>
 </html>

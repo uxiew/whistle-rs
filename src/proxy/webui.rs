@@ -769,7 +769,18 @@ fn index_html(state: &Arc<AppState>) -> String {
         .map(|h| h.to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     include_str!("ui/index.html")
+        .replace("/*__CM_CSS__*/", include_str!("ui/vendor/codemirror.css"))
         .replace("/*__CSS__*/", include_str!("ui/app.css"))
+        .replace(
+            "/*__CM_JS__*/",
+            &[
+                include_str!("ui/vendor/codemirror.js"),
+                include_str!("ui/vendor/mode-javascript.js"),
+                include_str!("ui/vendor/addon-placeholder.js"),
+            ]
+            .join("\n;\n"),
+        )
+        .replace("/*__MODE_JS__*/", include_str!("ui/mode-whistle.js"))
         .replace("/*__JS__*/", include_str!("ui/app.js"))
         .replace("__VERSION__", crate::config::VERSION)
         .replace("__HOST__", &host)

@@ -588,12 +588,12 @@ pre.dump {
   padding: 10px 12px;
 }
 
-textarea.editor {
+/* CodeMirror, dressed in the console's own variables so there is one theme
+   rather than a page theme and an editor theme that drift apart. */
+.editor-wrap .CodeMirror {
   flex: 1 1 auto;
-  width: 100%;
   min-height: 0;
-  resize: none;
-  padding: 10px 12px;
+  height: auto;
   border: 1px solid var(--line);
   border-radius: 7px;
   background: var(--bg-sub);
@@ -601,13 +601,42 @@ textarea.editor {
   font-family: var(--mono);
   font-size: 12.5px;
   line-height: 1.6;
-  tab-size: 4;
 }
 
-textarea.editor:focus {
-  outline: none;
-  border-color: var(--accent);
-}
+.editor-wrap .CodeMirror-focused { border-color: var(--accent); }
+.editor-wrap .CodeMirror-scroll { padding: 6px 0; }
+.editor-wrap .CodeMirror-gutters { background: var(--bg-sub); border-right: 1px solid var(--line-soft); }
+.editor-wrap .CodeMirror-linenumber { color: var(--fg-faint); font-size: 11px; }
+.editor-wrap .CodeMirror-cursor { border-left-color: var(--fg); }
+.editor-wrap .CodeMirror-selected { background: color-mix(in srgb, var(--accent) 25%, transparent); }
+.editor-wrap .CodeMirror-focused .CodeMirror-selected { background: color-mix(in srgb, var(--accent) 32%, transparent); }
+.editor-wrap .CodeMirror-activeline-background { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+.editor-wrap .CodeMirror-placeholder { color: var(--fg-faint); }
+.editor-wrap .CodeMirror-matchingbracket { color: var(--accent); font-weight: 600; }
+
+/* The token palette. `def` is a rule's pattern, `keyword` an operator's
+   protocol, `atom` a filter, `variable-2` a wildcard or a `$1` capture,
+   `variable-3` a `{value}` reference, and `error` a line that parses to
+   nothing at all. */
+.cm-s-default .cm-comment  { color: var(--fg-faint); font-style: italic; }
+.cm-s-default .cm-def      { color: var(--accent); font-weight: 600; }
+.cm-s-default .cm-keyword  { color: #b5539a; }
+.cm-s-default .cm-operator { color: var(--fg-faint); }
+.cm-s-default .cm-string   { color: var(--fg); }
+.cm-s-default .cm-atom     { color: #1f8a70; }
+.cm-s-default .cm-meta     { color: #b5720a; }
+.cm-s-default .cm-variable-2 { color: #d2691e; font-weight: 600; }
+.cm-s-default .cm-variable-3 { color: #7a5cc7; }
+.cm-s-default .cm-number   { color: #1f8a70; }
+.cm-s-default .cm-property { color: var(--accent); }
+.cm-s-default .cm-error    { color: var(--err); text-decoration: underline wavy var(--err); }
+
+:root[data-theme="dark"] .cm-s-default .cm-keyword    { color: #e08fce; }
+:root[data-theme="dark"] .cm-s-default .cm-atom       { color: #4fc7a5; }
+:root[data-theme="dark"] .cm-s-default .cm-number     { color: #4fc7a5; }
+:root[data-theme="dark"] .cm-s-default .cm-meta       { color: #e0a94f; }
+:root[data-theme="dark"] .cm-s-default .cm-variable-2 { color: #ffa657; }
+:root[data-theme="dark"] .cm-s-default .cm-variable-3 { color: #b39ae8; }
 
 .hint {
   margin: 6px 2px 0;

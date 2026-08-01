@@ -53,6 +53,44 @@ const state = {
   values: {},
 };
 
+/** The two CodeMirror instances, created once on first use of their pane. */
+const editors = { rules: null, values: null };
+
+/**
+ * Attach CodeMirror to a textarea, lazily.
+ *
+ * Lazily because a CodeMirror created inside a hidden pane measures itself as
+ * zero-height and stays that way until told otherwise; creating it when the
+ * pane is first shown avoids needing to know that.
+ */
+function editorFor(key) {
+  if (editors[key]) return editors[key];
+  const id = key + '-editor';
+  const cm = CodeMirror.fromTextArea($(id), {
+    mode: key === 'rules' ? 'text/x-whistle' : { name: 'javascript', json: true },
+    lineNumbers: true,
+    lineWrapping: true,
+    styleActiveLine: false,
+    matchBrackets: key === 'values',
+    tabSize: 2,
+    indentUnit: 2,
+    placeholder: $(id).getAttribute('placeholder') || '',
+    extraKeys: {
+      // ⌘S / Ctrl-S saves the pane, which is the only shortcut a rules file
+      // really wants; everything else is CodeMirror's own.
+      'Cmd-S': () => saveCurrentPane(),
+      'Ctrl-S': () => saveCurrentPane(),
+    },
+  });
+  editors[key] = cm;
+  return cm;
+}
+
+function saveCurrentPane() {
+  if (state.pane === 'rules') saveRules();
+  else if (state.pane === 'values') saveValues();
+}
+
 // ── request table ──────────────────────────────────────────────────────────
 
 const COLUMNS = [
@@ -229,9 +267,13 @@ function renderValueList(bar) {
       label: name,
       count: String(state.values[name]).length,
       onClick: () => {
-        const ta = $('values-editor');
-        const at = ta.value.indexOf('"' + name + '"');
-        if (at >= 0) { ta.focus(); ta.setSelectionRange(at, at + name.length + 2); }
+        const cm = editorFor('values');
+        const at = cm.getValue().indexOf('"' + name + '"');
+        if (at < 0) return;
+        const from = cm.posFromIndex(at);
+        cm.setSelection(from, cm.posFromIndex(at + name.length + 2));
+        cm.scrollIntoView(from, 60);
+        cm.focus();
       },
     });
   }
@@ -394,11 +436,16 @@ function selectGroup(name, keepStatus) {
   const url = name === 'default' ? '/api/rules' : '/api/rule-group?name=' + encodeURIComponent(name);
   return fetch(url)
     .then((r) => (name === 'default' ? r.text() : r.json().then((g) => g.text || '')))
-    .then((text) => { $('rules-editor').value = text; });
+    .then((text) => {
+      const cm = editorFor('rules');
+      cm.setValue(text);
+      cm.clearHistory();
+      cm.refresh();
+    });
 }
 
 function saveRules() {
-  const text = $('rules-editor').value;
+  const text = editorFor('rules').getValue();
   const status = $('rules-status');
   const done = (msg) => { status.textContent = msg; };
   if (state.group === 'default') {
@@ -436,13 +483,16 @@ function deleteGroup(name) {
 function loadValues() {
   return fetch('/api/values').then((r) => r.json()).then((v) => {
     state.values = v || {};
-    $('values-editor').value = JSON.stringify(state.values, null, 2);
+    const cm = editorFor('values');
+    cm.setValue(JSON.stringify(state.values, null, 2));
+    cm.clearHistory();
+    cm.refresh();
     renderSidebar();
   });
 }
 
 function saveValues() {
-  const text = $('values-editor').value;
+  const text = editorFor('values').getValue();
   const status = $('values-status');
   try { JSON.parse(text); } catch (e) { status.textContent = 'Invalid JSON: ' + e.message; return; }
   fetch('/api/values', { method: 'POST', body: text })
@@ -475,6 +525,9 @@ function showPane(name) {
   renderSidebar();
   if (name === 'rules') loadRules();
   if (name === 'values') loadValues();
+  // A CodeMirror that was resized while hidden has stale measurements.
+  const cm = editors[name];
+  if (cm) setTimeout(() => cm.refresh(), 0);
 }
 
 // ── wiring ─────────────────────────────────────────────────────────────────
@@ -482,6 +535,9 @@ function showPane(name) {
 function applyTheme(mode) {
   document.documentElement.setAttribute('data-theme', mode);
   try { localStorage.setItem('whistle-rs-theme', mode); } catch (e) { /* private mode */ }
+  // The editors read their colours from the same variables, but their measured
+  // line heights do not survive a repaint.
+  for (const cm of Object.values(editors)) if (cm) cm.refresh();
 }
 
 function initTheme() {
@@ -543,6 +599,15 @@ function init() {
 
   $('rules-save').addEventListener('click', saveRules);
   $('values-save').addEventListener('click', saveValues);
+
+  // ⌘F focuses the filter from anywhere, the way a request list should.
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'f' && state.pane === 'requests') {
+      e.preventDefault();
+      $('filter').focus();
+      $('filter').select();
+    }
+  });
 
   // Delete the selected group with the keyboard, since the source list has no
   // room for a per-row button without crowding the name.
