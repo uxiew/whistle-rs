@@ -53,10 +53,11 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   detail panel below it. Arrow keys walk the capture, `Copy as cURL` reproduces a
   request as the origin saw it, and a JSON body can be re-indented in place. A Status
   pane reports ports, TLS posture, the root CA path and the registered plugins.
-- **Rules editor with syntax highlighting** — CodeMirror with a whistle-specific mode
+- **Rules editor with syntax highlighting** — CodeMirror 6 with a whistle-specific mode
   that marks *which token the proxy will match on*, which is the one thing a rules
   file gets wrong silently. The mode runs the parser's own line split, and a test
-  holds the two together.
+  holds the two together. The console is a Vue 3 app built to a single
+  self-contained file — see [`ui-src/`](ui-src/).
 - **Traffic inspection** — each transaction records its request/response headers and a
   bounded body preview (captured via a streaming tee, so chunked/SSE responses are
   inspectable without breaking streaming; `gzip`/`deflate`/`br` bodies are decoded for

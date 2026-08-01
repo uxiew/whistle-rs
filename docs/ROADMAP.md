@@ -9,8 +9,9 @@
 > `rule` 协议）、别名算子层、本地文件/模板家族（含两遍替换与 `${var}` 运行时变量）、
 > `@`-includes、规则行级属性；**筛选器条件已全部可求值**；
 > **pattern 层已按上游三种通配符语义重写，`$0`–`$9` 子匹配传值可用**；
-> **⚠️ 「已应用」不等于「与上游逐位一致」** —— 本轮四路审计确认了 45 项行为差异，
-> 已修 12（含 7 项失败开放），其余 33 项逐条记录在下一节，**未修的没有被略去**；
+> **⚠️ 「已应用」不等于「与上游逐位一致」** —— 四路审计确认了 45 项行为差异，
+> **已修 33 项，失败开放已清空**；余下 12 项均为结构性改动，逐条记录在下一节并说明原因，
+> **未修的没有被略去**；
 > 单元测试 **500** 项全绿；`cargo build --all-targets` 与
 > `cargo clippy --all-targets` 均 **0 警告**（后者由 `Cargo.toml` 的 `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取）、上游代理、
@@ -127,72 +128,60 @@
 | `--no-intercept-https` 无实现 | 死字段 | 见上一节 |
 | `lineProps://originUrl` 无实现 | 死字段 | 见上一节 |
 
-### 尚未修（33，按严重度）
+### 已修（本轮追加 21 项，累计 33/45）
 
-**失败开放（规则做了不该做的）**
+上一轮记下 33 项未修，本轮修掉 21 项。**失败开放已清空**；剩余 12 项见下节。
 
-- `formatShorthand` 缺失：上游在切分前把 `/path/mock.json`、`(inline)`、`<verbatim>`、
-  `{key}`、`C:\…` 统统重写为 `file://…`（`rules.js:1766-1767,:219-260`）。本移植按原始
-  token 分类，且 `is_regexp_token` 比上游 `REG_EXP_RE` 宽得多，于是
-  `/Users/me/mock.json www.example.com` 把路径编译成**无锚点正则** `Users/me`，
-  两个域名反倒成了 URL 替换算子。算子在前的行只要用了这几种写法就整行走样。
-- `filter://<name>`：上游只有以 `/`(`i`) 结尾或 `*/` 开头的负载才是筛选器，其余是**折进
-  ignore 集**的算子（`rules.js:54,:61,:2188-2196`）；本移植一律当排除筛选器。
-- `skip://pattern=` / `operation=`、`ignore://pattern=` / `matcher=`：上游用 `_skipProps`
-  在扫描期跳过整条规则（`rules.js:1118-1147,:987-989`），本移植识别不了该键。
-- `disable://keepAlive` 作用在**响应**上，上游作用在**出站请求**上（`res.js:446-448`）；
-  且被本移植注释成「自有扩展」，该归属是错的。
-- `enable://abort` 的时机与取消：上游在**响应头回来之后**断连（`res.js:1175-1179`），
-  且可被 `disable://abort` 取消（`util/index.js:3905-3915`）；本移植在发请求前答 502。
+| 项 | 说明 |
+|----|------|
+| `formatShorthand` 缺失 | **最严重**。上游在切分行前展开每个 token（`rules.js:1766-1767`）；顺序承重 —— 没展开前路径没有协议，而**无协议的 token 正是切分器认定的 pattern**。`/Users/me/mock.json www.example.com api.example.com` 因此把路径当 pattern、把两个域名升格成目的地，且那条路径被过宽的正则判定接受、编译成**无锚点**的 `Users/me` |
+| `is_regexp_token` 过宽 | 收紧到上游封闭 flag 集（`REG_EXP_RE`），这是把 `/regexp/` 与文件路径区分开的依据 |
+| `filter://<name>` | `filter://` 是**两个算子共用一个名字**；只有 `/`(`i`) 结尾或 `*/` 开头的负载才是 URL 筛选器，其余命名的是要抑制的协议，上游折进 `ignore://` 同一集合 |
+| `includeFilter://(cond)` | 括号未剥离（`INLINE_RE`），负载掉进 URL pattern 分支，规则静默不生效 |
+| `disable://keepAlive` 作用错端 | 上游作用在**出站请求**（`res.js:446-448`），本移植作用在响应；注释里「自有扩展」的归属也是错的 |
+| `enable://abort` 时机与取消 | 两道闸门都可被 `disable://abort` 取消；abort 现在销毁 socket 而非回 502 |
+| `delete://query.x` 等整族 | `parseDelQuery`（`util/index.js:2669-2720`），含 `pathname[.N]` |
+| `accept-encoding` 未收敛 | 按 `removeUnsupportsHeaders` 收敛到 `gzip, br` —— Chrome 带 `zstd` 时，上一轮修好的压缩体改写会从请求侧整体失效 |
+| `reqReplace://` 对 form body 无效 | 上游归入 `FORM` 类（`req.js:434-438`） |
+| `auth://` 只认 `user:pass` | 补 `{json}`（含 `proxy:true` → `Proxy-Authorization`）与 `username=…&password=…` |
+| `reqHeaders://x=` 删头 | 上游发空值头；删除是 `delete://reqHeaders.x` |
+| `resHeaders://set-cookie` 覆盖 | 改为按 cookie 名合并（`setCookies`，`res.js:89-122`） |
+| trailers 四缺陷 | 源站 trailer、`disable://trailers`、非法 trailer 名过滤、trailers 分支吞掉 `resSpeed` |
+| dump 算子三缺陷 | 已存在即跳过（`enable://forceReqWrite` 才覆盖）、非 200 加 `.<状态码>` 后缀、`reqWrite` 按有无请求体设门 |
+| `disable://301` | 301→302 |
+| `replaceStatus://` 无谓覆盖 | 状态未变时不再改写 `WWW-Authenticate` |
+| `Location` 未重编码 | 补 `encodeNonLatin1Char`（比上游更宽，原因见代码注释） |
+| `delete://` 与注入顺序 | 删除移到 CSP/no-store 剥离之后 |
+| 方法名未大写 | 每个请求统一大写 |
+| `reqDelay://` 跳过短路 | 上游在独立管线阶段延迟（`data.js:534`），先于 abort 与所有短路；本移植等到转发处才等，于是 `reqDelay://` + `file://` 完全不延迟 —— 而这正是两者唯一的搭配用法 |
+| `urlReplace` / `params` 顺序颠倒 | 上游先写 query 再替换（`req.js:561,:569`） |
+| `$` 展开把非 ASCII 打碎 | `bytes[i] as char` 把每个 UTF-8 字节当 Latin-1 标量，`/搜索` → `/æ\u{90}\u{9c}ç´¢`；影响**所有** `$` 展开，不只 header |
+| 控制台「Saved」是假的 | 默认组规则与整个 Values 只写内存；且即便存盘也读不回来（`load_groups` 用 `add_group` 恢复，而 "default" 永远已存在）。两者现已往返落盘，命令行优先 |
 
-**失败静默（写了但不生效）**
+### 尚未修（12）
 
-- `delete://query.x` / `params.x` / `urlParams.x` / `pathname[.N]` 整族未解析
-  （`parseDelQuery`，`util/index.js:2669-2720`）。RULES.md 现有的「与上游一致地忽略」是错的。
-- 算子取值不支持**从文件 / 远程 URL / `(inline)` 读取**（`readRuleValue`，
-  `util/index.js:1174-1198`）：`reqBody://(Hello)` 是上游自己的文档示例，本移植发出字面
-  `(Hello)`；`reqHeaders:///etc/headers.json` 什么也不设。
-- `${key}` 值引用与反引号模板（`resolveVar`/`renderTpl`，`rules.js:762-783`）。
-- 内嵌值块（``` name … ``` 提升为命名值，`util/index.js:208-218`）。
-- `includeFilter://(cond)` / `<cond>` 的括号未剥离（`INLINE_RE`，`rules.js:62,:1549-1551`），
-  条件永不成立。
-- `reqReplace://` 对 `x-www-form-urlencoded` 请求体无效（上游归入 `FORM`，`req.js:434-438`）。
-- `accept-encoding` 未按 `removeUnsupportsHeaders`（`util/index.js:1549-1571`）收敛到
-  `gzip, br`：Chrome 会带 `zstd`，源站用 zstd 回，本移植的 body 改写就整体失效 ——
-  上一轮刚修好的压缩体改写，从请求侧又漏了回来。
-- `enable://gzip|br|deflate` 仅在同一行另有 body 算子时才生效。
-- SSE / 流式响应遇到任何 body 算子会**缓冲到流结束**（上游是流式替换且识别
-  `text/event-stream`，`res.js:140-142`），长连接等于挂死。
-- `auth://` 只认 `user:pass`，不认 `{json}`（含 `proxy:true` → `Proxy-Authorization`）、
-  `username=…&password=…`、文件路径（`util/index.js:3628-3662`）。
-- `reqHeaders://x=` 上游发空值头，本移植删除该头。
-- trailers 四缺陷：丢弃源站 trailer、无 `disable://trailers`、不过滤非法 trailer 名、
-  取 trailers 分支时静默丢掉 `resSpeed`。
-- `resHeaders://set-cookie=` 覆盖而非合并（上游 `setCookies` 按 cookie 名合并，`res.js:89-122`）。
-- `reqWrite`/`resWrite` 三缺陷：不做路径拼接（目录形态写不出文件）、总是追加而上游**已存在
-  即跳过**（`enable://forceReqWrite` 才覆盖）、非 200 上游会加 `.<状态码>` 后缀。
-- `disable://301`（301→302）未实现。
-- `replaceStatus://` 与原状态相同时仍覆盖 `WWW-Authenticate`（上游有 `!=` 守卫）。
-- 合并规则的优先级**相反**：上游 `mergeRule` 让后并入的规则**胜出**（`util/index.js:2147-2170`），
+**这些是结构性的，不是能顺手补的补丁**，逐条记明原因：
+
+- **SSE / 流式响应遇到 body 算子会缓冲到流结束**（上游是流式替换且识别 `text/event-stream`，
+  `res.js:140-142`）。本移植的 body 层建立在「整体缓冲后变换」之上，改成流式是重写该层。
+- **算子取值不支持从文件 / 远程 URL / `(inline)` 读取**（`readRuleValue`，`util/index.js:1174-1198`）。
+  `reqBody://(Hello)` 是上游自己的文档示例。需要一个值加载器贯穿规则层与算子层。
+- **`enable://gzip|br|deflate` 单独出现时不生效**。需要把响应强制走缓冲路径，且必须先加守卫 ——
+  否则会对一个解不开的编码（zstd 进）重压成 gzip 出。**该守卫是当前的潜在隐患**：任何 body 算子
+  遇到不可往返的编码时都存在。
+- **`${key}` 值引用与反引号模板**（`resolveVar`/`renderTpl`，`rules.js:762-783`）。
+- **内嵌值块**（``` name … ``` 提升为命名值，`util/index.js:208-218`）。
+- **`skip://pattern=` / `operation=`、`ignore://pattern=` / `matcher=`**：上游用 `_skipProps`
+  在扫描期跳过整条规则（`rules.js:1118-1147,:987-989`），需要一趟前置扫描。
+- **合并规则的优先级相反**：上游 `mergeRule` 让后并入的规则**胜出**（`util/index.js:2147-2170`），
   本移植是 `or_insert`。
-- `file`/`redirect`/`statusCode`/`tpl`/裸 URL 上游共用**一个槽位**（先写的胜出），
-  本移植是各自独立的键，可以共存。
-- `Location` 未做 `encodeNonLatin1Char`；`delete://` 与注入的 CSP/no-store 顺序相反。
-- 方法名未统一大写；`parse_header_pairs` 会 trim 而上游不 trim；同名 header 写两次
-  上游发两条、本移植发一条。
-
-**控制台**
-
-- 过滤只是四字段子串匹配，无正则/取反/字段限定，也无**抓取期**排除（上游两套引擎）。
-- 无 Composer（从零构造请求）。
-- 重放**丢弃请求体**（`do_replay` 发空 body）。
-- **看不到命中了哪条规则** —— 这是 whistle 的核心问题，数据在 `Resolved` 里但被丢弃了；
-  General 卡片里那行 `Log tags` 曾被标成 `Rules`，掩盖了这个缺口。
-- 二进制 body 在**序列化时**就被替换成 `[binary, N bytes]`，因此图片预览/十六进制/下载都做不了。
-- **默认组规则与所有 Values 不落盘**（`rules_post`/`values_post` 不写磁盘），改完重启即失，
-  却弹了「Saved」。
-- 无导入；导出仅 HAR。Values 无逐键编辑。无多选/标记/右键菜单。无时间线（Session 模型太薄）。
-- 无暂停抓取、无中断在途请求、帧视图只读。
+- **`file`/`redirect`/`statusCode`/`tpl`/裸 URL 上游共用一个槽位**（先写的胜出），本移植是独立键、可共存。
+- **响应 abort 仅覆盖 HTTP**；上游隧道路径也有（`tunnel.js:749`、`https/index.js:184,:783`）。
+- `parse_header_pairs` 会 trim 而上游不 trim；同名 header 写两次上游发两条、本移植发一条。
+- **控制台**：无 Composer；重放丢请求体；**看不到命中了哪条规则**（数据在 `Resolved` 里但被丢弃）；
+  二进制 body 在序列化时即被替换成 `[binary, N bytes]`，因此图片/十六进制/下载做不了；
+  无导入、导出仅 HAR；Values 无逐键编辑；无多选/标记；无时间线（Session 模型太薄）。
+- **`cipher://` 的完整 OpenSSL 语义**：rustls 不暴露 cipher 字符串（架构限制，非疏漏）。
 
 ---
 
