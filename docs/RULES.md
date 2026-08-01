@@ -1041,7 +1041,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 |----------|-------|--------|
 | `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
 | `disable` | flag(s) | see the two tables below |
-| `trailers` | `name=value` / `{json}` | Emit HTTP response trailer headers (forces chunked) |
+| `trailers` | `name=value` / `{json}` | Add HTTP response trailer headers (forces chunked) — see below |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
 | `responseFor` | a URL | Prefetch the URL; annotate the request with `x-whistle-response-for-*` |
 | `rule` | value name | Include the named value's rules and apply them too |
@@ -1082,6 +1082,29 @@ rather than failing the rule.
 > conditional request answers `304 Not Modified` with no body, and the rewrite
 > silently does nothing — intermittently, since it depends on what the client
 > already holds.
+
+#### Trailers
+
+`trailers://` **adds** to whatever trailer section the origin sent; it does not
+replace it (`extend(trailers, newTrailers)`,
+`_original/lib/inspectors/res.js:1264-1273`). A contested name takes the rule's
+value, and the `Trailer:` header announces everything that will follow.
+
+| Flag | Effect |
+|------|--------|
+| `disable://trailers` / `disable://trailer` | send no trailer section at all — the origin's included |
+| `disable://trailerHeader` | send the trailers, but not the `Trailer:` header announcing them |
+
+Names an HTTP trailer section may not carry are dropped, whichever side they
+came from (`ILLEGAL_TRAILERS`, `_original/lib/util/common.js:34-53`): `host`,
+`transfer-encoding`, `content-length`, `cache-control`, `te`, `max-forwards`,
+`authorization`, `set-cookie`, `content-encoding`, `content-type`,
+`content-range`, `trailer`, `connection`, `upgrade`, `http2-settings`,
+`proxy-connection`, `keep-alive`. A `Content-Length` arriving after the body
+contradicts the framing that just delivered it, and a `Set-Cookie` there is a
+credential a client is not required to read.
+
+`resSpeed://` applies alongside trailers — the two are not alternatives.
 
 `headerReplace` scopes are `req.` / `reqH.` (request), `res.` / `resH.` (response)
 and `trailer.`; a `resHeaders.` key matches none of them and does nothing. Two

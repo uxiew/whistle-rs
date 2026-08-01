@@ -135,6 +135,23 @@ async fn collect_body(body: DynBody) -> Result<Bytes> {
     }
 }
 
+/// As [`collect_body`], keeping the trailer section the body carried.
+///
+/// Collecting a body drops its trailers, and dropping them is not an option:
+/// upstream forwards the origin's own trailer section whatever else it does to
+/// the response (`extend(trailers, newTrailers)`,
+/// `_original/lib/inspectors/res.js:1264-1273`), so buffering here must hand
+/// them on rather than swallow them.
+async fn collect_with_trailers(body: DynBody) -> Result<(Bytes, Option<hyper::HeaderMap>)> {
+    match body.collect().await {
+        Ok(collected) => {
+            let trailers = collected.trailers().cloned();
+            Ok((collected.to_bytes(), trailers))
+        }
+        Err(e) => Err(anyhow::anyhow!("reading body: {e}")),
+    }
+}
+
 /// Monotonic id handed to plugins so their request and response hooks can be
 /// correlated. Distinct from a [`Session`] id, which is only assigned once the
 /// transaction is recorded — far too late for the request hook.
@@ -1217,8 +1234,15 @@ struct ResBodyOps {
     /// `resWrite://` / `resWriteRaw://` — dump paths.
     write: Option<String>,
     write_raw: Option<String>,
-    /// `trailers://` — trailing headers to append after the body.
+    /// `trailers://` — trailing headers to append after the body. Already empty
+    /// when `disable://trailers` cancelled them.
     trailers: hyper::HeaderMap,
+    /// `disable://trailers` / `trailer` — drop the origin's trailer section too,
+    /// which is the half a rule-side check cannot see.
+    no_trailers: bool,
+    /// `disable://trailerHeader` clears this: the trailers still go, the
+    /// `Trailer:` header announcing them does not.
+    announce_trailers: bool,
     /// Any content operator (`resReplace`, `htmlAppend`, `resBody`, …).
     content: bool,
 }
@@ -1243,6 +1267,8 @@ impl ResBodyOps {
             // upstream folds them in after this gate (`res.js:1250-1290`).
             return ResBodyOps {
                 trailers: apply::build_trailers(resolved),
+                no_trailers: apply::trailers_disabled(resolved),
+                announce_trailers: apply::trailer_header_announced(resolved),
                 ..ResBodyOps::default()
             };
         }
@@ -1256,6 +1282,8 @@ impl ResBodyOps {
             write: apply::res_write_path(resolved),
             write_raw: apply::res_write_raw_path(resolved),
             trailers: apply::build_trailers(resolved),
+            no_trailers: apply::trailers_disabled(resolved),
+            announce_trailers: apply::trailer_header_announced(resolved),
             content: apply::wants_res_body(resolved),
         }
     }
@@ -1357,30 +1385,108 @@ fn inject_res_body(
     new
 }
 
-/// Frame a finished in-memory body: drop the now-stale length headers, then
-/// hand it to whichever of `trailers://` / `resSpeed://` asked for it.
+/// Frame a finished in-memory body: drop the now-stale length headers, apply
+/// `resSpeed://`, and put the trailer section back on.
+///
+/// `origin` is the trailer section the upstream response sent, which buffering
+/// the body would otherwise have thrown away. whistle keeps it and lays the
+/// rule's trailers over the top — `extend(trailers, newTrailers)`
+/// (`_original/lib/inspectors/res.js:1264-1273`) — so a `trailers://x-a=1`
+/// against an origin that already sends `x-checksum` yields both.
 fn finish_res_body(
     parts: &mut hyper::http::response::Parts,
     new: Bytes,
     ops: ResBodyOps,
+    origin: Option<hyper::HeaderMap>,
 ) -> DynBody {
     apply::strip_length_headers(&mut parts.headers);
-    if !ops.trailers.is_empty() {
-        // Trailers need chunked transfer; ensure HTTP/1.1 (upstream may be 1.0).
-        parts.version = hyper::Version::HTTP_11;
-        let names = ops
-            .trailers
+    // `resSpeed://` applies whether or not there are trailers. Deciding between
+    // the two — which is what this did — meant a `trailers://` line silently
+    // cancelled the throttle written beside it.
+    let body = match ops.speed {
+        Some(kbps) => body::throttled(new, kbps),
+        None => body::full(new),
+    };
+
+    let mut trailers = origin.filter(|_| !ops.no_trailers).unwrap_or_default();
+    trailers.extend(ops.trailers);
+    // Last, over the merged map, exactly where upstream applies it
+    // (`removeIllegalTrailers`, `res.js:1285`): a name banned from a trailer
+    // section is banned wherever it came from.
+    apply::remove_illegal_trailers(&mut trailers);
+    if trailers.is_empty() {
+        // Nothing to send — but the origin's may still be on their way, so the
+        // `disable://` case has to say so rather than simply not adding any.
+        return match ops.no_trailers {
+            true => retrailer(body, None),
+            false => body,
+        };
+    }
+    // Trailers need chunked transfer; ensure HTTP/1.1 (upstream may be 1.0).
+    parts.version = hyper::Version::HTTP_11;
+    if ops.announce_trailers {
+        let names = trailers
             .keys()
             .map(|k| k.as_str().to_string())
             .collect::<Vec<_>>()
             .join(", ");
         set_header_raw(&mut parts.headers, "trailer", &names);
-        body::with_trailers(new, ops.trailers)
-    } else {
-        match ops.speed {
-            Some(kbps) => body::throttled(new, kbps),
-            None => body::full(new),
+    }
+    retrailer(body, Some(trailers))
+}
+
+/// Replace whatever trailer section `body` would emit with `trailers`, or with
+/// none at all.
+///
+/// Needed on both sides of the buffering decision: a body that was collected has
+/// already had its trailers lifted off and merged, and one that is streaming
+/// through still carries the origin's — which `disable://trailers` has to be
+/// able to drop.
+fn retrailer(body: DynBody, trailers: Option<hyper::HeaderMap>) -> DynBody {
+    use http_body_util::BodyExt;
+    Retrailed {
+        inner: Box::pin(body),
+        trailers,
+    }
+    .boxed()
+}
+
+/// Body wrapper backing [`retrailer`]: swallows the inner body's trailer frame
+/// and emits its own, once, at the end.
+struct Retrailed {
+    inner: std::pin::Pin<Box<DynBody>>,
+    trailers: Option<hyper::HeaderMap>,
+}
+
+impl hyper::body::Body for Retrailed {
+    type Data = Bytes;
+    type Error = body::BodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            match this.inner.as_mut().poll_frame(cx) {
+                // The inner section has already been accounted for — either
+                // merged into ours or deliberately dropped.
+                Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => continue,
+                Poll::Ready(None) => {
+                    return Poll::Ready(
+                        this.trailers
+                            .take()
+                            .map(|t| Ok(hyper::body::Frame::trailers(t))),
+                    );
+                }
+                other => return other,
+            }
         }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream() && self.trailers.is_none()
     }
 }
 
@@ -1611,7 +1717,8 @@ async fn finish_local_response(
     // `finish_res_body` drops the length headers, which a body nothing rewrote
     // still has correctly set — so only take that route when something did.
     let body = match ops.needs_body() {
-        true => finish_res_body(&mut parts, new, ops),
+        // A locally produced response has no origin trailer section to keep.
+        true => finish_res_body(&mut parts, new, ops, None),
         false => {
             // A hook that replaced the body invalidated the length its producer
             // declared; dropping the header lets hyper write the true one.
@@ -2277,9 +2384,15 @@ async fn serve(
         if ops.needs_body() || plugin_wants_res_body || plugin_res_override.is_some() {
             // A plugin that replaced the body outright makes the upstream bytes
             // irrelevant — don't wait on them.
-            let bytes = match &plugin_res_override {
-                Some(new) => Bytes::from(new.clone()),
-                None => collect_body(body).await?,
+            //
+            // The origin's trailer section is lifted off with the bytes and
+            // handed to `finish_res_body`. Collecting a body discards it
+            // otherwise, which is how a response that arrived with trailers
+            // reached the client without them the moment *any* body operator
+            // matched — including one that had nothing to do with trailers.
+            let (bytes, origin_trailers) = match &plugin_res_override {
+                Some(new) => (Bytes::from(new.clone()), None),
+                None => collect_with_trailers(body).await?,
             };
             // Decompress before rewriting. Every body operator works on text,
             // and most origins answer compressed — so without this a
@@ -2336,12 +2449,19 @@ async fn serve(
                     state.config.body_preview_cap,
                 ));
             }
-            finish_res_body(&mut parts, new, ops)
+            finish_res_body(&mut parts, new, ops, origin_trailers)
         } else {
-            // No transform: stream through, copying a bounded preview for inspection.
+            // No transform: stream through, copying a bounded preview for
+            // inspection. The origin's trailers ride along untouched — unless a
+            // `disable://` asked for them to go, which is the one thing this
+            // path still has to act on.
             let cap = Capture::new(res_ct.clone(), res_enc.as_deref(), state.config.body_preview_cap);
             res_body_cap = Some(cap.clone());
-            body::tee(body, cap)
+            let teed = body::tee(body, cap);
+            match ops.no_trailers {
+                true => retrailer(teed, None),
+                false => teed,
+            }
         };
 
     let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
@@ -2719,6 +2839,199 @@ mod body_gate_tests {
         // A HEAD answer never has one, whatever the status says.
         assert!(!response_has_body(200, "HEAD"));
         assert!(!response_has_body(200, "head"));
+    }
+}
+
+#[cfg(test)]
+mod trailer_tests {
+    use super::*;
+    use hyper::body::Body as _;
+
+    /// Drive a body to its end, returning its data frames and trailer section.
+    fn drain(body: DynBody) -> (Vec<Bytes>, Option<hyper::HeaderMap>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let mut body = std::pin::pin!(body);
+            let (mut frames, mut trailers) = (Vec::new(), None);
+            while let Some(frame) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+                let frame = frame.expect("frame");
+                match frame.into_data() {
+                    Ok(data) => frames.push(data),
+                    Err(frame) => trailers = frame.into_trailers().ok(),
+                }
+            }
+            (frames, trailers)
+        })
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).expect("name"),
+                v.parse().expect("value"),
+            );
+        }
+        h
+    }
+
+    /// Everything `finish_res_body` decides about the trailer section, driven
+    /// through the same struct `serve` builds.
+    fn finish(
+        rule_trailers: &[(&str, &str)],
+        origin: Option<&[(&str, &str)]>,
+        no_trailers: bool,
+        speed: Option<f64>,
+        body_len: usize,
+    ) -> (hyper::http::response::Parts, Vec<Bytes>, Option<hyper::HeaderMap>) {
+        let mut parts = Response::builder()
+            .status(200)
+            .body(())
+            .expect("parts")
+            .into_parts()
+            .0;
+        let ops = ResBodyOps {
+            speed,
+            trailers: headers(rule_trailers),
+            no_trailers,
+            announce_trailers: true,
+            content: true,
+            ..ResBodyOps::default()
+        };
+        let bytes = Bytes::from(vec![b'x'; body_len]);
+        let out = finish_res_body(&mut parts, bytes, ops, origin.map(headers));
+        let (frames, trailers) = drain(out);
+        (parts, frames, trailers)
+    }
+
+    fn names(h: &Option<hyper::HeaderMap>) -> Vec<String> {
+        let mut v: Vec<String> = h
+            .iter()
+            .flat_map(|h| h.iter())
+            .map(|(k, val)| format!("{k}={}", val.to_str().unwrap()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The origin's own trailer section survives a body rewrite, and the rule's
+    /// trailers are laid over it (`extend(trailers, newTrailers)`,
+    /// `_original/lib/inspectors/res.js:1264-1273`).
+    ///
+    /// Buffering the body threw the origin's trailers away, so *any* body
+    /// operator — one with nothing to do with trailers — silently deleted them
+    /// on the way past.
+    #[test]
+    fn the_origins_trailers_survive_a_rewrite() {
+        let (parts, _, trailers) = finish(
+            &[("x-rule", "1")],
+            Some(&[("x-origin", "2"), ("x-both", "origin")]),
+            false,
+            None,
+            8,
+        );
+        assert_eq!(names(&trailers), ["x-both=origin", "x-origin=2", "x-rule=1"]);
+        // The `Trailer:` header announces everything that is coming.
+        let announced = parts.headers.get("trailer").unwrap().to_str().unwrap();
+        for name in ["x-origin", "x-both", "x-rule"] {
+            assert!(announced.contains(name), "{announced} must name {name}");
+        }
+
+        // A contested name takes the rule's value.
+        let (_, _, trailers) = finish(
+            &[("x-both", "rule")],
+            Some(&[("x-both", "origin")]),
+            false,
+            None,
+            8,
+        );
+        assert_eq!(names(&trailers), ["x-both=rule"]);
+
+        // With no rule at all the origin's still go out.
+        let (_, _, trailers) = finish(&[], Some(&[("x-origin", "2")]), false, None, 8);
+        assert_eq!(names(&trailers), ["x-origin=2"]);
+    }
+
+    /// `disable://trailers` cancels the whole section, the origin's included —
+    /// upstream's guard is on the way out, after the merge (`res.js:1252-1260`).
+    #[test]
+    fn disabling_trailers_drops_the_origins_too() {
+        let (parts, frames, trailers) =
+            finish(&[], Some(&[("x-origin", "2")]), true, None, 8);
+        assert!(trailers.is_none(), "no trailer section may be sent");
+        assert!(parts.headers.get("trailer").is_none());
+        assert_eq!(frames.len(), 1, "the body itself is untouched");
+    }
+
+    /// A name an HTTP trailer section may not carry is dropped wherever it came
+    /// from (`removeIllegalTrailers`, `_original/lib/util/common.js:410-414`,
+    /// applied at `res.js:1285` over the merged map).
+    ///
+    /// A `Content-Length` arriving *after* the body contradicts the framing that
+    /// just delivered it, and a `Set-Cookie` there is a credential a client is
+    /// not required to read.
+    #[test]
+    fn illegal_trailer_names_are_dropped_from_both_sides() {
+        let (parts, _, trailers) = finish(
+            &[("content-length", "5"), ("x-ok", "1")],
+            Some(&[("set-cookie", "sid=1"), ("x-fine", "2")]),
+            false,
+            None,
+            8,
+        );
+        assert_eq!(names(&trailers), ["x-fine=2", "x-ok=1"]);
+        let announced = parts.headers.get("trailer").unwrap().to_str().unwrap();
+        assert!(!announced.contains("content-length"));
+        assert!(!announced.contains("set-cookie"));
+
+        // Nothing legal left means no trailer section and no announcement.
+        let (parts, _, trailers) = finish(&[("trailer", "x")], None, false, None, 8);
+        assert!(trailers.is_none());
+        assert!(parts.headers.get("trailer").is_none());
+    }
+
+    /// `resSpeed://` and `trailers://` are not alternatives.
+    ///
+    /// The port chose between them, so writing both meant the throttle was
+    /// silently dropped — a rule that reproduces a slow connection, cancelled by
+    /// an unrelated one on the same line.
+    #[test]
+    fn a_throttle_survives_the_trailers() {
+        // 8 kbit/s is 1000 bytes/s, paced in 50 ms slices of 50 bytes: 100 bytes
+        // is two frames rather than the single frame an unpaced body sends.
+        let (_, frames, trailers) = finish(&[("x-a", "1")], None, false, Some(8.0), 100);
+        assert_eq!(frames.len(), 2, "the body was paced");
+        assert_eq!(frames.concat().len(), 100);
+        assert_eq!(names(&trailers), ["x-a=1"]);
+
+        // Unpaced, the same body is one frame — so the assertion above is about
+        // the throttle and not about chunking in general.
+        let (_, frames, _) = finish(&[("x-a", "1")], None, false, None, 100);
+        assert_eq!(frames.len(), 1);
+    }
+
+    /// `disable://trailerHeader` withholds the announcement, not the trailers
+    /// (`_original/lib/inspectors/res.js:1215-1223`).
+    #[test]
+    fn disabling_the_trailer_header_still_sends_the_trailers() {
+        let mut parts = Response::builder()
+            .status(200)
+            .body(())
+            .expect("parts")
+            .into_parts()
+            .0;
+        let ops = ResBodyOps {
+            trailers: headers(&[("x-a", "1")]),
+            announce_trailers: false,
+            content: true,
+            ..ResBodyOps::default()
+        };
+        let (_, trailers) = drain(finish_res_body(&mut parts, Bytes::from_static(b"x"), ops, None));
+        assert_eq!(names(&trailers), ["x-a=1"]);
+        assert!(parts.headers.get("trailer").is_none());
     }
 }
 
