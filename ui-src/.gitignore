@@ -1,0 +1,5 @@
+node_modules
+*.tsbuildinfo
+
+# dist/ is deliberately NOT ignored: the built console is committed so the Rust
+# build can `include_str!` it without needing Node. See README.md.
