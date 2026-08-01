@@ -51,6 +51,7 @@ const state = {
   groups: [],
   group: 'default',    // the rule group being edited
   values: {},
+  prettyBody: true,    // re-indent a JSON body dump
 };
 
 /** The two CodeMirror instances, created once on first use of their pane. */
@@ -150,11 +151,12 @@ function renderRows() {
   const list = sortSessions(visibleSessions());
   $('rows').innerHTML = list.map((s) => {
     const sel = s.id === state.selected ? ' aria-selected="true"' : '';
+    const cls = s.status >= 400 || s.status === 0 ? ' class="failed"' : '';
     const cells = COLUMNS.map((c) => {
       const cls = c.num ? ' class="num"' : '';
       return '<td' + cls + '>' + (c.cell ? c.cell(s) : esc(c.get(s))) + '</td>';
     }).join('');
-    return '<tr data-id="' + s.id + '"' + sel + '>' + cells + '</tr>';
+    return '<tr data-id="' + s.id + '"' + cls + sel + '>' + cells + '</tr>';
   }).join('');
   const total = state.sessions.length;
   $('count').textContent = list.length === total
@@ -321,6 +323,11 @@ function renderDetail() {
     badge.hidden = true;
   }
 
+  $('d-actions').innerHTML = s
+    ? '<button class="btn tiny" data-act="curl">Copy as cURL</button>'
+      + '<button class="btn tiny" data-act="url">Copy URL</button>'
+    : '';
+
   $('d-tabs').innerHTML = DETAIL_TABS.map((t) => {
     const on = tabEnabled(t.key, s, d);
     const sel = state.detailTab === t.key && on ? ' aria-selected="true"' : '';
@@ -339,6 +346,44 @@ function renderDetail() {
     case 'res-body': body.innerHTML = bodyDump(d.res_body); break;
     case 'frames': body.innerHTML = '<div class="empty">loading frames…</div>'; loadFrames(s.id); break;
   }
+}
+
+/**
+ * The `curl` command that reproduces a request, for pasting into a terminal.
+ *
+ * Built from the headers as *forwarded*, not as received, so what it
+ * reproduces is the request the origin actually saw — rules and all.
+ */
+function asCurl(s, d) {
+  const q = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+  const parts = ['curl', '-i', '-X', s.method, q(s.url)];
+  for (const [k, v] of (d && d.req_headers) || []) {
+    // curl sets these itself, and a stale one breaks the replay.
+    if (/^(content-length|host)$/i.test(k)) continue;
+    parts.push('-H', q(k + ': ' + v));
+  }
+  if (d && d.req_body && d.req_body.text && !d.req_body.truncated) {
+    parts.push('--data-raw', q(d.req_body.text));
+  }
+  return parts.join(' ');
+}
+
+function copyText(text, note) {
+  const done = () => { $('count').textContent = note; setTimeout(renderRows, 1600); };
+  if (navigator.clipboard) return navigator.clipboard.writeText(text).then(done, done);
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } finally { ta.remove(); }
+  done();
+}
+
+/** Re-indent a body that is JSON, and leave anything else exactly as it is. */
+function prettyJson(text) {
+  const t = (text || '').trim();
+  if (!t || !/^[[{]/.test(t)) return null;
+  try { return JSON.stringify(JSON.parse(t), null, 2); } catch (e) { return null; }
 }
 
 function hostOf(url) {
@@ -375,7 +420,12 @@ function headerList(pairs) {
 function bodyDump(b) {
   if (!b || !b.len) return '<div class="empty">no body captured</div>';
   const note = b.len + ' bytes' + (b.truncated ? ', preview truncated' : '');
-  return '<p class="hint">' + esc(note) + '</p><pre class="dump">' + esc(b.text) + '</pre>';
+  const pretty = state.prettyBody ? prettyJson(b.text) : null;
+  const toggle = prettyJson(b.text) !== null
+    ? '<button class="btn tiny" data-act="pretty">' + (state.prettyBody ? 'Raw' : 'Format JSON') + '</button>'
+    : '';
+  return '<p class="hint">' + esc(note) + ' ' + toggle + '</p>'
+    + '<pre class="dump">' + esc(pretty !== null ? pretty : b.text) + '</pre>';
 }
 
 function loadFrames(id) {
@@ -530,6 +580,39 @@ function showPane(name) {
   if (cm) setTimeout(() => cm.refresh(), 0);
 }
 
+/**
+ * Let the detail panel be resized against the table.
+ *
+ * The height is remembered, because the useful split depends on what you are
+ * doing — reading a long body wants a tall panel, scanning a busy capture wants
+ * a short one — and re-dragging it every reload is exactly the kind of friction
+ * that makes a tool feel disposable.
+ */
+function initSplitter() {
+  const bar = $('splitter');
+  const panel = $('detail');
+  const saved = Number(localStorage.getItem('whistle-rs-detail-h') || 0);
+  const apply = (px) => {
+    const max = window.innerHeight - 180;
+    panel.style.flexBasis = Math.max(120, Math.min(px, max)) + 'px';
+  };
+  if (saved) apply(saved);
+
+  bar.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    bar.classList.add('dragging');
+    const move = (ev) => apply(window.innerHeight - ev.clientY);
+    const up = () => {
+      bar.classList.remove('dragging');
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      try { localStorage.setItem('whistle-rs-detail-h', String(panel.getBoundingClientRect().height)); } catch (err) { /* private mode */ }
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
+
 // ── wiring ─────────────────────────────────────────────────────────────────
 
 function applyTheme(mode) {
@@ -549,6 +632,7 @@ function initTheme() {
 
 function init() {
   initTheme();
+  initSplitter();
   renderHead();
   renderDetail();
 
@@ -580,6 +664,16 @@ function init() {
   $('d-tabs').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-tab]');
     if (btn && !btn.disabled) { state.detailTab = btn.dataset.tab; renderDetail(); }
+  });
+
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    const s = currentSession();
+    if (!s) return;
+    if (btn.dataset.act === 'curl') copyText(asCurl(s, state.detail), 'cURL copied');
+    if (btn.dataset.act === 'url') copyText(s.url, 'URL copied');
+    if (btn.dataset.act === 'pretty') { state.prettyBody = !state.prettyBody; renderDetail(); }
   });
 
   $('filter').addEventListener('input', renderRows);
