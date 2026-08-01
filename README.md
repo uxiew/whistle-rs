@@ -259,7 +259,7 @@ CA.
 | `--persist-days <N>` | Days of session history to retain on disk | `7` |
 | `--insecure-upstream` | Do **not** verify the origin's TLS certificate. whistle-rs verifies by default, unlike upstream — see [Origin certificate verification](docs/RULES.md#origin-certificate-verification) | verify on |
 | `--no-intercept-https` | Do not decrypt HTTPS: relay every TLS connection untouched, still routing it by its rules (whistle's `-M pureProxy`) | intercept on |
-| `-t, --timeout <MS>` | How long a connection to an origin or upstream proxy may take to *establish*. Never cuts short a connection that did establish, so streams are unaffected | `360000` |
+| `-t, --timeout <MS>` | How long a connection to an origin or upstream proxy may take to *establish*. Never cuts short a connection that did establish, so streams are unaffected. It only ever **tightens**: a hard 16s ceiling sits underneath, so the default means 16s and this matters only below that | `360000` |
 | `-v, --verbose` | Debug logging — the reason behind a failure, which the `502` alone will not tell you | off |
 | `-h, --help` / `-V, --version` | Help / version | — |
 
@@ -409,6 +409,7 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 |---------|-------------|
 | `502` on a self-signed or private-CA origin | whistle-rs **verifies** origin certificates; whistle does not (`rejectUnauthorized` is `false` there unless `--safe`). This is the one place the port deliberately does not copy upstream's default, because a debugging proxy that accepts any upstream certificate cannot tell you when the connection it is inspecting has itself been intercepted. `--insecure-upstream` opts out. |
 | `502` when forwarding to an intercepted host | The upstream connection or its TLS failed — `-v` gives the target and the error. A `host://` override that points TLS at a non-TLS port fails the handshake. |
+| A request hangs for a minute or more before failing | The destination is dropping packets rather than refusing, so the wait is the OS's TCP timeout. `-t 3000` caps connection *establishment* (never an established connection, so streams are safe). |
 | `resDelay://1s` is instantaneous | Delays are **milliseconds**, and a unit suffix is parsed off and discarded rather than converted, so `1s` is one millisecond. Write `1000`. |
 | A throttle is 8× faster than expected | `reqSpeed://` / `resSpeed://` are **kilobits** per second, not kilobytes. This port read them as kilobytes until recently; multiply values written against that by 8. |
 | An SSE or chunked response stops streaming | A body operator on a streaming response buffers the **whole stream** before anything is sent — measured at 3 ms to first byte without one and 621 ms with, on a 600 ms SSE stream. The body layer transforms whole buffers; making it streaming is a rewrite of that layer, recorded in [`docs/ROADMAP.md`](docs/ROADMAP.md). Delays and speed caps are unaffected. |

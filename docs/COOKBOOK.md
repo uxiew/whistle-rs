@@ -469,6 +469,28 @@ code path actually needs to see. `statusCode://` is the polite version.
 `chance:` is sampled per request, so it is the tool for "does the retry logic
 work" rather than "is this endpoint down".
 
+### Stop waiting on a host that never answers
+
+A destination that drops packets rather than refusing them holds the request for
+as long as the operating system's TCP timeout, which is over a minute. `-t` caps
+the wait:
+
+```bash
+whistle-rs -t 3000 -r rules.txt      # give up on a connection after 3s
+```
+
+Two things about it are not obvious from the flag:
+
+- **It bounds connection *establishment* only.** A connection that did connect is
+  never cut short, so a slow response, an SSE stream or a long poll is
+  unaffected. This is not a "kill the request after N ms" switch.
+- **It only ever tightens.** There is a hard 16-second ceiling underneath, so the
+  `360000` default really means 16 seconds and `-t` matters only when you set it
+  *below* that. `-t 0` is clamped to 1 ms rather than meaning "no limit".
+
+To make a *particular* request slow rather than the whole proxy patient, use
+`reqDelay://` — `-t` is a safety net, not a simulation tool.
+
 ### What throttling will not do
 
 A body operator and a streaming response do not mix: if a rule on an
@@ -653,7 +675,41 @@ pinned.example.com    sniCallback://no-mitm
 relayed byte-for-byte. It is still *routed* by its rules — `host://` and the
 proxy family apply — but nothing inside it is read.
 
-To stop decrypting everything, start with `--no-intercept-https`.
+### Route HTTPS without decrypting it, and skip the certificate entirely
+
+Sometimes you do not need to read the traffic — you need to *send it somewhere
+else*. Pointing a device's TLS at a staging box, or just learning which hosts an
+app talks to, does not require a MITM, and not requiring one means there is no
+certificate to install on the device at all:
+
+```bash
+whistle-rs -p 8899 --no-intercept-https -r rules.txt
+```
+
+```
+secure.example.com   host://10.0.0.9
+```
+
+What you keep and what you give up, both measured against a self-signed origin:
+
+| | with interception | `--no-intercept-https` |
+|---|---|---|
+| `host://` and the proxy family | routed | **routed** |
+| certificate the client sees | whistle-rs's, signed by its root CA | **the origin's own** |
+| root CA must be installed | yes | **no** |
+| `resHeaders://` and every other content operator | applied | **not applied** |
+| appears in the capture | yes | **no** |
+| a self-signed origin | `502` unless `--insecure-upstream` | fine — the *client* decides whether to trust it |
+
+The last row is the one that catches people out in the other direction. With
+interception on, whistle-rs verifies the origin's certificate itself and a
+self-signed origin is a `502`; with interception off there is nothing for the
+proxy to verify, because the TLS session is between the client and the origin
+and the proxy only moves bytes.
+
+`sniCallback://no-mitm` above is the per-host version of the same thing. Reach
+for the flag when you want it for everything, and for the rule when one pinned
+host is the problem.
 
 ---
 

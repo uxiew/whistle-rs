@@ -237,7 +237,7 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `--persist-days <N>` | 磁盘上保留多少天的历史 | `7` |
 | `--insecure-upstream` | **不**校验源站 TLS 证书。与上游不同，whistle-rs 默认校验 —— 见 [源站证书校验](docs/RULES.md#origin-certificate-verification) | 校验开启 |
 | `--no-intercept-https` | 不解密 HTTPS：每条 TLS 连接原样中继，但仍按规则路由（上游写作 `-M pureProxy`） | 拦截开启 |
-| `-t, --timeout <MS>` | 到源站 / 上游代理的连接**建立**超时。已建立的连接不会被切断，流式响应不受影响 | `360000` |
+| `-t, --timeout <MS>` | 到源站 / 上游代理的连接**建立**超时。已建立的连接不会被切断，流式响应不受影响。它只会**收紧**：底下还有 16 秒硬上限，所以默认值实际是 16 秒，只有设到它以下才起作用 | `360000` |
 | `-v, --verbose` | 调试日志 —— 失败的**原因**，这是光看 `502` 得不到的 | 关闭 |
 | `-h, --help` / `-V, --version` | 帮助 / 版本 | —— |
 
@@ -368,6 +368,7 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 |------|------------|
 | 自签名 / 私有 CA 源站返回 `502` | whistle-rs **校验**源站证书，上游不校验（那边 `rejectUnauthorized` 默认为 `false`，仅 `--safe` 打开）。这是本移植唯一刻意不照抄上游默认值的地方 —— 一个对任何源站证书照单全收的调试代理，无法告诉你它正在检查的连接自己也被劫持了。用 `--insecure-upstream` 关掉。 |
 | 转发到被拦截主机时报 `502` | 上游连接或其 TLS 失败 —— `-v` 会给出目标与错误。`host://` 若把 TLS 指向非 TLS 端口会握手失败。 |
+| 请求挂一分多钟才失败 | 目标是**丢包**而不是拒绝连接，于是这段等待就是操作系统的 TCP 超时。`-t 3000` 给连接**建立**封顶（不影响已建立的连接，流式响应是安全的）。 |
 | `resDelay://1s` 瞬间就过去了 | 延迟单位是**毫秒**，单位后缀会被解析掉然后丢弃而不是换算，所以 `1s` 是 1 毫秒。写 `1000`。 |
 | 限速比预期快 8 倍 | `reqSpeed://` / `resSpeed://` 的单位是**千比特**每秒，不是千字节。本移植此前按千字节读，按旧行为写的数值乘以 8。 |
 | SSE / chunked 响应不再流式 | 作用在流式响应上的 body 算子会把**整条流**缓冲完才开始发送 —— 实测一条 600 毫秒的 SSE 流，不带 body 算子首字节 3 毫秒，带上是 621 毫秒。本移植的 body 层建立在整体缓冲之上，改成流式是重写该层，记录在 [`docs/ROADMAP.md`](docs/ROADMAP.md)。延迟与限速不受影响。 |
