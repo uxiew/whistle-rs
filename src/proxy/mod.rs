@@ -8,6 +8,7 @@ pub mod apply;
 mod bench;
 pub mod body;
 pub mod coding;
+pub mod dest;
 pub mod persist;
 pub mod script;
 pub mod sni;
@@ -1853,16 +1854,18 @@ async fn serve(
 
     // WebSocket / other protocol upgrades are tunnelled after a 101.
     if is_upgrade(&req) {
-        return serve_upgrade(
-            &state, req, &info, &resolved, &scheme, &host, port, client_ip, time_ms, started,
-        )
-        .await;
+        return serve_upgrade(&state, req, &info, &resolved, client_ip, time_ms, started).await;
     }
+
+    // Where the request is addressed, which is its own URL unless a rule pointed
+    // it somewhere else — `www.example.com http://localhost:5173` and friends.
+    // Resolved before the target because the target is *how* to reach it.
+    let dest = dest::Destination::of(&info, &resolved);
 
     // Fails the request rather than silently connecting direct when a proxy rule
     // matched but could not be honoured (unusable address, unreachable or
     // throwing PAC file) — see `apply::find_proxy`.
-    let target = apply::resolve_target(&info, &resolved).await?;
+    let target = apply::resolve_target(&info, &dest, &resolved).await?;
 
     // A proxy rule that names this proxy would send the request back to us, be
     // matched by the same rule, and recurse until the sockets run out. whistle
@@ -1905,7 +1908,9 @@ async fn serve(
     // handle this request already returned above; any rules they injected have
     // been merged into `resolved`.)
     let (mut parts, incoming) = req.into_parts();
-    ensure_host_header(&mut parts.headers, &host, port, &scheme);
+    // The origin is asked for the destination's host, not the client's — that
+    // is the whole difference between a URL replacement and `host://`.
+    ensure_host_header(&mut parts.headers, &dest.host, dest.port, &dest.scheme);
     parts.headers.remove("proxy-connection");
     mark_stripped_tls(&mut parts.headers, &target);
     apply::apply_request(&mut parts, &resolved);
@@ -1948,7 +1953,11 @@ async fn serve(
         method: &req_method,
         content_type: req_ct.as_deref(),
     };
-    let new_path = apply::rewrite_path(&info.path, &resolved, body_ctx);
+    // From the destination's path, not the request's: a URL-replacement rule has
+    // already decided what is being asked for, and `urlReplace`/`params` then
+    // rewrite *that* — the same order as upstream, where `req.options` is built
+    // before the request inspectors run.
+    let new_path = apply::rewrite_path(&dest.path, &resolved, body_ctx);
     parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     let req_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     let mut req_body_cap: Option<Capture> = None;
@@ -2295,20 +2304,17 @@ fn is_websocket(req: &Request<DynBody>) -> bool {
 /// This is how WebSocket (`ws://`/`wss://`) traffic is proxied. WebSocket
 /// upgrades are tunnelled frame-by-frame so each frame is captured; any other
 /// `Upgrade:` protocol is tunnelled as an opaque byte stream.
-#[allow(clippy::too_many_arguments)]
 async fn serve_upgrade(
     state: &Arc<AppState>,
     mut req: Request<DynBody>,
     info: &ReqInfo,
     resolved: &Resolved,
-    scheme: &str,
-    host: &str,
-    port: u16,
     client_ip: Option<String>,
     time_ms: u128,
     started: Instant,
 ) -> Result<Response<DynBody>> {
-    let target = apply::resolve_target(info, resolved).await?;
+    let dest = dest::Destination::of(info, resolved);
+    let target = apply::resolve_target(info, &dest, resolved).await?;
     let frame_script = resolved.value("frameScript").and_then(script::load_script);
     let websocket = is_websocket(&req);
     // Which plugins may hook this session's frames. Resolving the plan contacts
@@ -2328,9 +2334,9 @@ async fn serve_upgrade(
     // Build the upstream handshake request (upgrades carry no body, so
     // `params://` can only address the query string here).
     let (mut parts, _body) = req.into_parts();
-    let new_path = apply::rewrite_path(&info.path, resolved, apply::ReqBodyCtx::default());
+    let new_path = apply::rewrite_path(&dest.path, resolved, apply::ReqBodyCtx::default());
     parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
-    ensure_host_header(&mut parts.headers, host, port, scheme);
+    ensure_host_header(&mut parts.headers, &dest.host, dest.port, &dest.scheme);
     parts.headers.remove("proxy-connection");
     mark_stripped_tls(&mut parts.headers, &target);
     apply::apply_request(&mut parts, resolved);
@@ -2526,7 +2532,7 @@ fn ensure_host_header(
     port: u16,
     scheme: &str,
 ) {
-    let default_port = if scheme == "https" { 443 } else { 80 };
+    let default_port = if dest::is_tls(scheme) { 443 } else { 80 };
     let value = if port == default_port {
         host.to_string()
     } else {

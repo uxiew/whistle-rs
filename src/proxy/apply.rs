@@ -478,16 +478,28 @@ fn proxy_survives_host(resolved: &Resolved, proxy_proto: &str, host_matched: boo
 
 /// Compute the upstream target, honouring `host://` (and `:port`) overrides.
 ///
+/// `dest` is where the request is *addressed* — its own URL, unless a
+/// URL-replacement rule moved it (see [`super::dest::Destination`]). `host://`
+/// then overrides the address to connect to without changing that, which is why
+/// the two are separate: a request forwarded to `http://localhost:5173` and then
+/// pinned with `host://10.0.0.1` connects to `10.0.0.1:5173` and still asks for
+/// `localhost`. Upstream stacks them the same way — `req.options` comes from the
+/// URL rule and `getServerIp` from the host rule.
+///
 /// Fails rather than falling back to a direct connection when a proxy rule
 /// matched but could not be honoured; see [`find_proxy`].
-pub async fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Result<Target> {
-    let mut connect_host = info.host.clone();
-    let mut connect_port = info.port;
+pub async fn resolve_target(
+    info: &ReqInfo,
+    dest: &super::dest::Destination,
+    resolved: &Resolved,
+) -> Result<Target> {
+    let mut connect_host = dest.host.clone();
+    let mut connect_port = dest.port;
 
     let host_op = resolved.get("host");
     let host_rule = host_op.map(|op| op.value.as_str());
     if let Some(value) = host_rule {
-        let (h, p) = parse_host_value(value, info.port);
+        let (h, p) = parse_host_value(value, dest.port);
         if let Some(h) = h {
             connect_host = h;
         }
@@ -510,7 +522,7 @@ pub async fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Result<Targe
         None => (None, None),
     };
 
-    let request_tls = info.scheme == "https" || info.scheme == "wss";
+    let request_tls = super::dest::is_tls(&dest.scheme);
     let tls = origin_tls(request_tls, proxy_proto);
     Ok(Target {
         connect_host,
@@ -519,8 +531,8 @@ pub async fn resolve_target(info: &ReqInfo, resolved: &Resolved) -> Result<Targe
         // Whether the hop stripped the origin's TLS: the request then carries
         // whistle's marker so the whistle on the far side can put it back.
         origin_tls_stripped: request_tls && !tls,
-        sni: info.host.clone(),
-        request_port: info.port,
+        sni: dest.host.clone(),
+        request_port: dest.port,
         proxy,
         tls_versions: resolved
             .value("cipher")
@@ -826,7 +838,26 @@ fn serve_file_family(
     let templated = proto.ends_with("tpl") || proto.ends_with("jsonp") || proto.ends_with("dust");
     let cross = proto.starts_with('x');
 
-    let candidates = FileCandidates::of(proto, value);
+    // A bracketed value is not a location. `(text)` *is* the response body —
+    // whistle's inline form, `readRuleValue`'s `if (rule.value)` arm
+    // (`_original/lib/util/index.js:1178-1180`) — and `<path>` is a path pinned
+    // in place, which the matcher has already honoured by not extending it.
+    let value = match crate::rules::url::fixed_value(value) {
+        Some((crate::rules::url::Fixed::Inline, text)) => {
+            let bytes = text.into_bytes();
+            return Some(if raw {
+                serve_raw_http(&bytes, &info.full_url, info)
+            } else if templated {
+                serve_template(&bytes, &info.full_url, info, env)
+            } else {
+                serve_file_bytes(&bytes, &info.full_url, info)
+            });
+        }
+        Some((crate::rules::url::Fixed::Verbatim, path)) => std::borrow::Cow::Owned(path),
+        None => std::borrow::Cow::Borrowed(value),
+    };
+
+    let candidates = FileCandidates::of(proto, &value);
     match candidates.read() {
         // The *matched* path drives the content type, not the rule value: with
         // `file:///tmp/mock/` it is `/tmp/mock/index.html` that was served.
@@ -876,7 +907,7 @@ impl FileCandidates {
         let mut paths = Vec::new();
         let mut blame = String::new();
         for entry in split_paths(proto, value) {
-            let entry = expand_home(entry);
+            let entry = expand_home(&decode_path(entry));
             if has_parent_ref(&entry) {
                 // `joinPath` refuses the path outright (`util/index.js:1847-1849`)
                 // and `readFiles` reports it with a fixed marker; it contributes
@@ -920,6 +951,46 @@ fn split_paths<'a>(proto: &str, value: &'a str) -> Vec<&'a str> {
         true => vec![value],
         false => value.split('|').collect(),
     }
+}
+
+/// Turn a candidate into a filesystem path — upstream's `decodePath`
+/// (`_original/lib/util/index.js:1403-1418`, reached from `getTempFilePath`).
+///
+/// Two things happen there, and both matter once a rule maps a directory: the
+/// query string and fragment come off (`getPureUrl`), because
+/// `/static/app.js?v=2` names the file `app.js`; and the rest is
+/// percent-decoded, because a request for `/a%20b.js` is asking for `a b.js`.
+/// Undecodable escapes are left as written, which is upstream's fallback too.
+fn decode_path(path: &str) -> String {
+    let pure = match path.find(['?', '#']) {
+        Some(i) => &path[..i],
+        None => path,
+    };
+    if !pure.contains('%') {
+        return pure.to_string();
+    }
+    let mut out = Vec::with_capacity(pure.len());
+    let bytes = pure.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(h), Some(l)) if let Some(byte) = from_hex(*h, *l) => {
+                out.push(byte);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| pure.to_string())
+}
+
+/// Two hex digits → the byte they spell, or `None` if they do not.
+fn from_hex(high: u8, low: u8) -> Option<u8> {
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    Some(digit(high)? << 4 | digit(low)?)
 }
 
 /// `~/x` (and the full-width `～/x`) start at the home directory
@@ -3475,8 +3546,11 @@ fn replace_once_or_all(text: &str, pattern: &str, value: &str) -> String {
     };
     // Expanded by hand rather than through the `regex` crate's own replacement
     // syntax: `$$1` has to percent-encode the group, and no replacement string
-    // can express that. See [`expand_replacement`].
-    let expand = |caps: &regex::Captures<'_>| expand_replacement(value, caps);
+    // can express that. See [`crate::rules::replace::expand`].
+    let expand = |caps: &regex::Captures<'_>| {
+        let groups: Vec<&str> = (0..=9).map(|n| caps.get(n).map_or("", |m| m.as_str())).collect();
+        crate::rules::replace::expand(value, &groups)
+    };
     match flags.contains('g') {
         true => re.replace_all(text, expand).into_owned(),
         false => re.replace(text, expand).into_owned(),
@@ -3495,96 +3569,6 @@ fn split_regexp(pattern: &str) -> Option<(&str, &str)> {
         && flags.len() <= 4
         && flags.chars().all(|c| matches!(c, 'i' | 'g' | 'm' | 'u'));
     ok.then_some((source, flags))
-}
-
-/// Expand a JavaScript replacement string against one regex match
-/// (`replacePattern`, `_original/lib/util/replace-pattern-transform.js:64-91`).
-///
-/// `$&` is the whole match and `$1`…`$9` are groups. The `$$`-prefixed spelling
-/// of either — `$$&`, `$$1` — inserts the same text **percent-encoded**, which
-/// is why this is expanded here instead of being handed to the `regex` crate as
-/// a replacement string: that syntax has no way to transform a group.
-///
-/// Backslashes in front of a reference are upstream's escape, and it reads at
-/// most two: `\$1` is the literal `$1`, `\\$1` is a backslash then the group.
-/// A `$b`-prefixed reference (`$b1`) names a *value* list that only whistle's
-/// streaming body transform has, so here it is left as written — which is what
-/// upstream does too when it calls this with no value list.
-fn expand_replacement(value: &str, caps: &regex::Captures<'_>) -> String {
-    let group = |n: usize| caps.get(n).map(|m| m.as_str()).unwrap_or("");
-    let bytes = value.as_bytes();
-    let mut out = String::with_capacity(value.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        // At most two, matching `\\{0,2}` — a third backslash is literal.
-        let slashes = bytes[i..].iter().take_while(|b| **b == b'\\').count().min(2);
-        let rest = &bytes[i + slashes..];
-        // `$`, an optional second `$` (encode), an optional `b`, then `&` or a digit.
-        let (encode, after_dollars) = match rest {
-            [b'$', b'$', tail @ ..] => (true, tail),
-            [b'$', tail @ ..] => (false, tail),
-            _ => {
-                // Not a reference: emit one byte and re-scan, so the slashes we
-                // counted are not consumed by a match that did not happen.
-                out.push(bytes[i] as char);
-                i += 1;
-                continue;
-            }
-        };
-        let (is_vals, after_b) = match after_dollars {
-            [b'b', tail @ ..] => (true, tail),
-            tail => (false, tail),
-        };
-        let Some((selector, consumed)) = (match after_b {
-            [b'&', ..] => Some((0usize, 1)),
-            [d, ..] if d.is_ascii_digit() => Some(((d - b'0') as usize, 1)),
-            _ => None,
-        }) else {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        };
-        let reference_len = slashes + if encode { 2 } else { 1 } + usize::from(is_vals) + consumed;
-        let reference = &value[i + slashes..i + reference_len];
-        if is_vals {
-            // No value list here, so the whole thing stays as it was written —
-            // slashes included (upstream returns `$1 + $2`).
-            out.push_str(&value[i..i + reference_len]);
-            i += reference_len;
-            continue;
-        }
-        match slashes {
-            // `\$1` escapes the reference: the `$1` is literal.
-            1 => out.push_str(reference),
-            _ => {
-                // `\\$1` keeps one backslash and expands.
-                if slashes == 2 {
-                    out.push('\\');
-                }
-                let text = group(selector);
-                match encode && !text.is_empty() {
-                    true => out.push_str(&encode_uri_component(text)),
-                    false => out.push_str(text),
-                }
-            }
-        }
-        i += reference_len;
-    }
-    out
-}
-
-/// JavaScript's `encodeURIComponent`: everything outside the unreserved set
-/// `A-Za-z0-9-_.!~*'()` is percent-encoded.
-fn encode_uri_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(b as char),
-            b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// Substitute a `pattern` → `replacement` list in `text`, in order.
@@ -4227,7 +4211,7 @@ mod tests {
 
     /// The target `resolved` produces for `info`, which must not fail.
     fn resolved_target(info: &ReqInfo, resolved: &Resolved) -> Target {
-        rt().block_on(resolve_target(info, resolved))
+        rt().block_on(resolve_target(info, &crate::proxy::dest::Destination::of(info, resolved), resolved))
             .expect("resolve_target")
     }
 
@@ -5459,6 +5443,116 @@ mod tests {
         assert_eq!(body, b"{\"from\":\"b\"}");
     }
 
+    /// Mapping a path onto a directory is the whole point of a `file://` rule,
+    /// and it works because the pattern's leftover URL is appended to the
+    /// operator's value (`joinUrl`, `_original/lib/rules/rules.js:334-366`).
+    /// Nothing appended it here: every request under `static.test` served the
+    /// directory itself, which is not a file, so all of them 404'd.
+    #[test]
+    fn a_directory_rule_maps_the_rest_of_the_path_onto_it() {
+        let fx = Fixtures::new("dirmap");
+        fx.write("js/app.js", b"console.log(1)");
+        fx.write("index.html", b"<h1>root</h1>");
+        let dir = fx.path("");
+
+        let served = |rules: &str, url: &str| -> Option<(u16, Vec<u8>)> {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(rules);
+            let (scheme, rest) = url.split_once("://").expect("absolute url");
+            let (host, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, "/"),
+            };
+            let info = build_req_info("GET", scheme, host, 80, path, &HeaderMap::new(), None);
+            let resp = short_circuit(&info, &mgr.resolve(&info), test_env())?;
+            let status = resp.status().as_u16();
+            let body = rt()
+                .block_on(async { http_body_util::BodyExt::collect(resp.into_body()).await })
+                .expect("collect body")
+                .to_bytes()
+                .to_vec();
+            Some((status, body))
+        };
+
+        let rules = format!("static.test file://{}\n", dir.trim_end_matches('/'));
+        assert_eq!(
+            served(&rules, "http://static.test/js/app.js"),
+            Some((200, b"console.log(1)".to_vec()))
+        );
+        // A directory with nothing more to add falls back to its `index.html`.
+        assert_eq!(
+            served(&rules, "http://static.test/"),
+            Some((200, b"<h1>root</h1>".to_vec()))
+        );
+        // The query string is not part of a filename.
+        assert_eq!(
+            served(&rules, "http://static.test/js/app.js?v=2"),
+            Some((200, b"console.log(1)".to_vec()))
+        );
+        // A path pattern contributes only what it did not consume.
+        let scoped = format!("static.test/assets file://{}\n", dir.trim_end_matches('/'));
+        assert_eq!(
+            served(&scoped, "http://static.test/assets/js/app.js"),
+            Some((200, b"console.log(1)".to_vec()))
+        );
+        // …and `<>` pins the value, whatever the request asked for.
+        let pinned = format!("static.test file://<{}index.html>\n", dir);
+        assert_eq!(
+            served(&pinned, "http://static.test/js/app.js"),
+            Some((200, b"<h1>root</h1>".to_vec()))
+        );
+    }
+
+    /// `file://(text)` answers with the text itself — whistle's inline value
+    /// (`docs/docs/rules/file.md`, "内联值"). It used to be read as a filename,
+    /// so every inline mock 404'd.
+    #[test]
+    fn a_bracketed_value_is_the_response_body() {
+        let (status, ctype, body) = serve_at(
+            "file",
+            "({\"status\":\"ok\"})",
+            "http://api.test/data.json",
+        )
+        .expect("served");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"{\"status\":\"ok\"}");
+        // With no file to name the type, the request URL does.
+        assert_eq!(ctype, "application/json; charset=utf-8");
+        // A template renders the inline text like it renders a file's.
+        let (_, _, body) = serve_at("tpl", "(hello {name})", "http://api.test/x?name=world")
+            .expect("served");
+        assert_eq!(body, b"hello world");
+    }
+
+    /// Each `|` alternative takes the request's remaining path, not just the
+    /// last: joining the value whole would leave the first alternative pointing
+    /// at the bare directory.
+    #[test]
+    fn every_alternative_path_takes_the_rest_of_the_url() {
+        let fx = Fixtures::new("altjoin");
+        fx.write("second/js/app.js", b"from second");
+        let value = format!("{}|{}", fx.path("first"), fx.path("second"));
+
+        let mut mgr = RuleManager::new();
+        mgr.set_text(&format!("static.test file://{value}\n"));
+        let info = build_req_info(
+            "GET",
+            "http",
+            "static.test",
+            80,
+            "/js/app.js",
+            &HeaderMap::new(),
+            None,
+        );
+        let resp = short_circuit(&info, &mgr.resolve(&info), test_env()).expect("served");
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = rt()
+            .block_on(async { http_body_util::BodyExt::collect(resp.into_body()).await })
+            .expect("collect body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"from second");
+    }
+
     #[test]
     fn xs_rules_never_split_on_pipe() {
         // whistle's split regex only admits a single `x` (`rules.js:96`), so an
@@ -5658,7 +5752,7 @@ mod tests {
             &HeaderMap::new(),
             None,
         );
-        rt().block_on(resolve_target(&info, &resolved))
+        rt().block_on(resolve_target(&info, &crate::proxy::dest::Destination::of(&info, &resolved), &resolved))
     }
 
     /// The upstream target `rules` produce for `url`.
