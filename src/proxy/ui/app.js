@@ -148,8 +148,26 @@ function sortSessions(list) {
   });
 }
 
+/** The rows as currently shown, which is what the arrow keys move through. */
+function shownRows() {
+  return sortSessions(visibleSessions());
+}
+
+/** Move the selection `delta` rows through the list, and keep it in view. */
+function moveSelection(delta) {
+  const list = shownRows();
+  if (!list.length) return;
+  const at = list.findIndex((s) => s.id === state.selected);
+  const next = at < 0
+    ? (delta > 0 ? 0 : list.length - 1)
+    : Math.max(0, Math.min(list.length - 1, at + delta));
+  selectRow(list[next].id);
+  const tr = document.querySelector('tr[data-id="' + list[next].id + '"]');
+  if (tr) tr.scrollIntoView({ block: 'nearest' });
+}
+
 function renderRows() {
-  const list = sortSessions(visibleSessions());
+  const list = shownRows();
   $('rows').innerHTML = list.map((s) => {
     const sel = s.id === state.selected ? ' aria-selected="true"' : '';
     const cls = s.status >= 400 || s.status === 0 ? ' class="failed"' : '';
@@ -769,12 +787,28 @@ function init() {
   $('rules-save').addEventListener('click', saveRules);
   $('values-save').addEventListener('click', saveValues);
 
-  // ⌘F focuses the filter from anywhere, the way a request list should.
   document.addEventListener('keydown', (e) => {
+    // ⌘F focuses the filter from anywhere, the way a request list should.
     if ((e.metaKey || e.ctrlKey) && e.key === 'f' && state.pane === 'requests') {
       e.preventDefault();
       $('filter').focus();
       $('filter').select();
+      return;
+    }
+    if (state.pane !== 'requests') return;
+    // Arrow keys walk the list. They work from the filter box too — you type,
+    // then step through what you found without reaching for the mouse — but not
+    // from anywhere else that takes text.
+    const inEditable = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)
+      && document.activeElement.id !== 'filter';
+    if (inEditable) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-1); }
+    else if (e.key === 'Escape') {
+      state.selected = null;
+      state.detail = null;
+      renderRows();
+      renderDetail();
     }
   });
 
