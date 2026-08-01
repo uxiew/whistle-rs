@@ -485,6 +485,7 @@ fn resolve_walk(
     defer_res_phase: bool,
 ) -> Resolved {
     let mut resolved = Resolved::default();
+    let exact = collect_exact_skips(rules, req, is_internal_req);
 
     // Two passes so important rules win: first important, then normal. Within a
     // pass we keep first-match order. `is_important` folds `lineProps://important`
@@ -495,6 +496,9 @@ fn resolve_walk(
                 continue;
             }
             if !rule.props.allows_scope(is_internal_req) {
+                continue;
+            }
+            if exact.silences_pattern(&rule.raw_pattern) {
                 continue;
             }
             let Some(matched) = match_rule(rule, req) else {
@@ -509,6 +513,9 @@ fn resolve_walk(
                 if defer_res && protocols::is_res_phase(&op.protocol) {
                     continue;
                 }
+                if exact.silences_op(op) {
+                    continue;
+                }
                 take(&mut resolved, op, order_key(index, pass_important), &matched);
             }
         }
@@ -516,6 +523,79 @@ fn resolve_walk(
 
     apply_ignores(&mut resolved);
     resolved
+}
+
+/// Rules silenced by name, gathered before anything is resolved.
+///
+/// `ignore://pattern=…` and `ignore://matcher=…` (with `skip://` and the
+/// `operator=`/`operation=` spellings folded in) drop a rule by the *text* it
+/// was written as. Two things follow, and both are why this cannot live in
+/// [`apply_ignores`] with the name-based ignores:
+///
+/// * the text is gone by then — a resolved [`RuleOp`] no longer knows which
+///   pattern brought it in;
+/// * the ignore may be written *below* the rule it silences, so nothing can be
+///   taken until the whole set has been read (upstream resolves its ignore list
+///   first for the same reason, `_original/lib/rules/rules.js:1118-1147`).
+#[derive(Debug, Default)]
+struct ExactSkips {
+    patterns: Vec<String>,
+    matchers: Vec<String>,
+}
+
+impl ExactSkips {
+    /// Is every rule written with this pattern token silenced?
+    fn silences_pattern(&self, raw_pattern: &str) -> bool {
+        self.patterns.iter().any(|p| p == raw_pattern)
+    }
+
+    /// Is this operator silenced?
+    ///
+    /// Upstream tests the matcher both as written and as expanded
+    /// (`exactIgnore`, `_original/lib/util/index.js:1973-1981`, which checks
+    /// `rule.matcher` *and* `rule.rawMatcher`). Shorthand is why: `example.com
+    /// /local/path` parses to `file:///local/path`, and a user silencing it will
+    /// write whichever of the two they are looking at.
+    fn silences_op(&self, op: &RuleOp) -> bool {
+        if self.matchers.is_empty() {
+            return false;
+        }
+        let expanded = format!("{}://{}", op.protocol, op.value);
+        self.matchers
+            .iter()
+            .any(|m| m == &op.raw || m == &expanded)
+    }
+}
+
+/// Gather the exact-form ignores from every rule that applies to this request.
+///
+/// Skipped outright unless some rule carries one ([`Rule::has_exact_skip`]),
+/// because this is a second matching pass over the whole rule set and rule sets
+/// that never use the feature must not pay for it.
+fn collect_exact_skips(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> ExactSkips {
+    let mut skips = ExactSkips::default();
+    if !rules.iter().any(|r| r.has_exact_skip) {
+        return skips;
+    }
+    for rule in rules {
+        if !rule.has_exact_skip || !rule.props.allows_scope(is_internal_req) {
+            continue;
+        }
+        if match_rule(rule, req).is_none() {
+            continue;
+        }
+        for op in &rule.ops {
+            if op.protocol != "ignore" {
+                continue;
+            }
+            match super::parse_exact_skip(&op.value, super::is_skip_token(&op.raw)) {
+                Some((super::ExactSkip::Pattern, v)) => skips.patterns.push(v),
+                Some((super::ExactSkip::Matcher, v)) => skips.matchers.push(v),
+                None => {}
+            }
+        }
+    }
+    skips
 }
 
 /// Does this operator's value take the tail of the URL its pattern matched?
@@ -657,6 +737,13 @@ fn apply_ignores(resolved: &mut Resolved) {
     let (mut drop, mut keep) = (Vec::new(), Vec::new());
     let (mut drop_all, mut cancel_all) = (false, false);
     for op in &ignores {
+        // An exact form (`pattern=…`, `matcher=…`) has already been applied by
+        // [`collect_exact_skips`], and must not also be read as a name list:
+        // `ignore://matcher=a|b` would split on the `|` and drop a protocol
+        // called `b` that the user never mentioned.
+        if super::parse_exact_skip(&op.value, super::is_skip_token(&op.raw)).is_some() {
+            continue;
+        }
         // `|` **and** `&` separate, as they do for every other prop list
         // (`PROP_SEP_RE`, `_original/lib/util/common.js:72`). This port split on
         // `|` only, so `ignore://host&ua` dropped nothing at all.
@@ -951,6 +1038,110 @@ mod tests {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("$ host://1.1.1.1\n");
         assert!(m.resolve(&req("http://anything.test/")).value("host").is_none());
+    }
+
+    /// `ignore://pattern=…` / `matcher=…` silence a rule by the text it was
+    /// written as, rather than by protocol name. Both were silent no-ops: the
+    /// value matched no protocol, so nothing was dropped and nothing said so.
+    ///
+    /// The expected answers come from running upstream's own branch in node
+    /// (`EXACT_SKIP_RE` / `EXACT_IGNORE_RE` / `NO_PROTO_RE`), not from reading
+    /// it.
+    #[test]
+    fn an_exact_ignore_silences_a_rule_by_its_text() {
+        let host_of = |text: &str| {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(text);
+            m.resolve(&req("http://example.com/x"))
+                .value("host")
+                .map(str::to_string)
+        };
+        const BASE: &str = "example.com host://1.1.1.1\n";
+
+        // By pattern, and by operator under all three spellings that mean it.
+        assert_eq!(host_of(&format!("{BASE}* ignore://pattern=example.com")), None);
+        for key in ["matcher", "operator", "operation"] {
+            assert_eq!(
+                host_of(&format!("{BASE}* ignore://{key}=host://1.1.1.1")),
+                None,
+                "{key}"
+            );
+        }
+        // `:` separates as well as `=`.
+        assert_eq!(host_of(&format!("{BASE}* ignore://pattern:example.com")), None);
+
+        // Written *below* the rule it silences — the case that forces the
+        // pre-scan, and the one a post-hoc filter could never have handled.
+        assert_eq!(host_of(&format!("{BASE}* ignore://pattern=example.com\n")), None);
+        // …and above it, which must work just as well.
+        assert_eq!(
+            host_of(&format!("* ignore://pattern=example.com\n{BASE}")),
+            None
+        );
+
+        // Naming something else leaves the rule alone. A silencer that silences
+        // more than it names is worse than one that does nothing.
+        assert_eq!(
+            host_of(&format!("{BASE}* ignore://pattern=other.com")).as_deref(),
+            Some("1.1.1.1")
+        );
+        assert_eq!(
+            host_of(&format!("{BASE}* ignore://matcher=host://9.9.9.9")).as_deref(),
+            Some("1.1.1.1")
+        );
+        // The ignore only applies where its own pattern matches.
+        assert_eq!(
+            host_of(&format!("{BASE}other.test ignore://pattern=example.com")).as_deref(),
+            Some("1.1.1.1")
+        );
+    }
+
+    /// `skip://` reads its value differently from `ignore://`, and this port
+    /// folds the two onto one protocol — so the difference has to be recovered
+    /// from the token as written.
+    ///
+    /// Upstream's `NO_PROTO_RE` branch belongs to `skip://` alone: a value
+    /// carrying a character no protocol name could hold is taken whole as a
+    /// matcher. Under `ignore://` the same text is a list of names. Writing the
+    /// branch for both broke `ignore://host&ua` — `&` is outside the protocol
+    /// character set, so the name list was read as one matcher instead.
+    #[test]
+    fn skip_and_ignore_read_an_unkeyed_value_differently() {
+        use crate::rules::{is_skip_token, parse_exact_skip, ExactSkip};
+
+        // `skip://` takes it whole…
+        assert_eq!(
+            parse_exact_skip("example.com/path", true),
+            Some((ExactSkip::Matcher, "example.com/path".to_string()))
+        );
+        // …`ignore://` does not, and reads it as names.
+        assert_eq!(parse_exact_skip("example.com/path", false), None);
+        assert_eq!(parse_exact_skip("host&ua", false), None);
+
+        // A value that could be a protocol name is a name under either.
+        assert_eq!(parse_exact_skip("a.com", true), None);
+        assert_eq!(parse_exact_skip("host|ua", true), None);
+
+        // The keyed forms need no help from the spelling.
+        for from_skip in [true, false] {
+            assert_eq!(
+                parse_exact_skip("pattern=x", from_skip),
+                Some((ExactSkip::Pattern, "x".to_string()))
+            );
+        }
+        // A key with an empty value falls *through* to the unkeyed branch rather
+        // than being rejected, because `EXACT_SKIP_RE` demands `(.+)` and `=` is
+        // itself outside the protocol character set. So upstream silences an
+        // operator literally spelled `pattern=`, and so does this. Checked in
+        // node; it is the kind of answer nobody would guess.
+        assert_eq!(
+            parse_exact_skip("pattern=", true),
+            Some((ExactSkip::Matcher, "pattern=".to_string()))
+        );
+        assert_eq!(parse_exact_skip("pattern=", false), None);
+
+        assert!(is_skip_token("skip://x"));
+        assert!(!is_skip_token("ignore://x"));
     }
 
     /// `ignore://` takes a vocabulary this port knew almost none of

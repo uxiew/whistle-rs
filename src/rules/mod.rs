@@ -257,9 +257,28 @@ pub struct Rule {
     pub filters: Vec<Filter>,
     /// `lineProps://…` declared on this line (also mirrored onto every op).
     pub props: LineProps,
+    /// The pattern token exactly as written, `$`/`!` prefixes and all.
+    ///
+    /// Upstream's `rawPattern`, captured before any stripping
+    /// (`_original/lib/rules/rules.js:1227`). It exists for one reader:
+    /// `ignore://pattern=…`, which matches on what the user typed rather than on
+    /// what it parsed to. Keeping the parsed [`Pattern`] alone would make the
+    /// feature unusable — there is no way to write a `Prefix { host, port, … }`
+    /// in a rules file.
+    pub raw_pattern: String,
     /// Precomputed: does this line write an operator the response phase decides
     /// ([`protocols::is_res_phase`]), or an `ignore://` that could drop one?
     pub res_phase_ops: bool,
+    /// Precomputed: does this line carry an `ignore://`/`skip://` naming a rule
+    /// *exactly* — `pattern=…`, `matcher=…`, `operator=…`, `operation=…`?
+    ///
+    /// These cannot be applied where the name-based ignores are, because they
+    /// drop a rule by text the resolved operator no longer carries, and they can
+    /// be written on a line *below* the rule they silence. Both force a pre-scan
+    /// (upstream resolves the ignore list first, `rules.js:1118-1147`), and a
+    /// pre-scan over every rule on every request is not free — so the flag says
+    /// whether one is needed at all. Rule sets that use none pay nothing.
+    pub has_exact_skip: bool,
     /// Precomputed: might one of its filters need the response head?
     pub res_dependent: bool,
     /// Precomputed: does one of its filters read the request body (`b:`)?
@@ -1428,6 +1447,9 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
     let res_dependent = filters.iter().any(|f| f.cond.may_need_response());
     let has_body_filter = filters.iter().any(|f| matches!(f.cond, Cond::Body(_)));
     let has_capture_ref = ops.iter().any(|op| replace::has_reference(&op.value));
+    let has_exact_skip = ops
+        .iter()
+        .any(|op| op.protocol == "ignore" && parse_exact_skip(&op.value, is_skip_token(&op.raw)).is_some());
 
     pattern_toks
         .into_iter()
@@ -1441,13 +1463,96 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
                 negate: parsed.negate,
                 filters: filters.clone(),
                 props: props.clone(),
+                // As written, before `parse_pattern` strips `$`/`!` — upstream
+                // captures `rawPattern` at the same point.
+                raw_pattern: tok.to_string(),
                 res_phase_ops,
                 res_dependent,
                 has_body_filter,
                 has_capture_ref,
+                has_exact_skip,
             })
         })
         .collect()
+}
+
+/// Which text an `ignore://`/`skip://` names a rule by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactSkip {
+    /// `pattern=…` — the pattern token as written ([`Rule::raw_pattern`]).
+    Pattern,
+    /// `matcher=…`, `operator=…`, `operation=…` — the operator token.
+    Matcher,
+}
+
+/// Read the exact form out of an `ignore://`/`skip://` value.
+///
+/// Upstream's two regexps (`_original/lib/rules/rules.js:94-98`):
+///
+/// ```text
+/// EXACT_SKIP_RE = /^(pattern|matcher|operator|operation)[=:](.+)$/
+/// NO_PROTO_RE   = /[^\w!*|.-]/
+/// ```
+///
+/// Three of the four keys mean the same thing: only `pattern` selects the
+/// pattern, and `matcher`/`operator`/`operation` all select the operator
+/// (`rules.js:1133`). A value that matches neither regexp is not an exact form
+/// at all — it is a list of protocol names, which this port already handles by
+/// folding `skip` onto `ignore` ([`protocols::canonical`]).
+///
+/// The `NO_PROTO_RE` branch is the subtle one, in two ways.
+///
+/// It takes a value carrying any character a protocol name could not contain
+/// *whole* as a matcher — and it belongs to `skip://` **only**. Plain
+/// `ignore://` is read by `EXACT_IGNORE_RE`, which demands one of the four
+/// keys (`rules.js:1142`), so `ignore://host&ua` is a two-name list while
+/// `skip://host&ua` is a matcher. This port folds `skip` onto `ignore` in
+/// [`protocols::canonical`], which loses that distinction; `from_skip` carries
+/// it back, read off the token as written. Getting this wrong is not
+/// theoretical — it broke `ignore://host&ua` in this very change, and the test
+/// that caught it was already there.
+///
+/// Second, upstream writes the branch reading `RegExp.$1`/`$2`, which belong to
+/// whichever regexp last matched — so its answer looks like it could depend on
+/// the preceding rule. It does not: `NO_PROTO_RE` has no capture groups and a
+/// successful `test` clears both, which lands every such value on
+/// `matcher=<whole value>`. Confirmed by running upstream's own branch over
+/// this port's cases in node rather than by reading it, because a stale-capture
+/// bug would have been invisible to reading.
+pub fn parse_exact_skip(value: &str, from_skip: bool) -> Option<(ExactSkip, String)> {
+    if let Some(at) = value.find(['=', ':']) {
+        let (key, rest) = value.split_at(at);
+        let rest = &rest[1..];
+        if !rest.is_empty() {
+            match key {
+                "pattern" => return Some((ExactSkip::Pattern, rest.to_string())),
+                "matcher" | "operator" | "operation" => {
+                    return Some((ExactSkip::Matcher, rest.to_string()));
+                }
+                _ => {}
+            }
+        }
+    }
+    // Not one of the four keys, so `NO_PROTO_RE` decides — and only for
+    // `skip://`, which is what `from_skip` is for.
+    (from_skip && has_non_protocol_char(value))
+        .then(|| (ExactSkip::Matcher, value.to_string()))
+}
+
+/// Was this operator written `skip://` rather than `ignore://`?
+///
+/// The two are one protocol here ([`protocols::canonical`] folds them), but they
+/// read their value differently — see [`parse_exact_skip`]. The token as written
+/// is the only place the difference survives.
+pub fn is_skip_token(raw: &str) -> bool {
+    raw.starts_with("skip://")
+}
+
+/// Upstream's `NO_PROTO_RE`: is there a character no protocol name could carry?
+fn has_non_protocol_char(value: &str) -> bool {
+    value
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '!' | '*' | '|' | '.' | '-')))
 }
 
 /// The `lineProps://…` payload of `tok`, if it declares line properties.
