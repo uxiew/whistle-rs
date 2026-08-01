@@ -647,28 +647,70 @@ pub fn resolve_response_ops(
 /// `ignore://all` clears everything. Ported from whistle's `ignore` handling.
 fn apply_ignores(resolved: &mut Resolved) {
     let ignores = resolved.multi.remove("ignore").unwrap_or_default();
-    for op in ignores {
-        for name in op.value.split(['|', ',', ' ']) {
+
+    // Upstream reads the whole ignore set before dropping anything
+    // (`resolveIgnore`, `_original/lib/util/index.js:1891-1932`), because an
+    // exclusion can arrive after the `*` it exempts a protocol from.
+    let (mut drop, mut keep) = (Vec::new(), Vec::new());
+    let (mut drop_all, mut cancel_all) = (false, false);
+    for op in &ignores {
+        // `|` **and** `&` separate, as they do for every other prop list
+        // (`PROP_SEP_RE`, `_original/lib/util/common.js:72`). This port split on
+        // `|` only, so `ignore://host&ua` dropped nothing at all.
+        for name in op.value.split(['|', '&', ',', ' ']) {
             let name = name.trim();
             if name.is_empty() {
                 continue;
             }
-            if name == "all" {
-                resolved.single.clear();
-                resolved.multi.clear();
-                return;
+            // `-name` / `!name` exempts a protocol from an `ignore://*`;
+            // `-*` cancels the `*` outright.
+            if let Some(rest) = name.strip_prefix('-').or_else(|| name.strip_prefix('!')) {
+                match rest {
+                    "*" => cancel_all = true,
+                    other => keep.push(protocols::canonical(other).unwrap_or(other).to_string()),
+                }
+                continue;
+            }
+            // Four spellings of "everything". `all` is this port's own — it
+            // predates the audit that found the upstream set, and dropping it
+            // now would break rules files written against this port.
+            if matches!(name, "*" | "All" | "allRules" | "allProtocols" | "all") {
+                drop_all = true;
+                continue;
             }
             // `xproxy`/`xsocks`/… name the same operator as their base spelling
             // once `canonical` has folded them, so an ignore has to be folded
             // the same way to find the key it means.
-            let name = protocols::canonical(name).unwrap_or(name);
-            if name == "proxy" {
-                ignore_upstream_proxies(resolved);
-                continue;
-            }
-            resolved.single.remove(name);
-            resolved.multi.remove(name);
+            drop.push(protocols::canonical(name).unwrap_or(name).to_string());
         }
+    }
+
+    if drop_all && !cancel_all {
+        let kept: Vec<(String, RuleOp)> = keep
+            .iter()
+            .filter_map(|name| resolved.single.remove_entry(name))
+            .collect();
+        let kept_multi: Vec<(String, Vec<RuleOp>)> = keep
+            .iter()
+            .filter_map(|name| resolved.multi.remove_entry(name))
+            .collect();
+        resolved.single.clear();
+        resolved.multi.clear();
+        resolved.single.extend(kept);
+        resolved.multi.extend(kept_multi);
+        return;
+    }
+
+    for name in drop {
+        if keep.contains(&name) {
+            continue;
+        }
+        if name == "proxy" {
+            ignore_upstream_proxies(resolved);
+            continue;
+        }
+        resolved.single.remove(&name);
+        resolved.multi.remove(&name);
     }
 }
 
@@ -906,6 +948,53 @@ mod tests {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("$ host://1.1.1.1\n");
         assert!(m.resolve(&req("http://anything.test/")).value("host").is_none());
+    }
+
+    /// `ignore://` takes a vocabulary this port knew almost none of
+    /// (`resolveIgnore`, `_original/lib/util/index.js:1891-1932`). Each of these
+    /// was a rule that went on applying after being told not to.
+    #[test]
+    fn ignore_speaks_upstreams_vocabulary() {
+        let host_of = |text: &str| {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(text);
+            m.resolve(&req("http://example.com/x"))
+                .value("host")
+                .map(str::to_string)
+        };
+        const BASE: &str = "example.com host://1.1.1.1 ua://Bot";
+
+        // Four spellings of "everything" — only `all` used to work, and it is
+        // this port's own.
+        for star in ["*", "All", "allRules", "allProtocols", "all"] {
+            assert_eq!(host_of(&format!("{BASE} ignore://{star}\n")), None, "{star}");
+        }
+        // `&` separates as well as `|`; splitting on `|` alone meant
+        // `ignore://host&ua` dropped nothing.
+        assert_eq!(host_of(&format!("{BASE} ignore://host&ua\n")), None);
+        assert_eq!(host_of(&format!("{BASE} ignore://host|ua\n")), None);
+        // `-name` / `!name` exempts one protocol from an `ignore://*`…
+        assert_eq!(
+            host_of(&format!("{BASE} ignore://*|-host\n")).as_deref(),
+            Some("1.1.1.1")
+        );
+        assert_eq!(
+            host_of(&format!("{BASE} ignore://*&!host\n")).as_deref(),
+            Some("1.1.1.1")
+        );
+        // …and `-*` cancels the `*` itself.
+        assert_eq!(
+            host_of(&format!("{BASE} ignore://*|-*\n")).as_deref(),
+            Some("1.1.1.1")
+        );
+        // An exemption applies however the two are ordered on the line.
+        assert_eq!(
+            host_of(&format!("{BASE} ignore://-host ignore://*\n")).as_deref(),
+            Some("1.1.1.1")
+        );
+        // A named protocol still goes.
+        assert_eq!(host_of(&format!("{BASE} ignore://host\n")), None);
+        assert_eq!(host_of(&format!("{BASE} ignore://ua\n")).as_deref(), Some("1.1.1.1"));
     }
 
     #[test]

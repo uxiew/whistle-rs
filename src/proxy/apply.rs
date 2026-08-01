@@ -1287,9 +1287,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
             set_header(&mut parts.headers, "authorization", &format!("Basic {token}"));
         }
     }
-    if let Some(xff) = resolved.value("forwardedFor") {
-        set_header(&mut parts.headers, "x-forwarded-for", xff);
-    }
+    apply_forwarded_for(&mut parts.headers, resolved);
     apply_req_cors(&mut parts.headers, resolved);
     apply_req_cookies(&mut parts.headers, resolved);
     let del = Deletions::of(resolved, true);
@@ -1887,6 +1885,44 @@ fn apply_show_host(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&R
         .and_then(|r| r.server_ip.as_deref())
         .unwrap_or("127.0.0.1");
     set_header(headers, "x-host-ip", ip);
+}
+
+/// `x-forwarded-for` (`_original/lib/inspectors/res.js:690-710`).
+///
+/// Three rules, none of which this port had:
+///
+/// * `forwardedFor://` sets the header **only when its value is an IP**
+///   (`net.isIP`). Upstream's own documentation points a non-IP value at
+///   `reqHeaders://` instead; setting it here let `forwardedFor://hello` reach
+///   the origin as a client address.
+/// * `disable://clientIp` (and `clientIP`) deletes the header outright.
+/// * Otherwise the client's own `X-Forwarded-For` is **removed** rather than
+///   forwarded. That is the load-bearing one: without it, any client can claim
+///   any address simply by sending the header, and the origin sees a value the
+///   proxy vouched for. whistle closes that by default and opens it with
+///   `enable://clientIp`.
+///
+/// The port does not implement upstream's `req.clientIp` *substitution* — it
+/// never forwards a client address of its own — so the choice here is between
+/// stripping and passing through, and stripping is the one that cannot mislead.
+fn apply_forwarded_for(headers: &mut HeaderMap, resolved: &Resolved) {
+    const XFF: &str = "x-forwarded-for";
+    let dis = disabled_flags(resolved);
+    if dis.contains("clientIp") || dis.contains("clientIP") {
+        headers.remove(XFF);
+        return;
+    }
+    if let Some(value) = resolved.value("forwardedFor") {
+        // `net.isIP`: a v4 or v6 literal, nothing else.
+        if value.trim().parse::<std::net::IpAddr>().is_ok() {
+            set_header(headers, XFF, value.trim());
+            return;
+        }
+    }
+    let en = enabled_flags(resolved);
+    if !en.contains("clientIp") && !en.contains("clientIP") {
+        headers.remove(XFF);
+    }
 }
 
 /// `responseFor://` — annotate the response with who answered it, as
@@ -5205,6 +5241,52 @@ mod tests {
         assert_eq!(res_delay_ms(&of("a.com resDelay://-5\n")), None);
         // Nothing numeric at all stays nothing.
         assert_eq!(res_speed_kbps(&of("a.com resSpeed://fast\n")), None);
+    }
+
+    /// `x-forwarded-for` — the header a client must not be able to dictate.
+    ///
+    /// whistle strips the client's by default (`res.js:690-710`); this port
+    /// forwarded it, so any client could claim any address and have the proxy
+    /// pass it on as if vouched for. It also set a `forwardedFor://` value that
+    /// was not an address at all.
+    #[test]
+    fn forwarded_for_is_an_address_or_nothing() {
+        let out = |rules: &str, incoming: Option<&str>| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(rules);
+            let mut hm = HeaderMap::new();
+            if let Some(v) = incoming {
+                hm.insert("x-forwarded-for", v.parse().unwrap());
+            }
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &hm, None);
+            let resolved = mgr.resolve(&info);
+            let mut headers = hm.clone();
+            apply_forwarded_for(&mut headers, &resolved);
+            headers
+                .get("x-forwarded-for")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        // The client's claim does not survive by default.
+        assert_eq!(out("a.com host://1.1.1.1\n", Some("10.0.0.5")), None);
+        // …unless the rules ask for it.
+        assert_eq!(
+            out("a.com enable://clientIp\n", Some("10.0.0.5")).as_deref(),
+            Some("10.0.0.5")
+        );
+        // A rule may set one, if it is an address.
+        assert_eq!(
+            out("a.com forwardedFor://203.0.113.7\n", None).as_deref(),
+            Some("203.0.113.7")
+        );
+        assert_eq!(out("a.com forwardedFor://2001:db8::1\n", None).as_deref(), Some("2001:db8::1"));
+        // A non-address value sets nothing — and does not rescue the client's.
+        assert_eq!(out("a.com forwardedFor://hello\n", Some("10.0.0.5")), None);
+        // `disable://clientIp` removes it whatever else said.
+        assert_eq!(
+            out("a.com forwardedFor://203.0.113.7 disable://clientIp\n", None),
+            None
+        );
     }
 
     #[test]
