@@ -1105,6 +1105,10 @@ mod forced_encoding_tests {
     use super::*;
 
     fn ops(rule: &str, has_body: bool) -> ResBodyOps {
+        ops_ct(rule, has_body, None)
+    }
+
+    fn ops_ct(rule: &str, has_body: bool, streaming_ct: Option<&str>) -> ResBodyOps {
         let mut m = RuleManager::new();
         m.set_text(&format!("example.com {rule}\n"));
         let info = apply::build_req_info(
@@ -1116,7 +1120,53 @@ mod forced_encoding_tests {
             &hyper::HeaderMap::new(),
             None,
         );
-        ResBodyOps::of(&m.resolve(&info), has_body, 200)
+        ResBodyOps::of(&m.resolve(&info), has_body, 200, streaming_ct)
+    }
+
+    /// An event stream is never collected, whatever the rule asks for.
+    ///
+    /// Collecting one does not delay the response, it withholds it: the body
+    /// ends when the server says so, which for SSE is typically never, so the
+    /// client receives nothing at all. Verified against a live SSE origin —
+    /// before this gate, `enable://gzip` and `resReplace://` each produced not
+    /// one byte in three seconds where the unruled host streamed events.
+    #[test]
+    fn an_event_stream_is_never_collected() {
+        for rule in [
+            "enable://gzip",
+            "resReplace://tick=TOCK",
+            "resBody://(x)",
+            "resSpeed://10",
+            "resAppend://(x)",
+        ] {
+            for ct in [
+                "text/event-stream",
+                "text/event-stream; charset=utf-8",
+                "  TEXT/EVENT-STREAM ;charset=utf-8",
+            ] {
+                let ops = ops_ct(rule, true, Some(ct));
+                assert!(
+                    !ops.needs_body(),
+                    "`{rule}` on `{ct}` would hold the stream shut"
+                );
+            }
+        }
+    }
+
+    /// …and the gate is only about event streams. Any other type still gets
+    /// every operator, or the fix would have bought the hang with the feature.
+    #[test]
+    fn an_ordinary_response_is_still_transformed() {
+        for ct in ["text/html", "application/json", "text/event", "application/event-stream"] {
+            assert!(ops_ct("resReplace://a=b", true, Some(ct)).needs_body(), "{ct}");
+        }
+        // A response with no content type at all is transformed as before.
+        assert!(ops_ct("resReplace://a=b", true, None).needs_body());
+        // `text/event-streamlike` *does* count as a stream: upstream's `SSE_RE`
+        // is not anchored at the end. Pinned as **documented**, not as desired —
+        // it is upstream's answer, and diverging here would be a divergence
+        // nobody asked for.
+        assert!(is_event_stream(Some("text/event-streamlike")));
     }
 
     /// The bug: `enable://gzip` standing alone left `needs_body` false, so the
@@ -1867,6 +1917,20 @@ struct ResBodyOps {
     force_encoding: Option<coding::Coding>,
 }
 
+/// Is this response an event stream — a body that need never end?
+///
+/// whistle's `isSSE` (`_original/lib/util/index.js:3917-3921`), whose test is
+/// `/^\s*text\/event-stream\s*;?/i` against `content-type`. Deliberately as
+/// loose as upstream's: the pattern is not anchored at the end, so anything
+/// *starting* with the media type matches, parameters and all.
+fn is_event_stream(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|ct| {
+        ct.trim_start()
+            .get(.."text/event-stream".len())
+            .is_some_and(|head| head.eq_ignore_ascii_case("text/event-stream"))
+    })
+}
+
 impl ResBodyOps {
     /// The body operators in force, given what the response *is*.
     ///
@@ -1881,7 +1945,33 @@ impl ResBodyOps {
     /// stripped its `Content-Length`, and — because the injection also stamps
     /// `Cache-Control: no-store` and strips CSP — rewrote the headers of a
     /// redirect the rule was never meant to touch.
-    fn of(resolved: &Resolved, has_body: bool, status: u16) -> Self {
+    ///
+    /// `streaming_ct` is the content type of a body that is **still arriving**,
+    /// and exists for one reason: an event stream must never be collected. A
+    /// caller whose body is already wholly in memory passes `None` — there is
+    /// nothing left to wait for, so the gate below would only drop operators
+    /// that can be applied perfectly well. See [`is_event_stream`].
+    fn of(resolved: &Resolved, has_body: bool, status: u16, streaming_ct: Option<&str>) -> Self {
+        if is_event_stream(streaming_ct) {
+            // Every operator here needs the whole body, and an event stream has
+            // no "whole" — it ends when the server decides, which for SSE is
+            // typically never. Collecting one does not delay the response, it
+            // withholds it: the client receives nothing at all, where without
+            // the rule it would have received events for as long as it listened.
+            //
+            // So the operators are dropped and the stream is passed through.
+            // They do not apply to SSE in this port — a real gap, and the honest
+            // shape of it, because upstream *does* transform event streams. It
+            // can because its body layer is streaming end to end: the replace
+            // transforms hold back only a chunk tail, and for SSE flush through
+            // the last `\n\n` so a complete event is never held back
+            // (`_original/lib/util/replace-string-transform.js:27-33`). This
+            // port collects and then transforms, so it has no such tail to hold.
+            //
+            // Passing the stream through is the behaviour the two ports share:
+            // events keep arriving. Buffering shares nothing with it.
+            return ResBodyOps::default();
+        }
         if !has_body {
             // The trailers still apply: they are headers, not a body, and
             // upstream folds them in after this gate (`res.js:1250-1290`). So
@@ -2332,6 +2422,9 @@ async fn finish_local_response(
         resolved,
         response_has_body(parts.status.as_u16(), &info.method),
         parts.status.as_u16(),
+        // `None`: the body is already collected on this path, so even an event
+        // stream is a finite `Bytes` here and every operator can be applied.
+        None,
     );
     let res_ct = parts
         .headers
@@ -3071,16 +3164,19 @@ async fn serve(
     )
     .await;
 
-    let ops = ResBodyOps::of(
-        &resolved,
-        response_has_body(parts.status.as_u16(), &info.method),
-        parts.status.as_u16(),
-    );
     let res_ct = parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    // This is the path where the body is still arriving frame by frame, so the
+    // content type is what decides whether it may be collected at all.
+    let ops = ResBodyOps::of(
+        &resolved,
+        response_has_body(parts.status.as_u16(), &info.method),
+        parts.status.as_u16(),
+        res_ct.as_deref(),
+    );
     let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     let mut res_body_cap: Option<Capture> = None;
     let res_body: DynBody =
