@@ -1719,22 +1719,52 @@ fn no_type_alias(_: &str) -> Option<&'static str> {
 
 /// Milliseconds to delay before forwarding the request (`reqDelay`).
 pub fn req_delay_ms(resolved: &Resolved) -> Option<u64> {
-    resolved.value("reqDelay").and_then(|v| v.trim().parse().ok())
+    resolved
+        .value("reqDelay")
+        .and_then(parse_leading_number)
+        .filter(|ms| *ms > 0.0)
+        .map(|ms| ms as u64)
 }
 
 /// Milliseconds to delay before returning the response (`resDelay`).
 pub fn res_delay_ms(resolved: &Resolved) -> Option<u64> {
-    resolved.value("resDelay").and_then(|v| v.trim().parse().ok())
+    resolved
+        .value("resDelay")
+        .and_then(parse_leading_number)
+        .filter(|ms| *ms > 0.0)
+        .map(|ms| ms as u64)
 }
 
-/// Request-body throughput cap in KB/s (`reqSpeed`).
+/// Request-body throughput cap in kilobits/s (`reqSpeed`) — see
+/// [`super::body::throttled`] for why the unit is bits.
 pub fn req_speed_kbps(resolved: &Resolved) -> Option<f64> {
-    resolved.value("reqSpeed").and_then(|v| v.trim().parse().ok())
+    resolved.value("reqSpeed").and_then(parse_leading_number)
 }
 
-/// Response-body throughput cap in KB/s (`resSpeed`).
+/// Response-body throughput cap in kilobits/s (`resSpeed`).
 pub fn res_speed_kbps(resolved: &Resolved) -> Option<f64> {
-    resolved.value("resSpeed").and_then(|v| v.trim().parse().ok())
+    resolved.value("resSpeed").and_then(parse_leading_number)
+}
+
+/// JavaScript's `parseFloat`: the longest numeric prefix, ignoring whatever
+/// follows.
+///
+/// whistle reads these values with `parseFloat`/`parseInt`
+/// (`_original/lib/inspectors/res.js:917-921`,
+/// `lib/util/index.js:3687-3693`), so `resSpeed://20kb` and `resDelay://500ms`
+/// are 20 and 500 there. Rust's `parse` rejects them outright, which turned a
+/// value with a unit suffix — the way anyone would first write one — into no
+/// throttle and no delay at all.
+fn parse_leading_number(value: &str) -> Option<f64> {
+    let text = value.trim();
+    let end = text
+        .char_indices()
+        .take_while(|(i, c)| {
+            c.is_ascii_digit() || *c == '.' || (*i == 0 && (*c == '-' || *c == '+'))
+        })
+        .map(|(i, c)| i + c.len_utf8())
+        .last()?;
+    text[..end].parse().ok()
 }
 
 /// Apply response-side operators (status replacement, headers) in place.
@@ -1808,6 +1838,7 @@ pub fn apply_response_for(
 
     disable_res_props(&mut parts.headers, resolved);
     apply_show_host(&mut parts.headers, resolved, info);
+    annotate_response_for(&mut parts.headers, resolved, info);
 }
 
 /// `disable://` flags with response-header effects (`disableResProps`,
@@ -1851,6 +1882,67 @@ fn apply_show_host(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&R
         .and_then(|r| r.server_ip.as_deref())
         .unwrap_or("127.0.0.1");
     set_header(headers, "x-host-ip", ip);
+}
+
+/// `responseFor://` — annotate the response with who answered it, as
+/// `x-whistle-response-for` (`setResponseFor`,
+/// `_original/lib/util/index.js:3214-3261`, called from `res.js:1200-1206`).
+///
+/// Two forms. A plain value is emitted verbatim. `name=a,b,req.c` names
+/// *headers* to read: bare names from the response, `req.`-prefixed ones from
+/// the request, with the address actually reached appended — so a response can
+/// carry a chain of who served it without anyone having to guess.
+///
+/// **This used to be a different operator entirely.** The port fetched the value
+/// as a URL, on every matching request, and wrote the result onto the *outgoing
+/// request* — an unrequested outbound call to whatever a rules file named, and
+/// headers the client never saw. Nothing upstream makes a network call here.
+fn annotate_response_for(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&ReqInfo>) {
+    let Some(spec) = resolved.value("responseFor") else {
+        return;
+    };
+    let server_ip = info
+        .and_then(|i| i.res.as_ref())
+        .and_then(|r| r.server_ip.as_deref())
+        .unwrap_or("127.0.0.1");
+
+    let Some(names) = spec.strip_prefix("name=") else {
+        set_header(headers, "x-whistle-response-for", spec);
+        return;
+    };
+
+    // Response-header lookups keep their position; request-header ones are
+    // collected and appended after, which is upstream's `result.concat(reqResult)`.
+    let (mut from_res, mut from_req) = (Vec::new(), Vec::new());
+    for name in names.to_ascii_lowercase().split(',') {
+        let name = name.trim();
+        match name.strip_prefix("req.") {
+            Some(req_name) => {
+                if let Some(v) = info.and_then(|i| header_of(&i.headers, req_name)) {
+                    from_req.push(v);
+                }
+            }
+            None => {
+                if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+                    from_res.push(v.to_string());
+                }
+            }
+        }
+    }
+    if !from_res.iter().any(|v| v == server_ip) {
+        from_res.push(server_ip.to_string());
+    }
+    from_res.extend(from_req);
+    set_header(headers, "x-whistle-response-for", &from_res.join(", "));
+}
+
+/// One request header by name, from the captured pairs.
+fn header_of(pairs: &[(String, String)], name: &str) -> Option<String> {
+    pairs
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
 }
 
 /// Strip the request headers a `disable://` flag names (`disableReqProps`,
@@ -5018,6 +5110,89 @@ mod tests {
             ),
             Some("93.184.216.34".to_string())
         );
+    }
+
+    /// `responseFor://` annotates the **response** with who served it. It used
+    /// to fetch its value as a URL — an unrequested outbound call on every
+    /// matching request, to whatever a rules file named — and write the result
+    /// onto the outgoing *request*, where the client never saw it. Nothing
+    /// upstream makes a network call here.
+    #[test]
+    fn response_for_annotates_rather_than_fetches() {
+        let annotate = |rules: &str, res_headers: Vec<(&str, &str)>, req_headers: Vec<(&str, &str)>| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(rules);
+            let mut hm = HeaderMap::new();
+            for (k, v) in &req_headers {
+                hm.insert(
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            let mut info = build_req_info("GET", "http", "example.com", 80, "/x", &hm, None);
+            info.res = Some(crate::rules::ResInfo {
+                status: 200,
+                headers: Vec::new(),
+                server_ip: Some("10.0.0.9".into()),
+                server_port: Some(80),
+            });
+            let resolved = mgr.resolve(&info);
+            let mut out = HeaderMap::new();
+            for (k, v) in &res_headers {
+                out.insert(
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            annotate_response_for(&mut out, &resolved, Some(&info));
+            out.get("x-whistle-response-for")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        // A plain value is emitted as written.
+        assert_eq!(
+            annotate("example.com responseFor://svc-a\n", vec![], vec![]),
+            Some("svc-a".into())
+        );
+        // `name=` reads headers: response ones in place, `req.` ones appended,
+        // with the address actually reached added if it is not already there.
+        assert_eq!(
+            annotate(
+                "example.com responseFor://name=server,req.host\n",
+                vec![("server", "nginx")],
+                vec![("host", "example.com")],
+            ),
+            Some("nginx, 10.0.0.9, example.com".into())
+        );
+        // A named header that is not present contributes nothing.
+        assert_eq!(
+            annotate("example.com responseFor://name=absent\n", vec![], vec![]),
+            Some("10.0.0.9".into())
+        );
+        // No rule, no header.
+        assert_eq!(annotate("example.com host://1.1.1.1\n", vec![], vec![]), None);
+    }
+
+    /// whistle reads a speed or a delay with `parseFloat`/`parseInt`, so a value
+    /// carrying its unit works. Rust's `parse` rejected it outright, turning
+    /// `resSpeed://20kb` — the way anyone would first write it — into no
+    /// throttle at all.
+    #[test]
+    fn a_speed_or_delay_may_carry_its_unit() {
+        let of = |text: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            mgr.resolve(&info)
+        };
+        assert_eq!(res_speed_kbps(&of("a.com resSpeed://20kb\n")), Some(20.0));
+        assert_eq!(req_speed_kbps(&of("a.com reqSpeed://3\n")), Some(3.0));
+        assert_eq!(res_delay_ms(&of("a.com resDelay://500ms\n")), Some(500));
+        // Upstream's `> 0` guard: a zero or negative delay is no delay.
+        assert_eq!(res_delay_ms(&of("a.com resDelay://0\n")), None);
+        assert_eq!(res_delay_ms(&of("a.com resDelay://-5\n")), None);
+        // Nothing numeric at all stays nothing.
+        assert_eq!(res_speed_kbps(&of("a.com resSpeed://fast\n")), None);
     }
 
     #[test]

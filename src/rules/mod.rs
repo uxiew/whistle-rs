@@ -208,6 +208,10 @@ pub enum Pattern {
     /// Matches every request (bare operator lines aren't produced here, but
     /// kept for completeness / `*` patterns collapse to this when trivial).
     Any,
+    /// Matches nothing: the token carried no host, path, scheme or port, so
+    /// there is nothing to test. Upstream drops the rule outright; keeping it as
+    /// a pattern that never matches costs one arm and keeps the parse total.
+    Nothing,
 }
 
 impl Pattern {
@@ -1707,6 +1711,22 @@ fn index_of_pattern(tokens: &[&str]) -> Option<usize> {
     ip_index
 }
 
+/// The plugin a `whistle.<name>` / `plugin.<name>` protocol names.
+///
+/// `PLUGIN_RE`'s name class (`_original/lib/rules/rules.js:24`) is
+/// `[a-z\d_\-]+` — deliberately narrow, so an ordinary dotted hostname written
+/// as a protocol cannot be mistaken for a plugin.
+fn plugin_package(proto: &str) -> Option<&str> {
+    let name = proto
+        .strip_prefix("whistle.")
+        .or_else(|| proto.strip_prefix("plugin."))?;
+    let ok = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    ok.then_some(name)
+}
+
 /// Split `proto://rest` → `(proto, rest)`.
 fn split_protocol(tok: &str) -> Option<(&str, &str)> {
     tok.find("://").map(|i| (&tok[..i], &tok[i + 3..]))
@@ -1785,6 +1805,24 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
         return op("host", tok);
     }
     if let Some((proto, rest)) = split_protocol(tok) {
+        // `whistle.<name>://…` and `plugin.<name>://…` name a plugin — it is how
+        // every npm-published whistle plugin is written, so a rules file carried
+        // over from whistle is full of them (`PLUGIN_RE`,
+        // `_original/lib/rules/rules.js:24,:1284-1285`).
+        //
+        // Without this the protocol is unknown, the token becomes a
+        // URL-replacement rule, and `whistle.vase://x` sends the traffic to a
+        // host called `x`. Fail-open, and pointed at whatever the plugin's
+        // argument happened to say.
+        if let Some(name) = plugin_package(proto) {
+            let value = match rest.is_empty() {
+                true => name.to_string(),
+                // The port's own `plugin://name/extra` spelling, which is what
+                // `plugins::matched` splits on.
+                false => format!("{name}/{rest}"),
+            };
+            return op("plugin", &value);
+        }
         if protocols::is_protocol(proto) {
             // Normalise alias protocols (e.g. `hosts` → `host`) to canonical names.
             return op(protocols::canonical(proto).unwrap_or(proto), rest);
@@ -1958,7 +1996,12 @@ fn parse_prefix(tok: &str) -> Pattern {
         (false, host_no_port.to_lowercase())
     };
     if host.is_empty() && path.is_empty() && scheme.is_none() && port.is_none() {
-        return Pattern::Any;
+        // Nothing to match on. Upstream drops such a rule (`if (!pattern) return`,
+        // `_original/lib/rules/rules.js:1247-1249`); reaching `Pattern::Any` here
+        // meant a stray token — a lone `$`, a lone `!` — silently applied its
+        // line's operators to **every** request. `Pattern::Any` stays for the
+        // callers that construct it deliberately.
+        return Pattern::Nothing;
     }
     Pattern::Prefix {
         scheme,
@@ -2852,6 +2895,32 @@ mod parse_text_tests {
         assert_eq!(parse_ip_shorthand("1.2.3.4:8080"), Some(("1.2.3.4".into(), Some(8080))));
         assert_eq!(parse_ip_shorthand("::ffff:1.2.3.4"), Some(("1.2.3.4".into(), None)));
         assert_eq!(parse_ip_shorthand("[::1]:9"), Some(("::1".into(), Some(9))));
+    }
+
+    /// `whistle.<name>://` and `plugin.<name>://` name a plugin. It is how every
+    /// npm-published whistle plugin is written, so a rules file carried over
+    /// from whistle is full of them — and without this the protocol is unknown,
+    /// the token becomes a URL-replacement rule, and `whistle.vase://x` sends
+    /// the traffic to a host called `x`.
+    #[test]
+    fn a_plugin_package_protocol_names_a_plugin() {
+        for (line, want) in [
+            ("example.com whistle.vase://", "vase"),
+            ("example.com plugin.vase://", "vase"),
+            ("example.com whistle.my-plugin://arg", "my-plugin/arg"),
+        ] {
+            let rules = parse_text(line);
+            let op = rules[0]
+                .ops
+                .iter()
+                .find(|op| op.protocol == "plugin")
+                .unwrap_or_else(|| panic!("{line} should name a plugin"));
+            assert_eq!(op.value, want, "{line}");
+        }
+        // A dotted *hostname* written as a protocol is not a plugin: upstream's
+        // name class is `[a-z\d_-]+`, deliberately narrow.
+        let rules = parse_text("example.com whistle.Example.COM://x");
+        assert!(rules[0].ops.iter().all(|op| op.protocol != "plugin"));
     }
 
     /// A destination is an operator, so the line configures one — this is the

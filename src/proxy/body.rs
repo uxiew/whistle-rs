@@ -127,10 +127,19 @@ impl Drop for TeeBody {
     }
 }
 
-/// A body that emits `data` in paced chunks to cap throughput at `kb_per_sec`
-/// (whistle's `reqSpeed`/`resSpeed`, in KB/s).
-pub fn throttled<T: Into<Bytes>>(data: T, kb_per_sec: f64) -> DynBody {
-    let bytes_per_sec = (kb_per_sec * 1024.0).max(1.0);
+/// A body that emits `data` in paced chunks to cap throughput at `kbits_per_sec`.
+///
+/// The unit is whistle's, and it is **kilobits**, not kilobytes: its own
+/// documentation says so — "单位：kb/s，千比特/每秒"
+/// (`_original/docs/docs/rules/resSpeed.md:2`) — and its implementation agrees,
+/// `parseInt((options.speed * 1000) / 8)` bytes per second
+/// (`_original/lib/util/whistle-transform.js:10`).
+///
+/// This port read it as KB/s, which is 8.192× too fast: `resSpeed://3` throttled
+/// to 3072 B/s where whistle gives 375 B/s. A throttle that is off by that much
+/// does not reproduce the slow link it was written to simulate.
+pub fn throttled<T: Into<Bytes>>(data: T, kbits_per_sec: f64) -> DynBody {
+    let bytes_per_sec = (kbits_per_sec * 1000.0 / 8.0).max(1.0);
     let interval = Duration::from_millis(50);
     let chunk = ((bytes_per_sec * interval.as_secs_f64()) as usize).max(1);
     ThrottledBody {

@@ -109,6 +109,15 @@ fn pattern_match<'r>(rule: &Rule, req: &'r ReqInfo) -> Option<Matched<'r>> {
     }
 }
 
+/// The port a scheme implies when a URL does not spell one out — the only case
+/// in which the port is absent from the URL text a pattern is matched against.
+fn default_port(scheme: &str) -> u16 {
+    match scheme {
+        "https" | "wss" => 443,
+        _ => 80,
+    }
+}
+
 /// `/`, `\` and `?` all end a path segment upstream (`isPathSeparator`,
 /// `_original/lib/rules/rules.js:307`).
 fn is_path_separator(c: char) -> bool {
@@ -149,6 +158,7 @@ fn pattern_accepts<'r>(
         // upstream's regexp branch builds its result with a bare `url: matcher`
         // and no `joinUrl` (`_original/lib/rules/rules.js:1013`).
         Pattern::Any => Some(Matched::default()),
+        Pattern::Nothing => None,
         // Without a `$` reference on the line there is nothing to collect, and
         // `is_match` skips building the capture locations entirely.
         Pattern::Regex(re) if !want_groups => {
@@ -196,6 +206,16 @@ fn pattern_accepts<'r>(
             if let Some(p) = port
                 && req.port != *p
             {
+                return None;
+            }
+            // A pattern that carries a *path* is matched against the URL text,
+            // port and all; only a bare-host pattern gets the port-stripped
+            // fallback. That is upstream's `rule.isDomain` guard on its
+            // `domainUrl` arm (`_original/lib/rules/rules.js:1081-1083`, with
+            // `isDomain` at `:1343-1348` — true only when the pattern has no
+            // `/`). Without it `example.com/api` also matched
+            // `http://example.com:8080/api`, which is a different origin.
+            if !path.is_empty() && port.is_none() && req.port != default_port(&req.scheme) {
                 return None;
             }
             if path.is_empty() {
@@ -853,6 +873,39 @@ mod tests {
             r.value(crate::rules::protocols::URL_REPLACE),
             Some("http://dev.internal/page")
         );
+    }
+
+    /// A pattern that carries a path is matched against the URL text, port and
+    /// all — `example.com/api` and `example.com:8080/api` are different origins,
+    /// and upstream's port-stripped fallback is reserved for bare-host patterns
+    /// (`rule.isDomain`). This port applied the rule on every port.
+    #[test]
+    fn a_path_pattern_is_scoped_to_the_default_port() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("example.com/api host://1.1.1.1\n");
+        assert!(m.resolve(&req("http://example.com/api/v2")).value("host").is_some());
+        assert!(m.resolve(&req("http://example.com:8080/api/v2")).value("host").is_none());
+        // Spelling the port out still scopes it to that port.
+        m.set_text("example.com:8080/api host://1.1.1.1\n");
+        assert!(m.resolve(&req("http://example.com:8080/api/v2")).value("host").is_some());
+        assert!(m.resolve(&req("http://example.com/api/v2")).value("host").is_none());
+        // A bare-host pattern keeps matching any port, which is the case the
+        // fallback exists for.
+        m.set_text("example.com host://1.1.1.1\n");
+        assert!(m.resolve(&req("http://example.com:8080/api")).value("host").is_some());
+        // …and https on 443 is still the default, not a port to exclude.
+        m.set_text("example.com/api host://1.1.1.1\n");
+        assert!(m.resolve(&req("https://example.com/api/v2")).value("host").is_some());
+    }
+
+    /// A token with no host, path, scheme or port is not a pattern that matches
+    /// everything — upstream drops the rule. A stray `$` used to apply its
+    /// line's operators to every request that reached the proxy.
+    #[test]
+    fn a_contentless_pattern_matches_nothing() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("$ host://1.1.1.1\n");
+        assert!(m.resolve(&req("http://anything.test/")).value("host").is_none());
     }
 
     #[test]
