@@ -1169,6 +1169,32 @@ mod forced_encoding_tests {
         assert!(is_event_stream(Some("text/event-streamlike")));
     }
 
+    /// Gating the rule operators was not enough: a plugin declaring
+    /// `responseBody` reaches the same collection through its own door, and is
+    /// not a rule operator. Measured against a live SSE origin — not one byte
+    /// in six seconds, not even a response head.
+    #[test]
+    fn a_plugin_asking_for_the_body_cannot_hold_an_event_stream_shut_either() {
+        let sse = Some("text/event-stream");
+        let ops = ops_ct("resReplace://a=b", true, sse);
+        assert!(!must_collect_body(&ops, true, false, sse));
+        // …and the gate is only about event streams: an ordinary response is
+        // still collected for the hook that asked for it.
+        let html = Some("text/html");
+        let ops = ops_ct("log://x", true, html);
+        assert!(must_collect_body(&ops, true, false, html));
+    }
+
+    /// The one door an event stream may pass through. A plugin that replaced
+    /// the body outright hands over bytes that are already in hand, so the
+    /// origin's stream is never awaited and nothing is withheld.
+    #[test]
+    fn an_overridden_body_is_collected_even_for_an_event_stream() {
+        let sse = Some("text/event-stream");
+        let ops = ops_ct("log://x", true, sse);
+        assert!(must_collect_body(&ops, false, true, sse));
+    }
+
     /// The bug: `enable://gzip` standing alone left `needs_body` false, so the
     /// response took the streaming path, `reencode` was never reached, and the
     /// flag did nothing at all. It only ever appeared to work when some *other*
@@ -1929,6 +1955,35 @@ fn is_event_stream(content_type: Option<&str>) -> bool {
             .get(.."text/event-stream".len())
             .is_some_and(|head| head.eq_ignore_ascii_case("text/event-stream"))
     })
+}
+
+/// Must the response body be collected before anything can go to the client?
+///
+/// Three doors lead to the buffered path, and gating only one of them is why
+/// this is written down in a single place. [`ResBodyOps::of`] already drops the
+/// rule operators for an event stream — but a plugin declaring `responseBody`
+/// reaches the same `collect_with_trailers` through its own door and hangs the
+/// stream exactly as `resReplace://` did, which is not a rule operator and so
+/// was not covered. Measured against a live SSE origin: not one byte in six
+/// seconds, no response head either, where the unruled host streamed at once.
+///
+/// An override is the one door an event stream may pass through: the plugin
+/// replaced the body outright, so those bytes are already in hand and the
+/// origin's body is never awaited. Nothing is withheld, because nothing is
+/// waited for.
+fn must_collect_body(
+    ops: &ResBodyOps,
+    plugin_wants_body: bool,
+    has_override: bool,
+    res_ct: Option<&str>,
+) -> bool {
+    if has_override {
+        return true;
+    }
+    if is_event_stream(res_ct) {
+        return false;
+    }
+    ops.needs_body() || plugin_wants_body
 }
 
 impl ResBodyOps {
@@ -3178,9 +3233,24 @@ async fn serve(
         res_ct.as_deref(),
     );
     let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
+    // A plugin that asked for the body of an event stream cannot have it, and
+    // says so rather than leaving the hook mysteriously un-run: `responseBody`
+    // is a declaration this port cannot honour on a body that need never end.
+    if plugin_wants_res_body && is_event_stream(res_ct.as_deref()) {
+        tracing::warn!(
+            "{} is an event stream; a plugin's responseBody hook is skipped rather \
+             than holding the stream shut",
+            info.full_url
+        );
+    }
     let mut res_body_cap: Option<Capture> = None;
     let res_body: DynBody =
-        if ops.needs_body() || plugin_wants_res_body || plugin_res_override.is_some() {
+        if must_collect_body(
+            &ops,
+            plugin_wants_res_body,
+            plugin_res_override.is_some(),
+            res_ct.as_deref(),
+        ) {
             // A plugin that replaced the body outright makes the upstream bytes
             // irrelevant — don't wait on them.
             //
