@@ -4320,6 +4320,23 @@ fn delete_query(path: &str, names: &[String], clear: bool) -> String {
 pub fn rewrite_path(path: &str, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> String {
     let mut p = path.to_string();
     let del = DelQuery::of(resolved);
+    // Each protocol collapses to one map of its own, then `urlParams` is laid
+    // over `params` (`extend(_params, urlParams)`,
+    // `_original/lib/inspectors/req.js:425`). `params` is skipped entirely when
+    // the body claimed it — `_params = hasBody ? null : params` (`req.js:421`);
+    // `urlParams` always addresses the query.
+    let mut params: Vec<(String, String)> = Vec::new();
+    if params_body_kind(resolved, ctx).is_none() {
+        params.extend(merge_params_pairs(resolved, "params"));
+    }
+    params.extend(merge_params_pairs(resolved, "urlParams"));
+    if !params.is_empty() {
+        p = merge_query(&p, &params);
+    }
+    // `urlReplace://` runs **after** the params merge, which is upstream's order:
+    // `handleParams` writes the query first (`req.js:561`) and `parsePathReplace`
+    // rewrites the URL that results (`:569`). Reversed, a `urlReplace` pattern
+    // aimed at what a `params://` on the same line had just written never saw it.
     let replacements = merge_rule_maps(resolved, "urlReplace");
     if !replacements.is_empty() {
         // whistle substitutes into the path *without* its leading slash — it
@@ -4338,19 +4355,6 @@ pub fn rewrite_path(path: &str, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> Str
     // (`_original/lib/util/index.js:1023-1058`).
     if let Some(paths) = &del.paths {
         p = delete_path_segments(&p, paths);
-    }
-    // Each protocol collapses to one map of its own, then `urlParams` is laid
-    // over `params` (`extend(_params, urlParams)`,
-    // `_original/lib/inspectors/req.js:425`). `params` is skipped entirely when
-    // the body claimed it — `_params = hasBody ? null : params` (`req.js:421`);
-    // `urlParams` always addresses the query.
-    let mut params: Vec<(String, String)> = Vec::new();
-    if params_body_kind(resolved, ctx).is_none() {
-        params.extend(merge_params_pairs(resolved, "params"));
-    }
-    params.extend(merge_params_pairs(resolved, "urlParams"));
-    if !params.is_empty() {
-        p = merge_query(&p, &params);
     }
     // `deleteQuery` runs last, over whatever the query string has become
     // (`_original/lib/inspectors/req.js:570`) — so a name it drops is dropped
@@ -6141,6 +6145,21 @@ mod tests {
             out("a.com forwardedFor://203.0.113.7 disable://clientIp\n", None),
             None
         );
+    }
+
+    /// `urlReplace://` rewrites the URL that `params://` produced, not the one
+    /// before it — `handleParams` writes the query first
+    /// (`_original/lib/inspectors/req.js:561`) and `parsePathReplace` runs over
+    /// the result (`:569`). Reversed, a pattern aimed at what `params://` had
+    /// just written never saw it.
+    #[test]
+    fn url_replace_sees_what_params_wrote() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com params://token=SECRET urlReplace://SECRET=redacted\n");
+        let info = build_req_info("GET", "http", "example.com", 80, "/api", &HeaderMap::new(), None);
+        let resolved = mgr.resolve(&info);
+        let out = rewrite_path("/api", &resolved, ReqBodyCtx::default());
+        assert_eq!(out, "/api?token=redacted");
     }
 
     #[test]
