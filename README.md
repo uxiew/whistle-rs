@@ -243,6 +243,8 @@ CA.
 | `-h, --help` / `-V, --version` | Help / version | — |
 
 ## Documentation
+- [`docs/UPSTREAM.md`](docs/UPSTREAM.md) — where to fetch the upstream whistle tree the 513 `_original/…` citations point at, and at which commit
+
 
 | Doc | Contents |
 |-----|----------|

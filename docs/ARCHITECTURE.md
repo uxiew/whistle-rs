@@ -17,6 +17,10 @@ to extend it.
 
 Each Rust module corresponds to part of the original JS under `../_original/lib`:
 
+> **`Ported from` points at the upstream whistle 2.10.4 tree**, which this
+> repository no longer ships. How to fetch it, and at which commit, is in
+> [`UPSTREAM.md`](UPSTREAM.md) — the line numbers are only valid for that one.
+
 | Rust module | Ported from | Responsibility |
 |-------------|-------------|----------------|
 | `src/config.rs` | `lib/config.js` | Runtime config, storage paths, defaults |

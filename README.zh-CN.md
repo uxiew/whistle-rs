@@ -225,6 +225,8 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `-h, --help` / `-V, --version` | 帮助 / 版本 | —— |
 
 ## 文档
+- [`docs/UPSTREAM.md`](docs/UPSTREAM.md) —— 原版 whistle 的取回方式与提交号；源码里 513 处 `_original/…` 引用都指向它
+
 
 | 文档 | 内容 |
 |------|------|
