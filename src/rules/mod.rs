@@ -165,6 +165,17 @@ pub struct RuleOp {
     /// so that resolution — which mixes operators from many lines — keeps each
     /// one's line scope.
     pub props: LineProps,
+    /// Is [`value`](RuleOp::value) the **content** rather than a location?
+    ///
+    /// Set when a whole-value `{name}` reference was replaced by what the values
+    /// store held. It is the distinction upstream draws between `rule.value` and
+    /// `rule.files`: `readRuleValue` hands back `rule.value` as the body and
+    /// never looks at the filesystem (`_original/lib/util/index.js:1178-1180`).
+    ///
+    /// Without it, `file://{mock.json}` substituted correctly and was then
+    /// opened as a *path* — so the console reported "file not found" naming the
+    /// JSON it was supposed to serve.
+    pub value_is_content: bool,
     /// Where this operator sits in the resolution order — important lines first,
     /// then source order (see [`order_key`]). Stamped when a rule resolves.
     ///
@@ -811,6 +822,9 @@ pub struct RuleGroup {
     pub enabled: bool,
     /// Parsed rules from `text`.
     rules: Vec<Rule>,
+    /// Values this group's own text declared in a ``` fenced block. Merged
+    /// under the configured values, so a `--value` of the same name wins.
+    inline_values: HashMap<String, String>,
     /// Indices into `rules` of the lines that carry response-phase operators
     /// behind a filter that asks about the response.
     ///
@@ -834,7 +848,8 @@ pub struct RuleGroup {
 
 impl RuleGroup {
     pub fn new(name: &str, text: &str, enabled: bool) -> Self {
-        let rules = parse_text(text);
+        let (body, inline_values) = lift_inline_values(text);
+        let rules = parse_text(&body);
         RuleGroup {
             name: name.to_string(),
             text: text.to_string(),
@@ -842,13 +857,16 @@ impl RuleGroup {
             res_candidates: res_candidates(&rules),
             body_candidates: body_candidates(&rules),
             has_sni_callback: has_sni_callback(&rules),
+            inline_values,
             rules,
         }
     }
 
     /// Re-parse rules from the current text.
     fn reparse(&mut self) {
-        self.rules = parse_text(&self.text);
+        let (body, inline) = lift_inline_values(&self.text);
+        self.inline_values = inline;
+        self.rules = parse_text(&body);
         self.res_candidates = res_candidates(&self.rules);
         self.body_candidates = body_candidates(&self.rules);
         self.has_sni_callback = has_sni_callback(&self.rules);
@@ -1087,6 +1105,20 @@ impl RuleManager {
     // ── Group management API ──
 
     /// Immutable access to all groups.
+    /// Every value declared in a ``` fenced block by any **enabled** group.
+    ///
+    /// The proxy lays these *under* the configured values, so a `--value` or a
+    /// console-edited value of the same name wins — an inline block travels with
+    /// the rules file, and an explicit setting should be able to override what
+    /// a file brought with it.
+    pub fn inline_values(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for group in self.groups.iter().filter(|g| g.enabled) {
+            out.extend(group.inline_values.clone());
+        }
+        out
+    }
+
     pub fn groups(&self) -> &[RuleGroup] {
         &self.groups
     }
@@ -1207,6 +1239,70 @@ fn merge_lines(text: &str) -> String {
 
 /// Parse whole rules text into a list of [`Rule`]s.
 /// Mirrors `parseText` in `_original/lib/rules/rules.js:1738`.
+/// Lift ``` fenced blocks out of a rules text and into named values.
+///
+/// whistle calls these 内嵌值 — a rules file carrying its own mocks, so a
+/// `file://{mock.json}` and the JSON it serves live in one place
+/// (`resolveInlineValues`, `_original/lib/util/index.js:208-218`; the shape is
+/// `MULTI_LINE_VALUE_RE` at `:98`):
+///
+/// ```text
+/// ``` mock.json
+/// {"ok": true}
+/// ```
+/// example.com file://{mock.json}
+/// ```
+///
+/// Without this pass the fence lines were parsed as rules — three tokens that
+/// configure nothing — and `{mock.json}` resolved to nothing, so the rule
+/// silently served a 404.
+///
+/// Returns the text with the blocks removed, and the values they declared. A
+/// name that appears twice keeps its **first** block, matching upstream's
+/// `if (inlineValues[key] == null)`.
+pub fn lift_inline_values(text: &str) -> (String, HashMap<String, String>) {
+    if !text.contains("```") {
+        return (text.to_string(), HashMap::new());
+    }
+    let mut values: HashMap<String, String> = HashMap::new();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut lines = text.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        // An opening fence is a run of at least three backticks and a name, and
+        // nothing else. The closing fence has to be the *same* run length, so a
+        // block whose content contains a shorter fence survives intact.
+        let trimmed = line.trim();
+        let ticks = trimmed.bytes().take_while(|b| *b == b'`').count();
+        let name = trimmed[ticks..].trim();
+        if ticks < 3 || name.is_empty() || name.contains(char::is_whitespace) {
+            kept.push(line);
+            continue;
+        }
+
+        let fence = "`".repeat(ticks);
+        let mut body: Vec<&str> = Vec::new();
+        let mut closed = false;
+        for inner in lines.by_ref() {
+            if inner.trim() == fence {
+                closed = true;
+                break;
+            }
+            body.push(inner);
+        }
+        // An unterminated block is not a block: put the line back as a rule line
+        // rather than swallowing the rest of the file.
+        if !closed {
+            kept.push(line);
+            kept.extend(body);
+            continue;
+        }
+        values.entry(name.to_string()).or_insert_with(|| body.join("\n"));
+    }
+
+    (kept.join("\n"), values)
+}
+
 pub fn parse_text(text: &str) -> Vec<Rule> {
     // Order matters: whistle's `mergeLines` strips comments over the whole text
     // and only then collapses `line`…`` blocks.
@@ -3175,6 +3271,66 @@ mod parse_text_tests {
         assert!(m.resolve(&req("http://example.com/x")).value("host").is_none());
         m.set_text("example.com host://1.1.1.1 filter://m:POST");
         assert!(m.resolve(&req("http://example.com/x")).value("host").is_some());
+    }
+
+    /// A rules file can carry its own mocks in a ``` fenced block. Without the
+    /// lifting pass the fence lines were parsed as rule lines — configuring
+    /// nothing — and `{mock.json}` resolved to nothing, so the rule it was
+    /// written for silently served a 404.
+    #[test]
+    fn a_fenced_block_becomes_a_named_value() {
+        let text = concat!(
+            "``` mock.json\n",
+            "{\"ok\": true,\n",
+            " \"n\": 1}\n",
+            "```\n",
+            "example.com file://{mock.json}\n",
+        );
+        let (body, values) = lift_inline_values(text);
+        assert_eq!(values.get("mock.json").map(String::as_str), Some("{\"ok\": true,\n \"n\": 1}"));
+        assert_eq!(body.trim(), "example.com file://{mock.json}");
+        // The rule survives the lift and is the only one.
+        assert_eq!(parse_text(&body).len(), 1);
+
+        // A longer fence may contain a shorter one, and the block ends only at
+        // its own length.
+        let nested = "````` outer\n```\ninner\n```\n`````\na.com file://{outer}\n";
+        let (body, values) = lift_inline_values(nested);
+        assert_eq!(values.get("outer").map(String::as_str), Some("```\ninner\n```"));
+        assert_eq!(body.trim(), "a.com file://{outer}");
+
+        // A name declared twice keeps the first block.
+        let twice = "``` k\nfirst\n```\n``` k\nsecond\n```\n";
+        assert_eq!(lift_inline_values(twice).1.get("k").map(String::as_str), Some("first"));
+
+        // An unterminated fence is not a block: the text is left alone rather
+        // than swallowing the rest of the file.
+        let open = "``` k\na.com host://1.1.1.1\n";
+        let (body, values) = lift_inline_values(open);
+        assert!(values.is_empty());
+        assert!(body.contains("a.com host://1.1.1.1"));
+
+        // Things that merely look like fences are not.
+        for text in ["`` k\n``\n", "``` \n```\n", "``` two words\n```\n"] {
+            assert!(lift_inline_values(text).1.is_empty(), "{text:?}");
+        }
+        // And a text with no backticks at all is returned untouched.
+        let plain = "a.com host://1.1.1.1\n";
+        assert_eq!(lift_inline_values(plain).0, plain);
+    }
+
+    /// The group exposes what its own text declared, and only while enabled.
+    #[test]
+    fn inline_values_come_from_enabled_groups() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("``` a\nfrom-default\n```\nexample.com file://{a}\n");
+        assert_eq!(mgr.inline_values().get("a").map(String::as_str), Some("from-default"));
+
+        mgr.add_group("extra", "``` b\nfrom-extra\n```\n", true);
+        assert_eq!(mgr.inline_values().get("b").map(String::as_str), Some("from-extra"));
+
+        mgr.toggle_group("extra");
+        assert!(mgr.inline_values().get("b").is_none(), "a disabled group contributes nothing");
     }
 
     /// `whistle.<name>://` and `plugin.<name>://` name a plugin. It is how every

@@ -1311,6 +1311,22 @@ impl ResBodyOps {
     }
 }
 
+/// The values a request resolves against: what the rules files declared in
+/// their ``` blocks, with the configured values laid over the top.
+///
+/// Rebuilt per request rather than cached because either side can change while
+/// the proxy runs — the console edits values, and a rules edit can add or
+/// remove an inline block. The cost is one map build over a handful of entries;
+/// a rules file with no ``` in it contributes an empty map without allocating.
+fn effective_values(state: &Arc<AppState>) -> std::collections::HashMap<String, String> {
+    let mut values = state.rules.read().unwrap().inline_values();
+    if values.is_empty() {
+        return state.values.read().unwrap().clone();
+    }
+    values.extend(state.values.read().unwrap().clone());
+    values
+}
+
 /// Does this response carry a body a rule may rewrite? whistle's `hasBody`
 /// (`_original/lib/util/common.js:370-380`).
 ///
@@ -1895,7 +1911,10 @@ async fn serve(
     // response phase resolves them a second time, exactly as it does the
     // top-level rules (`apply::merge_response_phase_of`).
     let mut merged_rules: Vec<crate::rules::RuleManager> = {
-        let values = state.values.read().unwrap();
+        // A ``` block in a rules file declares a value that travels with it.
+        // Configured values are laid *over* those, so a `--value` or a
+        // console-edited one of the same name wins over what a file brought.
+        let values = effective_values(&state);
         apply::substitute_values(&mut resolved, &values);
         let managers = apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
         apply::substitute_values(&mut resolved, &values);

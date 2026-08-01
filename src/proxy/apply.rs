@@ -96,13 +96,17 @@ pub fn build_res_info(
 /// Replace operator values of the form `{name}` with the named value's content
 /// (whistle's Values store references).
 pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, String>) {
-    fn sub(value: &mut String, values: &HashMap<String, String>) {
+    fn sub(op: &mut crate::rules::RuleOp, values: &HashMap<String, String>) {
+        let value = &mut op.value;
         // The whole value is a reference: it is replaced by the content, which
         // is how a mock body or a rules text gets in.
         if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
             && let Some(content) = values.get(name)
         {
             *value = content.clone();
+            // What came back is the content, not a place to find it — see
+            // `RuleOp::value_is_content`.
+            op.value_is_content = true;
             return;
         }
         // `${name}` anywhere *inside* a value, which is the other half of
@@ -119,11 +123,11 @@ pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, Strin
         }
     }
     for op in resolved.single.values_mut() {
-        sub(&mut op.value, values);
+        sub(op, values);
     }
     for list in resolved.multi.values_mut() {
         for op in list {
-            sub(&mut op.value, values);
+            sub(op, values);
         }
     }
 }
@@ -876,10 +880,10 @@ pub fn short_circuit(
         );
     }
 
-    if let Some((proto, value)) = find_file_rule(resolved)
+    if let Some((proto, op)) = find_file_rule(resolved)
         && !weak_rule_yields(resolved, proto)
     {
-        return serve_file_family(proto, value, info, env);
+        return serve_file_family(proto, op, info, env);
     }
 
     None
@@ -913,20 +917,21 @@ const FILE_PROTOS: &[&str] = &[
 ];
 
 /// Find a matched local-file/template rule (`file`/`tpl`/`xfile`/…) if any.
-fn find_file_rule(resolved: &Resolved) -> Option<(&'static str, &str)> {
+fn find_file_rule(resolved: &Resolved) -> Option<(&'static str, &RuleOp)> {
     FILE_PROTOS
         .iter()
-        .find_map(|&p| resolved.value(p).map(|v| (p, v)))
+        .find_map(|&p| resolved.get(p).map(|op| (p, op)))
 }
 
 /// Serve a matched file-family rule. Returns `None` only for a `x`/`xs` (cross)
 /// variant whose file is missing — that falls through to the real server.
 fn serve_file_family(
     proto: &str,
-    value: &str,
+    op: &RuleOp,
     info: &ReqInfo,
     env: super::template::ProxyEnv<'_>,
 ) -> Option<Response<DynBody>> {
+    let value = op.value.as_str();
     let raw = proto.contains("rawfile");
     // `tpl`, `dust` and `jsonp` are one protocol in whistle
     // (`_original/lib/handlers/file-proxy.js:14`); none of them has any
@@ -934,10 +939,22 @@ fn serve_file_family(
     let templated = proto.ends_with("tpl") || proto.ends_with("jsonp") || proto.ends_with("dust");
     let cross = proto.starts_with('x');
 
-    // A bracketed value is not a location. `(text)` *is* the response body —
-    // whistle's inline form, `readRuleValue`'s `if (rule.value)` arm
-    // (`_original/lib/util/index.js:1178-1180`) — and `<path>` is a path pinned
-    // in place, which the matcher has already honoured by not extending it.
+    // A value that *is* content rather than a location is served as the body.
+    // Two ways to get one: the `(text)` inline form, and a whole-value `{name}`
+    // the values store answered — both are `readRuleValue`'s `if (rule.value)`
+    // arm upstream (`_original/lib/util/index.js:1178-1180`). `<path>` is the
+    // third bracket form and means the opposite: a path pinned in place, which
+    // the matcher has already honoured by not extending it.
+    if op.value_is_content {
+        let bytes = value.as_bytes().to_vec();
+        return Some(if raw {
+            serve_raw_http(&bytes, &info.full_url, info)
+        } else if templated {
+            serve_template(&bytes, &info.full_url, info, env)
+        } else {
+            serve_file_bytes(&bytes, &info.full_url, info)
+        });
+    }
     let value = match crate::rules::url::fixed_value(value) {
         Some((crate::rules::url::Fixed::Inline, text)) => {
             let bytes = text.into_bytes();
@@ -6696,7 +6713,12 @@ mod tests {
             None => (rest, "/"),
         };
         let info = build_req_info("GET", scheme, host, 80, path, &HeaderMap::new(), None);
-        let resp = serve_file_family(proto, value, &info, test_env())?;
+        let op = RuleOp {
+            protocol: proto.to_string(),
+            value: value.to_string(),
+            ..Default::default()
+        };
+        let resp = serve_file_family(proto, &op, &info, test_env())?;
         let status = resp.status().as_u16();
         let ctype = resp
             .headers()
