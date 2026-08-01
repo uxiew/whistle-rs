@@ -18,6 +18,7 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 - [Configure your client](#configure-your-client)
 - [Intercepting HTTPS](#intercepting-https)
 - [Writing rules](#writing-rules)
+- [Cookbook](docs/COOKBOOK.md) — recipes for the things people actually do
 - [Use as a library](#use-as-a-library)
 - [CLI reference](#cli-reference)
 - [Documentation](#documentation)
@@ -165,8 +166,24 @@ example.com           resHeaders://x-mitm=intercepted
 $example.com          host://2.2.2.2
 ```
 
-**The full syntax — every pattern kind and operator, precedence rules, and a
-cookbook — is in [`docs/RULES.md`](docs/RULES.md).**
+Three things about that grammar are worth knowing before you write a rules file,
+because each one produces a rule that silently does nothing:
+
+- **Position decides, not shape.** The first token is the pattern and everything
+  after it is an operator — `example.com http://localhost:5173` is a forwarding
+  rule, not two patterns.
+- **An operator value cannot contain a space.** `reqHeaders://authorization=Bearer secret`
+  sets `authorization: Bearer` and then sends the request to a host called
+  `secret`. Use a named value and `${name}`.
+- **`file`, `redirect`, `statusCode`, the template family and a bare destination
+  URL share one slot**, first line wins — so a mock written *below* a forward
+  never runs.
+
+**Recipes for the tasks people actually have — point a site at a dev server,
+mock an endpoint, throttle a connection, debug a phone, export a HAR — are in
+[`docs/COOKBOOK.md`](docs/COOKBOOK.md). The full syntax — every pattern kind and
+operator, precedence rules, coverage — is in
+[`docs/RULES.md`](docs/RULES.md).**
 
 ## Use as a library
 
@@ -240,7 +257,10 @@ CA.
 | `--body-preview-limit <BYTES>` | Max captured body bytes kept per transaction | `16384` |
 | `--no-persist` | Disable session persistence (in-memory only) | persist on |
 | `--persist-days <N>` | Days of session history to retain on disk | `7` |
-| `-v, --verbose` | Debug logging (per-request decisions) | off |
+| `--insecure-upstream` | Do **not** verify the origin's TLS certificate. whistle-rs verifies by default, unlike upstream — see [Origin certificate verification](docs/RULES.md#origin-certificate-verification) | verify on |
+| `--no-intercept-https` | Do not decrypt HTTPS: relay every TLS connection untouched, still routing it by its rules (whistle's `-M pureProxy`) | intercept on |
+| `-t, --timeout <MS>` | How long a connection to an origin or upstream proxy may take to *establish*. Never cuts short a connection that did establish, so streams are unaffected | `360000` |
+| `-v, --verbose` | Debug logging — the reason behind a failure, which the `502` alone will not tell you | off |
 | `-h, --help` / `-V, --version` | Help / version | — |
 
 ## Documentation
@@ -249,7 +269,8 @@ CA.
 
 | Doc | Contents |
 |-----|----------|
-| [`docs/RULES.md`](docs/RULES.md) | Complete rule syntax: patterns, operators, precedence, cookbook, compatibility |
+| [`docs/COOKBOOK.md`](docs/COOKBOOK.md) | Task-oriented recipes: dev server, mocks, rewriting, throttling, phones, HAR, embedding — start here |
+| [`docs/RULES.md`](docs/RULES.md) | Complete rule syntax: patterns, operators, precedence, quick reference, compatibility |
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | Downloading, installing & trusting the root CA on every platform |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module map, request lifecycle, and how to extend the proxy |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md) | Writing plugins (Rust in-process + Node subprocess), the JSON protocol |
@@ -330,13 +351,69 @@ operator-level detail.
 
 ## Troubleshooting
 
+**Start with the log.** Every request prints the destination it resolved to, and
+that one line usually contains the answer:
+
+```
+INFO GET http://seg.test/path/to/x  -> 127.0.0.1:5173 (http)   # the rule matched
+INFO GET http://seg.test/path/toxxx -> seg.test:80    (http)   # it did not
+INFO OPTIONS http://api.test/users  -> short-circuit           # answered locally
+```
+
+Those are `INFO`, so they are there without any flag. `-v` adds the **reason**
+behind a failure, which a bare `502` will not tell you:
+
+```
+DEBUG request failed: connecting to 127.0.0.1:9: Connection refused (os error 61)
+DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
+```
+
+### Nothing is being intercepted
+
 | Symptom | Cause / fix |
 |---------|-------------|
-| `502 Bad Gateway` with a `Proxy-Connection` header on a **direct** request | Your shell has `http_proxy` set, so the request is going through *another* proxy. Add `--noproxy '*'` (curl) or unset the env var. |
-| Browser warns the cert is untrusted on HTTPS | The root CA isn't installed/trusted yet — see [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md). Firefox needs it in *its own* store. |
-| `502` when forwarding to an intercepted host | Upstream connection/TLS failed. Run with `-v` to see the target and error. A `host://` override that points TLS at a non-TLS port will fail the handshake. |
-| A rule seems ignored | Check precedence (important `$` and file order), and confirm the operator is one that's **applied** (see scope table). `-v` logs each request's resolved destination or short-circuit. |
-| Port already in use | Another process holds the port — pick another with `-p`. |
+| `502 Bad Gateway` with a `Proxy-Connection` header on a **direct** request | Your shell has `http_proxy` set, so even `http://127.0.0.1:8899/` goes through *another* proxy. Add `--noproxy '*'` (curl) or unset the variable. |
+| The console shows `CONNECT` lines and nothing inside them | HTTPS is being tunnelled, not decrypted — the client does not trust the root CA. See [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md). Firefox needs it in *its own* store; iOS needs the second, separate "enable full trust" step that most people stop short of. |
+| Browser warns the cert is untrusted | The same cause, one step earlier. |
+| A device on the LAN cannot reach the proxy | whistle-rs binds all interfaces by default, so check the firewall, and that you gave the device your **LAN** address rather than `127.0.0.1`. Fetching `http://<lan-ip>:8899/proxy.pac` from the device tests reachability and hands you a correct PAC in one go. |
+| Port already in use | Another process holds it — pick another with `-p`. |
+
+### A rule does not fire
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| The rule matches a URL you expected it to miss, or the reverse | A path prefix only matches at a `/`, `\` or `?` boundary: `example.com/path/to` matches `/path/to/x` but **not** `/path/toxxx`. |
+| A `*` in the path matches nothing | `*` is a wildcard **in the host only**; in a path it is a literal, because `*` is a legal URL character. Write `^http://example.com/old/**` for a path wildcard. Filter patterns are the exception — they always read as if `^`-prefixed. |
+| A mock, redirect or forward is silently ignored | `file`, `redirect`, `statusCode`, the template family and a bare destination URL **share one slot**, and the first line to fill it wins outright. A mock written below a forward never runs — move it up, or mark it `$`. |
+| An operator value arrives truncated | It contained a space, and the line is split on whitespace. `reqHeaders://authorization=Bearer secret` sets `Bearer` and then routes the request to a host called `secret`. Percent-encoding does not help; use a named value and `${name}`. |
+| The whole line does nothing on some requests | A filter scopes the *entire* line, destination included — `includeFilter://from:composer` beside a `host://` means the override applies only to replays. |
+| Two lines set the same header and one is missing | A contested name is won by the **first** line, important lines first. |
+| A rule you did not expect is winning | `$`-important rules resolve before everything else, whatever the file order. |
+
+### It fires, but the result is wrong
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| `502` on a self-signed or private-CA origin | whistle-rs **verifies** origin certificates; whistle does not (`rejectUnauthorized` is `false` there unless `--safe`). This is the one place the port deliberately does not copy upstream's default, because a debugging proxy that accepts any upstream certificate cannot tell you when the connection it is inspecting has itself been intercepted. `--insecure-upstream` opts out. |
+| `502` when forwarding to an intercepted host | The upstream connection or its TLS failed — `-v` gives the target and the error. A `host://` override that points TLS at a non-TLS port fails the handshake. |
+| `resDelay://1s` is instantaneous | Delays are **milliseconds**, and a unit suffix is parsed off and discarded rather than converted, so `1s` is one millisecond. Write `1000`. |
+| A throttle is 8× faster than expected | `reqSpeed://` / `resSpeed://` are **kilobits** per second, not kilobytes. This port read them as kilobytes until recently; multiply values written against that by 8. |
+| An SSE or chunked response stops streaming | A body operator on a streaming response buffers the **whole stream** before anything is sent — measured at 3 ms to first byte without one and 621 ms with, on a 600 ms SSE stream. The body layer transforms whole buffers; making it streaming is a rewrite of that layer, recorded in [`docs/ROADMAP.md`](docs/ROADMAP.md). Delays and speed caps are unaffected. |
+| `statusCode://` returned an empty body | That is what it does — it manufactures a response. `replaceStatus://` is the one that changes the status of a response that has a body. |
+| An operator given a path sends the path itself | Operator values are not loaded from a file or a URL here (upstream's `readRuleValue` is not ported), so `resBody:///tmp/mock.json` sends that string. Serve a file with `file://`, or pull its content in as a value. |
+| A certificate-pinned app breaks under interception | Stop intercepting that one host: `pinned.example.com sniCallback://no-mitm` relays it byte-for-byte while still routing it by its rules. `--no-intercept-https` does the same for everything. |
+
+### It is not in the capture
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| A failed request is missing from the console entirely | A request that never got a response — connection refused, DNS failure, TLS handshake failure — is **not** recorded as a session. The log is the only place it appears. |
+| A body is truncated in the detail panel | Previews are capped at 16 KB; raise it with `--body-preview-limit`. |
+| A binary body shows as `[binary, N bytes]` | Binary bodies are replaced at serialisation time, so image and hex views are not available yet — see [`docs/ROADMAP.md`](docs/ROADMAP.md). |
+| The capture is empty after a restart | `--no-persist` was on, or `--persist-days` has expired the files under `<storage_dir>/sessions/`. |
+
+Each of these has a worked recipe, with the sharp edge attached, in
+[`docs/COOKBOOK.md`](docs/COOKBOOK.md).
 
 ## Development
 

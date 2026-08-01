@@ -17,6 +17,7 @@ CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
 - [配置客户端](#配置客户端)
 - [拦截 HTTPS](#拦截-https)
 - [编写规则](#编写规则)
+- [使用手册 / Cookbook](docs/COOKBOOK.zh-CN.md) —— 大家真正会做的那些事的配方
 - [作为库使用](#作为库使用)
 - [命令行参数](#命令行参数)
 - [文档](#文档)
@@ -154,8 +155,18 @@ example.com           resHeaders://x-mitm=intercepted
 $example.com          host://2.2.2.2
 ```
 
-**完整语法 —— 每种模式与算子、优先级规则、以及速查手册 —— 见
-[`docs/RULES.md`](docs/RULES.md)。**
+写规则文件之前，这套语法里有三件事值得先知道，因为每一件都会产出「静默不生效」的规则：
+
+- **位置决定一切，形状不决定。** 第一个 token 是 pattern，其后**全部**是算子 ——
+  `example.com http://localhost:5173` 是一条转发规则，不是两个 pattern。
+- **算子取值里不能有空格。** `reqHeaders://authorization=Bearer secret` 会设成
+  `authorization: Bearer`，然后把请求发到一台叫 `secret` 的主机上。请用命名 value 加 `${name}`。
+- **`file`、`redirect`、`statusCode`、模板家族与裸目标 URL 共用一个槽位**，先写的赢 ——
+  所以写在转发**下面**的 mock 永远不会执行。
+
+**大家真正会做的那些事的配方 —— 把站点交给开发服务、mock 接口、限速、调手机、导出 HAR ——
+见 [`docs/COOKBOOK.zh-CN.md`](docs/COOKBOOK.zh-CN.md)。完整语法 —— 每种模式与算子、
+优先级规则、算子覆盖 —— 见 [`docs/RULES.md`](docs/RULES.md)。**
 
 ## 作为库使用
 
@@ -222,7 +233,12 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `--rule <TEXT>` | 内联规则，在 `--rules` 之后应用 | —— |
 | `--dir <DIR>` | 存储目录（根 CA 等） | `~/.whistle-rs` |
 | `--body-preview-limit <BYTES>` | 每条事务保留的 Body 预览上限字节数 | `16384` |
-| `-v, --verbose` | 调试日志（逐请求决策） | 关闭 |
+| `--no-persist` | 关闭流量落盘（仅存内存） | 开启落盘 |
+| `--persist-days <N>` | 磁盘上保留多少天的历史 | `7` |
+| `--insecure-upstream` | **不**校验源站 TLS 证书。与上游不同，whistle-rs 默认校验 —— 见 [源站证书校验](docs/RULES.md#origin-certificate-verification) | 校验开启 |
+| `--no-intercept-https` | 不解密 HTTPS：每条 TLS 连接原样中继，但仍按规则路由（上游写作 `-M pureProxy`） | 拦截开启 |
+| `-t, --timeout <MS>` | 到源站 / 上游代理的连接**建立**超时。已建立的连接不会被切断，流式响应不受影响 | `360000` |
+| `-v, --verbose` | 调试日志 —— 失败的**原因**，这是光看 `502` 得不到的 | 关闭 |
 | `-h, --help` / `-V, --version` | 帮助 / 版本 | —— |
 
 ## 文档
@@ -231,6 +247,7 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 
 | 文档 | 内容 |
 |------|------|
+| [`docs/COOKBOOK.zh-CN.md`](docs/COOKBOOK.zh-CN.md) | 按任务组织的实操手册：开发服务、mock、改写、限速、手机、HAR、嵌入 —— 从这里开始 |
 | [`docs/RULES.md`](docs/RULES.md) | 完整规则语法：模式、算子、优先级、速查、兼容性、算子覆盖表 |
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | 在各平台下载、安装并信任根 CA |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图、请求生命周期、如何扩展代理 |
@@ -297,13 +314,67 @@ WebSocket 帧）保留在内存的环形缓冲中，可选落盘（`--no-persist
 
 ## 故障排查
 
+**先看日志。** 每个请求都会打印它解析出的目标，答案通常就在这一行里：
+
+```
+INFO GET http://seg.test/path/to/x  -> 127.0.0.1:5173 (http)   # 规则命中
+INFO GET http://seg.test/path/toxxx -> seg.test:80    (http)   # 没命中
+INFO OPTIONS http://api.test/users  -> short-circuit           # 本地应答
+```
+
+这几行是 `INFO`，不加任何参数就有。`-v` 补上失败的**原因** —— 光看一个 `502` 是得不到的：
+
+```
+DEBUG request failed: connecting to 127.0.0.1:9: Connection refused (os error 61)
+DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
+```
+
+### 什么都没被拦到
+
 | 现象 | 原因 / 解决 |
 |------|------------|
-| **直连**请求返回带 `Proxy-Connection` 头的 `502 Bad Gateway` | 你的 shell 设置了 `http_proxy`，请求走了*另一个*代理。curl 加 `--noproxy '*'`，或取消该环境变量。 |
-| HTTPS 时浏览器提示证书不受信任 | 根 CA 尚未安装/信任 —— 见 [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md)。Firefox 需装入它*自己*的证书库。 |
-| 转发到被拦截主机时报 `502` | 上游连接/TLS 失败。用 `-v` 查看目标与错误。`host://` 若把 TLS 指向非 TLS 端口会握手失败。 |
-| 某条规则似乎被忽略 | 检查优先级（`$` 与文件顺序），并确认该算子确实被**应用**（见范围表）。`-v` 会打印每个请求解析出的目标或短路决策。 |
+| **直连**请求返回带 `Proxy-Connection` 头的 `502` | shell 设了 `http_proxy`，于是连 `http://127.0.0.1:8899/` 都走了*另一个*代理。curl 加 `--noproxy '*'`，或取消该环境变量。 |
+| 控制台只有一行行 `CONNECT`，里面什么都没有 | HTTPS 被隧道转发而没有被解密 —— 客户端不信任根 CA。见 [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md)。Firefox 要装进*它自己*的证书库；iOS 还需要单独的第二步「启用完全信任」，大多数人在这一步之前就停了。 |
+| 浏览器提示证书不受信任 | 同一个原因，早一步。 |
+| 局域网设备连不上代理 | whistle-rs 默认绑定所有网卡，所以检查防火墙，以及你给设备的是不是**局域网**地址而不是 `127.0.0.1`。在设备上打开 `http://<局域网IP>:8899/proxy.pac` 既能测连通性，又能一次拿到正确的 PAC。 |
 | 端口被占用 | 换一个端口：`-p`。 |
+
+### 规则不生效
+
+| 现象 | 原因 / 解决 |
+|------|------------|
+| 命中了你以为不该命中的 URL，或反过来 | 路径前缀只在 `/`、`\`、`?` 边界上匹配：`example.com/path/to` 命中 `/path/to/x`，但**不**命中 `/path/toxxx`。 |
+| 路径里的 `*` 什么都匹配不到 | `*` **只在域名部分**是通配符；在路径里它是字面量，因为 `*` 是合法的 URL 字符。要路径通配请写 `^http://example.com/old/**`。筛选器是例外 —— 它的 pattern 总按 `^` 解读。 |
+| mock / 重定向 / 转发被静默忽略 | `file`、`redirect`、`statusCode`、模板家族与裸目标 URL **共用一个槽位**，第一条填进去的完全获胜。写在转发下面的 mock 永远不会执行 —— 把它往上挪，或标 `$`。 |
+| 算子取值被截断 | 里面有空格，而行是按空白切分的。`reqHeaders://authorization=Bearer secret` 设成 `Bearer`，然后把请求路由到一台叫 `secret` 的主机。百分号编码救不了；用命名 value 加 `${name}`。 |
+| 整行只对一部分请求生效 | 筛选器的作用域是**整行**，包括目标。`host://` 旁边写了 `includeFilter://from:composer`，这个改写就只对重放生效。 |
+| 两行设了同一个头，少了一个 | 同名争用由**首行**获胜，important 行在前。 |
+| 赢的是一条你没料到的规则 | `$` important 规则先于其余一切解析，与行序无关。 |
+
+### 生效了，但结果不对
+
+| 现象 | 原因 / 解决 |
+|------|------------|
+| 自签名 / 私有 CA 源站返回 `502` | whistle-rs **校验**源站证书，上游不校验（那边 `rejectUnauthorized` 默认为 `false`，仅 `--safe` 打开）。这是本移植唯一刻意不照抄上游默认值的地方 —— 一个对任何源站证书照单全收的调试代理，无法告诉你它正在检查的连接自己也被劫持了。用 `--insecure-upstream` 关掉。 |
+| 转发到被拦截主机时报 `502` | 上游连接或其 TLS 失败 —— `-v` 会给出目标与错误。`host://` 若把 TLS 指向非 TLS 端口会握手失败。 |
+| `resDelay://1s` 瞬间就过去了 | 延迟单位是**毫秒**，单位后缀会被解析掉然后丢弃而不是换算，所以 `1s` 是 1 毫秒。写 `1000`。 |
+| 限速比预期快 8 倍 | `reqSpeed://` / `resSpeed://` 的单位是**千比特**每秒，不是千字节。本移植此前按千字节读，按旧行为写的数值乘以 8。 |
+| SSE / chunked 响应不再流式 | 作用在流式响应上的 body 算子会把**整条流**缓冲完才开始发送 —— 实测一条 600 毫秒的 SSE 流，不带 body 算子首字节 3 毫秒，带上是 621 毫秒。本移植的 body 层建立在整体缓冲之上，改成流式是重写该层，记录在 [`docs/ROADMAP.md`](docs/ROADMAP.md)。延迟与限速不受影响。 |
+| `statusCode://` 返回了空 body | 它就是这么设计的 —— 它**造**一个响应。要改一个本来就有 body 的响应的状态码，用 `replaceStatus://`。 |
+| 给了路径的算子把路径本身发了出去 | 本移植的算子取值不从文件或 URL 加载（上游的 `readRuleValue` 未移植），所以 `resBody:///tmp/mock.json` 发的就是这个字符串。要服务文件用 `file://`，或把内容作为 value 引进来。 |
+| 证书绑定的 App 一拦就崩 | 只放过这一个域名：`pinned.example.com sniCallback://no-mitm` 会逐字节中继它，同时仍按规则路由。`--no-intercept-https` 是对所有连接这么做。 |
+
+### 抓包里没有它
+
+| 现象 | 原因 / 解决 |
+|------|------------|
+| 失败的请求在控制台里根本找不到 | **没有拿到响应**的请求 —— 连接被拒、DNS 失败、TLS 握手失败 —— 不会被记为会话。它只出现在日志里。 |
+| 详情面板里 body 被截断 | 预览上限默认 16 KB，用 `--body-preview-limit` 调高。 |
+| 二进制 body 显示为 `[binary, N bytes]` | 二进制 body 在序列化时即被替换，因此图片与十六进制视图还做不了 —— 见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。 |
+| 重启之后抓包是空的 | 要么开了 `--no-persist`，要么 `--persist-days` 已经让 `<存储目录>/sessions/` 下的文件过期了。 |
+
+上面每一条都有配套的实操配方（含对应的坑），见
+[`docs/COOKBOOK.zh-CN.md`](docs/COOKBOOK.zh-CN.md)。
 
 ## 开发
 
