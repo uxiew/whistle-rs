@@ -815,6 +815,7 @@ Then work down this list:
 | Symptom | Cause |
 |---------|-------|
 | the rule matches a URL you expected it to miss, or vice versa | a path prefix only matches at a `/`, `\` or `?` boundary: `example.com/path/to` matches `/path/to/x` but **not** `/path/toxxx` |
+| a `*` in the path matches nothing | `*` is a wildcard **in the host only**. In a path it is a literal, because `*` is a legal URL character. `example.com/old/*` matches a URL containing an actual `*`; write `^http://example.com/old/**` for a path wildcard. Filter patterns are the exception — they always read as if `^`-prefixed, which is why `excludeFilter://*/health` works |
 | a mock, redirect or forward is ignored | another line of the [shared slot](#a-mock-has-to-be-written-above-the-forward) was written first. Move it up, or mark it `$` |
 | an operator value arrives truncated | it contained a space. Use `${name}` and a value — see [Headers](#headers) |
 | `502` on a self-signed or private-CA origin | whistle-rs **verifies** origin certificates, unlike upstream. `--insecure-upstream` opts out |

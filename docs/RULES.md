@@ -4,12 +4,100 @@ whistle-rs uses whistle's rule syntax. This document is the complete reference f
 the subset the Rust core understands. For the original, exhaustive whistle rule
 documentation see <https://wproxy.org>.
 
+> **Looking for how to *do* something?** [`COOKBOOK.md`](COOKBOOK.md) is the
+> task-oriented half — serve a site from a dev server, mock an endpoint, throttle
+> a connection, debug a phone — with worked, executed examples. This file is the
+> reference you come back to once you know which operator you want.
+
+## Start here
+
+A rules file is a list of lines. Each line is **one pattern followed by any
+number of operators**:
+
+```
+example.com          http://localhost:5173
+└─ pattern ────┘     └─ operator ───────┘
+```
+
+The pattern decides *which requests the line applies to*; the operators decide
+*what happens to them*. That is the whole grammar. Three things follow from it,
+and they are what a newcomer gets wrong:
+
+**1. Position decides, not shape.** The first token is the pattern and
+everything after it is an operator, however it is spelled. So
+`example.com http://localhost:5173` is "requests for example.com go to
+localhost:5173" — the second token is not a second pattern, even though it looks
+like a URL. The one exception is the swapped form, where an operator leads so
+that several patterns can share it:
+
+```
+example.com     http://localhost:5173     # pattern, then operators
+host://9.9.9.9  a.com  b.com  c.com       # operator, then patterns
+```
+
+Writing this the wrong way round is the most common way to get a rule that
+silently does nothing. The console's rules editor highlights whichever token the
+proxy will actually match on, so you can see the answer rather than guess it.
+
+**2. Tokens are separated by whitespace, so an operator value cannot contain a
+space.** `reqHeaders://authorization=Bearer secret` sets `authorization: Bearer`
+and then reads `secret` as another operator. Percent-encoding does not help.
+Put the value in the [values store](#flags-includes--values) and reference it
+with `${name}`.
+
+**3. Most operators accumulate; a few compete.** Several `resHeaders://` lines
+all apply. But `file://`, `redirect://`, `statusCode://`, the template family
+and a bare destination URL share **one slot**, so only the first of them to
+match answers — see [Short-circuit](#short-circuit-no-upstream-request-is-made).
+
+The four kinds of thing you can write as a pattern are a
+[domain or URL prefix](#1-domain--url-prefix-most-common), a
+[wildcard](#3-wildcard), a [regexp](#5-regular-expression) or a
+[port](#6-port); `$` in front makes a line [important](#--important-patterns) and
+`^` in front makes [`*` a wildcard everywhere](#4---wildcards-everywhere).
+
+The operators worth knowing before the rest are
+[`host://`](#destination) (change where a request goes, keep its `Host` header),
+[`file://`](#short-circuit-no-upstream-request-is-made) (answer it locally),
+[`reqHeaders://` / `resHeaders://`](#request-rewriting) (add a header),
+[`resBody://` and friends](#body) (rewrite what comes back), and
+[`includeFilter://`](#filter-conditions) (narrow any of the above).
+
+---
+
+## Contents
+
 - [File format](#file-format)
-- [Patterns](#patterns)
+- [Patterns](#patterns) — [prefix](#1-domain--url-prefix-most-common) ·
+  [leading dot](#2-leading-dot-subdomain-match) · [wildcard](#3-wildcard) ·
+  [`^`](#4---wildcards-everywhere) · [`$0`…`$9` captures](#09--what-the-pattern-captured) ·
+  [regexp](#5-regular-expression) · [port](#6-port) · [`!` negation](#--negated-patterns) ·
+  [`$` important](#--important-patterns)
 - [Operators](#operators)
-- [Precedence](#precedence)
-- [Cookbook](#cookbook)
-- [Operator coverage](#operator-coverage)
+  - [Where the pattern sits](#where-the-pattern-sits) · [Shorthands](#shorthands)
+  - [Destination](#destination) — [forwarding to another URL](#forwarding-to-another-url)
+  - [Upstream proxy](#upstream-proxy) — [PAC](#pac)
+  - [URL rewriting](#url-rewriting) — [where `params://` lands](#where-params-lands)
+  - [Filter conditions](#filter-conditions) — [conditions](#conditions) ·
+    [the response phase](#the-response-phase) · [the body condition](#the-body-condition) ·
+    [origin markers](#origin-markers)
+  - [Disabling operators](#disabling-operators) ·
+    [Short-circuit](#short-circuit-no-upstream-request-is-made)
+  - [Request rewriting](#request-rewriting) — [`auth://`](#auth-in-three-spellings)
+  - [Plugins](#plugins) · [Choosing the MITM certificate](#choosing-the-mitm-certificate) ·
+    [Scripting](#scripting) · [weinre](#weinre-html-debug-injection)
+  - [Flags, includes & values](#flags-includes--values) — [trailers](#trailers) ·
+    [`enable://abort`](#enableabort-is-two-gates-not-one) ·
+    [several `rulesFile://` lines](#how-several-rulesfile-lines-combine)
+  - [Dump files](#dump-files) · [Delays & throttling](#delays--throttling)
+  - [Response rewriting](#response-rewriting) · [Deleting](#deleting) ·
+    [Cookies](#cookies) · [Body](#body)
+- [Precedence](#precedence) — [how several lines of one operator combine](#how-several-lines-of-one-operator-combine)
+- [Quick reference](#quick-reference)
+- [Operator coverage](#operator-coverage) — [applied at runtime](#applied-at-runtime) ·
+  [parsed but not applied](#parsed-but-not-applied-2) ·
+  [simplified vs. upstream](#simplified-vs-upstream)
+- [Origin certificate verification](#origin-certificate-verification)
 
 ---
 
@@ -149,7 +237,7 @@ A regexp or wildcard pattern hands what it matched to the operators on its line.
 ```
 
 `$$1` inserts the group **percent-encoded**, and `\$1` is a literal `$1` — the
-same escapes the [`*Replace` operators](#replacing-inside-a-value) use, because it
+same escapes the [`*Replace` operators](#replace-details) use, because it
 is the same expander. A pattern with no groups substitutes nothing, so a `$1` in
 one of its values stays as written.
 
@@ -659,9 +747,9 @@ example.com   host://10.0.0.1         includeFilter://s:200    # never applies
 ```
 
 The second line is not an error — upstream evaluates it too, in the request phase,
-where the status is still unknown and the condition therefore fails (see
-[fail-closed](#conditions-that-still-cannot-be-evaluated) below). By the time the
-status is known the request has already gone to the origin the rules chose.
+where the status is still unknown and the condition therefore fails closed (the
+list of which conditions those are is directly below). By the time the status is
+known the request has already gone to the origin the rules chose.
 
 **Which conditions the second pass answers:** `s:`/`statusCode:`, `resH.` (and its
 `res.`/`resHeader.`/`resHeaders.` spellings), `serverIp:`, `serverPort:`, and the
@@ -849,10 +937,43 @@ cannot collide: a protocol name carries no `:`, `.` or `=`.
 | `file` / `rawfile` | a local path | Serve the file's bytes with a guessed `Content-Type` |
 
 ```
-old.example.com/*      redirect://https://new.example.com/
-/\/track\b/            statusCode://204
-example.com/app.js     file:///Users/me/dev/app.js
+old.example.com/legacy   redirect://https://new.example.com/
+/\/track\b/              statusCode://204
+example.com/app.js       file:///Users/me/dev/app.js
 ```
+
+Note the first line has no `*`. A path prefix already matches everything below
+it at a segment boundary, and a `*` in the path of an ordinary pattern is a
+**literal** — `old.example.com/legacy/*` matches a URL containing the character
+`*` and nothing else. Write `^http://old.example.com/legacy/**` when you need a
+path wildcard with a capture.
+
+**These share one slot with each other and with a bare destination URL.** None
+of `file`, `rawfile`, `tpl`, `jsonp`, `dust`, `redirect`, `location`,
+`statusCode` or a forwarding URL is a name in upstream's `protocols` array, so
+`parseRule` files every one of them under the same `rule` list
+(`_original/lib/rules/rules.js:1313-1316`) and `getRule` returns the **first**
+match (`:799-800`). They cannot coexist: whichever one was written first
+answers, and the rest do not apply.
+
+```
+example.com            http://localhost:5173
+example.com/api/flags  file://({"beta":true})     # never served — the forward won
+```
+
+Order the narrow rule above the broad one, or mark it `$`, which puts it first
+whatever the line order:
+
+```
+example.com/api/flags  file://({"beta":true})
+example.com            http://localhost:5173
+```
+
+Within a *single* line the tie is broken by protocol, in the order `redirect`,
+`location`, `statusCode`, then the file family — so
+`file://({"id":7}) statusCode://201` answers `201` with an **empty body**. Use
+[`replaceStatus://`](#response-rewriting) when you want the mock's body under a
+different status; it changes a response rather than manufacturing one.
 
 ### Request rewriting
 
@@ -1220,17 +1341,27 @@ api.example.com   resWrite:///tmp/api-body.json  enable://forceReqWrite
 |----------|-------|--------|
 | `reqDelay` | milliseconds | Wait before forwarding the request |
 | `resDelay` | milliseconds | Wait before returning the response |
-| `reqSpeed` | KB/s | Cap request-body upload throughput |
-| `resSpeed` | KB/s | Cap response-body download throughput |
+| `reqSpeed` | **kilobits**/s | Cap request-body upload throughput |
+| `resSpeed` | **kilobits**/s | Cap response-body download throughput |
 
 ```
 slow.example.com   reqDelay://500
 slow.example.com   resDelay://1000
-slow.example.com   resSpeed://20        # ~20 KB/s download
+slow.example.com   resSpeed://800       # 800 kbit/s ≈ 100 kB/s download
 ```
 
 > A speed cap buffers the body and re-emits it in paced chunks, so it forces a
 > known-length body to chunked transfer.
+
+**The speed unit is kilobits, not kilobytes** — upstream's documentation says
+千比特 and its implementation is `parseInt(speed * 1000 / 8)`. This port read the
+value as kilobytes until recently, so every throttle written against the old
+behaviour ran 8.192× too fast; multiply those values by 8.
+
+**Both families take only a number.** A unit suffix parses and is then
+*discarded*, not converted (`parseFloat`/`parseInt` semantics): `resDelay://500ms`
+is 500 ms as you would hope, but `resDelay://1s` is **1 millisecond**, and
+`resSpeed://20kb` is 20 kilobits. Write the number you mean.
 
 ### Response rewriting
 
@@ -1623,45 +1754,35 @@ $example.com/x resAppend://important     # → body + "important\r\nnormal"
 
 ---
 
-## Cookbook
+## Quick reference
 
-**Local development against a fake domain**
+One line each. The worked versions — what they do, what surprises people about
+them, and what to reach for when they do not fire — are in
+[`COOKBOOK.md`](COOKBOOK.md).
 
-```
-test.local        127.0.0.1:9099
-```
-
-**Force a CDN through a specific origin while keeping the real hostname/cert**
-
-```
-.cdn.example.com  host://10.0.0.9
-```
-
-**Mock an API endpoint**
-
-```
-api.example.com/health   statusCode://200
-api.example.com/users    file:///Users/me/mock/users.json
-```
-
-**Inject CORS + auth for a front-end talking to a third-party API**
-
-```
-api.thirdparty.com   resCors://*
-api.thirdparty.com   reqHeaders://authorization=Bearer abc
-```
-
-**Redirect an old path**
-
-```
-example.com/old/*    redirect://https://example.com/new/
-```
-
-**Tag every intercepted response (useful to confirm MITM is active)**
-
-```
-/^https:/i           resHeaders://x-via=whistle-rs
-```
+| Task | Rule |
+|------|------|
+| Serve a site from a local dev server | `www.example.com  http://localhost:5173` |
+| Send a host somewhere else, keeping its `Host` header | `.cdn.example.com  host://10.0.0.9` |
+| Local development against a fake domain | `test.local  127.0.0.1:9099` |
+| Mock an endpoint from a file | `api.example.com/users  file:///Users/me/mock/users.json` |
+| Mock an endpoint inline | `api.example.com/health  file://({"status":"ok"})  resType://json` |
+| Return a bare status | `/\/track\b/  statusCode://204` |
+| Redirect an old path (a prefix needs no `*`) | `example.com/old  redirect://https://example.com/new/` |
+| …keeping what followed it | `^http://example.com/old/**  redirect://https://example.com/new/$1` |
+| Add a request header | `example.com  reqHeaders://x-token=abc` |
+| Add a header whose value has a space | `example.com  reqHeaders://authorization=${bearer}` |
+| Drop a request header | `example.com  delete://reqHeaders.user-agent` |
+| Allow CORS for a front end | `api.thirdparty.com  resCors://*` |
+| Change one field of a JSON response | `api.example.com  resMerge://{"env":"staging"}` |
+| Slow a response down | `slow.example.com  resDelay://2000  resSpeed://800` |
+| Break a connection | `flaky.example.com  enable://abort` |
+| Fail a fraction of calls | `api.example.com  statusCode://503  includeFilter://chance:5%` |
+| Narrow a rule to one method | `api.example.com  host://10.0.0.1  includeFilter://m:POST` |
+| Carve one path out of a broad rule | `example.com/health  ignore://all` |
+| Win against an earlier line | `$example.com  host://2.2.2.2` |
+| Leave a pinned host alone | `pinned.example.com  sniCallback://no-mitm` |
+| Tag every intercepted response (confirms MITM is active) | `/^https:/i  resHeaders://x-via=whistle-rs` |
 
 ---
 
