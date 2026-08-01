@@ -191,7 +191,14 @@ pub struct RuleOp {
 /// normal ones, source order within each group. Both passes derive it from the
 /// same rule list, so a key means the same thing in either.
 pub fn order_key(index: usize, important: bool) -> u64 {
-    ((!important as u64) << 32) | index as u64
+    // `+ 1` so that **zero belongs to nobody**. Operators merged in mid-request
+    // are stamped `MERGED_ORDER = 0` to make them win every contest decided by
+    // this key (`crate::proxy::apply::merge_resolved`), and without the shift an
+    // `$`-important rule on the first line of a file would land on 0 as well.
+    // The two would then tie, and `min_by_key` resolves a tie by iteration
+    // order — which is a map's, not the file's. Both passes derive the key from
+    // this one function, so shifting it shifts nothing relative to itself.
+    ((!important as u64) << 32) | (index as u64 + 1)
 }
 
 /// How a rule's pattern decides whether a request matches.

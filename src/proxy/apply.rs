@@ -6457,6 +6457,45 @@ mod tests {
         assert_eq!(pairs[0].1.iter().next().map(String::as_str), Some("spaced"));
     }
 
+    /// A merged-in operator has to win *strictly*, not tie. `MERGED_ORDER` is
+    /// zero, and an `$`-important rule on a file's first line used to land on
+    /// zero too — a tie that `min_by_key` breaks by iteration order, which is a
+    /// map's rather than the file's, so which rule won was not something you
+    /// could read off the rules.
+    #[test]
+    fn a_merged_operator_outranks_even_the_first_important_line() {
+        use crate::rules::order_key;
+
+        assert!(
+            MERGED_ORDER < order_key(0, true),
+            "an important first line must still rank after a merged operator"
+        );
+        assert!(order_key(0, true) < order_key(1, true));
+        // Importance occupies the high half of the key, so any line index that
+        // fits the low 32 bits still sorts ahead of the first normal line.
+        assert!(order_key(u32::MAX as usize - 1, true) < order_key(0, false));
+
+        // And it decides the shared slot the same way.
+        let dir = std::env::temp_dir().join(format!("whistle-rs-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let inc = dir.join("inc.txt");
+        std::fs::write(&inc, "a.com statusCode://204\n").expect("write");
+        let mut mgr = RuleManager::new();
+        mgr.set_text(&format!(
+            "$a.com redirect://http://elsewhere/ rulesFile://{}\n",
+            inc.display()
+        ));
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        let mut resolved = mgr.resolve(&info);
+        let _keep = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+        assert_eq!(
+            slot_winner(&resolved).map(|(p, _)| p),
+            Some("statusCode"),
+            "the merged rule wins the slot outright"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn charset_set_and_strip() {
         let mut h = HeaderMap::new();
