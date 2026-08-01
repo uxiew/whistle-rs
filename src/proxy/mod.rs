@@ -2425,7 +2425,6 @@ async fn serve(
             // `_original/lib/inspectors/data.js:` and `inspectors/rules.js:60-140`).
             let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
             let restore = decoded.restore;
-        let restore = decoded.restore;
             let mut new = apply::transform_res_body(decoded.body, &resolved, res_ct.as_deref());
 
             // Response hook, part 2: plugins that asked for the body. It sits
