@@ -351,8 +351,21 @@ operator-level detail.
 
 ## Troubleshooting
 
-**Start with the log.** Every request prints the destination it resolved to, and
-that one line usually contains the answer:
+**Ask the capture which rules matched.** Every session records the operators that
+resolved for it, as written and as they came out — an operator missing from that
+list never matched, and one with an unexpected `value` is a substitution problem
+rather than a matching one:
+
+```bash
+curl -s --noproxy '*' http://127.0.0.1:8899/sessions.json |
+  python3 -c 'import sys,json
+s = json.load(sys.stdin)[0]
+print(s["url"])
+for r in s["rules"]: print(" ", r["raw"], "->", r["value"])'
+```
+
+**Then look at the log.** Every request prints the destination it resolved to,
+and that one line usually contains the rest of the answer:
 
 ```
 INFO GET http://seg.test/path/to/x  -> 127.0.0.1:5173 (http)   # the rule matched

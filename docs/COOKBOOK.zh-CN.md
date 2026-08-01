@@ -615,7 +615,7 @@ pinned.example.com    sniCallback://no-mitm
 
 | 接口 | 返回 |
 |------|------|
-| `GET /sessions.json` | 每一条抓到的事务：id、方法、url、状态码、目标、上下行字节、耗时 |
+| `GET /sessions.json` | 每一条抓到的事务：id、方法、url、状态码、目标、上下行字节、耗时，以及**命中了哪些规则** |
 | `GET /session.json?id=N` | 单条事务，含请求/响应头与 body 预览 |
 | `GET /frames.json?id=N` | 第 `N` 条连接的 WebSocket 帧，双向 |
 | `GET /sessions.har` | 全部导出为 HAR 1.2 文件 |
@@ -730,7 +730,29 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 
 ## 规则不生效时
 
-先看日志。每个请求都会打印它解析出的目标，答案通常就在这一行里：
+**先问抓包命中了什么。** 每条会话都记录了为它解析出来的算子，包含「原文」与「结果」两栏：
+
+```bash
+curl -s --noproxy '*' http://127.0.0.1:8899/sessions.json |
+  python3 -c 'import sys,json
+s = json.load(sys.stdin)[0]
+print(s["url"])
+for r in s["rules"]: print(" ", r["raw"], "->", r["value"])'
+```
+
+```
+http://api.example.com/anything
+  host://127.0.0.1:5173             -> 127.0.0.1:5173
+  reqHeaders://x-token=abc          -> x-token=abc
+  reqHeaders://authorization=${bearer} -> authorization=Bearer eyJhbGciOi
+```
+
+不在这张表里的算子就是**根本没匹配上** —— 去看它的 pattern。在表里但 `value`
+不是你期望的那个，那就是替换或路径拼接的问题，不是匹配的问题。注意这张表是
+**解析出来**的东西，不总等于**实际执行**的：[共用槽位](#mock-必须写在转发上面)
+的两个竞争者都会出现，而只有第一个真的应答了。
+
+然后看日志。每个请求都会打印它解析出的目标，其余的答案通常就在这一行里：
 
 ```
 INFO GET http://seg.test/path/to/x    -> 127.0.0.1:5173 (http)   # 规则命中

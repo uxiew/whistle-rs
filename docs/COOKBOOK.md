@@ -665,7 +665,7 @@ are **direct** requests, not through the proxy:
 
 | Endpoint | Returns |
 |----------|---------|
-| `GET /sessions.json` | every captured transaction: id, method, url, status, target, bytes up/down, duration |
+| `GET /sessions.json` | every captured transaction: id, method, url, status, target, bytes up/down, duration, and **which rules matched it** |
 | `GET /session.json?id=N` | one transaction with its request/response headers and body previews |
 | `GET /frames.json?id=N` | the WebSocket frames of connection `N`, both directions |
 | `GET /sessions.har` | everything as a HAR 1.2 file |
@@ -791,8 +791,33 @@ For out-of-process plugins in JS/TS, see [`PLUGINS.md`](PLUGINS.md).
 
 ## When a rule does not fire
 
-Start with the log. Every request prints its resolved destination, and that one
-line usually contains the answer:
+**Ask the capture what matched.** Each session records the operators that
+resolved for it, as written and as they came out:
+
+```bash
+curl -s --noproxy '*' http://127.0.0.1:8899/sessions.json |
+  python3 -c 'import sys,json
+s = json.load(sys.stdin)[0]
+print(s["url"])
+for r in s["rules"]: print(" ", r["raw"], "->", r["value"])'
+```
+
+```
+http://api.example.com/anything
+  host://127.0.0.1:5173             -> 127.0.0.1:5173
+  reqHeaders://x-token=abc          -> x-token=abc
+  reqHeaders://authorization=${bearer} -> authorization=Bearer eyJhbGciOi
+```
+
+An operator missing from that list never matched — go and look at the pattern.
+One present but with a `value` you did not expect is a substitution or a
+path-join problem, not a matching one. Note that the list is what *resolved*,
+which is not always what *ran*: both contenders for the
+[shared slot](#a-mock-has-to-be-written-above-the-forward) appear, and only the
+first of them answered.
+
+Then look at the log. Every request prints its resolved destination, and that
+one line usually contains the rest of the answer:
 
 ```
 INFO GET http://seg.test/path/to/x    -> 127.0.0.1:5173 (http)   # rule matched

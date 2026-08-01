@@ -314,7 +314,18 @@ WebSocket 帧）保留在内存的环形缓冲中，可选落盘（`--no-persist
 
 ## 故障排查
 
-**先看日志。** 每个请求都会打印它解析出的目标，答案通常就在这一行里：
+**先问抓包命中了哪些规则。** 每条会话都记录了为它解析出来的算子，含「原文」与「结果」两栏 ——
+不在表里的算子就是根本没匹配上，在表里但 `value` 不对的则是替换问题而非匹配问题：
+
+```bash
+curl -s --noproxy '*' http://127.0.0.1:8899/sessions.json |
+  python3 -c 'import sys,json
+s = json.load(sys.stdin)[0]
+print(s["url"])
+for r in s["rules"]: print(" ", r["raw"], "->", r["value"])'
+```
+
+**然后看日志。** 每个请求都会打印它解析出的目标，其余的答案通常就在这一行里：
 
 ```
 INFO GET http://seg.test/path/to/x  -> 127.0.0.1:5173 (http)   # 规则命中
