@@ -226,26 +226,42 @@ pub fn response_phase_of(
     out
 }
 
-/// Fold a resolution of *another* rules text into `resolved`: existing
-/// single-match operators win, multi-match operators accumulate at the end.
+/// Merge a rules text resolved mid-request — a `rule://` value, a
+/// `rulesFile://` include, a plugin's injected rules — into the set already
+/// resolved from the file that pulled it in.
 ///
-/// The merged operators are stamped with the last possible [`RuleOp::order`], so
-/// the response phase — which inserts by that key — still slots its own
-/// operators in front of them, where the operators of the rules file they were
-/// merged into already are.
+/// **What is merged wins.** Upstream's `mergeRule`
+/// (`_original/lib/util/index.js:2147-2170`) returns the *new* rule for a
+/// single-value protocol and puts the new list first for a multi-match one, so
+/// an included file overrides the file that included it and a plugin's rules
+/// override both. This port had it the other way round — `or_insert` and
+/// `extend` — so a rule you pulled in specifically to override something lost
+/// to the thing it was meant to override.
+///
+/// The order key follows the precedence rather than contradicting it. It was
+/// `u64::MAX`, which is what made merged operators lose; it is now the lowest
+/// possible, so they win the `min_by_key` that picks an upstream proxy and sort
+/// ahead of the host file's operators when the response phase inserts by the
+/// same key. Equal keys keep insertion order, so several merged sets stay in
+/// the sequence they were merged in.
 fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
     for (k, mut v) in sub.single {
-        v.order = u64::MAX;
-        resolved.single.entry(k).or_insert(v);
+        v.order = MERGED_ORDER;
+        resolved.single.insert(k, v);
     }
     for (k, vs) in sub.multi {
         let list = resolved.multi.entry(k).or_default();
-        list.extend(vs.into_iter().map(|mut op| {
-            op.order = u64::MAX;
-            op
-        }));
+        for (at, mut op) in vs.into_iter().enumerate() {
+            op.order = MERGED_ORDER;
+            list.insert(at, op);
+        }
     }
 }
+
+/// The resolution order stamped on every operator merged in mid-request, chosen
+/// so that merged operators win every contest decided by this key. See
+/// [`merge_resolved`].
+const MERGED_ORDER: u64 = 0;
 
 /// Merge the rules pulled in by `rule://<name>` (from the values store) and
 /// `rulesFile://<path>` (from disk), resolved in the request's own scope.
@@ -6160,6 +6176,37 @@ mod tests {
         let resolved = mgr.resolve(&info);
         let out = rewrite_path("/api", &resolved, ReqBodyCtx::default());
         assert_eq!(out, "/api?token=redacted");
+    }
+
+    /// A rules text merged in mid-request **wins**: upstream's `mergeRule`
+    /// returns the new rule for a single-value protocol and puts the new list
+    /// first for a multi-match one, so an included file overrides the file that
+    /// included it. This port had it reversed, which meant a rule pulled in
+    /// specifically to override something lost to the thing it was overriding.
+    #[test]
+    fn a_merged_rule_wins_the_contest() {
+        let dir = std::env::temp_dir().join(format!("whistle-rs-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let inc = dir.join("inc.txt");
+        std::fs::write(&inc, "example.com resHeaders://x-src=inc host://9.9.9.9\n").expect("write");
+
+        let mut mgr = RuleManager::new();
+        mgr.set_text(&format!(
+            "example.com resHeaders://x-src=main host://1.1.1.1 rulesFile://{}\n",
+            inc.display()
+        ));
+        let info = build_req_info("GET", "http", "example.com", 80, "/x", &HeaderMap::new(), None);
+        let mut resolved = mgr.resolve(&info);
+        let _keep = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
+
+        // Single-value: the included one replaces the including one.
+        assert_eq!(resolved.value("host"), Some("9.9.9.9"));
+        // Multi-match: the included one comes first, and these fold first-wins.
+        let mut headers = HeaderMap::new();
+        apply_header_ops(&mut headers, &resolved, "resHeaders");
+        assert_eq!(headers.get("x-src").map(|v| v.to_str().unwrap()), Some("inc"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
