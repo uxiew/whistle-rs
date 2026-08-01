@@ -1040,6 +1040,34 @@ mod tests {
         assert!(m.resolve(&req("http://anything.test/")).value("host").is_none());
     }
 
+    /// A shorthand operator is silenced by its **expanded** spelling only.
+    ///
+    /// A documented divergence, not an accident. Upstream's `exactIgnore` tests
+    /// `rule.rawMatcher` as well (`_original/lib/util/index.js:1977-1980`), so
+    /// `matcher=/local/path` silences `example.com /local/path` there. Here
+    /// `format_shorthand` runs over the whole line *before* `split_line` decides
+    /// which tokens are operators, so by the time a `RuleOp` exists the token it
+    /// came from is `file:///local/path` and the written form is not recoverable
+    /// without threading indices through the splitter — a change to a
+    /// load-bearing function for a spelling nobody is likely to reach for.
+    ///
+    /// This test exists because the user-facing docs first claimed *both*
+    /// spellings worked. They did not, and only running it said so.
+    #[test]
+    fn a_shorthand_operator_is_silenced_by_its_expanded_spelling() {
+        let served = |text: &str| {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(text);
+            m.resolve(&req("http://example.com/x")).value("file").is_some()
+        };
+        assert!(served("example.com /local/path\n"), "baseline");
+        assert!(!served(
+            "example.com /local/path\n* ignore://matcher=file:///local/path"
+        ));
+        // The written form does not silence it — upstream's answer, not ours.
+        assert!(served("example.com /local/path\n* ignore://matcher=/local/path"));
+    }
+
     /// `ignore://pattern=…` / `matcher=…` silence a rule by the text it was
     /// written as, rather than by protocol name. Both were silent no-ops: the
     /// value matched no protocol, so nothing was dropped and nothing said so.

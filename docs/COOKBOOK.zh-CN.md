@@ -459,11 +459,23 @@ whistle-rs -t 3000 -r rules.txt      # 连接 3 秒还建立不起来就放弃
 
 ### 限速做不到的事
 
-body 算子与流式响应不兼容：一条作用在 `text/event-stream` 或 chunked 响应上的
-body 算子（`resBody`、`resAppend`、`resReplace`、`resMerge`、html/js/css 家族），
-会让 whistle-rs 把**整条流缓冲完**才开始发送。实测一条 600 毫秒的 SSE 流：
+body 算子与流式响应不兼容，但**是不是事件流**决定了后果完全不同。
+
+**`text/event-stream` —— 算子被跳过，流照常往下走。** body 算子
+（`resBody`、`resAppend`、`resReplace`、`resMerge`、html/js/css 家族）、
+强制的 `enable://gzip`、以及插件声明的 `responseBody` 钩子，在事件流上一律被丢弃，
+事件原样通过。你得不到改写；插件钩子被跳过时控制台会打一行日志，
+免得看起来像钩子悄悄失效了。
+
+这不是算子生效了，而是算子主动让路。上游**确实**会改写事件流，因为它的 body 层
+从头到尾是流式的；本移植是先缓冲再变换，而缓冲一条「服务端不说结束就不结束」的流
+—— 对 SSE 通常是永不 —— 不是让响应变慢，是让它彻底不返回。两者之间，跳过才是诚实的那个。
+
+**chunked 但不是事件流 —— 整个 body 仍会被缓冲完。** 长轮询或慢速 chunked 下载
+若挂了 body 算子，会被扣到最后一个字节。实测一条 600 毫秒的流：
 不带 body 算子首字节 3 毫秒，带上是 621 毫秒。延迟与限速没问题，body 改写有问题。
-这是一个已知的结构性缺口，原因见 [`ROADMAP.md`](ROADMAP.md)。
+
+两者是同一个结构性缺口，原因见 [`ROADMAP.md`](ROADMAP.md)。
 
 ---
 
@@ -831,7 +843,8 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 | 写了 `1s` 的延迟瞬间就过去了 | 延迟单位是毫秒；后缀被丢弃而不是换算。写 `1000` |
 | 限速比预期快 8 倍 | `resSpeed://` 的单位是**千比特**，不是千字节 |
 | body 改写时灵时不灵 | 现在不会了 —— 响应体算子会顺带禁掉请求缓存，`304` 吞不掉它。如果你用的是旧版本，加 `disable://cache` |
-| SSE / chunked 响应不再流式 | 上面挂了 body 算子，它会把整条流缓冲完。去掉它，或者用筛选器把它避开 |
+| chunked 响应不再流式 | 上面挂了 body 算子，它会把整个 body 缓冲完。去掉它，或者用筛选器把它避开 |
+| body 算子对 SSE 流毫无作用 | 那是刻意跳过的，为的是让流继续走 —— 见[限速做不到的事](#限速做不到的事) |
 | 控制台只显示 `CONNECT`，里面什么都没有 | 客户端不信任根证书 —— 见 [`CERTIFICATES.md`](CERTIFICATES.md) |
 | 直连控制台却返回带 `Proxy-Connection` 的 `502` | 你的 shell 设了 `http_proxy`。`curl --noproxy '*'` |
 | 失败的请求在控制台里根本找不到 | **没有拿到响应**的请求 —— 连接被拒、DNS 失败、TLS 握手失败 —— 不会被记为会话。它只出现在代理日志里，这也是调试期间该一直开着 `-v` 的另一个理由 |

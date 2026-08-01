@@ -925,8 +925,54 @@ example.com/health   ignore://all         # bypass every rule for this path
 `ignore://` followed by a **[filter condition](#filter-conditions)** rather than a
 protocol name is an *exclude filter*, not this operator — `ignore://m:POST` skips the
 rule for POST requests, exactly like `excludeFilter://m:POST`. Upstream routes both
-spellings through the same parser (`_original/lib/rules/rules.js:57`). The two readings
-cannot collide: a protocol name carries no `:`, `.` or `=`.
+spellings through the same parser (`_original/lib/rules/rules.js:57`).
+
+#### Silencing a rule by its text
+
+A third reading names the rule *as written*, which is what you want when the rule
+you are trying to disable is one you cannot edit — in an included file, or one a
+plugin merged in.
+
+| Value | Silences |
+|-------|----------|
+| `pattern=<text>` | every rule whose **pattern token** is exactly `<text>` |
+| `matcher=<text>` | every **operator token** that is exactly `<text>` |
+| `operator=` / `operation=` | the same as `matcher=` |
+
+```
+# Turn off one line of an included rules file without touching the file.
+*   ignore://pattern=static.example.com
+*   ignore://matcher=host://10.0.0.1
+```
+
+`:` works in place of `=` (`ignore://pattern:example.com`). The text must match
+the token *exactly*, prefixes and all — `$example.com` and `example.com` are
+different patterns.
+
+Name an operator by its **expanded** form. A shorthand is expanded before the
+line is split, so `example.com /local/path` is silenced by
+`matcher=file:///local/path`, not by `matcher=/local/path`. (Upstream accepts
+both; this port accepts only the expanded one — the written token is not
+recoverable by the time the operator exists.)
+
+Unlike the protocol-name form, this one may be written **anywhere in the file** —
+above or below the rule it silences — because the whole set is read before
+anything is applied.
+
+The three readings do not collide in practice, but the reason is worth stating
+precisely, because it is *not* that their shapes are disjoint: a filter condition
+and a `pattern=` value can both carry `:`, `.` and `=`. What separates them is
+that each is recognised by its own vocabulary — a leading `m:`/`s:`/`b:`… makes a
+filter condition, one of the four keys above makes a text silencer, and anything
+that is neither is read as a list of protocol names.
+
+> **`skip://` reads an unkeyed value differently.** `skip://` and `ignore://` are
+> the same operator here, with one exception: under `skip://`, a value carrying
+> any character a protocol name could not hold is taken *whole* as a `matcher=`.
+> So `skip://example.com/path` silences that operator token, while
+> `ignore://example.com/path` looks for protocols with those names and finds
+> none. Upstream draws the same distinction (`rules.js:1129-1141`); if you are
+> not relying on it, prefer the explicit `matcher=` spelling.
 
 ### Short-circuit (no upstream request is made)
 

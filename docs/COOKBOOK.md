@@ -493,13 +493,28 @@ To make a *particular* request slow rather than the whole proxy patient, use
 
 ### What throttling will not do
 
-A body operator and a streaming response do not mix: if a rule on an
-`text/event-stream` or chunked response touches the body (`resBody`,
-`resAppend`, `resReplace`, `resMerge`, the html/js/css families), whistle-rs
-buffers the **whole stream** before sending anything. Measured on a 600 ms SSE
-stream: 3 ms to first byte without a body operator, 621 ms with one. Delays and
-speed caps are fine; body rewriting is not. This is a known structural gap —
-[`ROADMAP.md`](ROADMAP.md) has the reason.
+A body operator and a streaming response do not mix, and what happens depends
+on whether the response is an **event stream**.
+
+**`text/event-stream` — the operator is skipped, the stream keeps flowing.** A
+body operator (`resBody`, `resAppend`, `resReplace`, `resMerge`, the html/js/css
+families), a forced `enable://gzip`, and a plugin's `responseBody` hook are all
+dropped on an event stream, and the events pass through untouched. You get no
+rewriting, and the console logs a line when a plugin hook is skipped so it does
+not look like the hook silently failed.
+
+This is not the operator working — it is the operator declining. Upstream *does*
+rewrite event streams, because its body layer is streaming end to end. Ours
+collects and then transforms, and collecting a stream that ends when the server
+says so — which for SSE is typically never — does not delay the response, it
+withholds it entirely. Skipping is the honest behaviour of the two.
+
+**Chunked, but not an event stream — the whole body is buffered.** A long poll
+or a slow chunked download with a body operator on it is held until the last
+byte. Measured on a 600 ms stream: 3 ms to first byte without a body operator,
+621 ms with one. Delays and speed caps are fine; body rewriting is not.
+
+Both are the same structural gap — [`ROADMAP.md`](ROADMAP.md) has the reason.
 
 ---
 
@@ -903,7 +918,8 @@ Then work down this list:
 | a delay of `1s` is instant | delays are milliseconds; the suffix is discarded, not converted. Write `1000` |
 | a throttle is 8× faster than expected | `resSpeed://` is **kilobits**, not kilobytes |
 | a body rewrite works sometimes | it does not, any more — a response-body operator now busts the request cache, so a `304` cannot swallow it. If you are on an older build, add `disable://cache` |
-| an SSE/chunked response stops streaming | a body operator on it buffers the whole stream. Remove it, or scope it away with a filter |
+| a chunked response stops streaming | a body operator on it buffers the whole body. Remove it, or scope it away with a filter |
+| a body operator does nothing to an SSE stream | it is skipped there on purpose, so the stream keeps flowing — see [What throttling will not do](#what-throttling-will-not-do) |
 | the console shows `CONNECT` and nothing inside it | the client does not trust the root CA — see [`CERTIFICATES.md`](CERTIFICATES.md) |
 | a direct request to the console returns `502` with `Proxy-Connection` | your shell has `http_proxy` set. `curl --noproxy '*'` |
 | a request that failed is missing from the console entirely | a request that never got a response — connection refused, DNS failure, TLS handshake failure — is **not** recorded as a session. The proxy log is the only place it appears, which is the other reason to keep `-v` on while debugging |
