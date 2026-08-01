@@ -426,13 +426,27 @@ function card(title, pairs) {
 function generalCards(s, d) {
   const cards = [
     card('HTTP', [['Method', s.method], ['Status', s.status || '—']]),
-    card('Policy', [['Target', s.target], ['Rules', (s.log || []).join(', ')]]),
+    card('Policy', [
+      ['Target', s.target],
+      ['Log tags', (s.log || []).join(', ')],
+    ]),
     card('Traffic', [['Upload', fmtBytes(s.up)], ['Download', fmtBytes(s.down)]]),
     card('Timing', [['Duration', s.duration_ms + ' ms'], ['Start', fmtDateTime(s.time_ms)]]),
     card('Client', [['Address', s.client_ip || 'unknown']]),
+    d ? card('Content', [
+      ['Type', headerOf(d.res_headers, 'content-type')],
+      ['Encoding', headerOf(d.res_headers, 'content-encoding') || 'identity'],
+      ['Server', headerOf(d.res_headers, 'server')],
+    ]) : '',
   ].join('');
   return '<div class="cards">' + cards + '</div>'
     + (d ? '' : '<p class="hint">loading headers…</p>');
+}
+
+/** One response header by name, for the General cards. */
+function headerOf(pairs, name) {
+  const hit = (pairs || []).find((p) => p[0].toLowerCase() === name);
+  return hit ? hit[1] : '';
 }
 
 function headerList(pairs) {
