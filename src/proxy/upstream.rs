@@ -762,6 +762,48 @@ fn join_host_port(host: &str, port: u16, default_port: u16) -> String {
     }
 }
 
+/// How long a connection attempt may take before it is abandoned.
+///
+/// Upstream's number (`TIMEOUT`, `_original/lib/inspectors/res.js:22`), and its
+/// scope: whistle arms the timer only while the socket is *connecting* and
+/// clears it on `connect`/`secureConnect` (`res.js:653-673`), so a slow response
+/// is never cut off — only a destination that will not answer at all.
+///
+/// Without it the wait is the operating system's, which for a packet-dropping
+/// destination is 75 seconds on macOS and longer on Linux, with the request and
+/// its buffers held the whole time.
+///
+/// **One deliberate correction.** Upstream computes this as
+/// `config.timeout < 16000 && config.timeout > 0 ? 0 : 16000` — so configuring a
+/// timeout *shorter* than 16s disables the connect timeout entirely, which
+/// cannot be what was meant. This port takes the smaller of the two instead: a
+/// configured timeout may tighten the connect budget, never remove it.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16);
+
+/// The connect timeout in force, which a configured request timeout may lower.
+static CONNECT_BUDGET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(CONNECT_TIMEOUT.as_millis() as u64);
+
+/// Narrow the connect budget to `timeout_ms` when that is the stricter of the
+/// two. Call before serving.
+pub fn set_request_timeout(timeout_ms: u64) {
+    let budget = CONNECT_TIMEOUT.as_millis() as u64;
+    CONNECT_BUDGET.store(budget.min(timeout_ms.max(1)), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Await a connection attempt, giving up after [`CONNECT_TIMEOUT`].
+async fn connect_within<F, T>(connect: F) -> Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    let budget =
+        std::time::Duration::from_millis(CONNECT_BUDGET.load(std::sync::atomic::Ordering::Relaxed));
+    match tokio::time::timeout(budget, connect).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(anyhow!("timed out after {}s", budget.as_secs_f32())),
+    }
+}
+
 /// Establish a stream to the origin (through a proxy if configured), TLS-wrapping
 /// it when the origin speaks TLS.
 ///
@@ -774,7 +816,7 @@ async fn origin_stream(target: &Target, hop: &Hop) -> Result<(BoxedIo, Option<So
     let (dst_host, dst_port) = target.hop_addr();
     let (base, peer): (BoxedIo, Option<SocketAddr>) = match &target.proxy {
         None => {
-            let tcp = TcpStream::connect((dst_host, dst_port))
+            let tcp = connect_within(TcpStream::connect((dst_host, dst_port)))
                 .await
                 .with_context(|| format!("connecting to {dst_host}:{dst_port}"))?;
             tcp.set_nodelay(true).ok();
@@ -782,7 +824,7 @@ async fn origin_stream(target: &Target, hop: &Hop) -> Result<(BoxedIo, Option<So
             (BoxedIo(Box::new(tcp)), peer)
         }
         Some(proxy) => {
-            let ptcp = TcpStream::connect((proxy.host.as_str(), proxy.port))
+            let ptcp = connect_within(TcpStream::connect((proxy.host.as_str(), proxy.port)))
                 .await
                 .with_context(|| format!("connecting to proxy {}:{}", proxy.host, proxy.port))?;
             ptcp.set_nodelay(true).ok();
@@ -1213,6 +1255,60 @@ pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
         tunnel: false,
         fallback_direct: false,
     })
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// A connection attempt that never resolves has to be given up on, or the
+    /// request waits out the operating system's TCP timeout — over a minute on
+    /// macOS, longer on Linux — with its buffers held the whole time. That is
+    /// what a packet-dropping destination looks like from here.
+    ///
+    /// The attempt is a future that never completes rather than a real socket to
+    /// a black-holed address: the reserved ranges one would reach for
+    /// (TEST-NET-1 and friends) are answered by the fake-IP mode of every
+    /// desktop VPN client, this machine's included, and a test that passes only
+    /// on an unmanaged network is not a test. What is being pinned here is ours
+    /// — that we stop waiting — and tokio owns the rest.
+    #[test]
+    fn a_connection_that_never_completes_is_given_up_on() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        set_request_timeout(300);
+        let started = std::time::Instant::now();
+        let err = rt
+            .block_on(connect_within(std::future::pending::<
+                std::io::Result<TcpStream>,
+            >()))
+            .expect_err("a connection that never completes must not succeed");
+        let waited = started.elapsed();
+        // Restore the default so the ordering of tests cannot matter.
+        set_request_timeout(CONNECT_TIMEOUT.as_millis() as u64);
+
+        assert!(waited < std::time::Duration::from_secs(3), "waited {waited:?}");
+        assert!(waited >= std::time::Duration::from_millis(250), "gave up early: {waited:?}");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    /// A configured timeout may tighten the connect budget and never remove it —
+    /// upstream's own expression disables the timeout for any value under 16s,
+    /// which cannot have been the intent.
+    #[test]
+    fn a_short_timeout_tightens_rather_than_disables() {
+        let budget = || CONNECT_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        set_request_timeout(1_000);
+        assert_eq!(budget(), 1_000);
+        set_request_timeout(360_000);
+        assert_eq!(budget(), CONNECT_TIMEOUT.as_millis() as u64);
+        // Zero would mean "no budget at all", which is never what is wanted.
+        set_request_timeout(0);
+        assert_eq!(budget(), 1);
+        set_request_timeout(CONNECT_TIMEOUT.as_millis() as u64);
+    }
 }
 
 #[cfg(test)]

@@ -77,6 +77,16 @@ struct Cli {
     #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_DAYS)]
     persist_days: u32,
 
+    /// Request timeout in milliseconds (whistle's `-t`).
+    ///
+    /// Caps how long a connection to an origin or an upstream proxy may take to
+    /// establish — a destination that drops packets otherwise holds the request
+    /// for as long as the operating system's TCP timeout, which is over a
+    /// minute. It never cuts short a connection that *did* establish, so a slow
+    /// response or a long-lived stream is unaffected.
+    #[arg(short = 't', long, default_value_t = whistle_rs::config::DEFAULT_TIMEOUT_MS)]
+    timeout: u64,
+
     /// Verbose (debug) logging.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -136,6 +146,7 @@ async fn main() -> Result<()> {
         body_preview_cap: cli.body_preview_limit,
         persist_sessions: !cli.no_persist,
         persist_days: cli.persist_days,
+        timeout_ms: cli.timeout,
         ..Config::default()
     };
 
@@ -203,6 +214,7 @@ async fn main() -> Result<()> {
     }
     tracing::info!("plugins: {}", registry.names().join(", "));
 
+    whistle_rs::proxy::upstream::set_request_timeout(cli.timeout);
     whistle_rs::proxy::upstream::set_insecure_upstream(cli.insecure_upstream);
     if cli.insecure_upstream {
         tracing::warn!(
