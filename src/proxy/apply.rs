@@ -5098,6 +5098,16 @@ enum HeaderValues {
 }
 
 impl HeaderValues {
+    /// Add another value under the same name, promoting a single one to a list.
+    fn push(&mut self, value: String) {
+        match self {
+            HeaderValues::One(first) => {
+                *self = HeaderValues::Many(vec![std::mem::take(first), value]);
+            }
+            HeaderValues::Many(all) => all.push(value),
+        }
+    }
+
     fn iter(&self) -> std::slice::Iter<'_, String> {
         match self {
             HeaderValues::One(s) => std::slice::from_ref(s).iter(),
@@ -5143,16 +5153,27 @@ fn parse_header_pairs(value: &str) -> Vec<(String, HeaderValues)> {
             .collect();
     }
     if value.contains('=') {
-        return value
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .map(|(name, val)| {
-                (
-                    name.trim().to_string(),
-                    HeaderValues::One(val.trim().to_string()),
-                )
-            })
-            .collect();
+        // A name repeated in one value is a *list*, not a contest: Node's
+        // `querystring.parse("a=1&a=2")` yields `{a: ["1","2"]}`, whistle
+        // assigns that array onto the header map, and Node writes one header
+        // line per element. Folding to the last value here sent one header
+        // where whistle sends two, which for `set-cookie` or `accept` is the
+        // difference between the rule working and half of it vanishing.
+        //
+        // Names are trimmed, deliberately unlike upstream: `qs.parse` leaves
+        // `x-t = v` with the name `"x-t "`, and a header name with a trailing
+        // space is not a valid token — hyper rejects it, so faithfully keeping
+        // the space would turn the operator into a silent no-op. Upstream's own
+        // `setHeader` throws on it.
+        let mut out: Vec<(String, HeaderValues)> = Vec::new();
+        for (name, val) in value.split('&').filter_map(|pair| pair.split_once('=')) {
+            let (name, val) = (name.trim().to_string(), val.trim().to_string());
+            match out.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, values)) => values.push(val),
+                None => out.push((name, HeaderValues::One(val))),
+            }
+        }
+        return out;
     }
     match value.split_once(':') {
         Some((name, val)) => vec![(
@@ -6402,6 +6423,38 @@ mod tests {
         // `rule://<name>` is the values-store include, not a destination, so it
         // does not compete.
         assert_eq!(winner("a.com rule://mocks\n", "http://a.com/"), None);
+    }
+
+    /// A header name repeated inside one operator value is a **list**, not a
+    /// contest. Node's `querystring.parse("a=1&a=2")` yields `{a: ["1","2"]}`
+    /// and writes one header line per element; folding to the last value sent
+    /// one header where whistle sends two.
+    #[test]
+    fn a_repeated_header_name_sends_every_value() {
+        let pairs = parse_header_pairs("x-a=1&x-b=2&x-a=3");
+        assert_eq!(pairs.len(), 2, "two distinct names");
+        let x_a = &pairs.iter().find(|(n, _)| n == "x-a").expect("x-a").1;
+        assert_eq!(x_a.iter().cloned().collect::<Vec<_>>(), ["1", "3"]);
+
+        // …and it reaches the header map as two lines.
+        let mut mgr = RuleManager::new();
+        mgr.set_text("a.com resHeaders://x-a=1&x-a=2\n");
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        let resolved = mgr.resolve(&info);
+        let mut headers = HeaderMap::new();
+        apply_header_ops(&mut headers, &resolved, "resHeaders");
+        let sent: Vec<&str> = headers
+            .get_all("x-a")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(sent, ["1", "2"]);
+
+        // Names are still trimmed — deliberately unlike upstream, whose
+        // `qs.parse` would leave `"x-t "`, a name hyper rejects outright.
+        let pairs = parse_header_pairs("x-t = spaced");
+        assert_eq!(pairs[0].0, "x-t");
+        assert_eq!(pairs[0].1.iter().next().map(String::as_str), Some("spaced"));
     }
 
     #[test]
