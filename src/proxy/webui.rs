@@ -190,6 +190,12 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
                     "target": s.target,
                     "duration_ms": s.duration_ms,
                     "log": s.log,
+                    // The traffic columns. Body bytes only: the head is a
+                    // couple of hundred bytes that this port never counts on
+                    // the wire, and reporting a guess for it would be worse
+                    // than reporting the part it actually measured.
+                    "up": s.req_body.as_ref().map(|c| c.total()).unwrap_or(0),
+                    "down": s.res_body.as_ref().map(|c| c.total()).unwrap_or(0),
                     "has_req_body": s.req_body.as_ref().map(|c| c.total() > 0).unwrap_or(false),
                     "has_res_body": s.res_body.as_ref().map(|c| c.total() > 0).unwrap_or(false),
                 })
@@ -749,293 +755,23 @@ fn html_ok(html: String) -> Response<DynBody> {
         .unwrap()
 }
 
-/// The single-page UI (all CSS/JS inline; no external requests).
+/// The console, assembled from `ui/` at compile time.
+///
+/// The three assets are separate files so the CSS and JavaScript can be edited
+/// as CSS and JavaScript — with a formatter, with syntax highlighting, and
+/// without escaping every brace past a `format!`. They are stitched together
+/// here rather than served separately because the console must load with the
+/// network it is inspecting switched off, which rules out a second request.
 fn index_html(state: &Arc<AppState>) -> String {
-    let version = crate::config::VERSION;
     let host = state
         .config
         .host
         .map(|h| h.to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = state.config.port;
-    format!(
-        r##"<!doctype html><html data-theme="light"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>whistle-rs</title>
-<style>
-:root{{--bg:#fff;--fg:#222;--muted:#888;--line:#eee;--accent:#2d7ff9;--code:#f4f4f4}}
-@media(prefers-color-scheme:dark){{:root{{--bg:#1e1e1e;--fg:#e0e0e0;--muted:#999;--line:#333;--accent:#4c9ffe;--code:#2a2a2a}}}}
-*{{box-sizing:border-box}}
-body{{margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}}
-header{{display:flex;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line)}}
-header h1{{font-size:16px;margin:0}}
-header .sp{{flex:1}}
-header a{{color:var(--accent);text-decoration:none;font-size:13px}}
-nav{{display:flex;gap:4px;padding:8px 16px;border-bottom:1px solid var(--line)}}
-nav button{{background:none;border:1px solid var(--line);color:var(--fg);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:13px}}
-nav button.active{{background:var(--accent);color:#fff;border-color:var(--accent)}}
-main{{padding:12px 16px}}
-table{{width:100%;border-collapse:collapse;font-size:13px}}
-th,td{{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}}
-td.url{{white-space:normal;word-break:break-all}}
-.s2{{color:#2e9d4f}}.s3{{color:#3b8fd6}}.s4,.s5{{color:#e05a5a}}
-textarea{{width:100%;height:60vh;font-family:ui-monospace,Menlo,monospace;font-size:13px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:10px}}
-.bar{{display:flex;gap:10px;align-items:center;margin-bottom:8px}}
-.bar input#filter{{flex:1;max-width:360px;background:var(--code);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;font-size:13px}}
-.bar button{{background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer}}
-.hint{{color:var(--muted);font-size:12px}}
-.hidden{{display:none}}
-tr.row{{cursor:pointer}}
-tr.row:hover td{{background:var(--code)}}
-.wsbadge{{font-size:10px;background:var(--accent);color:#fff;border-radius:3px;padding:0 4px;margin-left:4px}}
-.wsbadge.b{{background:var(--muted)}}
-.detail{{padding:4px 2px}}
-.grp{{margin:8px 0}}
-.grpt{{font-size:12px;font-weight:600;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.03em}}
-.hz{{display:flex;gap:8px;font-family:ui-monospace,Menlo,monospace;font-size:12px;padding:1px 0;word-break:break-all}}
-.hk{{color:var(--accent);flex:0 0 30%;max-width:260px}}
-.hv{{flex:1;white-space:pre-wrap}}
-pre.body{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:32vh;overflow:auto;background:var(--code);border-radius:6px;padding:8px;margin:0;white-space:pre-wrap;word-break:break-all}}
-.frames{{font-family:ui-monospace,Menlo,monospace;font-size:12px;max-height:40vh;overflow:auto;background:var(--code);border-radius:6px;padding:6px}}
-.frm{{display:flex;gap:8px;padding:2px 4px;border-bottom:1px solid var(--line);white-space:nowrap}}
-.frm .arw{{width:56px}}
-.frm.send .arw{{color:#3b8fd6}}
-.frm.receive .arw{{color:#2e9d4f}}
-.frm .op{{width:80px;color:var(--muted)}}
-.frm .len{{width:64px;color:var(--muted);text-align:right}}
-.frm .pv{{flex:1;white-space:pre;overflow:hidden;text-overflow:ellipsis}}
-.rbtn{{background:none;border:1px solid var(--line);color:var(--muted);padding:1px 6px;border-radius:4px;cursor:pointer;font-size:12px;line-height:1}}
-.rbtn:hover{{color:var(--accent);border-color:var(--accent)}}
-.grp{{display:flex;align-items:center;gap:8px;padding:4px 8px;border-bottom:1px solid var(--line)}}
-.grp label{{flex:1;cursor:pointer}}
-.grp-off label{{opacity:.5;text-decoration:line-through}}
-</style></head><body>
-<header>
-  <h1>whistle-rs</h1><span class="hint">v{version} · proxy {host}:{port}</span>
-  <span class="sp"></span>
-  <a href="/rootCA.crt">rootCA.crt</a>
-  <a href="/proxy.pac">proxy.pac</a>
-  <a href="/sessions.har" download>HAR</a>
-</header>
-<nav>
-  <button id="tab-net" class="active" onclick="show('net')">Network</button>
-  <button id="tab-rules" onclick="show('rules')">Rules</button>
-  <button id="tab-values" onclick="show('values')">Values</button>
-</nav>
-<main>
-  <section id="net">
-    <div class="bar">
-      <button onclick="loadNet()">Refresh</button>
-      <button onclick="clearSessions()">Clear</button>
-      <input id="filter" placeholder="filter: url / method / status" oninput="loadNet()">
-      <label class="hint"><input type="checkbox" id="auto" checked> auto-refresh</label>
-      <span class="hint" id="netcount"></span>
-    </div>
-    <table><thead><tr><th>#</th><th>Method</th><th>Status</th><th>URL</th><th>Target</th><th>ms</th><th></th></tr></thead>
-    <tbody id="rows"></tbody></table>
-  </section>
-  <section id="rules" class="hidden">
-    <div class="bar">
-      <button onclick="saveRules()">Save</button>
-      <span class="hint" id="rulestatus"></span>
-    </div>
-    <textarea id="editor" spellcheck="false" placeholder="pattern operator1 operator2 ..."></textarea>
-    <p class="hint">Default group — one rule per line. See the docs for the full syntax.</p>
-    <div class="bar" style="margin-top:8px">
-      <b>Rule Groups</b>
-      <button onclick="addGroup()">+ Add Group</button>
-      <span class="hint" id="grpstatus"></span>
-    </div>
-    <div id="grplist"></div>
-  </section>
-  <section id="values" class="hidden">
-    <div class="bar">
-      <button onclick="saveValues()">Save</button>
-      <span class="hint" id="valstatus"></span>
-    </div>
-    <textarea id="valeditor" spellcheck="false" placeholder='{{"name":"content"}}'></textarea>
-    <p class="hint">A JSON object of named values. Reference them with <code>{{name}}</code> in rules.</p>
-  </section>
-</main>
-<script>
-var esc=function(s){{return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}};
-function show(t){{
-  ['net','rules','values'].forEach(function(x){{
-    document.getElementById(x).classList.toggle('hidden',x!==t);
-    document.getElementById('tab-'+x).classList.toggle('active',x===t);
-  }});
-  if(t==='rules') loadRules();
-  if(t==='values') loadValues();
-}}
-var open={{}}, wsRows={{}};
-function loadNet(){{
-  fetch('/sessions.json').then(function(r){{return r.json()}}).then(function(all){{
-    var q=(document.getElementById('filter').value||'').toLowerCase().trim();
-    var list=q?all.filter(function(s){{
-      return (s.url||'').toLowerCase().indexOf(q)>=0
-        || (s.method||'').toLowerCase().indexOf(q)>=0
-        || String(s.status).indexOf(q)>=0
-        || (s.target||'').toLowerCase().indexOf(q)>=0;
-    }}):all;
-    document.getElementById('netcount').textContent=q?(list.length+' / '+all.length+' shown'):(all.length+' captured');
-    document.getElementById('rows').innerHTML=list.map(function(s){{
-      var cls='s'+Math.floor(s.status/100);
-      var ws=s.status===101;
-      wsRows[s.id]=ws;
-      var tag=ws?'<span class="wsbadge">WS</span>':(s.has_res_body?'<span class="wsbadge b">body</span>':'');
-      var row='<tr class="row" onclick="toggle('+s.id+')"><td>'+s.id+
-        '</td><td>'+esc(s.method)+'</td><td class="'+cls+'">'+s.status+
-        tag+'</td><td class="url">'+esc(s.url)+
-        '</td><td>'+esc(s.target)+'</td><td>'+s.duration_ms+'</td><td><button class="rbtn" onclick="replayReq('+s.id+',event)" title="Replay">↻</button></td></tr>';
-      row+='<tr class="det hidden" id="det'+s.id+'"><td colspan="7">'+
-        '<div class="detail" id="dt'+s.id+'">click the row to load…</div></td></tr>';
-      return row;
-    }}).join('');
-    Object.keys(open).forEach(render);
-  }});
-}}
-function toggle(id){{
-  if(open[id]) delete open[id]; else open[id]=true;
-  render(id);
-}}
-function render(id){{
-  var det=document.getElementById('det'+id);
-  if(!det) return;
-  var isOpen=!!open[id];
-  det.classList.toggle('hidden',!isOpen);
-  if(isOpen){{ if(wsRows[id]) loadFrames(id); else loadDetail(id); }}
-}}
-function headerTable(title,pairs){{
-  if(!pairs||!pairs.length) return '';
-  var rows=pairs.map(function(p){{return '<div class="hz"><span class="hk">'+esc(p[0])+'</span>'+
-    '<span class="hv">'+esc(p[1])+'</span></div>';}}).join('');
-  return '<div class="grp"><div class="grpt">'+title+'</div>'+rows+'</div>';
-}}
-function bodyBlock(title,b){{
-  if(!b||!b.len) return '';
-  var note=b.truncated?' <span class="hint">('+b.len+' bytes, truncated)</span>':' <span class="hint">('+b.len+' bytes)</span>';
-  return '<div class="grp"><div class="grpt">'+title+note+'</div><pre class="body">'+esc(b.text)+'</pre></div>';
-}}
-function loadDetail(id){{
-  fetch('/session.json?id='+id).then(function(r){{return r.json()}}).then(function(s){{
-    var box=document.getElementById('dt'+id);
-    if(!box) return;
-    if(!s){{box.textContent='(no detail)';return;}}
-    box.innerHTML=headerTable('Request headers',s.req_headers)+bodyBlock('Request body',s.req_body)+
-      headerTable('Response headers',s.res_headers)+bodyBlock('Response body',s.res_body)||'(no captured detail)';
-  }});
-}}
-function loadFrames(id){{
-  fetch('/frames.json?id='+id).then(function(r){{return r.json()}}).then(function(list){{
-    var box=document.getElementById('dt'+id);
-    if(!box) return;
-    if(!list.length){{box.textContent='no frames captured yet';return;}}
-    box.innerHTML='<div class="frames">'+list.slice().reverse().map(function(f){{
-      var arrow=f.dir==='send'?'▲ send':'▼ recv';
-      return '<div class="frm '+f.dir+'"><span class="arw">'+arrow+'</span><span class="op">'+
-        esc(f.opcode)+'</span><span class="len">'+f.len+'B</span><span class="pv">'+esc(f.preview)+'</span></div>';
-    }}).join('')+'</div>';
-  }});
-}}
-function loadRules(){{
-  fetch('/api/rules').then(function(r){{return r.text()}}).then(function(t){{
-    document.getElementById('editor').value=t;
-  }});
-  loadGroups();
-}}
-function saveRules(){{
-  var txt=document.getElementById('editor').value;
-  fetch('/api/rules',{{method:'POST',body:txt}}).then(function(r){{return r.json()}}).then(function(j){{
-    document.getElementById('rulestatus').textContent='Saved · '+j.rules+' rules active';
-  }}).catch(function(){{document.getElementById('rulestatus').textContent='Save failed'}});
-}}
-function loadGroups(){{
-  fetch('/api/rule-groups').then(function(r){{return r.json()}}).then(function(groups){{
-    var el=document.getElementById('grplist');
-    if(!groups.length){{el.innerHTML='<p class="hint">No custom groups.</p>';return;}}
-    el.innerHTML=groups.filter(function(g){{return g.name!=='default'}}).map(function(g){{
-      var cls=g.enabled?'grp':'grp grp-off';
-      return '<div class="'+cls+'" data-name="'+esc(g.name)+'">'+
-        '<label><input type="checkbox" '+(g.enabled?'checked':'')+' onchange="toggleGroup(\''+esc(g.name)+'\')">'+ esc(g.name)+'</label>'+
-        '<span class="hint">'+g.rules+' rules</span>'+
-        '<button class="rbtn" onclick="editGroup(\''+esc(g.name)+'\')">edit</button>'+
-        '<button class="rbtn" onclick="deleteGroup(\''+esc(g.name)+'\')">×</button>'+
-        '</div>';
-    }}).join('');
-  }});
-}}
-function addGroup(){{
-  var name=prompt('Group name:');
-  if(!name||!name.trim()) return;
-  fetch('/api/rule-groups',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:name.trim(),text:'',enabled:true}})}}).then(function(r){{return r.json()}}).then(function(j){{
-    if(j.ok) loadGroups(); else alert(j.error||'Failed');
-  }});
-}}
-function toggleGroup(name){{
-  fetch('/api/rule-group/toggle',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:name}})}}).then(function(r){{return r.json()}}).then(function(j){{
-    document.getElementById('grpstatus').textContent=name+(j.enabled?' enabled':' disabled');
-    loadGroups();
-  }});
-}}
-function editGroup(name){{
-  var el=document.querySelector('[data-name="'+name+'"]');
-  if(!el) return;
-  if(el.querySelector('textarea')) return; // already editing
-  fetch('/api/rule-group?name='+encodeURIComponent(name)).then(function(r){{return r.json()}}).then(function(g){{
-    if(!g.name) return;
-    var ta=document.createElement('textarea');
-    ta.style.cssText='width:100%;height:120px;margin-top:4px;font-family:monospace;font-size:12px';
-    ta.placeholder='rules for '+name;
-    ta.value=g.text||'';
-    var btn=document.createElement('button');
-    btn.textContent='Save Group';
-    btn.onclick=function(){{
-      fetch('/api/rule-group/update',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:name,text:ta.value}})}}).then(function(r){{return r.json()}}).then(function(j){{
-        if(j.ok){{document.getElementById('grpstatus').textContent=name+' saved';loadGroups();}}
-        else alert(j.error||'Failed');
-      }});
-    }};
-    el.appendChild(ta);
-    el.appendChild(btn);
-  }});
-}}
-function deleteGroup(name){{
-  if(!confirm('Delete group "'+name+'"?')) return;
-  fetch('/api/rule-group',{{method:'DELETE',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name:name}})}}).then(function(r){{return r.json()}}).then(function(j){{
-    if(j.ok) loadGroups(); else alert(j.error||'Failed');
-  }});
-}}
-function loadValues(){{
-  fetch('/api/values').then(function(r){{return r.json()}}).then(function(v){{
-    document.getElementById('valeditor').value=JSON.stringify(v,null,2);
-  }});
-}}
-function saveValues(){{
-  var txt=document.getElementById('valeditor').value;
-  try{{JSON.parse(txt);}}catch(e){{document.getElementById('valstatus').textContent='Invalid JSON';return;}}
-  fetch('/api/values',{{method:'POST',body:txt}}).then(function(r){{return r.json()}}).then(function(){{
-    document.getElementById('valstatus').textContent='Saved';
-  }}).catch(function(){{document.getElementById('valstatus').textContent='Save failed'}});
-}}
-function replayReq(id,e){{
-  e.stopPropagation();
-  fetch('/api/replay',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{id:id}})}}).then(function(r){{return r.json()}}).then(function(j){{
-    if(j.replayed) setTimeout(loadNet,500);
-  }}).catch(function(){{}});
-}}
-function clearSessions(){{
-  if(!confirm('Clear all captured sessions?')) return;
-  fetch('/api/sessions/clear',{{method:'POST'}}).then(function(r){{return r.json()}}).then(function(){{
-    loadNet();
-    document.getElementById('netcount').textContent='cleared';
-  }});
-}}
-loadNet();
-setInterval(function(){{if(document.getElementById('auto').checked && !document.getElementById('net').classList.contains('hidden')) loadNet();}},2000);
-</script>
-</body></html>"##,
-        version = version,
-        host = host,
-        port = port,
-    )
+    include_str!("ui/index.html")
+        .replace("/*__CSS__*/", include_str!("ui/app.css"))
+        .replace("/*__JS__*/", include_str!("ui/app.js"))
+        .replace("__VERSION__", crate::config::VERSION)
+        .replace("__HOST__", &host)
+        .replace("__PORT__", &state.config.port.to_string())
 }
