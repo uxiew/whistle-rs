@@ -1034,13 +1034,13 @@ the request on its way out, or from the response on its way back:
 | `referer` / `referrer` | `Referer` (both spellings, since the misspelling matches the header) |
 | `ajax` | `X-Requested-With` |
 | `cache` | `If-None-Match`, `If-Modified-Since`, `ETag`, `Last-Modified`, and sets `Pragma`/`Cache-Control: no-cache` |
+| `keepAlive` / `keepalive` | sets `Connection: close`, so the hop to the origin is not pooled |
 
 | Flag | Changes in the response |
 |------|-------------------------|
 | `cookie` / `cookies` / `resCookie` / `resCookies` | drops `Set-Cookie` |
 | `cache` | `Cache-Control: no-cache` plus a past `Expires` and `Pragma` |
 | `csp` | drops the `Content-Security-Policy` headers |
-| `keepAlive` / `keepalive` | `Connection: close` |
 | `doctype` | no `<!DOCTYPE html>` before an HTML prepend |
 
 A flag this port does not recognise is **inert** — it parses and does nothing,

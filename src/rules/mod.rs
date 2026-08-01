@@ -1266,7 +1266,15 @@ pub fn is_filter_spelling(tok: &str) -> bool {
 /// the multi-line `line`…`` block relies on. Returning a single rule silently
 /// dropped every pattern after the first.
 fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
-    let Some((pattern_toks, op_toks)) = split_line(tokens) else {
+    // Shorthands are expanded **before** the line is split, because expanding
+    // one changes what the token *is*: `/srv/mock.json` is a bare path until it
+    // becomes `file:///srv/mock.json`, and only then does the splitter know it
+    // is an operator rather than the line's pattern. Upstream is explicit about
+    // the order — `line.map(formatShorthand)` then `indexOfPattern(line)`
+    // (`_original/lib/rules/rules.js:1766-1767`).
+    let expanded: Vec<String> = tokens.iter().map(|t| format_shorthand(t)).collect();
+    let tokens: Vec<&str> = expanded.iter().map(String::as_str).collect();
+    let Some((pattern_toks, op_toks)) = split_line(&tokens) else {
         return Vec::new();
     };
 
@@ -1626,6 +1634,80 @@ fn parse_probability(key: &str) -> f64 {
     parsed.unwrap_or(f64::NAN)
 }
 
+/// Expand a token's shorthand into the operator it stands for — `formatShorthand`
+/// (`_original/lib/rules/rules.js:219-260`).
+///
+/// whistle lets several kinds of operator be written without their protocol, and
+/// normalises them all before it decides which token on the line is the pattern.
+/// Running this first is the whole point: until `/srv/mock.json` has become
+/// `file:///srv/mock.json` it has no protocol, and a token with no protocol is
+/// what [`index_of_pattern`] takes for the line's pattern. So an operator-first
+/// line naming a mock — `/srv/mock.json  www.example.com  api.example.com` —
+/// used to classify the *path* as the pattern and both domains as destinations.
+///
+/// Returns an owned string because most tokens are unchanged and a `Cow` would
+/// buy one allocation per line at parse time, which is not on any hot path.
+fn format_shorthand(tok: &str) -> String {
+    // `//host/path` is scheme-relative — a pattern, and left alone.
+    if tok.starts_with("//") && !tok.starts_with("///") {
+        return tok.to_string();
+    }
+    // Two filter spellings whistle rewrites into line properties.
+    match tok {
+        "includeFilter://safeHtml" => return "lineProps://safeHtml".to_string(),
+        "includeFilter://strictHtml" => return "lineProps://strictHtml".to_string(),
+        _ => {}
+    }
+    // `{key}`, `<path>`, `(value)` and the empty object all name file content.
+    if tok == "{}" || is_wrapped(tok, '{', '}') || is_wrapped(tok, '<', '>') || is_wrapped(tok, '(', ')')
+    {
+        return format!("file://{tok}");
+    }
+    // A filesystem path: `/x`, `C:\x`, `C:/x` — but not a `/regexp/`.
+    if (tok == "/" || is_file_path(tok)) && !is_regexp_token(tok) {
+        return format!("file://{tok}");
+    }
+    // Chrome pastes a Windows path as `file:///C:/…`; whistle keeps the drive.
+    if let Some(rest) = tok.strip_prefix("file:///")
+        && rest.len() > 2
+        && rest.as_bytes()[0].is_ascii_uppercase()
+        && rest[1..].starts_with(":/")
+    {
+        return format!("file://{rest}");
+    }
+    // `@name` includes another rules source; whistle files it under `G`.
+    if let Some(rest) = tok.strip_prefix('@') {
+        let body = match tok.contains("@://") {
+            true => rest.to_string(),
+            false => format!("://{rest}"),
+        };
+        return format!("G{body}");
+    }
+    tok.to_string()
+}
+
+/// `FILE_RE` (`_original/lib/rules/rules.js:36`) — `/^(?:[a-z]:(?:\\|\/[^/])|\/[^/])/i`:
+/// a drive letter followed by a separator, or a single leading slash.
+fn is_file_path(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    if let Some(rest) = tok.strip_prefix('/') {
+        return !rest.starts_with('/');
+    }
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return match bytes[2] {
+            b'\\' => true,
+            b'/' => bytes.get(3).is_some_and(|c| *c != b'/'),
+            _ => false,
+        };
+    }
+    false
+}
+
+/// Is `tok` wrapped in this pair of brackets, with something between them?
+fn is_wrapped(tok: &str, open: char, close: char) -> bool {
+    tok.len() > 1 && tok.starts_with(open) && tok.ends_with(close)
+}
+
 /// Does this token *look like* a pattern on its own — whistle's `isPattern`
 /// (`_original/lib/rules/rules.js:1403-1412`)?
 ///
@@ -1659,9 +1741,23 @@ fn web_protocol(tok: &str) -> Option<&str> {
     matches!(proto, "http" | "https" | "ws" | "wss" | "tunnel").then_some(proto)
 }
 
-/// A `/body/flags` regexp token (`util.isRegExp`).
+/// A `/body/flags` regexp token — `isRegExp`
+/// (`REG_EXP_RE = /^\/(.+)\/(i?u?|ui)$/`, `_original/lib/util/index.js:603-607`).
+///
+/// The flag set is closed, and that matters: this test used to accept anything
+/// with a second slash, so a **file path** like `/Users/me/mock.json` read as a
+/// regexp. Combined with [`format_shorthand`] not existing, an operator-first
+/// line naming a mock file compiled the path into an unanchored pattern and
+/// promoted the line's real patterns to destinations.
 fn is_regexp_token(tok: &str) -> bool {
-    tok.starts_with('/') && tok.len() > 1 && tok.rfind('/').is_some_and(|end| end > 0)
+    let Some(rest) = tok.strip_prefix('/') else {
+        return false;
+    };
+    let Some(end) = rest.rfind('/') else {
+        return false;
+    };
+    // `(.+)` — the body may not be empty.
+    end > 0 && matches!(&rest[end + 1..], "" | "i" | "u" | "iu" | "ui")
 }
 
 /// whistle's `hasProtocol` — `/^[a-zA-Z0-9.-]+:\/\//`
@@ -2895,6 +2991,70 @@ mod parse_text_tests {
         assert_eq!(parse_ip_shorthand("1.2.3.4:8080"), Some(("1.2.3.4".into(), Some(8080))));
         assert_eq!(parse_ip_shorthand("::ffff:1.2.3.4"), Some(("1.2.3.4".into(), None)));
         assert_eq!(parse_ip_shorthand("[::1]:9"), Some(("::1".into(), Some(9))));
+    }
+
+    /// Every shorthand whistle expands before it decides which token on a line
+    /// is the pattern. The expected column is upstream's own `formatShorthand`,
+    /// run over the same inputs — not restated from its source.
+    #[test]
+    fn shorthands_expand_the_way_upstream_expands_them() {
+        for (input, want) in [
+            ("/srv/mock.json", "file:///srv/mock.json"),
+            ("/", "file:///"),
+            ("C:\\mock\\a.json", "file://C:\\mock\\a.json"),
+            ("C:/mock/a.json", "file://C:/mock/a.json"),
+            ("(hello)", "file://(hello)"),
+            ("<//dev.internal/fixed>", "file://<//dev.internal/fixed>"),
+            ("{myMock}", "file://{myMock}"),
+            ("{}", "file://{}"),
+            // A scheme-relative pattern is left alone…
+            ("//a.com/x", "//a.com/x"),
+            // …and so is a real regexp, whose flag set is closed — which is how
+            // a path is told apart from one.
+            ("/re/", "/re/"),
+            ("/re/i", "/re/i"),
+            ("/re/gm", "file:///re/gm"),
+            ("/Users/me/mock.json", "file:///Users/me/mock.json"),
+            // Chrome's paste of a Windows path keeps the drive letter.
+            ("file:///C:/x/y.json", "file://C:/x/y.json"),
+            ("@https://x/rules.txt", "G://https://x/rules.txt"),
+            ("@name", "G://name"),
+            ("includeFilter://safeHtml", "lineProps://safeHtml"),
+            // Untouched.
+            ("example.com", "example.com"),
+            ("http://a.com", "http://a.com"),
+            ("host://1.2.3.4", "host://1.2.3.4"),
+            ("~/mock.json", "~/mock.json"),
+        ] {
+            assert_eq!(format_shorthand(input), want, "{input}");
+        }
+    }
+
+    /// The failure the expansion above exists to prevent: an operator-first line
+    /// naming a mock file. Until the path becomes `file://…` it has no protocol,
+    /// so the splitter took *it* for the pattern and promoted both domains to
+    /// destinations — and the path, accepted as a regexp by a too-lax test,
+    /// compiled to the unanchored pattern `Users/me`.
+    #[test]
+    fn an_operator_first_line_naming_a_file_is_read_correctly() {
+        let rules = parse_text("/Users/me/mock.json  www.example.com  api.example.com");
+        assert_eq!(rules.len(), 2, "one rule per pattern");
+        for rule in &rules {
+            let op = rule.ops.iter().find(|op| op.protocol == "file").expect("a file operator");
+            assert_eq!(op.value, "/Users/me/mock.json");
+        }
+        let file_for = |text: &str, url: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            mgr.resolve(&req(url)).value("file").map(str::to_string)
+        };
+        const LINE: &str = "/Users/me/mock.json www.example.com";
+        assert_eq!(
+            file_for(LINE, "http://www.example.com/x").as_deref(),
+            Some("/Users/me/mock.json/x")
+        );
+        // And it no longer matches an unrelated host that merely contains the path.
+        assert_eq!(file_for(LINE, "http://cdn.test/Users/me/pic.png"), None);
     }
 
     /// `whistle.<name>://` and `plugin.<name>://` name a plugin. It is how every

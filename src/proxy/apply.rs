@@ -1846,7 +1846,7 @@ pub fn apply_response_for(
 
 /// `disable://` flags with response-header effects (`disableResProps`,
 /// `_original/lib/util/index.js:3011-3027`), applied last so nothing can undo
-/// them. `keepAlive` is whistle-rs's own addition.
+/// them.
 fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
     let dis = disabled_flags(resolved);
     if ["cookie", "cookies", "resCookie", "resCookies"]
@@ -1863,9 +1863,6 @@ fn disable_res_props(headers: &mut HeaderMap, resolved: &Resolved) {
     }
     if dis.contains("csp") {
         disable_csp(headers);
-    }
-    if dis.contains("keepAlive") || dis.contains("keepalive") {
-        set_header(headers, "connection", "close");
     }
 }
 
@@ -2023,6 +2020,17 @@ fn disable_req_props(headers: &mut HeaderMap, resolved: &Resolved) {
     }
     if off("cache") {
         disable_req_cache(headers);
+    }
+    // `Connection: close` goes on the request that leaves here, not on the
+    // answer that goes back to the client: upstream writes it into the outgoing
+    // `options.headers` (`_original/lib/inspectors/res.js:447-449`) so the hop
+    // to the origin is not pooled. Putting it on the response instead tore down
+    // the *client's* connection and left the origin socket in the pool — the
+    // exact opposite of what the flag asks for. Both spellings, because
+    // upstream folds `keepalive` into `keepAlive` before reading it
+    // (`res.js:268-270`).
+    if off("keepAlive") || off("keepalive") {
+        set_header(headers, "connection", "close");
     }
 }
 
@@ -7675,6 +7683,42 @@ mod tests {
         );
         // A flag nobody set leaves everything alone.
         assert_eq!(sent("host://1.1.1.1", "cookie"), Some("sid=secret".to_string()));
+    }
+
+    /// `disable://keepAlive` closes the hop to the **origin**, not the client's
+    /// connection (`_original/lib/inspectors/res.js:447-449`).
+    ///
+    /// The port had it backwards: it wrote `Connection: close` onto the response
+    /// and left the origin socket pooled, so the one connection the flag exists
+    /// to un-pool stayed up and the browser's was torn down instead — a rule
+    /// that made every page slower while doing nothing it promised.
+    #[test]
+    fn disable_keep_alive_closes_the_origin_hop() {
+        for spelling in ["keepAlive", "keepalive"] {
+            let resolved = resolve(
+                &format!("example.com disable://{spelling}\n"),
+                "http://example.com/",
+            );
+            let mut parts = req_parts(&[]);
+            apply_request(&mut parts, &resolved);
+            assert_eq!(
+                parts.headers.get("connection").map(|v| v.to_str().unwrap()),
+                Some("close"),
+                "{spelling} must close the outgoing request"
+            );
+            // …and the answer to the client is left alone.
+            let mut res = res_parts(&[]);
+            apply_response(&mut res, &resolved);
+            assert!(
+                res.headers.get("connection").is_none(),
+                "{spelling} must not touch the response"
+            );
+        }
+        // Nothing set: the request keeps whatever framing it arrived with.
+        let none = resolve("example.com host://1.1.1.1\n", "http://example.com/");
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &none);
+        assert!(parts.headers.get("connection").is_none());
     }
 
     /// `disable://cache` strips the conditional headers *and* asks for no cache
