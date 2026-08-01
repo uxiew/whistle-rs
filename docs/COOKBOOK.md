@@ -1,0 +1,831 @@
+# Cookbook
+
+[English README](../README.md) · [简体中文 README](../README.zh-CN.md) · [中文版本](COOKBOOK.zh-CN.md) · [规则参考 / Rules reference](RULES.md)
+
+Task-oriented recipes. Each one is a problem you actually have, the rules that
+solve it, and the reason it is written that way. [`RULES.md`](RULES.md) is the
+reference for every operator; this file is the part you read first.
+
+Every recipe here was run against the proxy before it was written down.
+
+- [Before you start](#before-you-start)
+- [Serve a site from a local dev server](#serve-a-site-from-a-local-dev-server)
+- [Mock an API endpoint](#mock-an-api-endpoint)
+- [Change a request or a response in flight](#change-a-request-or-a-response-in-flight)
+- [Simulate a bad network](#simulate-a-bad-network)
+- [Scope a rule precisely](#scope-a-rule-precisely)
+- [Debug a phone or another device](#debug-a-phone-or-another-device)
+- [Capture, export and replay](#capture-export-and-replay)
+- [Embed the proxy in your own program](#embed-the-proxy-in-your-own-program)
+- [When a rule does not fire](#when-a-rule-does-not-fire)
+
+---
+
+## Before you start
+
+```bash
+cargo build --release
+./target/release/whistle-rs -p 8899 -r rules.txt
+```
+
+Two different things are listening on that one port, and confusing them is the
+most common early mistake:
+
+| You want | You do |
+|----------|--------|
+| to send traffic **through** the proxy | `curl -x http://127.0.0.1:8899 http://example.com/` |
+| to talk **to** the proxy — console, PAC, CA, JSON APIs | `curl --noproxy '*' http://127.0.0.1:8899/api/status` |
+
+`--noproxy '*'` matters because a shell that has `http_proxy` set will otherwise
+send even `http://127.0.0.1:8899/` through whatever that variable names. The
+symptom is a `502` carrying a `Proxy-Connection` header.
+
+Open <http://127.0.0.1:8899/> in a browser for the console: a request table, a
+detail panel, and a rules editor that highlights **which token the proxy will
+match on**.
+
+While you are iterating, `--no-persist` keeps captured traffic out of
+`~/.whistle-rs`, and `--dir` puts the root CA and rule groups somewhere
+disposable:
+
+```bash
+./target/release/whistle-rs -p 8899 -r rules.txt --no-persist --dir /tmp/w
+```
+
+---
+
+## Serve a site from a local dev server
+
+The rule whistle exists for. One token, no operator:
+
+```
+www.example.com       http://localhost:5173
+```
+
+Now every request for `www.example.com` is answered by your Vite/webpack/whatever
+dev server, with the real hostname still in the address bar — so cookies,
+`localStorage`, CORS origins and OAuth redirect URIs all keep working, which is
+exactly what `localhost:5173` in the address bar breaks.
+
+### The path comes along, and that surprises people
+
+Whatever the pattern did not consume is appended to the destination:
+
+| rule | request | forwarded to |
+|------|---------|--------------|
+| `example.com http://localhost:5173` | `/a/b?q=1` | `http://localhost:5173/a/b?q=1` |
+| `example.com http://localhost:5173/base` | `/a/b?q=1` | `http://localhost:5173/base/a/b?q=1` |
+| `example.com/api http://dev.local/v2` | `/api/users?x=2` | `http://dev.local/v2/users?x=2` |
+
+Read the third row twice. The pattern's `/api` is **consumed**, not kept: the
+part of the path the pattern matched is replaced by the destination's path.
+`/api/users` becomes `/v2/users`, not `/v2/api/users`. If you wanted the prefix
+kept, put it on the destination (`http://dev.local/v2/api`).
+
+To stop the concatenation and always hit one exact URL, wrap the value in `< >`:
+
+```
+example.com/api    http://<dev.internal/fixed>
+```
+
+### `http://…` moves the Host header, `host://` does not
+
+Both point the request somewhere else. Only one of them is visible to the server
+that answers:
+
+| | socket | `Host:` header | path | scheme |
+|---|---|---|---|---|
+| `example.com http://localhost:5173` | moves | **becomes `localhost:5173`** | rewritten | moves |
+| `example.com host://127.0.0.1:5173` | moves | **stays `example.com`** | kept | kept |
+
+Use `host://` when the server on the other end routes by `Host` — a staging box
+behind nginx, a CDN origin, anything with virtual hosts. Use the bare URL when
+you are pointing at a dev server that does not care.
+
+```
+# hit the staging machine, but keep the hostname so its vhost matches
+www.example.com     host://10.0.0.9
+
+# same host, different port
+.example.com        host://:8443
+
+# use this address if something is listening, otherwise carry on to the real one
+www.example.com     xhost://10.0.0.9
+```
+
+A bare `127.0.0.1:5173` is shorthand for `host://127.0.0.1:5173` — but only
+because it is an **IP**. `localhost:5173` is a *name*, and a name is read as a
+forwarding destination, so it moves the `Host` header where the IP form does
+not. That asymmetry is upstream's (`net.isIP`), and it is easy to trip over.
+
+### A mock has to be written above the forward
+
+`file://`, `redirect://`, `statusCode://`, the template family and a bare
+destination URL all compete for **one slot**. The first line to fill it answers,
+and the rest do not apply — so this does *not* work:
+
+```
+example.com            http://localhost:5173
+example.com/api/flags  file://({"beta":true})     # never served
+```
+
+The forward is written first, so it wins for `/api/flags` too and the request
+goes to the dev server. Put the narrower rule above the broader one:
+
+```
+example.com/api/flags  file://({"beta":true})
+example.com            http://localhost:5173
+```
+
+…or mark it important, which puts it first whatever the line order:
+
+```
+example.com            http://localhost:5173
+$example.com/api/flags file://({"beta":true})
+```
+
+Operators that are *not* in that family — `resHeaders://`, `reqHeaders://`,
+`resDelay://`, filters — accumulate normally and do not need this treatment.
+
+---
+
+## Mock an API endpoint
+
+Three places a mock body can live. All three work; which one you want depends on
+whether the mock should travel with the rules.
+
+### In the rule itself
+
+Parentheses mean "this **is** the content", not "here is where to find it":
+
+```
+api.example.com/health   file://({"status":"ok"})   resType://json
+```
+
+Good for one-liners. There is no way to put a newline in it, and — see below —
+no way to put a **space** in it either.
+
+### In a fenced block in the same rules file
+
+A ` ``` ` block declares a named value that the rest of the file can reference.
+The rule and the JSON it serves stay in one file, which is what you want when
+the rules file is the artefact you share:
+
+````
+api.example.com/users    file://{users.json}
+
+``` users.json
+[
+  {"id": 1, "name": "Ada"},
+  {"id": 2, "name": "Grace"}
+]
+```
+````
+
+The opening fence is three or more backticks followed by **one** name and
+nothing else; the closing fence must be the same number of backticks. A block
+whose body contains a shorter fence survives if you open with a longer one.
+
+### In a file on disk
+
+```
+api.example.com/users    file:///Users/me/mock/users.json
+```
+
+This is the one that gets the `Content-Type` right for free: whistle-rs guesses
+it from the file extension. The other two have no filename to guess from and
+default to `text/html; charset=utf-8`, so add `resType://json` when the client
+is fussy — a `fetch().then(r => r.json())` will not care, but a strict client
+will.
+
+A directory works too, and the request path is appended to it:
+
+```
+static.example.com       file:///srv/static
+# /js/app.js  ->  /srv/static/js/app.js
+```
+
+### Statuses, and why `statusCode://` eats your body
+
+`statusCode://` answers with that status and an **empty body**, and it beats
+`file://` when both are on the same line:
+
+```
+api.example.com/gone     statusCode://410               # 410, no body
+api.example.com/created  file://({"id":7})  statusCode://201   # 201, NO body
+```
+
+To serve a body *with* a non-200 status, use `replaceStatus://`, which changes
+the status of a response rather than manufacturing one:
+
+```
+api.example.com/created  file://({"id":7})  replaceStatus://201  resType://json
+# -> 201 Created, {"id":7}
+```
+
+### A mock that reads the request
+
+`tpl://` renders `${…}` variables against the live request. There is no template
+*engine* — no loops, no conditionals; upstream never had one either — but the
+variable table is useful:
+
+````
+api.example.com/greet    tpl://{greet.json}  resType://json
+
+``` greet.json
+{"hello": "${query.name}", "ua": "${reqHeaders.user-agent}"}
+```
+````
+
+```
+$ curl -x http://127.0.0.1:8899 'http://api.example.com/greet?name=world'
+{"hello": "world", "ua": "curl/8.7.1"}
+```
+
+The full variable table, the `.replace(a,b)` modifier and the two render passes
+are in [`TEMPLATES.md`](TEMPLATES.md). One gate to know about: the file must
+contain at least one `{…}` **with no whitespace inside the braces**, or neither
+pass runs.
+
+### Rewrite the real response instead of replacing it
+
+When you want the origin's answer with one thing changed, keep the request going
+upstream and patch what comes back:
+
+```
+api.example.com/config   resMerge://{"env":"staging","featureX":true}
+```
+
+`resMerge://` deep-merges into the JSON body. `{"env":"production","flag":false,"n":1}`
+comes back as `{"env":"staging","featureX":true,"flag":false,"n":1}` — the keys
+you did not name are untouched. For non-JSON bodies, `resReplace://from=to`
+substitutes text.
+
+To replace the body outright while still letting the request reach the origin —
+so the headers, the status and the timing are the real ones — use `resBody://`:
+
+```
+api.example.com/config   resBody://({"env":"staging"})   resType://json
+api.example.com/config   resBody://{config.json}
+```
+
+The parenthesised form means "the value **is** this content", and it works on
+**every** operator, not only the body family: `reqBody://(Hello)` sends five
+bytes, brackets stripped.
+
+Two of `file://`'s three value forms carry over; the third does not.
+`resBody:///Users/me/mock.json` sends the **path** as the body — operator values
+are not loaded from a file or a URL here, so a mock that lives on disk has to be
+served by `file://` (which short-circuits the request) or pulled in as a value.
+
+Any response-body operator also stops the client's conditional request from
+being answered `304 Not Modified` with no body — otherwise the rewrite would
+vanish intermittently, depending on what the browser already had cached.
+
+---
+
+## Change a request or a response in flight
+
+### Headers
+
+```
+api.example.com    reqHeaders://x-token=abc&x-env=dev
+api.example.com    resHeaders://x-mitm=intercepted
+api.example.com    delete://reqHeaders.user-agent
+```
+
+Lines accumulate: several `reqHeaders://` lines all apply, and when two of them
+name the same header the **first** one wins.
+
+**A value cannot contain a space.** Rule lines are split on whitespace, so
+
+```
+api.example.com    reqHeaders://authorization=Bearer secret
+```
+
+sets `authorization: Bearer` and then reads `secret` as a second operator — a
+bare word, which is a *forwarding destination*, so your request is sent to a
+host called `secret`. Percent-encoding does not help; `%20` arrives literally.
+The fix is a named value, referenced with `${…}`:
+
+````
+api.example.com    reqHeaders://authorization=${bearer}
+
+``` bearer
+Bearer eyJhbGciOi...
+```
+````
+
+or from the command line:
+
+```bash
+whistle-rs --value 'bearer=Bearer eyJhbGciOi...' -r rules.txt
+```
+
+Note the two brace forms. `{name}` replaces the **whole** operator value
+(`file://{users.json}`); `${name}` substitutes **inside** one
+(`reqHeaders://authorization=${bearer}`). You want `${name}` for headers.
+
+To delete rather than set, use `delete://` — `reqHeaders://x-a=` sends an
+*empty* header, it does not remove one.
+
+### Cookies
+
+```
+api.example.com    reqCookies://sid=42
+api.example.com    resCookies://{"sid":{"value":"abc","path":"/","httpOnly":true,"maxAge":600}}
+api.example.com    delete://reqCookies.tracking
+```
+
+`reqCookies://` merges into whatever the client sent (`old=1` becomes
+`old=1; sid=42`). Cookie **attributes** need the JSON form — the `k=v` form has
+nowhere to put them, and a literal `; Path=/` would be split on the space and
+percent-encoded into the value. The JSON above emits:
+
+```
+set-cookie: sid=abc; Expires=…; Max-Age=600; HttpOnly; Path=/
+```
+
+`resHeaders://set-cookie=…` **merges** with the origin's cookies by name rather
+than replacing the header, so setting `sid` leaves the origin's `csrf` alone.
+
+### A field in a JSON body
+
+Response side, deep merge:
+
+```
+api.example.com/me    resMerge://{"role":"admin"}
+```
+
+Request side, into whatever body shape the request has:
+
+```
+api.example.com    params://uid=42          # merged into a JSON or form body
+api.example.com    urlParams://trace=1      # always the query string
+api.example.com    delete://reqBody.password
+```
+
+`params://` addresses the body **or** the query string, never both: a JSON,
+form-urlencoded or multipart body takes it, and anything else sends it to the
+query string. `urlParams://` is unconditional. See
+[`RULES.md#where-params-lands`](RULES.md#where-params-lands) for the table.
+
+### CORS
+
+For a browser talking to an API that does not allow your origin:
+
+```
+api.thirdparty.com   resCors://*
+```
+
+`resCors://enable` echoes the request's own `Origin` and adds
+`Access-Control-Allow-Credentials: true`, which is what you need when the call
+sends cookies.
+
+Preflights need a little more care. On an `OPTIONS` with `*` or `enable`,
+whistle-rs echoes the requested method back as **`Access-Control-Allow-Method`** —
+singular, which is not a real CORS header. That is upstream's typo, reproduced
+so the two implementations emit the same bytes; browsers ignore it. Name the
+methods yourself, on a second line:
+
+```
+api.thirdparty.com   resCors://*
+api.thirdparty.com   resCors://methods=GET,POST,PUT&headers=x-token&maxAge=600
+```
+
+Both lines fold into one set of headers. If the origin does not handle `OPTIONS`
+at all, answer the preflight locally instead of forwarding it:
+
+```
+api.thirdparty.com   resCors://*
+api.thirdparty.com   statusCode://204   includeFilter://m:OPTIONS
+```
+
+The filter keeps the short-circuit off your real `GET`s.
+
+### Method, URL and user-agent
+
+```
+api.example.com      method://POST
+api.example.com/api  urlReplace://v1=v2            # /api/v1/x -> /api/v2/x
+example.com          ua://Mozilla/5.0 (iPhone…)    # …but see the space rule above
+example.com          referer://https://example.com/
+```
+
+---
+
+## Simulate a bad network
+
+### Delay
+
+```
+slow.example.com     reqDelay://500      # wait before forwarding
+slow.example.com     resDelay://2000     # wait before answering
+```
+
+**Always milliseconds.** A unit suffix is parsed off and thrown away, not
+converted: `resDelay://500ms` is 500 ms as you would hope, but `resDelay://1s`
+is **1 millisecond**, because the number is read with `parseInt` semantics and
+the `s` is ignored. Write `resDelay://1000`.
+
+`reqDelay://` runs before every short-circuit, so it delays a `file://` mock too
+— which is the whole point of pairing them.
+
+### Throttle
+
+```
+slow.example.com     resSpeed://800      # ~100 kB/s down
+slow.example.com     reqSpeed://200      # ~25 kB/s up
+```
+
+**The unit is kilobits per second, not kilobytes.** `resSpeed://800` is
+800 kbit/s ≈ 100 kB/s; a 64 KiB response takes about 0.65 s. This port read the
+value as kilobytes until recently, which made every throttle 8.192× too fast —
+if you have rules written against the old behaviour, multiply them by 8.
+
+Rough dial:
+
+| you want | write |
+|----------|-------|
+| 2G-ish (~50 kbit/s) | `resSpeed://50` |
+| 3G-ish (~1.6 Mbit/s) | `resSpeed://1600` |
+| DSL (~8 Mbit/s) | `resSpeed://8000` |
+
+A speed cap buffers the body and re-emits it in paced chunks, so it forces a
+known-length response to chunked transfer.
+
+### Fail
+
+```
+flaky.example.com    enable://abort         # destroy the connection, no response
+api.example.com      statusCode://503       # a clean 503
+api.example.com      statusCode://500  includeFilter://chance:5%   # 5% of calls
+```
+
+`enable://abort` destroys the socket rather than answering — the client sees a
+connection reset (curl exit 52), which is the failure mode a timeout-handling
+code path actually needs to see. `statusCode://` is the polite version.
+
+`chance:` is sampled per request, so it is the tool for "does the retry logic
+work" rather than "is this endpoint down".
+
+### What throttling will not do
+
+A body operator and a streaming response do not mix: if a rule on an
+`text/event-stream` or chunked response touches the body (`resBody`,
+`resAppend`, `resReplace`, `resMerge`, the html/js/css families), whistle-rs
+buffers the **whole stream** before sending anything. Measured on a 600 ms SSE
+stream: 3 ms to first byte without a body operator, 621 ms with one. Delays and
+speed caps are fine; body rewriting is not. This is a known structural gap —
+[`ROADMAP.md`](ROADMAP.md) has the reason.
+
+---
+
+## Scope a rule precisely
+
+### Filters
+
+`includeFilter://` is the only spelling that *includes*. `filter://` and
+`ignore://<condition>` both **exclude**.
+
+```
+# only POST
+api.example.com   host://10.0.0.1     includeFilter://m:POST
+
+# only requests carrying a canary header (matched by containment)
+api.example.com   resHeaders://x-canary=1   includeFilter://reqH.x-canary:on
+
+# everything except the health check
+api.example.com   host://10.0.0.1     excludeFilter://*/health
+
+# only this client
+api.example.com   resHeaders://x-a=1  includeFilter://clientIp:192.168.1.44
+
+# a fraction of traffic
+api.example.com   statusCode://503    includeFilter://chance:5%
+```
+
+Include filters are OR-ed; one matching exclude filter vetoes the rule whatever
+the includes said. Conditions can also test the **response** — `s:404`,
+`resH.content-type:json`, `serverIp:` — which is resolved on a second pass after
+the response head arrives.
+
+A filter's URL pattern always reads as if it were `^`-prefixed, which is why
+`excludeFilter://*/health` wildcards the path while the same token as a rule
+pattern would not.
+
+### `$` — important
+
+```
+example.com    host://1.1.1.1
+$example.com   host://2.2.2.2      # this one wins
+```
+
+Important rules are resolved before normal ones, whatever their line order. It
+is the escape hatch for "my narrow rule is below a broad one and I do not want
+to reorder the file".
+
+### `ignore://` — carve a hole in a broad rule
+
+```
+.example.com          host://10.0.0.1
+static.example.com    ignore://host      # this subdomain keeps its real address
+example.com/health    ignore://all       # this path bypasses every rule
+```
+
+`ignore://` names **protocols** to drop from the resolved set. If what follows
+looks like a filter condition instead (it contains a `:`, `.` or `=`), it is
+read as an exclude filter — the two readings cannot collide.
+
+### Rule groups — switch a whole set on and off
+
+Several named rule sets live alongside the default one. In the console they are
+the source list on the left, and double-clicking one toggles it. Over HTTP:
+
+```bash
+curl --noproxy '*' -X POST -H 'content-type: application/json' \
+     -d '{"name":"staging","text":"api.example.com host://10.0.0.9\n"}' \
+     http://127.0.0.1:8899/api/rule-groups
+
+curl --noproxy '*' -X POST -H 'content-type: application/json' \
+     -d '{"name":"staging"}' http://127.0.0.1:8899/api/rule-group/toggle
+# {"ok":true,"enabled":false}
+
+curl --noproxy '*' http://127.0.0.1:8899/api/rule-groups
+# [{"enabled":true,"name":"default","rules":1},{"enabled":false,"name":"staging","rules":1}]
+```
+
+Groups persist to `<storage_dir>/rules/` and come back on restart. A disabled
+group contributes nothing — not even the values its fenced blocks declare.
+
+### Pull rules in from elsewhere
+
+```
+@/etc/whistle/team.rules          # a line starting with @ includes that file
+@https://intra/rules.txt          # …or that URL, fetched at startup
+```
+
+`@` includes are resolved once, at load. For runtime includes, `rulesFile://`
+and `rule://` pull a file or a named value in as more rules for matching
+requests only.
+
+---
+
+## Debug a phone or another device
+
+### 1. Make the proxy reachable
+
+whistle-rs binds **all interfaces** by default, so it is already listening on
+your LAN address. Find it:
+
+```bash
+ipconfig getifaddr en0        # macOS
+ip -4 addr show scope global  # Linux
+```
+
+Everything below assumes `192.168.1.5:8899`. If you would rather bind
+explicitly, `-H 0.0.0.0`; to keep the proxy off the network entirely,
+`-H 127.0.0.1`.
+
+### 2. Point the device at it
+
+Manually: Wi-Fi settings → the network → HTTP proxy → Manual →
+`192.168.1.5`, port `8899`. Set it for **both** HTTP and HTTPS.
+
+Or use the PAC file, which several platforms accept where a manual proxy is
+awkward:
+
+```
+http://192.168.1.5:8899/proxy.pac
+```
+
+The PAC is generated from the `Host` header of the request that fetched it, so
+whatever address the device used to reach the page is the address it will be
+told to proxy through. Fetching it from the device itself is therefore the
+reliable way to get it right.
+
+### 3. Install the root CA, or you will only see `CONNECT`
+
+Without a trusted CA, HTTPS is a tunnel: you get a `CONNECT` line and no
+contents. Open this on the device:
+
+```
+http://192.168.1.5:8899/rootCA.crt
+```
+
+Then trust it. The per-platform steps — including iOS's two-step
+install-then-*enable-full-trust*, which is where most people stop too early, and
+Android 7+'s user-store restriction — are in
+[`CERTIFICATES.md`](CERTIFICATES.md). Firefox has its own store and ignores the
+system one.
+
+Verify from your laptop first, where the failure modes are easier to read:
+
+```bash
+curl -x http://127.0.0.1:8899 --cacert ~/.whistle-rs/certs/root.crt \
+     https://example.com/ -D - -o /dev/null
+```
+
+### 4. Point the device's traffic at your laptop
+
+Now the rules are the same as any other recipe. The one you want first is
+usually:
+
+```
+www.example.com     http://192.168.1.5:5173
+```
+
+Note the LAN address, not `localhost` — the destination is dialled by the
+**proxy**, so `localhost` would be the machine running whistle-rs. That happens
+to be right when the dev server is on the same laptop, and wrong the moment it
+is not.
+
+### Leave one host alone
+
+Certificate-pinned apps break when you intercept them, and the useful answer is
+usually to stop intercepting that one host rather than to give up:
+
+```
+pinned.example.com    sniCallback://no-mitm
+```
+
+`no-mitm` is a built-in plugin that declines interception; the connection is
+relayed byte-for-byte. It is still *routed* by its rules — `host://` and the
+proxy family apply — but nothing inside it is read.
+
+To stop decrypting everything, start with `--no-intercept-https`.
+
+---
+
+## Capture, export and replay
+
+The console at <http://127.0.0.1:8899/> is the interactive view. Everything it
+shows is also an endpoint, which is what you want for scripting. All of these
+are **direct** requests, not through the proxy:
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /sessions.json` | every captured transaction: id, method, url, status, target, bytes up/down, duration |
+| `GET /session.json?id=N` | one transaction with its request/response headers and body previews |
+| `GET /frames.json?id=N` | the WebSocket frames of connection `N`, both directions |
+| `GET /sessions.har` | everything as a HAR 1.2 file |
+| `GET /api/status` | ports, TLS posture, root CA path, rule count, registered plugins |
+| `POST /api/sessions/clear` | drop the capture |
+
+```bash
+# a table of what has been seen
+curl -s --noproxy '*' http://127.0.0.1:8899/sessions.json |
+  python3 -c 'import sys,json
+for s in json.load(sys.stdin): print(s["status"], s["method"], s["url"])'
+
+# a HAR you can drag into Chrome DevTools
+curl -s --noproxy '*' http://127.0.0.1:8899/sessions.har -o capture.har
+```
+
+Body previews are bounded — 16 KB by default, `--body-preview-limit` to change
+it. `gzip`/`deflate`/`br` bodies are decoded for viewing, and the capture is a
+streaming tee, so a chunked or SSE response is inspectable without breaking the
+stream.
+
+WebSocket connections appear as a session with status `101`, and every frame in
+both directions is recorded:
+
+```json
+[{"session":1,"dir":"receive","opcode":"text","len":17,"preview":"hello from origin","ignored":false},
+ {"session":1,"dir":"send","opcode":"text","len":16,"preview":"ping from client","ignored":false}]
+```
+
+### Replay
+
+Re-send a captured request through the whole pipeline — so it picks up whatever
+your rules say **now**, not what they said when it was captured:
+
+```bash
+curl --noproxy '*' -X POST -H 'content-type: application/json' \
+     -d '{"id":6}' http://127.0.0.1:8899/api/replay
+```
+
+`{"ids":[6,7,8]}` replays a batch (100 at most). The JSON answer reports what
+went out, per session — including how much of the request body was available to
+re-send, since a body is only replayable to the extent it was captured, and
+captures are bounded by `--body-preview-limit`.
+
+The replayed hop is marked as the Composer's, so a rule can treat it differently
+from the traffic it was captured from:
+
+```
+api.example.com   resHeaders://x-replayed=1   includeFilter://from:composer
+```
+
+The header lands on the replay and on nothing else.
+
+### Keep the capture across restarts
+
+Sessions are written to JSONL under `<storage_dir>/sessions/` with daily
+rotation and reloaded at startup. `--persist-days N` sets the retention;
+`--no-persist` turns the whole thing off, which is what you want in a test
+harness.
+
+---
+
+## Embed the proxy in your own program
+
+whistle-rs is a library with a binary on top. If your own program needs traffic
+interception — a test harness that must assert on outbound calls, a desktop app
+with a built-in inspector, a proxy of your own — embed it rather than shelling
+out:
+
+```rust
+use whistle_rs::embed::Proxy;
+
+let proxy = Proxy::builder()
+    .port(0)                          // the OS picks; addr() reports which
+    .host("127.0.0.1".parse()?)       // keep it off the network
+    .rules("api.example.com  http://127.0.0.1:3000")
+    .on_session(|s| println!("{} {} -> {}", s.method, s.url, s.status))
+    .start()
+    .await?;
+
+let addr = proxy.addr();              // point your client here
+proxy.set_rules("api.example.com  statusCode://503");   // live, no restart
+proxy.shutdown().await;
+```
+
+`.port(0)` and `addr()` are the pair that makes this usable in tests: no port to
+reserve, no collision between concurrent test binaries.
+
+To *change* traffic rather than watch it, register an in-process hook. It is the
+same `RustPlugin` trait the built-in plugins use, so it can rewrite request
+headers, inject rules, answer the request outright, gate it, transform the
+response, or pick the TLS certificate:
+
+```rust
+struct MockApi;
+
+impl RustPlugin for MockApi {
+    fn name(&self) -> &str { "mock-api" }
+    fn on_request(&self, _req: &PluginReq) -> PluginResult {
+        PluginResult {
+            response: Some(PluginResp {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: br#"{"answered_by":"your program"}"#.to_vec(),
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
+```
+
+[`examples/embedded.rs`](../examples/embedded.rs) runs all of the above end to
+end — `cargo run --example embedded`. The builder also covers a SOCKS5 port, the
+storage directory (two embedders sharing one share a CA), values, the
+body-capture cap, and `intercept_https(false)` for routing TLS without
+decrypting it. Anything past the facade is reachable through `proxy.state()`.
+
+For out-of-process plugins in JS/TS, see [`PLUGINS.md`](PLUGINS.md).
+
+---
+
+## When a rule does not fire
+
+Start with the log. Every request prints its resolved destination, and that one
+line usually contains the answer:
+
+```
+INFO GET http://seg.test/path/to/x    -> 127.0.0.1:5173 (http)   # rule matched
+INFO GET http://seg.test/path/toxxx   -> seg.test:80    (http)   # it did not
+INFO OPTIONS http://api.test/users    -> short-circuit           # answered locally
+```
+
+Those lines are `INFO`, so they are there without any flag. `-v` adds the
+**reason** behind a failure, which a `502` alone will not tell you:
+
+```
+INFO  GET http://dead.test/ -> 127.0.0.1:9 (http)
+DEBUG request failed: connecting to 127.0.0.1:9: Connection refused (os error 61)
+INFO  GET https://sec.test/ -> 127.0.0.1:5443 (https)
+DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
+```
+
+Then work down this list:
+
+| Symptom | Cause |
+|---------|-------|
+| the rule matches a URL you expected it to miss, or vice versa | a path prefix only matches at a `/`, `\` or `?` boundary: `example.com/path/to` matches `/path/to/x` but **not** `/path/toxxx` |
+| a mock, redirect or forward is ignored | another line of the [shared slot](#a-mock-has-to-be-written-above-the-forward) was written first. Move it up, or mark it `$` |
+| an operator value arrives truncated | it contained a space. Use `${name}` and a value — see [Headers](#headers) |
+| `502` on a self-signed or private-CA origin | whistle-rs **verifies** origin certificates, unlike upstream. `--insecure-upstream` opts out |
+| a delay of `1s` is instant | delays are milliseconds; the suffix is discarded, not converted. Write `1000` |
+| a throttle is 8× faster than expected | `resSpeed://` is **kilobits**, not kilobytes |
+| a body rewrite works sometimes | it does not, any more — a response-body operator now busts the request cache, so a `304` cannot swallow it. If you are on an older build, add `disable://cache` |
+| an SSE/chunked response stops streaming | a body operator on it buffers the whole stream. Remove it, or scope it away with a filter |
+| the console shows `CONNECT` and nothing inside it | the client does not trust the root CA — see [`CERTIFICATES.md`](CERTIFICATES.md) |
+| a direct request to the console returns `502` with `Proxy-Connection` | your shell has `http_proxy` set. `curl --noproxy '*'` |
+| a request that failed is missing from the console entirely | a request that never got a response — connection refused, DNS failure, TLS handshake failure — is **not** recorded as a session. The proxy log is the only place it appears, which is the other reason to keep `-v` on while debugging |
+| the editor highlights the wrong token as the pattern | it is telling you the truth. `example.com http://localhost:5173` is pattern + destination; `http://a.com/x host://1.2.3.4` is pattern + operator. Whichever token it marks is what the proxy will match on |
+
+More failure modes, and the ones that are structural rather than fixable, are in
+the READMEs' troubleshooting sections and in [`ROADMAP.md`](ROADMAP.md).
