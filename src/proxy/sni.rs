@@ -228,6 +228,21 @@ pub enum Decision {
     Unroutable(String),
 }
 
+/// Where a connection goes when it is relayed rather than intercepted.
+///
+/// A connection we have promised not to read has no request to rewrite, so a
+/// URL-replacement rule has nothing to act on; the destination is the address
+/// asked for, and `host://` and the proxy family route it as usual. A proxy rule
+/// that cannot be honoured closes the connection rather than quietly putting the
+/// bytes on the wire it was told to divert.
+async fn relay_decision(info: &crate::rules::ReqInfo, resolved: &crate::rules::Resolved) -> Decision {
+    let dest = super::dest::Destination::of(info, resolved);
+    match super::apply::resolve_target(info, &dest, resolved).await {
+        Ok(target) => Decision::Bypass(Box::new(target)),
+        Err(err) => Decision::Unroutable(format!("{err:#}")),
+    }
+}
+
 /// Consult the `sniCallback://` rules for this connection.
 ///
 /// The common answer is [`Decision::Generated`] and it is reached without
@@ -243,6 +258,19 @@ pub async fn decide(
     peer: SocketAddr,
     has_sni: bool,
 ) -> Decision {
+    // Interception switched off globally: every TLS connection is relayed, and
+    // the answer is the same one a plugin's `false` produces — the connection is
+    // still *routed* by its rules, it is simply not read. whistle spells this
+    // `-M pureProxy`; here it is `--no-intercept-https`.
+    if !state.config.intercept_https {
+        let (info, resolved) = {
+            let rules = state.rules.read().unwrap();
+            let info = connection_req_info(servername, port, peer, has_sni);
+            let resolved = rules.resolve(&info);
+            (info, resolved)
+        };
+        return relay_decision(&info, &resolved).await;
+    }
     // Scoped so the read guard cannot cross the `.await` below. `Resolved` owns
     // its contents, so it outlives the guard and is kept: a declined connection
     // still has to be routed, and re-resolving would mean matching twice.
@@ -284,11 +312,7 @@ pub async fn decide(
             // rewrite, so a URL-replacement rule has nothing to act on here;
             // the destination is the request's own address, and `host://` and
             // the proxy family route it as usual.
-            let dest = super::dest::Destination::of(&info, &resolved);
-            match super::apply::resolve_target(&info, &dest, &resolved).await {
-                Ok(target) => Decision::Bypass(Box::new(target)),
-                Err(err) => Decision::Unroutable(format!("{err:#}")),
-            }
+            relay_decision(&info, &resolved).await
         }
         Ok(SniVerdict::Cert(cert)) => {
             match state.ca.set_plugin_cert(
@@ -703,6 +727,69 @@ mod tests {
 
     fn peer() -> SocketAddr {
         "127.0.0.1:51234".parse().unwrap()
+    }
+
+    /// Like [`state_with`], but with interception switched off globally.
+    fn relaying_state(rules: &str) -> Arc<AppState> {
+        let state = state_with(rules, None);
+        let mut config = state.config.clone();
+        config.intercept_https = false;
+        let ca = crate::ca::CertAuthority::load_or_create(&config).unwrap();
+        let mut mgr = crate::rules::RuleManager::new();
+        mgr.set_text(rules);
+        Arc::new(AppState::with_plugins(
+            config,
+            mgr,
+            ca,
+            crate::plugins::Plugins::new(),
+        ))
+    }
+
+    /// `--no-intercept-https` relays every TLS connection — but relaying is not
+    /// the same as ignoring: the connection still goes where its rules say.
+    ///
+    /// The field behind this switch existed and nothing read it, so the setting
+    /// was inert and the console's Status pane reported it as if it were not.
+    #[tokio::test]
+    async fn interception_off_relays_but_still_routes() {
+        // No rule at all: relayed straight to the address asked for.
+        let state = relaying_state("");
+        match decide_for(&state, "example.test").await {
+            Decision::Bypass(target) => {
+                assert_eq!(target.connect_host, "example.test");
+                assert_eq!(target.connect_port, 443);
+            }
+            _ => panic!("expected a relay"),
+        }
+
+        // `host://` still moves the socket, exactly as it does for a connection
+        // a plugin declined to intercept.
+        let state = relaying_state("example.test host://10.0.0.9
+");
+        match decide_for(&state, "example.test").await {
+            Decision::Bypass(target) => assert_eq!(target.connect_host, "10.0.0.9"),
+            _ => panic!("expected a relay"),
+        }
+
+        // And a proxy rule that cannot be honoured still closes the connection
+        // rather than putting the bytes on the wire it was told to divert.
+        let state = relaying_state("example.test proxy://
+");
+        assert!(
+            matches!(decide_for(&state, "example.test").await, Decision::Unroutable(_)),
+            "an unusable proxy rule must not fail open"
+        );
+    }
+
+    /// With interception on and no `sniCallback://` rule, nothing changes: the
+    /// connection is intercepted with a generated certificate as before.
+    #[tokio::test]
+    async fn interception_on_is_unchanged() {
+        let state = state_with("example.test host://10.0.0.9\n", None);
+        assert!(matches!(
+            decide_for(&state, "example.test").await,
+            Decision::Generated
+        ));
     }
 
     async fn decide_for(state: &Arc<AppState>, servername: &str) -> Decision {

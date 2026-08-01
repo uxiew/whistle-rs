@@ -77,6 +77,15 @@ struct Cli {
     #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_DAYS)]
     persist_days: u32,
 
+    /// Do not decrypt HTTPS: relay every TLS connection untouched.
+    ///
+    /// The connection is still *routed* by its rules — `host://` and the proxy
+    /// family apply — but nothing inside it is read, so no certificate has to be
+    /// trusted and no request/response operator can run. whistle spells this
+    /// `-M pureProxy`.
+    #[arg(long)]
+    no_intercept_https: bool,
+
     /// Request timeout in milliseconds (whistle's `-t`).
     ///
     /// Caps how long a connection to an origin or an upstream proxy may take to
@@ -147,6 +156,7 @@ async fn main() -> Result<()> {
         persist_sessions: !cli.no_persist,
         persist_days: cli.persist_days,
         timeout_ms: cli.timeout,
+        intercept_https: !cli.no_intercept_https,
         ..Config::default()
     };
 
