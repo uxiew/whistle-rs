@@ -19,7 +19,6 @@ pub mod webui;
 pub mod ws;
 
 use std::collections::VecDeque;
-use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -953,13 +952,13 @@ async fn top_level(
     state: Arc<AppState>,
     req: Request<Incoming>,
     peer: SocketAddr,
-) -> Result<Response<DynBody>, Infallible> {
+) -> Result<Response<DynBody>, Destroyed> {
     if req.method() == hyper::Method::CONNECT {
         return Ok(handle_connect(state, req, peer));
     }
     // Absolute-form URI => proxied request. Origin-form => a direct hit on us.
     if req.uri().authority().is_some() {
-        return Ok(guard(serve(state, req, Origin::Forward, peer).await));
+        return guard(serve(state, req, Origin::Forward, peer).await);
     }
     Ok(webui::handle(&state, req).await)
 }
@@ -1076,7 +1075,7 @@ where
             tls: true,
             sni,
         };
-        async move { Ok::<_, Infallible>(guard(serve(state, req, origin, peer).await)) }
+        async move { guard(serve(state, req, origin, peer).await) }
     });
 
     hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -1107,7 +1106,7 @@ where
             tls,
             sni,
         };
-        async move { Ok::<_, Infallible>(guard(serve(state, req, origin, peer).await)) }
+        async move { guard(serve(state, req, origin, peer).await) }
     });
 
     hyper::server::conn::http1::Builder::new()
@@ -1625,18 +1624,40 @@ async fn finish_local_response(
     (Response::from_parts(parts, body), capture)
 }
 
-/// Turn an internal error into a 502 so the service signature stays infallible.
-fn guard(result: Result<Response<DynBody>>) -> Response<DynBody> {
+/// What an aborted request leaves behind: nothing.
+///
+/// whistle answers an abort with `res.destroy()`
+/// (`_original/lib/inspectors/data.js:536`, `res.js:1178`), which tears the
+/// socket down mid-transaction — the client sees a reset, not a status. hyper
+/// does the same when the service resolves to an error, so the abort travels
+/// out of [`serve`] as one and [`guard`] passes it through instead of dressing
+/// it up as a 502. A 502 with a body is a *served* response: it satisfies a
+/// fetch, gets cached as a failure page, and cannot be told apart from a real
+/// gateway error — which is not what `enable://abort` is for.
+#[derive(Debug)]
+struct Destroyed;
+
+impl std::fmt::Display for Destroyed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("connection destroyed by enable://abort")
+    }
+}
+
+impl std::error::Error for Destroyed {}
+
+/// Turn an internal error into a 502, except an abort, which gets no answer.
+fn guard(result: Result<Response<DynBody>>) -> Result<Response<DynBody>, Destroyed> {
     match result {
-        Ok(resp) => resp,
+        Ok(resp) => Ok(resp),
+        Err(err) if err.is::<Destroyed>() => Err(Destroyed),
         Err(err) => {
             // `{err:#}` includes the full anyhow context chain (e.g. the
             // underlying rustls reason behind "upstream TLS handshake").
             tracing::debug!("request failed: {err:#}");
-            Response::builder()
+            Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(body::full(Bytes::from(format!("whistle-rs: {err:#}"))))
-                .unwrap()
+                .unwrap())
         }
     }
 }
@@ -1900,10 +1921,13 @@ async fn serve(
         }
     }
 
-    // enable://abort drops the request without contacting upstream.
-    if apply::is_aborted(&resolved) {
+    // `enable://abort` / `abortReq` drop the request without contacting the
+    // origin, and without an answer of any kind — upstream's `res.destroy()`
+    // (`_original/lib/inspectors/data.js:534-539`). `abortRes` is *not* here:
+    // it lets the request go out and destroys the answer instead, further down.
+    if apply::aborts_request(&resolved) {
         tracing::info!("{} {} -> aborted", info.method, info.full_url);
-        return Err(anyhow::anyhow!("aborted by enable://abort"));
+        return Err(Destroyed.into());
     }
 
     // Short-circuit rules (redirect, mocked status, file) skip the upstream.
@@ -2151,6 +2175,34 @@ async fn serve(
 
     if let Some(ms) = apply::res_delay_ms(&resolved) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
+    // `enable://abort` / `abortRes`: the request went out, the origin answered,
+    // and *now* the connection is destroyed — `res.js:1175-1179`, right after
+    // `resDelay://`, which is why this sits below the sleep. The point of
+    // aborting here rather than before the request is that the origin still
+    // sees the traffic; only the client is cut off.
+    if apply::aborts_response(&resolved) {
+        tracing::info!("{} {} -> response aborted", info.method, info.full_url);
+        // Upstream keeps the head it is about to throw away (`req.__resHeaders`
+        // / `req.__statusCode`, `res.js:1176-1177`) so the capture still shows
+        // what arrived; without this the session reads as if nothing came back.
+        state.record(Session {
+            id: 0,
+            time_ms,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            status: parts.status.as_u16(),
+            client_ip,
+            target: format!("{}:{} (aborted)", target.connect_host, target.connect_port),
+            duration_ms: started.elapsed().as_millis(),
+            log: log_labels(&resolved),
+            req_headers: req_header_pairs,
+            res_headers: header_pairs(&parts.headers),
+            req_body: req_body_cap,
+            ..Default::default()
+        });
+        return Err(Destroyed.into());
     }
 
     // Apply response-side rules.

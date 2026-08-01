@@ -1011,7 +1011,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | `abort` (drop the request), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
+| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
 | `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Emit HTTP response trailer headers (forces chunked) |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
@@ -1079,6 +1079,35 @@ page.example.com    responseFor://http://auth.internal/verify
 example.com         resBody://{mockJson}        # {mockJson} from the values store
 example.com         rulesFile:///etc/whistle/extra.rules
 ```
+
+#### `enable://abort` is two gates, not one
+
+An abort **destroys the connection** — the client sees a reset, never a status
+code (upstream's `res.destroy()`, `_original/lib/inspectors/data.js:536` and
+`res.js:1178`). There are two moments it can happen at, and which one you get
+depends on the spelling:
+
+| Flag | Fires | The origin |
+|------|-------|------------|
+| `abortReq` | before the request leaves | never hears about it |
+| `abortRes` | after the response head arrives, and after `resDelay://` | serves the request in full |
+| `abort` | both are armed, so the request gate wins | never hears about it |
+
+Each gate is cancelled by a `disable://` of its own name, or by `disable://abort`,
+which cancels both (`needAbortReq`/`needAbortRes`,
+`_original/lib/util/index.js:3893-3915`). The cancellation is what lets an abort
+be armed broadly and exempted narrowly:
+
+```
+example.com          enable://abort
+example.com/health   disable://abort
+```
+
+`enable://abort disable://abortReq` is the way to say "let it reach the origin,
+then cut the client off" without changing what the origin sees.
+
+> Upstream also arms these from a `filter://abort` line; in whistle-rs `filter://`
+> is only a match condition, so `enable://` is the whole vocabulary here.
 
 #### How several `rulesFile://` lines combine
 

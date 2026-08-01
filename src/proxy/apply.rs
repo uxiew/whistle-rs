@@ -676,10 +676,42 @@ pub fn ignored_ws_dirs(resolved: &Resolved) -> (bool, bool) {
     (e.contains("ignoreSend"), e.contains("ignoreReceive"))
 }
 
-/// True if the request should be aborted (`enable://abort`/`abortReq`/`abortRes`).
-pub fn is_aborted(resolved: &Resolved) -> bool {
-    let e = enabled_flags(resolved);
-    e.contains("abort") || e.contains("abortReq") || e.contains("abortRes")
+/// True when the request must be destroyed **before** it is sent
+/// (`needAbortReq`, `_original/lib/util/index.js:3893-3903`, applied from the
+/// `data` inspector at `_original/lib/inspectors/data.js:534-539` — which runs
+/// before `res`, so an abort here means the origin is never contacted).
+///
+/// `abortRes` is deliberately absent: it lets the request go out and destroys
+/// the answer instead — see [`aborts_response`].
+pub fn aborts_request(resolved: &Resolved) -> bool {
+    aborts(resolved, "abortReq")
+}
+
+/// True when the response must be destroyed **after** its head has arrived
+/// (`needAbortRes`, `_original/lib/util/index.js:3905-3915`, applied at
+/// `_original/lib/inspectors/res.js:1175-1179`, after `resDelay://`).
+pub fn aborts_response(resolved: &Resolved) -> bool {
+    aborts(resolved, "abortRes")
+}
+
+/// The shape both abort gates share: a `disable://` of either spelling cancels
+/// the abort outright, and only then does an `enable://` arm it.
+///
+/// The `disable://` arm is the half this port was missing, which made
+/// `enable://abort` unconditional — a rule you could arm on a whole domain and
+/// then not exempt one path from.
+///
+/// Upstream also arms on `req._filters.abort`, set by a `filter://abort` line.
+/// This port reads `filter://` only as a match condition (`src/rules/mod.rs`),
+/// so there is no filter bag to consult; `enable://` is the whole vocabulary
+/// here.
+fn aborts(resolved: &Resolved, side: &str) -> bool {
+    let dis = disabled_flags(resolved);
+    if dis.contains("abort") || dis.contains(side) {
+        return false;
+    }
+    let en = enabled_flags(resolved);
+    en.contains("abort") || en.contains(side)
 }
 
 /// The coding an `enable://gzip|br|deflate` flag demands the response leave under,
@@ -7683,6 +7715,40 @@ mod tests {
         );
         // A flag nobody set leaves everything alone.
         assert_eq!(sent("host://1.1.1.1", "cookie"), Some("sid=secret".to_string()));
+    }
+
+    /// The two abort gates are two different moments, and each has its own
+    /// `disable://` cancellation (`needAbortReq`/`needAbortRes`,
+    /// `_original/lib/util/index.js:3893-3915`).
+    ///
+    /// The port collapsed all three spellings into one before-the-request gate,
+    /// which got `abortRes` wrong (it must let the request reach the origin) and
+    /// ignored `disable://` entirely — so `enable://abort` on a domain could not
+    /// be exempted for a single path, the one thing a `disable://` line is for.
+    #[test]
+    fn the_abort_gates_are_two_moments_and_both_can_be_cancelled() {
+        let gates = |rules: &str| {
+            let r = resolve(&format!("example.com {rules}\n"), "http://example.com/");
+            (aborts_request(&r), aborts_response(&r))
+        };
+
+        // `abort` arms both, but the request gate fires first, so the origin is
+        // never contacted.
+        assert_eq!(gates("enable://abort"), (true, true));
+        // `abortReq` stops at the request; `abortRes` lets it through and kills
+        // the answer.
+        assert_eq!(gates("enable://abortReq"), (true, false));
+        assert_eq!(gates("enable://abortRes"), (false, true));
+
+        // A `disable://` of the same name cancels its own gate…
+        assert_eq!(gates("enable://abort disable://abortReq"), (false, true));
+        assert_eq!(gates("enable://abort disable://abortRes"), (true, false));
+        // …and `disable://abort` cancels both, whatever armed them.
+        assert_eq!(gates("enable://abort disable://abort"), (false, false));
+        assert_eq!(gates("enable://abortReq|abortRes disable://abort"), (false, false));
+
+        // Nothing set: nothing aborts.
+        assert_eq!(gates("host://1.1.1.1"), (false, false));
     }
 
     /// `disable://keepAlive` closes the hop to the **origin**, not the client's
