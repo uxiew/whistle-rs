@@ -1295,11 +1295,15 @@ fn content_type_of_ext(path: &str) -> Option<&'static str> {
 pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     apply_header_ops(&mut parts.headers, resolved, "reqHeaders");
 
+    // Both go through the same `setHeader` assignment upstream
+    // (`_original/lib/inspectors/req.js:511-519`), so an empty `ua://` sends an
+    // empty `User-Agent` rather than none at all — `disable://ua` is the rule
+    // that removes it.
     if let Some(ua) = resolved.value("ua") {
-        set_header(&mut parts.headers, "user-agent", ua);
+        assign_header(&mut parts.headers, "user-agent", ua);
     }
     if let Some(referer) = resolved.value("referer") {
-        set_header(&mut parts.headers, "referer", referer);
+        assign_header(&mut parts.headers, "referer", referer);
     }
     if let Some(m) = resolved.value("method")
         && let Ok(method) = m.to_uppercase().parse()
@@ -1309,15 +1313,16 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(ct) = resolved.value("reqType") {
         set_content_type(&mut parts.headers, ct, req_type_alias);
     }
-    if let Some(auth) = resolved.value("auth") {
-        // `auth://user:pass` → HTTP Basic Authorization header.
-        if !auth.is_empty() {
-            let token = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                auth.as_bytes(),
-            );
-            set_header(&mut parts.headers, "authorization", &format!("Basic {token}"));
-        }
+    if let Some(auth) = resolved.value("auth").map(parse_auth)
+        && let Some(basic) = auth.basic()
+    {
+        // `"proxy":true` addresses the *proxy* rather than the origin
+        // (`handleAuth`, `_original/lib/inspectors/req.js:150-155`).
+        let name = match auth.proxy {
+            true => "proxy-authorization",
+            false => "authorization",
+        };
+        set_header(&mut parts.headers, name, &basic);
     }
     apply_forwarded_for(&mut parts.headers, resolved);
     apply_req_cors(&mut parts.headers, resolved);
@@ -1345,6 +1350,116 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     // request goes out unconditional even without `disable://cache`.
     if res_body_forbids_cache(resolved) {
         disable_req_cache(&mut parts.headers);
+    }
+}
+
+/// What an `auth://` rule asks for (`getAuthByRules`,
+/// `_original/lib/util/index.js:3645-3662`).
+///
+/// A missing half is not an empty one: `username` and `password` are each
+/// `None` when the rule did not name them, and `getAuthBasic`
+/// (`util/index.js:3668-3685`) reads the difference — a password with no
+/// username becomes `:pass`, a username with no password has no colon at all.
+#[derive(Debug, Default, PartialEq)]
+struct Auth {
+    username: Option<String>,
+    password: Option<String>,
+    /// `"proxy":true` — send `Proxy-Authorization` rather than `Authorization`.
+    proxy: bool,
+}
+
+impl Auth {
+    /// The header value, or `None` when the rule named neither half
+    /// (`getAuthBasic`, `_original/lib/util/index.js:3668-3685`).
+    fn basic(&self) -> Option<String> {
+        let joined = match (&self.username, &self.password) {
+            (None, None) => return None,
+            // No username: upstream starts the pair with an empty string, so
+            // the colon survives and the server still sees two fields.
+            (None, Some(p)) => format!(":{p}"),
+            // No password: no colon either — `['u'].join(':')` is just `u`.
+            (Some(u), None) => u.clone(),
+            (Some(u), Some(p)) => format!("{u}:{p}"),
+        };
+        let token = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            joined.as_bytes(),
+        );
+        Some(format!("Basic {token}"))
+    }
+}
+
+/// Parse an `auth://` value in all three shapes upstream accepts.
+///
+/// This port understood only `user:pass`, so the other two — the JSON object
+/// and the `username=…&password=…` query — were base64-encoded whole and sent
+/// as the credentials themselves. `auth://{"username":"u","password":"p"}`
+/// authenticated as the user *`{"username"`* with the password
+/// *`"u","password":"p"}`*, which a server answers with a 401 that looks like
+/// the rule never ran.
+///
+/// The one shape not honoured here is upstream's fourth: a value containing a
+/// slash is a **file reference**, read through `readRuleValue`
+/// (`getAuthByRules` returns nothing for it, `util/index.js:3654-3656`, and
+/// `req.js:464` then feeds the rule to `parseRuleJson` instead). This port has
+/// no rule-value loader, so rather than answer such a rule with silence it
+/// keeps splitting on the first colon — which is what `auth://u:pa/ss`, a
+/// password with a slash in it, needs anyway.
+fn parse_auth(value: &str) -> Auth {
+    let value = value.trim();
+    // `auth[0] === '{' && auth[auth.length - 1] === '}'`: a JSON object.
+    if value.starts_with('{') && value.ends_with('}') {
+        // A JSON object upstream cannot parse becomes `{}` — an auth naming
+        // neither half, which produces no header rather than a bad one.
+        let parsed = serde_json::from_str::<serde_json::Value>(value).ok();
+        return format_auth(parsed.as_ref());
+    }
+    // `AUTH_RE = /^(?:username|password)=/` — anchored, and case-sensitive.
+    if value.starts_with("username=") || value.starts_with("password=") {
+        // `parseQuery(auth, null, null, true)`: the raw decoder, so a `%2F` or a
+        // `+` in a password reaches the server as written.
+        let obj: serde_json::Map<String, serde_json::Value> = value
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        return format_auth(Some(&serde_json::Value::Object(obj)));
+    }
+    match value.split_once(':') {
+        Some((u, p)) => Auth {
+            username: Some(u.to_string()),
+            password: Some(p.to_string()),
+            proxy: false,
+        },
+        None => Auth {
+            username: Some(value.to_string()),
+            password: None,
+            proxy: false,
+        },
+    }
+}
+
+/// `formatAuth` (`_original/lib/util/index.js:3632-3643`): read the three
+/// fields, stringifying whatever was there and keeping `null` distinct.
+fn format_auth(obj: Option<&serde_json::Value>) -> Auth {
+    let field = |name: &str| match obj.and_then(|o| o.get(name)) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+    };
+    Auth {
+        username: field("username"),
+        password: field("password"),
+        // `!!obj.proxy`, so the query spelling `proxy=false` is a non-empty
+        // string and therefore **true**. Upstream's, and the reason the JSON
+        // spelling is the one to reach for when the answer is "no".
+        proxy: match obj.and_then(|o| o.get("proxy")) {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => !s.is_empty(),
+            Some(serde_json::Value::Number(n)) => n.as_f64() != Some(0.0),
+            Some(_) => true,
+        },
     }
 }
 
@@ -2658,6 +2773,13 @@ enum ResClass {
     Xml,
     Text,
     Img,
+    /// Not one of `getContentType`'s classes. `handleReplace` substitutes the
+    /// string `FORM` for a urlencoded **request** body before its gate
+    /// (`_original/lib/inspectors/req.js:435`), which is the only reason
+    /// `reqReplace://` reaches a form POST at all — `getContentType` puts
+    /// `application/x-www-form-urlencoded` in no class, and the gate refuses
+    /// anything unclassified. Never produced for a response.
+    Form,
 }
 
 /// Classify a `Content-Type` header the way whistle does. `None` covers both a
@@ -2983,6 +3105,34 @@ fn request_body_kind(ctx: ReqBodyCtx<'_>) -> Option<ParamsBody> {
     None
 }
 
+/// The class `reqReplace://` is gated on (`handleReplace`,
+/// `_original/lib/inspectors/req.js:429-438`).
+///
+/// It is *not* the response gate with the request's content type substituted,
+/// which is what this port had — and why `reqReplace://` was a silent no-op on
+/// the commonest request body there is. Two things differ:
+///
+/// * a method that carries no body is refused before the type is looked at
+///   (`hasRequestBody`, `common.js:1591-1604`);
+/// * a urlencoded body is mapped to a class of its own — `type =
+///   isUrlEncoded(req) ? 'FORM' : getContentType(type)` — because
+///   `getContentType` puts `application/x-www-form-urlencoded` in no class at
+///   all, and the next line refuses everything unclassified.
+fn req_replace_class(ctx: ReqBodyCtx<'_>) -> Option<ResClass> {
+    if !method_has_body(ctx.method) {
+        return None;
+    }
+    let ct = ctx.content_type?;
+    // `isUrlEncoded` is POST-only (`_original/lib/util/common.js:692-695`), so a
+    // `PUT` carrying a form body takes the ordinary path and is refused.
+    if ctx.method.eq_ignore_ascii_case("POST")
+        && ct.to_ascii_lowercase().contains("application/x-www-form-urlencoded")
+    {
+        return Some(ResClass::Form);
+    }
+    res_class(ct)
+}
+
 /// `hasRequestBody` (`_original/lib/util/common.js:1591-1604`) — the methods
 /// whistle will look for a body on.
 fn method_has_body(method: &str) -> bool {
@@ -3076,12 +3226,12 @@ pub fn transform_req_body(body: Bytes, resolved: &Resolved, ctx: ReqBodyCtx<'_>)
     if let Some(kind) = params_body_kind(resolved, ctx) {
         data = merge_params_into_body(data, resolved, &del, kind, ctx);
     }
-    // whistle gates `reqReplace` on the request's own content type, exactly as
-    // it gates `resReplace` on the response's (`_original/lib/inspectors/req.js`
-    // mirrors `res.js:129-132`): a request with no `content-type`, or an image
-    // one, is left alone.
-    let class = ctx.content_type.and_then(res_class);
-    Bytes::from(apply_replace(data, resolved, "reqReplace", class))
+    Bytes::from(apply_replace(
+        data,
+        resolved,
+        "reqReplace",
+        req_replace_class(ctx),
+    ))
 }
 
 /// `params://` merged into the request body, and `delete://reqBody.…` applied
@@ -4572,7 +4722,7 @@ fn escape_cookie(s: &str, is_name: bool) -> String {
 /// for why the fold, not a top-to-bottom apply, is what upstream does.
 fn apply_header_ops(headers: &mut HeaderMap, resolved: &Resolved, protocol: &str) {
     for (name, value) in merge_header_ops(resolved, protocol) {
-        set_header(headers, &name, &value);
+        assign_header(headers, &name, &value);
     }
 }
 
@@ -4617,7 +4767,31 @@ fn parse_header_pairs(value: &str) -> Vec<(String, String)> {
     }
 }
 
-/// Set (replace) a header; empty value removes it. whistle treats empty as delete.
+/// Assign a header, **including** an empty value.
+///
+/// The header operators are an assignment upstream, not a conditional one —
+/// `extend(req.headers, data.headers)` (`_original/lib/inspectors/req.js:105`)
+/// and `extend(_resHeaders, data.headers)` (`res.js:927`) — so
+/// `reqHeaders://x-a=` sends `X-A:` with nothing after it. Removing the header
+/// instead is a different rule, spelled `delete://reqHeaders.x-a`, and the two
+/// are not interchangeable: a server that branches on a header's *presence*
+/// sees the opposite of what was asked for.
+fn assign_header(headers: &mut HeaderMap, name: &str, value: &str) {
+    let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+        return;
+    };
+    if let Ok(v) = HeaderValue::from_str(value) {
+        headers.insert(name, v);
+    }
+}
+
+/// Set (replace) a header this proxy writes itself; an empty value removes it.
+///
+/// This is the right rule for the headers whistle *computes* — the one place it
+/// is explicit is `pragma`, which upstream deletes when the value it worked out
+/// is falsy (`if (!_resHeaders.pragma) delete _resHeaders.pragma`,
+/// `_original/lib/inspectors/res.js:940-942`). It is the **wrong** rule for a
+/// value a rule supplied: see [`assign_header`].
 fn set_header(headers: &mut HeaderMap, name: &str, value: &str) {
     let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
         return;
@@ -5063,6 +5237,101 @@ mod tests {
             "Basic dXNlcjpwYXNz"
         );
         assert_eq!(parts.headers.get("x-forwarded-for").unwrap(), "9.9.9.9");
+    }
+
+    /// `auth://` takes three shapes, not one (`getAuthByRules`,
+    /// `_original/lib/util/index.js:3645-3662`, `getAuthBasic` at `:3668-3685`,
+    /// `handleAuth` at `req.js:150-155`).
+    ///
+    /// This port understood only `user:pass` and base64-encoded everything else
+    /// whole, so `auth://{"username":"u","password":"p"}` authenticated as the
+    /// user `{"username"` with the password `"u","password":"p"}` — a 401 that
+    /// reads as the rule never having run. The `"proxy":true` field, which
+    /// moves the credentials to `Proxy-Authorization`, had nowhere to land at
+    /// all.
+    ///
+    /// The expectations are upstream's own: `getAuthByRules`, `formatAuth`,
+    /// `getAuthBasic` and `parseQuery` were lifted verbatim and run over these
+    /// inputs.
+    #[test]
+    fn auth_takes_a_json_object_and_a_query_string_too() {
+        let sent = |value: &str| {
+            let resolved = resolve(
+                &format!("example.com auth://{value}\n"),
+                "http://example.com/",
+            );
+            let mut parts = req_parts(&[]);
+            apply_request(&mut parts, &resolved);
+            for name in ["authorization", "proxy-authorization"] {
+                if let Some(v) = parts.headers.get(name) {
+                    return Some(format!("{name}: {}", v.to_str().unwrap()));
+                }
+            }
+            None
+        };
+        let auth = |v: &str| Some(format!("authorization: {v}"));
+        let proxy = |v: &str| Some(format!("proxy-authorization: {v}"));
+
+        // ── `user:pass`, which already worked ──
+        assert_eq!(sent("user:pass"), auth("Basic dXNlcjpwYXNz"));
+        // Only the *first* colon splits.
+        assert_eq!(sent("u:p:q"), auth("Basic dTpwOnE="));
+        // A username with no password carries no colon either.
+        assert_eq!(sent("user"), auth("Basic dXNlcg=="));
+        assert_eq!(sent("user:"), auth("Basic dXNlcjo="));
+        assert_eq!(sent(":pass"), auth("Basic OnBhc3M="));
+
+        // ── the JSON object ──
+        assert_eq!(sent(r#"{"username":"u","password":"p"}"#), auth("Basic dTpw"));
+        // `"proxy":true` re-addresses the credentials at the proxy.
+        assert_eq!(
+            sent(r#"{"username":"u","password":"p","proxy":true}"#),
+            proxy("Basic dTpw")
+        );
+        assert_eq!(sent(r#"{"username":"u"}"#), auth("Basic dQ=="));
+        // A password alone still gets its colon, so the server sees two fields.
+        assert_eq!(sent(r#"{"password":"p"}"#), auth("Basic OnA="));
+        assert_eq!(sent(r#"{"username":null,"password":"p"}"#), auth("Basic OnA="));
+        // Non-strings are stringified (`String(username)`).
+        assert_eq!(sent(r#"{"username":123,"password":true}"#), auth("Basic MTIzOnRydWU="));
+        // Naming neither half sends nothing — and so does a JSON object
+        // upstream cannot parse, which it turns into an empty one.
+        assert_eq!(sent("{}"), None);
+        // (A value with a space in it would be two tokens on the line, so the
+        // unparseable case is spelled without one.)
+        assert_eq!(sent("{not-json}"), None);
+        // `!!obj.proxy`, so the JSON `false` really is false.
+        assert_eq!(sent(r#"{"username":"u","proxy":false}"#), auth("Basic dQ=="));
+        // …but the *string* `"false"` is not.
+        assert_eq!(sent(r#"{"username":"u","proxy":"false"}"#), proxy("Basic dQ=="));
+
+        // ── `username=…&password=…` ──
+        assert_eq!(sent("username=u&password=p"), auth("Basic dTpw"));
+        assert_eq!(sent("username=u"), auth("Basic dQ=="));
+        assert_eq!(sent("password=p"), auth("Basic OnA="));
+        assert_eq!(sent("username=u&password=p&proxy=1"), proxy("Basic dTpw"));
+        // Every query value is a non-empty string, so `proxy=false` is **true**
+        // here. Use the JSON spelling when the answer is no.
+        assert_eq!(sent("username=u&password=p&proxy=false"), proxy("Basic dTpw"));
+        // Values are taken raw: `parseQuery` is given the escaping decoder, so
+        // a `%2F` reaches the server as `%2F` and a `+` stays a `+`.
+        assert_eq!(sent("username=u&password=p%2Fx"), auth("Basic dTpwJTJGeA=="));
+        assert_eq!(sent("username=a+b&password=p"), auth("Basic YStiOnA="));
+        // Only the first `=` splits a pair.
+        assert_eq!(sent("username=u&password=a=b"), auth("Basic dTphPWI="));
+        assert_eq!(sent("username=u&password="), auth("Basic dTo="));
+        // `AUTH_RE` is anchored *and* case-sensitive, so this is not the query
+        // form at all — it falls through to the colon split and is sent whole.
+        assert_eq!(
+            sent("Username=u&password=p"),
+            auth("Basic VXNlcm5hbWU9dSZwYXNzd29yZD1w")
+        );
+
+        // Deliberate divergence: upstream reads a value containing a slash as a
+        // *file reference* and sends nothing when it cannot (`SLASH_RE`,
+        // `util/index.js:3654-3656`). With no rule-value loader here, splitting
+        // on the colon is what a password with a slash in it needs.
+        assert_eq!(sent("u:pa/ss"), auth("Basic dTpwYS9zcw=="));
     }
 
     #[test]
@@ -7775,6 +8044,43 @@ mod tests {
         );
     }
 
+    /// …but a **form POST** is not one of the bodies it leaves alone, which is
+    /// where this port had it wrong (`handleReplace`,
+    /// `_original/lib/inspectors/req.js:434-438`).
+    ///
+    /// `getContentType` puts `application/x-www-form-urlencoded` in no class,
+    /// and the gate refuses everything unclassified — so upstream substitutes
+    /// the class `FORM` for it first. Without that substitution `reqReplace://`
+    /// was inert against the single commonest request body there is, and
+    /// silently so.
+    #[test]
+    fn req_replace_reaches_a_form_post() {
+        let resolved = resolve("example.com reqReplace://old=new\n", "http://example.com/");
+        let sent = |method: &str, ct: Option<&str>| {
+            let ctx = ReqBodyCtx { method, content_type: ct };
+            let out = transform_req_body(Bytes::from_static(b"q=old"), &resolved, ctx);
+            String::from_utf8(out.to_vec()).expect("utf-8")
+        };
+        let form = Some("application/x-www-form-urlencoded");
+
+        assert_eq!(sent("POST", form), "q=new");
+        // The charset parameter does not change the answer.
+        assert_eq!(
+            sent("POST", Some("application/x-www-form-urlencoded; charset=UTF-8")),
+            "q=new"
+        );
+        // `isUrlEncoded` is POST-only, so a `PUT` carrying the same body takes
+        // the ordinary path — and `getContentType` gives it no class.
+        assert_eq!(sent("PUT", form), "q=old");
+        // A method that carries no body is refused before the type is looked
+        // at (`hasRequestBody`, `common.js:1591-1604`).
+        assert_eq!(sent("GET", Some("text/plain")), "q=old");
+        assert_eq!(sent("OPTIONS", Some("text/plain")), "q=old");
+        // The classes that did already work still do.
+        assert_eq!(sent("POST", Some("application/json")), "q=new");
+        assert_eq!(sent("PUT", Some("text/plain")), "q=new");
+    }
+
     #[test]
     fn res_cookies_replace_by_name() {
         let resolved = resolve(
@@ -8032,6 +8338,51 @@ mod tests {
         let mut headers = HeaderMap::new();
         apply_req_cookies(&mut headers, &resolved);
         assert_eq!(headers.get(hyper::header::COOKIE).unwrap(), "sid=x");
+    }
+
+    /// An empty header value is a value, not a deletion
+    /// (`extend(req.headers, data.headers)`,
+    /// `_original/lib/inspectors/req.js:105`; `res.js:927` on the other side).
+    ///
+    /// The port removed the header instead, which is a different rule with a
+    /// different spelling (`delete://reqHeaders.x`) and the opposite meaning to
+    /// any server that branches on a header being *present*. `ua://` and
+    /// `referer://` ride the same assignment and had the same bug.
+    #[test]
+    fn an_empty_header_value_is_sent_not_deleted() {
+        let resolved = resolve(
+            "example.com reqHeaders://x-a=&x-b=1 ua:// referer://\n",
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[
+            ("x-a", "arrived"),
+            ("user-agent", "MyUA"),
+            ("referer", "http://ref.test/"),
+        ]);
+        apply_request(&mut parts, &resolved);
+        for name in ["x-a", "user-agent", "referer"] {
+            assert_eq!(
+                parts.headers.get(name).map(|v| v.to_str().unwrap()),
+                Some(""),
+                "{name} must be sent empty, not dropped"
+            );
+        }
+        assert_eq!(parts.headers.get("x-b").unwrap(), "1");
+
+        // The response side assigns the same way.
+        let res = resolve("example.com resHeaders://x-a=\n", "http://example.com/");
+        let mut parts = res_parts(&[("x-a", "arrived")]);
+        apply_response(&mut parts, &res);
+        assert_eq!(parts.headers.get("x-a").map(|v| v.to_str().unwrap()), Some(""));
+
+        // Removal is still available, under its own name.
+        let del = resolve(
+            "example.com reqHeaders://x-a=1 delete://reqHeaders.x-a\n",
+            "http://example.com/",
+        );
+        let mut parts = req_parts(&[]);
+        apply_request(&mut parts, &del);
+        assert!(parts.headers.get("x-a").is_none());
     }
 
     /// Every `disable://` flag that strips a request header

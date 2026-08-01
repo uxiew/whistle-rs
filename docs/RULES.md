@@ -858,14 +858,14 @@ example.com/app.js     file:///Users/me/dev/app.js
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `reqHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace request headers (empty value deletes). Accumulates across lines. |
+| `reqHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace request headers. An empty value sends an **empty header**, not a deletion — use `delete://reqHeaders.x` for that. Accumulates across lines. |
 | `ua` | user-agent string | Set the `User-Agent` header |
 | `referer` | URL | Set the `Referer` header |
 | `method` | HTTP method | Override the request method |
 | `reqType` | MIME type or short name | Set the request `Content-Type` (`reqType://json`, `reqType://form`, …) |
 | `reqCharset` | charset | Set the charset on the request `Content-Type` |
 | `reqCors` | origin URL, `*`, or `method=…&headers=…` | Set the request `Origin`, and the `Access-Control-Request-Method` / `-Headers` preflight headers. A URL is reduced to its origin. `enable` is the *response*-side spelling and does nothing here. |
-| `auth` | `user:pass` | Add an HTTP Basic `Authorization` header |
+| `auth` | `user:pass`, `username=…&password=…`, or `{json}` | Add an HTTP Basic `Authorization` header — see below |
 | `forwardedFor` | IP | Set the `X-Forwarded-For` header |
 | `reqWrite` | file path | Append the request body to a file |
 
@@ -878,6 +878,34 @@ api.test/*    method://POST
 api.test      auth://admin:secret
 api.test      forwardedFor://203.0.113.7
 ```
+
+`ua://` and `referer://` are assignments too, so writing them with no value
+sends an empty header. `disable://ua` and `disable://referer` are the rules that
+remove one.
+
+#### `auth://` in three spellings
+
+| Value | Sends |
+|-------|-------|
+| `admin:secret` | `Authorization: Basic …` for `admin`/`secret` |
+| `username=admin&password=secret` | the same |
+| `{"username":"admin","password":"secret"}` | the same |
+| `{"username":"admin","password":"secret","proxy":true}` | **`Proxy-Authorization`** instead |
+
+Only the first colon splits, so a password may contain one. Naming one half is
+allowed and the two halves are not symmetric (`getAuthBasic`,
+`_original/lib/util/index.js:3668-3685`): a password with no username still
+carries its colon (`:secret`), a username with no password carries none
+(`admin`). A value naming neither sends no header at all.
+
+Two edges are upstream's and easy to trip over: the query spelling's `proxy` is
+read as `!!value`, so `proxy=false` is **true** — write the JSON form when the
+answer is no; and query values are taken raw, so a `%2F` in a password reaches
+the server as `%2F`.
+
+> whistle additionally reads a value containing a slash as a **file reference**
+> and sends nothing when it cannot load one. whistle-rs has no rule-value loader,
+> so it keeps splitting on the colon — which is what `auth://user:pa/ss` needs.
 
 ### Plugins
 
