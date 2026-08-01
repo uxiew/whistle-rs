@@ -851,3 +851,119 @@ fn index_html(state: &Arc<AppState>) -> String {
         .replace("__HOST__", &host)
         .replace("__PORT__", &state.config.port.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::rules::protocols;
+
+    /// The rules editor highlights whichever token the proxy will treat as the
+    /// **pattern**, and that is the whole reason the mode exists: whistle's line
+    /// grammar is positional, `example.com http://localhost:5173` and
+    /// `http://a.com/x host://1.2.3.4` look alike and split differently, and
+    /// writing one the wrong way round is the most common way to get a rule that
+    /// silently does nothing.
+    ///
+    /// So the two implementations have to agree — and they are in different
+    /// languages, in different files, and neither would notice the other
+    /// drifting. This runs the editor's classifier (in the JS engine the port
+    /// already carries for `resScript` and PAC) over the same lines the parser
+    /// gets, and holds the answers against each other.
+    #[test]
+    fn the_editor_and_the_parser_agree_on_what_a_pattern_is() {
+        use boa_engine::{Context, Source};
+
+        let mut ctx = Context::default();
+        // The mode is a browser file; it needs only enough of CodeMirror to
+        // register itself against.
+        ctx.eval(Source::from_bytes(
+            b"var CodeMirror = { defineMode: function(){}, defineMIME: function(){} };\
+              var window = { CodeMirror: CodeMirror };",
+        ))
+        .expect("stub CodeMirror");
+        ctx.eval(Source::from_bytes(include_str!("ui/mode-whistle.js")))
+            .expect("mode-whistle.js evaluates");
+
+        for line in [
+            // The forwarding rule, and the shape it is confused with.
+            "example.com http://localhost:5173",
+            "http://a.com/api host://1.1.1.1",
+            "example.com localhost:5173",
+            "example.com 1.2.3.4",
+            "example.com 1.2.3.4:8080",
+            // The swapped form, which is the only one that takes several patterns.
+            "host://9.9.9.9 a.com b.com c.com",
+            "proxy://1.1.1.1:8080 a.com b.com",
+            "127.0.0.1 example.com",
+            // Pattern kinds that announce themselves.
+            "$example.com host://1.1.1.1",
+            "!example.com host://1.1.1.1",
+            ":8080 host://1.1.1.1",
+            "/re/i host://1.1.1.1",
+            "//a.com/x host://1.1.1.1",
+            "^*.example.com/v0/** file:///mock/$1",
+            "*.example.com/api reqHeaders://X-Tenant=$1",
+            // Filters and line properties are neither.
+            "a.com host://1.1.1.1 includeFilter://m:GET lineProps://important",
+            "includeFilter://m:GET a.com host://1.1.1.1",
+            // A line that configures nothing.
+            "host://x proxy://y",
+        ] {
+            let js = format!(
+                "JSON.stringify(CodeMirror.__whistleClassify({}).map(function(t){{return t.role}}))",
+                serde_json::to_string(line).expect("a JSON string")
+            );
+            let editor: Vec<String> = serde_json::from_str(
+                &ctx.eval(Source::from_bytes(js.as_bytes()))
+                    .expect("classify runs")
+                    .to_string(&mut ctx)
+                    .expect("a string")
+                    .to_std_string_escaped(),
+            )
+            .expect("an array of roles");
+
+            assert_eq!(editor, parser_roles(line), "{line}");
+        }
+    }
+
+    /// What the *parser* calls each token on `line`, in the editor's vocabulary.
+    ///
+    /// Read out of [`crate::rules::split_line`] — the function `parse_line`
+    /// itself uses — rather than restated here, so this cannot agree with a
+    /// parser that has since changed.
+    fn parser_roles(line: &str) -> Vec<String> {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let split = crate::rules::split_line(&tokens);
+        tokens
+            .iter()
+            .map(|t| {
+                let role = if t.starts_with("lineProps://") {
+                    "props"
+                } else if crate::rules::is_filter_spelling(t) {
+                    "filter"
+                } else {
+                    match &split {
+                        // No pattern: the line configures nothing.
+                        None => "dead",
+                        Some((patterns, _)) if patterns.contains(t) => "pattern",
+                        Some(_) => "operator",
+                    }
+                };
+                role.to_string()
+            })
+            .collect()
+    }
+
+    /// Every protocol the editor colours as an operator has to be one the parser
+    /// recognises, or the highlighting would promise an effect that never comes.
+    #[test]
+    fn the_editors_filter_spellings_are_the_parsers() {
+        for name in ["includeFilter", "excludeFilter", "filter", "ignore"] {
+            assert!(
+                crate::rules::is_filter_spelling(&format!("{name}://m:GET")),
+                "{name}"
+            );
+        }
+        assert!(!crate::rules::is_filter_spelling("host://1.2.3.4"));
+        assert!(protocols::is_protocol(protocols::URL_REPLACE));
+    }
+}

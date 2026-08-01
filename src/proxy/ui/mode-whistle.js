@@ -198,4 +198,10 @@
   });
 
   CodeMirror.defineMIME('text/x-whistle', 'whistle');
+
+  // Exposed for one test, not for the page. The proxy holds this classification
+  // against its own `index_of_pattern` over the same lines, so the editor and
+  // the parser cannot drift into disagreeing about which token is the pattern
+  // — which is the one thing this mode exists to answer.
+  CodeMirror.__whistleClassify = classify;
 })(window.CodeMirror);

@@ -1213,21 +1213,20 @@ pub fn parse_text(text: &str) -> Vec<Rule> {
     out
 }
 
-/// Parse one logical rule line into **one rule per pattern**.
+/// Split a line's tokens into its patterns and its operators, or `None` when
+/// the line has no pattern and therefore configures nothing.
 ///
-/// whistle splits a line's tokens into patterns and operators regardless of
-/// order, then produces a rule for every (operator set × pattern) pair — which
-/// is what makes `host://1.1.1.1 a.com b.com` apply to *both* hosts, and what
-/// the multi-line `line`…`` block relies on. Returning a single rule silently
-/// dropped every pattern after the first.
-fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
+/// Public because the console's rules editor highlights the same split, and the
+/// two must not drift: what the editor paints as a pattern has to be what this
+/// function calls one. A test in [`crate::proxy::webui`] runs both over the same
+/// lines. (The filter and line-property tokens are *not* separated here — they
+/// come out among the operators and are sorted in [`parse_line`], which is also
+/// where upstream sorts them.)
+pub fn split_line<'t>(tokens: &[&'t str]) -> Option<(Vec<&'t str>, Vec<&'t str>)> {
     // Where the line's pattern sits decides how the rest is read — see
     // [`index_of_pattern`]. A line with no pattern at all configures nothing,
     // which is upstream's `if (patternIndex === -1) return`.
-    let Some(pattern_index) = index_of_pattern(tokens) else {
-        return Vec::new();
-    };
-    let (pattern_toks, op_toks): (Vec<&str>, Vec<&str>) = match pattern_index {
+    Some(match index_of_pattern(tokens)? {
         // `pattern op1 op2 …`: the first token is the pattern and every other
         // token is an operator, however it is shaped.
         0 => (vec![tokens[0]], tokens[1..].to_vec()),
@@ -1246,6 +1245,25 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
             }
             (patterns, ops)
         }
+    })
+}
+
+/// Is this token a filter condition rather than an operator? The console's
+/// editor asks the same question to colour it.
+pub fn is_filter_spelling(tok: &str) -> bool {
+    is_filter_token(tok) || parse_ignore_filter(tok).is_some()
+}
+
+/// Parse one logical rule line into **one rule per pattern**.
+///
+/// whistle splits a line's tokens into patterns and operators regardless of
+/// order, then produces a rule for every (operator set × pattern) pair — which
+/// is what makes `host://1.1.1.1 a.com b.com` apply to *both* hosts, and what
+/// the multi-line `line`…`` block relies on. Returning a single rule silently
+/// dropped every pattern after the first.
+fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
+    let Some((pattern_toks, op_toks)) = split_line(tokens) else {
+        return Vec::new();
     };
 
     // Separate line properties, filter conditions and ordinary operators.
