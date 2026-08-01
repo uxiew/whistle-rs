@@ -1305,11 +1305,21 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(referer) = resolved.value("referer") {
         assign_header(&mut parts.headers, "referer", referer);
     }
-    if let Some(m) = resolved.value("method")
-        && let Ok(method) = m.to_uppercase().parse()
-    {
-        parts.method = method;
-    }
+    // `getMethod` runs on **every** request, not only one carrying a
+    // `method://`: `req.method = util.getMethod(data.method || req.method)`
+    // (`_original/lib/inspectors/req.js:536`, impl `util/common.js:1608-1613`).
+    // So a client that sent `post` reaches the origin as `POST`, and — more to
+    // the point here — the same normalised method is what every body gate then
+    // reads. An empty or unusable value falls back to `GET`, as upstream's does.
+    let method = resolved
+        .value("method")
+        .map(str::to_string)
+        .unwrap_or_else(|| parts.method.to_string());
+    parts.method = method
+        .trim()
+        .to_ascii_uppercase()
+        .parse()
+        .unwrap_or(hyper::Method::GET);
     if let Some(ct) = resolved.value("reqType") {
         set_content_type(&mut parts.headers, ct, req_type_alias);
     }
@@ -1931,7 +1941,8 @@ pub fn apply_response(parts: &mut response::Parts, resolved: &Resolved) {
 /// written on the line (`_original/lib/inspectors/res.js:820-950`): cookies and
 /// CORS go straight onto the upstream headers, then `resHeaders` — with `cache`
 /// and `attachment` folded into it — overwrites them, then `resType`, the
-/// charset pass, `headerReplace`, and finally the `delete://` keys.
+/// charset pass, `headerReplace`, the `Location` re-encode, and — last of all,
+/// after the injection's CSP and cache strips — the `delete://` keys.
 pub fn apply_response_for(
     parts: &mut response::Parts,
     resolved: &Resolved,
@@ -1945,9 +1956,29 @@ pub fn apply_response_for(
             .parse::<u16>()
             .ok()
             .and_then(|c| StatusCode::from_u16(c).ok())
+        // `replaceStatus != _res.statusCode` (`res.js:827`). Without the guard a
+        // `replaceStatus://401` on a response that was *already* a 401 wrote a
+        // `WWW-Authenticate: Basic` the origin had not asked for — and a browser
+        // answers that with a login box.
+        && status != parts.status
     {
         parts.status = status;
-        handle_status_code(&mut parts.headers, status);
+        // `disable://userLogin` suppresses the challenge without suppressing the
+        // status change (`isDisableUserLogin`,
+        // `_original/lib/util/index.js:3558-3563`); `enable://userLogin` wins
+        // over it. Upstream also reads the two from the line's own properties,
+        // which this port does not carry this far.
+        let en = enabled_flags(resolved);
+        if en.contains("userLogin") || !disabled_flags(resolved).contains("userLogin") {
+            handle_status_code(&mut parts.headers, status);
+        }
+    }
+    // `disable://301` — hand back a `302` instead, so the browser does not cache
+    // the redirect permanently (`_original/lib/inspectors/res.js:833-835`). This
+    // is the flag you reach for once a site has already taught the browser a
+    // `301` you now need to override, and it was not implemented.
+    if parts.status == StatusCode::MOVED_PERMANENTLY && disabled_flags(resolved).contains("301") {
+        parts.status = StatusCode::FOUND;
     }
     // Resolved before the cookies, because `delete://resCookies.x` is *served*
     // as a cookie rather than applied as a removal — see [`expiring_cookies`].
@@ -1969,7 +2000,26 @@ pub fn apply_response_for(
         del.drop_charset,
     );
     apply_header_replace(&mut parts.headers, resolved, HeaderScope::Response);
-    apply_deletes(&mut parts.headers, &del, false);
+    // Node's URL layer only speaks ASCII, so a `Location` carrying anything else
+    // reaches the browser as mojibake; whistle percent-encodes it right here,
+    // after `headerReplace` has had its say (`res.js:946-949`). A rule that
+    // redirects to a path with a non-Latin-1 character in it needs this.
+    //
+    // Read as UTF-8 rather than through `to_str`, which refuses the very bytes
+    // this exists to encode; a value that is not UTF-8 at all is left alone,
+    // since there is no encoding to read it under. That last part is where this
+    // is *wider* than upstream: Node hands its header values over as latin-1
+    // strings, one character per byte, so an **origin's** raw-UTF-8 `Location`
+    // matches nothing in `G_NON_LATIN1_RE` and passes through unencoded there.
+    // Encoding it is the conformant answer and the one a browser follows.
+    if let Some(location) = parts
+        .headers
+        .get(hyper::header::LOCATION)
+        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+        .map(encode_non_latin1)
+    {
+        assign_header(&mut parts.headers, "location", &location);
+    }
 
     // Injected content is useless behind a CSP that forbids it, or cached for
     // the next load; whistle strips both (`res.js:1093-1101`).
@@ -1988,6 +2038,13 @@ pub fn apply_response_for(
             disable_res_store(&mut parts.headers);
         }
     }
+
+    // After the strip above, not before it, which is upstream's order
+    // (`res.js:1160-1165` against `:1097-1104`) and the whole point of the
+    // operator: `resAppend://x delete://resHeaders.cache-control` has to be able
+    // to take away the `Cache-Control: no-store` the injection just wrote, and
+    // deleting first left it standing.
+    apply_deletes(&mut parts.headers, &del, false);
 
     disable_res_props(&mut parts.headers, resolved);
     apply_show_host(&mut parts.headers, resolved, info);
@@ -8652,6 +8709,179 @@ mod tests {
         let mut headers = HeaderMap::new();
         apply_req_cookies(&mut headers, &resolved);
         assert_eq!(headers.get(hyper::header::COOKIE).unwrap(), "sid=x");
+    }
+
+    /// The request method is uppercased on **every** request, not only one
+    /// carrying a `method://` (`req.method = util.getMethod(data.method ||
+    /// req.method)`, `_original/lib/inspectors/req.js:536`, impl
+    /// `util/common.js:1608-1613`).
+    ///
+    /// It matters beyond tidiness: the normalised method is what every
+    /// body gate downstream reads, so a client sending `post` was treated as a
+    /// method that carries no body and had its `reqBody://` silently dropped.
+    #[test]
+    fn the_method_is_uppercased_whether_or_not_a_rule_names_one() {
+        let sent = |rule: &str, arrived: &str| {
+            let resolved = resolve(
+                &format!("example.com {rule}\n"),
+                "http://example.com/",
+            );
+            let mut parts = hyper::Request::builder()
+                .method(arrived)
+                .uri("http://example.com/")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            apply_request(&mut parts, &resolved);
+            parts.method.to_string()
+        };
+
+        // No `method://` at all: the client's own spelling is normalised.
+        assert_eq!(sent("host://1.1.1.1", "post"), "POST");
+        assert_eq!(sent("host://1.1.1.1", "GET"), "GET");
+        // A rule's value is normalised the same way, and trimmed.
+        assert_eq!(sent("method://put", "GET"), "PUT");
+        // An unusable value falls back to `GET`, as `getMethod` does.
+        assert_eq!(sent("method://", "POST"), "GET");
+    }
+
+    /// `replaceStatus://` only writes the auth challenge when the status
+    /// actually changed (`replaceStatus != _res.statusCode`,
+    /// `_original/lib/inspectors/res.js:826-832`).
+    ///
+    /// Without the guard a rule pinned to `401` wrote a `WWW-Authenticate:
+    /// Basic` onto a response that was *already* a 401 and had deliberately not
+    /// asked for one — and a browser answers that header with a login box.
+    #[test]
+    fn replace_status_only_challenges_when_the_status_changed() {
+        let challenge = |rule: &str, from: u16| {
+            let resolved = resolve(&format!("example.com {rule}\n"), "http://example.com/");
+            let mut parts = Response::builder()
+                .status(from)
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            apply_response(&mut parts, &resolved);
+            (
+                parts.status.as_u16(),
+                parts
+                    .headers
+                    .get("www-authenticate")
+                    .map(|v| v.to_str().unwrap().to_string()),
+            )
+        };
+
+        // A real change still challenges.
+        assert_eq!(
+            challenge("replaceStatus://401", 200),
+            (401, Some("Basic realm=User Login".to_string()))
+        );
+        // Replacing a status with itself does not.
+        assert_eq!(challenge("replaceStatus://401", 401), (401, None));
+        // `disable://userLogin` suppresses the challenge without suppressing
+        // the status change (`isDisableUserLogin`, `util/index.js:3558-3563`)…
+        assert_eq!(
+            challenge("replaceStatus://401 disable://userLogin", 200),
+            (401, None)
+        );
+        // …and `enable://userLogin` wins over it.
+        assert_eq!(
+            challenge("replaceStatus://401 disable://userLogin enable://userLogin", 200),
+            (401, Some("Basic realm=User Login".to_string()))
+        );
+        // 407 takes the proxy spelling.
+        let resolved = resolve("example.com replaceStatus://407\n", "http://example.com/");
+        let mut parts = res_parts(&[]);
+        apply_response(&mut parts, &resolved);
+        assert_eq!(
+            parts.headers.get("proxy-authenticate").unwrap(),
+            "Basic realm=User Login"
+        );
+    }
+
+    /// `disable://301` hands back a `302` instead
+    /// (`_original/lib/inspectors/res.js:833-835`).
+    ///
+    /// This is the flag you reach for once a site has taught the browser a
+    /// permanent redirect you now need to override, and it did nothing.
+    #[test]
+    fn disable_301_downgrades_the_redirect() {
+        let status = |rule: &str, from: u16| {
+            let resolved = resolve(&format!("example.com {rule}\n"), "http://example.com/");
+            let mut parts = Response::builder().status(from).body(()).unwrap().into_parts().0;
+            apply_response(&mut parts, &resolved);
+            parts.status.as_u16()
+        };
+        assert_eq!(status("disable://301", 301), 302);
+        // Only a 301, and only with the flag.
+        assert_eq!(status("disable://301", 302), 302);
+        assert_eq!(status("disable://301", 308), 308);
+        assert_eq!(status("host://1.1.1.1", 301), 301);
+        // It runs after `replaceStatus://`, so a rule that *produces* a 301 is
+        // downgraded too.
+        assert_eq!(status("replaceStatus://301 disable://301", 200), 302);
+    }
+
+    /// `Location` is percent-encoded on the way out (`encodeNonLatin1Char`,
+    /// `_original/lib/inspectors/res.js:946-949`).
+    ///
+    /// Node's URL layer only speaks ASCII, so a redirect to a path with a
+    /// non-Latin-1 character in it reached the browser as mojibake — or, here,
+    /// as a header value hyper would not carry at all.
+    #[test]
+    fn location_is_re_encoded() {
+        let location = |rules: &str, arrived: &str| {
+            let resolved = resolve(rules, "http://example.com/");
+            let mut parts = res_parts(&[("location", arrived)]);
+            apply_response(&mut parts, &resolved);
+            parts
+                .headers
+                .get("location")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            location("example.com host://1.1.1.1\n", "/搜索"),
+            Some("/%E6%90%9C%E7%B4%A2".to_string())
+        );
+        // ASCII is left exactly as it is.
+        assert_eq!(
+            location("example.com host://1.1.1.1\n", "https://a.test/x?y=1"),
+            Some("https://a.test/x?y=1".to_string())
+        );
+        // The encode runs *after* the header operators, so a `Location` a rule
+        // wrote is encoded too — upstream's order, `extend` at `res.js:927`
+        // against the encode at `:946`.
+        assert_eq!(
+            location("example.com resHeaders://location=/搜\n", "/x/y"),
+            Some("/%E6%90%9C".to_string())
+        );
+    }
+
+    /// `delete://resHeaders.x` runs **after** the injection's CSP and
+    /// cache strips (`_original/lib/inspectors/res.js:1160-1165` against
+    /// `:1097-1104`), so it can take away what they just wrote.
+    ///
+    /// Deleting first left the `Cache-Control: no-store` standing, which is the
+    /// one header anyone writes this pair of rules to get rid of.
+    #[test]
+    fn a_delete_outlives_the_injections_own_headers() {
+        let resolved = resolve(
+            "example.com resAppend://x delete://resHeaders.cache-control\n",
+            "http://example.com/",
+        );
+        let mut parts = res_parts(&[("content-type", "text/html"), ("cache-control", "max-age=60")]);
+        apply_response(&mut parts, &resolved);
+        assert!(
+            parts.headers.get("cache-control").is_none(),
+            "the injection's own no-store must be deletable"
+        );
+        // …and the injection still writes it when nothing deleted it.
+        let kept = resolve("example.com resAppend://x\n", "http://example.com/");
+        let mut parts = res_parts(&[("content-type", "text/html")]);
+        apply_response(&mut parts, &kept);
+        assert_eq!(parts.headers.get("cache-control").unwrap(), "no-store");
     }
 
     /// An empty header value is a value, not a deletion

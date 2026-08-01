@@ -861,7 +861,7 @@ example.com/app.js     file:///Users/me/dev/app.js
 | `reqHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace request headers. An empty value sends an **empty header**, not a deletion — use `delete://reqHeaders.x` for that. Accumulates across lines. |
 | `ua` | user-agent string | Set the `User-Agent` header |
 | `referer` | URL | Set the `Referer` header |
-| `method` | HTTP method | Override the request method |
+| `method` | HTTP method | Override the request method. The method is uppercased on **every** request, rule or no rule, and an unusable value falls back to `GET` |
 | `reqType` | MIME type or short name | Set the request `Content-Type` (`reqType://json`, `reqType://form`, …) |
 | `reqCharset` | charset | Set the charset on the request `Content-Type` |
 | `reqCors` | origin URL, `*`, or `method=…&headers=…` | Set the request `Origin`, and the `Access-Control-Request-Method` / `-Headers` preflight headers. A URL is reduced to its origin. `enable` is the *response*-side spelling and does nothing here. |
@@ -1069,6 +1069,10 @@ the request on its way out, or from the response on its way back:
 | `cookie` / `cookies` / `resCookie` / `resCookies` | drops `Set-Cookie` |
 | `cache` | `Cache-Control: no-cache` plus a past `Expires` and `Pragma` |
 | `csp` | drops the `Content-Security-Policy` headers |
+| `301` | turns a `301 Moved Permanently` into a `302 Found`, so the browser does not cache the redirect |
+| `userLogin` | withholds the `WWW-Authenticate` / `Proxy-Authenticate` challenge a `replaceStatus://401\|407` would send (`enable://userLogin` wins over it) |
+| `trailers` / `trailer` | sends no trailer section at all — the origin's included |
+| `trailerHeader` | sends the trailers without the `Trailer:` header announcing them |
 | `doctype` | no `<!DOCTYPE html>` before an HTML prepend |
 
 A flag this port does not recognise is **inert** — it parses and does nothing,
@@ -1232,7 +1236,7 @@ slow.example.com   resSpeed://20        # ~20 KB/s download
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `replaceStatus` / `statusCode` | status number | Replace the upstream response status (401/407 also send the matching auth challenge) |
+| `replaceStatus` / `statusCode` | status number | Replace the upstream response status. A **changed** 401/407 also sends the matching auth challenge; `disable://userLogin` withholds it |
 | `resHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace response headers. An empty value sends an **empty header**, not a deletion — use `delete://resHeaders.x`. `set-cookie` merges instead of replacing; see below. Accumulates across lines. |
 | `resType` | MIME type or short name | Set the response `Content-Type` |
 | `resCharset` | charset | Set the charset on the response `Content-Type` |
@@ -1504,6 +1508,22 @@ blocked) and the response is made uncacheable. `enable://keepCSP` and
 `enable://keepCache` opt out of each; an explicit `cache://` also survives.
 A non-empty prepend into an **HTML** response is additionally preceded by
 `<!DOCTYPE html>`, which `disable://doctype` turns off.
+
+The response *head* has an order of its own, and one part of it is worth
+knowing: `delete://resHeaders.x` runs **after** those two side effects
+(`_original/lib/inspectors/res.js:1160-1165` against `:1097-1104`), so it can
+take away what the injection just wrote —
+
+```
+example.com   resAppend://<!-- x -->   delete://resHeaders.cache-control
+```
+
+— leaves the response with no `Cache-Control` at all, rather than with the
+`no-store` the injection stamped on it.
+
+`Location` is percent-encoded on the way out (`encodeNonLatin1Char`,
+`res.js:946-949`), after every header operator has had its say, so a redirect to
+a path with a non-ASCII character in it arrives intact.
 
 #### `*Replace` details
 
