@@ -587,7 +587,15 @@ mod tests {
             // Resolution of a literal is the literal; localhost is resolvable.
             ("dnsResolve('10.9.8.7')", "'10.9.8.7'"),
             ("isResolvable('localhost')", "true"),
-            ("dnsResolve('no-such-host.invalid') === null", "true"),
+            // A name that cannot resolve answers `null` rather than throwing.
+            // The obvious probe — a name under the reserved `.invalid` TLD —
+            // cannot be used: a resolver that answers NXDOMAIN with an address
+            // of its own (a captive portal, or the fake-IP mode every desktop
+            // VPN client ships) resolves it, and the test would then fail on the
+            // network rather than on the code. An empty host never reaches a
+            // resolver at all: `getaddrinfo` rejects it locally.
+            ("dnsResolve('') === null", "true"),
+            ("isResolvable('')", "false"),
             ("typeof myIpAddress()", "'string'"),
             ("typeof myIpAddressEx()", "'string'"),
             ("typeof getClientVersion()", "'string'"),

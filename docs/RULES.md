@@ -98,15 +98,62 @@ matches `example.com`, `www.example.com`, `a.b.example.com`, …
 
 ### 3. Wildcard
 
-A pattern containing `*` is compiled to an anchored regular expression, with `*`
-meaning "any characters":
+`*` is a wildcard **in the host**, and a literal everywhere else — `*` is a legal
+character in a URL path, so whistle will not silently take it away from you
+(`_original/docs/docs/rules/pattern.md`, "域名通配符"):
+
+| in the host | matches |
+|-------------|---------|
+| `*` | any run of characters **without a dot** — `[^/?.]*` |
+| `**` | any run without `/` or `?` — `[^/?]*` |
+| `***` and up | as `**`, and the dot after it becomes optional |
 
 ```
-*.example.com/api/*   redirect://https://api.internal/
-http://*/track.gif    statusCode://204
+*.example.com          host://10.0.0.9      # www.example.com, but not a.b.example.com
+**.example.com:8*      host://10.0.0.9      # any depth, any 8xxx port
+.example.com           host://10.0.0.9      # the domain itself and every subdomain
 ```
 
-### 4. Regular expression
+The path after the host is matched as an ordinary prefix, on the same segment
+boundary as any other pattern.
+
+### 4. `^` — wildcards everywhere
+
+Prefix the pattern with `^` and `*` becomes a wildcard in the **path and query**
+as well, with a reach that depends on how many you write:
+
+| | path | query |
+|---|---|---|
+| `*` | within one segment (`[^?/]*`) | within one value (`[^&]*`) |
+| `**` | across segments, up to the `?` (`[^?]*`) | the rest, `&` included (`.*`) |
+| `***` | everything left, `?` included (`.*`) | — |
+
+A trailing `$` anchors the end, and a `^` pattern is case-insensitive (write `^^`
+to keep case significant):
+
+```
+^https://*.example.com/path/*/to$    statusCode://204
+^http://*.example.com/v0/users/**    file:///mock/$1/$2
+```
+
+### `$0`…`$9` — what the pattern captured
+
+A regexp or wildcard pattern hands what it matched to the operators on its line.
+`$0` is the request URL; `$1`…`$9` are the groups, left to right — each `*` in a
+`^` pattern is one, as is each `( )` in a regexp:
+
+```
+^http://*.example.com/v0/users/**       file:///mock/$1/$2
+/\/regexp\/(user|admin)\/(\d+)/         reqHeaders://X-Type=$1&X-ID=$2
+*.example.com/api                       reqHeaders://X-Tenant=$1
+```
+
+`$$1` inserts the group **percent-encoded**, and `\$1` is a literal `$1` — the
+same escapes the [`*Replace` operators](#replacing-inside-a-value) use, because it
+is the same expander. A pattern with no groups substitutes nothing, so a `$1` in
+one of its values stays as written.
+
+### 5. Regular expression
 
 A pattern wrapped in slashes is a regex tested against the **full request URL**
 (`scheme://host[:port]/path?query`). A trailing `i` makes it case-insensitive:
@@ -116,7 +163,7 @@ A pattern wrapped in slashes is a regex tested against the **full request URL**
 /^https:\/\/cdn\./i   host://10.0.0.9
 ```
 
-### 5. Port
+### 6. Port
 
 A bare `:<port>` scopes a rule to a port, whatever the host:
 
@@ -158,6 +205,26 @@ An operator is `protocol://value`. whistle-rs recognises the **full whistle prot
 list** at parse time, and applies essentially all of the common operators at runtime
 (see [Operator coverage](#operator-coverage) for the exceptions).
 
+### Where the pattern sits
+
+The first token of a line is the pattern and **every other token is an operator** —
+by position, not by shape. That is what makes `example.com http://localhost:5173`
+a forwarding rule rather than two patterns.
+
+The one exception is whistle's swapped form, which lets an operator lead so that
+several patterns can share it:
+
+```
+example.com    http://localhost:5173     # pattern, then operators
+host://9.9.9.9  a.com  b.com  c.com      # operator, then patterns
+```
+
+whistle decides which form it is looking at by scanning for the first token that
+can only be a pattern (`indexOfPattern`, `_original/lib/rules/rules.js:1449`). A
+token with a `scheme://` is never it, and a **bare IP address** is never it either
+— an IP is the `host://` shorthand. A *name* with a port is not that shorthand:
+`localhost:8080` is a destination, `127.0.0.1:8080` is a host override.
+
 ### Shorthands
 
 | You write | Interpreted as |
@@ -165,11 +232,13 @@ list** at parse time, and applies essentially all of the common operators at run
 | `127.0.0.1:8080` | `host://127.0.0.1:8080` |
 | `127.0.0.1` | `host://127.0.0.1` |
 | `/abs/path` · `~/f` · `./f` | `file:///abs/path` … |
+| any other URL | a destination — see below |
 
 ### Destination
 
 | Operator | Value | Effect |
 |----------|-------|--------|
+| *(a bare URL)* | `[scheme://]host[:port][/path]` | **Forward the request** to that URL: the socket, the `Host` header, the path and the scheme all move |
 | `host` | `ip` / `ip:port` / `host:port` / `:port` | Rewrite the upstream destination. The **Host header and TLS SNI keep the original hostname**, only the socket destination changes. `:port` keeps the host, changes the port. |
 | `xhost` | as `host` | The **pass-through** spelling: the address is used when it works and *ignored* when the connection cannot be made, where `host://` fails the request. |
 
@@ -178,6 +247,54 @@ api.example.com   host://127.0.0.1:9000
 .example.com      host://:8443            # same host, force port 8443
 api.example.com   xhost://127.0.0.1:9000  # …unless nothing is listening there
 ```
+
+#### Forwarding to another URL
+
+A bare URL is whistle's most-used rule: it replaces the request's URL outright.
+The scheme may be omitted, in which case the request's own is kept:
+
+```
+www.example.com        http://localhost:5173     # a site served by a dev server
+www.example.com/api    https://staging/v2        # …and its API somewhere else
+www.example.com        //localhost:5173          # keep https if the request was https
+www.example.com        localhost:5173            # same thing, spelled shorter
+```
+
+The difference from `host://` is worth stating once, because both "point the
+request somewhere else" and only one of them is visible to the origin:
+
+| | socket | `Host:` header | path | scheme |
+|---|---|---|---|---|
+| `host://1.2.3.4` | moves | **kept** | kept | kept |
+| `http://localhost:5173` | moves | **moves** | rewritten | moves |
+
+**The rest of the path comes along.** Whatever the pattern did not consume is
+appended to the destination — the same "automatic path concatenation" that maps a
+directory onto a URL prefix:
+
+| rule | request | forwarded to |
+|------|---------|--------------|
+| `example.com http://localhost:5173` | `/a/b?q=1` | `http://localhost:5173/a/b?q=1` |
+| `example.com/api http://dev/v2` | `/api/users?x=2` | `http://dev/v2/users?x=2` |
+| `example.com file:///srv/static` | `/js/app.js?v=2` | `/srv/static/js/app.js` |
+
+Wrap the value in `< >` to turn that off, and in `( )` to give the value *as
+content* rather than as a location:
+
+```
+example.com/api  http://<dev.internal/fixed>       # always this exact URL
+example.com/api  file://({"status":"ok"})          # a one-line mock
+```
+
+A file rule may list alternatives with `|`, and each one takes the path:
+
+```
+static.example.com   file:///srv/a|/srv/b        # first one that exists wins
+```
+
+> `rule://<name>` is **not** a destination: it is this port's own spelling for
+> pulling a values-store entry in as more rules. Upstream files it in the same
+> place, where it can only ever produce the unusable URL `rule://<name>`.
 
 `xhost://` retries **once**, against the host and port the request actually asked for,
 and only when the connection could not be *established* — once the request has been
@@ -659,7 +776,7 @@ are real answers rather than filters that fail closed.
 |---|---|
 | `tunnel` | the request came out of a tunnel this proxy intercepted — a `CONNECT`, or a SOCKS connection |
 | `sni` | the intercepted TLS handshake named a server. A tunnel carrying plain HTTP is `tunnel` without being `sni` |
-| `composer` | the built-in Web UI replayed the request (the ↻ button / `POST /api/replay`) |
+| `composer` | the built-in console replayed the request (the Replay button / `POST /api/replay`) |
 | `test`, `httpserver`, `httpsserver`, `httpsport` | never, here — see below |
 
 ```
@@ -793,11 +910,13 @@ ordinary response inspectors (`_original/lib/inspectors/res.js:825`).
 api.example.com   plugin://mock  resHeaders://x-mocked=1  replaceStatus://503
 ```
 
-Not covered on that path: the plugins' own response hooks (`POST /response` and the
-streaming `pipe://` ones), which are still skipped when a plugin answered — they exist
-to transform an *upstream* response. Upstream would run them, since it establishes its
-response pipes for every matched plugin regardless of which one produced the bytes; the
-divergence is the remaining half of this gap.
+The plugins' own response hooks (`POST /response` and the streaming `pipe://` ones)
+run over that answer too, as they do over the origin's — including for the plugin
+that produced it, since upstream establishes its response pipes for every matched
+plugin regardless of which one wrote the bytes. See
+[`PLUGINS.md`](PLUGINS.md#本地产生的响应也走响应阶段). The one exception is an
+`onAuth` refusal, which upstream pins with `ignore://!…` and this port sends
+through untouched.
 
 ### Choosing the MITM certificate
 
@@ -902,7 +1021,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 | `pipe` | plugin name | Route through a registered server (like `plugin`) |
 
 `{name}` anywhere in an operator value is replaced with the content of the named value
-(from `--value name=…` or the web UI's Values panel).
+(from `--value name=…` or the console's Values pane).
 
 `disable://` takes one or more flags, `|`-separated. They strip something from
 the request on its way out, or from the response on its way back:
@@ -1416,8 +1535,10 @@ back to a direct connection — see [the upstream-proxy section](#upstream-proxy
 for what the retry does and does not cover. `enable`/`disable` apply a curated flag set on both
 sides of the request (see the [Flags](#flags-includes--values) tables — others are
 inert); `pipe` routes to a
-registered server like `plugin` (no mid-stream piping); `rule`/`rulesFile` pull in
-extra rules from the values store / a file; `{name}` in any operator value is
+registered server like `plugin` (no mid-stream piping); a **bare URL** forwards the
+request (see [Destination](#destination)), while the `rule://` spelling of that same
+protocol key pulls extra rules in from the values store, as `rulesFile://` does from a
+file; `{name}` in any operator value is
 substituted from the values store. `cipher` honours the portable part of Node's TLS
 options — `minVersion`/`maxVersion`/`secureProtocol` (or a bare `cipher://TLSv1.2`
 token) pin the **upstream** TLS protocol version; rustls exposes TLS 1.2 / 1.3 only,
@@ -1443,7 +1564,8 @@ string, then `${var}` runtime variables. See
 
 WebSocket frames are captured too: every intercepted `ws://`/`wss://` connection is
 recorded as a session (status `101`) and each frame (both directions) is surfaced —
-click the connection in the Network view, or fetch `/frames.json?id=<session>`.
+select the connection in the console and open its Frames tab, or fetch
+`/frames.json?id=<session>`.
 
 `enable://ignoreSend` and `enable://ignoreReceive` silence one direction of such a
 session: the frames are still **captured and flagged**, they are simply never
@@ -1460,7 +1582,9 @@ has no such control, so a pause here would be a stall nobody could lift.
 ### Multiple patterns and multi-line blocks
 
 One operator can serve several patterns on a line — the line expands to one rule
-per pattern:
+per pattern. This needs the **operator-first** form; written pattern-first, only
+the first token is a pattern and the rest are operators (see
+[Where the pattern sits](#where-the-pattern-sits)):
 
 ```
 host://127.0.0.1:8080   www.example.com  api.example.com  static.example.com
@@ -1498,7 +1622,7 @@ fragment is also treated as a comment, so `example.com/a#b file:///x` loses the
 | Operator(s) | Why / note |
 |-------------|-----------|
 | `G` | Global-rule marker (a rule-precedence concept, not a per-request traffic effect) |
-| `style` | Rule colour in whistle's rule list — the built-in UI is a plain editor with no per-rule rendering |
+| `style` | Rule colour in whistle's rule list — the console's rule editor is plain text with no per-rule rendering |
 
 ### Simplified vs. upstream
 

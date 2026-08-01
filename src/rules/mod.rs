@@ -16,7 +16,10 @@
 
 pub mod matcher;
 pub mod protocols;
+pub mod replace;
 pub mod storage;
+pub mod url;
+pub mod wildcard;
 
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
@@ -185,6 +188,9 @@ pub fn order_key(index: usize, important: bool) -> u64 {
 pub enum Pattern {
     /// `/regexp/flags` — tested against the full request URL.
     Regex(Regex),
+    /// A host wildcard (`*.example.com/api`): a regexp for the host part and an
+    /// ordinary prefix for the path. See [`wildcard`].
+    Wildcard(Box<wildcard::Wildcard>),
     /// Scheme/host/path prefix match (the common whistle case).
     Prefix {
         /// Restrict to this scheme (`http`/`https`/`ws`/…) if present.
@@ -202,6 +208,15 @@ pub enum Pattern {
     /// Matches every request (bare operator lines aren't produced here, but
     /// kept for completeness / `*` patterns collapse to this when trivial).
     Any,
+}
+
+impl Pattern {
+    /// Is this a bare host pattern, with no path of its own? Upstream's
+    /// `isDomain` (`_original/lib/rules/rules.js:1343-1348`) — a non-regexp,
+    /// non-negated pattern whose protocol- and query-stripped form has no `/`.
+    pub fn is_host_only(&self) -> bool {
+        matches!(self, Pattern::Prefix { path, .. } if path.is_empty())
+    }
 }
 
 /// A single parsed rule line.
@@ -230,6 +245,14 @@ pub struct Rule {
     /// (`_original/lib/rules/rules.js:1390-1392`), for the same reason: the body
     /// has to be buffered before resolution, and only these lines can ask.
     pub has_body_filter: bool,
+    /// Precomputed: does any operator on this line write `$0`…`$9`?
+    ///
+    /// Only then does a match have to collect what the pattern captured, which
+    /// costs ten small allocations. Upstream asks the same question per value
+    /// (`SUB_MATCH_RE`, `_original/lib/rules/rules.js:947-950`); asking once per
+    /// line at parse time answers it for free on the hot path, where the
+    /// overwhelming majority of rules contain no `$` at all.
+    pub has_capture_ref: bool,
 }
 
 impl Rule {
@@ -1198,18 +1221,31 @@ pub fn parse_text(text: &str) -> Vec<Rule> {
 /// the multi-line `line`…`` block relies on. Returning a single rule silently
 /// dropped every pattern after the first.
 fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
-    // Classify every token once. A token that looks like a pattern is one;
-    // everything else is an operator, filter or line property.
-    let (pattern_toks, op_toks): (Vec<&str>, Vec<&str>) =
-        tokens.iter().copied().partition(|t| looks_like_pattern(t));
-
-    // No pattern at all: whistle treats the first token as the pattern, which
-    // keeps `a.com host://x`-shaped lines working when `a.com` is not
-    // recognised as a pattern by itself.
-    let (pattern_toks, op_toks) = if pattern_toks.is_empty() {
-        (vec![tokens[0]], tokens[1..].to_vec())
-    } else {
-        (pattern_toks, op_toks)
+    // Where the line's pattern sits decides how the rest is read — see
+    // [`index_of_pattern`]. A line with no pattern at all configures nothing,
+    // which is upstream's `if (patternIndex === -1) return`.
+    let Some(pattern_index) = index_of_pattern(tokens) else {
+        return Vec::new();
+    };
+    let (pattern_toks, op_toks): (Vec<&str>, Vec<&str>) = match pattern_index {
+        // `pattern op1 op2 …`: the first token is the pattern and every other
+        // token is an operator, however it is shaped.
+        0 => (vec![tokens[0]], tokens[1..].to_vec()),
+        // `op1 … pattern1 pattern2 …`: the first token is an operator, and the
+        // rest split by shape. Upstream's filter is `isPattern(p) || isHost(p)
+        // || !hasProtocol(p)` — note that a bare address is a *pattern* on this
+        // side of the line, where it was an operator on the other.
+        _ => {
+            let (mut ops, mut patterns) = (vec![tokens[0]], Vec::new());
+            for tok in &tokens[1..] {
+                match is_pattern_token(tok) || parse_ip_shorthand(tok).is_some() || !has_protocol(tok)
+                {
+                    true => patterns.push(*tok),
+                    false => ops.push(*tok),
+                }
+            }
+            (patterns, ops)
+        }
     };
 
     // Separate line properties, filter conditions and ordinary operators.
@@ -1246,6 +1282,7 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
         .any(|op| protocols::is_res_phase(&op.protocol) || op.protocol == "ignore");
     let res_dependent = filters.iter().any(|f| f.cond.may_need_response());
     let has_body_filter = filters.iter().any(|f| matches!(f.cond, Cond::Body(_)));
+    let has_capture_ref = ops.iter().any(|op| replace::has_reference(&op.value));
 
     pattern_toks
         .into_iter()
@@ -1262,6 +1299,7 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
                 res_phase_ops,
                 res_dependent,
                 has_body_filter,
+                has_capture_ref,
             })
         })
         .collect()
@@ -1431,14 +1469,17 @@ fn parse_ignore_filter(tok: &str) -> Option<Filter> {
 fn parse_cond(spec: &str, pure_ok: bool) -> Option<(Cond, bool)> {
     match split_cond_name(spec, pure_ok) {
         Some((kind, rest)) => build_cond(kind, rest),
-        // Anything unrecognised is a URL pattern, matched exactly like a rule's
-        // own pattern. Only here may a `!` precede the payload: with a condition
-        // name present it belongs to the value, so `includeFilter://!m:GET` is a
-        // (negated) URL pattern upstream, not a method condition.
+        // Anything unrecognised is a URL pattern — compiled the way *filters*
+        // are, which is not the way a rule's own pattern is: every filter is
+        // read as if it carried a `^`, so its stars wildcard the path too
+        // ([`wildcard::parse_filter`]). Only here may a `!` precede the payload:
+        // with a condition name present it belongs to the value, so
+        // `includeFilter://!m:GET` is a (negated) URL pattern upstream, not a
+        // method condition.
         None => {
             let (negate, body) = strip_negation(spec);
-            let pattern = parse_pattern(body)?.pattern;
-            Some((Cond::Url(pattern), negate))
+            let re = wildcard::parse_filter(body)?;
+            Some((Cond::Url(Pattern::Regex(re)), negate))
         }
     }
 }
@@ -1563,35 +1604,89 @@ fn parse_probability(key: &str) -> f64 {
     parsed.unwrap_or(f64::NAN)
 }
 
-/// Heuristic: does this token read as a match pattern (vs. an operator)?
-fn looks_like_pattern(tok: &str) -> bool {
-    // Both pattern prefixes have to come off first, or `!/re/` and `!:8080`
-    // would not be recognised for what they are.
-    let t = tok.strip_prefix('!').unwrap_or(tok);
-    let t = t.strip_prefix('$').unwrap_or(t);
-    if t.starts_with('/') || t.starts_with(':') {
-        return true; // regexp or port pattern
+/// Does this token *look like* a pattern on its own — whistle's `isPattern`
+/// (`_original/lib/rules/rules.js:1403-1412`)?
+///
+/// "On its own" is the whole point: the answer decides nothing by itself, it
+/// only feeds [`index_of_pattern`], which is what actually splits a line. A
+/// token can be a pattern here and an operator on the line — `http://a.com` is a
+/// pattern when it comes first and a URL-replacement operator when it does not.
+fn is_pattern_token(tok: &str) -> bool {
+    // `!`-negated, `$`-exact, and `:8080` port patterns.
+    if tok.starts_with('!') || tok.starts_with('$') || port_pattern(tok).is_some() {
+        return true;
     }
-    // Line properties and filters are neither pattern nor operator. Classifying
-    // one as a pattern would both lose its effect and mint a rule that can
-    // never match, so they are excluded before anything else is considered.
-    if line_props_spec(t).is_some() {
-        return false;
-    }
-    if is_filter_token(t) {
-        return false;
-    }
-    // An operator has a known `protocol://` prefix.
-    if let Some((proto, _)) = split_protocol(t)
-        && protocols::is_protocol(proto)
+    // `//host/path` — a scheme-relative pattern.
+    if let Some(rest) = tok.strip_prefix("//")
+        && !rest.starts_with('/')
     {
-        return false;
+        return true;
     }
-    // A bare host:port / ip is an operator (hosts shorthand), not a pattern.
-    if is_host_shorthand(t) {
-        return false;
+    // A web-protocol URL, and a `/regexp/` — both unambiguous.
+    if web_protocol(tok).is_some() || is_regexp_token(tok) {
+        return true;
     }
-    true
+    // A `^`-prefixed wildcard URL (upstream's `isRegUrl`).
+    tok.starts_with('^')
+}
+
+/// The scheme of a token written with one of the four request schemes whistle
+/// recognises plus `tunnel` (`WEB_PROTOCOL_RE`, `_original/lib/rules/rules.js:22`).
+fn web_protocol(tok: &str) -> Option<&str> {
+    let (proto, _) = split_protocol(tok)?;
+    matches!(proto, "http" | "https" | "ws" | "wss" | "tunnel").then_some(proto)
+}
+
+/// A `/body/flags` regexp token (`util.isRegExp`).
+fn is_regexp_token(tok: &str) -> bool {
+    tok.starts_with('/') && tok.len() > 1 && tok.rfind('/').is_some_and(|end| end > 0)
+}
+
+/// whistle's `hasProtocol` — `/^[a-zA-Z0-9.-]+:\/\//`
+/// (`_original/lib/util/common.js:491-493`). Deliberately laxer than
+/// [`protocols::is_protocol`]: an operator whose protocol whistle does not know
+/// is still an operator (a URL-replacement rule), not a pattern.
+fn has_protocol(tok: &str) -> bool {
+    let Some((proto, _)) = split_protocol(tok) else {
+        return false;
+    };
+    !proto.is_empty()
+        && proto
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+}
+
+/// Where the pattern starts on a rule line — upstream's `indexOfPattern`
+/// (`_original/lib/rules/rules.js:1449-1466`).
+///
+/// `0` means the ordinary form (`pattern op1 op2 …`), in which **every**
+/// remaining token is an operator whatever its shape; anything else means the
+/// swapped form (`op pattern1 pattern2 …`) whistle also accepts. `None` means
+/// the line has no pattern and configures nothing.
+///
+/// The distinction is load-bearing rather than cosmetic. `example.com
+/// http://localhost:5173` — the forwarding rule whistle's own getting-started
+/// guide leads with — only works because the second token is an operator *by
+/// position*: judged on its own shape it reads as a URL pattern, and this port
+/// used to classify both tokens as patterns and drop the line entirely.
+fn index_of_pattern(tokens: &[&str]) -> Option<usize> {
+    let mut ip_index = None;
+    for (i, tok) in tokens.iter().enumerate() {
+        if is_pattern_token(tok) {
+            return Some(i);
+        }
+        if !has_protocol(tok) {
+            // A bare address is an operator (the hosts shorthand); anything else
+            // without a protocol can only be a pattern.
+            if parse_ip_shorthand(tok).is_none() {
+                return Some(i);
+            }
+            if ip_index.is_none() {
+                ip_index = Some(i);
+            }
+        }
+    }
+    ip_index
 }
 
 /// Split `proto://rest` → `(proto, rest)`.
@@ -1599,20 +1694,57 @@ fn split_protocol(tok: &str) -> Option<(&str, &str)> {
     tok.find("://").map(|i| (&tok[..i], &tok[i + 3..]))
 }
 
-/// Recognise a bare `host:port` / `ip[:port]` operator (whistle's hosts form).
-fn is_host_shorthand(tok: &str) -> bool {
-    if tok.contains("://") || tok.starts_with('/') {
-        return false;
+/// Recognise whistle's bare-address operator — `parseHost`
+/// (`_original/lib/rules/rules.js:1418-1440`) — returning the address and the
+/// port written beside it, if any.
+///
+/// The address has to be an **IP literal**: `net.isIP` is the whole test, so
+/// `127.0.0.1:8080` is this shorthand while `localhost:8080` is not. That is not
+/// a detail — a name with a port falls through to a URL-replacement rule
+/// upstream, which rewrites the `Host` header where `host://` would have
+/// preserved it. This port used to accept any `name:port` here and quietly gave
+/// the two forms the same meaning.
+///
+/// The two accepted spellings beyond a bare literal are upstream's: a bracketed
+/// IPv6 address with an optional port, and an IPv4 address (optionally
+/// v4-mapped) with an optional port. A v4-mapped address is reported unmapped,
+/// as upstream reports its `RegExp.$1`.
+fn parse_ip_shorthand(tok: &str) -> Option<(String, Option<u16>)> {
+    use std::net::IpAddr;
+
+    let port_of = |p: &str| -> Option<Option<u16>> {
+        match p.is_empty() {
+            true => Some(None),
+            false => p.parse::<u16>().ok().map(Some),
+        }
+    };
+
+    // `[addr]` / `[addr]:port` — `IP_WITH_PORT_RE`.
+    if let Some(rest) = tok.strip_prefix('[')
+        && let Some((addr, tail)) = rest.split_once(']')
+        && addr.parse::<IpAddr>().is_ok()
+    {
+        let port = tail.strip_prefix(':').map_or(Some(None), port_of)?;
+        return Some((addr.to_string(), port));
     }
-    // ipv4[:port] or hostname:port
-    let host_port = tok.rsplit_once(':');
-    match host_port {
-        Some((h, p)) => !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty(),
-        None => {
-            // bare ipv4 like 127.0.0.1
-            tok.split('.').count() == 4 && tok.split('.').all(|o| o.parse::<u8>().is_ok())
+
+    // `1.2.3.4[:port]`, including the `::ffff:` v4-mapped spellings — `IPV4_RE`.
+    let v4 = tok
+        .strip_prefix("::ffff:")
+        .or_else(|| tok.strip_prefix("::"))
+        .unwrap_or(tok);
+    if v4.starts_with(|c: char| c.is_ascii_digit()) {
+        let (addr, port) = match v4.split_once(':') {
+            Some((a, p)) => (a, port_of(p)?),
+            None => (v4, None),
+        };
+        if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+            return Some((addr.to_string(), port));
         }
     }
+
+    // A bare literal of either family, port and all (`::1`, `fe80::1`).
+    tok.parse::<IpAddr>().ok().map(|ip| (ip.to_string(), None))
 }
 
 /// Parse one operator token into a [`RuleOp`].
@@ -1621,43 +1753,51 @@ fn is_host_shorthand(tok: &str) -> bool {
 /// Line properties are left at their default here and stamped on by
 /// [`parse_line`], which is the only place that has seen the whole line.
 fn parse_op(tok: &str) -> Option<RuleOp> {
+    let op = |protocol: &str, value: &str| {
+        Some(RuleOp {
+            protocol: protocol.to_string(),
+            value: value.to_string(),
+            raw: tok.to_string(),
+            ..Default::default()
+        })
+    };
+    // A bare IP address (with an optional port) is the hosts shorthand. It is
+    // tested before the protocol split so a v6 literal cannot be read as one.
+    if parse_ip_shorthand(tok).is_some() {
+        return op("host", tok);
+    }
     if let Some((proto, rest)) = split_protocol(tok) {
         if protocols::is_protocol(proto) {
             // Normalise alias protocols (e.g. `hosts` → `host`) to canonical names.
-            let canon = protocols::canonical(proto).unwrap_or(proto);
-            return Some(RuleOp {
-                protocol: canon.to_string(),
-                value: rest.to_string(),
-                raw: tok.to_string(),
-                ..Default::default()
-            });
+            return op(protocols::canonical(proto).unwrap_or(proto), rest);
         }
-        // Unknown scheme (e.g. a plain proxy target) — treat as a proxy URL.
-        return Some(RuleOp {
-            protocol: proto.to_string(),
-            value: rest.to_string(),
-            raw: tok.to_string(),
-            ..Default::default()
-        });
+        // A protocol whistle does not know names no operator — the token is a
+        // URL, and a URL is a destination. Upstream reaches the same place by
+        // `rules[protocol]` coming back undefined and falling through to the
+        // `rule` list (`_original/lib/rules/rules.js:1313-1316`); it is what
+        // makes `example.com http://localhost:5173` forward to a dev server.
+        return op(protocols::URL_REPLACE, tok);
     }
-    if is_host_shorthand(tok) {
-        return Some(RuleOp {
-            protocol: "host".to_string(),
-            value: tok.to_string(),
-            raw: tok.to_string(),
-            ..Default::default()
-        });
+    // `//host/path` — a URL that inherits the request's own scheme.
+    if tok.starts_with("//") && !tok.starts_with("///") {
+        return op(protocols::URL_REPLACE, tok);
     }
-    // Bare path / file shorthand → file operator.
-    if tok.starts_with('/') || tok.starts_with('~') || tok.starts_with('.') {
-        return Some(RuleOp {
-            protocol: "file".to_string(),
-            value: tok.to_string(),
-            raw: tok.to_string(),
-            ..Default::default()
-        });
+    // Bare path / file shorthand → file operator. The bracket forms count too:
+    // upstream rewrites `{key}`, `(value)` and `<path>` to `file://…` before
+    // parsing (`formatShorthand`, `_original/lib/rules/rules.js:222-240`), so a
+    // line may name a mock without naming a protocol.
+    if tok.starts_with('/')
+        || tok.starts_with('~')
+        || tok.starts_with('.')
+        || url::fixed_value(tok).is_some()
+        || url::is_values_key(tok)
+    {
+        return op("file", tok);
     }
-    None
+    // Anything else with no protocol at all is still a destination: upstream's
+    // fall-through does not require one, so `example.com localhost:5173`
+    // forwards just as the spelled-out `http://localhost:5173` does.
+    op(protocols::URL_REPLACE, tok)
 }
 
 /// A pattern token after its `!` / `$` prefixes have been peeled off.
@@ -1691,6 +1831,14 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
         })
     };
 
+    // A `^`-prefixed URL turns every `*` into a wildcard, in the path and the
+    // query as well as the host. Upstream tests this first too — `regUrlCache`
+    // is consulted before anything else in `parseRule` (`rules.js:1226-1234`) —
+    // and the result is a plain regexp over the whole URL.
+    if let Some(re) = wildcard::parse_reg_url(tok) {
+        return done(Pattern::Regex(re), false);
+    }
+
     // Port pattern: `:8080` scopes the rule to one port.
     if let Some(re) = port_pattern(tok) {
         return done(Pattern::Regex(re), false);
@@ -1698,6 +1846,13 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
 
     let important = tok.starts_with('$');
     let tok = tok.strip_prefix('$').unwrap_or(tok);
+    // `//host/path` is scheme-relative: the `//` comes off and any scheme
+    // matches (`NO_SCHEMA_RE`, `rules.js:1241-1244`). Without this the `//`
+    // ended up in the *path*, and the pattern matched every host.
+    let tok = match tok.strip_prefix("//") {
+        Some(rest) if !rest.starts_with('/') => rest,
+        _ => tok,
+    };
 
     // Regexp pattern: /body/flags
     if tok.starts_with('/')
@@ -1717,22 +1872,22 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
         }
     }
 
-    // Everything below is a literal pattern, and whistle refuses to negate
-    // those: `parseWildcard` bails out for a negated wildcard
-    // (`rules.js:1171-1173`) and a negated plain pattern falls into the
-    // `else if (not) return;` at `rules.js:1266`. Dropping the rule — rather
-    // than inventing an inversion the original does not have — keeps a rules
-    // file behaving the same in both implementations.
-    if negate {
-        return None;
+    // A host wildcard. Asked before the negation check below because upstream
+    // asks in that order, and it is `parseWildcard` that decides a *negated*
+    // wildcard is dropped (`rules.js:1171-1173`).
+    match wildcard::parse(tok, negate) {
+        wildcard::Parsed::Wildcard(w) => return done(Pattern::Wildcard(w), important),
+        wildcard::Parsed::Dropped => return None,
+        wildcard::Parsed::NotWildcard => {}
     }
 
-    // Wildcard pattern → regex.
-    if tok.contains('*') {
-        let re = wildcard_to_regex(tok);
-        if let Ok(re) = Regex::new(&re) {
-            return done(Pattern::Regex(re), important);
-        }
+    // Everything below is a literal pattern, and whistle refuses to negate
+    // those: a negated plain pattern falls into the `else if (not) return;` at
+    // `rules.js:1266`. Dropping the rule — rather than inventing an inversion
+    // the original does not have — keeps a rules file behaving the same in both
+    // implementations.
+    if negate {
+        return None;
     }
 
     // Scheme/host/path prefix.
@@ -1794,23 +1949,6 @@ fn parse_prefix(tok: &str) -> Pattern {
         port,
         path,
     }
-}
-
-/// Convert a whistle wildcard pattern to an anchored regex string.
-/// `*` → `.*`, other regex metacharacters escaped.
-fn wildcard_to_regex(tok: &str) -> String {
-    let mut out = String::from("^");
-    for ch in tok.chars() {
-        match ch {
-            '*' => out.push_str(".*"),
-            c if "\\.+?()[]{}|^$".contains(c) => {
-                out.push('\\');
-                out.push(c);
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -2598,10 +2736,10 @@ mod pattern_tests {
     fn literal_patterns_cannot_be_negated() {
         assert!(parse_text("!example.test host://1.1.1.1").is_empty());
         assert!(parse_text("!*.example.test host://1.1.1.1").is_empty());
-        // Other patterns on the same line are unaffected.
-        let rules = parse_text("!example.test other.test host://1.1.1.1");
-        assert_eq!(rules.len(), 1);
-        assert!(hits("!example.test other.test host://1.1.1.1", "http://other.test/"));
+        // And the whole line goes with it. A negated token *is* a pattern to
+        // `index_of_pattern`, so it is the line's only one — every token after
+        // it is an operator, whatever its shape.
+        assert!(parse_text("!example.test other.test host://1.1.1.1").is_empty());
     }
 
     /// The `$` important shorthand still works, and survives a `!` in front.
@@ -2642,6 +2780,97 @@ mod parse_text_tests {
         mgr.resolve(&req(url)).value("host").map(str::to_string)
     }
 
+    // ── where the pattern sits ──
+
+    /// The split has to agree with upstream's `indexOfPattern` token for token,
+    /// because it decides whether a token is read as a pattern or an operator —
+    /// and the two readings have nothing in common.
+    ///
+    /// Every case below was checked against the original's own classifier.
+    #[test]
+    fn the_pattern_index_agrees_with_upstream() {
+        for (line, want) in [
+            // Ordinary form: the first token is the pattern.
+            ("example.com http://localhost:5173", Some(0)),
+            ("example.com localhost:5173", Some(0)),
+            ("example.com 1.2.3.4", Some(0)),
+            ("a.com b.com host://8.8.8.8", Some(0)),
+            ("http://a.com/api host://1.1.1.1", Some(0)),
+            ("^www.example.com/user/*/profile file:///x", Some(0)),
+            ("*.example.com/api host://1.1.1.1", Some(0)),
+            ("!example.test other.test host://1.1.1.1", Some(0)),
+            ("$example.com host://1.1.1.1", Some(0)),
+            (":8080 host://1.1.1.1", Some(0)),
+            ("/re/ host://1.1.1.1", Some(0)),
+            ("//a.com/x host://1.1.1.1", Some(0)),
+            // Swapped form: an operator leads, the patterns follow.
+            ("host://x a.com b.com", Some(1)),
+            ("proxy://1.1.1.1:8080 a.com b.com", Some(1)),
+            ("127.0.0.1 example.com", Some(1)),
+            // A bare address is an operator wherever it sits, so a line of
+            // nothing but addresses has no pattern until one of them can be
+            // one — here, the first.
+            ("127.0.0.1 1.2.3.4", Some(0)),
+            // Nothing but operators: no pattern, no rule.
+            ("host://x proxy://y", None),
+        ] {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(index_of_pattern(&tokens), want, "{line}");
+        }
+    }
+
+    /// The bare-address shorthand is `net.isIP`, nothing looser: a *name* with a
+    /// port is a destination, and giving it `host://`'s meaning instead would
+    /// quietly preserve a `Host` header upstream rewrites.
+    #[test]
+    fn only_an_ip_literal_is_the_address_shorthand() {
+        for tok in ["127.0.0.1", "1.2.3.4:8080", "[::1]:8080", "::1", "::ffff:1.2.3.4:80"] {
+            assert!(parse_ip_shorthand(tok).is_some(), "{tok} is an address");
+        }
+        for tok in ["localhost:8080", "example.com", "example.com:80", "1.2.3", "1.2.3.4:abc"] {
+            assert!(parse_ip_shorthand(tok).is_none(), "{tok} is not an address");
+        }
+        // The port travels with the address, and a v4-mapped form is unmapped.
+        assert_eq!(parse_ip_shorthand("1.2.3.4:8080"), Some(("1.2.3.4".into(), Some(8080))));
+        assert_eq!(parse_ip_shorthand("::ffff:1.2.3.4"), Some(("1.2.3.4".into(), None)));
+        assert_eq!(parse_ip_shorthand("[::1]:9"), Some(("::1".into(), Some(9))));
+    }
+
+    /// A destination is an operator, so the line configures one — this is the
+    /// rule whistle's getting-started guide opens with, and it used to parse as
+    /// two patterns and nothing else.
+    #[test]
+    fn a_bare_url_is_an_operator_not_a_second_pattern() {
+        for (line, want) in [
+            ("example.com http://localhost:5173", "http://localhost:5173"),
+            ("example.com //localhost:5173", "//localhost:5173"),
+            ("example.com localhost:5173", "localhost:5173"),
+            ("example.com tunnel://a.com:443", "tunnel://a.com:443"),
+        ] {
+            let rules = parse_text(line);
+            assert_eq!(rules.len(), 1, "{line}");
+            assert_eq!(
+                rules[0]
+                    .ops
+                    .iter()
+                    .find(|op| op.protocol == protocols::URL_REPLACE)
+                    .map(|op| op.value.as_str()),
+                Some(want),
+                "{line}"
+            );
+        }
+        // A bare IP is still the address shorthand, not a destination.
+        let rules = parse_text("example.com 1.2.3.4:8080");
+        assert_eq!(rules[0].ops[0].protocol, "host");
+        // …and so are the bracket forms, which name a mock rather than a place
+        // (`formatShorthand`).
+        for tok in ["(hello)", "<~/mock.json>", "{mock.json}"] {
+            let rules = parse_text(&format!("example.com {tok}"));
+            assert_eq!(rules[0].ops[0].protocol, "file", "{tok}");
+            assert_eq!(rules[0].ops[0].value, tok);
+        }
+    }
+
     // ── one rule per pattern ──
 
     /// whistle expands a line into one rule per pattern; taking only the first
@@ -2659,12 +2888,31 @@ mod parse_text_tests {
         assert_eq!(host_for(text, "http://d.com/"), None);
     }
 
-    /// The same holds for the pattern-first spelling.
+    /// …and **only** that spelling: several patterns on a line is the
+    /// operator-first form's privilege. Written pattern-first, the first token
+    /// is the line's one pattern and everything after it is an operator — so
+    /// `b.com` here names a destination, not a second host to match.
+    ///
+    /// This is upstream's split, not a simplification: `indexOfPattern` returns
+    /// 0 for this line, and its `patternIndex > 0` branch — the one that hands
+    /// out several patterns — is the only place that ever does
+    /// (`_original/lib/rules/rules.js:1767-1793`).
     #[test]
-    fn pattern_first_form_also_expands() {
+    fn pattern_first_form_takes_one_pattern_and_the_rest_are_operators() {
         let text = "a.com b.com host://8.8.8.8";
         assert_eq!(host_for(text, "http://a.com/").as_deref(), Some("8.8.8.8"));
-        assert_eq!(host_for(text, "http://b.com/").as_deref(), Some("8.8.8.8"));
+        assert_eq!(host_for(text, "http://b.com/"), None);
+        let rules = parse_text(text);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]
+                .ops
+                .iter()
+                .find(|op| op.protocol == protocols::URL_REPLACE)
+                .map(|op| op.value.as_str()),
+            Some("b.com"),
+            "the second token is a destination"
+        );
     }
 
     /// Filters and line properties must not be mistaken for patterns — doing so

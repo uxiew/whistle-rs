@@ -19,10 +19,42 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Does `rule`'s pattern (and all its filter conditions) match `req`?
 pub fn matches(rule: &Rule, req: &ReqInfo) -> bool {
-    if !pattern_matches(rule, req) {
-        return false;
+    match_rule(rule, req).is_some()
+}
+
+/// The same question, answering with what the match *left over* when it holds.
+///
+/// A prefix pattern consumes a prefix of the request URL, and whistle appends
+/// the remainder to a destination value: that is what turns
+/// `www.example.com/path file:///dir` into `/dir/x/y` for a request to
+/// `/path/x/y` (`filePath`, `_original/lib/rules/rules.js:1098-1108`). Only the
+/// prefix kind leaves anything — a regexp match passes its captures instead, and
+/// upstream joins nothing onto it.
+fn match_rule<'r>(rule: &Rule, req: &'r ReqInfo) -> Option<Matched<'r>> {
+    let matched = pattern_match(rule, req)?;
+    filters_match(&rule.filters, req, false).then_some(matched)
+}
+
+/// What a prefix pattern did not consume, ready to be joined onto a destination.
+///
+/// Borrowed from the request path in the common case; owned only for a pattern
+/// that carried a query string, where upstream puts back the `?` its own
+/// substring arithmetic cut off (`rules.js:1103-1105`).
+type Tail<'r> = std::borrow::Cow<'r, str>;
+
+/// Everything a successful pattern match hands to the operators on its line.
+#[derive(Default)]
+struct Matched<'r> {
+    tail: Tail<'r>,
+    /// `$0`…`$9`, when the pattern captured anything. `None` for a plain prefix
+    /// pattern, which has no groups and so needs no substitution pass.
+    groups: Option<[String; 10]>,
+}
+
+impl<'r> Matched<'r> {
+    fn with_tail(tail: Tail<'r>) -> Matched<'r> {
+        Matched { tail, groups: None }
     }
-    filters_match(&rule.filters, req, false)
 }
 
 /// Would this rule match if its `b:` conditions were satisfied?
@@ -39,16 +71,42 @@ pub fn matches(rule: &Rule, req: &ReqInfo) -> bool {
 /// (`_original/lib/rules/rules.js:1903-1906,2455-2465`).
 pub fn matches_but_for_body(rule: &Rule, req: &ReqInfo, is_internal_req: bool) -> bool {
     rule.props.allows_scope(is_internal_req)
-        && pattern_matches(rule, req)
+        && pattern_match(rule, req).is_some()
         && filters_match(&rule.filters, req, true)
 }
 
-/// Does the rule's pattern accept `req`? `!`-prefixed patterns invert the
-/// answer — and only the pattern's: whistle applies `not` to the pattern test
-/// alone, leaving the filter conditions to hold as written
-/// (`_original/lib/rules/rules.js:994-998`).
-fn pattern_matches(rule: &Rule, req: &ReqInfo) -> bool {
-    pattern_accepts(&rule.pattern, req) != rule.negate
+/// Does the rule's pattern accept `req`, and what did it leave over?
+///
+/// `!`-prefixed patterns invert the answer — and only the pattern's: whistle
+/// applies `not` to the pattern test alone, leaving the filter conditions to
+/// hold as written (`_original/lib/rules/rules.js:994-998`). An inverted match
+/// consumed nothing, so it leaves the whole request behind — which is moot in
+/// practice, since only regexp and port patterns can be negated and neither
+/// joins a tail.
+fn pattern_match<'r>(rule: &Rule, req: &'r ReqInfo) -> Option<Matched<'r>> {
+    match (pattern_accepts(&rule.pattern, req, rule.has_capture_ref), rule.negate) {
+        // `lineProps://originUrl` on a host-only pattern replaces the tail with
+        // `/` — the line asked for the destination's own root, not the path the
+        // request happened to use (`rules.js:1105`; undocumented upstream).
+        (Some(matched), false) if rule.props.has("originUrl") && rule.pattern.is_host_only() => {
+            Some(Matched {
+                tail: Tail::Borrowed("/"),
+                ..matched
+            })
+        }
+        (Some(matched), false) => Some(matched),
+        // Upstream keeps a group table for an inverted match too, but fills only
+        // `$0` — there were no groups to fill (`rules.js:1000-1008`).
+        (None, true) if rule.has_capture_ref => Some(Matched {
+            groups: Some(std::array::from_fn(|i| match i {
+                0 => req.full_url.clone(),
+                _ => String::new(),
+            })),
+            ..Default::default()
+        }),
+        (None, true) => Some(Matched::default()),
+        _ => None,
+    }
 }
 
 /// `/`, `\` and `?` all end a path segment upstream (`isPathSeparator`,
@@ -81,10 +139,37 @@ fn path_match_ends_cleanly(pattern_path: &str, req_path: &str) -> bool {
     }
 }
 
-fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
+fn pattern_accepts<'r>(
+    pattern: &Pattern,
+    req: &'r ReqInfo,
+    want_groups: bool,
+) -> Option<Matched<'r>> {
     match pattern {
-        Pattern::Any => true,
-        Pattern::Regex(re) => re.is_match(&req.full_url),
+        // Neither kind consumes a prefix of the URL, so neither leaves a tail:
+        // upstream's regexp branch builds its result with a bare `url: matcher`
+        // and no `joinUrl` (`_original/lib/rules/rules.js:1013`).
+        Pattern::Any => Some(Matched::default()),
+        // Without a `$` reference on the line there is nothing to collect, and
+        // `is_match` skips building the capture locations entirely.
+        Pattern::Regex(re) if !want_groups => {
+            re.is_match(&req.full_url).then(Matched::default)
+        }
+        Pattern::Regex(re) => re.captures(&req.full_url).map(|caps| Matched {
+            // `$0` is the whole URL for a regexp pattern, which is upstream's
+            // `regExp['0'] = curUrl` (`rules.js:1009`) rather than the regexp's
+            // own match — a `/re/` need not be anchored, and a rule referring to
+            // `$0` means the request.
+            groups: Some(std::array::from_fn(|i| match i {
+                0 => req.full_url.clone(),
+                n => caps.get(n).map_or("", |m| m.as_str()).to_string(),
+            })),
+            ..Default::default()
+        }),
+        // A host wildcard does consume a prefix, and reports what it left.
+        Pattern::Wildcard(w) => w.match_url(&req.full_url, want_groups).map(|m| Matched {
+            tail: m.tail,
+            groups: m.groups,
+        }),
         Pattern::Prefix {
             scheme,
             host,
@@ -95,33 +180,39 @@ fn pattern_accepts(pattern: &Pattern, req: &ReqInfo) -> bool {
             if let Some(s) = scheme
                 && !scheme_matches(s, &req.scheme)
             {
-                return false;
+                return None;
             }
             if !host.is_empty() {
                 if *host_suffix {
                     // `.example.com` matches the domain and any subdomain.
                     if req.host != *host && !req.host.ends_with(&format!(".{host}")) {
-                        return false;
+                        return None;
                     }
                 } else if req.host != *host {
-                    return false;
+                    return None;
                 }
             }
             // An explicit port in the pattern scopes the rule to it.
             if let Some(p) = port
                 && req.port != *p
             {
-                return false;
+                return None;
             }
-            if !path.is_empty() {
-                if !req.path.starts_with(path.as_str()) {
-                    return false;
-                }
-                if !path_match_ends_cleanly(path, &req.path) {
-                    return false;
-                }
+            if path.is_empty() {
+                // A host-only pattern consumed no path, so all of it is tail.
+                return Some(Matched::with_tail(Tail::Borrowed(&req.path)));
             }
-            true
+            if !req.path.starts_with(path.as_str()) || !path_match_ends_cleanly(path, &req.path) {
+                return None;
+            }
+            let rest = &req.path[path.len()..];
+            // A pattern carrying a query matched into the query string, so what
+            // is left is more query — upstream puts back the `?` that its own
+            // substring arithmetic cut off (`rules.js:1103-1105`).
+            Some(Matched::with_tail(match path.contains('?') && !rest.is_empty() {
+                true => Tail::Owned(format!("?{rest}")),
+                false => Tail::Borrowed(rest),
+            }))
         }
     }
 }
@@ -179,7 +270,7 @@ fn cond_holds(cond: &Cond, req: &ReqInfo, assume_body: bool) -> Option<bool> {
     match cond {
         Cond::Method(v) => Some(v.matches(&req.method)),
         Cond::Host(v) => Some(v.matches(&req.host)),
-        Cond::Url(p) => Some(pattern_accepts(p, req)),
+        Cond::Url(p) => Some(pattern_accepts(p, req, false).is_some()),
         Cond::Header { name, value, scope } => header_holds(req, name, value, *scope),
         // whistle documents `i:` as client-or-server, but only ever tests the
         // client's — see [`Cond::Ip`].
@@ -383,9 +474,12 @@ fn resolve_walk(
             if rule.is_important() != pass_important {
                 continue;
             }
-            if !rule.props.allows_scope(is_internal_req) || !matches(rule, req) {
+            if !rule.props.allows_scope(is_internal_req) {
                 continue;
             }
+            let Some(matched) = match_rule(rule, req) else {
+                continue;
+            };
             // A line whose filters ask about the response has not said anything
             // about the response *yet*. Its response-phase operators are left
             // for [`resolve_response_ops`], which is where upstream decides
@@ -395,7 +489,7 @@ fn resolve_walk(
                 if defer_res && protocols::is_res_phase(&op.protocol) {
                     continue;
                 }
-                take(&mut resolved, op, order_key(index, pass_important));
+                take(&mut resolved, op, order_key(index, pass_important), &matched);
             }
         }
     }
@@ -404,10 +498,76 @@ fn resolve_walk(
     resolved
 }
 
-/// Add `op` to `resolved` under its protocol's arity rule, stamped with `order`.
-fn take(resolved: &mut Resolved, op: &RuleOp, order: u64) {
+/// Does this operator's value take the tail of the URL its pattern matched?
+///
+/// Only two families do, and it is not a choice of ours: upstream computes the
+/// join into `rule.url` and `rule.files` (`getPathRule`,
+/// `_original/lib/rules/rules.js:936-956`), and those two fields are read by
+/// exactly the URL-replacement rule (`util.rule.getUrl`) and the local-file
+/// family (`util.getRuleFiles`). Every other operator is read through
+/// `getMatcher`, which returns the matcher as written.
+///
+/// Three value shapes opt out, because upstream's `getRuleValue` prefers
+/// `rule.value` / `rule.path` over the joined `rule.url`
+/// (`lib/util/common.js:911-919`):
+///
+/// * `(inline)` — the value *is* the content, not a location to extend;
+/// * `<verbatim>` — the documented way to say "this exact path, no matter what
+///   the request asked for" (`docs/docs/rules/file.md`, "禁用路径拼接");
+/// * `{key}` — a values-store reference, whose content is substituted whole
+///   ([`crate::proxy::apply::substitute_values`]). Upstream skips the join only
+///   when the key *resolves*; here the shape decides, so a `{key}` naming
+///   nothing is left alone where upstream would have extended the literal text.
+///   That rule is already broken, and leaving it alone reads better than
+///   appending a path to it.
+fn joins_tail(op: &RuleOp) -> bool {
+    let takes_path =
+        op.protocol == protocols::URL_REPLACE || protocols::is_file_protocol(&op.protocol);
+    takes_path
+        && super::url::fixed_value(&op.value).is_none()
+        && !super::url::is_values_key(&op.value)
+}
+
+/// Join `tail` onto a value, once per `|`-separated path when it lists several.
+///
+/// A file rule may name alternatives — `file:///a|/b` serves whichever exists —
+/// and each of them takes the tail, not just the last. Upstream keeps them
+/// apart to begin with (`getFiles` splits the matcher and `getPathRule` maps the
+/// join over the result, `_original/lib/rules/rules.js:290,:943-948`); this port
+/// carries them in one string, so it splits, joins, and puts them back. The
+/// alternative — joining the whole string — would produce `/a|/b/x`, whose
+/// first alternative silently loses the request's path.
+///
+/// The `xs` spellings never split, which is upstream's own quirk (its split
+/// regexp admits a single `x`) and is reproduced in
+/// [`crate::proxy::apply`]'s reader too.
+fn join_each_path(protocol: &str, value: &str, tail: &str) -> String {
+    if protocol.starts_with("xs") || !value.contains('|') {
+        return super::url::join_url(value, tail);
+    }
+    value
+        .split('|')
+        .map(|path| super::url::join_url(path, tail))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Add `op` to `resolved` under its protocol's arity rule, stamped with `order`
+/// and with the pattern's leftover URL joined on where that applies.
+fn take(resolved: &mut Resolved, op: &RuleOp, order: u64, matched: &Matched<'_>) {
     let mut op = op.clone();
     op.order = order;
+    // Captures first, then the tail — upstream's order too (`resolveVar` and
+    // `replaceSubMatcher` run before `getPathRule` joins anything).
+    if let Some(groups) = &matched.groups
+        && super::replace::has_reference(&op.value)
+    {
+        let refs: Vec<&str> = groups.iter().map(String::as_str).collect();
+        op.value = super::replace::expand(&op.value, &refs);
+    }
+    if joins_tail(&op) && !matched.tail.is_empty() {
+        op.value = join_each_path(&op.protocol, &op.value, &matched.tail);
+    }
     if protocols::is_multi_match(&op.protocol) {
         resolved
             .multi
@@ -448,12 +608,15 @@ pub fn resolve_response_ops(
 ) -> Resolved {
     let mut resolved = Resolved::default();
     for (order, rule) in candidates {
-        if !rule.props.allows_scope(is_internal_req) || !matches(rule, req) {
+        if !rule.props.allows_scope(is_internal_req) {
             continue;
         }
+        let Some(matched) = match_rule(rule, req) else {
+            continue;
+        };
         for op in &rule.ops {
             if protocols::is_res_phase(&op.protocol) || op.protocol == "ignore" {
-                take(&mut resolved, op, *order);
+                take(&mut resolved, op, *order, &matched);
             }
         }
     }
@@ -613,9 +776,83 @@ mod tests {
     #[test]
     fn wildcard_pattern() {
         let mut m = crate::rules::RuleManager::new();
-        m.set_text("*.example.com/api/* redirect://https://api.internal/\n");
+        // A star in the *host* is a wildcard; the path is an ordinary prefix.
+        m.set_text("*.example.com/api redirect://https://api.internal/\n");
         let r = m.resolve(&req("http://a.example.com/api/users"));
         assert_eq!(r.value("redirect"), Some("https://api.internal/"));
+        assert!(m.resolve(&req("http://a.b.example.com/api/x")).value("redirect").is_none());
+
+        // A star in the *path* is a literal there — whistle's own documentation
+        // is explicit about it (`docs/docs/rules/pattern.md`: "`*` 也是 URL 路径
+        // 中的合法字符"), and `^` is how you ask for the other reading.
+        m.set_text("*.example.com/api/* redirect://https://api.internal/\n");
+        assert!(m.resolve(&req("http://a.example.com/api/users")).value("redirect").is_none());
+        m.set_text("^*.example.com/api/* redirect://https://api.internal/\n");
+        assert_eq!(
+            m.resolve(&req("http://a.example.com/api/users")).value("redirect"),
+            Some("https://api.internal/")
+        );
+    }
+
+    /// `$0`…`$9` in an operator's value are what the pattern captured
+    /// (`pattern.md`, "子匹配传值"). Nothing substituted them here, so every rule
+    /// written that way sent the two literal characters to the origin.
+    #[test]
+    fn pattern_captures_reach_operator_values() {
+        let mut m = crate::rules::RuleManager::new();
+
+        // A regexp pattern's groups.
+        m.set_text("/\\/regexp\\/(user|admin)\\/(\\d+)/ reqHeaders://X-Type=$1&X-ID=$2\n");
+        let r = m.resolve(&req("http://a.com/regexp/admin/123"));
+        assert_eq!(r.value("reqHeaders"), Some("X-Type=admin&X-ID=123"));
+
+        // A `^` wildcard's stars, in order — the example from the docs.
+        m.set_text("^http://*.example.com/v0/users/** file:///mock/$1/$2\n");
+        let r = m.resolve(&req("http://www.example.com/v0/users/alice/test.html"));
+        assert_eq!(r.value("file"), Some("/mock/www/alice/test.html"));
+
+        // A host wildcard's star, with the unmatched path still appended after.
+        m.set_text("*.example.com/api reqHeaders://X-Tenant=$1\n");
+        let r = m.resolve(&req("http://acme.example.com/api/orders"));
+        assert_eq!(r.value("reqHeaders"), Some("X-Tenant=acme"));
+
+        // `$0` is the request URL, and `$$1` inserts the group percent-encoded.
+        m.set_text("/\\/x\\/(.+)$/ reqHeaders://X-Url=$0&X-Enc=$$1\n");
+        let r = m.resolve(&req("http://a.com/x/a b"));
+        assert_eq!(r.value("reqHeaders"), Some("X-Url=http://a.com/x/a b&X-Enc=a%20b"));
+
+        // A plain pattern captures nothing, so a `$1` in its value is literal —
+        // there is no group to put there, and inventing one would corrupt a
+        // value that merely contains a dollar sign.
+        m.set_text("a.com reqHeaders://X-Raw=$1\n");
+        let r = m.resolve(&req("http://a.com/x"));
+        assert_eq!(r.value("reqHeaders"), Some("X-Raw=$1"));
+    }
+
+    /// `lineProps://originUrl` asks for the destination's root rather than the
+    /// path the request used. Undocumented upstream, and only meaningful on a
+    /// host-only pattern — which is the only kind whose tail is the whole path.
+    #[test]
+    fn origin_url_drops_the_matched_path() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("a.com http://dev.internal lineProps://originUrl\n");
+        let r = m.resolve(&req("http://a.com/deep/page?q=1"));
+        assert_eq!(r.value(crate::rules::protocols::URL_REPLACE), Some("http://dev.internal/"));
+        // Without it, the path comes along as usual.
+        m.set_text("a.com http://dev.internal\n");
+        let r = m.resolve(&req("http://a.com/deep/page?q=1"));
+        assert_eq!(
+            r.value(crate::rules::protocols::URL_REPLACE),
+            Some("http://dev.internal/deep/page?q=1")
+        );
+        // A pattern with a path of its own is not a host pattern, so the flag
+        // does not apply — upstream guards on `rule.isDomain` too.
+        m.set_text("a.com/deep http://dev.internal lineProps://originUrl\n");
+        let r = m.resolve(&req("http://a.com/deep/page"));
+        assert_eq!(
+            r.value(crate::rules::protocols::URL_REPLACE),
+            Some("http://dev.internal/page")
+        );
     }
 
     #[test]

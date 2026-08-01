@@ -98,6 +98,26 @@ pub const PROTOCOLS: &[&str] = &[
     "xrawfile",
 ];
 
+/// The protocol key a **URL-replacement** rule resolves to.
+///
+/// whistle has no operator name for this one: you write a destination URL and it
+/// lands in the `rule` list because `rules[protocol]` came back undefined
+/// (`_original/lib/rules/rules.js:1313-1316`). Its resolved URL then replaces
+/// the request's own — scheme, host, port, path and query
+/// (`util.rule.getUrl(req.rules.rule)` → `req.options`,
+/// `lib/inspectors/rules.js:40-44`). It is how `www.example.com
+/// http://localhost:5173` forwards a site to a dev server, and it differs from
+/// [`host`](crate::proxy::apply::resolve_target) in exactly that breadth: `host://`
+/// moves the socket and keeps the `Host` header, a URL replacement moves both.
+///
+/// **One spelling is this port's own.** A rule written literally as
+/// `rule://<name>` pulls in the named entry of the values store as *more rules*
+/// (see [`crate::proxy::apply::merge_included_rules`]) instead of naming a
+/// destination. Upstream files that spelling here too, where it can only ever
+/// produce the unusable URL `rule://<name>`, so the divergence costs no rule
+/// that works upstream — and `ignore://rule` still drops both readings.
+pub const URL_REPLACE: &str = "rule";
+
 /// Every upstream-proxy operator, in the order this port prefers them.
 ///
 /// whistle files all of them under one protocol key. A `socks://` line and a

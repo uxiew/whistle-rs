@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>whistle-rs</title>
+<style>/*__CSS__*/</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <span class="brand">whistle-rs <span class="ver">v__VERSION__ · __HOST__:__PORT__</span></span>
+  <div class="segmented" role="tablist" id="nav">
+    <button role="tab" data-pane="requests" aria-selected="true">Requests</button>
+    <button role="tab" data-pane="rules" aria-selected="false">Rules</button>
+    <button role="tab" data-pane="values" aria-selected="false">Values</button>
+  </div>
+  <span class="spacer"></span>
+  <a class="icon-btn" href="/rootCA.crt" title="Download the root certificate">⛨</a>
+  <a class="icon-btn" href="/proxy.pac" title="PAC file">⚙</a>
+  <a class="icon-btn" href="/sessions.har" download title="Export as HAR">⤓</a>
+  <button class="icon-btn" id="theme" title="Toggle appearance">◐</button>
+  <div class="search"><input id="filter" placeholder="Filter" spellcheck="false"></div>
+</div>
+
+<div class="shell">
+  <aside class="sidebar" id="sidebar"></aside>
+
+  <div class="work">
+    <!-- ── Requests ────────────────────────────────────────────────── -->
+    <section class="pane" id="pane-requests">
+      <div class="table-wrap">
+        <table class="requests">
+          <thead><tr id="head"></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+
+      <div class="actions">
+        <button class="btn" id="clear">Clear</button>
+        <button class="btn" id="reload">Reload</button>
+        <button class="btn" id="replay" disabled>Replay</button>
+        <label class="check"><input type="checkbox" id="auto" checked> Auto refresh</label>
+        <span class="spacer"></span>
+        <span class="status" id="count"></span>
+      </div>
+
+      <div class="detail">
+        <div class="detail-head">
+          <div class="title">
+            <h2 id="d-title">No request selected</h2>
+            <div class="url" id="d-url">Pick a row above to inspect it.</div>
+          </div>
+          <span class="badge" id="d-badge" hidden></span>
+        </div>
+        <div class="tabs" id="d-tabs"></div>
+        <div class="detail-body" id="d-body"><div class="empty">Nothing selected</div></div>
+      </div>
+    </section>
+
+    <!-- ── Rules ───────────────────────────────────────────────────── -->
+    <section class="pane" id="pane-rules" hidden>
+      <div class="editor-wrap">
+        <textarea class="editor" id="rules-editor" spellcheck="false"
+                  placeholder="pattern  operator1  operator2  …"></textarea>
+        <p class="hint">One rule per line. <code>example.com http://localhost:5173</code> forwards a
+          site; <code>host://1.2.3.4</code> only moves the socket. See <code>docs/RULES.md</code>.</p>
+      </div>
+      <div class="actions">
+        <button class="btn primary" id="rules-save">Save</button>
+        <span class="spacer"></span>
+        <span class="status" id="rules-status"></span>
+      </div>
+    </section>
+
+    <!-- ── Values ──────────────────────────────────────────────────── -->
+    <section class="pane" id="pane-values" hidden>
+      <div class="editor-wrap">
+        <textarea class="editor" id="values-editor" spellcheck="false"
+                  placeholder='{ "mock.json": "{\"ok\":true}" }'></textarea>
+        <p class="hint">A JSON object of named values. Reference one from any operator as
+          <code>{name}</code>, or pull a whole rules text in with <code>rule://name</code>.</p>
+      </div>
+      <div class="actions">
+        <button class="btn primary" id="values-save">Save</button>
+        <span class="spacer"></span>
+        <span class="status" id="values-status"></span>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>/*__JS__*/</script>
+</body>
+</html>

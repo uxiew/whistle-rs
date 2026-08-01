@@ -37,23 +37,27 @@ CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
 - **上游代理** —— 可经由另一个 HTTP/HTTPS 代理或 SOCKS5 代理转发。
 - **内建 SOCKS5 服务** —— 接受 SOCKS5 客户端（`--socks-port`）进入同一套拦截管线，
   自动识别 TLS 与明文 HTTP。
-- **规则引擎** —— whistle 规则语法：域名/前缀、前导点子域、通配符与正则模式；
-  `$` 高优先级；多命中累加。
+- **规则引擎** —— whistle 规则语法：域名/前缀、前导点子域、域名通配符、`^` 前缀的
+  路径/查询通配符（含 `$1`…`$9` 子匹配传值）与正则模式；`$` 高优先级；多命中累加。
+- **转发** —— 一个裸 URL 就把站点指向本地开发服务
+  （`www.example.com http://localhost:5173`），未命中的路径会自动拼接过去。
 - **目标改写**（`host://`）—— 改写目标 IP/端口，同时保留原始 `Host` 头与 TLS SNI ——
   这正是调试代理的核心行为。
 - **请求/响应改写** —— 头、Cookie、Body（替换/前插/追加/正则）、URL/查询串、
   User-Agent、方法、Content-Type、CORS、鉴权、延迟、状态码替换、重定向、本地文件服务。
 - **流量检查** —— 每条事务记录请求/响应头与有界的 Body 预览（通过流式 tee 抓取，
   因此分块 / SSE 响应也可查看且不破坏流式传输；`gzip`/`deflate`/`br` 压缩体会被解码后
-  预览）。可在界面展开/过滤，或访问 `/sessions.json`、`/session.json?id=`，也可导出为
+  预览）。可在控制台里过滤/排序，或访问 `/sessions.json`、`/session.json?id=`，也可导出为
   HAR 文件（`/sessions.har`）。
-- **Web 界面** —— 自包含单页（浏览器直接访问代理地址即可打开），含实时网络视图、
-  可编辑的规则面板与 Values 面板；规则改动即时生效。
+- **控制台** —— 自包含单页（浏览器直接访问代理地址即可打开）：左侧来源列表、上方可排序的
+  请求表格、下方详情面板（General / 请求头 / 响应头 / 请求体 / 响应体 / WebSocket 帧）。
+  规则分组与 Values 在同一套外壳里编辑，规则改动即时生效。
 - **流量持久化** —— 捕获的请求/响应以 JSONL 格式写入磁盘，每日自动轮转；重启后自动恢复
   历史流量。通过 `--no-persist` 关闭，`--persist-days` 控制保留天数。
-- **请求重放** —— 通过 `POST /api/replay` 或界面 ↻ 按钮重发已捕获的请求，走完整规则管线。
-- **规则分组** —— 在 UI 中管理多个命名规则集，每组可独立启用/禁用。分组持久化到
-  `storage_dir/rules/`。
+- **请求重放** —— 通过 `POST /api/replay` 或控制台的 Replay 按钮重发已捕获的请求，
+  走完整规则管线。
+- **规则分组** —— 多个命名规则集与默认组并列显示在控制台的来源列表里，每组可独立
+  启用/禁用（双击切换）。分组持久化到 `storage_dir/rules/`。
 - **单一静态二进制**，构建无需 C 工具链（固定使用 `ring` TLS provider）。
 
 ## 安装与构建
@@ -118,7 +122,10 @@ HTTPS 流量是加密的，要读取/改写它，whistle-rs 会出示一份自�
 每行形如 `pattern operator1 operator2 …`。几个例子：
 
 ```
-# 将域名映射到本地开发服务器（hosts 简写）
+# 把站点交给本地开发服务（剩余路径会跟着走）
+www.example.com       http://localhost:5173
+
+# 改写目标地址、保留 Host 头（hosts 简写）
 test.local            127.0.0.1:9099
 
 # 显式目标改写（同时作用于 http + https）
@@ -127,8 +134,11 @@ test.local            127.0.0.1:9099
 # 正则模式 → 设置响应 Content-Type
 /\.js(\?|$)/          resType://application/javascript
 
-# 通配符模式 → 重定向（短路上游）
-old.example.com/*     redirect://https://new.example.com/
+# 域名通配符 → 重定向（短路上游）
+*.old.example.com     redirect://https://new.example.com/
+
+# `^` 让每个 `*` 都成为通配符，$1… 就是它们匹配到的内容
+^http://*.example.com/v0/users/**   file:///mock/$1/$2
 
 # 注入头（同名规则跨行累加）
 example.com           reqHeaders://x-token=abc
@@ -197,9 +207,10 @@ $example.com          host://2.2.2.2
   `skip`、`tlsOptions`、`pathReplace`、`reqMerge` 等），均归一化到规范名。
   完整映射见 [`docs/RULES.md#operator-coverage`](docs/RULES.md#operator-coverage)。
 - 流量检查：逐事务的请求/响应头 + Body 预览
-- Web 界面：实时网络视图（过滤/搜索、可展开查看头 + 解码后的 Body 预览、逐连接的
-  WebSocket 帧）+ 可编辑的规则与 Values；`/sessions.json`、`/session.json?id=`、
-  `/frames.json`、`/sessions.har`（HAR 导出）、`/proxy.pac`
+- 三栏控制台：请求按客户端分组、表格可按任意列排序与过滤，详情面板含头、解码后的
+  Body 预览与逐连接的 WebSocket 帧；规则分组与 Values 在同一外壳内编辑。
+  `/sessions.json`、`/session.json?id=`、`/frames.json`、`/sessions.har`（HAR 导出）、
+  `/proxy.pac`
 - `@`-includes（从 URL/文件引入规则）与 `${port}`/`${version}` 配置变量
 
 仅剩 **2** 个算子未实现 —— `G`（全局规则标记）与 `style`（界面里的规则颜色）——
@@ -218,7 +229,7 @@ $example.com          host://2.2.2.2
 理由见[路线图的 Non-goals](docs/ROADMAP.md)。
 
 **相对原版的其他简化**（可用，但非逐字节移植）：whistle 的 React web UI（`biz/`）由一个
-轻量内建 UI 替代；weinre 仅做脚本注入（inspector 服务在外部）；流量抓取（含头、Body 与
+轻量内建控制台替代；weinre 仅做脚本注入（inspector 服务在外部）；流量抓取（含头、Body 与
 WebSocket 帧）保留在内存的环形缓冲中，可选落盘（`--no-persist` 关闭），Body 预览上限
 默认 16 KB（`--body-preview-limit` 可调），gzip/deflate/brotli 会为查看而解码。
 
