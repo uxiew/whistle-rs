@@ -7,7 +7,8 @@ WebSocket debugging proxy. It implements the load-bearing heart of whistle: the
 **rules DSL engine**, the **proxy server** (HTTP forward proxy + CONNECT tunnelling +
 HTTPS man-in-the-middle), and **dynamic CA certificate generation**.
 
-The original JavaScript source lives in [`../_original`](../_original); this port maps
+The original JavaScript source is **not distributed with this repository** — see
+[`docs/UPSTREAM.md`](docs/UPSTREAM.md) for how to fetch it, and at which commit. This port maps
 module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 
 ## Contents
@@ -79,7 +80,6 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 Requires a recent stable Rust toolchain.
 
 ```bash
-cd whistle-rs
 cargo build --release
 # binary at ./target/release/whistle-rs
 ```

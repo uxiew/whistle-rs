@@ -6,7 +6,8 @@
 它实现了 whistle 最核心、最吃重的部分：**规则 DSL 引擎**、**代理服务器**（HTTP 正向代理 +
 CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
 
-原始 JavaScript 源码位于 [`../_original`](../_original)；本移植逐模块对应到它
+原始 JavaScript 源码**不随本仓库分发** —— 取回方式与对应提交见
+[`docs/UPSTREAM.md`](docs/UPSTREAM.md)。本移植逐模块对应到它
 （见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)）。
 
 ## 目录
@@ -72,7 +73,6 @@ CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
 需要较新的稳定版 Rust 工具链。
 
 ```bash
-cd whistle-rs
 cargo build --release
 # 二进制位于 ./target/release/whistle-rs
 ```

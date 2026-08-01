@@ -1,2 +1,6 @@
 target
 .DS_Store
+
+# Left in the working directory by tooling and by hand; not repository content.
+.playwright-mcp/
+requests.png
