@@ -1206,7 +1206,7 @@ is **not** an upstream flag — whistle-rs keeps it as an alias for
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `delete` | one or more keys, separated by `\|` or `&` | Remove headers, cookies, body properties, or the type/charset |
+| `delete` | one or more keys, separated by `\|` or `&` | Remove headers, cookies, query parameters, path segments, body properties, or the type/charset |
 
 Keys are matched against a fixed set of spellings; **anything else is silently
 ignored**, exactly as upstream. In particular a bare `delete://server` deletes
@@ -1220,6 +1220,10 @@ nothing — you need a scope.
 | `reqCookies.x` / `cookies.x` | that cookie from the request `Cookie` header |
 | `resCookies.x` / `cookies.x` | that cookie **in the client** — see below |
 | `trailer.x` | that trailing header (this key takes no `req`/`res` scope) |
+| `query.x` / `params.x` / `urlParams.x` / `url.Param.x` | that query-string parameter, every repeat of it |
+| `query` / `params` / `urlParams` (bare) | the whole query string, `?` and all |
+| `pathname` | the whole path, keeping the query string |
+| `pathname.0` / `pathname.first`, `pathname.2`, `pathname.-1`, `pathname.last` | that path segment, counted from the end when negative |
 | `resType` / `res.type`, `reqType` / `req.type` | the media type (a `charset` parameter survives) |
 | `resCharset` / `res.charset`, `reqCharset` / `req.charset` | the charset parameter |
 | `body`, `res.body`, `req.body` | the whole body, including anything an operator injects |
@@ -1229,7 +1233,32 @@ nothing — you need a scope.
 example.com   delete://resHeaders.server|resHeaders.x-powered-by
 example.com   delete://reqCookies.tracking
 example.com   delete://resBody.debug&resBody.internal.token
+example.com   delete://query.utm_source|query.utm_medium
+example.com   delete://pathname.first        # /v1/users → /users
 ```
+
+The URL keys have edges worth knowing, all inherited
+(`parseDelQuery`/`parsePathReplace`/`deleteQuery`,
+`_original/lib/util/index.js:2674-2721,1023-1058`):
+
+* segments are counted in the path **without** its leading slash, so
+  `pathname.0` names `v1` in `/v1/users` — the same slice `urlReplace://`
+  substitutes into;
+* `pathname.last` leaves a trailing slash where the segment was (`/a/b/c` →
+  `/a/b/`); `pathname.-1` names the same segment and does not (`/a/b`);
+* the dot is optional (`pathname-1` ≡ `pathname.-1`), and `pathname` itself is
+  case-insensitive — but `first`/`last` are **not**. `delete://pathname.LAST`
+  matches the pattern and then does nothing, because upstream coerces every
+  key it does not recognise as the literal `last` with `+key`, and `+'LAST'`
+  is `NaN`;
+* the query deletion runs **after** `params://`, so it wins over a parameter
+  the same line just wrote;
+* an index out of range is a no-op rather than an error.
+
+> **One deliberate divergence.** A bare `delete://pathname` against a URL that
+> has a query string emits the query **twice** upstream (`/a?x=1` → `/?x=1?x=1`,
+> `util/index.js:1033,1057`). whistle-rs emits it once; the upstream form is a
+> request line no origin parses.
 
 A response cannot reach into the browser and remove a cookie, so
 `delete://resCookies.x` sends back one that has **already expired**

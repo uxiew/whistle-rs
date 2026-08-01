@@ -3760,9 +3760,214 @@ fn apply_str_replace(text: &str, pairs: &[(String, String)]) -> String {
     out
 }
 
-/// Rewrite the request path+query per `urlReplace`, `params`, and `urlParams`.
+/// The `delete://` keys that address the request's **URL** rather than its
+/// headers (`parseDelQuery`, `_original/lib/util/index.js:2674-2699`).
+///
+/// These live here rather than in [`Deletions`] because upstream applies them
+/// from the URL-rewriting pass, not the header pass: the path indices go to
+/// `parsePathReplace` alongside `urlReplace://` and the query names to
+/// `deleteQuery` after it (`_original/lib/inspectors/req.js:557,562-570`).
+#[derive(Default)]
+struct DelQuery {
+    /// `delete://query.<name>` — query-string names to drop. Also spelled
+    /// `params.<name>` and `url[.]Param[s].<name>`.
+    names: Vec<String>,
+    /// The same words with nothing after them: drop the query string outright,
+    /// `?` and all.
+    clear: bool,
+    /// `delete://pathname…`, absent when no key named a segment.
+    paths: Option<DelPaths>,
+}
+
+/// Which path segments `delete://pathname…` names.
+#[derive(Default)]
+struct DelPaths {
+    /// A bare `delete://pathname`: the whole path goes, the query stays.
+    all: bool,
+    /// `delete://pathname.last` — the final segment, and a trailing slash left
+    /// where it was.
+    last: bool,
+    /// Segment indices, counted from the end when negative. `first` is `0`.
+    indices: Vec<i64>,
+}
+
+/// What one `pathname…` key names.
+enum PathKey {
+    All,
+    Last,
+    Index(i64),
+}
+
+impl DelQuery {
+    /// Classify every `delete://` key that addresses the URL.
+    fn of(resolved: &Resolved) -> DelQuery {
+        let mut del = DelQuery::default();
+        for value in collect_values(resolved, "delete") {
+            // Same split as [`Deletions::of`] — `parseProps` takes `|` and `&`.
+            for key in value.split(['|', '&']) {
+                let key = key.trim();
+                match strip_query_scope(key) {
+                    Some(Some(name)) => del.names.push(name.to_string()),
+                    Some(None) => del.clear = true,
+                    None => match strip_pathname_scope(key) {
+                        Some(PathKey::All) => del.paths.get_or_insert_default().all = true,
+                        Some(PathKey::Last) => del.paths.get_or_insert_default().last = true,
+                        Some(PathKey::Index(i)) => {
+                            del.paths.get_or_insert_default().indices.push(i)
+                        }
+                        None => {}
+                    },
+                }
+            }
+        }
+        del
+    }
+}
+
+/// Strip whistle's query-string prefix — `query`, `params` or `url[.]Param[s]`,
+/// all case-insensitive (`QUERY_RE` / `QUERY_STRING_RE`,
+/// `_original/lib/util/index.js:2670-2671`).
+///
+/// `Some(None)` is the bare form (drop the whole query string), `Some(Some(n))`
+/// names one parameter.
+fn strip_query_scope(key: &str) -> Option<Option<&str>> {
+    for prefix in ["query", "params", "urlParams", "urlParam", "url.Params", "url.Param"] {
+        let Some(head) = key.get(..prefix.len()).filter(|h| h.eq_ignore_ascii_case(prefix)) else {
+            continue;
+        };
+        let rest = &key[head.len()..];
+        if rest.is_empty() {
+            return Some(None);
+        }
+        if let Some(name) = rest.strip_prefix('.').filter(|n| !n.is_empty()) {
+            return Some(Some(name));
+        }
+    }
+    None
+}
+
+/// Match `PATH_INDEX_RE` (`_original/lib/util/index.js:2672`).
+///
+/// The dot before the index is optional in the regex, so `pathname-1` names the
+/// same segment as `pathname.-1`, and `pathnamelast` the same as
+/// `pathname.last`. A trailing dot with nothing after it matches neither branch
+/// and is ignored, exactly as the regex ignores it.
+///
+/// `first`/`last` are matched **case-sensitively** even though the regex is
+/// not. That is upstream's, not an oversight here: the regex accepts
+/// `pathname.LAST`, but `parseDelQuery` then keys the map on the *matched
+/// spelling* and `parsePathReplace` looks up the literal `last` and coerces
+/// every other key with `+key` — `+'LAST'` is `NaN`, so the key is silently
+/// dropped (`util/index.js:2688,1037-1047`). Only the word `pathname` itself is
+/// case-insensitive all the way through.
+fn strip_pathname_scope(key: &str) -> Option<PathKey> {
+    let head = key.get(.."pathname".len()).filter(|h| h.eq_ignore_ascii_case("pathname"))?;
+    let rest = &key[head.len()..];
+    if rest.is_empty() {
+        return Some(PathKey::All);
+    }
+    let idx = rest.strip_prefix('.').unwrap_or(rest);
+    if idx == "first" {
+        return Some(PathKey::Index(0));
+    }
+    if idx == "last" {
+        return Some(PathKey::Last);
+    }
+    // `-?\d+`: a leading `+` is not one of the shapes upstream accepts, and
+    // Rust's integer parser would take it.
+    (!idx.starts_with('+'))
+        .then(|| idx.parse::<i64>().ok())
+        .flatten()
+        .map(PathKey::Index)
+}
+
+/// `delete://pathname…` — drop path segments (`parsePathReplace`'s `delPaths`
+/// arm, `_original/lib/util/index.js:1023-1058`).
+///
+/// Segments are counted in the path *without* its leading slash — the same
+/// slice `urlReplace://` substitutes into — so `pathname.0` names `a` in
+/// `/a/b/c`. The query string is split off first and put back untouched.
+fn delete_path_segments(path: &str, del: &DelPaths) -> String {
+    let (head, rest) = match path.strip_prefix('/') {
+        Some(rest) => ("/", rest),
+        None => ("", path),
+    };
+    let (cur, query) = match rest.find('?') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // `if (curPath)`: a URL that is nothing but a query string has no segment to
+    // name, and upstream leaves it alone.
+    if cur.is_empty() {
+        return path.to_string();
+    }
+    if del.all {
+        // Deliberate divergence: upstream assigns the query to `curPath` and
+        // then appends it again two lines later (`util/index.js:1033,1057`), so
+        // a bare `delete://pathname` on `/a?x=1` produces `/?x=1?x=1`. That is a
+        // malformed request line no origin parses; the query goes on once here.
+        return format!("{head}{query}");
+    }
+    let mut segs: Vec<Option<&str>> = cur.split('/').map(Some).collect();
+    let len = segs.len() as i64;
+    let mut indices = del.indices.clone();
+    if del.last {
+        indices.push(len - 1);
+    }
+    for i in indices {
+        let i = if i < 0 { len + i } else { i };
+        if (0..len).contains(&i) {
+            segs[i as usize] = None;
+        }
+    }
+    let mut kept: Vec<&str> = segs.into_iter().flatten().collect();
+    // `pathname.last` leaves a trailing slash where the segment was: upstream
+    // pushes an empty segment back when the new last one is non-empty
+    // (`util/index.js:1051-1053`). `pathname.-1` does not — the two spellings
+    // name the same segment and disagree about the slash.
+    if del.last && kept.last().is_some_and(|s| !s.is_empty()) {
+        kept.push("");
+    }
+    format!("{head}{}{query}", kept.join("/"))
+}
+
+/// `deleteQuery` (`_original/lib/util/index.js:2701-2721`): drop the named
+/// pairs from the query string, or all of it when `clear`.
+///
+/// Names are compared raw, before any percent-decoding, because that is what
+/// upstream compares — `delete://query.a%20b` names the parameter spelled that
+/// way on the wire.
+fn delete_query(path: &str, names: &[String], clear: bool) -> String {
+    let Some(i) = path.find('?') else {
+        return path.to_string();
+    };
+    if clear {
+        return path[..i].to_string();
+    }
+    let query = &path[i + 1..];
+    if query.is_empty() {
+        return path.to_string();
+    }
+    let kept = query
+        .split('&')
+        .filter(|item| {
+            let name = item.split_once('=').map_or(*item, |(k, _)| k);
+            !names.iter().any(|n| n == name)
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    // The `?` goes too when nothing survives.
+    match kept.is_empty() {
+        true => path[..i].to_string(),
+        false => format!("{}?{kept}", &path[..i]),
+    }
+}
+
+/// Rewrite the request path+query per `urlReplace`, `params`, `urlParams`, and
+/// the `delete://` keys that name a query parameter or a path segment.
 pub fn rewrite_path(path: &str, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> String {
     let mut p = path.to_string();
+    let del = DelQuery::of(resolved);
     let replacements = merge_rule_maps(resolved, "urlReplace");
     if !replacements.is_empty() {
         // whistle substitutes into the path *without* its leading slash — it
@@ -3776,6 +3981,12 @@ pub fn rewrite_path(path: &str, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> Str
             false => replaced,
         };
     }
+    // The path deletions are `parsePathReplace`'s second half, so they run in
+    // the same pass as `urlReplace://` and after it
+    // (`_original/lib/util/index.js:1023-1058`).
+    if let Some(paths) = &del.paths {
+        p = delete_path_segments(&p, paths);
+    }
     // Each protocol collapses to one map of its own, then `urlParams` is laid
     // over `params` (`extend(_params, urlParams)`,
     // `_original/lib/inspectors/req.js:425`). `params` is skipped entirely when
@@ -3788,6 +3999,12 @@ pub fn rewrite_path(path: &str, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> Str
     params.extend(merge_params_pairs(resolved, "urlParams"));
     if !params.is_empty() {
         p = merge_query(&p, &params);
+    }
+    // `deleteQuery` runs last, over whatever the query string has become
+    // (`_original/lib/inspectors/req.js:570`) — so a name it drops is dropped
+    // even when a `params://` on the same line had just written it.
+    if del.clear || !del.names.is_empty() {
+        p = delete_query(&p, &del.names, del.clear);
     }
     p
 }
@@ -6845,6 +7062,107 @@ mod tests {
             "http://example.com/api/v1/old",
         );
         assert_eq!(rewrite_path("/api/v1/old", &resolved, body_ctx(None)), "/api/v2/new");
+    }
+
+    /// `delete://` also names query parameters and path segments
+    /// (`parseDelQuery`, `_original/lib/util/index.js:2674-2699`, applied by
+    /// `deleteQuery` and `parsePathReplace`'s `delPaths` arm at
+    /// `req.js:557,562-570`).
+    ///
+    /// None of these keys were parsed anywhere in this port, so every one of
+    /// them was a rule that resolved, matched, and did nothing — the shape of
+    /// bug you debug by rereading your own rules file.
+    ///
+    /// The expectations are upstream's own output: `parseDelQuery`,
+    /// `parsePathReplace` and `deleteQuery` were lifted verbatim and run over
+    /// these inputs, which is why the odd ones are here — `pathname.last` leaves
+    /// a trailing slash where `pathname.-1` does not, and `pathname.LAST`
+    /// matches the pattern and then does nothing at all.
+    #[test]
+    fn delete_names_query_parameters_and_path_segments() {
+        let out = |rule: &str, path: &str| {
+            let resolved = resolve(
+                &format!("example.com {rule}\n"),
+                &format!("http://example.com{path}"),
+            );
+            rewrite_path(path, &resolved, body_ctx(None))
+        };
+
+        // ── query parameters ──
+        assert_eq!(out("delete://query.a", "/p?a=1&b=2"), "/p?b=2");
+        // Every spelling `QUERY_RE` takes, and it is case-insensitive.
+        for spelling in ["query", "params", "urlParams", "urlParam", "url.Param", "url.Params", "QUERY"] {
+            assert_eq!(
+                out(&format!("delete://{spelling}.a"), "/p?a=1&b=2"),
+                "/p?b=2",
+                "{spelling}"
+            );
+        }
+        // Repeats of a named parameter all go.
+        assert_eq!(out("delete://query.a", "/p?a=1&a=2&b=3"), "/p?b=3");
+        // The `?` goes with the last surviving pair.
+        assert_eq!(out("delete://query.a|query.b", "/p?a=1&b=2"), "/p");
+        // A valueless pair is named by the bare token.
+        assert_eq!(out("delete://query.a", "/p?a"), "/p");
+        // Nothing to delete from.
+        assert_eq!(out("delete://query.a", "/p"), "/p");
+        // An empty query string is left exactly as it is — upstream returns
+        // before it can drop the `?`.
+        assert_eq!(out("delete://query.a", "/p?"), "/p?");
+        // The bare form clears the whole query string, `?` and all…
+        assert_eq!(out("delete://query", "/p?a=1&b=2"), "/p");
+        assert_eq!(out("delete://urlparams", "/p?a=1&b=2"), "/p");
+        // …and that one *does* drop a lone `?`.
+        assert_eq!(out("delete://query", "/p?"), "/p");
+        // A key with nothing after the dot matches neither pattern.
+        assert_eq!(out("delete://query.", "/p?a=1"), "/p?a=1");
+
+        // ── path segments ──
+        assert_eq!(out("delete://pathname.0", "/a/b/c"), "/b/c");
+        assert_eq!(out("delete://pathname.first", "/a/b/c"), "/b/c");
+        // `last` leaves a trailing slash behind; `-1` names the same segment
+        // and does not.
+        assert_eq!(out("delete://pathname.last", "/a/b/c"), "/a/b/");
+        assert_eq!(out("delete://pathname.-1", "/a/b/c"), "/a/b");
+        assert_eq!(out("delete://pathname.-2", "/a/b/c"), "/a/c");
+        // A path already ending in `/` has an empty last segment, so `last`
+        // removes that and the slash is put straight back.
+        assert_eq!(out("delete://pathname.last", "/a/b/c/"), "/a/b/c/");
+        // Several indices are counted against the *original* path.
+        assert_eq!(out("delete://pathname.1|pathname.2", "/a/b/c/d"), "/a/d");
+        // Out of range is a no-op, either way round.
+        assert_eq!(out("delete://pathname.99", "/a/b"), "/a/b");
+        assert_eq!(out("delete://pathname.-9", "/a/b/c"), "/a/b/c");
+        // The dot is optional, and `pathname` is case-insensitive.
+        assert_eq!(out("delete://pathname-1", "/a/b/c"), "/a/b");
+        assert_eq!(out("delete://pathname0", "/a/b/c"), "/b/c");
+        assert_eq!(out("delete://pathnamelast", "/a/b/c"), "/a/b/");
+        assert_eq!(out("delete://PATHNAME", "/a/b/c"), "/");
+        // …but `first`/`last` are not: the key matches and then evaporates.
+        assert_eq!(out("delete://pathname.LAST", "/a/b/c"), "/a/b/c");
+        assert_eq!(out("delete://pathname.First", "/a/b/c"), "/a/b/c");
+        // `all` is not one of the words the pattern accepts.
+        assert_eq!(out("delete://pathname.all", "/a/b/c"), "/a/b/c");
+        // A `+` is not one of the shapes `-?\d+` accepts.
+        assert_eq!(out("delete://pathname.+1", "/a/b/c"), "/a/b/c");
+        // The bare form drops the path and keeps the query — and beats an index
+        // named on the same line.
+        assert_eq!(out("delete://pathname", "/a/b/c"), "/");
+        assert_eq!(out("delete://pathname|pathname.0", "/a/b/c"), "/");
+        // Deliberate divergence: upstream emits the query twice here
+        // (`/?x=1?x=1`), which is a request line no origin parses.
+        assert_eq!(out("delete://pathname", "/a/b/c?x=1"), "/?x=1");
+        // Nothing but a query string has no segment to name.
+        assert_eq!(out("delete://pathname", "/?x=1"), "/?x=1");
+        assert_eq!(out("delete://pathname.last", "/a?x=1"), "/?x=1");
+
+        // ── together, and against the operators they run beside ──
+        assert_eq!(out("delete://pathname.last|query.a", "/a/b?a=1&b=2"), "/a/?b=2");
+        // `deleteQuery` runs after `params://`, so it wins over a parameter the
+        // same line had just written (`req.js:568-570`).
+        assert_eq!(out("params://a=9 delete://query.a", "/p?b=2"), "/p?b=2");
+        // …and the path deletion runs with `urlReplace://`, over its output.
+        assert_eq!(out("urlReplace://b=x delete://pathname.-1", "/a/b/c"), "/a/x");
     }
 
     /// The request side accumulates through the same code path.
