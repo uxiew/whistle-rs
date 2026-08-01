@@ -1231,9 +1231,12 @@ struct ResBodyOps {
     weinre: Option<String>,
     /// `locationHref://` — client-side redirect to inject.
     location_href: Option<String>,
-    /// `resWrite://` / `resWriteRaw://` — dump paths.
+    /// `resWrite://` / `resWriteRaw://` — dump paths, already carrying the
+    /// `.<status>` suffix a non-200 gets.
     write: Option<String>,
     write_raw: Option<String>,
+    /// `enable://forceReqWrite` — write the dump even over an existing file.
+    force_write: bool,
     /// `trailers://` — trailing headers to append after the body. Already empty
     /// when `disable://trailers` cancelled them.
     trailers: hyper::HeaderMap,
@@ -1261,11 +1264,15 @@ impl ResBodyOps {
     /// stripped its `Content-Length`, and — because the injection also stamps
     /// `Cache-Control: no-store` and strips CSP — rewrote the headers of a
     /// redirect the rule was never meant to touch.
-    fn of(resolved: &Resolved, has_body: bool) -> Self {
+    fn of(resolved: &Resolved, has_body: bool, status: u16) -> Self {
         if !has_body {
             // The trailers still apply: they are headers, not a body, and
-            // upstream folds them in after this gate (`res.js:1250-1290`).
+            // upstream folds them in after this gate (`res.js:1250-1290`). So
+            // does `resWriteRaw://`, which dumps the head — only the *body*
+            // dump is gated on there being one (`res.js:1126-1135`).
             return ResBodyOps {
+                write_raw: apply::res_write_raw_path(resolved, status),
+                force_write: apply::forces_write(resolved),
                 trailers: apply::build_trailers(resolved),
                 no_trailers: apply::trailers_disabled(resolved),
                 announce_trailers: apply::trailer_header_announced(resolved),
@@ -1279,8 +1286,9 @@ impl ResBodyOps {
                 .and_then(script::load_script),
             weinre: resolved.value("weinre").map(|s| s.to_string()),
             location_href: resolved.value("locationHref").map(|s| s.to_string()),
-            write: apply::res_write_path(resolved),
-            write_raw: apply::res_write_raw_path(resolved),
+            write: apply::res_write_path(resolved, status),
+            write_raw: apply::res_write_raw_path(resolved, status),
+            force_write: apply::forces_write(resolved),
             trailers: apply::build_trailers(resolved),
             no_trailers: apply::trailers_disabled(resolved),
             announce_trailers: apply::trailer_header_announced(resolved),
@@ -1372,7 +1380,7 @@ fn inject_res_body(
         new = inject_into_html(&new, &tag);
     }
     if let Some(path) = &ops.write {
-        write_body_file(path, &new);
+        write_body_file(path, &new, ops.force_write);
     }
     if let Some(path) = &ops.write_raw {
         let head = format!(
@@ -1380,7 +1388,7 @@ fn inject_res_body(
             parts.status,
             header_dump(&parts.headers)
         );
-        write_raw_file(path, &head, &new);
+        write_raw_file(path, &head, &new, ops.force_write);
     }
     new
 }
@@ -1657,6 +1665,7 @@ async fn finish_local_response(
     let ops = ResBodyOps::of(
         resolved,
         response_has_body(parts.status.as_u16(), &info.method),
+        parts.status.as_u16(),
     );
     let res_ct = parts
         .headers
@@ -2161,8 +2170,11 @@ async fn serve(
     }
     // Buffer + transform the request body only when a body/speed/write operator applies.
     let req_speed = apply::req_speed_kbps(&resolved);
-    let req_write = apply::req_write_path(&resolved);
+    // The method is read after the request operators, because `method://` may
+    // have changed it — a `GET` rewritten to a `POST` does get its body dumped.
+    let req_write = apply::req_write_path(&resolved, parts.method.as_str());
     let req_write_raw = apply::req_write_raw_path(&resolved);
+    let force_write = apply::forces_write(&resolved);
     let req_ct = parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
@@ -2193,11 +2205,11 @@ async fn serve(
         let bytes = collect_body(incoming).await?;
         let new = apply::transform_req_body(bytes, &resolved, body_ctx);
         if let Some(path) = &req_write {
-            write_body_file(path, &new);
+            write_body_file(path, &new, force_write);
         }
         if let Some(path) = &req_write_raw {
             let head = format!("{} {} HTTP/1.1\r\n{}", parts.method, parts.uri, header_dump(&parts.headers));
-            write_raw_file(path, &head, &new);
+            write_raw_file(path, &head, &new, force_write);
         }
         if !new.is_empty() {
             req_body_cap = Some(Capture::from_bytes(
@@ -2372,6 +2384,7 @@ async fn serve(
     let ops = ResBodyOps::of(
         &resolved,
         response_has_body(parts.status.as_u16(), &info.method),
+        parts.status.as_u16(),
     );
     let res_ct = parts
         .headers
@@ -2685,15 +2698,57 @@ async fn serve_upgrade(
 }
 
 /// Append a captured body to a file (`reqWrite`/`resWrite`). Best-effort.
-fn write_body_file(path: &str, data: &Bytes) {
+fn write_body_file(path: &str, data: &Bytes, force: bool) {
     use std::io::Write;
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(data) {
-                tracing::debug!("write body to {path} failed: {e}");
-            }
+    let Some(mut f) = open_writer(path, force) else {
+        return;
+    };
+    if let Err(e) = f.write_all(data) {
+        tracing::debug!("write body to {path} failed: {e}");
+    }
+}
+
+/// Open a dump file for one of the four write operators, or refuse.
+///
+/// whistle writes a dump file **once**: `getFileWriter` stats the path first and
+/// hands back no writer at all when it already exists, so only `ENOENT` produces
+/// one (`checkWriterFile`/`getFileWriter`,
+/// `_original/lib/util/index.js:502-546`). `enable://forceReqWrite` is the
+/// override, and it overwrites rather than appends — the stream is opened with
+/// Node's default `w`.
+///
+/// Appending, which is what this did, is a different tool: point a rule at a
+/// path once and every reload of the page grows the file, so what you open is a
+/// concatenation of runs with no boundary between them, and the "capture" of the
+/// request you meant is somewhere in the middle of it.
+///
+/// A path ending in a separator names a directory, and the dump goes in it as
+/// `index.html` (`END_RE`, `util/index.js:54,:521-523`).
+///
+/// Upstream's `pendingFiles` guard — which also refuses a file another request
+/// is mid-write on — is not reproduced: it exists because its writers are
+/// asynchronous streams, and these are one synchronous `write_all`.
+fn open_writer(path: &str, force: bool) -> Option<std::fs::File> {
+    let path = match path.ends_with('/') || path.ends_with('\\') {
+        true => std::path::Path::new(path).join("index.html"),
+        false => std::path::PathBuf::from(path),
+    };
+    if !force && path.exists() {
+        tracing::debug!("{} already exists; not written", path.display());
+        return None;
+    }
+    if let Some(dir) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        tracing::debug!("create {} failed: {e}", dir.display());
+        return None;
+    }
+    match std::fs::File::create(&path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::debug!("open {} for write failed: {e}", path.display());
+            None
         }
-        Err(e) => tracing::debug!("open {path} for write failed: {e}"),
     }
 }
 
@@ -2710,17 +2765,15 @@ fn header_dump(headers: &hyper::HeaderMap) -> String {
 }
 
 /// Append a raw message (head + blank line + body + separator) to a file.
-fn write_raw_file(path: &str, head: &str, body: &Bytes) {
+fn write_raw_file(path: &str, head: &str, body: &Bytes, force: bool) {
     use std::io::Write;
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        Ok(mut f) => {
-            let _ = f.write_all(head.as_bytes());
-            let _ = f.write_all(b"\r\n");
-            let _ = f.write_all(body);
-            let _ = f.write_all(b"\r\n\r\n");
-        }
-        Err(e) => tracing::debug!("open {path} for raw write failed: {e}"),
-    }
+    let Some(mut f) = open_writer(path, force) else {
+        return;
+    };
+    let _ = f.write_all(head.as_bytes());
+    let _ = f.write_all(b"\r\n");
+    let _ = f.write_all(body);
+    let _ = f.write_all(b"\r\n\r\n");
 }
 
 /// True if the response declares an HTML content type.
@@ -2839,6 +2892,146 @@ mod body_gate_tests {
         // A HEAD answer never has one, whatever the status says.
         assert!(!response_has_body(200, "HEAD"));
         assert!(!response_has_body(200, "head"));
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "whistle-rs-writer-tests-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join(name)
+    }
+
+    /// A dump file is written **once**: whistle stats the path first and hands
+    /// back no writer when it already exists (`checkWriterFile`/`getFileWriter`,
+    /// `_original/lib/util/index.js:502-546`).
+    ///
+    /// This appended instead, so a rule left in place over a reload produced a
+    /// file that is a concatenation of runs with no boundary between them — and
+    /// the request you meant to capture somewhere in the middle of it.
+    #[test]
+    fn a_dump_file_is_written_once() {
+        let path = scratch("body.txt");
+        let p = path.to_str().expect("utf-8 path");
+
+        write_body_file(p, &Bytes::from_static(b"first"), false);
+        assert_eq!(std::fs::read(&path).expect("read"), b"first");
+
+        // The second request through the same rule leaves it alone.
+        write_body_file(p, &Bytes::from_static(b"second"), false);
+        assert_eq!(std::fs::read(&path).expect("read"), b"first");
+
+        // `enable://forceReqWrite` overwrites — it does not append, because
+        // upstream reopens the stream with Node's default `w`.
+        write_body_file(p, &Bytes::from_static(b"second"), true);
+        assert_eq!(std::fs::read(&path).expect("read"), b"second");
+    }
+
+    /// The raw dump takes the same gate, and missing parent directories are
+    /// created (`fse.ensureFile`, `util/index.js:536`).
+    #[test]
+    fn the_raw_dump_takes_the_same_gate_and_makes_its_directory() {
+        let path = scratch("nested/deeper/raw.txt");
+        let p = path.to_str().expect("utf-8 path");
+
+        write_raw_file(p, "GET / HTTP/1.1", &Bytes::from_static(b"body"), false);
+        let written = std::fs::read(&path).expect("read");
+        assert_eq!(written, b"GET / HTTP/1.1\r\nbody\r\n\r\n");
+
+        write_raw_file(p, "GET /other HTTP/1.1", &Bytes::from_static(b"x"), false);
+        assert_eq!(std::fs::read(&path).expect("read"), written);
+    }
+
+    /// A path ending in a separator names a directory, and the dump goes in it
+    /// as `index.html` (`END_RE`, `_original/lib/util/index.js:54,:521-523`).
+    #[test]
+    fn a_trailing_separator_names_a_directory() {
+        let dir = scratch("dumpdir");
+        let p = format!("{}/", dir.to_str().expect("utf-8 path"));
+        write_body_file(&p, &Bytes::from_static(b"page"), false);
+        assert_eq!(
+            std::fs::read(dir.join("index.html")).expect("read"),
+            b"page"
+        );
+    }
+
+    /// A non-200 response is dumped beside the good capture, not over it
+    /// (`getWriterFile`, `_original/lib/inspectors/res.js:147-153`).
+    #[test]
+    fn a_failing_response_is_dumped_under_its_status() {
+        let mut m = RuleManager::new();
+        m.set_text("example.com resWrite:///tmp/dump  resWriteRaw:///tmp/raw\n");
+        let info = apply::build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        let resolved = m.resolve(&info);
+
+        assert_eq!(
+            apply::res_write_path(&resolved, 200),
+            Some("/tmp/dump".to_string())
+        );
+        assert_eq!(
+            apply::res_write_path(&resolved, 502),
+            Some("/tmp/dump.502".to_string())
+        );
+        // The raw dump is named the same way.
+        assert_eq!(
+            apply::res_write_raw_path(&resolved, 404),
+            Some("/tmp/raw.404".to_string())
+        );
+    }
+
+    /// `reqWrite://` is gated on the request actually having a body
+    /// (`util.hasRequestBody(req) ? … : null`,
+    /// `_original/lib/inspectors/req.js:582-584`).
+    ///
+    /// Without the gate a `GET` created an empty file, which reads as "the
+    /// capture worked and there was no body" rather than "there was never a
+    /// body to capture". `reqWriteRaw://` is *not* gated: the head is worth
+    /// dumping either way.
+    #[test]
+    fn req_write_needs_a_method_that_carries_a_body() {
+        let mut m = RuleManager::new();
+        m.set_text("example.com reqWrite:///tmp/req  reqWriteRaw:///tmp/rawreq\n");
+        let info = apply::build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        let resolved = m.resolve(&info);
+
+        for method in ["GET", "HEAD", "OPTIONS", "CONNECT"] {
+            assert_eq!(apply::req_write_path(&resolved, method), None, "{method}");
+        }
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert_eq!(
+                apply::req_write_path(&resolved, method),
+                Some("/tmp/req".to_string()),
+                "{method}"
+            );
+        }
+        assert_eq!(
+            apply::req_write_raw_path(&resolved),
+            Some("/tmp/rawreq".to_string())
+        );
     }
 }
 

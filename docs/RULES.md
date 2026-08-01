@@ -867,7 +867,7 @@ example.com/app.js     file:///Users/me/dev/app.js
 | `reqCors` | origin URL, `*`, or `method=…&headers=…` | Set the request `Origin`, and the `Access-Control-Request-Method` / `-Headers` preflight headers. A URL is reduced to its origin. `enable` is the *response*-side spelling and does nothing here. |
 | `auth` | `user:pass`, `username=…&password=…`, or `{json}` | Add an HTTP Basic `Authorization` header — see below |
 | `forwardedFor` | IP | Set the `X-Forwarded-For` header |
-| `reqWrite` | file path | Append the request body to a file |
+| `reqWrite` | file path | Write the request body to a file, once — see [Dump files](#dump-files) |
 
 ```
 example.com   reqHeaders://x-token=abc
@@ -1187,6 +1187,29 @@ example.com   rulesFile:///etc/whistle/d.rules    # dropped
 > and splices the rules the script emits into the join. whistle-rs has no dynamic-rules
 > script: every kept file is read as rules text.
 
+### Dump files
+
+`reqWrite://`, `reqWriteRaw://`, `resWrite://` and `resWriteRaw://` write a
+capture to a path. They **do not append**, and they write **once**: whistle stats
+the path first and does nothing at all when the file already exists
+(`checkWriterFile` / `getFileWriter`, `_original/lib/util/index.js:502-546`). So
+a rule left in place over a reload leaves the first capture intact rather than
+growing a file that is several runs concatenated with no boundary between them.
+
+| | |
+|---|---|
+| `enable://forceReqWrite` | write even over an existing file — **overwriting** it, not appending. One flag for all four operators, despite the name (`req.js:601`, `res.js:1304`) |
+| a path ending in `/` | names a directory; the dump lands in it as `index.html` |
+| missing parent directories | created |
+| a response that is not `200` | dumped to `<file>.<status>`, so a run of 502s lands in `dump.502` beside the good capture in `dump` (`getWriterFile`, `res.js:147-153`) |
+| `reqWrite://` on a `GET`/`HEAD`/`OPTIONS`/`CONNECT` | not written — there is no body to capture (`req.js:582-584`). `reqWriteRaw://` still dumps the head |
+| `resWrite://` on a response with no body | not written, for the same reason. `resWriteRaw://` still dumps the head |
+
+```
+api.example.com   reqWriteRaw:///tmp/api-request.http
+api.example.com   resWrite:///tmp/api-body.json  enable://forceReqWrite
+```
+
 ### Delays & throttling
 
 | Operator | Value | Effect |
@@ -1216,7 +1239,7 @@ slow.example.com   resSpeed://20        # ~20 KB/s download
 | `resCors` | origin, `*`, `enable`, `{json}` or `k=v&…` | Negotiate the CORS response headers |
 | `attachment` | filename (optional) | Force download via `Content-Disposition: attachment` |
 | `cache` | `no`/`no-cache`/`no-store`/seconds/`keep` | Set `Cache-Control`, `Expires` and `Pragma` |
-| `resWrite` | file path | Append the response body to a file |
+| `resWrite` | file path | Write the response body to a file, once — see [Dump files](#dump-files) |
 
 ```
 example.com        resHeaders://x-mitm=intercepted
