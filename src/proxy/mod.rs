@@ -2055,6 +2055,17 @@ async fn serve(
         port: state.config.port,
         version: crate::config::VERSION,
     };
+    // `reqDelay://` waits here, before anything answers. Upstream delays in a
+    // pipeline stage of its own (`util.delay(...reqDelay)`,
+    // `_original/lib/inspectors/data.js:534`) that runs ahead of the abort gate
+    // and ahead of every short-circuit — so `reqDelay://500 file://mock.json`
+    // delays there. Waiting further down, next to the forwarding call, meant it
+    // was skipped by exactly the rules people pair it with: a delay is how you
+    // make a *mock* feel like a slow endpoint.
+    if let Some(ms) = apply::req_delay_ms(&resolved) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
     if let Some(resp) = apply::short_circuit(&info, &resolved, proxy_env) {
         tracing::info!("{} {} -> short-circuit", info.method, info.full_url);
         // Response-side operators apply to a mocked response too: upstream runs
@@ -2255,10 +2266,6 @@ async fn serve(
     // Capture the outgoing request headers (as forwarded).
     let req_header_pairs = header_pairs(&parts.headers);
     let out_req = Request::from_parts(parts, req_body);
-
-    if let Some(ms) = apply::req_delay_ms(&resolved) {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-    }
 
     tracing::info!(
         "{} {} -> {}:{} ({})",
