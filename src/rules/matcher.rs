@@ -544,6 +544,9 @@ fn joins_tail(op: &RuleOp) -> bool {
     let takes_path =
         op.protocol == protocols::URL_REPLACE || protocols::is_file_protocol(&op.protocol);
     takes_path
+        // Content is not a location, so there is nothing to extend. The inline
+        // form has already been unwrapped by then, so the flag is what says so.
+        && !op.value_is_content
         && super::url::fixed_value(&op.value).is_none()
         && !super::url::is_values_key(&op.value)
 }

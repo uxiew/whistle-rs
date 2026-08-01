@@ -151,12 +151,18 @@ pub fn fixed_value(value: &str) -> Option<(Fixed, String)> {
     if rest.len() < 2 {
         return None;
     }
-    let inner = &rest[1..rest.len() - 1];
-    match (rest.as_bytes()[0], rest.as_bytes()[rest.len() - 1]) {
-        (b'(', b')') => Some((Fixed::Inline, format!("{scheme}{inner}"))),
-        (b'<', b'>') => Some((Fixed::Verbatim, format!("{scheme}{inner}"))),
-        _ => None,
-    }
+    // The brackets are matched as bytes and only *then* sliced away. Slicing
+    // first panics the moment a value starts with a multi-byte character —
+    // `resHeaders://x=报告` has no brackets at all, but `&rest[1..len-1]` cuts
+    // through the middle of one. This is now on the path of every operator, so
+    // that panic would have been a rules file crashing the parser.
+    let kind = match (rest.as_bytes()[0], rest.as_bytes()[rest.len() - 1]) {
+        (b'(', b')') => Fixed::Inline,
+        (b'<', b'>') => Fixed::Verbatim,
+        _ => return None,
+    };
+    // Both brackets are one byte, so these indices are char boundaries.
+    Some((kind, format!("{scheme}{}", &rest[1..rest.len() - 1])))
 }
 
 /// Is this value a bare reference into the values store (`{name}`)?
@@ -226,6 +232,32 @@ mod tests {
         assert_eq!(set_protocol("http://a.com/x", "https"), "http://a.com/x");
         // A protocol whistle does not know is still a protocol.
         assert_eq!(set_protocol("weird://a.com", "http"), "weird://a.com");
+    }
+
+    /// The bracket test runs on **every** operator's value now, so it has to
+    /// survive text it was never shown before. Slicing the brackets away before
+    /// checking for them panicked the moment a value began with a multi-byte
+    /// character — a rules file taking the parser down with it.
+    #[test]
+    fn a_non_ascii_value_is_not_a_bracket_form() {
+        for value in [
+            "x=报告",
+            "报告",
+            "resHeaders://x=搜索",
+            "位置",
+            "(报告)",
+            "<搜索>",
+            "中",
+            "",
+        ] {
+            // The assertion is that this returns rather than panicking.
+            let got = fixed_value(value);
+            match value {
+                "(报告)" => assert_eq!(got, Some((Fixed::Inline, "报告".into()))),
+                "<搜索>" => assert_eq!(got, Some((Fixed::Verbatim, "搜索".into()))),
+                _ => assert_eq!(got, None, "{value:?}"),
+            }
+        }
     }
 
     #[test]

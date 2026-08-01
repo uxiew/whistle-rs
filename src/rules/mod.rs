@@ -2042,10 +2042,28 @@ fn parse_ip_shorthand(tok: &str) -> Option<(String, Option<u16>)> {
 /// [`parse_line`], which is the only place that has seen the whole line.
 fn parse_op(tok: &str) -> Option<RuleOp> {
     let op = |protocol: &str, value: &str| {
+        // `proto://(text)` means the value **is** `text` — whistle's inline
+        // form, which `getValue` unwraps into `rule.value` for *every* operator
+        // (`_original/lib/rules/rules.js:271-287`), not only the file family.
+        // `readRuleValue` then hands that back directly and never looks at the
+        // filesystem or the network (`lib/util/index.js:1178-1180`).
+        //
+        // It was only unwrapped for `file://` here, so `reqBody://(Hello)` —
+        // upstream's own documented example — sent the seven characters
+        // `(Hello)` to the origin, parentheses and all.
+        let inline = matches!(
+            url::fixed_value(value),
+            Some((url::Fixed::Inline, _))
+        );
+        let value = match inline {
+            true => url::fixed_value(value).map(|(_, v)| v).unwrap_or_default(),
+            false => value.to_string(),
+        };
         Some(RuleOp {
             protocol: protocol.to_string(),
-            value: value.to_string(),
+            value,
             raw: tok.to_string(),
+            value_is_content: inline,
             ..Default::default()
         })
     };
@@ -3333,6 +3351,48 @@ mod parse_text_tests {
         assert!(!mgr.inline_values().contains_key("b"), "a disabled group contributes nothing");
     }
 
+    /// `proto://(text)` means the value **is** `text`, for every operator and
+    /// not just the file family. It was unwrapped only for `file://` here, so
+    /// `reqBody://(Hello)` — upstream's own documented example — sent the seven
+    /// characters `(Hello)` to the origin, parentheses and all.
+    #[test]
+    fn the_inline_form_unwraps_for_every_operator() {
+        let op_of = |line: &str, proto: &str| {
+            let rules = parse_text(line);
+            rules[0]
+                .ops
+                .iter()
+                .find(|op| op.protocol == proto)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {proto} in {line}"))
+        };
+
+        for (line, proto, want) in [
+            ("a.com reqBody://(Hello)", "reqBody", "Hello"),
+            ("a.com resBody://(<h1>hi</h1>)", "resBody", "<h1>hi</h1>"),
+            ("a.com ua://(MyBot/1.0)", "ua", "MyBot/1.0"),
+            ("a.com file://({\"ok\":true})", "file", "{\"ok\":true}"),
+        ] {
+            let op = op_of(line, proto);
+            assert_eq!(op.value, want, "{line}");
+            assert!(op.value_is_content, "{line} is content, not a location");
+        }
+
+        // The other two bracket forms are not content. `<path>` is a location
+        // pinned in place…
+        let op = op_of("a.com file://</srv/mock.json>", "file");
+        assert!(!op.value_is_content);
+        // …and `{key}` is a reference the values store answers later.
+        let op = op_of("a.com file://{mock.json}", "file");
+        assert!(!op.value_is_content);
+        assert_eq!(op.value, "{mock.json}");
+
+        // A value that merely contains parentheses is not the inline form.
+        let op = op_of("a.com ua://Mozilla(compatible)/5", "ua");
+        assert_eq!(op.value, "Mozilla(compatible)/5");
+        assert!(!op.value_is_content);
+    }
+
     /// `whistle.<name>://` and `plugin.<name>://` name a plugin. It is how every
     /// npm-published whistle plugin is written, so a rules file carried over
     /// from whistle is full of them — and without this the protocol is unknown,
@@ -3386,11 +3446,17 @@ mod parse_text_tests {
         let rules = parse_text("example.com 1.2.3.4:8080");
         assert_eq!(rules[0].ops[0].protocol, "host");
         // …and so are the bracket forms, which name a mock rather than a place
-        // (`formatShorthand`).
-        for tok in ["(hello)", "<~/mock.json>", "{mock.json}"] {
+        // (`formatShorthand`). The inline one is unwrapped on the way through,
+        // which is what makes it *content* rather than a path.
+        for (tok, want, content) in [
+            ("(hello)", "hello", true),
+            ("<~/mock.json>", "<~/mock.json>", false),
+            ("{mock.json}", "{mock.json}", false),
+        ] {
             let rules = parse_text(&format!("example.com {tok}"));
             assert_eq!(rules[0].ops[0].protocol, "file", "{tok}");
-            assert_eq!(rules[0].ops[0].value, tok);
+            assert_eq!(rules[0].ops[0].value, want, "{tok}");
+            assert_eq!(rules[0].ops[0].value_is_content, content, "{tok}");
         }
     }
 
