@@ -160,6 +160,10 @@ pub struct AppState {
     next_id: AtomicU64,
     /// Optional session persistence (JSONL on disk).
     session_store: Option<persist::SessionStore>,
+    /// Told about every completed transaction, for a program that has embedded
+    /// this proxy and wants the traffic rather than the console. Set once,
+    /// before serving; see [`AppState::observe`].
+    observer: std::sync::OnceLock<SessionObserver>,
 }
 
 impl AppState {
@@ -192,6 +196,7 @@ impl AppState {
             ws_frames: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
             session_store: None,
+            observer: std::sync::OnceLock::new(),
         }
     }
 
@@ -206,11 +211,29 @@ impl AppState {
         self.next_id.store(id, Ordering::Relaxed);
     }
 
+    /// Be told about every transaction as it completes.
+    ///
+    /// For an **embedding** program: a proxy inside another application usually
+    /// wants the traffic delivered, not polled out of `/sessions.json`. The
+    /// callback runs on the request's own task, after the response has gone to
+    /// the client and before the session enters the ring buffer, so it must be
+    /// quick — hand the work to a channel if it is not.
+    ///
+    /// Settable once, before serving. A second call is ignored rather than
+    /// replacing the first, so a library consumer cannot silently lose the
+    /// observer another part of the program installed.
+    pub fn observe(&self, f: impl Fn(&Session) + Send + Sync + 'static) {
+        let _ = self.observer.set(Box::new(f));
+    }
+
     /// Record a transaction, assigning it an id which is returned so callers
     /// (e.g. WebSocket tunnels) can correlate later frames with it.
     fn record(&self, mut session: Session) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         session.id = id;
+        if let Some(observe) = self.observer.get() {
+            observe(&session);
+        }
         // Persist to disk before inserting into the in-memory ring buffer.
         if let Some(store) = &self.session_store {
             store.persist(&session);
@@ -238,6 +261,9 @@ impl AppState {
         q.push_back(frame);
     }
 }
+
+/// A callback told about each completed transaction — see [`AppState::observe`].
+pub type SessionObserver = Box<dyn Fn(&Session) + Send + Sync>;
 
 /// Longest body prefix retained for the inspection preview (per body).
 pub const BODY_PREVIEW_CAP: usize = 16 * 1024;
@@ -822,20 +848,34 @@ enum Origin {
 
 /// Start the proxy and serve until the process exits.
 pub async fn run(state: Arc<AppState>) -> Result<()> {
-    let addr = SocketAddr::new(
+    let (listener, _addr) = bind(&state).await?;
+    accept_loop(state, listener, None).await
+}
+
+/// Bind the proxy's listening socket and announce it, without accepting yet.
+///
+/// Split out of [`run`] for the sake of an **embedding** program: with
+/// `port: 0` the operating system chooses the port, and the only way to learn
+/// which one is to ask the bound socket. Returning it before the accept loop
+/// starts means the embedder can hand the address to whatever it is configuring
+/// without racing the first connection. See [`crate::embed`].
+pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
+    let requested = SocketAddr::new(
         state
             .config
             .host
             .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
         state.config.port,
     );
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(requested).await?;
+    let addr = listener.local_addr().unwrap_or(requested);
     tracing::info!("whistle-rs listening on http://{addr}");
 
     // Teach the forwarding layer which addresses are *us*, so a `proxy://` rule
     // naming this proxy is refused instead of recursing into it. Registered
     // before the first connection is accepted; see `upstream::self_loop`.
-    let mut own_ports = vec![state.config.port];
+    // The *bound* port, not the requested one, or port 0 would register nothing.
+    let mut own_ports = vec![addr.port()];
     own_ports.extend(state.config.socks_port);
     upstream::set_listen(state.config.host, &own_ports);
     tracing::info!(
@@ -843,7 +883,19 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
         state.config.root_ca_cert_path().display(),
         addr
     );
+    Ok((listener, addr))
+}
 
+/// Accept connections until `shutdown` resolves (or forever, if it is `None`).
+///
+/// The optional shutdown is what lets an embedded proxy be stopped: a binary
+/// runs until the process ends, but a proxy inside another program has to be
+/// able to go away without taking its host with it.
+pub async fn accept_loop(
+    state: Arc<AppState>,
+    listener: TcpListener,
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<()> {
     // Optional inbound SOCKS5 server.
     if let Some(socks_port) = state.config.socks_port {
         let socks_state = state.clone();
@@ -854,8 +906,23 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
         });
     }
 
+    // `Either` rather than a `select!` per iteration: with no shutdown channel
+    // there is nothing to poll, and the binary's hot loop should not pay for a
+    // feature only the library uses.
+    let mut shutdown = shutdown;
     loop {
-        let (stream, peer) = match listener.accept().await {
+        let accepted = match &mut shutdown {
+            None => listener.accept().await,
+            Some(stop) => tokio::select! {
+                biased;
+                _ = &mut *stop => {
+                    tracing::info!("whistle-rs shutting down");
+                    return Ok(());
+                }
+                accepted = listener.accept() => accepted,
+            },
+        };
+        let (stream, peer) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("accept error: {e}");
