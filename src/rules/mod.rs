@@ -3330,7 +3330,7 @@ mod parse_text_tests {
         assert_eq!(mgr.inline_values().get("b").map(String::as_str), Some("from-extra"));
 
         mgr.toggle_group("extra");
-        assert!(mgr.inline_values().get("b").is_none(), "a disabled group contributes nothing");
+        assert!(!mgr.inline_values().contains_key("b"), "a disabled group contributes nothing");
     }
 
     /// `whistle.<name>://` and `plugin.<name>://` name a plugin. It is how every
