@@ -830,33 +830,28 @@ fn html_ok(html: String) -> Response<DynBody> {
         .unwrap()
 }
 
-/// The console, assembled from `ui/` at compile time.
+/// The console: the Vue application from `ui-src/`, built to one file.
 ///
-/// The three assets are separate files so the CSS and JavaScript can be edited
-/// as CSS and JavaScript — with a formatter, with syntax highlighting, and
-/// without escaping every brace past a `format!`. They are stitched together
-/// here rather than served separately because the console must load with the
-/// network it is inspecting switched off, which rules out a second request.
+/// `ui-src/dist/index.html` is a committed build artifact, and deliberately so.
+/// The console is a Vue 3 / Vite / TypeScript app — which needs node to build —
+/// but the *proxy* must not: `cargo build` on a machine with no node has to
+/// produce a working binary. So the artifact is checked in and `include_str!`'d,
+/// and `ui-src/README.md` says how to regenerate it.
+///
+/// It is one file for a harder reason than convenience: the console is served by
+/// the proxy being debugged, and has to load with the network it is inspecting
+/// switched off. A second request for a chunk or a stylesheet could not be
+/// relied on to arrive.
+///
+/// The three runtime facts the page needs are substituted here rather than
+/// fetched, so the first paint needs no round trip.
 fn index_html(state: &Arc<AppState>) -> String {
     let host = state
         .config
         .host
         .map(|h| h.to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    include_str!("ui/index.html")
-        .replace("/*__CM_CSS__*/", include_str!("ui/vendor/codemirror.css"))
-        .replace("/*__CSS__*/", include_str!("ui/app.css"))
-        .replace(
-            "/*__CM_JS__*/",
-            &[
-                include_str!("ui/vendor/codemirror.js"),
-                include_str!("ui/vendor/mode-javascript.js"),
-                include_str!("ui/vendor/addon-placeholder.js"),
-            ]
-            .join("\n;\n"),
-        )
-        .replace("/*__MODE_JS__*/", include_str!("ui/mode-whistle.js"))
-        .replace("/*__JS__*/", include_str!("ui/app.js"))
+    include_str!("../../ui-src/dist/index.html")
         .replace("__VERSION__", crate::config::VERSION)
         .replace("__HOST__", &host)
         .replace("__PORT__", &state.config.port.to_string())
@@ -883,15 +878,13 @@ mod tests {
         use boa_engine::{Context, Source};
 
         let mut ctx = Context::default();
-        // The mode is a browser file; it needs only enough of CodeMirror to
-        // register itself against.
-        ctx.eval(Source::from_bytes(
-            b"var CodeMirror = { defineMode: function(){}, defineMIME: function(){} };\
-              var window = { CodeMirror: CodeMirror };",
-        ))
-        .expect("stub CodeMirror");
-        ctx.eval(Source::from_bytes(include_str!("ui/mode-whistle.js")))
-            .expect("mode-whistle.js evaluates");
+        // The classifier is deliberately dependency-free, script-shaped
+        // JavaScript so it can be evaluated here as well as bundled into the
+        // console — see the note at the top of the file it comes from.
+        ctx.eval(Source::from_bytes(include_str!(
+            "../../ui-src/src/editor/whistle-classify.js"
+        )))
+        .expect("whistle-classify.js evaluates");
 
         for line in [
             // The forwarding rule, and the shape it is confused with.
@@ -919,7 +912,7 @@ mod tests {
             "host://x proxy://y",
         ] {
             let js = format!(
-                "JSON.stringify(CodeMirror.__whistleClassify({}).map(function(t){{return t.role}}))",
+                "JSON.stringify(whistleClassify({}).map(function(t){{return t.role}}))",
                 serde_json::to_string(line).expect("a JSON string")
             );
             let editor: Vec<String> = serde_json::from_str(
