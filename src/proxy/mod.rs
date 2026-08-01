@@ -1101,6 +1101,107 @@ fn matched_ops(resolved: &Resolved) -> Vec<MatchedOp> {
 }
 
 #[cfg(test)]
+mod forced_encoding_tests {
+    use super::*;
+
+    fn ops(rule: &str, has_body: bool) -> ResBodyOps {
+        let mut m = RuleManager::new();
+        m.set_text(&format!("example.com {rule}\n"));
+        let info = apply::build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        ResBodyOps::of(&m.resolve(&info), has_body, 200)
+    }
+
+    /// The bug: `enable://gzip` standing alone left `needs_body` false, so the
+    /// response took the streaming path, `reencode` was never reached, and the
+    /// flag did nothing at all. It only ever appeared to work when some *other*
+    /// operator on the line happened to buffer the body for it.
+    #[test]
+    fn a_forced_encoding_alone_asks_for_the_buffered_path() {
+        for flag in ["enable://gzip", "enable://br", "enable://deflate"] {
+            let ops = ops(flag, true);
+            assert!(ops.force_encoding.is_some(), "{flag}");
+            assert!(ops.needs_body(), "{flag} must buffer, or it cannot be applied");
+        }
+    }
+
+    /// A response with no body has nothing to encode, so the flag must not drag
+    /// it onto the buffered path — gzipping nothing produces a 20-byte header
+    /// that says "nothing".
+    #[test]
+    fn a_response_with_no_body_is_not_buffered_to_encode_it() {
+        let ops = ops("enable://gzip", false);
+        assert!(ops.force_encoding.is_none());
+        assert!(!ops.needs_body());
+    }
+
+    /// The streaming fast path is what most traffic takes, and nothing here may
+    /// pull it onto the buffered one.
+    #[test]
+    fn a_response_no_operator_touches_still_streams() {
+        assert!(!ops("log://x", true).needs_body());
+    }
+
+    /// A body that could not be decoded goes out exactly as it arrived,
+    /// **including its header**. `reencode` refuses to force a coding onto such
+    /// a body and reports `Identity` — and stamping that removes the header, so
+    /// a `zstd` response would reach the client as zstd bytes labelled plain.
+    /// That is worse than the flag doing nothing: it arrived readable and would
+    /// leave unreadable.
+    #[test]
+    fn a_body_that_was_never_decoded_keeps_the_coding_it_arrived_under() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("content-encoding", "zstd".parse().expect("a header value"));
+        let restore = coding::Restore {
+            coding: coding::Coding::Identity,
+            plain: false,
+        };
+        let now = restore_content_encoding(
+            &mut headers,
+            restore,
+            coding::Coding::Identity,
+            Some("zstd".to_string()),
+        );
+        assert_eq!(headers.get("content-encoding").expect("kept"), "zstd");
+        // …and the capture is told what the body is really under, so the
+        // preview does not try to read zstd as text.
+        assert_eq!(now.as_deref(), Some("zstd"));
+    }
+
+    /// The ordinary case still stamps what was actually applied — including
+    /// removing the header when a gzipped body was rewritten and goes out plain.
+    #[test]
+    fn a_decoded_body_is_labelled_with_what_went_back_on() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().expect("a header value"));
+        let restore = coding::Restore {
+            coding: coding::Coding::Gzip,
+            plain: true,
+        };
+        let now = restore_content_encoding(
+            &mut headers,
+            restore,
+            coding::Coding::Identity,
+            Some("gzip".to_string()),
+        );
+        assert!(headers.get("content-encoding").is_none(), "must be removed");
+        assert_eq!(now, None);
+
+        let mut headers = hyper::HeaderMap::new();
+        let now = restore_content_encoding(&mut headers, restore, coding::Coding::Brotli, None);
+        assert_eq!(headers.get("content-encoding").expect("set"), "br");
+        assert_eq!(now.as_deref(), Some("br"));
+    }
+}
+
+#[cfg(test)]
 mod client_capture_tests {
     use super::*;
 
@@ -1753,6 +1854,17 @@ struct ResBodyOps {
     announce_trailers: bool,
     /// Any content operator (`resReplace`, `htmlAppend`, `resBody`, …).
     content: bool,
+    /// `enable://gzip|br|deflate` — the coding the response must leave under
+    /// (`getEnableEncoding`, `_original/lib/util/index.js:1534-1548`).
+    ///
+    /// Held here rather than read where it is used so that
+    /// [`ResBodyOps::needs_body`] can count it. It is the one operator that
+    /// needs the whole body without rewriting a byte of it, and leaving it out
+    /// of that gate is what made the flag do nothing when it stood alone: the
+    /// response took the streaming path, `reencode` was never reached, and
+    /// `enable://gzip` was inert unless some *other* operator happened to
+    /// buffer the body for it.
+    force_encoding: Option<coding::Coding>,
 }
 
 impl ResBodyOps {
@@ -1798,6 +1910,10 @@ impl ResBodyOps {
             no_trailers: apply::trailers_disabled(resolved),
             announce_trailers: apply::trailer_header_announced(resolved),
             content: apply::wants_res_body(resolved),
+            // Only where there is a body to encode. A `HEAD` answer, a 204 or a
+            // 3xx takes the branch above, where this stays `None`: compressing
+            // nothing produces a header that says "nothing".
+            force_encoding: apply::forced_encoding(resolved),
         }
     }
 
@@ -1813,7 +1929,36 @@ impl ResBodyOps {
             || self.write.is_some()
             || self.write_raw.is_some()
             || !self.trailers.is_empty()
+            // A coding cannot be put on a body that is still arriving in
+            // frames, so asking for one is asking for the buffered path.
+            || self.force_encoding.is_some()
     }
+}
+
+/// Put `Content-Encoding` back after a rewrite, and report the coding the
+/// capture should be told the body is now under.
+///
+/// The header is left **exactly as it arrived** when the bytes were never
+/// decoded. `reencode` refuses to force a coding onto such a body — see
+/// `Restore { plain: false }` — and reports [`coding::Coding::Identity`],
+/// because it encoded nothing; but stamping that would *remove* the header, and
+/// a `zstd` response would reach the client as zstd bytes labelled as plain.
+/// That is worse than the flag doing nothing: the response arrived readable and
+/// would leave unreadable.
+///
+/// `arrived_as` is the response's own `Content-Encoding`, which is what such a
+/// body is still under.
+fn restore_content_encoding(
+    headers: &mut hyper::HeaderMap,
+    restore: coding::Restore,
+    encoded_as: coding::Coding,
+    arrived_as: Option<String>,
+) -> Option<String> {
+    if !restore.plain {
+        return arrived_as;
+    }
+    coding::set_content_encoding(headers, encoded_as);
+    encoded_as.header_value().map(str::to_string)
 }
 
 /// The values a request resolves against: what the rules files declared in
@@ -2230,10 +2375,9 @@ async fn finish_local_response(
             }
         }
         let new = inject_res_body(state, &mut parts, new, &ops, info);
-        let (new, encoded_as) =
-            coding::reencode(new, restore, apply::forced_encoding(resolved));
-        coding::set_content_encoding(&mut parts.headers, encoded_as);
-        (new, encoded_as.header_value().map(str::to_string))
+        let (new, encoded_as) = coding::reencode(new, restore, ops.force_encoding);
+        let now = restore_content_encoding(&mut parts.headers, restore, encoded_as, res_enc);
+        (new, now)
     } else {
         (bytes, res_enc)
     };
@@ -2996,16 +3140,16 @@ async fn serve(
             // than arrived (`getEnableEncoding`,
             // `_original/lib/util/index.js:1534-1548`) — the only case where the
             // body leaves compressed that arrived plain.
-            let (new, encoded_as) =
-                coding::reencode(new, restore, apply::forced_encoding(&resolved));
-            coding::set_content_encoding(&mut parts.headers, encoded_as);
+            let (new, encoded_as) = coding::reencode(new, restore, ops.force_encoding);
+            let now =
+                restore_content_encoding(&mut parts.headers, restore, encoded_as, res_enc.clone());
             if !new.is_empty() {
                 res_body_cap = Some(Capture::from_bytes(
                     &new,
                     res_ct.clone(),
                     // The preview decodes what it is told the body is, so it has
                     // to be told what the body *now* is, not what arrived.
-                    encoded_as.header_value(),
+                    now.as_deref(),
                     state.config.body_preview_cap,
                 ));
             }
