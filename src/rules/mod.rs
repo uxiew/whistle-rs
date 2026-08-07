@@ -176,6 +176,15 @@ pub struct RuleOp {
     /// opened as a *path* — so the console reported "file not found" naming the
     /// JSON it was supposed to serve.
     pub value_is_content: bool,
+    /// The values-store name [`value`](RuleOp::value) came from, when it came
+    /// from one.
+    ///
+    /// It is upstream's `rule.key` (`getKey`, `_original/lib/rules/rules.js:817-820`),
+    /// and the local-file family reads it as a *filename*: the content type of
+    /// `file://{mock.json}` is guessed from `mock.json`, not from the request
+    /// URL (`_original/lib/handlers/file-proxy.js:270-272`). A named value is
+    /// the only body whose extension is written nowhere else.
+    pub value_key: Option<String>,
     /// Where this operator sits in the resolution order — important lines first,
     /// then source order (see [`order_key`]). Stamped when a rule resolves.
     ///

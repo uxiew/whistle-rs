@@ -48,15 +48,35 @@ const EXPECTED = [
     why: 'busting the request cache: deliberate, and better than upstream',
   },
   {
-    // whistle stamps `x-server: Whistle`; this is not whistle.
-    match: (p) => /res\.header\.x-server: whistle="Whistle" rs="whistle-rs"/.test(p),
-    why: 'x-server names the proxy that actually answered',
+    // whistle stamps `x-server: Whistle`; this is not whistle. It also only
+    // stamps the responses it built in memory — `wrapResponse` is where the
+    // header is set, and a file streamed off disk never goes through it, so
+    // upstream's most common mock is the one response it leaves unmarked.
+    // whistle-rs marks every response it made itself, which is the whole point
+    // of the header.
+    match: (p) => /res\.header\.x-server: whistle=("Whistle"|undefined) rs="whistle-rs"/.test(p),
+    why: 'x-server names the proxy that actually answered, on every answer',
+  },
+  {
+    // The `Server` header a served local file carries (`file-proxy.js:315-318`).
+    // Same header, same reason as above: naming whistle would be a lie.
+    match: (p) => /res\.header\.server: whistle="Whistle" rs="whistle-rs"/.test(p),
+    why: 'a mocked file names the proxy that served it',
   },
   {
     // Both fail to find the file and say so; only the wording differs, and
     // matching another program's error prose is not worth pinning.
-    match: (p) => /res\.body: whistle="Not found file /.test(p),
+    match: (p) => /res\.body: whistle="Not found (file|key) /.test(p),
     why: 'the same 404, phrased in each proxy\'s own words',
+  },
+  {
+    // `rawfile://` whose head has no status line: upstream assigns the second
+    // word of the first line as the status code and throws while writing it,
+    // which reaches the client as a reset connection. whistle-rs falls back to
+    // 200 and serves the body.
+    match: (p) => /status: whistle=0 rs=200/.test(p)
+      || /res\.body: whistle="ERR ECONNRESET"/.test(p),
+    why: 'a rawfile with no status line: upstream crashes, this serves it',
   },
 ];
 
