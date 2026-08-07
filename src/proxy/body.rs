@@ -186,3 +186,142 @@ impl Body for ThrottledBody {
         Poll::Ready(Some(Ok(Frame::data(chunk))))
     }
 }
+
+/// The result of reading a body up to a limit — see [`collect_capped`].
+pub enum Capped {
+    /// The whole body arrived within the limit.
+    Whole(Bytes),
+    /// The body is larger than the limit. Nothing has been lost: this is the
+    /// same body, from its first byte, with the part already read queued in
+    /// front of the part still arriving. It can only be streamed, not rewritten.
+    TooBig(DynBody),
+}
+
+/// Read a body into memory, giving up if it exceeds `limit`.
+///
+/// The operators that rewrite a request body need it whole, so the proxy reads
+/// it whole — and a proxy that reads whatever a client sends, without a bound,
+/// is one upload away from being killed by the operating system. whistle bounds
+/// it: `MAX_REQ_SIZE` is 2MB, or 16MB behind `enable://reqMergeBigData`
+/// (`_original/lib/inspectors/req.js:19-20,:163`).
+///
+/// What happens at the bound is the part worth copying. whistle does not fail
+/// the request and does not truncate the body — it sets `interrupt`, flushes
+/// what it has, and lets the remainder stream past **untransformed**
+/// (`handleParams`, `req.js:169-185`). So an upload that is too big to rewrite
+/// still arrives at the origin, whole and unharmed; only the rule stops
+/// applying. That is the right failure for a debugging proxy: the traffic it
+/// was asked to inspect must not be damaged by the inspection.
+pub async fn collect_capped(body: DynBody, limit: usize) -> Result<Capped, BodyError> {
+    let mut seen: Vec<Frame<Bytes>> = Vec::new();
+    let mut total = 0usize;
+    let mut body = Box::pin(body);
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            total += data.len();
+        }
+        seen.push(frame);
+        if total > limit {
+            return Ok(Capped::TooBig(
+                QueuedBody { queued: seen.into(), inner: body }.boxed(),
+            ));
+        }
+    }
+    let mut whole = bytes::BytesMut::with_capacity(total);
+    for frame in seen {
+        if let Ok(data) = frame.into_data() {
+            whole.extend_from_slice(&data);
+        }
+    }
+    Ok(Capped::Whole(whole.freeze()))
+}
+
+/// Body impl backing [`Capped::TooBig`]: replays the frames already read, then
+/// continues from where the read stopped.
+struct QueuedBody {
+    queued: std::collections::VecDeque<Frame<Bytes>>,
+    inner: Pin<Box<DynBody>>,
+}
+
+impl Body for QueuedBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.queued.pop_front() {
+            Some(frame) => Poll::Ready(Some(Ok(frame))),
+            None => this.inner.as_mut().poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.queued.is_empty() && self.inner.is_end_stream()
+    }
+}
+
+#[cfg(test)]
+mod capped_tests {
+    use super::*;
+
+    /// A body delivered in several frames, as one arrives off a socket.
+    fn framed(parts: &[&[u8]]) -> DynBody {
+        let (tx, body) = channel(parts.len().max(1));
+        for part in parts {
+            tx.try_send(Ok(Bytes::copy_from_slice(part))).expect("capacity");
+        }
+        drop(tx);
+        body
+    }
+
+    async fn drain(body: DynBody) -> Vec<u8> {
+        let mut body = Box::pin(body);
+        let mut out = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Some(data) = frame.expect("no error").data_ref() {
+                out.extend_from_slice(data);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_limit_comes_back_whole() {
+        let got = collect_capped(framed(&[b"hello ", b"world"]), 1024).await.expect("ok");
+        match got {
+            Capped::Whole(bytes) => assert_eq!(&bytes[..], b"hello world"),
+            Capped::TooBig(_) => panic!("11 bytes is not too big for 1024"),
+        }
+    }
+
+    /// The failure that matters: the request must reach the origin unharmed.
+    /// Not truncated, not reordered, not one byte short — only un-rewritten.
+    #[tokio::test]
+    async fn a_body_over_the_limit_still_arrives_byte_for_byte() {
+        let got = collect_capped(framed(&[b"aaaa", b"bbbb", b"cccc"]), 6).await.expect("ok");
+        match got {
+            Capped::Whole(_) => panic!("12 bytes is too big for 6"),
+            Capped::TooBig(body) => assert_eq!(drain(body).await, b"aaaabbbbcccc"),
+        }
+    }
+
+    /// The bound is on what was read, so a body that is exactly the limit is
+    /// still rewritable — `len > maxReqSize`, not `>=` (`req.js:177`).
+    #[tokio::test]
+    async fn a_body_exactly_at_the_limit_is_still_whole() {
+        let got = collect_capped(framed(&[b"123456"]), 6).await.expect("ok");
+        assert!(matches!(got, Capped::Whole(b) if &b[..] == b"123456"));
+    }
+
+    /// An empty body is whole, not a stream to give up on: `b:!x` has to hold
+    /// for a request with no body at all.
+    #[tokio::test]
+    async fn an_empty_body_is_whole() {
+        let got = collect_capped(empty(), 1024).await.expect("ok");
+        assert!(matches!(got, Capped::Whole(b) if b.is_empty()));
+    }
+}
