@@ -250,6 +250,15 @@ async fn relay_decision(info: &crate::rules::ReqInfo, resolved: &crate::rules::R
 /// `bool` per group, precomputed when the group parsed. That is what keeps a
 /// connection nobody wrote a rule for identical to one from before this hook
 /// existed.
+/// Does a rule ask for this connection to be relayed rather than read?
+///
+/// Read straight off `disable`, without the `enable://` cancellation, as
+/// upstream reads it. The three spellings are one question there and one here.
+fn no_intercept(resolved: &crate::rules::Resolved) -> bool {
+    let disabled = crate::proxy::apply::disabled_flags(resolved);
+    ["intercept", "https", "capture"].iter().any(|f| disabled.contains(*f))
+}
+
 pub async fn decide(
     state: &Arc<AppState>,
     servername: &str,
@@ -274,16 +283,35 @@ pub async fn decide(
     // Scoped so the read guard cannot cross the `.await` below. `Resolved` owns
     // its contents, so it outlives the guard and is kept: a declined connection
     // still has to be routed, and re-resolving would mean matching twice.
-    let (matched, info, resolved) = {
+    let (matched, info, resolved, relay) = {
         let rules = state.rules.read().unwrap();
-        if !rules.has_sni_callback() {
+        // Two questions, both answered from a `bool` per group: does anything
+        // want to choose a certificate, and does anything want this connection
+        // left alone? A rules file that asks neither costs exactly this much.
+        if !rules.has_sni_callback() && !rules.has_no_intercept() {
             return Decision::Generated;
         }
         let info = connection_req_info(servername, port, peer, has_sni);
         let resolved = rules.resolve(&info);
-        let matched = resolved.value("sniCallback").and_then(parse_rule);
-        (matched, info, resolved)
+        // `disable://intercept` — and its two other spellings — mean "route this
+        // connection but do not read it" (`disable.intercept || disable.https ||
+        // disable.capture`, `_original/lib/tunnel.js:167-169`). It is the answer
+        // a certificate-pinned client needs, and it outranks `sniCallback://`:
+        // asking a plugin which certificate to forge for a connection nobody is
+        // going to forge one for is a question with no use for its answer.
+        //
+        // Decided here and acted on below, because the relay is an `.await` and
+        // the read guard must not cross one.
+        let relay = no_intercept(&resolved);
+        let matched = match relay {
+            true => None,
+            false => resolved.value("sniCallback").and_then(parse_rule),
+        };
+        (matched, info, resolved, relay)
     };
+    if relay {
+        return relay_decision(&info, &resolved).await;
+    }
     let Some((plugin, value)) = matched else {
         return Decision::Generated;
     };
@@ -801,6 +829,57 @@ mod tests {
             decide_for(&state, "example.test").await,
             Decision::Generated
         ));
+    }
+
+    /// `disable://intercept` relays the connection instead of reading it —
+    /// what a certificate-pinned client needs, and one of whistle's
+    /// most-reached-for flags (`disable.intercept || disable.https ||
+    /// disable.capture`, `_original/lib/tunnel.js:167-169`). This port had only
+    /// the global `--no-intercept-https` and no way to say it per host.
+    #[tokio::test]
+    async fn disable_intercept_relays_the_connection() {
+        for spelling in ["intercept", "https", "capture"] {
+            let state = state_with(&format!("example.test disable://{spelling}\n"), None);
+            assert!(
+                matches!(decide_for(&state, "example.test").await, Decision::Bypass(_)),
+                "disable://{spelling} should relay"
+            );
+        }
+        // …and it names one connection, not all of them.
+        let state = state_with("example.test disable://intercept\n", None);
+        assert!(matches!(
+            decide_for(&state, "other.test").await,
+            Decision::Generated
+        ));
+    }
+
+    /// A relayed connection is still **routed**: `host://` lands in the target
+    /// the bypass carries, which is what makes "do not read this, but do send
+    /// it somewhere else" expressible.
+    #[tokio::test]
+    async fn a_relayed_connection_is_still_routed() {
+        let state = state_with("example.test disable://intercept host://10.0.0.9\n", None);
+        match decide_for(&state, "example.test").await {
+            Decision::Bypass(target) => assert_eq!(target.connect_host, "10.0.0.9"),
+            _ => panic!("expected a routed bypass"),
+        }
+    }
+
+    /// The flag outranks `sniCallback://`: choosing a certificate to forge for
+    /// a connection nobody will forge one for is a question with no use for its
+    /// answer, so the plugin is never asked.
+    #[tokio::test]
+    async fn disable_intercept_outranks_the_certificate_hook() {
+        let plugin = FakeSni::start(200, r#"{"intercept":true}"#).await;
+        let state = state_with(
+            "example.test disable://intercept sniCallback://sni\n",
+            Some(&plugin),
+        );
+        assert!(matches!(
+            decide_for(&state, "example.test").await,
+            Decision::Bypass(_)
+        ));
+        assert!(plugin.seen.lock().unwrap().is_empty(), "the hook must not be asked");
     }
 
     async fn decide_for(state: &Arc<AppState>, servername: &str) -> Decision {

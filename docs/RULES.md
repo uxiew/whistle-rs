@@ -2287,6 +2287,31 @@ If a rule doesn't do what you expect, run with `-v` (debug logging) — each req
 logs its resolved destination or short-circuit decision.
 
 
+### Not decrypting a connection
+
+`disable://intercept` relays a TLS connection instead of reading it — the client
+gets the **origin's own certificate**, not one this proxy forged. It is what a
+certificate-pinned client needs, and what you reach for on a host you do not
+want decrypted. `disable://https` and `disable://capture` are the same flag
+(`disable.intercept || disable.https || disable.capture`,
+`_original/lib/tunnel.js:167-169`).
+
+```
+pinned.example.com disable://intercept
+```
+
+The connection is still **routed**: `host://` and the proxy family apply to it
+as usual, because routing needs no plaintext. What it loses is everything that
+does — the session carries no request, no headers and no body, and no request or
+response operator runs on it.
+
+It outranks `sniCallback://`: asking a plugin which certificate to forge for a
+connection nobody will forge one for is a question with no use for its answer,
+so the hook is not called.
+
+`--no-intercept-https` says the same thing for every connection at once.
+
+
 ### Shaping the CONNECT to an upstream proxy
 
 `disable://proxyUA` drops the client's `User-Agent` from the CONNECT this proxy

@@ -870,6 +870,13 @@ pub struct RuleGroup {
     /// connection, before a single certificate has been chosen. A rules file
     /// with no `sniCallback://` in it has to cost one `bool`, not a resolution.
     has_sni_callback: bool,
+    /// Does any line here ask for a connection **not** to be intercepted —
+    /// `disable://intercept`, `disable://https` or `disable://capture`?
+    ///
+    /// Precomputed for exactly the reason [`Self::has_sni_callback`] is, and
+    /// read at the same moment: a rules file that never says so must cost one
+    /// `bool` inside every TLS handshake, not a resolution.
+    has_no_intercept: bool,
 }
 
 impl RuleGroup {
@@ -883,6 +890,7 @@ impl RuleGroup {
             res_candidates: res_candidates(&rules),
             body_candidates: body_candidates(&rules),
             has_sni_callback: has_sni_callback(&rules),
+            has_no_intercept: has_no_intercept(&rules),
             inline_values,
             rules,
         }
@@ -896,6 +904,7 @@ impl RuleGroup {
         self.res_candidates = res_candidates(&self.rules);
         self.body_candidates = body_candidates(&self.rules);
         self.has_sni_callback = has_sni_callback(&self.rules);
+        self.has_no_intercept = has_no_intercept(&self.rules);
     }
 
     /// Number of parsed rules in this group.
@@ -928,6 +937,24 @@ fn has_sni_callback(rules: &[Rule]) -> bool {
     rules
         .iter()
         .any(|rule| rule.ops.iter().any(|op| op.protocol == "sniCallback"))
+}
+
+/// Does any rule ask for a connection not to be intercepted?
+///
+/// The three spellings are upstream's, read together as one question
+/// (`disable.intercept || disable.https || disable.capture`,
+/// `_original/lib/tunnel.js:167-169`). Only the *presence* of the flag is
+/// precomputed; whether it matches this connection is decided per handshake.
+fn has_no_intercept(rules: &[Rule]) -> bool {
+    rules.iter().any(|rule| {
+        rule.ops.iter().any(|op| {
+            op.protocol == "disable"
+                && op
+                    .value
+                    .split(['|', '&'])
+                    .any(|f| matches!(f.trim(), "intercept" | "https" | "capture"))
+        })
+    })
 }
 
 /// Which of `rules` carry a `b:` filter — see [`RuleGroup::body_candidates`].
@@ -1053,6 +1080,12 @@ impl RuleManager {
     /// [`crate::proxy::sni::decide`].
     pub fn has_sni_callback(&self) -> bool {
         self.groups.iter().any(|g| g.enabled && g.has_sni_callback)
+    }
+
+    /// Does any enabled group ask for connections not to be intercepted?
+    /// See [`RuleGroup::has_no_intercept`].
+    pub fn has_no_intercept(&self) -> bool {
+        self.groups.iter().any(|g| g.enabled && g.has_no_intercept)
     }
 
     /// Must this request's body be buffered before the rules resolve?
