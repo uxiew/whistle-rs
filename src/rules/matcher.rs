@@ -32,7 +32,7 @@ pub fn matches(rule: &Rule, req: &ReqInfo) -> bool {
 /// upstream joins nothing onto it.
 fn match_rule<'r>(rule: &Rule, req: &'r ReqInfo) -> Option<Matched<'r>> {
     let matched = pattern_match(rule, req)?;
-    filters_match(&rule.filters, req, false).then_some(matched)
+    filters_match(&rule.filters, req).then_some(matched)
 }
 
 /// What a prefix pattern did not consume, ready to be joined onto a destination.
@@ -60,19 +60,19 @@ impl<'r> Matched<'r> {
 /// Would this rule match if its `b:` conditions were satisfied?
 ///
 /// The question the proxy has to answer *before* it reads the body: is it worth
-/// buffering at all. Every other condition is evaluated as usual — a `b:` line
-/// scoped to one host, or to `POST`, costs nothing on the requests it excludes —
-/// and only the body conditions are assumed true, because assuming them false
-/// would mean never buffering and so never being able to answer them.
+/// buffering at all. Upstream answers it from the **pattern alone** — its
+/// `resolveBodyFilter` passes `isFilter`, and `checkFilter` short-circuits on it
+/// before `matchExcludeFilters` runs (`_original/lib/rules/rules.js:975-984`,
+/// `:2455-2465`) — so a line's other conditions have no say in whether its body
+/// is read.
 ///
-/// Mirrors upstream's `resolveBodyFilter`, which runs `getRule` over the
-/// `_bodyFilters` list while `req._reqBody` is still undefined; its body arm
-/// returns `false` there, so the same optimism is spelled as skipping the arm
-/// (`_original/lib/rules/rules.js:1903-1906,2455-2465`).
+/// This port asked the conditions too, with the `b:` ones assumed true. That is
+/// the right optimism for an *include* filter and exactly the wrong one for an
+/// exclude: `excludeFilter://b:secret` assumed itself satisfied, concluded the
+/// line would be skipped, never buffered the body, and so never excluded
+/// anything.
 pub fn matches_but_for_body(rule: &Rule, req: &ReqInfo, is_internal_req: bool) -> bool {
-    rule.props.allows_scope(is_internal_req)
-        && pattern_match(rule, req).is_some()
-        && filters_match(&rule.filters, req, true)
+    rule.props.allows_scope(is_internal_req) && pattern_match(rule, req).is_some()
 }
 
 /// Does the rule's pattern accept `req`, and what did it leave over?
@@ -257,15 +257,15 @@ fn pattern_accepts<'r>(
 /// Once either verdict is settled the remaining filters of that kind are not
 /// evaluated — upstream guards its loop the same way, which matters for a
 /// `chance:` filter: it must draw no more random numbers than upstream does.
-fn filters_match(filters: &[Filter], req: &ReqInfo, assume_body: bool) -> bool {
+fn filters_match(filters: &[Filter], req: &ReqInfo) -> bool {
     let mut has_include = false;
     let (mut include, mut exclude) = (false, false);
     for f in filters {
         if f.exclude {
-            exclude = exclude || filter_holds(f, req, assume_body);
+            exclude = exclude || filter_holds(f, req);
         } else {
             has_include = true;
-            include = include || filter_holds(f, req, assume_body);
+            include = include || filter_holds(f, req);
         }
     }
     if has_include && !include {
@@ -281,8 +281,8 @@ fn filters_match(filters: &[Filter], req: &ReqInfo, assume_body: bool) -> bool {
 /// before it ever consults `not`. So a condition this port cannot evaluate
 /// leaves an include filter unsatisfied *and* an exclude filter inert, however
 /// it is written — the subsystem fails closed in both directions.
-fn filter_holds(f: &Filter, req: &ReqInfo, assume_body: bool) -> bool {
-    match cond_holds(&f.cond, req, assume_body) {
+fn filter_holds(f: &Filter, req: &ReqInfo) -> bool {
+    match cond_holds(&f.cond, req) {
         Some(held) => held != f.negate,
         None => false,
     }
@@ -291,7 +291,7 @@ fn filter_holds(f: &Filter, req: &ReqInfo, assume_body: bool) -> bool {
 /// Evaluate one condition. `None` means "not knowable" — either the fact has no
 /// equivalent here at all (an unrecognised [`FromMarker`]) or it belongs to the
 /// response and this is the request phase, where [`ReqInfo::res`] is `None`.
-fn cond_holds(cond: &Cond, req: &ReqInfo, assume_body: bool) -> Option<bool> {
+fn cond_holds(cond: &Cond, req: &ReqInfo) -> Option<bool> {
     match cond {
         Cond::Method(v) => Some(v.matches(&req.method)),
         Cond::Host(v) => Some(v.matches(&req.host)),
@@ -323,13 +323,12 @@ fn cond_holds(cond: &Cond, req: &ReqInfo, assume_body: bool) -> Option<bool> {
             .as_ref()
             .and_then(|r| r.server_port)
             .map(|p| v.matches(&p.to_string())),
-        // The body, when it was buffered for exactly this. `assume_body` is the
-        // pre-resolution question "would this line want it?", which cannot
-        // answer with the body it is asking for.
-        Cond::Body(v) => match assume_body {
-            true => Some(true),
-            false => req.req_body.as_deref().map(|b| v.matches_header(b)),
-        },
+        // The body, when it was buffered for exactly this — see
+        // [`matches_but_for_body`], which decides that a page earlier. A body
+        // that was never read is not knowable, which is upstream's state too:
+        // `matchFilter` returns `false` for a `req._reqBody` that is not a
+        // string, before it consults `not` (`rules.js:1903-1906`).
+        Cond::Body(v) => req.req_body.as_deref().map(|b| v.matches_header(b)),
         // whistle's own process environment (`env = process.env`,
         // `_original/lib/rules/rules.js:14`). A variable that is not set is a
         // *known* `false`, exactly as an absent header is, so `env:X!=v` holds
@@ -1632,8 +1631,22 @@ mod filter_tests {
         assert!(hits("includeFilter://clientIp=10.0.0.5", &r));
         assert!(hits("includeFilter://i:/^10\\./", &r));
         assert!(!hits("includeFilter://i:10.0.0.6", &r));
-        // A literal that is not an IP simply never equals one.
-        assert!(!hits("includeFilter://i:localhost", &r));
+    }
+
+    /// A literal that is not an address drops the whole condition, so the line
+    /// applies to everything rather than to nothing — upstream's `net.isIP`
+    /// guard (`_original/lib/rules/rules.js:1592-1594`). Measured against
+    /// whistle 2.10.8: `i:localhost` used to disable the line here, silently.
+    #[test]
+    fn an_ip_condition_that_names_no_address_is_dropped() {
+        let mut r = req("http://example.com/");
+        r.client_ip = Some("10.0.0.5".into());
+        for cond in ["i:localhost", "ip:localhost", "clientIp:nothing", "serverIP:x"] {
+            assert!(hits(&format!("includeFilter://{cond}"), &r), "include {cond}");
+            assert!(hits(&format!("excludeFilter://{cond}"), &r), "exclude {cond}");
+        }
+        // `remoteAddress:` has no such guard upstream, and keeps its literal.
+        assert!(!hits("includeFilter://remoteAddress:localhost", &r));
     }
 
     // ── chance ──
@@ -1782,6 +1795,70 @@ mod filter_tests {
         // `!` inverts a URL pattern, which a rule's own pattern cannot do.
         assert!(hits("includeFilter://!other.com", &cgi));
         assert!(!hits("includeFilter://!example.com", &cgi));
+    }
+
+    /// A URL filter written `/regexp/` is a regexp over the whole URL, unanchored
+    /// — the form upstream's documentation leads with. This port compiled it as
+    /// a path wildcard instead, so `includeFilter:///echo$/` matched nothing and
+    /// `filter:///echo$/` silenced nothing.
+    #[test]
+    fn a_url_filter_may_be_written_as_a_regexp() {
+        let echo = req("http://example.com/echo");
+        for token in ["includeFilter:///echo$/", "includeFilter:///ECHO$/i"] {
+            assert!(hits(token, &echo), "{token}");
+            assert!(!hits(token, &req("http://example.com/other")), "{token}");
+        }
+        // Without the `i` the expression is case-sensitive, as upstream's
+        // `caseIns ? 'i' : ''` leaves it (`_original/lib/rules/rules.js:1712`).
+        assert!(!hits("includeFilter:///ECHO$/", &echo));
+        // `filter://` and `ignore://` read the same form through
+        // `PATTERN_FILTER_RE`, which takes no delimiting slash of its own.
+        assert!(!hits("filter:///echo$/", &echo));
+        assert!(!hits("ignore:///echo$/", &echo));
+        assert!(!hits("filter://echo$/", &echo));
+        assert!(hits("filter://other$/", &echo));
+        // `!` negates the whole expression, for either spelling.
+        assert!(hits("includeFilter://!/other$/", &echo));
+        assert!(hits("filter://!echo$/", &echo));
+    }
+
+    /// `ignore://` takes the wildcard URL filter too: upstream's
+    /// `PATTERN_WILD_FILTER_RE` names `filter` and `ignore` together
+    /// (`_original/lib/rules/rules.js:61`). Only its named conditions were read
+    /// here, so `ignore://*/echo` fell through to the protocol operator and
+    /// suppressed a protocol by that name, which is to say nothing.
+    #[test]
+    fn ignore_takes_the_wildcard_url_filter() {
+        let echo = req("http://example.com/echo");
+        assert!(!hits("ignore://*/echo", &echo));
+        assert!(hits("ignore://*/other", &echo));
+        assert!(!hits("filter://*/echo", &echo));
+        // The `!` its regexp form allows belongs to the pattern here too.
+        assert!(hits("ignore://!*/echo", &echo));
+    }
+
+    /// `ignore://` accepts the bracketed inline form its three siblings do —
+    /// `INLINE_RE` names all four (`_original/lib/rules/rules.js:62`).
+    #[test]
+    fn ignore_takes_the_bracketed_form() {
+        let mut post = req("http://example.com/");
+        post.method = "POST".into();
+        assert!(!hits("ignore://(m:POST)", &post));
+        assert!(hits("ignore://(m:POST)", &req("http://example.com/")));
+        assert!(!hits("ignore://<m:POST>", &post));
+    }
+
+    /// The brackets come off before the payload's *shape* is read, not after:
+    /// a bracketed URL filter is still a URL filter. Deciding shape first left
+    /// `filter://(*/echo)` looking like a protocol name.
+    #[test]
+    fn a_bracketed_url_filter_is_still_a_url_filter() {
+        let echo = req("http://example.com/echo");
+        assert!(!hits("filter://(*/echo)", &echo));
+        assert!(!hits("ignore://(/echo$/)", &echo));
+        assert!(hits("filter://(*/other)", &echo));
+        assert!(hits("includeFilter://(*/echo)", &echo));
+        assert!(!hits("includeFilter://(*/other)", &echo));
     }
 }
 
@@ -2253,21 +2330,37 @@ mod body_filter_tests {
         }
     }
 
-    /// A `b:` line asks for the body only on the requests its *other* conditions
-    /// already let through — the pattern, the method, everything but the body
-    /// itself.
+    /// A `b:` line asks for the body on the requests its **pattern** accepts,
+    /// and on no others.
     #[test]
-    fn a_body_filter_asks_only_where_it_could_apply() {
+    fn a_body_filter_asks_only_where_its_pattern_matches() {
         let m = mgr("example.com/api resBody://hit includeFilter://b:secret\n");
         assert!(m.needs_request_body(&post("http://example.com/api/x", None), false));
         assert!(!m.needs_request_body(&post("http://other.test/api/x", None), false));
         assert!(!m.needs_request_body(&post("http://example.com/other", None), false));
+    }
 
-        // An exclude filter vetoes the line, so the body is not read for it.
-        // (A second *include* filter would not: include filters are or-ed, so
-        // the line could still apply on the body condition alone.)
-        let m = mgr("example.com resBody://hit includeFilter://b:secret excludeFilter://m:POST\n");
-        assert!(!m.needs_request_body(&post("http://example.com/", None), false));
+    /// The line's *other* conditions have no say in it. Upstream's
+    /// `resolveBodyFilter` passes `isFilter`, which short-circuits `checkFilter`
+    /// before `matchExcludeFilters` runs (`_original/lib/rules/rules.js:983`),
+    /// so the body is read whether or not those conditions hold.
+    ///
+    /// Narrowing it here looked like a free optimisation and was not: an
+    /// exclude body filter concluded from its own assumed-true condition that
+    /// the line was already excluded, and never read the body it needed to
+    /// decide that.
+    #[test]
+    fn the_other_conditions_do_not_gate_the_body() {
+        for text in [
+            "example.com resBody://hit excludeFilter://b:secret\n",
+            "example.com resBody://hit includeFilter://b:secret excludeFilter://m:POST\n",
+            "example.com resBody://hit includeFilter://b:secret includeFilter://m:GET\n",
+        ] {
+            assert!(
+                mgr(text).needs_request_body(&post("http://example.com/", None), false),
+                "{text:?}"
+            );
+        }
     }
 
     /// The condition compares by containment, like a header's, and a `/re/`
@@ -2445,3 +2538,4 @@ mod from_tests {
         }
     }
 }
+
