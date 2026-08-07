@@ -1004,7 +1004,7 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 | Client port | `clientPort:<v>`, `remotePort:<v>` | the client socket's port |
 | Server address | `serverIp:<v>`, `serverIP:` | the address the request was actually sent to — the upstream proxy's when one was used (response phase) |
 | Server port | `serverPort:<v>` | the port the request was sent to (response phase) |
-| Host | `host:<v>`, `host=<v>` | request host — a [deviation](#remaining-divergences-from-upstream) |
+| Host | `host:<v>`, `host=<v>` | request host — a [deviation](#where-filter-conditions-differ-from-upstream) |
 | Request body | `b:<v>`, `body:<v>` | the request body **contains** `<v>` — see [the body condition](#the-body-condition) |
 | Environment | `env:<KEY>=<v>` | whistle's own process environment variable `<KEY>` contains `<v>`. The key is case-**sensitive**, and only `=` separates it |
 | Origin | `from:<marker>`, `from=<marker>` | where the request came from — see [origin markers](#origin-markers) |
@@ -1220,7 +1220,7 @@ Two upstream behaviours are **reproduced rather than fixed**:
 
 Every other condition this port parses now evaluates.
 
-#### Remaining divergences from upstream
+#### Where filter conditions differ from upstream
 
 | Upstream | Here | Why |
 |---|---|---|
