@@ -602,9 +602,17 @@ group contributes nothing — not even the values its fenced blocks declare.
 @https://intra/rules.txt          # …or that URL, fetched at startup
 ```
 
-`@` includes are resolved once, at load. For runtime includes, `rulesFile://`
-and `rule://` pull a file or a named value in as more rules for matching
-requests only.
+`@` includes are resolved once, at load — and **only for the rules `-r` /
+`--rule` supplied**. A rules text typed into the console or posted to
+`/api/rules` keeps the line as written, and it configures nothing; upstream
+expands it there too. For rules you edit in the console, use `rulesFile://` for a
+file or `rule://` for a named value: both pull in more rules for the requests
+their pattern matches.
+
+```
+example.com   rulesFile:///etc/whistle/team.rules
+example.com   rule://{teamRules}
+```
 
 ---
 

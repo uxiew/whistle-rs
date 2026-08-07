@@ -559,8 +559,15 @@ curl --noproxy '*' http://127.0.0.1:8899/api/rule-groups
 @https://intra/rules.txt          # ……或那个 URL，启动时抓取
 ```
 
-`@` 引入只在**加载时**解析一次。要运行时引入，用 `rulesFile://` 与 `rule://`：
-它们把一个文件或一个命名 value 作为**更多规则**引进来，且只对命中的请求生效。
+`@` 引入只在**加载时**解析一次，而且**只对 `-r` / `--rule` 给的规则生效**。
+在控制台里编辑、或 POST 到 `/api/rules` 的规则文本，这一行会原样留着、什么都不配置 ——
+上游在那里也会展开。控制台里的规则请改用 `rulesFile://`（文件）或 `rule://`（命名 value）：
+它们把内容作为**更多规则**引进来，且只对命中的请求生效。
+
+```
+example.com   rulesFile:///etc/whistle/team.rules
+example.com   rule://{teamRules}
+```
 
 ---
 

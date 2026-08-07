@@ -36,7 +36,9 @@ PORT_BASE=19100 CASES=./cases-filters.js npm run bench
 ```
 
 It prints the cases it ran and every difference it could not explain. A clean
-run says `differing: 0`.
+run says `differing: 0` — except for the two corpora whose own header declares a
+number, because the reason those cases differ is a rule the harness cannot see:
+`cases-delete.js` at `differing: 10` and `cases-values.js` at `differing: 16`.
 
 ## The HTTPS bench
 

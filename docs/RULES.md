@@ -77,7 +77,8 @@ The operators worth knowing before the rest are
   - [Where the pattern sits](#where-the-pattern-sits) · [Shorthands](#shorthands)
   - [What an operator's value can be](#what-an-operators-value-can-be) —
     [read from a file or a URL](#values-read-from-a-file-or-a-url) ·
-    [backtick templates](#backtick-templates)
+    [backtick templates](#backtick-templates) ·
+    [values declared in the rules text](#values-declared-in-the-rules-text)
   - [Destination](#destination) — [forwarding to another URL](#forwarding-to-another-url)
   - [Upstream proxy](#upstream-proxy) — [PAC](#pac)
   - [URL rewriting](#url-rewriting) — [where `params://` lands](#where-params-lands)
@@ -491,6 +492,24 @@ That is the only way a stored value ever sees the request: it is written once
 and reused by every rule that names it, so the backticks on the *rule* line are
 what say "render what this expands to".
 
+The **whole-value** form takes the backticks too, and it is the one place a
+pattern's captures reach a stored value — under a different spelling
+(`SUB_VAR_RE`, `rules.js:99,:826-830`):
+
+```
+# values: mock = {"m":"${method}","id":"${RegExp.$1}"}
+/example\.com\/api\/(\d+)/   resBody://`{mock}`   # both substituted
+/example\.com\/api\/(\d+)/   resBody://{mock}     # neither: the content is bytes
+```
+
+`${RegExp.$1}`…`${RegExp.$9}` and `${RegExp.$&}` (the whole request URL) are the
+only capture syntax that works there. A plain `$1` inside the value is left as
+written — `$1` is substituted over the rule line, and the rule line said `{mock}`,
+six characters with no `$` in them. Inside a **`${name}`** reference it is the
+other way round: values expand first and captures second (`resolveVar` then
+`replaceSubMatcher`, `rules.js:1010-1012`), so a plain `$1` there does arrive
+expanded.
+
 `log://` and `weinre://` opt out at parse time upstream (`rule.isTpl = false`,
 `rules.js:1357-1359`) — their values name a channel, and a backtick in one is a
 backtick.
@@ -500,6 +519,34 @@ A backtick value on a **response-phase** operator (`resHeaders://`, `resBody://`
 `${resHeaders.x}`, `${resCookies.x}`, `${serverIp}` and `${serverPort}` answer
 there. On a `tpl://` file they are still empty, because a template short-circuits
 before any origin replies.
+
+#### Values declared in the rules text
+
+A ```` ``` ```` fence declares a value beside the rules that use it
+(`resolveInlineValues`, `_original/lib/util/index.js:211-224`), which is how a
+rules file carries its own mocks:
+
+````
+``` mock.json
+{"ok": true}
+```
+example.com/api   file://{mock.json}
+````
+
+The name is one whitespace-free token; the closing fence has to be the same run
+of backticks, so a block containing a shorter fence survives intact; a name
+declared twice keeps its **first** block; and an unterminated fence declares
+nothing at all.
+
+What comes back is **content, not rules**: nothing in it is scanned again, so a
+`${…}`, a `{…}` or a fence inside a mock body is the text the mock meant to
+contain.
+
+> **One divergence.** When a fenced block and a [values store](#flags-includes--values)
+> entry carry the same name, upstream uses the block — `getValueFor` asks the
+> inline map first and falls back to the store (`rules.js:785-796`). whistle-rs
+> uses the store, so that a `--value` given on the command line, or an edit in
+> the console, overrides what a rules file brought.
 
 ### Destination
 
@@ -2146,7 +2193,12 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
 **Rule-file features:** `${port}` and `${version}` in operator values are substituted
-(case-insensitive); an operator value that names a file or a URL is
+(case-insensitive) — wider than upstream, where `CONFIG_VAR_RE`
+(`_original/lib/util/index.js:3262`) is read only for the URL of a backticked
+`@`-include, and a `${port}` elsewhere resolves only inside
+[backticks](#backtick-templates). It never reaches **content**: a `${port}` in an
+inline `(…)` payload or in what a `{name}` returned is text the mock meant to
+contain. An operator value that names a file or a URL is
 [read before the operator applies](#values-read-from-a-file-or-a-url), and one
 wrapped in backticks is [rendered against the request](#backtick-templates);
 `locationHref://` injects a client-side redirect into HTML responses.
@@ -2343,13 +2395,22 @@ in upstream whistle.
 
 Known gaps in the operator layer, deliberately left:
 
-- **A line that is just `@<file>` or `@<url>` does not include anything.**
-  Upstream reads the source at load time and parses its rules into the group —
-  put `@/tmp/mock/rules.txt` on a line by itself and the file's rules take
-  effect; point it at a path that does not exist and none do. whistle-rs drops
-  the line, and the request goes to the origin. Written with a pattern
-  (`example.com @/tmp/rules.txt`) neither proxy includes anything: that is the
-  `G://` global-value operator, not an include.
+- **`@<file>` / `@<url>` includes are resolved for the startup rules only.**
+  A line that is just `@` and a source is replaced by the text it names. In
+  whistle-rs that happens once, in `main.rs`, for what `-r` / `--rule` supplied;
+  a rules text set through the console or `POST /api/rules` keeps the line, which
+  configures nothing. Upstream applies the same expansion to **every** rules
+  source, the console's own text included (`REMOTE_RULES_RE`,
+  `_original/lib/util/index.js:3296`; `getRemoteRulesResolver`, `:3300-3307`,
+  called from `lib/rules/util.js:73-88`), fenced values in the included text
+  included, up to `MAX_REMOTE_RULES_COUNT` = 20 of them, and re-reads each source
+  on a timer. Two shapes are not includes in either proxy: a line with a pattern
+  in front of it (`example.com @/tmp/rules.txt`) — that is the `G://` global-value
+  operator — and, upstream, a **relative** path, since the regexp wants `/`, `~/`,
+  a drive letter or `http(s)://`; whistle-rs resolves a relative one against the
+  rules file's own directory. Use `rulesFile://` for a file or `rule://` for a
+  named value when the rules come from the console: both are read per matching
+  request instead of once at load.
 - **`resRules://` entries of a `resScript` list are not applied.** Upstream folds
   them into a rules text the response phase parses; whistle-rs's `resScript` is a
   JavaScript hook that mutates the response directly, so it has nowhere to put
