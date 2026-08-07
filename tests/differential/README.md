@@ -79,6 +79,20 @@ was asked for `/echo` — the unmatched path is concatenated onto the value, so
 both proxies looked for `/tmp/x.txt/echo`, both 404'd, and eleven cases agreed on
 nothing. A rule that fires and a rule that misses look identical in the output.
 
+The sharper version of that: a case can exercise *a* rule and not the one it
+names, because an earlier layer claimed the token. `cases-patterns.js` has five
+cases asking whether `/echo/g` is a regexp — it is not, and both proxies agree —
+but not for that reason: a `/`-led token that is not a valid regexp is a **file
+path**, and `formatShorthand` rewrites it to `file:///echo/g` before the line is
+even split into pattern and operators. The five agree on the shorthand's flag
+test, and say nothing about the pattern parser's. Only two `//`-led cases
+(`////` and `///host`) reach that parser at all, and one of them is what caught
+the bug.
+
+No amount of reading the parser shows this; the layer above it has to be run.
+When a case is inert on both sides, the question to answer before believing it
+is *which* layer made it inert.
+
 ## Adding cases
 
 `cases.js` is a list of `{ name, rules, request? }`. `rules` is the text both

@@ -2576,6 +2576,17 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
 /// `i` in it, which made `/echo/g` a regexp upstream does not have — and, worse,
 /// turned `///a.example.com` into the regexp `/`, matching every URL that
 /// contains a slash. That is every URL.
+///
+/// **Which tokens reach here** is worth knowing before writing a test for it,
+/// because it is not the obvious set: [`format_shorthand`] runs over every token
+/// first, and it claims any `/`-led token that is *not* already a valid regexp
+/// as a file path (`FILE_RE.test(url) && !util.isRegExp(url)`,
+/// `_original/lib/rules/rules.js:1195`). So `/echo/g` never arrives — it is
+/// `file:///echo/g` by then, and its line has no pattern left. What arrives is
+/// the tokens with a valid flag set, which this accepts, and the `///…` family,
+/// which `FILE_RE` will not take and `parse_pattern`'s `//` strip leaves alone.
+/// The second is the only shape whose rejection is observable, and the one the
+/// bench caught the bug with.
 fn slash_regexp(tok: &str) -> Option<Regex> {
     let body_and_flags = tok.strip_prefix('/')?;
     let end = body_and_flags.rfind('/')?;
