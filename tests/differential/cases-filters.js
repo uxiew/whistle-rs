@@ -218,14 +218,21 @@ module.exports = [
   // Upstream files a `host` condition under `hostFilter`, which only
   // `util.checkProxyHost` reads — deciding which hosts a `proxy://` engages
   // for, never whether a rule applies. whistle-rs matches the request's host
-  // with it (`docs/RULES.md`, deliberate deviations). These cases carry their
-  // own probe header so the harness can name the difference and let it pass;
-  // see `EXPECTED` in `harness.js`.
-  { name: 'host= the request host', rules: `${P} reqHeaders://x-host-filter=1 includeFilter://host=127.0.0.1` },
-  { name: 'host= another host', rules: `${P} reqHeaders://x-host-filter=1 includeFilter://host=other.test` },
-  { name: 'host: the request host', rules: `${P} reqHeaders://x-host-filter=1 includeFilter://host:127.0.0.1` },
-  { name: 'host: another host', rules: `${P} reqHeaders://x-host-filter=1 includeFilter://host:other.test` },
-  { name: 'excludeFilter host= the request host', rules: `${P} reqHeaders://x-host-filter=1 excludeFilter://host=127.0.0.1` },
+  // with it (`docs/RULES.md`, deliberate deviations). All five carry their own
+  // probe header so the harness can name the difference and let it pass; see
+  // `EXPECTED` in `harness.js`.
+  //
+  // Only **three** of the five actually diverge, measured — the marks below.
+  // The other two agree, and for opposite reasons on each side rather than for
+  // the same one: upstream ignores the condition and applies the rule, while
+  // this port evaluates it and happens to reach the same verdict. Agreement
+  // there is a coincidence of the value chosen, not evidence the spellings
+  // behave alike, so they are kept as cases and not as proof.
+  { name: 'host= the request host', rules: `${P} reqHeaders://x-host-filter=1 includeFilter://host=127.0.0.1` },              // agrees
+  { name: 'host= another host', rules: `${P} reqHeaders://x-host-filter=1 includeFilter://host=other.test` },                 // diverges
+  { name: 'host: the request host', rules: `${P} reqHeaders://x-host-filter=1 includeFilter://host:127.0.0.1` },              // diverges
+  { name: 'host: another host', rules: `${P} reqHeaders://x-host-filter=1 includeFilter://host:other.test` },                 // agrees
+  { name: 'excludeFilter host= the request host', rules: `${P} reqHeaders://x-host-filter=1 excludeFilter://host=127.0.0.1` },// diverges
 
   // ── the URL-pattern form ───────────────────────────────────────────────
   { name: 'a wildcard URL filter that matches', rules: `${P} ${REQ} includeFilter://*/echo` },
