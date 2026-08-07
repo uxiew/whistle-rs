@@ -56,8 +56,8 @@ example.com  htmlAppend:///tmp/x.html  lineProps://safeHtml&important
 | `proxyHostOnly` | ✅ **已接线** | 同上，但无 `host` 命中时丢弃 `proxy` |
 | `weakRule` | ✅ **已接线** | 反转默认优先级，使 `file` 族规则给命中的 `proxy`/`host` 让路 |
 | `originUrl` | ✅ **已接线** | **原版未文档化**：域名型 pattern（无自带路径）命中时，拼到转发/file 值后面的路径强制为 `/`，即只要目标自己的根（`lib/rules/rules.js:1105`）。带路径的 pattern 不受影响 —— 上游同样以 `rule.isDomain` 为前提 |
-| `disableAutoCors` | 仅暴露 | **本移植没有可抑制的对象**：`file`/`tpl`/`rawfile` 响应根本不会自动加 CORS 头（原版 `isAutoCors`，`lib/handlers/file-proxy.js:178-191`）。为了能"关掉"它而先实现自动 CORS 是本末倒置 |
-| `disabledAutoCors` | 仅暴露 | 原版接受的拼写错误别名，本移植一并解析；同上无效果 |
+| `disableAutoCors` | ✅ 已生效 | 关掉本地文件响应上的**自动 CORS**（`isAutoCors`，`_original/lib/handlers/file-proxy.js:178-191`）。此前这里写着「本移植没有可抑制的对象……为了能关掉它而先实现自动 CORS 是本末倒置」——结论写反了：自动 CORS 本身就是那个功能，见 [`RULES.md`](RULES.md#跨域-mock自动-cors) |
+| `disabledAutoCors` | ✅ 已生效 | 原版接受的拼写错误别名，同上 |
 | `enableBigData` | 仅暴露 | **本移植没有可抬高的上限**：`reqMerge`/`resMerge` 对整个已缓冲的 body 生效，不设 2MB 门槛（原版 `MAX_RES_SIZE`/`BIG_MAX_RES_SIZE`，`lib/inspectors/res.js:25-26,:1017`），等价于该开关恒为开 |
 | `internalProxy` | 仅暴露 | 本移植没有「经上游代理明文转发 https」这一模式：`internal-proxy://` 与 `proxy://` 走同一条 HTTP 代理路径，没有可切换的行为（原版 `isInternalProxy`，`lib/util/index.js:3799-3809`） |
 | `proxyTunnel` | 仅暴露 | 需要在 `upstream::Target` 上增加「明文请求也先 CONNECT」的开关，而 `src/proxy/upstream.rs` 不在本次改动范围内；且无法在没有上游代理的情况下做端到端验证 |

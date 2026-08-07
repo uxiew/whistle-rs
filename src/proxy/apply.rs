@@ -1064,7 +1064,28 @@ pub fn short_circuit(
         p if p == crate::rules::protocols::URL_REPLACE => None,
         // A file rule, unless `weakRule` hands the request to a proxy instead.
         _ if weak_rule_yields(resolved, proto) => None,
-        _ => serve_file_family(proto, op, info, env),
+        _ => {
+            let cors = auto_cors_wanted(resolved, proto, info);
+            // A preflight is answered here and the file is never opened —
+            // upstream does the same (`file-proxy.js:249-252`). It has to: the
+            // browser sends `OPTIONS` before the real request, and a mock that
+            // answers it with the file's own bytes (or a 404, for a rule keyed
+            // to the real method) fails the preflight and the real request
+            // never follows.
+            if cors && info.method.eq_ignore_ascii_case("OPTIONS") {
+                let mut resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(body::empty())
+                    .unwrap();
+                write_auto_cors(resp.headers_mut(), info);
+                return Some(resp);
+            }
+            let mut resp = serve_file_family(proto, op, info, env)?;
+            if cors {
+                write_auto_cors(resp.headers_mut(), info);
+            }
+            Some(resp)
+        }
     }
 }
 
@@ -1086,6 +1107,40 @@ fn weak_rule_yields(resolved: &Resolved, file_proto: &str) -> bool {
     matched_proxy_proto(resolved)
         .map(|proto| !resolved.props(proto).has("proxyHostOnly"))
         .unwrap_or(false)
+}
+
+/// Does a local-file response carry CORS headers it was never asked for?
+///
+/// whistle adds them whenever the request came from a page on another origin —
+/// `isAutoCors` is `!req.disable.autoCors && req.headers.origin`, with a line
+/// property to turn it off (`_original/lib/handlers/file-proxy.js:178-191`).
+///
+/// This port had the writer and not the trigger, and `docs/LINE_PROPS.md` said
+/// so while drawing the wrong conclusion — that implementing the automatic CORS
+/// in order to have something for `disableAutoCors` to disable would be putting
+/// the cart before the horse. The automatic CORS *is* the horse: mocking an API
+/// with `file://` from a page on another origin is one of the things whistle is
+/// for, and without it the browser rejects the response before any code sees it.
+fn auto_cors_wanted(resolved: &Resolved, proto: &str, info: &ReqInfo) -> bool {
+    let props = resolved.props(proto);
+    // Upstream reads both spellings; the second is its own typo, kept because
+    // rules in the wild are written against it.
+    if props.has("disableAutoCors") || props.has("disabledAutoCors") {
+        return false;
+    }
+    if disabled_flags(resolved).contains("autoCors") {
+        return false;
+    }
+    req_header(Some(info), "origin").is_some_and(|o| !o.is_empty())
+}
+
+/// The CORS headers a local-file response carries — `{enable: true}`, which
+/// echoes the request's own `Origin` with credentials, and on a preflight fills
+/// in the asked-for method and headers.
+fn write_auto_cors(headers: &mut HeaderMap, info: &ReqInfo) {
+    let mut spec: HashMap<String, String> = HashMap::new();
+    spec.insert("enable".to_string(), "true".to_string());
+    write_res_cors(headers, &spec, Some(info));
 }
 
 /// The local-file / template protocols, in resolution order (base before `x`/`xs`
@@ -2989,6 +3044,20 @@ fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&Re
     if spec.is_empty() {
         return;
     }
+    write_res_cors(headers, &spec, info);
+}
+
+/// Write the CORS headers a resolved spec asks for.
+///
+/// Split out of [`apply_res_cors`] so the automatic CORS a local-file response
+/// carries can reuse it — that is `setResCors(reader, {enable: true}, req)`
+/// upstream (`_original/lib/handlers/file-proxy.js:187`), the very same writer
+/// with a spec nobody typed.
+fn write_res_cors(
+    headers: &mut HeaderMap,
+    spec: &HashMap<String, String>,
+    info: Option<&ReqInfo>,
+) {
     let custom_origin = match spec.get("origin").map(String::as_str) {
         Some("*") => Some("*".to_string()),
         Some(url) if is_http_url(url) => Some(parse_origin(url)),
@@ -7371,6 +7440,88 @@ mod tests {
         // The request side has extra aliases of its own.
         assert_eq!(lookup_type("form", req_type_alias), "application/x-www-form-urlencoded");
         assert_eq!(lookup_type("form", no_type_alias), "application/octet-stream");
+    }
+
+    /// A `ReqInfo` for a request a page on `https://app.test` made.
+    fn cross_origin(method: &str) -> ReqInfo {
+        let mut h = HeaderMap::new();
+        h.insert("origin", "https://app.test".parse().unwrap());
+        build_req_info(method, "http", "a.com", 80, "/api", &h, None)
+    }
+
+    /// Mocking an API with `file://` from a page on another origin is one of
+    /// the things whistle is for, and the browser rejects the response unless
+    /// the proxy says who may read it. whistle adds the headers by itself
+    /// (`isAutoCors`, `_original/lib/handlers/file-proxy.js:178-191`); this port
+    /// had the writer and not the trigger.
+    #[test]
+    fn a_local_file_answer_carries_cors_for_a_cross_origin_page() {
+        let resolved = resolve("a.com/api file:///no/such/mock.json\n", "http://a.com/api");
+        let resp = short_circuit(&cross_origin("GET"), &resolved, test_env()).expect("file://");
+        let h = resp.headers();
+        assert_eq!(h.get("access-control-allow-origin").unwrap(), "https://app.test");
+        assert_eq!(h.get("access-control-allow-credentials").unwrap(), "true");
+    }
+
+    /// …and a same-origin request gets none, because none is needed. The
+    /// trigger is the `Origin` header, exactly as upstream reads it.
+    #[test]
+    fn a_same_origin_request_gets_no_cors_headers() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/api", &HeaderMap::new(), None);
+        let resolved = resolve("a.com/api file:///no/such/mock.json\n", "http://a.com/api");
+        let resp = short_circuit(&info, &resolved, test_env()).expect("file://");
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    /// The half that decides whether the real request ever happens: a preflight
+    /// is answered 200 with the CORS headers and the file is never opened. Here
+    /// the file does not exist, so serving it would 404 the preflight and the
+    /// browser would stop.
+    #[test]
+    fn a_preflight_is_answered_without_opening_the_file() {
+        let mut h = HeaderMap::new();
+        h.insert("origin", "https://app.test".parse().unwrap());
+        h.insert("access-control-request-method", "PUT".parse().unwrap());
+        h.insert("access-control-request-headers", "x-token".parse().unwrap());
+        let info = build_req_info("OPTIONS", "http", "a.com", 80, "/api", &h, None);
+        let resolved = resolve("a.com/api file:///no/such/mock.json\n", "http://a.com/api");
+        let resp = short_circuit(&info, &resolved, test_env()).expect("file://");
+        assert_eq!(resp.status(), StatusCode::OK, "not the file's 404");
+        let hs = resp.headers();
+        assert_eq!(hs.get("access-control-allow-origin").unwrap(), "https://app.test");
+        assert_eq!(hs.get("access-control-allow-methods").unwrap(), "PUT");
+        assert_eq!(hs.get("access-control-allow-headers").unwrap(), "x-token");
+    }
+
+    /// Both ways of turning it off, including upstream's own misspelling.
+    #[test]
+    fn auto_cors_can_be_turned_off() {
+        for rule in [
+            "a.com/api file:///no/such/mock.json lineProps://disableAutoCors",
+            "a.com/api file:///no/such/mock.json lineProps://disabledAutoCors",
+            "a.com/api file:///no/such/mock.json disable://autoCors",
+        ] {
+            let resolved = resolve(&format!("{rule}\n"), "http://a.com/api");
+            let resp = short_circuit(&cross_origin("GET"), &resolved, test_env()).expect("file://");
+            assert!(
+                resp.headers().get("access-control-allow-origin").is_none(),
+                "{rule} should have silenced it"
+            );
+            // …and with it off, the preflight is the file's own answer again.
+            let resp = short_circuit(&cross_origin("OPTIONS"), &resolved, test_env()).expect("f");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{rule}");
+        }
+    }
+
+    /// Only the file family. `redirect://` and `statusCode://` are answered by
+    /// a different handler upstream and carry no automatic CORS.
+    #[test]
+    fn redirect_and_status_code_carry_no_automatic_cors() {
+        for rule in ["redirect://http://b.com/", "statusCode://204"] {
+            let resolved = resolve(&format!("a.com/api {rule}\n"), "http://a.com/api");
+            let resp = short_circuit(&cross_origin("GET"), &resolved, test_env()).expect("answer");
+            assert!(resp.headers().get("access-control-allow-origin").is_none(), "{rule}");
+        }
     }
 
     #[test]

@@ -2287,6 +2287,33 @@ If a rule doesn't do what you expect, run with `-v` (debug logging) — each req
 logs its resolved destination or short-circuit decision.
 
 
+### 跨域 mock：自动 CORS
+
+用 `file://`（以及 `rawfile`/`tpl`/`dust`/`jsonp` 和它们的 `x`/`xs` 变体）mock 一个
+API，而发起请求的页面在**另一个源**上时，whistle 会自己补上 CORS 头 —— 否则浏览器
+在任何代码看到响应之前就把它拒了。whistle-rs 现在同样如此
+（`isAutoCors`，`_original/lib/handlers/file-proxy.js:178-191`）。
+
+触发条件就是请求带了 `Origin` 头。补的是 `resCors://enable` 那一套：回显请求自己的
+`Origin`，并带 `access-control-allow-credentials: true`。
+
+**预检也被直接应答。** 浏览器在真实请求之前先发 `OPTIONS`，而 whistle 对 file 规则的
+预检**答 200 + CORS 头，根本不打开文件**（`file-proxy.js:249-252`）。这一半不可省：
+文件不存在就会 404 掉预检，规则只对 `POST` 写也会答出错误的东西，真实请求于是永远
+不会发生。
+
+```
+# 页面在 http://app.test 上，API mock 在 http://api.test 上
+api.test/data file:///srv/mock.json
+```
+
+关掉它：`disable://autoCors`，或行级属性 `lineProps://disableAutoCors`
+（原版的拼写错误别名 `disabledAutoCors` 一并接受）。
+
+只作用于 file 家族。`redirect://` 与 `statusCode://` 在上游由另一个 handler 应答，
+不带自动 CORS，这里也一样。
+
+
 ### Request bodies have a ceiling
 
 The operators that rewrite a request body need it in memory, and the body is
