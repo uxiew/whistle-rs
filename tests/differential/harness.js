@@ -47,6 +47,12 @@ const EXPECTED = [
     match: (p) => /res\.header\.x-server: whistle="Whistle" rs="whistle-rs"/.test(p),
     why: 'x-server names the proxy that actually answered',
   },
+  {
+    // Both fail to find the file and say so; only the wording differs, and
+    // matching another program's error prose is not worth pinning.
+    match: (p) => /res\.body: whistle="Not found file /.test(p),
+    why: 'the same 404, phrased in each proxy\'s own words',
+  },
 ];
 
 const norm = (headers) => {

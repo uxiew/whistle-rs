@@ -3052,11 +3052,24 @@ const BODY_PROTOCOLS: &[&str] = &[
     "resMerge",
 ];
 
-/// True when a rule on this request will want to rewrite the response body, and
-/// therefore cannot tolerate a `304`. See [`BODY_PROTOCOLS`].
+/// The two tool protocols that inject a script into an HTML response, and so
+/// need one to inject into.
+///
+/// Upstream busts the cache for these the moment the rule matches
+/// (`util.disableReqCache(req.headers)`, `_original/lib/inspectors/log.js:30`
+/// and `weinre.js:26`) — and unlike `notAllowCache`, which reads the response
+/// phase's protocols from the request pass and therefore never fires, these two
+/// are request-phase and really do run. Measured against whistle 2.10.8: a
+/// `log://` rule reaches the origin with `pragma: no-cache`.
+const SCRIPT_INJECTORS: &[&str] = &["log", "weinre"];
+
+/// True when a rule on this request will want to rewrite or inject into the
+/// response body, and therefore cannot tolerate a `304`.
+/// See [`BODY_PROTOCOLS`] and [`SCRIPT_INJECTORS`].
 fn res_body_forbids_cache(resolved: &Resolved) -> bool {
     BODY_PROTOCOLS
         .iter()
+        .chain(SCRIPT_INJECTORS)
         .any(|p| resolved.value(p).is_some())
 }
 
@@ -7647,6 +7660,25 @@ mod tests {
             let resp = short_circuit(&cross_origin("OPTIONS"), &resolved, test_env()).expect("f");
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{rule}");
         }
+    }
+
+    /// `log://` and `weinre://` inject a script into an HTML response, so they
+    /// need a response with HTML in it. Upstream busts the cache for both the
+    /// moment the rule matches (`log.js:30`, `weinre.js:26`); this port did it
+    /// for the body operators and not for these two.
+    ///
+    /// Found by the differential bench: whistle reached the origin with
+    /// `pragma: no-cache` under `log://mytag` and this port did not.
+    #[test]
+    fn a_script_injector_busts_the_cache_too() {
+        let bust = |rule: &str| {
+            let resolved = resolve(&format!("a.com {rule}\n"), "http://a.com/");
+            res_body_forbids_cache(&resolved)
+        };
+        assert!(bust("log://mytag"));
+        assert!(bust("weinre://myid"));
+        assert!(bust("resBody://(x)"), "the body operators, as before");
+        assert!(!bust("reqHeaders://x-a=1"), "and nothing else");
     }
 
     /// Every response the proxy makes itself says so — upstream's `x-server`

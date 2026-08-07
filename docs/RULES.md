@@ -1432,6 +1432,11 @@ rather than failing the rule.
 >
 > So the rewrite disappears on reload in whistle. whistle-rs does what
 > whistle's code says rather than what whistle does.
+>
+> `log://` and `weinre://` bust the cache too, and there whistle *does* reach
+> the code (`disableReqCache`, `_original/lib/inspectors/log.js:30`,
+> `weinre.js:26`) — those two are request-phase protocols. They inject a script
+> into an HTML response, so they need one to inject into.
 
 #### Trailers
 
