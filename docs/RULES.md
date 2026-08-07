@@ -2054,7 +2054,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Short-circuit / flags | `redirect`, `location`, `locationHref`, `statusCode` mock, `enable`, `disable` |
 | Local file / template | `file`, `rawfile`, `tpl`, `jsonp`, `dust`, and their `x`/`xs` fallback variants (`xfile`, `xrawfile`, …) |
 | Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
-| TLS | `cipher` (upstream TLS version pin + cipher-suite selection), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |
+| TLS | `cipher` (upstream TLS version pin + OpenSSL cipher-string evaluation), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
 **Rule-file features:** a line `@<url>` or `@<file>` includes rules fetched/read from
@@ -2100,33 +2100,44 @@ what rustls can express — see [What `cipher://` can pin](#what-cipher-can-pin)
 token) pin the **upstream** TLS protocol version. rustls offers TLS 1.2 and 1.3
 only, so a pin older than 1.2 clamps up to 1.2.
 
-`ciphers` is an **OpenSSL cipher string** in Node, and that is a small language:
-names joined by `:`, group aliases (`HIGH`, `DEFAULT`), exclusions (`!aNULL`,
-`-RC4`), and an ordering directive (`@STRENGTH`). rustls takes no string at all
-— it has a fixed list of suites and lets you choose a subset. So:
+`ciphers` is an **OpenSSL cipher string**, and whistle-rs evaluates it. Not
+matches names against a table — evaluates the language: aliases (`HIGH`,
+`DEFAULT`, `ECDHE`, `AESGCM`, `aRSA`, …), the infix `+` as a conjunction
+(`ECDHE+AESGCM`), `!` and `-` exclusions, `+` deprioritisation, `@STRENGTH`
+sorting. What differs from OpenSSL is not the language but the **universe** it is
+evaluated over: rustls carries nine suites, so `3DES` correctly selects nothing —
+exactly as it does on an OpenSSL built without 3DES.
 
-- a token naming a suite rustls has, in **either** spelling, selects it:
-  `TLS_AES_128_GCM_SHA256` (IANA, and what TLS 1.3 and OpenSSL both use) or
-  `ECDHE-RSA-AES128-GCM-SHA256` (OpenSSL's TLS 1.2 spelling);
-- every other token is **logged as not honoured**, naming itself. It used to be
-  walked past in silence, so a rule that pinned a suite configured nothing and
-  looked exactly like one that had worked;
-- a string that named no usable suite leaves rustls's own list alone rather than
-  narrowing it to nothing — an empty suite list fails every handshake, which is
-  not what asking for a cipher meant.
+Two details are reproduced because they were **measured against Node 26 /
+OpenSSL 3.6**, not inferred:
 
-The selection is an **intersection** with what this build offers, so a
-`cipher://` can only ever narrow what the proxy will negotiate, never widen it.
-The nine suites available are the three TLS 1.3 ones and the six ECDHE
-AES-GCM / ChaCha20 ones; `openssl ciphers` names outside that set have no
-counterpart here.
+- **A TLS 1.2 name does not constrain TLS 1.3.** `ciphers: "ECDHE-RSA-AES128-GCM-SHA256"`
+  still negotiates TLS 1.3 with its default suite. Applying the pin to the 1.3
+  list would leave nothing to offer there and **downgrade the connection to TLS
+  1.2** — a rule meaning "prefer this suite" would have weakened it.
+- **Only an explicit TLS 1.3 suite name constrains TLS 1.3.** `TLS_AES_128_GCM_SHA256`
+  pins it; the alias `CHACHA20` does not, even though it describes a TLS 1.3
+  suite too.
+
+A string that selects **nothing at all** fails the request with a message naming
+the tokens that came up empty. That is OpenSSL's own behaviour — it throws `no
+cipher match` at context creation, before any connection — and it is the honest
+answer for the one case evaluation cannot rescue: this build does not have the
+algorithm.
 
 ```
-# pins the suite — the origin really does negotiate it
-localhost:8443 cipher://{"ciphers":"ECDHE-RSA-AES256-GCM-SHA384"}
-# logs `HIGH, !aNULL, @STRENGTH not honoured` and negotiates normally
-localhost:8443 cipher://{"ciphers":"HIGH:!aNULL:@STRENGTH"}
+# evaluated; the origin really negotiates from this set
+example.com cipher://{"ciphers":"ECDHE+AESGCM:!AES128"}
+# TLS 1.3 pinned by name; the TLS 1.2 list is emptied, as OpenSSL empties it
+example.com cipher://{"ciphers":"TLS_AES_128_GCM_SHA256"}
+# 502: `no cipher match: 3DES names no cipher suite this build has`
+example.com cipher://{"ciphers":"3DES"}
 ```
+
+The nine suites are the three TLS 1.3 ones (AES-GCM ×2, ChaCha20-Poly1305) and
+the six TLS 1.2 ECDHE ones (ECDSA/RSA × AES-128-GCM/AES-256-GCM/ChaCha20). Since
+a selection is an **intersection** with that set, a `cipher://` can only narrow
+what the proxy will negotiate, never widen it.
 
 **Upstream certificate verification differs from whistle's.** whistle sets
 `rejectUnauthorized: false` by default (`_original/lib/config.js:74`) and only

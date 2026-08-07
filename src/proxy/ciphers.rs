@@ -1,232 +1,567 @@
-//! What `cipher://`'s `ciphers` option can and cannot mean here.
+//! OpenSSL cipher strings, evaluated.
 //!
 //! whistle's `cipher://` carries Node's TLS options, and `ciphers` there is an
-//! **OpenSSL cipher string** — a small language of its own: names joined by `:`,
-//! group aliases (`HIGH`, `DEFAULT`, `ALL`), exclusions (`!aNULL`, `-RC4`),
-//! promotions (`+SHA`), and an ordering directive (`@STRENGTH`). rustls has none
-//! of that. It has a fixed list of suites and lets you choose a subset of it,
-//! and nothing in it accepts a string.
+//! OpenSSL cipher string. The earlier note in `docs/ROADMAP.md` called this
+//! unreachable because "rustls does not accept a cipher string", which is true
+//! and beside the point: **the string is a language, and a language can be
+//! evaluated.** What rustls has is a smaller universe of cipher suites to
+//! evaluate it over — which is exactly the position an OpenSSL build compiled
+//! without 3DES is in, and OpenSSL evaluates the same strings there without
+//! complaint.
 //!
-//! So the full semantics genuinely cannot be ported, and `docs/ROADMAP.md` has
-//! said so for as long as the operator has existed. What it did **not** say is
-//! that the option was being dropped in silence: `parse_cipher_versions` read
-//! `minVersion`/`maxVersion` and walked past `ciphers` without a word. A rule
-//! that pinned a suite configured nothing, said nothing, and looked exactly like
-//! a rule that had worked.
+//! So this is not a translation or an approximation. `HIGH:!aNULL:!MD5` over
+//! these nine suites has an exact answer, and it is the same answer OpenSSL
+//! would give if these nine were all it had.
 //!
-//! This is the part that can be honoured, and a voice for the part that cannot:
+//! # The two lists
 //!
-//! * a token naming a suite rustls has — in either the IANA spelling
-//!   (`TLS_AES_128_GCM_SHA256`) or OpenSSL's (`ECDHE-RSA-AES128-GCM-SHA256`) —
-//!   selects that suite;
-//! * every other token is **reported**, once, naming itself, so an `@STRENGTH`
-//!   or a `!aNULL` is visibly not honoured rather than invisibly ignored;
-//! * if nothing at all could be selected, the option is dropped entirely rather
-//!   than narrowed to nothing — an empty suite list fails every handshake, which
-//!   is not what asking for a cipher meant.
+//! OpenSSL 1.1.1+ splits cipher configuration in two: `cipher_list` for TLS 1.2
+//! and below, `ciphersuites` for TLS 1.3. Node's single `ciphers` option feeds
+//! both, and the split is observable — measured against Node 26 / OpenSSL 3.6:
 //!
-//! Restricting suites can only narrow what the proxy will negotiate, never
-//! widen it: the selection is an intersection with what rustls already offers,
-//! so a `cipher://` cannot talk this port into a suite it would otherwise
-//! refuse.
+//! ```text
+//! ciphers=ECDHE-RSA-AES128-GCM-SHA256  ->  TLSv1.3 TLS_AES_256_GCM_SHA384
+//! ciphers=TLS_AES_128_GCM_SHA256       ->  TLSv1.3 TLS_AES_128_GCM_SHA256
+//! ```
+//!
+//! A TLS 1.2 name does **not** constrain TLS 1.3 — the first line negotiated
+//! 1.3 with the default suite, not the one that was asked for. A TLS 1.3 name
+//! does. Reproduced here, because getting it wrong is not cosmetic: applying a
+//! TLS 1.2 pin to the 1.3 list leaves no 1.3 suite to offer, and the connection
+//! silently **downgrades to TLS 1.2** — a rule that meant "prefer this suite"
+//! would then have weakened the connection.
+//!
+//! # When the answer is nothing
+//!
+//! A string that selects no suite at all is an error in OpenSSL — it throws at
+//! context creation, before any connection (`no cipher match`, measured). It is
+//! an error here too, and the message names the tokens that came up empty. This
+//! is the one place the smaller universe shows: `ciphers: "3DES"` works against
+//! an OpenSSL that has 3DES and fails here, because this build does not have it,
+//! and no evaluation can conjure an algorithm that is not compiled in.
 
 use rustls::SupportedCipherSuite;
 use rustls::crypto::ring::cipher_suite as ring;
 
-/// Every suite rustls's ring provider has, with the two spellings each is
-/// written in. The IANA name is what TLS 1.3 and Node both use; the OpenSSL
-/// name is what a `ciphers` string usually carries for TLS 1.2.
+/// How a suite is classified, which is all an OpenSSL alias ever asks about.
+struct Attrs {
+    /// Key exchange. TLS 1.3 negotiates it separately, so its suites have none.
+    kx: Kx,
+    /// Authentication. Likewise separate in TLS 1.3.
+    au: Au,
+    enc: Enc,
+    /// Symmetric key size, which is what `HIGH`/`MEDIUM` and `@STRENGTH` read.
+    bits: u16,
+    prf: Prf,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Kx {
+    Ecdhe,
+    /// TLS 1.3: not part of the suite.
+    None13,
+}
+#[derive(PartialEq, Clone, Copy)]
+enum Au {
+    Rsa,
+    Ecdsa,
+    /// TLS 1.3: not part of the suite.
+    None13,
+}
+#[derive(PartialEq, Clone, Copy)]
+enum Enc {
+    AesGcm,
+    Chacha20,
+}
+#[derive(PartialEq, Clone, Copy)]
+enum Prf {
+    Sha256,
+    Sha384,
+}
+
+/// One suite this build can offer, with every name it answers to.
+struct Suite {
+    rustls: SupportedCipherSuite,
+    /// The IANA name, which is also OpenSSL's name for a TLS 1.3 suite.
+    iana: &'static str,
+    /// OpenSSL's own spelling, empty for TLS 1.3 where the two agree.
+    openssl: &'static str,
+    tls13: bool,
+    attrs: Attrs,
+}
+
+/// Every suite rustls's ring provider carries, in its own preference order.
 ///
-/// The order is rustls's own preference order, and the selection preserves it —
-/// OpenSSL's `ciphers` string is also a *preference* list, but rustls does not
-/// take an ordering, so only the membership is honoured.
-const SUITES: &[(SupportedCipherSuite, &str, &str)] = &[
-    (ring::TLS13_AES_256_GCM_SHA384, "TLS_AES_256_GCM_SHA384", ""),
-    (ring::TLS13_AES_128_GCM_SHA256, "TLS_AES_128_GCM_SHA256", ""),
-    (
-        ring::TLS13_CHACHA20_POLY1305_SHA256,
-        "TLS_CHACHA20_POLY1305_SHA256",
-        "",
-    ),
-    (
-        ring::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-        "ECDHE-ECDSA-AES256-GCM-SHA384",
-    ),
-    (
-        ring::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-        "ECDHE-ECDSA-AES128-GCM-SHA256",
-    ),
-    (
-        ring::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-        "ECDHE-ECDSA-CHACHA20-POLY1305",
-    ),
-    (
-        ring::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-        "ECDHE-RSA-AES256-GCM-SHA384",
-    ),
-    (
-        ring::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-        "ECDHE-RSA-AES128-GCM-SHA256",
-    ),
-    (
-        ring::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-        "ECDHE-RSA-CHACHA20-POLY1305",
-    ),
+/// This is the universe the cipher string is evaluated over. It is smaller than
+/// OpenSSL's, and every alias naming something outside it — `3DES`, `RC4`,
+/// `kRSA`, `DH`, `PSK` — correctly selects nothing.
+static SUITES: &[Suite] = &[
+    Suite {
+        rustls: ring::TLS13_AES_256_GCM_SHA384,
+        iana: "TLS_AES_256_GCM_SHA384",
+        openssl: "",
+        tls13: true,
+        attrs: Attrs { kx: Kx::None13, au: Au::None13, enc: Enc::AesGcm, bits: 256, prf: Prf::Sha384 },
+    },
+    Suite {
+        rustls: ring::TLS13_AES_128_GCM_SHA256,
+        iana: "TLS_AES_128_GCM_SHA256",
+        openssl: "",
+        tls13: true,
+        attrs: Attrs { kx: Kx::None13, au: Au::None13, enc: Enc::AesGcm, bits: 128, prf: Prf::Sha256 },
+    },
+    Suite {
+        rustls: ring::TLS13_CHACHA20_POLY1305_SHA256,
+        iana: "TLS_CHACHA20_POLY1305_SHA256",
+        openssl: "",
+        tls13: true,
+        attrs: Attrs { kx: Kx::None13, au: Au::None13, enc: Enc::Chacha20, bits: 256, prf: Prf::Sha256 },
+    },
+    Suite {
+        rustls: ring::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        iana: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        openssl: "ECDHE-ECDSA-AES256-GCM-SHA384",
+        tls13: false,
+        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Ecdsa, enc: Enc::AesGcm, bits: 256, prf: Prf::Sha384 },
+    },
+    Suite {
+        rustls: ring::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        iana: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        openssl: "ECDHE-ECDSA-AES128-GCM-SHA256",
+        tls13: false,
+        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Ecdsa, enc: Enc::AesGcm, bits: 128, prf: Prf::Sha256 },
+    },
+    Suite {
+        rustls: ring::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        iana: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        openssl: "ECDHE-ECDSA-CHACHA20-POLY1305",
+        tls13: false,
+        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Ecdsa, enc: Enc::Chacha20, bits: 256, prf: Prf::Sha256 },
+    },
+    Suite {
+        rustls: ring::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        iana: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        openssl: "ECDHE-RSA-AES256-GCM-SHA384",
+        tls13: false,
+        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Rsa, enc: Enc::AesGcm, bits: 256, prf: Prf::Sha384 },
+    },
+    Suite {
+        rustls: ring::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        iana: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        openssl: "ECDHE-RSA-AES128-GCM-SHA256",
+        tls13: false,
+        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Rsa, enc: Enc::AesGcm, bits: 128, prf: Prf::Sha256 },
+    },
+    Suite {
+        rustls: ring::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        iana: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        openssl: "ECDHE-RSA-CHACHA20-POLY1305",
+        tls13: false,
+        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Rsa, enc: Enc::Chacha20, bits: 256, prf: Prf::Sha256 },
+    },
 ];
 
-/// Which suites a `cipher://` selected, as a bitmask over [`SUITES`].
+/// Does one OpenSSL alias describe this suite?
 ///
-/// A mask rather than a list so that [`super::upstream::Target`] stays `Copy`
-/// and so that the client-config cache has a key it can hash — there are nine
-/// suites, and a `u16` holds the answer with room to spare. **Zero means no
-/// selection**, which is not the same as "no suites": it is the ordinary case,
-/// and it leaves rustls's own list alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Suites(u16);
+/// `None` when the word is not an alias this evaluator knows. `Some(false)` is a
+/// word it knows that does not apply — including every family OpenSSL has and
+/// this build does not, which is why `3DES` selects nothing rather than failing
+/// to parse.
+fn alias_matches(word: &str, s: &Suite) -> Option<bool> {
+    let a = &s.attrs;
+    let aes = a.enc == Enc::AesGcm;
+    Some(match word.to_ascii_uppercase().as_str() {
+        // Everything, and the ordinary default. This build has no NULL or
+        // export suites, so the two are the same set here.
+        "ALL" | "DEFAULT" => true,
+        "COMPLEMENTOFALL" | "COMPLEMENTOFDEFAULT" => false,
 
-impl Suites {
-    /// No selection — rustls decides, as it does for every request without a
-    /// `cipher://ciphers`.
-    pub const ALL: Suites = Suites(0);
+        // Strength classes. Every suite here is an AEAD of at least 128 bits.
+        "HIGH" => true,
+        "MEDIUM" | "LOW" | "EXP" | "EXPORT" | "EXPORT40" | "EXPORT56" => false,
 
-    /// Is anything selected?
-    pub fn is_all(self) -> bool {
-        self.0 == 0
+        // Key exchange. `RSA` is OpenSSL's name for *kRSA* — static RSA key
+        // exchange — which is not what `ECDHE-RSA-…` uses and not something
+        // this build has at all. Authentication is `aRSA`; conflating them is
+        // the single easiest way to read one of these strings backwards.
+        "ECDHE" | "EECDH" | "KEECDH" | "KECDHE" | "ECDH" => a.kx == Kx::Ecdhe,
+        "KRSA" | "RSA" | "DH" | "DHE" | "EDH" | "KDHE" | "KEDH" | "ADH" | "AECDH" | "PSK"
+        | "SRP" | "KGOST" | "GOST" => false,
+
+        // Authentication.
+        "ARSA" => a.au == Au::Rsa,
+        "AECDSA" | "ECDSA" => a.au == Au::Ecdsa,
+        "ANULL" | "ADSS" | "DSS" | "DSA" | "AGOST" => false,
+
+        // Bulk cipher.
+        "AES" | "AESGCM" => aes,
+        "AES128" | "AES128GCM" => aes && a.bits == 128,
+        "AES256" | "AES256GCM" => aes && a.bits == 256,
+        "CHACHA20" | "CHACHA20POLY1305" => a.enc == Enc::Chacha20,
+        "3DES" | "DES" | "RC2" | "RC4" | "IDEA" | "SEED" | "CAMELLIA" | "ARIA" | "ENULL"
+        | "NULL" | "AESCCM" | "AESCCM8" => false,
+
+        // MAC / PRF.
+        "SHA256" => a.prf == Prf::Sha256,
+        "SHA384" => a.prf == Prf::Sha384,
+        "MD5" | "SHA1" | "SHA" | "AEAD" => false,
+
+        // Protocol vintage. Aliases are only ever evaluated over the TLS 1.2
+        // suites (see `evaluate`), so `TLSv1.2` is all of them and `TLSv1.3`
+        // names a list this expression cannot reach.
+        "TLSV1.2" => true,
+        "TLSV1.3" | "SSLV3" | "TLSV1" | "TLSV1.0" | "TLSV1.1" | "SSLV2" => false,
+
+        _ => return None,
+    })
+}
+
+/// What one token of a cipher string selects, or `None` if it names nothing
+/// this evaluator recognises.
+///
+/// A token may be a conjunction: OpenSSL's **infix** `+` is a logical AND, so
+/// `ECDHE+AESGCM` is "ECDHE *and* AES-GCM". (The *leading* `+` is a different
+/// operator entirely — see [`evaluate`].)
+fn token_selects(token: &str, s: &Suite) -> Option<bool> {
+    // A full suite name, in either spelling, selects exactly itself.
+    if token.eq_ignore_ascii_case(s.iana) || (!s.openssl.is_empty() && token.eq_ignore_ascii_case(s.openssl)) {
+        return Some(true);
+    }
+    // …but a name that belongs to *some* suite must not fall through to the
+    // alias table, or a typo would silently become an alias miss.
+    if names_a_suite(token) {
+        return Some(false);
+    }
+    let mut all = true;
+    for word in token.split('+') {
+        match alias_matches(word, s) {
+            Some(hit) => all &= hit,
+            None => return None,
+        }
+    }
+    Some(all)
+}
+
+/// Is this token the full name of one of our suites?
+fn names_a_suite(token: &str) -> bool {
+    SUITES.iter().any(|s| {
+        token.eq_ignore_ascii_case(s.iana) || (!s.openssl.is_empty() && token.eq_ignore_ascii_case(s.openssl))
+    })
+}
+
+/// A `ciphers` string that selected nothing at all.
+#[derive(Debug)]
+pub struct NoCipherMatch {
+    /// The tokens that came up empty, for a message worth reading.
+    pub tokens: Vec<String>,
+}
+
+impl std::fmt::Display for NoCipherMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no cipher match: {} names no cipher suite this build has. \
+             Available: TLS 1.3 AES-GCM/ChaCha20, TLS 1.2 ECDHE with AES-GCM/ChaCha20",
+            self.tokens.join(", ")
+        )
+    }
+}
+
+/// A `ciphers` string, evaluated into the two lists rustls needs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CipherPolicy {
+    /// Indices into [`SUITES`], in the order the expression produced — TLS 1.3
+    /// first, as rustls orders its own list.
+    order: Vec<usize>,
+}
+
+impl CipherPolicy {
+    /// The suites to offer, in order.
+    pub fn suites(&self) -> Vec<SupportedCipherSuite> {
+        self.order.iter().map(|&i| SUITES[i].rustls).collect()
     }
 
-    /// The selected suites, in rustls's preference order.
-    pub fn selected(self) -> Vec<SupportedCipherSuite> {
-        SUITES
+    /// The suite names, for logging what a rule actually did.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.order
             .iter()
-            .enumerate()
-            .filter(|(i, _)| self.0 & (1 << i) != 0)
-            .map(|(_, (suite, _, _))| *suite)
+            .map(|&i| match SUITES[i].openssl.is_empty() {
+                true => SUITES[i].iana,
+                false => SUITES[i].openssl,
+            })
             .collect()
     }
 }
 
-/// What a `ciphers` string asked for, and what could not be given.
-pub struct Requested {
-    /// The suites named that rustls has.
-    pub suites: Suites,
-    /// The tokens that name nothing rustls can select — an OpenSSL group alias,
-    /// an exclusion, an ordering directive, or a suite this build does not
-    /// carry. Reported so the gap is audible.
-    pub unhonoured: Vec<String>,
-}
-
-/// Read an OpenSSL `ciphers` string as far as rustls can follow it.
+/// Evaluate an OpenSSL cipher string over the suites this build has.
 ///
-/// Splitting is OpenSSL's: `:` is the separator, and `,`/space are accepted too
-/// because Node's own documentation writes lists both ways and a rule is typed
-/// by hand.
-pub fn parse(spec: &str) -> Requested {
-    let mut mask = 0u16;
-    let mut unhonoured = Vec::new();
-    for token in spec.split([':', ',', ' ']).map(str::trim).filter(|t| !t.is_empty()) {
-        match index_of(token) {
-            Some(i) => mask |= 1 << i,
-            None => unhonoured.push(token.to_string()),
+/// The algorithm is OpenSSL's own, left to right over an ordered list:
+///
+/// * a plain token **appends** the suites it selects that are not already in the
+///   list and have not been permanently removed;
+/// * `!token` removes them and blacklists them, so a later token cannot bring
+///   them back;
+/// * `-token` removes them, and a later token can;
+/// * `+token` moves the ones already in the list to the **end** (deprioritise);
+/// * `@STRENGTH` sorts the list by key size, strongest first.
+///
+/// The TLS 1.3 half follows what Node does, which was measured rather than
+/// assumed: a string that names no TLS 1.3 suite leaves all three in place, and
+/// one that names any restricts to those. See the module doc for why applying
+/// the TLS 1.2 half to TLS 1.3 would be a downgrade rather than a pin.
+pub fn evaluate(spec: &str) -> Result<CipherPolicy, NoCipherMatch> {
+    let mut list: Vec<usize> = Vec::new();
+    let mut banned: Vec<usize> = Vec::new();
+    let mut named13: Vec<usize> = Vec::new();
+    let mut empty_tokens: Vec<String> = Vec::new();
+
+    for raw in spec.split([':', ',', ' ']).map(str::trim).filter(|t| !t.is_empty()) {
+        // `@STRENGTH` and `@SECLEVEL=n` are directives, not selections.
+        if let Some(directive) = raw.strip_prefix('@') {
+            if directive.eq_ignore_ascii_case("STRENGTH") {
+                list.sort_by_key(|&i| std::cmp::Reverse(SUITES[i].attrs.bits));
+            }
+            // `@SECLEVEL=n` sets a floor this build is already above: every
+            // suite here is a ≥128-bit AEAD with forward secrecy or TLS 1.3.
+            continue;
+        }
+        let (op, token) = match raw.as_bytes()[0] {
+            b'!' => ('!', &raw[1..]),
+            b'-' => ('-', &raw[1..]),
+            b'+' => ('+', &raw[1..]),
+            _ => (' ', raw),
+        };
+        if token.is_empty() {
+            continue;
+        }
+
+        // A TLS 1.3 suite addresses the *other* list, and only by name. This is
+        // the whole of what an alias may not do: measured against Node,
+        // `CHACHA20` leaves TLS 1.3 at its default while
+        // `TLS_CHACHA20_POLY1305_SHA256` pins it. An alias reaching the 1.3 list
+        // would silently narrow it on strings that never meant to.
+        if let Some(i) = SUITES.iter().position(|s| s.tls13 && token.eq_ignore_ascii_case(s.iana)) {
+            if op == ' ' && !named13.contains(&i) {
+                named13.push(i);
+            }
+            continue;
+        }
+
+        // Everything else is evaluated over the TLS 1.2 universe, which is what
+        // an OpenSSL cipher list has always been about.
+        let hit: Vec<usize> = SUITES
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.tls13)
+            .filter(|(_, s)| token_selects(token, s) == Some(true))
+            .map(|(i, _)| i)
+            .collect();
+        if hit.is_empty() {
+            // Worth naming later if the whole string turns out empty: whether
+            // the word was unknown or merely absent from this build, something
+            // was asked for and not given.
+            empty_tokens.push(raw.to_string());
+            continue;
+        }
+        match op {
+            '!' => {
+                list.retain(|i| !hit.contains(i));
+                banned.extend(hit);
+            }
+            '-' => list.retain(|i| !hit.contains(i)),
+            '+' => {
+                // Deprioritise: the ones already in the list move to the end,
+                // keeping their order. A `+` never *adds* a suite — that is what
+                // distinguishes it from a plain token.
+                let moving: Vec<usize> = list.iter().copied().filter(|i| hit.contains(i)).collect();
+                list.retain(|i| !moving.contains(i));
+                list.extend(moving);
+            }
+            _ => {
+                for i in hit {
+                    if !banned.contains(&i) && !list.contains(&i) {
+                        list.push(i);
+                    }
+                }
+            }
         }
     }
-    Requested {
-        // Selecting nothing is not a selection. An empty suite list makes every
-        // handshake fail, which no `cipher://` was asking for — so a string this
-        // port understood none of leaves rustls's own list in place, and says so
-        // through `unhonoured`.
-        suites: Suites(mask),
-        unhonoured,
-    }
-}
 
-/// The index in [`SUITES`] of a suite named by either spelling, case-insensitively.
-fn index_of(token: &str) -> Option<usize> {
-    SUITES.iter().position(|(_, iana, openssl)| {
-        token.eq_ignore_ascii_case(iana) || (!openssl.is_empty() && token.eq_ignore_ascii_case(openssl))
-    })
+    // Nothing at all was selected — neither list. OpenSSL throws `no cipher
+    // match` at context creation, before any connection, and so does this.
+    // Measured, not assumed; see the module doc.
+    if list.is_empty() && named13.is_empty() {
+        return Err(NoCipherMatch {
+            tokens: match empty_tokens.is_empty() {
+                true => vec![spec.trim().to_string()],
+                false => empty_tokens,
+            },
+        });
+    }
+
+    // A string that named no TLS 1.3 suite leaves all three in place. That is
+    // Node's behaviour and the alternative is a downgrade: with no 1.3 suite to
+    // offer, a connection that could have been TLS 1.3 falls back to 1.2.
+    let mut order: Vec<usize> = match named13.is_empty() {
+        true => SUITES.iter().enumerate().filter(|(_, s)| s.tls13).map(|(i, _)| i).collect(),
+        false => named13,
+    };
+    order.extend(list);
+    Ok(CipherPolicy { order })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_suite_is_recognised_by_either_spelling() {
-        let iana = parse("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256");
-        let openssl = parse("ECDHE-RSA-AES128-GCM-SHA256");
-        assert_eq!(iana.suites, openssl.suites, "one suite, two names");
-        assert!(iana.unhonoured.is_empty());
-        assert_eq!(iana.suites.selected().len(), 1);
+    /// The names the policy selected, TLS 1.2 ones only — the half a cipher
+    /// string is really about.
+    fn tls12(spec: &str) -> Vec<&'static str> {
+        let p = evaluate(spec).expect("a policy");
+        p.order
+            .iter()
+            .filter(|&&i| !SUITES[i].tls13)
+            .map(|&i| SUITES[i].openssl)
+            .collect()
     }
 
-    /// TLS 1.3 suites have one name in both worlds, and OpenSSL uses it too.
-    #[test]
-    fn a_tls13_suite_has_a_single_spelling() {
-        let r = parse("TLS_AES_128_GCM_SHA256");
-        assert_eq!(r.suites.selected().len(), 1);
-        assert!(r.unhonoured.is_empty());
+    /// The TLS 1.3 names selected.
+    fn tls13(spec: &str) -> Vec<&'static str> {
+        let p = evaluate(spec).expect("a policy");
+        p.order
+            .iter()
+            .filter(|&&i| SUITES[i].tls13)
+            .map(|&i| SUITES[i].iana)
+            .collect()
     }
 
-    /// The whole reason this module exists: what cannot be honoured is named.
+    /// The finding that matters most, because getting it wrong downgrades the
+    /// connection: a TLS 1.2 name must leave all three TLS 1.3 suites in place.
+    /// Measured against Node 26 / OpenSSL 3.6 — see the module doc.
     #[test]
-    fn what_cannot_be_honoured_is_reported_rather_than_dropped() {
-        let r = parse("HIGH:!aNULL:!MD5:@STRENGTH");
-        assert!(r.suites.is_all(), "none of those name a suite rustls has");
-        assert_eq!(r.unhonoured, ["HIGH", "!aNULL", "!MD5", "@STRENGTH"]);
+    fn a_tls12_pin_does_not_touch_the_tls13_suites() {
+        assert_eq!(tls12("ECDHE-RSA-AES128-GCM-SHA256"), ["ECDHE-RSA-AES128-GCM-SHA256"]);
+        assert_eq!(
+            tls13("ECDHE-RSA-AES128-GCM-SHA256").len(),
+            3,
+            "all three, or the connection downgrades to 1.2 to find a suite"
+        );
     }
 
-    /// A mixed string honours what it can and reports the rest, rather than
-    /// taking all of it or none of it.
+    /// An **alias** never reaches the TLS 1.3 list, even when it plainly
+    /// describes those suites. Measured against Node: `CHACHA20` leaves TLS 1.3
+    /// at `TLS_AES_256_GCM_SHA384`, where the explicit name pins it. Reading
+    /// this the other way narrows 1.3 on strings that never meant to.
     #[test]
-    fn a_mixed_string_keeps_the_half_that_maps() {
-        let r = parse("ECDHE-RSA-AES128-GCM-SHA256:!RC4:DES-CBC3-SHA");
-        assert_eq!(r.suites.selected().len(), 1);
-        assert_eq!(r.unhonoured, ["!RC4", "DES-CBC3-SHA"]);
+    fn an_alias_never_reaches_the_tls13_list() {
+        for alias in ["CHACHA20", "AESGCM", "AES128", "ECDHE+AESGCM", "HIGH"] {
+            assert_eq!(tls13(alias).len(), 3, "{alias} must leave TLS 1.3 alone");
+        }
+        // …and the TLS 1.2 half of the same strings is still selected.
+        assert_eq!(tls12("CHACHA20").len(), 2);
     }
 
-    /// Separators: OpenSSL's `:`, and the spellings a person types.
+    /// …and a TLS 1.3 name does constrain them, which Node also does.
     #[test]
-    fn the_list_may_be_separated_three_ways() {
-        for spec in [
-            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
-            "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384",
-            "TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384",
-        ] {
-            assert_eq!(parse(spec).suites.selected().len(), 2, "{spec}");
+    fn a_tls13_name_selects_only_that_tls13_suite() {
+        assert_eq!(tls13("TLS_AES_128_GCM_SHA256"), ["TLS_AES_128_GCM_SHA256"]);
+        assert!(tls12("TLS_AES_128_GCM_SHA256").is_empty(), "as OpenSSL empties it");
+    }
+
+    /// The whole point: an ordinary string people actually write evaluates to
+    /// an ordinary answer, with nothing to warn about.
+    #[test]
+    fn the_strings_people_write_just_work() {
+        assert_eq!(tls12("HIGH:!aNULL:!MD5").len(), 6, "every suite here is HIGH");
+        assert_eq!(tls12("DEFAULT").len(), 6);
+        assert_eq!(tls12("ALL").len(), 6);
+        assert_eq!(tls12("AESGCM").len(), 4, "the four AES-GCM suites");
+        assert_eq!(tls12("CHACHA20").len(), 2);
+        assert_eq!(tls12("ECDHE").len(), 6);
+    }
+
+    /// OpenSSL's infix `+` is a logical AND, and `ECDHE+AESGCM` is one of the
+    /// most-written cipher strings there is.
+    #[test]
+    fn an_infix_plus_is_a_conjunction() {
+        assert_eq!(tls12("ECDHE+AESGCM").len(), 4);
+        assert_eq!(tls12("ECDHE+CHACHA20").len(), 2);
+        assert_eq!(tls12("aRSA+AES256").len(), 1);
+        assert_eq!(tls12("aRSA+AES256"), ["ECDHE-RSA-AES256-GCM-SHA384"]);
+    }
+
+    /// `RSA` is *key exchange*, `aRSA` is authentication. Confusing them reads
+    /// the string backwards, and this build has no kRSA suites at all —
+    /// confirmed against OpenSSL, which answers `RSA` with `AES256-GCM-SHA384`,
+    /// a static-RSA suite rustls does not implement.
+    #[test]
+    fn rsa_is_key_exchange_and_arsa_is_authentication() {
+        assert_eq!(tls12("aRSA").len(), 3);
+        assert!(evaluate("RSA").is_err(), "kRSA: this build has none");
+    }
+
+    /// Removal, permanent and otherwise.
+    #[test]
+    fn exclusion_removes_and_bang_forbids() {
+        assert_eq!(tls12("AESGCM:-AES128").len(), 2, "the 256-bit AES-GCM pair");
+        // `-` allows a later token to bring them back; `!` does not.
+        assert_eq!(tls12("ALL:-AESGCM:AES128").len(), 4);
+        assert_eq!(tls12("ALL:!AESGCM:AES128").len(), 2, "only the ChaCha20 pair");
+        assert_eq!(tls12("HIGH:!CHACHA20").len(), 4);
+    }
+
+    /// `@STRENGTH` sorts by key size, strongest first.
+    #[test]
+    fn strength_sorts_the_list() {
+        let sorted = tls12("AESGCM:@STRENGTH");
+        let bits: Vec<u16> = sorted
+            .iter()
+            .map(|n| SUITES.iter().find(|s| s.openssl == *n).unwrap().attrs.bits)
+            .collect();
+        assert_eq!(bits, [256, 256, 128, 128]);
+    }
+
+    /// A family OpenSSL has and this build does not selects nothing — the same
+    /// answer OpenSSL gives when compiled without it.
+    #[test]
+    fn a_family_this_build_lacks_selects_nothing() {
+        for spec in ["3DES", "RC4", "DES-CBC3-SHA", "DH", "PSK", "aNULL"] {
+            assert!(evaluate(spec).is_err(), "{spec} should select nothing");
         }
     }
 
-    /// No selection is the ordinary case and must not be confused with an empty
-    /// one, which would fail every handshake.
+    /// And the error names what came up empty, which OpenSSL's own message does
+    /// not do.
     #[test]
-    fn an_empty_string_selects_everything_rather_than_nothing() {
-        let r = parse("");
-        assert!(r.suites.is_all());
-        assert!(r.unhonoured.is_empty());
-        assert!(r.suites.selected().is_empty(), "and `selected` is not consulted");
+    fn the_error_names_the_tokens_that_found_nothing() {
+        let err = evaluate("3DES:RC4").expect_err("nothing to select");
+        assert_eq!(err.tokens, ["3DES", "RC4"]);
+        assert!(err.to_string().contains("no cipher match"));
     }
 
-    /// The mask is a subset of what rustls offers, so a rule can only ever
-    /// narrow the negotiation.
+    /// An unknown word is not a parse failure — it simply selects nothing, and
+    /// only matters if the whole string came up empty. `HIGH` carries this one.
     #[test]
-    fn every_selectable_suite_is_one_rustls_actually_has() {
-        let all: Vec<_> = SUITES.iter().map(|(_, iana, _)| *iana).collect();
-        let r = parse(&all.join(":"));
-        assert!(r.unhonoured.is_empty(), "the table names its own suites");
-        assert_eq!(r.suites.selected().len(), SUITES.len());
+    fn an_unknown_word_alongside_a_real_one_is_survivable() {
+        assert_eq!(tls12("HIGH:!NOTACIPHER").len(), 6);
+        assert!(evaluate("NOTACIPHER").is_err());
+    }
+
+    /// Every suite named is one the provider really carries, so a policy can
+    /// only ever narrow what is negotiated.
+    #[test]
+    fn every_selected_suite_is_one_the_provider_has() {
         let provider = rustls::crypto::ring::default_provider();
-        for suite in r.suites.selected() {
-            assert!(
-                provider.cipher_suites.contains(&suite),
-                "{:?} is not in the provider",
-                suite.suite()
-            );
+        for suite in evaluate("ALL").expect("all").suites() {
+            assert!(provider.cipher_suites.contains(&suite), "{:?}", suite.suite());
+        }
+    }
+
+    /// The separators a person actually types.
+    #[test]
+    fn the_list_may_be_separated_three_ways() {
+        for spec in ["AES128:AES256", "AES128,AES256", "AES128 AES256"] {
+            assert_eq!(tls12(spec).len(), 4, "{spec}");
         }
     }
 }

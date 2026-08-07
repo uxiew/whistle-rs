@@ -660,8 +660,14 @@ pub async fn resolve_target(
     let request_tls = super::dest::is_tls(&dest.scheme);
     let tls = origin_tls(request_tls, proxy_proto);
     let cipher = resolved.value("cipher");
+    // A cipher string that names nothing this build has fails the request, as
+    // it fails at context creation in Node. See `parse_cipher_suites`.
+    let tls_ciphers = match cipher.map(parse_cipher_suites).transpose() {
+        Ok(policy) => policy.flatten(),
+        Err(e) => bail!("cipher://: {e}"),
+    };
     Ok(Target {
-        tls_suites: cipher.map(parse_cipher_suites).unwrap_or_default(),
+        tls_ciphers,
         connect_host,
         connect_port,
         tls,
@@ -747,39 +753,29 @@ fn parse_cipher_versions(value: &str) -> super::upstream::TlsVersions {
 
 /// Read the `ciphers` half of a `cipher://` value.
 ///
-/// The other half of the operator — `minVersion`/`maxVersion` — is
-/// [`parse_cipher_versions`]. This one is the OpenSSL cipher string, which
-/// rustls cannot take as a string but can be partly satisfied by selecting
-/// suites; [`super::ciphers`] explains exactly how far that goes.
+/// The other half — `minVersion`/`maxVersion` — is [`parse_cipher_versions`].
+/// This one is the OpenSSL cipher string, which [`super::ciphers`] evaluates
+/// over the suites this build has.
 ///
-/// **The tokens that cannot be honoured are logged, once per resolution.** They
-/// used to be walked past in silence, so a rule that pinned a suite configured
-/// nothing and looked exactly like a rule that had worked — which is the failure
-/// mode this port keeps finding and removing.
-fn parse_cipher_suites(value: &str) -> super::ciphers::Suites {
+/// `Err` is upstream's own answer to a string that selects nothing: OpenSSL
+/// throws `no cipher match` at context creation, so the request fails rather
+/// than quietly going out under a policy nobody asked for.
+fn parse_cipher_suites(
+    value: &str,
+) -> Result<Option<std::sync::Arc<super::ciphers::CipherPolicy>>, super::ciphers::NoCipherMatch> {
     let value = value.trim();
-    let spec = match value.starts_with('{') {
-        // Node's own option name, inside the JSON the operator carries.
-        true => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
-            .ok()
-            .and_then(|m| m.get("ciphers").and_then(|v| v.as_str()).map(str::to_string)),
-        // A bare token is a version pin, not a cipher list — see
-        // `parse_cipher_versions`.
-        false => None,
-    };
-    let Some(spec) = spec else {
-        return super::ciphers::Suites::ALL;
-    };
-    let requested = super::ciphers::parse(&spec);
-    if !requested.unhonoured.is_empty() {
-        tracing::warn!(
-            "cipher://…\"ciphers\": {} not honoured — rustls selects from a fixed \
-             suite list and takes no OpenSSL cipher string. Name a suite directly \
-             (TLS_AES_128_GCM_SHA256, ECDHE-RSA-AES128-GCM-SHA256, …) to pin one",
-            requested.unhonoured.join(", ")
-        );
+    // A bare token is a version pin, not a cipher list — see
+    // `parse_cipher_versions`. Only the JSON form carries Node's `ciphers`.
+    if !value.starts_with('{') {
+        return Ok(None);
     }
-    requested.suites
+    let spec = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+        .ok()
+        .and_then(|m| m.get("ciphers").and_then(|v| v.as_str()).map(str::to_string));
+    let Some(spec) = spec.filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    super::ciphers::evaluate(&spec).map(|p| Some(std::sync::Arc::new(p)))
 }
 
 /// True if a version token names TLS 1.3.
