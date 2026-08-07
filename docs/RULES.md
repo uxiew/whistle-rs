@@ -1737,7 +1737,7 @@ nothing — you need a scope.
 | `headers.x` | the header on both sides (this spelling is case-**sensitive** and must be plural) |
 | `reqCookies.x` / `cookies.x` | that cookie from the request `Cookie` header |
 | `resCookies.x` / `cookies.x` | that cookie **in the client** — see below |
-| `trailer.x` | that trailing header (this key takes no `req`/`res` scope) |
+| `trailer.x` | that trailing header (this key takes no `req`/`res` scope, and is the one key that is case-**sensitive**) |
 | `query.x` / `params.x` / `urlParams.x` / `url.Param.x` | that query-string parameter, every repeat of it |
 | `query` / `params` / `urlParams` (bare) | the whole query string, `?` and all |
 | `pathname` | the whole path, keeping the query string |
@@ -1746,6 +1746,11 @@ nothing — you need a scope.
 | `resCharset` / `res.charset`, `reqCharset` / `req.charset` | the charset parameter |
 | `body`, `res.body`, `req.body` | the whole body, including anything an operator injects |
 | `resBody.a.b` / `resB.a.b`, `reqBody.a.b` | that dotted path from a JSON body |
+
+A body path is read the way whistle reads one: `reqBody.a\.b` names a single key
+containing a dot (backslashes are halved first, so `a\\.b` is two segments),
+`reqBody."k[0]"` takes a segment literally, and `reqBody.a[0]` indexes an array
+— the same element `reqBody.a.0` names.
 
 ```
 example.com   delete://resHeaders.server|resHeaders.x-powered-by
@@ -1773,20 +1778,31 @@ The URL keys have edges worth knowing, all inherited
   the same line just wrote;
 * an index out of range is a no-op rather than an error.
 
-> **One deliberate divergence.** A bare `delete://pathname` against a URL that
-> has a query string emits the query **twice** upstream (`/a?x=1` → `/?x=1?x=1`,
-> `util/index.js:1033,1057`). whistle-rs emits it once; the upstream form is a
-> request line no origin parses.
+> **Two deliberate divergences.**
+>
+> A bare `delete://pathname` against a URL that has a query string emits the
+> query **twice** upstream (`/a?x=1` → `/?x=1?x=1`, `util/index.js:1033,1057`).
+> whistle-rs emits it once; the upstream form is a request line no origin
+> parses.
+>
+> `delete://body` (and `req.body` / `res.body`) does **not** empty the body in
+> real whistle, only discard what `reqBody://`, `reqPrepend://` and their
+> response twins meant to inject. `removeBody` assigns `EMPTY_BUFFER`, and
+> `EMPTY_BUFFER` is `toBuffer('')` — whose first act is `if (!buf) return`
+> (`util/common.js:1630-1632`), so the constant is `undefined` and the
+> assignment leaves the body alone. whistle-rs empties it, which is what the
+> key is documented to do and what upstream's own code means to do.
 
 A response cannot reach into the browser and remove a cookie, so
 `delete://resCookies.x` sends back one that has **already expired**
 (`Max-Age=0` with a past `Expires`). Two go out per name, plain and `Secure`,
 because a `Secure` cookie is not overwritten by a non-`Secure` one and the proxy
-cannot tell which is out there. A request that arrived through an intercepted
-tunnel gets two more, scoped to the parent domain, for a cookie set on
-`.example.com` rather than on the host — matching upstream, which reads a
-hostname only set on that path. The deletion **wins** over a `resCookies://`
-naming the same cookie on the same request.
+cannot tell which is out there. A host with a parent domain worth naming gets
+two more scoped to it, for a cookie set on `.example.com` rather than on the
+host: `a.b.example.com` adds `Domain=b.example.com`, a three-label host keeps
+the leading dot (`.example.com`), and `example.com` has no parent and adds
+nothing. The deletion **wins** over a `resCookies://` naming the same cookie on
+the same request.
 
 ### Cookies
 
@@ -1795,10 +1811,15 @@ naming the same cookie on the same request.
 | `reqCookies` | `name=value` pairs (`&`-separated) or `{json}` | Merge into the request `Cookie` header. Accumulates across lines. |
 | `resCookies` | `name=value` pairs (`&`-separated) or `{json}` | Set `Set-Cookie` headers. Accumulates across lines. |
 
-A name written with no `=` gets an **empty value** — it does not delete the
-cookie. To remove one, use `delete://reqCookies.<name>`. A `resCookies` entry
-**replaces** a `Set-Cookie` the response already sent under the same name rather
-than adding a second one.
+A name written with no `=` *inside* a query gets an **empty value** — it does not
+delete the cookie; to remove one, use `delete://reqCookies.<name>`. A whole
+value with no `=` anywhere is not a query string at all but a **location**, so
+`resCookies://sid` reads a file of that name and sets nothing. A `resCookies`
+entry **replaces** a `Set-Cookie` the response already sent under the same name
+rather than adding a second one.
+
+Deleting every cookie from a request leaves `Cookie:` present and **empty**
+rather than removing it, which is upstream's `setHeader(data, 'cookie', '')`.
 
 ```
 example.com   reqCookies://sid=abc&locale=en
