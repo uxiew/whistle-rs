@@ -1736,7 +1736,7 @@ async fn top_level(
     peer: SocketAddr,
 ) -> Result<Response<DynBody>, Destroyed> {
     if req.method() == hyper::Method::CONNECT {
-        return Ok(handle_connect(state, req, peer));
+        return handle_connect(state, req, peer);
     }
     // Absolute-form URI => proxied request. Origin-form => a direct hit on us.
     if req.uri().authority().is_some() {
@@ -1750,13 +1750,19 @@ fn handle_connect(
     state: Arc<AppState>,
     req: Request<Incoming>,
     peer: SocketAddr,
-) -> Response<DynBody> {
+) -> Result<Response<DynBody>, Destroyed> {
     let Some((host, port)) = authority_host_port(req.uri()) else {
-        return Response::builder()
+        return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(body::full(Bytes::from_static(b"bad CONNECT target")))
-            .unwrap();
+            .unwrap());
     };
+
+    // The last moment a tunnel can be refused: everything below this line has
+    // already told the client it is open. See [`tunnel_aborted`].
+    if tunnel_aborted(&state, &host, port, peer) {
+        return Err(Destroyed);
+    }
 
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
@@ -1772,10 +1778,260 @@ fn handle_connect(
         }
     });
 
-    Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .body(body::empty())
-        .unwrap()
+        .unwrap())
+}
+
+/// Does a rule refuse to carry this connection — and, when one does, record the
+/// refusal so an aborted tunnel is visible rather than simply absent.
+///
+/// This is whistle's tunnel-side abort. Upstream tests it twice on a CONNECT it
+/// carries: once before the origin is dialled (`needAbortReq`,
+/// `_original/lib/tunnel.js:372-374`) and once instead of writing the CONNECT
+/// reply (`needAbortRes`, `tunnel.js:748-750`). Both end in the same
+/// `reqSocket.destroy()`, so the client observes the same thing either way — a
+/// CONNECT that is never answered — and here the two collapse into one gate,
+/// because hyper hands over the tunnel's bytes only *after* the answer to the
+/// CONNECT has gone out. What that costs is `abortRes`'s one distinguishing
+/// effect: upstream has dialled the origin by the time it fires, and this port
+/// has not. Buying it back would mean acknowledging the CONNECT first, and then
+/// neither gate can produce the silence the abort exists for.
+///
+/// `disable://tunnel` is the third arm of the same two predicates — on a tunnel
+/// it *is* an abort (`_original/lib/util/index.js:3900,:3912`) — and, like the
+/// other two, `disable://abort` calls it off, that being the first thing both
+/// predicates test (`util/index.js:3893,:3905`).
+///
+/// Upstream skips this gate entirely on a tunnel it decides to intercept
+/// (`tunnel.js:251-277` dispatches to the MITM server and returns, so
+/// `handleTunnel` is never reached) and lets the abort bite on each request
+/// inside instead. This port cannot follow it there: the interception decision
+/// needs the ClientHello, which only arrives once the CONNECT has been
+/// acknowledged. So the gate runs for every connection, intercepted or relayed,
+/// and an aborted CONNECT is one refused session rather than N refused requests.
+/// Requests inside a tunnel that is *not* refused still meet the request-side
+/// gate in [`serve`], and a path-scoped `enable://abort` only ever reaches that
+/// one — a connection has no path to match.
+///
+/// The connection is matched on the [`ReqInfo`] the SNI stage already defines
+/// ([`sni::connection_req_info`]): the address, the client, `from:tunnel`, and
+/// nothing invented. One resolution per connection is what upstream pays too
+/// (`rules.initRules(req)` per CONNECT, `tunnel.js:155-160`), and against the
+/// TLS handshake that follows it does not show up.
+fn tunnel_aborted(state: &Arc<AppState>, host: &str, port: u16, peer: SocketAddr) -> bool {
+    let started = Instant::now();
+    let time_ms = now_ms();
+    // Scoped so the read guard is dropped before anything is recorded.
+    let (info, resolved) = {
+        let rules = state.rules.read().unwrap();
+        // No ClientHello has been read yet, so this connection has named no
+        // server: `from:sni` is false, not unknown.
+        let info = sni::connection_req_info(host, port, peer, false);
+        let resolved = rules.resolve(&info);
+        (info, resolved)
+    };
+    let disabled = apply::disabled_flags(&resolved);
+    let refuses_tunnel = disabled.contains("tunnel")
+        && !disabled.contains("abort")
+        && !(disabled.contains("abortReq") && disabled.contains("abortRes"));
+    if !apply::aborts_request(&resolved) && !apply::aborts_response(&resolved) && !refuses_tunnel {
+        return false;
+    }
+    tracing::info!("CONNECT {} -> aborted", info.full_url);
+    state.record(Session {
+        id: 0,
+        time_ms,
+        // Upstream records the tunnel under the method the client sent, which
+        // for a SOCKS client is the CONNECT its own front end issued against
+        // whistle's port (`_original/lib/index.js:166-173`).
+        method: "CONNECT".to_string(),
+        // The URL the rules matched, so the row and the rule agree.
+        url: info.full_url.clone(),
+        // Nothing answered and nothing will: upstream writes the string
+        // `'aborted'` here (`tunnel.js:31-36`) where this port has a number, and
+        // 0 is the console's "no status" (it already paints it as a warning).
+        status: 0,
+        client_ip: Some(peer.ip().to_string()),
+        // Not "somewhere, aborted": no address was dialled at all.
+        target: "aborted".to_string(),
+        duration_ms: started.elapsed().as_millis(),
+        log: log_labels(&resolved),
+        rules: matched_ops(&resolved),
+        // A connection has no request headers the rules were allowed to see —
+        // see [`sni::connection_req_info`] — so showing some here would be
+        // showing what did not take part in the decision.
+        ..Default::default()
+    });
+    true
+}
+
+#[cfg(test)]
+pub(crate) mod tunnel_abort_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// State over a storage directory nobody else touches, with `rules` loaded.
+    pub(crate) fn state_with(rules: &str) -> Arc<AppState> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let config = crate::config::Config {
+            port: 0,
+            host: Some("127.0.0.1".parse().unwrap()),
+            storage_dir: std::env::temp_dir()
+                .join(format!("whistle-rs-abort-{}-{n}", std::process::id())),
+            persist_sessions: false,
+            ..crate::config::Config::default()
+        };
+        let ca = CertAuthority::load_or_create(&config).expect("root CA");
+        let mut mgr = RuleManager::new();
+        mgr.set_text(rules);
+        Arc::new(AppState::with_plugins(
+            config,
+            mgr,
+            ca,
+            crate::plugins::Plugins::new(),
+        ))
+    }
+
+    pub(crate) fn peer() -> SocketAddr {
+        "127.0.0.1:51234".parse().unwrap()
+    }
+
+    /// Would `rules` refuse a tunnel to `example.com:443`?
+    fn refuses(rules: &str) -> bool {
+        tunnel_aborted(&state_with(rules), "example.com", 443, peer())
+    }
+
+    /// The tunnel gate is armed and called off by exactly the flags the request
+    /// gate is, because it is the same pair of predicates
+    /// (`needAbortReq`/`needAbortRes`, `_original/lib/util/index.js:3891-3913`)
+    /// read at a different moment.
+    #[test]
+    fn a_tunnel_is_refused_by_either_spelling_and_spared_by_either_cancellation() {
+        for rules in [
+            "example.com enable://abort",
+            "example.com enable://abortReq",
+            "example.com enable://abortRes",
+            // One side cancelled still leaves the other armed, and on a tunnel
+            // both end in the same silence.
+            "example.com enable://abort disable://abortReq",
+            "example.com enable://abort disable://abortRes",
+        ] {
+            assert!(refuses(rules), "{rules}");
+        }
+        for rules in [
+            "",
+            "example.com enable://abort disable://abort",
+            "example.com enable://abortReq disable://abortReq",
+            // A different host's rule is a different host's rule.
+            "other.test enable://abort",
+        ] {
+            assert!(!refuses(rules), "{rules}");
+        }
+    }
+
+    /// `disable://tunnel` has no meaning anywhere else — upstream reads it only
+    /// as the last arm of these two predicates (`util/index.js:3900,:3912`), so
+    /// this is the one path on which it does anything at all.
+    #[test]
+    fn disable_tunnel_refuses_the_connection_and_disable_abort_calls_it_off() {
+        assert!(refuses("example.com disable://tunnel"));
+        assert!(!refuses("example.com disable://tunnel disable://abort"));
+        // Each predicate tests its own cancellation before it reaches the tunnel
+        // arm, so cancelling both named gates cancels that arm with them.
+        assert!(!refuses("example.com disable://tunnel disable://abortReq disable://abortRes"));
+    }
+
+    /// A connection has no path, so a path-scoped abort cannot match one — and
+    /// must not, or `example.com/api enable://abort` would take the whole host
+    /// off the air instead of one endpoint. The request inside still meets the
+    /// request-side gate.
+    #[test]
+    fn a_path_scoped_abort_leaves_the_tunnel_alone() {
+        assert!(!refuses("example.com/api enable://abort"));
+    }
+
+    /// A refused tunnel is a session, not a silence: whistle emits the request
+    /// event before the gate and marks the result `aborted`
+    /// (`_original/lib/tunnel.js:338,:31-36`), so the console shows what was
+    /// refused. Recording nothing would make an abort indistinguishable from a
+    /// rule that never fired.
+    #[test]
+    fn an_aborted_tunnel_is_recorded_rather_than_vanishing() {
+        let state = state_with("example.com enable://abort log://blocked");
+        assert!(tunnel_aborted(&state, "example.com", 443, peer()));
+        let sessions = state.sessions.lock().unwrap();
+        let session = sessions.front().expect("the refusal is recorded");
+        assert_eq!(session.method, "CONNECT");
+        assert_eq!(session.url, "https://example.com/");
+        assert_eq!(session.status, 0, "nothing answered");
+        assert_eq!(session.target, "aborted", "nothing was dialled");
+        assert_eq!(session.client_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(session.log, ["blocked"]);
+        assert!(
+            session.rules.iter().any(|op| op.protocol == "enable"),
+            "the rule that refused it is on the row"
+        );
+    }
+
+    /// A tunnel nobody refused is not recorded here at all — this gate exists to
+    /// stop connections, not to log every CONNECT twice.
+    #[test]
+    fn a_tunnel_no_rule_refuses_is_left_unrecorded() {
+        let state = state_with("example.com enable://abort");
+        assert!(!tunnel_aborted(&state, "other.test", 443, peer()));
+        assert!(state.sessions.lock().unwrap().is_empty());
+    }
+
+    /// Start a proxy on an ephemeral port with `rules` loaded.
+    pub(crate) async fn proxy_with(rules: &str) -> (Arc<AppState>, SocketAddr) {
+        let state = state_with(rules);
+        let (listener, addr) = bind(&state).await.expect("bind");
+        let serving = state.clone();
+        tokio::spawn(async move {
+            accept_loop(serving, listener, None).await.ok();
+        });
+        (state, addr)
+    }
+
+    /// End to end: the client's CONNECT is never answered. Upstream destroys the
+    /// socket (`_original/lib/tunnel.js:372-374,:748-750`) rather than refusing
+    /// with a status, and a status is what the whole feature is trying not to
+    /// produce — a `502` to a CONNECT is a *served* answer a client can report,
+    /// cache and retry against.
+    #[tokio::test]
+    async fn a_refused_connect_gets_no_reply_at_all() {
+        let (state, addr) = proxy_with("blocked.test enable://abort").await;
+
+        let mut refused = tokio::net::TcpStream::connect(addr).await.unwrap();
+        refused
+            .write_all(b"CONNECT blocked.test:443 HTTP/1.1\r\nHost: blocked.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        // A reset is an error rather than a clean EOF; both mean the same thing
+        // here, which is that nothing was written back.
+        refused.read_to_end(&mut got).await.ok();
+        assert!(
+            got.is_empty(),
+            "expected silence, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(state.sessions.lock().unwrap().len(), 1);
+
+        // And a tunnel no rule refuses is still acknowledged, so the gate is
+        // refusing connections rather than the CONNECT handler being broken.
+        let mut allowed = tokio::net::TcpStream::connect(addr).await.unwrap();
+        allowed
+            .write_all(b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0u8; 12];
+        allowed.read_exact(&mut head).await.expect("a CONNECT reply");
+        assert_eq!(&head, b"HTTP/1.1 200");
+    }
 }
 
 /// Serve HTTP over an intercepted tunnel stream, optionally TLS-decrypting first.
@@ -3649,6 +3905,39 @@ async fn serve_upgrade(
     if target.proxy.is_some() {
         target_desc.push_str(" (via proxy)");
     }
+
+    // `enable://abort` / `abortRes` on an upgrade: the handshake went out, the
+    // server answered it, and the client is cut off instead of being handed the
+    // `101` (`_original/lib/https/index.js:783-786`). `abortReq` needs nothing
+    // here — an upgrade is an ordinary request until this function is called,
+    // and it has already passed the request-side gate in [`serve`], which is
+    // where upstream's WebSocket path puts it too (`https/index.js:256-259`).
+    //
+    // Upstream waits out `resDelay://` before this gate; this port has no
+    // response phase on the upgrade path at all, so there is nothing to wait
+    // for and nothing to re-resolve — `resolved` is the request pass.
+    if apply::aborts_response(resolved) {
+        tracing::info!("{} {} -> upgrade aborted", info.method, info.full_url);
+        // The head that is being thrown away is still recorded, for the reason
+        // the HTTP gate records one: a session that shows nothing coming back
+        // reads as if the server never answered, and it did.
+        state.record(Session {
+            id: 0,
+            time_ms,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            status: resp.status().as_u16(),
+            client_ip,
+            target: format!("{target_desc} (aborted)"),
+            duration_ms: started.elapsed().as_millis(),
+            log: log_labels(resolved),
+            rules: matched_ops(resolved),
+            res_headers: header_pairs(resp.headers()),
+            ..Default::default()
+        });
+        return Err(Destroyed.into());
+    }
+
     let session_id = state.record(Session {
         id: 0,
         time_ms,
@@ -3708,6 +3997,149 @@ async fn serve_upgrade(
 
     // Relay the 101 (with Sec-WebSocket-Accept etc.) so the client handshake completes.
     Ok(Response::from_parts(p, body::empty()))
+}
+
+#[cfg(test)]
+mod upgrade_abort_tests {
+    use super::tunnel_abort_tests::proxy_with;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An origin that answers anything with a WebSocket `101` and then holds the
+    /// connection open, so the proxy sees a live upgrade rather than a hang-up.
+    async fn upgrading_origin() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // However much of the handshake arrives, the answer is the
+                    // same — this origin agrees to every upgrade.
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    sock.write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\n\
+                          Upgrade: websocket\r\n\
+                          Connection: Upgrade\r\n\
+                          Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                    )
+                    .await
+                    .ok();
+                    // Then hold the socket open until the other end lets go.
+                    let _ = sock.read(&mut buf).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Open a WebSocket handshake for `path` through the proxy at `addr` and
+    /// return everything the proxy writes back.
+    async fn handshake_through(addr: SocketAddr, origin: SocketAddr, path: &str) -> Vec<u8> {
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET http://{origin}{path} HTTP/1.1\r\n\
+             Host: {origin}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        // One read: it returns as soon as a response head arrives, and returns
+        // nothing when the connection is torn down instead — a reset is an error
+        // rather than an EOF, and both mean the same thing here. Reading to EOF
+        // would mean waiting out the tunnel that a *relayed* upgrade opens.
+        let mut got = vec![0u8; 1024];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut got))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        got.truncate(read);
+        got
+    }
+
+    /// `enable://abortRes` on an upgrade lets the handshake reach the server and
+    /// then cuts the client off instead of handing it the `101`
+    /// (`_original/lib/https/index.js:783-786`). The client must not see the
+    /// switch, or it would start speaking WebSocket into a closed socket.
+    #[tokio::test]
+    async fn an_aborted_upgrade_never_reaches_the_client() {
+        let origin = upgrading_origin().await;
+        let (state, addr) = proxy_with(&format!("{origin} enable://abortRes")).await;
+
+        let got = handshake_through(addr, origin, "/ws").await;
+        assert!(
+            !got.starts_with(b"HTTP/1.1 101"),
+            "the switch must not be relayed, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert!(
+            got.is_empty(),
+            "and nothing else is served in its place, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+
+        // The head that was thrown away is still on the row, so the session
+        // reads as "the server answered and the client was cut off" rather than
+        // "nothing came back".
+        let sessions = state.sessions.lock().unwrap();
+        let session = sessions.front().expect("the abort is recorded");
+        assert_eq!(session.status, 101);
+        assert!(
+            session.target.ends_with("(aborted)"),
+            "target was {:?}",
+            session.target
+        );
+    }
+
+    /// `enable://abortReq` on an upgrade needs no gate of its own: an upgrade is
+    /// an ordinary request right up to the point the handshake is forwarded, so
+    /// it meets the request-side gate first — which is exactly where upstream's
+    /// WebSocket path puts it (`_original/lib/https/index.js:256-259`). The
+    /// origin is never contacted, and the proof is that an origin which cannot
+    /// be reached at all makes no difference to what the client sees.
+    #[tokio::test]
+    async fn an_upgrade_aborted_before_it_leaves_never_reaches_the_origin() {
+        // A port bound only long enough to know nothing else has it.
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+
+        let (_state, addr) = proxy_with(&format!("{dead} enable://abortReq")).await;
+        let got = handshake_through(addr, dead, "/ws").await;
+        assert!(
+            got.is_empty(),
+            "expected silence, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+
+        // Without the rule the same unreachable origin produces a `502`, so the
+        // silence above is the abort and not the dial failing.
+        let (_state, addr) = proxy_with("other.test enable://abortReq").await;
+        let got = handshake_through(addr, dead, "/ws").await;
+        assert!(
+            got.starts_with(b"HTTP/1.1 502"),
+            "expected a gateway error, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    /// The control: the same proxy relays an upgrade no rule aborts, so the
+    /// gate is refusing responses rather than the upgrade path being broken.
+    #[tokio::test]
+    async fn an_upgrade_no_rule_aborts_is_relayed() {
+        let origin = upgrading_origin().await;
+        let (_state, addr) = proxy_with("other.test enable://abortRes").await;
+        let got = handshake_through(addr, origin, "/ws").await;
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "expected the switch, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
 }
 
 /// Append a captured body to a file (`reqWrite`/`resWrite`). Best-effort.
