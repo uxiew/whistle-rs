@@ -75,6 +75,9 @@ The operators worth knowing before the rest are
   [`$` important](#--important-patterns)
 - [Operators](#operators)
   - [Where the pattern sits](#where-the-pattern-sits) · [Shorthands](#shorthands)
+  - [What an operator's value can be](#what-an-operators-value-can-be) —
+    [read from a file or a URL](#values-read-from-a-file-or-a-url) ·
+    [backtick templates](#backtick-templates)
   - [Destination](#destination) — [forwarding to another URL](#forwarding-to-another-url)
   - [Upstream proxy](#upstream-proxy) — [PAC](#pac)
   - [URL rewriting](#url-rewriting) — [where `params://` lands](#where-params-lands)
@@ -321,6 +324,155 @@ token with a `scheme://` is never it, and a **bare IP address** is never it eith
 | `127.0.0.1` | `host://127.0.0.1` |
 | `/abs/path` · `~/f` · `./f` | `file:///abs/path` … |
 | any other URL | a destination — see below |
+
+### What an operator's value can be
+
+`protocol://value` — and `value` is not always the text you wrote. Six
+spellings, resolved in this order:
+
+| You write | The value becomes |
+|-----------|-------------------|
+| `resBody://patched` | the text `patched` |
+| `resBody://(patched)` | the text `patched` — the explicit "this **is** content" form (`getValue`, `_original/lib/rules/rules.js:271-287`), and the only way to write text that would otherwise read as a path |
+| `resBody://{mock}` | the whole content of the value named `mock` |
+| `resHeaders://x-v=${mock}` | `x-v=` followed by that content |
+| `resBody:///tmp/mock.json`<br>`resBody://https://cdn.test/mock.json` | the **contents of that file or that URL** — see below |
+| ``resHeaders://`x-m=${method}` `` | rendered against the request — see [Backtick templates](#backtick-templates) |
+
+Remember that tokens are whitespace-separated, so none of these may contain a
+space. That is what the values store is for.
+
+#### Values read from a file or a URL
+
+Some operators take a *location* rather than a value. `readRuleValue`
+(`_original/lib/util/index.js:1189-1213`) reads it before the operator is
+applied, so the operator sees the file's contents:
+
+```
+example.com   reqHeaders:///etc/whistle/headers.json    # {"x-env":"staging"}
+example.com   resBody://https://cdn.test/mock.json      # fetched per request
+example.com   resBody://~/mock/a.html|~/mock/b.html     # both, CRLF-joined
+```
+
+**Which operators.** Two families, because upstream feeds them through two
+different readers:
+
+| Family | Operators | A value that is neither `{json}` nor `k=v` pairs |
+|--------|-----------|--------------------------------------------------|
+| JSON-valued (`parseRuleJson`, `_original/lib/inspectors/req.js:463-472`, `res.js:830-841`) | `reqHeaders`, `resHeaders`, `reqCookies`, `resCookies`, `reqCors`, `resCors`, `reqReplace`, `resReplace`, `urlReplace`, `params`, `urlParams`, `resMerge`, `trailers`, `auth`, `cipher` | is a location |
+| Text-valued (`getRuleValue`, `req.js:545-548`, `res.js:984`) | `reqBody`, `resBody`, `reqPrepend`, `resPrepend`, `reqAppend`, `resAppend`, `htmlBody`, `htmlPrepend`, `htmlAppend` | is a location |
+| Text-valued, **file only** | `jsBody`, `jsPrepend`, `jsAppend`, `cssBody`, `cssPrepend`, `cssAppend` | a path is a location; a URL is not |
+
+The last row is upstream's own split, not a simplification: `readRuleValue`'s
+`checkUrl` argument is set for exactly the `js*`/`css*` families
+(`util/index.js:1339`), so on an **HTML** response a URL there stays a URL and
+becomes `<script src=…>` / `<link rel=stylesheet>`, while on a JS or CSS response
+the same URL is fetched and inlined. whistle-rs reads values in the request
+phase, before there is a response to classify, so it keeps the HTML meaning —
+which is the documented one — and never fetches for those six.
+
+**What counts as a location.** An `http://` or `https://` URL, or a path that
+starts at the root (`/tmp/x`), the home directory (`~/x`, also the full-width
+`～/x`), a Windows drive (`C:\x`), or an explicit `./` / `../`.
+
+> **Deliberately narrower than upstream.** whistle has no shape test: for the
+> text operators *every* non-inline value is a path, and a bare
+> `resBody://patched` is a read of `./patched` — relative to the rules file's
+> root (`rule.root`, which only exists for rules a plugin or an `@`-include
+> brought in) or else to whistle's own working directory. It fails, and the
+> operator quietly sets an **empty** body. whistle-rs has no `rule.root`, and a
+> path relative to the proxy's working directory is not something a rules file
+> can rely on, so a bare value stays the literal this document already
+> describes. Every spelling that *works* upstream still loads.
+>
+> For the JSON operators there is one more narrowing: a value containing `=` is
+> read as pairs and never as a path, so `urlReplace:///api/v1=/api/v2` costs no
+> filesystem call. Upstream reaches the same result by the long road — it reads
+> the path, gets nothing, and falls back to parsing the matcher as a query
+> string (`tryParseMatcher`, `util/index.js:1165-1171,:1303`). The difference
+> only shows for a file whose name contains an `=`.
+
+**Details that matter:**
+
+- `a|b|c` **concatenates**, CRLF-joined, missing entries dropping out
+  (`readFileText`, `_original/lib/util/file-mgr.js:96-102,:157-166`). This is
+  *not* the first-one-wins of a `file://` rule, which serves whichever exists.
+- The path is percent-decoded and anything after a `?` or `#` is cut
+  (`decodePath`, `util/index.js:1403-1418`).
+- A path with a `..` segment is refused outright, as `joinPath` refuses it.
+- A file is read through the same mtime-keyed cache as `file://`: every request
+  still `stat`s it, so editing a mock takes effect immediately.
+- A **URL** is fetched on every matching request — upstream does not cache these
+  either — with a 16-second deadline (`TIMEOUT`,
+  `_original/lib/util/http-mgr.js:14`) and a 256 KB ceiling (`MAX_URL_VAL_LEN`,
+  `lib/plugins/index.js:1497`). A non-200, a timeout, or an oversized body is a
+  failure. Put the content in a file if you do not want an outbound call per
+  request.
+- The content becomes a **string**, so a binary mock body has to go through
+  `file://` instead.
+- `(inline)` and a whole-value `{name}` are content already and are never read
+  (`if (rule.value)`, `util/index.js:1177-1179`).
+
+**When the read fails**, the two families part company, and both halves are
+upstream's:
+
+- A **JSON-valued** operator keeps its value as written, because upstream's
+  `tryParseMatcher` fallback parses the matcher as a query string once the read
+  comes back empty — so a rule that never asked for this feature cannot be
+  broken by it. A line is logged at `warn`.
+- A **text-valued** operator becomes **empty**. It deliberately does not fall
+  back to the text: that text is a path, and a path must never reach an origin
+  as a request body.
+
+#### Backtick templates
+
+An operator value wrapped **entirely** in backticks is a template, rendered
+against the request before anything else looks at it (`renderTpl`,
+`_original/lib/rules/rules.js:762-772`):
+
+```
+example.com   reqHeaders://`x-method=${method}&x-when=${now}`
+example.com   resHeaders://`x-status=${statusCode}`
+example.com   redirect://`https://b.com${path}`
+```
+
+The variables are the same closed whitelist `tpl://` files use — one
+implementation, so a rule value and a template file can never disagree about
+what `${query.id}` means. See [`TEMPLATES.md`](TEMPLATES.md) for the table,
+the `.key` subpaths, `${{var}}` URI-encoding and the `.replace(a,b)` modifier.
+
+Two differences from a `tpl://` file, both upstream's:
+
+- **only** the `${var}` pass runs. There is no `{name}` query-string
+  interpolation and no "the text must contain `{…}`" gate — those belong to the
+  file handler (`file-proxy.js:15,360`), not to `resolveTplVar`.
+- the whole value must be backticked. ``reqHeaders://x=`${method}` `` is not a
+  template; the backticks are two literal characters.
+
+**The subtle one.** When the value *was* a backtick template, whatever the
+[values store](#flags-includes--values) returns for a `${name}` inside it is
+rendered too (`rule.isTpl && key ? resolveTplVar(key, req) : key`,
+`rules.js:779`):
+
+```
+# values: greeting = x-hello=${method}
+example.com   reqHeaders://`${greeting}`     # → x-hello=GET
+example.com   reqHeaders://${greeting}       # → x-hello=${method}, sent literally
+```
+
+That is the only way a stored value ever sees the request: it is written once
+and reused by every rule that names it, so the backticks on the *rule* line are
+what say "render what this expands to".
+
+`log://` and `weinre://` opt out at parse time upstream (`rule.isTpl = false`,
+`rules.js:1357-1359`) — their values name a channel, and a backtick in one is a
+backtick.
+
+A backtick value on a **response-phase** operator (`resHeaders://`, `resBody://`,
+`trailers://`, …) renders with the response head in hand, so `${statusCode}`,
+`${resHeaders.x}`, `${resCookies.x}`, `${serverIp}` and `${serverPort}` answer
+there. On a `tpl://` file they are still empty, because a template short-circuits
+before any origin replies.
 
 ### Destination
 
@@ -1215,8 +1367,10 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 | `rulesFile` | file path | Include rules from a file and apply them too. Also spelled `reqRules://`, `ruleFile://`, `ruleScript://`, `rulesScript://`, `reqScript://` — see below |
 | `pipe` | plugin name | Route through a registered server (like `plugin`) |
 
-`{name}` anywhere in an operator value is replaced with the content of the named value
-(from `--value name=…` or the console's Values pane).
+`{name}` as a **whole** operator value, and `${name}` anywhere inside one, are
+replaced with the content of the named value (from `--value name=…` or the
+console's Values pane) — see
+[What an operator's value can be](#what-an-operators-value-can-be).
 
 `disable://` takes one or more flags, `|`-separated. They strip something from
 the request on its way out, or from the response on its way back:
@@ -1591,10 +1745,10 @@ header has nowhere to put attributes, and upstream drops them here too.
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `reqBody` / `resBody` | replacement text | Replace the entire body |
+| `reqBody` / `resBody` | replacement text, or a file/URL holding it | Replace the entire body |
 | `reqReplace` / `resReplace` | `from=to` pairs, `&`-separated | Substitute inside the body |
-| `reqPrepend` / `resPrepend` | text | Insert at the start of the body |
-| `reqAppend` / `resAppend` | text | Insert at the end of the body |
+| `reqPrepend` / `resPrepend` | text, or a file/URL holding it | Insert at the start of the body |
+| `reqAppend` / `resAppend` | text, or a file/URL holding it | Insert at the end of the body |
 | `resMerge` | `{json}` | Deep-merge a patch into a JSON response body |
 | `cssBody`/`cssPrepend`/`cssAppend` | CSS, or a URL | CSS to add to a **CSS or HTML** response |
 | `htmlBody`/`htmlPrepend`/`htmlAppend` | markup | Markup to add to an HTML response |
@@ -1636,6 +1790,11 @@ rather than being given one it never asked for.
 Every operator in this table accumulates: writing the same one on several
 matching lines makes them all contribute, joined per family — see
 [How several lines of one operator combine](#how-several-lines-of-one-operator-combine).
+
+A value that names a **file or a URL** is read before the operator applies (see
+[Values read from a file or a URL](#values-read-from-a-file-or-a-url)) — which is
+also why a URL on `jsAppend`/`cssAppend` still means `<script src>` here and is
+never fetched.
 
 ```
 api.example.com/echo   reqBody://{"mocked":true}
@@ -1854,7 +2013,10 @@ resolve (so mixed rule files load) but have no distinct effect.
 
 **Rule-file features:** a line `@<url>` or `@<file>` includes rules fetched/read from
 that source at load time; `${port}` and `${version}` in operator values are substituted
-(case-insensitive); `locationHref://` injects a client-side redirect into HTML responses.
+(case-insensitive); an operator value that names a file or a URL is
+[read before the operator applies](#values-read-from-a-file-or-a-url), and one
+wrapped in backticks is [rendered against the request](#backtick-templates);
+`locationHref://` injects a client-side redirect into HTML responses.
 
 **Alias operators** are normalised to their canonical form, so all of these work too:
 `hosts→host`, `xhost→host` (same operator, but the `x` spelling also falls back — see

@@ -71,6 +71,11 @@ URL 里**没有** `?` 时第一遍整个跳过，但**第二遍照常执行**。
 
 变量名是一个**封闭白名单**，不在表内的名字原样保留。
 
+> 这一遍就是上游的 `resolveTplVar`（`rules.js:715-758`），它还有第二个调用点：
+> 整值加反引号的**算子取值**（`renderTpl`，`rules.js:762-772`）。那条路径**只跑第二遍**
+> —— 没有第一遍的查询串插值，也没有上面那个 `{…}` 开关，两者都属于文件处理器而不属于
+> 变量层。写法见 [`RULES.md` 的反引号模板](RULES.md#backtick-templates)。
+
 | 写法 | 含义 |
 |------|------|
 | `${var}` | 普通替换 |
@@ -144,11 +149,29 @@ URI 编码**之前**生效。
 > （`resolveVarValue`，`_original/lib/rules/rules.js:657-668`），
 > 想要请求的主机名请用 `${url.hostname}`。
 
-### 解析为空字符串
+### 响应侧变量：`tpl://` 里为空，反引号算子里不为空
 
-`tpl://` 在**上游响应产生之前**就短路了，所以响应侧的变量必然为空 —— 返回空串而非留下占位符，与上游一致：
+`${statusCode}`、`${serverIp}`、`${serverPort}`、`${resHeaders.*}`（别名 `resH`）、
+`${resCookies.*}`、`${clientPort}`
 
-`${statusCode}`、`${serverIp}`、`${serverPort}`、`${resHeaders.*}`、`${resCookies.*}`、`${id}` / `${reqId}`、`${clientId}`、`${clientPort}`、`${remoteAddress}`、`${remotePort}`、`${realUrl}`
+这几个读的是**响应头**（上游在响应规则求值前把它们盖到 request 对象上，
+`_original/lib/inspectors/res.js:802-806`）。`tpl://` 在上游响应产生之前就短路了，
+所以在模板文件里它们必然为空 —— 返回空串而非留下占位符，与上游一致。
+
+但同一套变量还有第二个调用点：[反引号算子取值](RULES.md#backtick-templates)。
+写在响应期算子上时响应头已经在手，于是它们**会**求出值：
+
+```
+example.com   resHeaders://`x-upstream=${serverIp}:${serverPort}&x-code=${statusCode}`
+```
+
+`${resCookies.<名>}` 给出该 cookie 的**值**；属性（`domain`、`path`、`max-age` …）
+一律为空 —— 上游为它们建了对象却从不存入（`rules.js:504-538`），只有 `.value` 是
+存下来的那个属性。名字叫 `path` 的 cookie 同样取不到，上游也取不到。
+
+**仍然恒为空**（本移植没有对应的数据源，与上游字段未设置时的 `''` 同值）：
+
+`${id}` / `${reqId}`、`${clientId}`、`${remoteAddress}`、`${remotePort}`、`${realUrl}`
 
 ### 未实现（原样保留）
 
@@ -278,7 +301,7 @@ Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写
 | 上游行为 | 现状 |
 |----------|------|
 | 路径先 `decodeURIComponent`，并截掉 `?`/`#` 之后的部分（`decodePath`，`util/index.js:1403-1418`） | 未实现。上游需要它是因为目录规则会把请求路径拼到值后面，whistle-rs 不拼；代价是 `file:///tmp/a%20b.json` 这种写法目前不会解码 |
-| 从 values 存储 / 远程 URL / 插件 key 解析文件 | 未实现 |
+| 文件族的值从**远程 URL** / 插件 key 解析 | 未实现。**算子取值**这一侧已支持（见 [`RULES.md`](RULES.md#values-read-from-a-file-or-a-url)），但 `file://` 一族走的是上游另一条路（`getRuleFiles`，`util/index.js:1420-1444`），仍只认本地路径。values 存储引用（`file://{name}`）一直是支持的，见本文末尾 |
 | `file://` 的 Range 请求（206 + `content-range`，`file-proxy.js:102,166-176`） | 未实现，整份文件以 200 返回。Range 是可选的，客户端会自行处理；另外上游 `parseRange` 对 `bytes=-500` 这类后缀区间算错（`util/index.js:3364-3368`），复刻与否都需要额外决策 |
 | `rawfile://` 的**内联值**形式会删掉 `content-encoding`（`file-proxy.js:71-73`） | 无法触发：whistle-rs 的规则解析器不支持 `<...>` 内联值，文件族的值永远是路径 |
 
