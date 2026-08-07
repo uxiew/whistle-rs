@@ -10,6 +10,7 @@ pub mod body;
 pub mod coding;
 pub mod dest;
 pub mod persist;
+pub mod restream;
 pub mod script;
 pub mod sni;
 pub mod socks;
