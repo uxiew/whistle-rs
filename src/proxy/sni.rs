@@ -376,7 +376,7 @@ pub async fn decide(
     }
 }
 
-/// The facts a rule can match on at SNI time.
+/// The facts a rule can match on about a connection, before any request in it.
 ///
 /// There is no request yet, so most of a [`ReqInfo`](crate::rules::ReqInfo) is
 /// genuinely unknown and is left that way rather than invented: no method (so
@@ -387,7 +387,13 @@ pub async fn decide(
 /// Upstream matches on less — it resolves against a socket carrying only
 /// `fullUrl = 'https://' + servername` (`lib/https/index.js:1294`) — so a
 /// `clientIp:` condition on an `sniCallback` line works here and does not there.
-fn connection_req_info(
+///
+/// Two stages read it, and it is deliberately one definition: this one, where
+/// the name comes from the ClientHello, and the connection's abort gate
+/// ([`super::tunnel_aborted`]), where nothing has been read yet and the name is
+/// the address the client asked to reach. A rule that decides one should decide
+/// the other the same way.
+pub(super) fn connection_req_info(
     servername: &str,
     port: u16,
     peer: SocketAddr,
@@ -437,6 +443,11 @@ fn parse_rule(value: &str) -> Option<(String, String)> {
 /// What a relayed connection does *not* get is anything that would require
 /// reading it: no capture, no request rules, no response phase. There is no
 /// request here — only bytes we agreed not to look at.
+///
+/// `enable://abort` is not missing from that list: a connection the rules refuse
+/// never gets this far, having been turned away at the CONNECT or the SOCKS
+/// handshake, before the client was told anything was open — see
+/// [`super::tunnel_aborted`].
 pub async fn relay<S>(mut client: Prefixed<S>, target: &upstream::Target) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,

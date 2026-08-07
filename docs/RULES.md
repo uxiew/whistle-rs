@@ -1242,6 +1242,10 @@ the request on its way out, or from the response on its way back:
 | `trailerHeader` | sends the trailers without the `Trailer:` header announcing them |
 | `doctype` | no `<!DOCTYPE html>` before an HTML prepend |
 
+`disable://tunnel` belongs to neither table: it strips nothing, it refuses the
+connection — see
+[Aborting a connection rather than a request](#aborting-a-connection-rather-than-a-request).
+
 A flag this port does not recognise is **inert** — it parses and does nothing,
 rather than failing the rule.
 
@@ -1330,6 +1334,43 @@ then cut the client off" without changing what the origin sees.
 
 > Upstream also arms these from a `filter://abort` line; in whistle-rs `filter://`
 > is only a match condition, so `enable://` is the whole vocabulary here.
+
+#### Aborting a connection rather than a request
+
+A `CONNECT` tunnel and an inbound SOCKS connection have no response of their own
+to destroy, so the abort lands on the connection itself, and lands **before the
+client is told the connection is open**: the `CONNECT` is never answered at all,
+and the SOCKS request comes back *connection not allowed by ruleset*. Upstream
+destroys the same socket from either gate (`_original/lib/tunnel.js:372-374`,
+`:748-750`) and opens its SOCKS connections by issuing a `CONNECT` against its
+own port, so a refused tunnel denies the SOCKS client (`lib/index.js:174-193`).
+
+The two spellings collapse into one here. whistle-rs acknowledges a `CONNECT`
+before it can know where the bytes will go, so `abortRes` cannot let the origin
+be dialled first the way it does on the request path — both spellings produce the
+same silence. Everything else holds, `disable://abort` included.
+
+A connection carries no path and no headers, so a line can refuse one only on
+what is known before any request — the address and the client:
+
+```
+blocked.test         enable://abort   # the tunnel is refused
+example.com/api      enable://abort   # the tunnel is carried; the request inside is not
+```
+
+`disable://tunnel` refuses a connection too, and does nothing anywhere else:
+upstream reads that flag only here (`_original/lib/util/index.js:3900,:3912`),
+and `disable://abort` calls it off exactly as it calls off the other two.
+
+A refused connection is still a session. It appears in the console as a `CONNECT`
+with no status, so an abort looks like an abort rather than like a client that
+hung up.
+
+On a **WebSocket** the two gates stay apart, because an upgrade does have a
+response of its own: `abortReq` fires before the handshake leaves — an upgrade is
+an ordinary request until then — and `abortRes` fires once the server's `101` has
+arrived, instead of relaying it (`_original/lib/https/index.js:256-259,:783-786`).
+So the server has served the handshake and the client never sees the switch.
 
 #### How several `rulesFile://` lines combine
 
