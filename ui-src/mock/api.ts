@@ -19,6 +19,19 @@ interface MockRule {
   raw: string;
 }
 
+/**
+ * A captured body. `binary` says `text` is a `[binary, N bytes]` marker, and
+ * `base64` carries what `/body.bin` would hand over for it — the mock's stand-in
+ * for the bytes the proxy keeps in its capture.
+ */
+interface MockBody {
+  len: number;
+  truncated: boolean;
+  text: string;
+  binary: boolean;
+  base64?: string;
+}
+
 interface MockSession {
   id: number;
   time_ms: number;
@@ -32,9 +45,28 @@ interface MockSession {
   rules?: MockRule[];
   req_headers: [string, string][];
   res_headers: [string, string][];
-  req_body?: { len: number; truncated: boolean; text: string };
-  res_body?: { len: number; truncated: boolean; text: string };
+  req_body?: MockBody;
+  res_body?: MockBody;
 }
+
+/** A text body, which is what most of the fixture is. */
+const text = (s: string, truncated = false, len = s.length): MockBody => ({
+  len,
+  truncated,
+  text: s,
+  binary: false,
+});
+
+/** A body the proxy judged non-textual: a marker, and the bytes behind it. */
+const binary = (base64: string, truncated = false): MockBody => {
+  const len = Buffer.from(base64, 'base64').length;
+  return { len, truncated, text: `[binary, ${len} bytes]`, binary: true, base64 };
+};
+
+/** A 32×32 checkerboard PNG — small enough to inline, big enough to look at. */
+const PNG_32 =
+  'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAOUlEQVR42mN44GGHFenn38aKSFXPMGr' +
+  'BqAVDwAJqGYRL/agFoxYMBQtGi4pRC0YtGK0PRi0YtQCIAOJfvkzE9IskAAAAAElFTkSuQmCC';
 
 /** `protocol://value` split the way the proxy records it, plus what was typed. */
 const rule = (spelled: string, raw = spelled): MockRule => {
@@ -69,7 +101,7 @@ function session(over: Partial<MockSession> & { id: number }): MockSession {
       ['server', 'nginx/1.25.3'],
       ['content-length', String(JSON_RES.length)],
     ],
-    res_body: { len: JSON_RES.length, truncated: false, text: JSON_RES },
+    res_body: text(JSON_RES),
     ...over,
   };
 }
@@ -99,7 +131,7 @@ const FIXTURE: MockSession[] = [
       ['content-length', '38'],
       ['x-tenant', 'acme'],
     ],
-    req_body: { len: 38, truncated: false, text: '{"name":"third","tags":["a","b"]}' },
+    req_body: text('{"name":"third","tags":["a","b"]}', false, 38),
   }),
   session({
     id: 3,
@@ -111,11 +143,11 @@ const FIXTURE: MockSession[] = [
       ['content-encoding', 'gzip'],
       ['server', 'cloudfront'],
     ],
-    res_body: {
-      len: 262144,
-      truncated: true,
-      text: '(function(){"use strict";var t=document.createElement("div");t.id="app";',
-    },
+    res_body: text(
+      '(function(){"use strict";var t=document.createElement("div");t.id="app";',
+      true,
+      262144,
+    ),
   }),
   session({ id: 4, url: 'https://example.com/favicon.ico', status: 404, duration_ms: 12 }),
   session({
@@ -130,7 +162,7 @@ const FIXTURE: MockSession[] = [
     // phase — the case where reading `Resolved` too early would report nothing.
     rules: [rule('log://errors'), rule('resDelay://800')],
     res_headers: [['content-type', 'text/html']],
-    res_body: { len: 92, truncated: false, text: '<html><body><h1>500 Internal Server Error</h1></body></html>' },
+    res_body: text('<html><body><h1>500 Internal Server Error</h1></body></html>', false, 92),
   }),
   session({
     id: 6,
@@ -162,7 +194,7 @@ const FIXTURE: MockSession[] = [
     target: 'localhost:5173',
     duration_ms: 3,
     res_headers: [['content-type', 'text/javascript']],
-    res_body: { len: 41, truncated: false, text: 'import { createHotContext } from "/@vite";' },
+    res_body: text('import { createHotContext } from "/@vite";', false, 41),
   }),
   session({
     id: 9,
@@ -181,6 +213,29 @@ const FIXTURE: MockSession[] = [
     duration_ms: 19,
     res_headers: [['location', 'https://example.com/short']],
     res_body: undefined,
+  }),
+  // An image, so the body panel's image preview, hex view and download have
+  // something real to work on without a proxy in front of them.
+  session({
+    id: 11,
+    url: 'https://cdn.example.com/assets/check.png',
+    target: 'cdn.example.com:443',
+    duration_ms: 27,
+    res_headers: [
+      ['content-type', 'image/png'],
+      ['cache-control', 'max-age=31536000'],
+    ],
+    res_body: binary(PNG_32),
+  }),
+  // And a binary body that is *not* an image, and is truncated as well: the
+  // hex view has to cope with both, and the download must not claim to be whole.
+  session({
+    id: 12,
+    url: 'https://cdn.example.com/fonts/inter.woff2',
+    target: 'cdn.example.com:443',
+    duration_ms: 88,
+    res_headers: [['content-type', 'font/woff2']],
+    res_body: { ...binary(PNG_32, true), len: 74216 },
   }),
 ];
 
@@ -251,14 +306,23 @@ const summary = (s: MockSession) => ({
   has_res_body: !!s.res_body?.len,
 });
 
-/** The Rust side skips empty collections; the UI has to cope, so the mock does too. */
-const detail = (s: MockSession) => ({
-  ...summary(s),
-  ...(s.req_headers.length ? { req_headers: s.req_headers } : {}),
-  ...(s.res_headers.length ? { res_headers: s.res_headers } : {}),
-  ...(s.req_body ? { req_body: s.req_body } : {}),
-  ...(s.res_body ? { res_body: s.res_body } : {}),
-});
+/**
+ * The Rust side skips empty collections; the UI has to cope, so the mock does
+ * too. `base64` is dropped here for the same reason the proxy never puts bytes
+ * in `/session.json`: they are fetched from `/body.bin`, by the one panel that
+ * wants them.
+ */
+const detail = (s: MockSession) => {
+  const capture = (b: MockBody | undefined) =>
+    b && { len: b.len, truncated: b.truncated, text: b.text, binary: b.binary };
+  return {
+    ...summary(s),
+    ...(s.req_headers.length ? { req_headers: s.req_headers } : {}),
+    ...(s.res_headers.length ? { res_headers: s.res_headers } : {}),
+    ...(s.req_body ? { req_body: capture(s.req_body) } : {}),
+    ...(s.res_body ? { res_body: capture(s.res_body) } : {}),
+  };
+};
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
@@ -297,6 +361,31 @@ export function mockApi(): Plugin {
       case '/session.json': {
         const s = sessions.find((x) => x.id === id);
         return reply(s ? detail(s) : null);
+      }
+      case '/body.bin': {
+        // The bytes of one body, as `session_body_bytes` serves them: always an
+        // attachment, always `nosniff`, and named `partial-` when the preview
+        // was capped.
+        const s = sessions.find((x) => x.id === id);
+        const side = url.searchParams.get('side') === 'req' ? 'req' : 'res';
+        const captured = side === 'req' ? s?.req_body : s?.res_body;
+        if (!s || !captured) {
+          res.statusCode = 404;
+          return res.end('not found');
+        }
+        const bytes = captured.base64
+          ? Buffer.from(captured.base64, 'base64')
+          : Buffer.from(captured.text);
+        const headers = side === 'req' ? s.req_headers : s.res_headers;
+        const type = headers.find((h) => h[0] === 'content-type')?.[1] || 'application/octet-stream';
+        const tail = s.url.split(/[?#]/)[0].split('/').pop() || `session-${s.id}-${side}.bin`;
+        res.setHeader('Content-Type', type);
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${captured.truncated ? 'partial-' : ''}${tail}"`,
+        );
+        return setTimeout(() => res.end(bytes), 60);
       }
       case '/frames.json':
         return reply(FRAMES.filter((f) => f.session === id).slice().reverse());

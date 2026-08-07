@@ -50,6 +50,23 @@ export interface BodyCapture {
   len: number;
   truncated: boolean;
   text: string;
+  /**
+   * `text` is a `[binary, N bytes]` marker rather than the body.
+   *
+   * The proxy's verdict, not one re-derived here: it applies the same rule when
+   * it decides whether to store the preview as text at all, and two copies of
+   * that rule would drift. The bytes themselves come from `/body.bin`.
+   */
+  binary: boolean;
+}
+
+/** The captured bytes of one body, as `/body.bin` hands them over. */
+export interface BodyBytes {
+  bytes: Uint8Array;
+  /** The Content-Type the proxy recorded, without its parameters. */
+  type: string;
+  /** What to call the file, as the proxy named it — `partial-` when capped. */
+  filename: string;
 }
 
 export type HeaderPair = [string, string];
@@ -163,9 +180,30 @@ async function postText<T>(url: string, text: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** The `filename="…"` of a `Content-Disposition`, if it carries one. */
+function dispositionName(header: string | null): string {
+  return /filename="([^"]*)"/.exec(header || '')?.[1] || 'body.bin';
+}
+
 export const api = {
   sessions: () => getJson<SessionSummary[]>('/sessions.json'),
   session: (id: number) => getJson<SessionDetail | null>(`/session.json?id=${id}`),
+  /**
+   * The captured body as bytes — what the hex view, the image preview and the
+   * download are all built from. Separate from `/session.json` on purpose: see
+   * `session_body_bytes` in `webui.rs`.
+   */
+  bodyBytes: async (id: number, side: 'req' | 'res'): Promise<BodyBytes> => {
+    const res = await fetch(`/body.bin?id=${id}&side=${side}`);
+    if (!res.ok) throw new Error(`/body.bin: ${res.status}`);
+    return {
+      bytes: new Uint8Array(await res.arrayBuffer()),
+      type: (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(),
+      // Named by the proxy rather than re-derived here, so the file a download
+      // produces and the file `curl` produces have the same name.
+      filename: dispositionName(res.headers.get('content-disposition')),
+    };
+  },
   frames: (id: number) => getJson<WsFrame[]>(`/frames.json?id=${id}`),
   clearSessions: () => postJson<OkResult>('/api/sessions/clear', {}),
   // The endpoint also takes `{ ids: [...] }` for a batch, which nothing calls:

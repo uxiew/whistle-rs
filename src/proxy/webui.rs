@@ -12,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use super::body::{self, DynBody};
-use super::{AppState, ReplayBody, Session, WsFrame};
+use super::{AppState, Capture, ReplayBody, Session, WsFrame};
 
 /// Route a direct (non-proxied) request to the UI / API.
 pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
@@ -27,8 +27,9 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         (_, "/rootCA.crt") | (_, "/rootca.crt") => root_ca(state),
         (_, "/proxy.pac") | (_, "/pac") => pac(state, &req),
         (_, "/sessions.json") => sessions_json(state),
-        (_, "/sessions.har") => sessions_har(state),
+        (_, "/sessions.har") => sessions_har(state, &req),
         (_, "/session.json") => session_detail_json(state, &req),
+        (_, "/body.bin") => session_body_bytes(state, &req),
         (_, "/frames.json") => frames_json(state, &req),
         ("GET", "/api/rules") => rules_get(state),
         ("POST", "/api/rules") => rules_post(state, req).await,
@@ -41,7 +42,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/rule-group/update") => rule_group_update(state, req).await,
         ("GET", "/api/rule-group") => rule_group_get(state, &req),
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
-        ("POST", "/api/sessions/clear") => sessions_clear(state),
+        ("POST", "/api/sessions/clear") => sessions_clear(state, req).await,
         ("GET", "/api/status") => status_json(state).await,
         ("GET", "/plugin") => redirect_to("/plugin/"),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
@@ -219,12 +220,35 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
         .unwrap()
 }
 
-/// Export captured traffic as a HAR 1.2 file (importable into DevTools etc.).
-fn sessions_har(state: &Arc<AppState>) -> Response<DynBody> {
-    let sessions: Vec<Session> = {
-        let q = state.sessions.lock().unwrap();
-        q.iter().cloned().collect()
+/// A captured body as a HAR field carries it: `(size, text, base64)`.
+///
+/// A body that is not text goes out **base64-encoded**, which is what HAR 1.2
+/// defines `content.encoding` for. Until this did that, a binary body was
+/// exported as the console's own `[binary, N bytes]` marker, written into the
+/// `text` field where every tool that reads a HAR would take it for the body —
+/// a sentence delivered as if it were an image.
+///
+/// The same key is used on `postData`, which HAR 1.2 does not define it for. It
+/// is the least surprising extension available: a reader that ignores it still
+/// receives the body, recoverable, rather than a sentence that never was one.
+fn har_body(cap: Option<&Capture>) -> (usize, String, bool) {
+    let Some(cap) = cap else {
+        return (0, String::new(), false);
     };
+    let (len, _, text) = cap.snapshot();
+    if !cap.is_binary() {
+        return (len, text, false);
+    }
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        cap.preview_bytes().bytes,
+    );
+    (len, encoded, true)
+}
+
+/// One HAR 1.2 entry for one session. Separate from [`sessions_har`] so the
+/// shape can be asserted on without a proxy behind it.
+fn har_entry(s: &Session) -> serde_json::Value {
     let har_headers = |pairs: &[(String, String)]| -> Vec<serde_json::Value> {
         pairs
             .iter()
@@ -238,62 +262,75 @@ fn sessions_har(state: &Arc<AppState>) -> Response<DynBody> {
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "application/octet-stream".to_string())
     };
+    let encoding = |base64: bool| match base64 {
+        true => serde_json::json!("base64"),
+        false => serde_json::Value::Null,
+    };
 
-    let entries: Vec<serde_json::Value> = sessions
-        .iter()
-        .map(|s| {
-            let (req_len, _, req_text) = s
-                .req_body
-                .as_ref()
-                .map(|c| c.snapshot())
-                .unwrap_or((0, false, String::new()));
-            let (res_len, _, res_text) = s
-                .res_body
-                .as_ref()
-                .map(|c| c.snapshot())
-                .unwrap_or((0, false, String::new()));
-            let post_data = if req_len > 0 {
-                serde_json::json!({ "mimeType": mime_of(&s.req_headers), "text": req_text })
-            } else {
-                serde_json::Value::Null
-            };
-            serde_json::json!({
-                "startedDateTime": super::iso8601_utc(s.time_ms),
-                "time": s.duration_ms,
-                "request": {
-                    "method": s.method,
-                    "url": s.url,
-                    "httpVersion": "HTTP/1.1",
-                    "cookies": [],
-                    "headers": har_headers(&s.req_headers),
-                    "queryString": [],
-                    "postData": post_data,
-                    "headersSize": -1,
-                    "bodySize": req_len,
-                },
-                "response": {
-                    "status": s.status,
-                    "statusText": "",
-                    "httpVersion": "HTTP/1.1",
-                    "cookies": [],
-                    "headers": har_headers(&s.res_headers),
-                    "content": {
-                        "size": res_len,
-                        "mimeType": mime_of(&s.res_headers),
-                        "text": res_text,
-                    },
-                    "redirectURL": "",
-                    "headersSize": -1,
-                    "bodySize": res_len,
-                },
-                "cache": {},
-                "timings": { "send": 0, "wait": s.duration_ms, "receive": 0 },
-                "serverIPAddress": "",
-                "_target": s.target,
-                "_clientIp": s.client_ip,
-            })
+    let (req_len, req_text, req_b64) = har_body(s.req_body.as_ref());
+    let (res_len, res_text, res_b64) = har_body(s.res_body.as_ref());
+    let post_data = if req_len > 0 {
+        serde_json::json!({
+            "mimeType": mime_of(&s.req_headers),
+            "text": req_text,
+            "encoding": encoding(req_b64),
         })
-        .collect();
+    } else {
+        serde_json::Value::Null
+    };
+    serde_json::json!({
+        "startedDateTime": super::iso8601_utc(s.time_ms),
+        "time": s.duration_ms,
+        "request": {
+            "method": s.method,
+            "url": s.url,
+            "httpVersion": "HTTP/1.1",
+            "cookies": [],
+            "headers": har_headers(&s.req_headers),
+            "queryString": [],
+            "postData": post_data,
+            "headersSize": -1,
+            "bodySize": req_len,
+        },
+        "response": {
+            "status": s.status,
+            "statusText": "",
+            "httpVersion": "HTTP/1.1",
+            "cookies": [],
+            "headers": har_headers(&s.res_headers),
+            "content": {
+                "size": res_len,
+                "mimeType": mime_of(&s.res_headers),
+                "text": res_text,
+                "encoding": encoding(res_b64),
+            },
+            "redirectURL": "",
+            "headersSize": -1,
+            "bodySize": res_len,
+        },
+        "cache": {},
+        "timings": { "send": 0, "wait": s.duration_ms, "receive": 0 },
+        "serverIPAddress": "",
+        "_target": s.target,
+        "_clientIp": s.client_ip,
+    })
+}
+
+/// Export captured traffic as a HAR 1.2 file (importable into DevTools etc.).
+///
+/// `?ids=1,2,3` exports only those sessions, in the order the capture holds
+/// them — what the request table's multi-selection asks for. Without it the
+/// answer is everything, as before.
+fn sessions_har(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let wanted = id_list(req, "ids");
+    let sessions: Vec<Session> = {
+        let q = state.sessions.lock().unwrap();
+        q.iter()
+            .filter(|s| wanted.as_ref().is_none_or(|ids| ids.contains(&s.id)))
+            .cloned()
+            .collect()
+    };
+    let entries: Vec<serde_json::Value> = sessions.iter().map(har_entry).collect();
 
     let har = serde_json::json!({
         "log": {
@@ -334,6 +371,117 @@ fn session_detail_json(state: &Arc<AppState>, req: &Request<Incoming>) -> Respon
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(body)))
         .unwrap()
+}
+
+/// One query parameter, undecoded. Every caller here reads digits, a side name
+/// or a comma-separated id list, none of which percent-encoding reaches.
+fn query_param(req: &Request<Incoming>, name: &str) -> Option<String> {
+    req.uri().query().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+            .map(|v| v.to_string())
+    })
+}
+
+/// A `?name=1,2,3` session-id list. `None` when the parameter is absent, which
+/// every caller reads as "all of them" — an *empty* list is a selection of
+/// nothing and stays distinct from it.
+fn id_list(req: &Request<Incoming>, name: &str) -> Option<Vec<u64>> {
+    query_param(req, name)
+        .map(|v| v.split(',').filter_map(|id| id.trim().parse().ok()).collect())
+}
+
+/// The captured bytes of one body (`?id=N&side=req|res`).
+///
+/// The hex view, the image preview and the download all need the body as bytes,
+/// and until this route existed the console never saw them: a non-textual body
+/// was replaced by a `[binary, N bytes]` marker as it was serialized, so there
+/// was nothing behind the marker to render.
+///
+/// `/session.json` deliberately does not grow a base64 copy instead. It is
+/// fetched on every selection, and encoding two 16 KiB previews into it would be
+/// paid on every click, by everyone, to serve the small minority of bodies
+/// anyone opens as bytes. A HAR has no such choice — it is one file that has to
+/// carry everything — which is why [`har_body`] does base64 and this does not.
+///
+/// The response is **always** an attachment, whatever type was recorded. These
+/// bytes are whatever the inspected site sent, and they are served from the
+/// console's own origin: a captured `text/html` body rendered as a page here
+/// would be someone else's script with reach into `/api/rules`. An attachment
+/// is never rendered as a page, and `nosniff` stops the browser deciding the
+/// type for itself. Neither `fetch` nor `<img>` honours the disposition, and
+/// those are the only two ways the console reads this route.
+fn session_body_bytes(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let want: Option<u64> = query_param(req, "id").and_then(|v| v.parse().ok());
+    let side = query_param(req, "side").unwrap_or_else(|| "res".to_string());
+    let found: Option<Session> = want.and_then(|id| {
+        let q = state.sessions.lock().unwrap();
+        q.iter().find(|s| s.id == id).cloned()
+    });
+    let Some(sess) = found else {
+        return not_found();
+    };
+    let capture = match side.as_str() {
+        "req" => sess.req_body.as_ref(),
+        "res" => sess.res_body.as_ref(),
+        _ => return not_found(),
+    };
+    let Some(preview) = capture.map(|c| c.preview_bytes()) else {
+        return not_found();
+    };
+    let content_type = preview
+        .content_type
+        .as_deref()
+        .and_then(|ct| hyper::header::HeaderValue::from_str(ct).ok())
+        .unwrap_or_else(|| hyper::header::HeaderValue::from_static("application/octet-stream"));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, content_type)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(
+            hyper::header::CONTENT_DISPOSITION,
+            format!(
+                "attachment; filename=\"{}\"",
+                body_filename(&sess, &side, preview.truncated)
+            ),
+        )
+        .body(body::full(preview.bytes))
+        .unwrap()
+}
+
+/// What to call a downloaded body: the last segment of the URL when it has one,
+/// and the session it came from when it does not.
+///
+/// A capped preview is named `partial-…`. The bytes are a prefix of the body and
+/// nothing inside the file can say so — a truncated PNG saved under the name of
+/// the whole one is a wrong answer that looks like a corrupt server.
+fn body_filename(sess: &Session, side: &str, truncated: bool) -> String {
+    let without_query = sess.url.split(['?', '#']).next().unwrap_or("");
+    // The path, never the authority: `https://example.com/` has no filename in
+    // it, and the last `/`-segment of the whole URL would be the host.
+    let path = match without_query.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map(|(_, p)| p).unwrap_or(""),
+        None => without_query,
+    };
+    // Only the characters a filename needs. The rest is dropped rather than
+    // escaped: this ends up inside a quoted `Content-Disposition` filename, and
+    // the URL is the inspected site's to choose — a quote or a CRLF in it would
+    // close the filename early and start a header of its own.
+    let name: String = path
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    let name = match name.trim_matches('.').is_empty() {
+        true => format!("session-{}-{side}.bin", sess.id),
+        false => name,
+    };
+    match truncated {
+        true => format!("partial-{name}"),
+        false => name,
+    }
 }
 
 /// Captured WebSocket frames as JSON. `?id=<session>` filters to one
@@ -680,9 +828,35 @@ async fn status_json(state: &Arc<AppState>) -> Response<DynBody> {
         .unwrap()
 }
 
-fn sessions_clear(state: &Arc<AppState>) -> Response<DynBody> {
-    state.clear_sessions();
-    tracing::info!("sessions cleared via UI");
+/// Forget captured sessions: all of them, or only the `{"ids":[…]}` the request
+/// table's selection names.
+///
+/// A body that names no ids clears everything, which is both what the console
+/// sent before multi-select existed (`{}`) and the only reading of "clear" that
+/// an empty request can have.
+async fn sessions_clear(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let ids: Option<Vec<u64>> = read_json_body(req).await.ok().and_then(|v| {
+        let list = v.get("ids")?.as_array()?;
+        Some(list.iter().filter_map(|id| id.as_u64()).collect())
+    });
+    let Some(ids) = ids else {
+        state.clear_sessions();
+        tracing::info!("sessions cleared via UI");
+        return json_ok();
+    };
+    // The frames go with the sessions they belong to, exactly as they do in
+    // `clear_sessions` — a frame whose connection has been forgotten is
+    // unreachable in the console and would only sit in the ring.
+    {
+        let mut q = state.sessions.lock().unwrap();
+        q.retain(|s| !ids.contains(&s.id));
+    }
+    state
+        .ws_frames
+        .lock()
+        .unwrap()
+        .retain(|f| !ids.contains(&f.session));
+    tracing::info!("{} sessions cleared via UI", ids.len());
     json_ok()
 }
 
@@ -934,6 +1108,114 @@ fn index_html(state: &Arc<AppState>) -> String {
         .replace("__VERSION__", crate::config::VERSION)
         .replace("__HOST__", &host)
         .replace("__PORT__", &state.config.port.to_string())
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use crate::proxy::Capture;
+
+    fn session(url: &str, id: u64) -> Session {
+        Session {
+            id,
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A PNG saved from the console should arrive under the name it had on the
+    /// site it came from.
+    #[test]
+    fn a_downloaded_body_is_named_after_its_url() {
+        let s = session("https://cdn.example.com/img/logo.png?v=2", 7);
+        assert_eq!(body_filename(&s, "res", false), "logo.png");
+    }
+
+    /// A URL with nothing to take a name from still has to produce one, and the
+    /// session it came from is the only thing left to name it after.
+    #[test]
+    fn a_body_from_a_url_with_no_filename_is_named_after_its_session() {
+        assert_eq!(
+            body_filename(&session("https://example.com/", 12), "req", false),
+            "session-12-req.bin"
+        );
+        assert_eq!(
+            body_filename(&session("https://example.com", 13), "res", false),
+            "session-13-res.bin"
+        );
+    }
+
+    /// The preview is capped, so what is downloaded is a prefix. Nothing inside
+    /// a truncated PNG can say so — saved under the name of the whole file it
+    /// would read as a corrupt server rather than a capped capture.
+    #[test]
+    fn a_truncated_download_says_so_in_its_name() {
+        let s = session("https://cdn.example.com/app.a91f.js", 3);
+        assert_eq!(body_filename(&s, "res", true), "partial-app.a91f.js");
+    }
+
+    /// A name is taken from the URL, not trusted from it: the value ends up in
+    /// a `Content-Disposition` header, where a quote or a newline would end the
+    /// filename early and start something else.
+    #[test]
+    fn a_downloaded_body_cannot_be_named_by_the_site_it_came_from() {
+        let s = session("https://evil.example.com/a\"b\r\nX-Evil:%201.bin", 1);
+        assert_eq!(body_filename(&s, "res", false), "abX-Evil201.bin");
+    }
+
+    /// The bug this closes: a HAR entry carried `[binary, N bytes]` in the field
+    /// a HAR reader takes for the body, so an exported capture handed every
+    /// image on to the next tool as that sentence.
+    #[test]
+    fn a_binary_body_is_exported_as_base64() {
+        let raw = [0x89, b'P', b'N', b'G', 0x0d];
+        let s = Session {
+            res_headers: vec![("content-type".into(), "image/png".into())],
+            res_body: Some(Capture::from_bytes(&raw, Some("image/png".into()), None, 64)),
+            ..session("https://example.com/logo.png", 1)
+        };
+        let entry = har_entry(&s);
+        let content = &entry["response"]["content"];
+        assert_eq!(content["encoding"], "base64");
+        assert_eq!(content["size"], 5);
+        assert_eq!(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                content["text"].as_str().unwrap()
+            )
+            .unwrap(),
+            raw
+        );
+    }
+
+    /// A text body is exported as itself, with no `encoding` for a reader to
+    /// have to understand.
+    #[test]
+    fn a_text_body_is_exported_as_text() {
+        let s = Session {
+            req_headers: vec![("content-type".into(), "application/json".into())],
+            req_body: Some(Capture::from_bytes(
+                br#"{"name":"third"}"#,
+                Some("application/json".into()),
+                None,
+                64,
+            )),
+            ..session("https://example.com/api/items", 1)
+        };
+        let post = &har_entry(&s)["request"]["postData"];
+        assert_eq!(post["text"], r#"{"name":"third"}"#);
+        assert!(post["encoding"].is_null());
+    }
+
+    /// A session with no bodies still exports, with the fields a HAR requires
+    /// and nothing invented behind them.
+    #[test]
+    fn a_session_without_bodies_exports_empty_ones() {
+        let entry = har_entry(&session("https://example.com/", 1));
+        assert!(entry["request"]["postData"].is_null());
+        assert_eq!(entry["response"]["content"]["size"], 0);
+        assert_eq!(entry["response"]["content"]["text"], "");
+    }
 }
 
 #[cfg(test)]

@@ -591,6 +591,63 @@ pre.dump {
   word-break: break-all;
 }
 
+/* A hex dump is a fixed grid: it must not wrap or the columns stop lining up,
+   so it scrolls sideways instead. */
+pre.dump.hex {
+  white-space: pre;
+  word-break: normal;
+  overflow-x: auto;
+}
+
+/* The line above a body: what was captured, how to look at it, how to save it. */
+.bodybar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 2px 7px;
+}
+
+.bodybar .warn { color: var(--warn); }
+
+/* The Text/Hex/Image switch. The tab strip's shape at the size of a hint. */
+.viewsel {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.viewsel button {
+  padding: 1px 8px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: var(--bg-sub);
+  color: var(--fg-dim);
+  font: inherit;
+  cursor: pointer;
+}
+
+.viewsel button:last-child { border-right: 0; }
+.viewsel button:hover { color: var(--fg); }
+.viewsel button[aria-selected="true"] { background: var(--accent); color: var(--accent-fg); }
+
+/* A checkerboard behind the image, so a transparent PNG reads as transparent
+   rather than as whatever the theme happens to be. */
+.img-preview {
+  padding: 10px;
+  border-radius: 7px;
+  background:
+    conic-gradient(var(--line-soft) 25%, transparent 0 50%, var(--line-soft) 0 75%, transparent 0)
+    0 0 / 16px 16px,
+    var(--bg-sub);
+  text-align: center;
+}
+
+.img-preview img {
+  max-width: 100%;
+  border-radius: 3px;
+}
+
 /* "No rule matched" is a sentence, not a label: let it breathe and wrap. */
 .empty.wide {
   padding: 0 24px;

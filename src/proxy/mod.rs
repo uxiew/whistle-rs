@@ -408,6 +408,17 @@ impl CaptureState {
         }
     }
 
+    /// Whether the preview falls short of the body: it either hit the cap, or
+    /// bytes went past uncompressed after it was full.
+    ///
+    /// One predicate rather than three, because [`Capture::snapshot`],
+    /// [`Capture::preview_bytes`] and [`Capture::replay_body`] each have to
+    /// answer it and three copies of it would drift.
+    fn is_truncated(&self) -> bool {
+        self.data.len() >= self.cap()
+            || (matches!(self.decoder, BodyDecoder::Identity) && self.total > self.data.len())
+    }
+
     /// Drop the decompressor once it can contribute nothing further.
     ///
     /// A `write`-side decompressor accumulates *everything* it has inflated in
@@ -483,14 +494,37 @@ impl Capture {
     /// (wire) byte count; `text` is the decoded preview (or a binary marker).
     pub fn snapshot(&self) -> (usize, bool, String) {
         let st = self.0.lock().unwrap();
-        let truncated = st.data.len() >= st.cap()
-            || (matches!(st.decoder, BodyDecoder::Identity) && st.total > st.data.len());
+        let truncated = st.is_truncated();
         let text = if is_textual(st.content_type.as_deref()) {
             String::from_utf8_lossy(&st.data).into_owned()
         } else {
             format!("[binary, {} bytes]", st.total)
         };
         (st.total, truncated, text)
+    }
+
+    /// Whether [`Capture::snapshot`]'s `text` is a marker rather than the body.
+    pub fn is_binary(&self) -> bool {
+        !is_textual(self.0.lock().unwrap().content_type.as_deref())
+    }
+
+    /// The preview as **bytes**, with what is needed to serve them.
+    ///
+    /// Deliberately *not* built on [`Capture::snapshot`], for the same reason
+    /// [`Capture::replay_body`] is not: `snapshot` renders the preview for a
+    /// human and loses the body doing it — `from_utf8_lossy` flattens every
+    /// invalid byte to U+FFFD, and a non-textual type is replaced outright by a
+    /// `[binary, N bytes]` marker. That marker *was* the whole story the console
+    /// got for a PNG, which is why it could show neither the image, nor its
+    /// bytes, nor offer it as a download.
+    pub fn preview_bytes(&self) -> BodyBytes {
+        let st = self.0.lock().unwrap();
+        BodyBytes {
+            bytes: Bytes::copy_from_slice(&st.data),
+            content_type: st.content_type.clone(),
+            total: st.total,
+            truncated: st.is_truncated(),
+        }
     }
 
     /// What a replay can honestly re-send of this body — see [`ReplayBody`].
@@ -514,16 +548,27 @@ impl Capture {
             return ReplayBody::Empty;
         }
         let bytes = Bytes::copy_from_slice(&st.data);
-        // Same test as `snapshot`: the preview is short of the body either
-        // because it hit the cap, or because bytes went by uncompressed after
-        // it was full.
-        let complete = st.data.len() < st.cap()
-            && !(matches!(st.decoder, BodyDecoder::Identity) && st.total > st.data.len());
-        match complete {
+        match !st.is_truncated() {
             true => ReplayBody::Whole(bytes),
             false => ReplayBody::Partial { bytes, of: st.total },
         }
     }
+}
+
+/// A captured body as the bytes it is, for the console's hex view, its image
+/// preview and its download — and for a HAR entry, which has to carry a body no
+/// text field can hold.
+#[derive(Clone, Debug)]
+pub struct BodyBytes {
+    /// The decoded preview, byte for byte, up to the preview cap.
+    pub bytes: Bytes,
+    /// The `Content-Type` recorded for the body, if it had one.
+    pub content_type: Option<String>,
+    /// Raw (wire) bytes seen. Exceeds `bytes.len()` when the preview was capped
+    /// — and, for a body that arrived compressed, is not comparable to it.
+    pub total: usize,
+    /// The preview is short of the body: it must not be offered as the whole.
+    pub truncated: bool,
 }
 
 /// What of a captured request body a replay can re-send.
@@ -575,10 +620,16 @@ impl serde::Serialize for Capture {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let (len, truncated, text) = self.snapshot();
-        let mut o = s.serialize_struct("BodyCapture", 3)?;
+        let mut o = s.serialize_struct("BodyCapture", 4)?;
         o.serialize_field("len", &len)?;
         o.serialize_field("truncated", &truncated)?;
         o.serialize_field("text", &text)?;
+        // Whether `text` is the body or a marker standing in for it. The console
+        // needs to know, and re-deriving [`is_textual`] from the Content-Type in
+        // TypeScript would be a second copy of a rule this side already applied
+        // — the kind that drifts silently and is only noticed as a body that
+        // renders as mojibake.
+        o.serialize_field("binary", &self.is_binary())?;
         o.end()
     }
 }
@@ -792,6 +843,60 @@ mod capture_tests {
     #[test]
     fn a_request_without_a_body_replays_without_one() {
         assert_eq!(Capture::default().replay_body(), ReplayBody::Empty);
+    }
+
+    /// The gap this closes: a PNG reached the console as the sentence
+    /// `[binary, 4 bytes]` and nothing else, so there was no hex view, no image
+    /// and no download to build — the bytes were discarded at serialization.
+    #[test]
+    fn a_binary_body_keeps_its_bytes_beside_its_marker() {
+        let raw = [0x89, b'P', b'N', b'G'];
+        let cap = Capture::from_bytes(&raw, Some("image/png".into()), None, 64);
+        assert_eq!(cap.snapshot().2, "[binary, 4 bytes]");
+
+        let pv = cap.preview_bytes();
+        assert_eq!(pv.bytes, Bytes::from(raw.to_vec()));
+        assert_eq!(pv.content_type.as_deref(), Some("image/png"));
+        assert_eq!(pv.total, 4);
+        assert!(!pv.truncated);
+    }
+
+    /// A compressed body is served to the console **decoded**, like everything
+    /// else read out of the capture: what the hex view shows is the body, not
+    /// the transfer encoding it arrived under.
+    #[test]
+    fn the_bytes_the_console_gets_are_decoded() {
+        let cap = Capture::new(Some("application/octet-stream".into()), Some("gzip"), 4096);
+        cap.append(&gzip(&[0u8, 1, 2, 3, 255]));
+        cap.finish();
+        assert_eq!(cap.preview_bytes().bytes, Bytes::from_static(&[0, 1, 2, 3, 255]));
+    }
+
+    /// The bytes a capped preview holds are a prefix, and the flag that says so
+    /// travels with them — a download offered as the whole file would be wrong
+    /// in a way the file itself could not reveal.
+    #[test]
+    fn a_capped_preview_hands_over_a_prefix_that_admits_it() {
+        let cap = Capture::new(Some("image/png".into()), None, 8);
+        cap.append(&[b'x'; 200]);
+        let pv = cap.preview_bytes();
+        assert_eq!(pv.bytes.len(), 8);
+        assert_eq!(pv.total, 200);
+        assert!(pv.truncated);
+    }
+
+    /// Whether `text` is the body or a marker standing in for it, decided on
+    /// this side so the console does not have to re-derive it.
+    #[test]
+    fn the_capture_says_whether_its_text_is_a_marker() {
+        let binary = |ct: &str| {
+            let v = serde_json::to_value(Capture::new(Some(ct.into()), None, 64)).unwrap();
+            v["binary"].as_bool().unwrap()
+        };
+        assert!(binary("image/png"));
+        assert!(binary("application/octet-stream"));
+        assert!(!binary("text/html; charset=utf-8"));
+        assert!(!binary("application/json"));
     }
 
     #[test]
