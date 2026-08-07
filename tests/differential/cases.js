@@ -2,7 +2,7 @@
 //
 // `P` is the origin's authority; rules are written against it so the same text
 // can go to both proxies unchanged.
-const P = '127.0.0.1:18800';
+const P = `127.0.0.1:${Number(process.env.PORT_BASE || 18700) + 2}`;
 
 module.exports = [
   // ── request headers ────────────────────────────────────────────────────

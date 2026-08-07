@@ -7,6 +7,10 @@ const whistle = require('whistle');
 const path = require('path');
 
 whistle(
-  { port: Number(process.env.W_PORT || 18700), baseDir: path.join(__dirname, '.data') },
-  () => console.log('whistle listening on', process.env.W_PORT || 18700),
+  {
+    port: Number(process.env.PORT_BASE || 18700),
+    // A directory per port, so several oracles can run side by side.
+    baseDir: path.join(__dirname, `.data-${process.env.PORT_BASE || 18700}`),
+  },
+  () => console.log('whistle listening on', process.env.PORT_BASE || 18700),
 );

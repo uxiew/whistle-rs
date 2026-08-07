@@ -12,9 +12,14 @@
 
 const http = require('http');
 
-const ORIGIN = 18800;
-const W = 18700;   // upstream whistle
-const RS = 18999;  // whistle-rs
+// Ports and corpus come from the environment so several benches can run at
+// once — one per area under audit — without colliding on a port or on a file.
+//   PORT_BASE=19100 CASES=./cases-filters.js node harness.js
+const BASE = Number(process.env.PORT_BASE || 18700);
+const W = BASE;          // upstream whistle
+const RS = BASE + 1;     // whistle-rs
+const ORIGIN = BASE + 2; // the echo origin
+const CASES_FILE = process.env.CASES || './cases.js';
 
 /** Headers neither proxy is expected to agree on, and why. */
 const IGNORE = new Set([
@@ -156,7 +161,7 @@ function diff(a, b, label) {
 
 async function main() {
   const origin = await startOrigin();
-  const CASES = require('./cases.js');
+  const CASES = require(CASES_FILE);
   let ran = 0, differing = 0;
   const report = [];
 

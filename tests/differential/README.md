@@ -22,10 +22,17 @@ an npm install of whistle. It is a tool you reach for, not a gate you pass.
 
 ```sh
 cd tests/differential
-npm install                 # once — pulls real whistle
-node oracle.js &            # real whistle on :18700
-cargo run -- --port 18999 --no-persist --dir /tmp/rs-diff &   # from the repo root
-npm run bench
+npm install                                  # once — pulls real whistle
+PORT_BASE=18700 node oracle.js &             # real whistle on :18700
+cargo run -- --port 18701 --no-persist --dir /tmp/rs-diff &   # from the repo root
+PORT_BASE=18700 npm run bench
+```
+
+`PORT_BASE` claims three consecutive ports — whistle, whistle-rs, and the echo
+origin — so several benches can run at once, one per area under audit:
+
+```sh
+PORT_BASE=19100 CASES=./cases-filters.js npm run bench
 ```
 
 It prints the cases it ran and every difference it could not explain. A clean
