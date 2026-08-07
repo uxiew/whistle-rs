@@ -1263,21 +1263,22 @@ fn merge_lines(text: &str) -> String {
     out.join("\n")
 }
 
-/// Parse whole rules text into a list of [`Rule`]s.
-/// Mirrors `parseText` in `_original/lib/rules/rules.js:1738`.
 /// Lift ``` fenced blocks out of a rules text and into named values.
 ///
 /// whistle calls these 内嵌值 — a rules file carrying its own mocks, so a
 /// `file://{mock.json}` and the JSON it serves live in one place
 /// (`resolveInlineValues`, `_original/lib/util/index.js:208-218`; the shape is
-/// `MULTI_LINE_VALUE_RE` at `:98`):
+/// `MULTI_LINE_VALUE_RE` at `:98`). The outer fence below is four backticks so
+/// that the three-backtick fences *inside* the example stay literal — with a
+/// three-backtick outer fence rustdoc closes the block early and then compiles
+/// the remaining prose as Rust.
 ///
-/// ```text
+/// ````text
 /// ``` mock.json
 /// {"ok": true}
 /// ```
 /// example.com file://{mock.json}
-/// ```
+/// ````
 ///
 /// Without this pass the fence lines were parsed as rules — three tokens that
 /// configure nothing — and `{mock.json}` resolved to nothing, so the rule
@@ -1329,6 +1330,8 @@ pub fn lift_inline_values(text: &str) -> (String, HashMap<String, String>) {
     (kept.join("\n"), values)
 }
 
+/// Parse whole rules text into a list of [`Rule`]s.
+/// Mirrors `parseText` in `_original/lib/rules/rules.js:1738`.
 pub fn parse_text(text: &str) -> Vec<Rule> {
     // Order matters: whistle's `mergeLines` strips comments over the whole text
     // and only then collapses `line`…`` blocks.
