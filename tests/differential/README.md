@@ -44,9 +44,13 @@ Two corpora are not clean on a bare run, by design:
   Both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle
   *and* whistle-rs. Starting only the oracle reports five differences that are
   the launch, not the port.
-* `cases-delete.js` ends at `differing: 10`. Those ten are named at the top of
-  the file: `EMPTY_BUFFER` is `undefined` in whistle 2.10.8, so upstream's
-  "empty the body" paths forward the real body instead.
+* `cases-delete.js` ends at `differing: 8`, and its own header still says ten.
+  All of them come from one fact: `EMPTY_BUFFER` is `undefined` in whistle
+  2.10.8, so upstream's "empty the body" paths forward the real body instead.
+  The two that closed are `reqBody with an empty value` and `resBody with an
+  empty value` — an operator written with *no value* now does nothing here too,
+  which is a different question from `delete://body`, where this port still
+  empties the body on purpose. The eight that remain are all `delete://`'s.
 
 ## The HTTPS bench
 
