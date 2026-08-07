@@ -1557,7 +1557,10 @@ async fn read_value_source(source: &ValueSource) -> Option<String> {
                     // A rule value is a string; a binary mock body has to go
                     // through `file://`, which never decodes.
                     Some(data) => parts.push(String::from_utf8_lossy(&data).into_owned()),
-                    None => tracing::warn!("rule value {path}: not readable"),
+                    // Only `debug`: `a|b` is written precisely so that a missing
+                    // alternative is normal. The caller warns once when *nothing*
+                    // was read, which is the case worth a line per request.
+                    None => tracing::debug!("rule value {path}: not readable"),
                 }
             }
             (!parts.is_empty()).then(|| parts.join("\r\n"))
@@ -1649,13 +1652,21 @@ pub async fn load_rule_values(resolved: &mut Resolved, at: &ReqInfo) {
             // are emptied so a path can never reach an origin as a body.
             None if LOADABLE_JSON_OPS.contains(&op.protocol.as_str()) => {
                 tracing::warn!(
-                    "{} {}: {}:// value kept as written, nothing loaded",
+                    "{} {} -> {}://{}: nothing loaded, value kept as written",
                     at.method,
                     at.full_url,
-                    op.protocol
+                    op.protocol,
+                    op.value
                 );
             }
             None => {
+                tracing::warn!(
+                    "{} {} -> {}://{}: nothing loaded, value emptied",
+                    at.method,
+                    at.full_url,
+                    op.protocol,
+                    op.value
+                );
                 op.value = String::new();
                 op.value_is_content = true;
             }
