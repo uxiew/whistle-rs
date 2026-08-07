@@ -211,10 +211,11 @@ export const api = {
     };
   },
   frames: (id: number) => getJson<WsFrame[]>(`/frames.json?id=${id}`),
-  clearSessions: () => postJson<OkResult>('/api/sessions/clear', {}),
-  // The endpoint also takes `{ ids: [...] }` for a batch, which nothing calls:
-  // the request table is single-select. See `replay_session` in `webui.rs`.
-  replay: (id: number) => postJson<ReplayResult>('/api/replay', { id }),
+  /** No ids forgets everything; a list forgets exactly those sessions. */
+  clearSessions: (ids?: number[]) => postJson<OkResult>('/api/sessions/clear', ids ? { ids } : {}),
+  replay: (ids: number[]) => postJson<ReplayResult>('/api/replay', { ids }),
+  /** A HAR of the given sessions, as a link the browser downloads. */
+  harUrl: (ids: number[]) => `/sessions.har?ids=${ids.join(',')}`,
 
   rules: async () => (await fetch('/api/rules')).text(),
   saveRules: (text: string) => postText<{ ok: boolean; rules: number }>('/api/rules', text),

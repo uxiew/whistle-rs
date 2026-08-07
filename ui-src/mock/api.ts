@@ -389,35 +389,45 @@ export function mockApi(): Plugin {
       }
       case '/frames.json':
         return reply(FRAMES.filter((f) => f.session === id).slice().reverse());
-      case '/sessions.har':
-        return reply({ log: { version: '1.2', creator: { name: 'whistle-rs-mock' }, entries: [] } });
-      case '/api/sessions/clear':
-        sessions = [];
-        return reply({ ok: true });
-      case '/api/replay': {
-        const { id: want } = JSON.parse((await readBody(req)) || '{}');
-        const src = sessions.find((x) => x.id === want);
-        if (src) sessions.push({ ...src, id: nextId++, time_ms: Date.now(), target: src.target });
-        // The proxy replays from the capture, which is decoded and capped, so
-        // it reports what the replay will actually carry — see `ReplayResult`.
-        const body = !src?.req_body
-          ? 'empty'
-          : src.req_body.truncated
-            ? 'partial'
-            : 'whole';
+      case '/sessions.har': {
+        // `?ids=` exports only those sessions — what the table's multi-select
+        // asks for. Without it, everything.
+        const only = url.searchParams.get('ids')?.split(',').map(Number);
+        const picked = only ? sessions.filter((s) => only.includes(s.id)) : sessions;
         return reply({
-          replayed: src ? 1 : 0,
-          sessions: src
-            ? [
-                {
-                  id: src.id,
-                  body,
-                  sent: body === 'empty' ? 0 : src.req_body!.text.length,
-                  captured: src.req_body?.len ?? 0,
-                },
-              ]
-            : [],
+          log: {
+            version: '1.2',
+            creator: { name: 'whistle-rs-mock' },
+            entries: picked.map((s) => ({ request: { url: s.url }, response: { status: s.status } })),
+          },
         });
+      }
+      case '/api/sessions/clear': {
+        const { ids } = JSON.parse((await readBody(req)) || '{}');
+        sessions = ids ? sessions.filter((s) => !ids.includes(s.id)) : [];
+        return reply({ ok: true });
+      }
+      case '/api/replay': {
+        const body = JSON.parse((await readBody(req)) || '{}');
+        const want: number[] = body.ids ?? (body.id === undefined ? [] : [body.id]);
+        const picked = want
+          .map((id) => sessions.find((x) => x.id === id))
+          .filter((s): s is MockSession => !!s);
+        // The proxy replays from the capture, which is decoded and capped, so
+        // it reports what each replay will actually carry — see `ReplayResult`.
+        const report = picked.map((src) => {
+          const kind = !src.req_body ? 'empty' : src.req_body.truncated ? 'partial' : 'whole';
+          return {
+            id: src.id,
+            body: kind,
+            sent: kind === 'empty' ? 0 : src.req_body!.text.length,
+            captured: src.req_body?.len ?? 0,
+          };
+        });
+        for (const src of picked) {
+          sessions.push({ ...src, id: nextId++, time_ms: Date.now(), target: src.target });
+        }
+        return reply({ replayed: picked.length, sessions: report });
       }
       case '/api/rules':
         if (method === 'POST') {

@@ -55,7 +55,15 @@ interface State {
   sessions: SessionSummary[];
   /** `null` = every client. */
   client: string | null;
+  /** The row the detail panel is showing — one of `selection`, or `null`. */
   selected: number | null;
+  /** Every row the table has selected, in the order they were picked. */
+  selection: number[];
+  /** Where a shift-click measures its range from. */
+  anchor: number | null;
+  /** Rows flagged by hand — see [`toggleMark`]. */
+  marked: number[];
+  markedOnly: boolean;
   detail: SessionDetail | null;
   frames: WsFrame[] | null;
   detailTab: DetailTab;
@@ -93,6 +101,10 @@ export const state = reactive<State>({
   sessions: [],
   client: null,
   selected: null,
+  selection: [],
+  anchor: null,
+  marked: [],
+  markedOnly: false,
   detail: null,
   frames: null,
   detailTab: 'general',
@@ -123,6 +135,7 @@ const visibleSessions = computed(() => {
   const q = state.filter.trim().toLowerCase();
   return state.sessions.filter((s) => {
     if (state.client && clientOf(s) !== state.client) return false;
+    if (state.markedOnly && !state.marked.includes(s.id)) return false;
     if (!q) return true;
     return (
       (s.url || '').toLowerCase().includes(q) ||
@@ -247,30 +260,74 @@ export async function loadSessions(): Promise<void> {
   if (!list) return;
   state.sessions = list;
   if (state.client && !list.some((s) => clientOf(s) === state.client)) state.client = null;
-  if (state.selected !== null && !list.some((s) => s.id === state.selected)) {
+  // A session that has fallen out of the proxy's ring takes its selection and
+  // its mark with it: both name a row by an id that now belongs to nothing.
+  const live = new Set(list.map((s) => s.id));
+  state.selection = state.selection.filter((id) => live.has(id));
+  state.marked = state.marked.filter((id) => live.has(id));
+  if (state.markedOnly && !state.marked.length) state.markedOnly = false;
+  if (state.anchor !== null && !live.has(state.anchor)) state.anchor = null;
+  if (state.selected !== null && !live.has(state.selected)) {
     state.selected = null;
     state.detail = null;
     state.frames = null;
   }
 }
 
-export async function selectRow(id: number): Promise<void> {
+/** What a click carried, as the table's modifier keys mean it. */
+export interface Pick {
+  /** ⌘/Ctrl: add this row to the selection, or take it out. */
+  toggle?: boolean;
+  /** Shift: select everything between the anchor and this row. */
+  extend?: boolean;
+}
+
+export async function selectRow(id: number, pick: Pick = {}): Promise<void> {
+  const rows = shownRows.value.map((s) => s.id);
+  const from = state.anchor === null ? -1 : rows.indexOf(state.anchor);
+  if (pick.extend && from >= 0 && rows.includes(id)) {
+    // The range runs through the rows *as shown*, not by id: the table sorts,
+    // and a shift-click means "these, between here and there".
+    const to = rows.indexOf(id);
+    state.selection = rows.slice(Math.min(from, to), Math.max(from, to) + 1);
+  } else if (pick.toggle) {
+    state.selection = state.selection.includes(id)
+      ? state.selection.filter((x) => x !== id)
+      : [...state.selection, id];
+    state.anchor = id;
+  } else {
+    state.selection = [id];
+    state.anchor = id;
+  }
+  // Un-picking the row being shown moves the panel to whatever is still picked,
+  // rather than leaving it on a row the table no longer highlights.
+  await showDetail(state.selection.includes(id) ? id : (state.selection.at(-1) ?? null));
+}
+
+/** Fill the detail panel from one session, or empty it. */
+async function showDetail(id: number | null): Promise<void> {
+  if (id === state.selected) return;
   state.selected = id;
   state.detail = null;
   state.frames = null;
+  if (id === null) return;
   const detail = await reach(() => api.session(id));
   if (state.selected !== id || detail === undefined) return;
   state.detail = detail;
 }
 
 export function clearSelection(): void {
-  state.selected = null;
-  state.detail = null;
-  state.frames = null;
+  state.selection = [];
+  state.anchor = null;
+  void showDetail(null);
 }
 
-/** Move the selection `delta` rows through the list, and keep it in view. */
-export function moveSelection(delta: number): void {
+/**
+ * Move the selection `delta` rows through the list, and keep it in view.
+ * With `extend`, the anchor stays put and the range grows — shift-arrow, the
+ * keyboard's spelling of a shift-click.
+ */
+export function moveSelection(delta: number, extend = false): void {
   const list = shownRows.value;
   if (!list.length) return;
   const at = list.findIndex((s) => s.id === state.selected);
@@ -280,8 +337,41 @@ export function moveSelection(delta: number): void {
         ? 0
         : list.length - 1
       : Math.max(0, Math.min(list.length - 1, at + delta));
-  void selectRow(list[next].id);
+  void selectRow(list[next].id, { extend });
   state.revealSeq++;
+}
+
+/**
+ * Flag rows, or clear the flag — all of them at once, so a marked selection
+ * un-marks and a mixed one marks.
+ *
+ * Marks live in this window and nowhere else, deliberately. A mark names a
+ * session by the id the proxy gave it, and those ids start again at 1 every
+ * time the proxy restarts — kept in `localStorage`, a mark would come back
+ * attached to whatever request took its number next, which is worse than not
+ * keeping it. Nor is there anywhere on the proxy to put it: the session ring
+ * records what crossed the wire, not what someone thought about it.
+ */
+export function toggleMark(ids: number[]): void {
+  if (!ids.length) return;
+  state.marked = ids.every((id) => state.marked.includes(id))
+    ? state.marked.filter((id) => !ids.includes(id))
+    : [...new Set([...state.marked, ...ids])];
+  if (!state.marked.length) state.markedOnly = false;
+}
+
+/** The rows the bulk actions act on: the selection, or the one row shown. */
+export const actingOn = computed(() =>
+  state.selection.length ? state.selection : state.selected === null ? [] : [state.selected],
+);
+
+/** Forget the selected sessions, and only those. */
+export async function clearSelected(): Promise<void> {
+  const ids = actingOn.value.slice();
+  if (!ids.length) return;
+  if (!(await reach(() => api.clearSessions(ids)))) return;
+  clearSelection();
+  await loadSessions();
 }
 
 export function toggleSort(key: string): void {
@@ -305,11 +395,14 @@ export async function clearSessions(): Promise<void> {
 }
 
 export async function replaySelected(): Promise<void> {
-  if (state.selected === null) return;
-  const id = state.selected;
-  const res = await reach(() => api.replay(id));
+  const ids = actingOn.value.slice();
+  if (!ids.length) return;
+  const res = await reach(() => api.replay(ids));
   if (!res) return;
-  flashNote(replayNote(res.sessions?.[0]));
+  // One replay is reported in full — whether its body survived the capture is
+  // the thing worth saying. A batch reports the count; naming which of twenty
+  // requests lost bytes belongs on the rows, not in a one-line note.
+  flashNote(ids.length > 1 ? `Replayed ${res.replayed} requests` : replayNote(res.sessions?.[0]));
   // The replay is fired off asynchronously by the proxy; give it a moment to
   // come back around through the capture before asking for the list again.
   setTimeout(() => void loadSessions(), 400);

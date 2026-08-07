@@ -374,6 +374,45 @@ table.requests tbody tr[aria-selected="true"] td {
 table.requests tbody tr[aria-selected="true"] .status-dot { filter: brightness(1.7); }
 table.requests tbody tr[aria-selected="true"] .muted { color: var(--accent-fg); opacity: .85; }
 
+/* With several rows selected, one of them is the row the detail panel is
+   showing. It gets an edge rather than a second colour: the selection is
+   already the loudest thing on screen, and "which of these am I reading" is a
+   quieter question than "which of these did I pick". */
+table.requests tbody tr.current td:first-child { box-shadow: inset 3px 0 0 var(--accent-fg); }
+table.requests tbody tr.current:not([aria-selected="true"]) td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* The mark. Deliberately not the selection's colour: a mark outlives the
+   selection that made it, and survives filtering and re-render. */
+.mark {
+  width: 7px;
+  height: 9px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  fill: var(--warn);
+}
+
+table.requests tbody tr[aria-selected="true"] .mark { fill: var(--accent-fg); }
+
+/* Bulk actions, above the table, only while there is a selection or a mark. */
+.picked-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-bar));
+  border-bottom: 1px solid var(--line);
+}
+
+.picked-bar .count { font-size: 11.5px; color: var(--fg-dim); }
+
+/* An `<a>` cannot be `:disabled`, so an export with nothing to export is set
+   back and made unclickable by hand. */
+.picked-bar a.btn { text-decoration: none; color: var(--fg); }
+.picked-bar a.btn.off { opacity: .45; pointer-events: none; }
+
 .status-dot {
   display: inline-block;
   width: 7px;
