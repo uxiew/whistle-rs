@@ -1459,6 +1459,21 @@ pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
 mod timeout_tests {
     use super::*;
 
+    /// Both tests here write `CONNECT_BUDGET`, which is process-global, and
+    /// cargo runs tests in parallel. Restoring the default at the end of each
+    /// is not enough — the problem was never ordering. One test's restore was
+    /// landing in the middle of the other's measurement, so the timeout test
+    /// waited the full 16 seconds it had just shortened to 300ms and failed
+    /// its own bound.
+    static BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold the budget for the duration of a test. Poisoning is ignored: a
+    /// panicking test has already failed, and blocking its neighbour on that
+    /// would turn one failure into two.
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        BUDGET.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A connection attempt that never resolves has to be given up on, or the
     /// request waits out the operating system's TCP timeout — over a minute on
     /// macOS, longer on Linux — with its buffers held the whole time. That is
@@ -1472,6 +1487,7 @@ mod timeout_tests {
     /// — that we stop waiting — and tokio owns the rest.
     #[test]
     fn a_connection_that_never_completes_is_given_up_on() {
+        let _guard = exclusive();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1484,7 +1500,8 @@ mod timeout_tests {
             >()))
             .expect_err("a connection that never completes must not succeed");
         let waited = started.elapsed();
-        // Restore the default so the ordering of tests cannot matter.
+        // Restore the default for whatever runs next; `exclusive` is what keeps
+        // a neighbour from seeing the shortened one.
         set_request_timeout(CONNECT_TIMEOUT.as_millis() as u64);
 
         assert!(waited < std::time::Duration::from_secs(3), "waited {waited:?}");
@@ -1497,6 +1514,7 @@ mod timeout_tests {
     /// which cannot have been the intent.
     #[test]
     fn a_short_timeout_tightens_rather_than_disables() {
+        let _guard = exclusive();
         let budget = || CONNECT_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
         set_request_timeout(1_000);
         assert_eq!(budget(), 1_000);
