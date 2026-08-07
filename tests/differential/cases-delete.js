@@ -10,23 +10,30 @@
 // `P` is the origin's authority; rules are written against it so the same text
 // can go to both proxies unchanged.
 //
-// Ten cases here are **expected** to differ, on two deliberate divergences.
+// Eight cases here are **expected** to differ, on two deliberate divergences.
 // They are not in `harness.js`'s `EXPECTED` because a matcher wide enough to
 // catch them would also hide real news in another corpus — what makes them
 // expected is the rule, which the matcher cannot see. A clean run of this file
-// is therefore `differing: 10`, and these are they:
+// is therefore `differing: 8`, and these are they:
 //
 //   * `delete bare body on a post`, `delete req.body …` (×3),
-//     `delete res.body …` (×3), `reqBody with an empty value`, `resBody with
-//     an empty value` — all one defect. `EMPTY_BUFFER` is `toBuffer('')`, and
-//     `toBuffer` returns `undefined` on a falsy argument
+//     `delete res.body …` (×3) — all one defect. `EMPTY_BUFFER` is
+//     `toBuffer('')`, and `toBuffer` returns `undefined` on a falsy argument
 //     (`_original/lib/util/common.js:1630-1632`), so the constant every
 //     "empty the body" path assigns is `undefined`. `removeBody` therefore
 //     discards the body *injections* and forwards the real body untouched
-//     (`util/index.js:3591-3598`), and `reqBody://()` does nothing at all
-//     (`inspectors/req.js:549`, `res.js:1002`). Neither is what upstream's own
-//     code means, nor what <https://wproxy.org/docs/rules/delete.html>
-//     promises; whistle-rs empties the body.
+//     (`util/index.js:3591-3598`). That is neither what upstream's own code
+//     means nor what <https://wproxy.org/docs/rules/delete.html> promises, and
+//     `delete://body` is an explicit request for an empty body, so whistle-rs
+//     empties it.
+//
+//     `reqBody with an empty value` and `resBody with an empty value` were on
+//     this list and are not any more. They are the same root cause but not the
+//     same question: an operator written with *no value* is not a request for
+//     an empty body, it is an operator nobody filled in, and blanking the page
+//     for it — plus stripping the CSP and stamping `no-store`, which the port
+//     also did — is a footgun rather than an improvement. The bodies audit
+//     matched upstream there; the two cases now agree.
 //   * `delete bare pathname keeps the query` — upstream appends the query
 //     twice (`/a?x=1` → `/?x=1?x=1`, `util/index.js:1033,1057`), which is a
 //     request line no origin parses.
