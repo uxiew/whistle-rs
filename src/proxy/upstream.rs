@@ -24,6 +24,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use bytes::Bytes;
@@ -37,6 +38,8 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+
+use super::timing::Timings;
 
 use super::body::DynBody;
 
@@ -542,7 +545,11 @@ fn uses_absolute_form(target: &Target) -> bool {
 /// Forward `req` to `target` and return the upstream response (body still
 /// streaming). The request URI arrives origin-form with a `Host` header.
 pub async fn forward(target: &Target, req: Request<DynBody>) -> Result<Response<Incoming>> {
-    forward_with_addr(target, req).await.map(|(resp, _)| resp)
+    // Nobody is going to read these phases, but measuring them costs a few
+    // atomics on a path that is about to open a socket.
+    forward_with_addr(target, req, &Timings::new())
+        .await
+        .map(|(resp, _)| resp)
 }
 
 /// [`forward`], additionally reporting the address the request actually reached
@@ -559,9 +566,10 @@ pub async fn forward(target: &Target, req: Request<DynBody>) -> Result<Response<
 pub async fn forward_with_addr(
     target: &Target,
     req: Request<DynBody>,
+    timings: &Timings,
 ) -> Result<(Response<Incoming>, Option<SocketAddr>)> {
     let fallback = target.fallback_target();
-    match forward_once(target, req).await {
+    match forward_once(target, req, timings).await {
         Ok(out) => Ok(out),
         // `xproxy://` and `xhost://` mean "this way, or the ordinary way if that
         // fails" (`X_RE`, `_original/lib/inspectors/res.js:546-560,:571-600`).
@@ -578,7 +586,9 @@ pub async fn forward_with_addr(
                 next.connect_host,
                 next.connect_port
             );
-            forward_once(&next, err.into_request())
+            // The retry overwrites the phases of the attempt that failed, which
+            // is right: they belong to a connection that was never used.
+            forward_once(&next, err.into_request(), timings)
                 .await
                 .map_err(RetryableError::into_inner)
         }
@@ -633,7 +643,9 @@ async fn tunnel_once(target: &Target) -> Result<BoxedIo> {
     // No request exists on this path, so the CONNECT to an upstream proxy carries
     // no `User-Agent` or client `Proxy-Authorization` to echo. The proxy URL's own
     // credentials still apply, which is how a proxy rule normally carries them.
-    origin_stream(target, &Hop::default())
+    // A tunnel has no session to report phases to; they are measured and
+    // dropped rather than threaded through a path with nowhere to put them.
+    origin_stream(target, &Hop::default(), &Timings::new())
         .await
         .map(|(io, _)| io)
 }
@@ -684,6 +696,7 @@ impl RetryableError {
 async fn forward_once(
     target: &Target,
     mut req: Request<DynBody>,
+    timings: &Timings,
 ) -> Result<(Response<Incoming>, Option<SocketAddr>), RetryableError> {
     // Refused before anything is sent: a proxy hop pointing back at us would
     // recurse until the process runs out of sockets. A caller that can answer
@@ -701,7 +714,7 @@ async fn forward_once(
     // cannot be established hands `req` back untouched — which is what lets an
     // `xproxy://` fall back to a direct connection with the *same* request,
     // rather than one already rewritten for a proxy that is not there.
-    let (stream, peer) = match origin_stream(target, &hop).await {
+    let (stream, peer) = match origin_stream(target, &hop, timings).await {
         Ok(out) => out,
         Err(error) => {
             return Err(RetryableError::Connect(Box::new(UnsentRequest {
@@ -741,9 +754,14 @@ async fn forward_once(
         }
     }
 
+    // `wait` from here: hyper writes the request and resolves on the response
+    // head, with no observation point in between — so this is `send` + `wait`
+    // and is reported as `wait` alone. See `timing`.
+    let waiting = Instant::now();
     let resp = send(TokioIo::new(stream), req)
         .await
         .map_err(RetryableError::Sent)?;
+    timings.wait(waiting);
     Ok((resp, peer))
 }
 
@@ -791,6 +809,28 @@ pub fn set_request_timeout(timeout_ms: u64) {
     CONNECT_BUDGET.store(budget.min(timeout_ms.max(1)), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Open a TCP connection, timing the name lookup apart from the connect.
+///
+/// `TcpStream::connect((host, port))` does both and reports one duration, so
+/// this does what tokio's own `ToSocketAddrs` does — resolve, then try each
+/// answer in turn — with a stopwatch between the halves. Behaviour is unchanged;
+/// only the reporting is finer. The budget covers both, as it did when they were
+/// one call: a name that will not resolve is a destination that will not answer.
+///
+/// Returns the moment the *connect* began, so the caller can decide what else
+/// belongs in that phase — for a proxied hop, opening the tunnel does.
+async fn dial(host: &str, port: u16, timings: &Timings) -> Result<(TcpStream, Instant)> {
+    connect_within(async move {
+        let looking_up = Instant::now();
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+        timings.dns(looking_up);
+        let connecting = Instant::now();
+        let tcp = TcpStream::connect(&addrs[..]).await?;
+        Ok((tcp, connecting))
+    })
+    .await
+}
+
 /// Await a connection attempt, giving up after [`CONNECT_TIMEOUT`].
 async fn connect_within<F, T>(connect: F) -> Result<T>
 where
@@ -812,21 +852,32 @@ where
 /// (`setHostsInfo` is fed the resolved *proxy* address when a proxy rule
 /// matched, `_original/lib/inspectors/res.js:238,:259`). It is the only place
 /// the chosen address is ever visible, so `serverIp:` gets it from here.
-async fn origin_stream(target: &Target, hop: &Hop) -> Result<(BoxedIo, Option<SocketAddr>)> {
+async fn origin_stream(
+    target: &Target,
+    hop: &Hop,
+    timings: &Timings,
+) -> Result<(BoxedIo, Option<SocketAddr>)> {
     let (dst_host, dst_port) = target.hop_addr();
+    // When the TCP connect began. `connect` ends when there is a byte pipe to
+    // the origin, so on a proxied hop it also covers the proxy's own TLS and its
+    // CONNECT/SOCKS negotiation: HAR has no phase for those, and the connection
+    // is not established until they are done.
+    let connecting;
     let (base, peer): (BoxedIo, Option<SocketAddr>) = match &target.proxy {
         None => {
-            let tcp = connect_within(TcpStream::connect((dst_host, dst_port)))
+            let (tcp, at) = dial(dst_host, dst_port, timings)
                 .await
                 .with_context(|| format!("connecting to {dst_host}:{dst_port}"))?;
+            connecting = at;
             tcp.set_nodelay(true).ok();
             let peer = tcp.peer_addr().ok();
             (BoxedIo(Box::new(tcp)), peer)
         }
         Some(proxy) => {
-            let ptcp = connect_within(TcpStream::connect((proxy.host.as_str(), proxy.port)))
+            let (ptcp, at) = dial(proxy.host.as_str(), proxy.port, timings)
                 .await
                 .with_context(|| format!("connecting to proxy {}:{}", proxy.host, proxy.port))?;
+            connecting = at;
             ptcp.set_nodelay(true).ok();
             let peer = ptcp.peer_addr().ok();
             // Optionally TLS to the proxy itself (https-proxy).
@@ -845,6 +896,7 @@ async fn origin_stream(target: &Target, hop: &Hop) -> Result<(BoxedIo, Option<So
                 ProxyKind::Http | ProxyKind::Https => {
                     if uses_absolute_form(target) {
                         // Plain http via a plain proxy: absolute-form, no CONNECT.
+                        timings.connect(connecting);
                         return Ok((pstream, peer));
                     }
                     let tunnelled = http_connect(pstream, dst_host, dst_port, hop, proxy, false)
@@ -872,14 +924,17 @@ async fn origin_stream(target: &Target, hop: &Hop) -> Result<(BoxedIo, Option<So
         }
     };
 
+    timings.connect(connecting);
     if target.tls {
         let connector = TlsConnector::from(client_config_for(target.tls_versions));
         let server_name = ServerName::try_from(target.sni.clone())
             .map_err(|_| anyhow!("invalid SNI host {}", target.sni))?;
+        let shaking_hands = Instant::now();
         let tls = connector
             .connect(server_name, base)
             .await
             .context("upstream TLS handshake")?;
+        timings.ssl(shaking_hands);
         Ok((BoxedIo(Box::new(tls)), peer))
     } else {
         Ok((base, peer))
@@ -2044,6 +2099,7 @@ mod tests {
             let (_, addr) = forward_with_addr(
                 &target("localhost", origin_port, None),
                 get("/", "localhost"),
+                &Timings::new(),
             )
             .await
             .expect("direct");
@@ -2056,6 +2112,7 @@ mod tests {
             let (_, via) = forward_with_addr(
                 &target("example.com", 80, Some(cfg)),
                 get("/", "example.com"),
+                &Timings::new(),
             )
             .await
             .expect("proxied");

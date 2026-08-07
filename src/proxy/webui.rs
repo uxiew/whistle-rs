@@ -318,7 +318,16 @@ fn har_entry(s: &Session) -> serde_json::Value {
             "bodySize": res_len,
         },
         "cache": {},
-        "timings": { "send": 0, "wait": s.duration_ms, "receive": 0 },
+        // The phases as measured. A session that never left the proxy has none,
+        // and HAR's `-1` says so — where the `{send: 0, wait: <all of it>,
+        // receive: 0}` this used to write said something that never happened.
+        "timings": match &s.timings {
+            Some(t) => t.har(),
+            None => serde_json::json!({
+                "blocked": -1, "dns": -1, "connect": -1, "ssl": -1,
+                "send": -1, "wait": s.duration_ms, "receive": -1,
+            }),
+        },
         "serverIPAddress": "",
         "_target": s.target,
         "_clientIp": s.client_ip,

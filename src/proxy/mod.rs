@@ -15,6 +15,7 @@ pub mod script;
 pub mod sni;
 pub mod socks;
 pub mod template;
+pub mod timing;
 pub mod upstream;
 pub mod webui;
 pub mod ws;
@@ -992,6 +993,11 @@ pub struct Session {
     /// Response body preview (filled as the body streams), if captured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub res_body: Option<Capture>,
+    /// Where the time went, when the request left the proxy at all. A request a
+    /// rule answered has no phases, and reports none rather than a row of zeros
+    /// — see [`timing::Timings`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<timing::Timings>,
 }
 
 /// Read a single header as an owned string, if present and valid UTF-8.
@@ -3506,6 +3512,8 @@ async fn serve(
                     res_headers: header_pairs(response.headers()),
                     req_body,
                     res_body,
+                    // Answered here: no connection was opened, so there are no phases.
+                    timings: None,
                 });
                 return Ok(response);
             }
@@ -3606,6 +3614,8 @@ async fn serve(
             res_headers: header_pairs(resp.headers()),
             req_body,
             res_body,
+            // Answered here: no connection was opened, so there are no phases.
+            timings: None,
         });
         return Ok(resp);
     }
@@ -3807,7 +3817,11 @@ async fn serve(
         if target.tls { "https" } else { "http" }
     );
 
-    let (upstream_resp, server_addr) = upstream::forward_with_addr(&target, out_req).await?;
+    // Handed in rather than returned: the row is recorded when the response head
+    // arrives, and `receive` only lands when the body ends. See `timing`.
+    let timings = timing::Timings::new();
+    let (upstream_resp, server_addr) =
+        upstream::forward_with_addr(&target, out_req, &timings).await?;
 
     let (mut parts, body) = upstream_resp.into_parts();
 
@@ -4073,6 +4087,10 @@ async fn serve(
                 false => teed,
             }
         };
+    // `receive` runs from the response head to the last byte, so it is stamped
+    // by the body itself — on both paths, because a buffered body was received
+    // too; it was simply received before the operators ran.
+    let res_body = timing::measure_receive(res_body, timings.clone());
 
     let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
     if target.proxy.is_some() {
@@ -4093,6 +4111,7 @@ async fn serve(
         res_headers: header_pairs(&parts.headers),
         req_body: req_body_cap,
         res_body: res_body_cap,
+        timings: Some(timings.clone()),
     });
 
     Ok(Response::from_parts(parts, res_body))

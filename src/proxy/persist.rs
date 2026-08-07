@@ -26,6 +26,13 @@ pub struct PersistedSession {
     pub client_ip: Option<String>,
     pub target: String,
     pub duration_ms: u128,
+    /// Where the time went, when the request left the proxy at all.
+    ///
+    /// `default` so a file written before this field existed still loads: an
+    /// older record simply has no phases, which is also what a request answered
+    /// by a rule reports. See [`super::timing::Timings`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<super::timing::Timings>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<String>,
     /// The operators that applied — see [`MatchedOp`]. `default` so a file
@@ -85,6 +92,7 @@ impl PersistedSession {
                     text,
                 }
             }),
+            timings: s.timings.clone(),
         }
     }
 
@@ -103,6 +111,7 @@ impl PersistedSession {
             duration_ms: self.duration_ms,
             log: self.log,
             rules: self.rules,
+            timings: self.timings,
             req_headers: self.req_headers,
             res_headers: self.res_headers,
             req_body: self.req_body_preview.map(|snap| {
@@ -304,6 +313,7 @@ mod tests {
     #[test]
     fn persisted_roundtrip() {
         let ps = PersistedSession {
+            timings: None,
             id: 42,
             time_ms: 1_609_459_200_000,
             method: "GET".into(),
