@@ -1,23 +1,32 @@
 <script setup lang="ts">
-// The keys of the values object, as a source list. Clicking one selects it in
-// the editor rather than filtering to it: the file is the thing being edited,
-// and jumping is what a long one needs.
+// The values, as a source list. Picking a key and picking what to edit are the
+// same act, as on the Rules pane — "All values" is to this list what "Default"
+// is to the group list: the whole store, edited as the one JSON object it is
+// stored as.
 
 import { computed } from 'vue';
 import SideItem from '../components/SideItem.vue';
-import { revealValue, state } from '../store';
+import { addValue, selectValue, state } from '../store';
 
 const names = computed(() => Object.keys(state.values).sort());
 </script>
 
 <template>
   <div class="side-title">Values</div>
-  <SideItem v-if="!names.length" label="none defined" muted />
+  <SideItem
+    label="All values"
+    :selected="state.valueKey === null"
+    @click="selectValue(null)"
+  />
+
   <SideItem
     v-for="name in names"
     :key="name"
     :label="name"
     :count="String(state.values[name]).length"
-    @click="revealValue(name)"
+    :selected="state.valueKey === name"
+    @click="selectValue(name)"
   />
+
+  <div class="side-add" @click="addValue()">+ New value</div>
 </template>

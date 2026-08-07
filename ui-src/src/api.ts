@@ -226,6 +226,12 @@ export const api = {
 
   values: () => getJson<Record<string, string>>('/api/values'),
   saveValues: (json: string) => postText<OkResult>('/api/values', json),
+  // One key at a time. Editing the store as a whole object rewrites every key
+  // on every save, so a typo anywhere loses all of them.
+  setValue: (name: string, value: string) => postJson<OkResult>('/api/value', { name, value }),
+  renameValue: (name: string, to: string) =>
+    postJson<OkResult>('/api/value/rename', { name, to }),
+  deleteValue: (name: string) => postJson<OkResult>('/api/value', { name }, 'DELETE'),
 
   status: () => getJson<ProxyStatus>('/api/status'),
 };

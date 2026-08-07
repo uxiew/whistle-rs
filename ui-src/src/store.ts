@@ -63,8 +63,10 @@ interface State {
   prettyBody: boolean;
   /** Bumped when the selection moved by keyboard and wants scrolling into view. */
   revealSeq: number;
-  /** A value name the source list asked the Values editor to jump to. */
-  valueReveal: { key: string; seq: number };
+  /** The value being edited, or `null` for the whole store as one JSON object. */
+  valueKey: string | null;
+  /** The selected value's content, edited on its own. */
+  valueText: string;
   /** A transient message shown where the request count normally is. */
   note: string | null;
   /** True once a call to the proxy failed, until one succeeds. */
@@ -97,7 +99,8 @@ export const state = reactive<State>({
   sort: { key: 'id', dir: 'desc' },
   prettyBody: true,
   revealSeq: 0,
-  valueReveal: { key: '', seq: 0 },
+  valueKey: null,
+  valueText: '',
   note: null,
   offline: false,
 
@@ -440,11 +443,30 @@ export async function loadValues(): Promise<void> {
   }
   state.values = values;
   state.valuesText = JSON.stringify(values, null, 2);
+  // A key that is no longer there — deleted, or renamed from another window —
+  // falls back to the whole store rather than editing something that is gone.
+  if (state.valueKey !== null && !(state.valueKey in values)) state.valueKey = null;
+  if (state.valueKey !== null) state.valueText = values[state.valueKey];
 }
 
-/** Ask the Values editor to jump to a key, from the source list. */
-export function revealValue(key: string): void {
-  state.valueReveal = { key, seq: state.valueReveal.seq + 1 };
+/** Edit one value, or `null` for the whole store as one JSON object. */
+export function selectValue(name: string | null): void {
+  state.valueKey = name;
+  state.valuesStatus = '';
+  state.valueText = name === null ? '' : (state.values[name] ?? '');
+}
+
+/** Save whichever of the two the Values pane is showing. */
+export async function saveValue(): Promise<void> {
+  if (state.valueKey === null) return saveValues();
+  const name = state.valueKey;
+  const res = await reach(() => api.setValue(name, state.valueText));
+  if (!res) {
+    state.valuesStatus = 'Save failed';
+    return;
+  }
+  state.valuesStatus = res.ok ? 'Saved' : res.error || 'Save failed';
+  await loadValues();
 }
 
 export async function saveValues(): Promise<void> {
@@ -461,6 +483,41 @@ export async function saveValues(): Promise<void> {
   } catch {
     state.valuesStatus = 'Save failed';
   }
+}
+
+export async function addValue(): Promise<void> {
+  const name = prompt('Value name:');
+  if (!name || !name.trim()) return;
+  const res = await api.setValue(name.trim(), '');
+  if (!res.ok) {
+    alert(res.error || 'Failed');
+    return;
+  }
+  await loadValues();
+  selectValue(name.trim());
+}
+
+export async function renameValue(name: string): Promise<void> {
+  const to = prompt('Rename value to:', name);
+  if (!to || !to.trim() || to.trim() === name) return;
+  const res = await api.renameValue(name, to.trim());
+  if (!res.ok) {
+    alert(res.error || 'Failed');
+    return;
+  }
+  state.valueKey = to.trim();
+  await loadValues();
+}
+
+export async function deleteValue(name: string): Promise<void> {
+  if (!confirm(`Delete value "${name}"?`)) return;
+  const res = await api.deleteValue(name);
+  if (!res.ok) {
+    alert(res.error || 'Failed');
+    return;
+  }
+  selectValue(null);
+  await loadValues();
 }
 
 // ── status ─────────────────────────────────────────────────────────────────
@@ -482,5 +539,5 @@ export function showPane(name: Pane): void {
 /** ⌘S saves whichever pane is showing, and nothing else has one. */
 export function saveCurrentPane(): void {
   if (state.pane === 'rules') void saveRules();
-  else if (state.pane === 'values') void saveValues();
+  else if (state.pane === 'values') void saveValue();
 }

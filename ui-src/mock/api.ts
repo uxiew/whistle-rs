@@ -471,6 +471,28 @@ export function mockApi(): Plugin {
           return reply({ ok: true });
         }
         return reply(values);
+      case '/api/value': {
+        const body = JSON.parse((await readBody(req)) || '{}');
+        if (method === 'DELETE') {
+          if (!(body.name in values)) return reply({ ok: false, error: 'value not found' });
+          delete values[body.name];
+          return reply({ ok: true });
+        }
+        if (!body.name?.trim()) return reply({ ok: false, error: 'name is required' });
+        values[body.name.trim()] = body.value ?? '';
+        return reply({ ok: true });
+      }
+      case '/api/value/rename': {
+        const { name, to } = JSON.parse((await readBody(req)) || '{}');
+        if (!(name in values)) return reply({ ok: false, error: 'value not found' });
+        if (name !== to && to in values) {
+          return reply({ ok: false, error: 'a value by that name already exists' });
+        }
+        const content = values[name];
+        delete values[name];
+        values[to] = content;
+        return reply({ ok: true });
+      }
       case '/api/status':
         return reply({
           version: '0.1.0-mock',
