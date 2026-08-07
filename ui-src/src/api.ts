@@ -71,6 +71,31 @@ export interface WsFrame {
   preview: string;
   /** Recorded but never delivered — `enable://ignoreSend|ignoreReceive`. */
   ignored: boolean;
+  /**
+   * Recorded and waiting — `enable://pauseSend|pauseReceive` is holding it
+   * until someone releases the direction. Cleared when it goes out, so a frame
+   * still marked once the connection ended never reached the peer.
+   */
+  held: boolean;
+}
+
+/** One direction of `/api/ws/status`. */
+export interface WsDirPause {
+  paused: boolean;
+  /** How many frames that direction is holding right now. */
+  held: number;
+}
+
+/**
+ * `/api/ws/status?id=` — whether a live WebSocket session is being held.
+ *
+ * `live` is false for a session that was never paused and for one that has since
+ * closed alike: only a paused, running connection can be released.
+ */
+export interface WsPauseStatus {
+  live: boolean;
+  send: WsDirPause;
+  receive: WsDirPause;
 }
 
 export interface RuleGroup {
@@ -167,6 +192,11 @@ export const api = {
   sessions: () => getJson<SessionSummary[]>('/sessions.json'),
   session: (id: number) => getJson<SessionDetail | null>(`/session.json?id=${id}`),
   frames: (id: number) => getJson<WsFrame[]>(`/frames.json?id=${id}`),
+  wsPause: (id: number) => getJson<WsPauseStatus>(`/api/ws/status?id=${id}`),
+  // Per session and per direction, and all of it at once: that is the only
+  // granularity whistle has — there is no release-one-frame anywhere in it.
+  releaseWs: (id: number, dir: 'send' | 'receive') =>
+    postJson<OkResult & { released?: number }>('/api/ws/release', { id, dir }),
   clearSessions: () => postJson<OkResult>('/api/sessions/clear', {}),
   // The endpoint also takes `{ ids: [...] }` for a batch, which nothing calls:
   // the request table is single-select. See `replay_session` in `webui.rs`.

@@ -41,6 +41,8 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/rule-group/update") => rule_group_update(state, req).await,
         ("GET", "/api/rule-group") => rule_group_get(state, &req),
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
+        ("GET", "/api/ws/status") => ws_status(state, &req),
+        ("POST", "/api/ws/release") => ws_release(state, req).await,
         ("POST", "/api/sessions/clear") => sessions_clear(state),
         ("GET", "/api/status") => status_json(state).await,
         ("GET", "/plugin") => redirect_to("/plugin/"),
@@ -339,15 +341,7 @@ fn session_detail_json(state: &Arc<AppState>, req: &Request<Incoming>) -> Respon
 /// Captured WebSocket frames as JSON. `?id=<session>` filters to one
 /// connection; otherwise every buffered frame (newest first) is returned.
 fn frames_json(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
-    let want: Option<u64> = req
-        .uri()
-        .query()
-        .and_then(|q| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("id="))
-                .map(|v| v.to_string())
-        })
-        .and_then(|v| v.parse().ok());
+    let want = query_id(req);
     let frames: Vec<WsFrame> = {
         let q = state.ws_frames.lock().unwrap();
         q.iter()
@@ -362,6 +356,82 @@ fn frames_json(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBo
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(body)))
         .unwrap()
+}
+
+// ── the WebSocket pause control ──
+
+/// A JSON body that is built rather than spelled out.
+fn json_value(body: &serde_json::Value) -> Response<DynBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
+/// Whether either direction of one live WebSocket session is being held, and how
+/// much of it (`?id=<session>`).
+///
+/// Only a session `enable://pauseSend|pauseReceive` held is registered, so
+/// `live: false` covers "never paused" and "already closed" alike — which is all
+/// the console can act on anyway. It answers for an unknown id rather than
+/// failing, because this is what the Frames tab polls.
+///
+/// whistle's own endpoint is the setter `/cgi-bin/socket/change-status`, which
+/// can also *start* a pause on a live session from its UI (`changeStatus`,
+/// `_original/lib/socket-mgr.js:907-918`). This port only lifts one: the hold
+/// machinery is wired up for the directions a rule named, so there is nothing
+/// for a mid-session pause to hold with.
+fn ws_status(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let want = query_id(req);
+    let found = want.and_then(|id| state.ws_pause.lock().unwrap().get(&id).cloned());
+    let dir = |d: Option<&crate::proxy::ws::DirPause>| match d {
+        Some(d) => serde_json::json!({ "paused": d.paused(), "held": d.held() }),
+        None => serde_json::json!({ "paused": false, "held": 0 }),
+    };
+    let body = serde_json::json!({
+        "live": found.is_some(),
+        "send": dir(found.as_ref().map(|p| &p.send)),
+        "receive": dir(found.as_ref().map(|p| &p.receive)),
+    });
+    json_value(&body)
+}
+
+/// Let one held direction of one session go: `{ "id": N, "dir": "send" }`.
+///
+/// Per session and per direction, and all of it at once, because that is the
+/// only granularity upstream has — its console picks a status for a direction,
+/// and everything held goes out when it picks `0` again. There is no
+/// release-one-frame anywhere in whistle.
+async fn ws_release(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(id) = payload.get("id").and_then(|v| v.as_u64()) else {
+        return json_error("id is required");
+    };
+    let name = payload.get("dir").and_then(|v| v.as_str()).unwrap_or("");
+    let found = state.ws_pause.lock().unwrap().get(&id).cloned();
+    let Some(pause) = found else {
+        // The session ended while its frames were held. They stay flagged in the
+        // capture, which is the truth: they never reached the peer.
+        return json_error("no live paused WebSocket session with that id");
+    };
+    let Some(gate) = pause.dir(name) else {
+        return json_error("dir must be \"send\" or \"receive\"");
+    };
+    let released = gate.release();
+    tracing::info!("released {released} held {name} frame(s) of session {id}");
+    json_value(&serde_json::json!({ "ok": true, "released": released }))
+}
+
+/// The `?id=<n>` a per-session endpoint takes.
+fn query_id(req: &Request<Incoming>) -> Option<u64> {
+    req.uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("id=")))
+        .and_then(|v| v.parse().ok())
 }
 
 fn rules_get(state: &Arc<AppState>) -> Response<DynBody> {

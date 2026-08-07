@@ -16,6 +16,7 @@ import type {
   SessionDetail,
   SessionSummary,
   WsFrame,
+  WsPauseStatus,
 } from './api';
 import { COLUMNS } from './columns';
 import { clientOf, fmtBytes } from './format';
@@ -58,6 +59,8 @@ interface State {
   selected: number | null;
   detail: SessionDetail | null;
   frames: WsFrame[] | null;
+  /** Whether the selected WebSocket is being held — `null` until asked. */
+  wsPause: WsPauseStatus | null;
   detailTab: DetailTab;
   sort: { key: string; dir: 'asc' | 'desc' };
   prettyBody: boolean;
@@ -93,6 +96,7 @@ export const state = reactive<State>({
   selected: null,
   detail: null,
   frames: null,
+  wsPause: null,
   detailTab: 'general',
   sort: { key: 'id', dir: 'desc' },
   prettyBody: true,
@@ -248,6 +252,7 @@ export async function loadSessions(): Promise<void> {
     state.selected = null;
     state.detail = null;
     state.frames = null;
+    state.wsPause = null;
   }
 }
 
@@ -255,6 +260,7 @@ export async function selectRow(id: number): Promise<void> {
   state.selected = id;
   state.detail = null;
   state.frames = null;
+  state.wsPause = null;
   const detail = await reach(() => api.session(id));
   if (state.selected !== id || detail === undefined) return;
   state.detail = detail;
@@ -264,6 +270,7 @@ export function clearSelection(): void {
   state.selected = null;
   state.detail = null;
   state.frames = null;
+  state.wsPause = null;
 }
 
 /** Move the selection `delta` rows through the list, and keep it in view. */
@@ -293,6 +300,29 @@ export async function loadFrames(id: number): Promise<void> {
   if (state.selected !== id || !list) return;
   // `/frames.json` answers newest-first; a conversation reads oldest-first.
   state.frames = list.slice().reverse();
+  // Whether a direction is being held has to be asked for separately: a pause
+  // that has caught nothing yet is invisible in the frames themselves.
+  const pause = await reach(() => api.wsPause(id));
+  if (state.selected === id && pause) state.wsPause = pause;
+}
+
+/**
+ * Let one held direction of the selected session go.
+ *
+ * All of it at once, because that is the only granularity whistle has: its own
+ * console sets the direction's status back to normal and everything held goes
+ * out together. A session that has closed in the meantime answers plainly
+ * rather than silently doing nothing — its frames are never getting out now.
+ */
+export async function releaseWsDir(dir: 'send' | 'receive'): Promise<void> {
+  const id = state.selected;
+  if (id === null) return;
+  const res = await reach(() => api.releaseWs(id, dir));
+  if (!res) return;
+  flashNote(
+    res.ok ? `Released ${res.released ?? 0} held ${dir} frame(s)` : res.error || 'Release failed',
+  );
+  await loadFrames(id);
 }
 
 export async function clearSessions(): Promise<void> {

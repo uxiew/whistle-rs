@@ -21,12 +21,19 @@
 //! ping would break keepalive and one that rewrote a close would break the
 //! closing handshake, and no legitimate hook needs either. They are still
 //! captured.
+//!
+//! One direction of a session can also be **held** — see [`DirMode::Pause`] and
+//! [`SessionPause`]. That is the one place where a control frame is *not*
+//! exempt, because upstream pauses the byte stream rather than the frames in it.
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{Notify, mpsc};
 
 use crate::plugins::wsframe::{Dir, FrameHook, FrameMeta, HookFrame, Verdict};
 use crate::plugins::{PluginMatch, Plugins};
@@ -41,6 +48,10 @@ const OPCODE_TEXT: u8 = 0x1;
 const OPCODE_BINARY: u8 = 0x2;
 /// The closing handshake.
 const OPCODE_CLOSE: u8 = 0x8;
+/// A keep-alive probe.
+const OPCODE_PING: u8 = 0x9;
+/// The answer to one, or an unsolicited heartbeat.
+const OPCODE_PONG: u8 = 0xa;
 
 /// A decoded WebSocket frame (control/data), payload already unmasked.
 pub struct Frame {
@@ -217,7 +228,7 @@ pub async fn capturing_tunnel<A, B>(
     upstream: B,
     script: Option<String>,
     plan: FramePlan,
-    ignore: IgnoreDirs,
+    flow: FrameFlow,
     state: Arc<AppState>,
     session: u64,
 ) where
@@ -228,6 +239,15 @@ pub async fn capturing_tunnel<A, B>(
     // dialling the plugins now overlaps with the client composing its first
     // frame instead of delaying the handshake.
     let (send_hooks, receive_hooks) = plan.connect(&state.plugins, session).await;
+    // A session a rule paused is announced to the console, which is the only
+    // thing that can let it go again. Nothing else is registered: a pause is
+    // rare, and the registry is meant to answer "which connections is somebody
+    // holding", not "which connections exist".
+    let pause = flow.holds().then(|| {
+        let gate = Arc::new(SessionPause::new(flow));
+        state.ws_pause.lock().unwrap().insert(session, gate.clone());
+        gate
+    });
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
     let up = tokio::spawn(pump(
@@ -237,7 +257,8 @@ pub async fn capturing_tunnel<A, B>(
             dir: Dir::Send,
             script: script.clone(),
             hooks: send_hooks,
-            ignore: ignore.send,
+            mode: flow.send,
+            pause: pause.clone(),
         },
         state.clone(),
         session,
@@ -249,94 +270,312 @@ pub async fn capturing_tunnel<A, B>(
             dir: Dir::Receive,
             script,
             hooks: receive_hooks,
-            ignore: ignore.receive,
+            mode: flow.receive,
+            pause: pause.clone(),
         },
-        state,
+        state.clone(),
         session,
     ));
     let _ = tokio::join!(up, down);
+    if pause.is_some() {
+        state.ws_pause.lock().unwrap().remove(&session);
+    }
 }
 
-/// Which directions `enable://ignoreSend` / `enable://ignoreReceive` silence.
+/// What `enable://` asked to happen to one direction of a session.
+///
+/// One value rather than a flag each, because that is what upstream keeps: a
+/// single `sendStatus`/`receiveStatus` per direction, `0` normal,
+/// `PAUSE_STATUS = 1`, `IGNORE_STATUS = 2` (`_original/lib/socket-mgr.js:13-14`).
+/// Modelling it as two booleans would admit a state upstream cannot reach —
+/// ignoring and pausing the same direction at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DirMode {
+    /// Deliver every frame, as an unruled session does.
+    #[default]
+    Pass,
+    /// `enable://pauseSend|pauseReceive` — hold the frames, in order, until the
+    /// console releases them. Unlike [`DirMode::Ignore`] this holds *control*
+    /// frames too: upstream pauses the byte stream, not the frames in it, so a
+    /// `close` or `ping` inside a held chunk is held with it
+    /// (`handleFrame`, `_original/lib/socket-mgr.js:232-247`). What keeps the
+    /// peers from timing out meanwhile is [`KEEPALIVE`], as it does upstream.
+    Pause,
+    /// `enable://ignoreSend|ignoreReceive` — capture the data frames but never
+    /// deliver them.
+    Ignore,
+}
+
+/// What `enable://` asked for each direction of a session.
 ///
 /// Kept apart from [`FramePlan`] deliberately: the plan collapses to
 /// [`FramePlan::default`] when no plugin is named, and folding the flags into it
 /// would lose them on exactly the sessions that have no plugin — which is most
 /// of the sessions anyone writes these rules for.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct IgnoreDirs {
-    /// Discard frames travelling client → server.
-    pub send: bool,
-    /// Discard frames travelling server → client.
-    pub receive: bool,
+pub struct FrameFlow {
+    /// Frames travelling client → server.
+    pub send: DirMode,
+    /// Frames travelling server → client.
+    pub receive: DirMode,
 }
 
-impl IgnoreDirs {
-    /// Read both flags off a resolved rule set.
+impl FrameFlow {
+    /// Read both directions off a resolved rule set.
     pub fn of(resolved: &Resolved) -> Self {
-        let (send, receive) = crate::proxy::apply::ignored_ws_dirs(resolved);
-        IgnoreDirs { send, receive }
+        let (pause_send, pause_receive) = crate::proxy::apply::paused_ws_dirs(resolved);
+        let (ignore_send, ignore_receive) = crate::proxy::apply::ignored_ws_dirs(resolved);
+        FrameFlow {
+            send: DirMode::of(pause_send, ignore_send),
+            receive: DirMode::of(pause_receive, ignore_receive),
+        }
+    }
+
+    /// Whether either direction starts held, and so needs a console control.
+    fn holds(&self) -> bool {
+        self.send == DirMode::Pause || self.receive == DirMode::Pause
+    }
+}
+
+impl DirMode {
+    /// Pause outranks ignore, as upstream's `else if` chain does
+    /// (`initStatus`, `_original/lib/socket-mgr.js:86-97`). `ignored_ws_dirs`
+    /// already applies that precedence; this is where it becomes unrepresentable.
+    fn of(pause: bool, ignore: bool) -> Self {
+        match (pause, ignore) {
+            (true, _) => DirMode::Pause,
+            (false, true) => DirMode::Ignore,
+            (false, false) => DirMode::Pass,
+        }
+    }
+}
+
+/// How often a paused direction sends the peer a keep-alive of the proxy's own.
+///
+/// A pause stops a direction's control frames along with its data, so a peer
+/// that has an idle timeout — most of them do — would close a connection that
+/// is merely being held. Upstream answers that by writing its own: an empty
+/// `pong` to the server on the client's leg and an empty `ping` to the client on
+/// the server's, every 22 seconds (`INTERVAL`, `PING`/`PONG`,
+/// `reqReceiver.ping`/`resReceiver.ping`,
+/// `_original/lib/socket-mgr.js:8,:11-12,:366-375,:496-505`).
+///
+/// Upstream also runs this timer while a direction is *ignoring*. This port does
+/// not: its ignore path forwards control frames untouched, so the endpoints'
+/// own keep-alive is still crossing and there is nothing to stand in for.
+const KEEPALIVE: Duration = Duration::from_secs(22);
+
+/// How much one paused direction will hold before it stops reading.
+///
+/// Upstream needs no such number. It holds the transform callback of the chunk
+/// it is on and stops reading the socket entirely (`handleFrame`,
+/// `_original/lib/socket-mgr.js:232-247`), so the kernel's receive buffer is the
+/// bound and at most one chunk is ever in whistle's own memory — at the price of
+/// the console being able to show nothing of what is waiting. This port reads
+/// ahead so it can capture and show each held frame, and read-ahead has to be
+/// bounded explicitly. On reaching either cap the leg stops taking frames from
+/// its reader, which stops reading, which back-pressures the peer exactly as
+/// upstream's paused socket does.
+///
+/// Two caps rather than one because either alone leaves a hole: a count would
+/// let 64 frames of 8 MiB through, and a byte budget alone would let four
+/// million one-byte frames through.
+///
+/// A leg that has stopped reading cannot see its peer leave — there is no way to
+/// watch a socket for an EOF you are not reading. Below the caps it still can,
+/// because it is still reading; at them, what notices is [`KEEPALIVE`] failing
+/// against the peer on the other side. A hold nobody ever lifts therefore costs
+/// one task and at most these many bytes, which is the same open-ended cost
+/// upstream's unread socket has.
+const MAX_HELD_FRAMES: usize = 64;
+/// The byte half of [`MAX_HELD_FRAMES`].
+const MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
+
+/// The pause state of one live WebSocket session: what the console reads, and
+/// what it releases.
+///
+/// Present in [`AppState::ws_pause`](crate::proxy::AppState::ws_pause) for
+/// exactly as long as the tunnel runs. A release for a session that has since
+/// closed finds nothing, which is the honest answer — its held frames stay
+/// flagged in the capture, having never been delivered.
+#[derive(Default)]
+pub struct SessionPause {
+    /// Frames travelling client → server.
+    pub send: DirPause,
+    /// Frames travelling server → client.
+    pub receive: DirPause,
+}
+
+impl SessionPause {
+    fn new(flow: FrameFlow) -> Self {
+        let gate = SessionPause::default();
+        gate.send.paused.store(flow.send == DirMode::Pause, Ordering::Relaxed);
+        gate.receive
+            .paused
+            .store(flow.receive == DirMode::Pause, Ordering::Relaxed);
+        gate
+    }
+
+    /// One direction by the name the capture and the API use for it.
+    pub fn dir(&self, name: &str) -> Option<&DirPause> {
+        match name {
+            "send" => Some(&self.send),
+            "receive" => Some(&self.receive),
+            _ => None,
+        }
+    }
+
+    /// The direction a leg is pumping.
+    fn of(&self, dir: Dir) -> &DirPause {
+        match dir {
+            Dir::Send => &self.send,
+            Dir::Receive => &self.receive,
+        }
+    }
+}
+
+/// One direction's half of a [`SessionPause`].
+#[derive(Default)]
+pub struct DirPause {
+    paused: AtomicBool,
+    held: AtomicUsize,
+    release: Notify,
+}
+
+impl DirPause {
+    /// Whether this direction is currently holding its frames back.
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// How many frames are waiting to go out.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// Let this direction go, and say how many frames that frees.
+    ///
+    /// Releasing ends the pause outright rather than letting one frame through,
+    /// because that is the only granularity upstream has: its console sets the
+    /// direction's status back to `0` and everything held goes out at once
+    /// (`setConnStatus`, `_original/lib/socket-mgr.js:63-84`). A direction that
+    /// was not paused is untouched, so a second click is harmless.
+    pub fn release(&self) -> usize {
+        let held = self.held();
+        self.paused.store(false, Ordering::Release);
+        // `notify_one` and not `notify_waiters`: the leg may be between waits,
+        // and only the permit-storing form survives that.
+        self.release.notify_one();
+        held
+    }
+
+    /// Wait for [`DirPause::release`]. Cancel-safe, so it can be a `select!` arm.
+    async fn released(&self) {
+        self.release.notified().await;
     }
 }
 
 /// How one direction of a session is to be treated: which way it flows, what may
 /// rewrite its frames, and whether they are delivered at all.
 ///
-/// The two directions differ only in these four things, so they travel together
-/// rather than as four positional arguments that could be crossed over.
+/// The two directions differ only in these things, so they travel together
+/// rather than as positional arguments that could be crossed over.
 struct Leg {
     dir: Dir,
     /// `frameScript://`, applied to text frames.
     script: Option<String>,
     /// The plugin hooks watching this direction, in rule order.
     hooks: Vec<FrameHook>,
-    /// `enable://ignoreSend|ignoreReceive` — capture the frames but do not
-    /// deliver them.
-    ignore: bool,
+    /// What `enable://` asked for this direction.
+    mode: DirMode,
+    /// The console-visible pause state, when a rule paused either direction.
+    pause: Option<Arc<SessionPause>>,
 }
 
-async fn pump<R, W>(mut r: R, mut w: W, leg: Leg, state: Arc<AppState>, session: u64)
+async fn pump<R, W>(r: R, w: W, leg: Leg, state: Arc<AppState>, session: u64)
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
     let Leg {
         dir,
         script,
-        mut hooks,
-        ignore,
+        hooks,
+        mode,
+        pause,
     } = leg;
-    let direction = dir.label();
-    let to_server = dir == Dir::Send;
-    loop {
-        let frame = match read_frame(&mut r).await {
-            Ok(Some(f)) => f,
-            _ => break,
-        };
+    let ctx = FrameCtx {
+        direction: dir.label(),
+        to_server: dir == Dir::Send,
+        script,
+        hooks,
+        mode,
+        state,
+        session,
+    };
+    match (mode, pause) {
+        (DirMode::Pause, Some(gate)) => pump_held(r, w, ctx, gate, dir).await,
+        // Everything else, which is very nearly every session: read, decide,
+        // write, with no companion task and no channel between the two.
+        _ => pump_direct(r, w, ctx).await,
+    }
+}
+
+/// Everything one leg needs to turn a frame it has read into the frame it
+/// delivers, and to record it on the way past.
+struct FrameCtx {
+    /// `"send"` or `"receive"` — the capture's own spelling of the direction.
+    direction: &'static str,
+    to_server: bool,
+    script: Option<String>,
+    hooks: Vec<FrameHook>,
+    mode: DirMode,
+    state: Arc<AppState>,
+    session: u64,
+}
+
+impl FrameCtx {
+    /// Run the script and the hooks over one frame and record it, returning the
+    /// payload to deliver — or `None` when it is not to be delivered at all: a
+    /// hook dropped it, or `enable://ignore…` discarded it.
+    ///
+    /// `held` marks the capture as waiting for a release rather than delivered.
+    async fn process(&mut self, frame: Frame, held: bool) -> Option<Bytes> {
         let mut payload = Bytes::from(frame.payload);
         if frame.opcode == OPCODE_TEXT {
             // Text frame: allow the script to rewrite it.
-            if let Some(script) = &script
-                && let Some(new) = std::str::from_utf8(&payload)
-                    .ok()
-                    .and_then(|text| crate::proxy::script::run_frame_script(script, direction, text))
+            if let Some(script) = &self.script
+                && let Some(new) = std::str::from_utf8(&payload).ok().and_then(|text| {
+                    crate::proxy::script::run_frame_script(script, self.direction, text)
+                })
             {
                 payload = Bytes::from(new);
             }
         }
-        if !hooks.is_empty() && is_data_frame(frame.opcode) {
-            match run_hooks(&mut hooks, direction, frame.fin, frame.opcode, payload).await {
+        if !self.hooks.is_empty() && is_data_frame(frame.opcode) {
+            match run_hooks(
+                &mut self.hooks,
+                self.direction,
+                frame.fin,
+                frame.opcode,
+                payload,
+            )
+            .await
+            {
                 Some(kept) => payload = kept,
                 // Dropped: it reaches neither the peer nor the capture, because
                 // it never happened as far as the other end is concerned.
-                None => continue,
+                None => return None,
             }
         }
         // Capture the (possibly rewritten) frame for the Network view. An
         // ignored frame is recorded too, flagged — upstream does the same
         // (`ignore`, `_original/lib/socket-mgr.js:401,:531`), so the view shows
-        // that a frame was dropped instead of just not showing it.
-        let mut record = WsFrame::new(session, direction, frame.opcode, &payload);
+        // that a frame was dropped instead of just not showing it. A held frame
+        // is flagged the same way for the same reason: what is waiting is worth
+        // more than a count of it.
+        let mut record = WsFrame::new(self.session, self.direction, frame.opcode, &payload);
+        record.held = held;
 
         // `enable://ignoreSend|ignoreReceive` discards this direction's data
         // frames. Control frames are exempt: dropping a `close` would leave the
@@ -344,22 +583,227 @@ where
         // `ping`/`pong` breaks the keep-alive the endpoints agreed on —
         // upstream's ignore path likewise only ever withholds data
         // (`opts.data`, `_original/lib/socket-mgr.js:249-274`).
-        if ignore && is_data_frame(frame.opcode) {
+        if self.mode == DirMode::Ignore && is_data_frame(frame.opcode) {
             record.ignored = true;
-            state.record_frame(record);
+            self.state.record_frame(record);
+            return None;
+        }
+        self.state.record_frame(record);
+        Some(payload)
+    }
+}
+
+/// What became of one frame on its way to the peer.
+#[derive(PartialEq, Eq)]
+enum Sent {
+    /// Written; the leg carries on.
+    Ok,
+    /// Written, and it was the close that ends the conversation.
+    Closed,
+    /// The peer is gone.
+    Failed,
+}
+
+/// Encode one frame onto the wire.
+async fn deliver<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    fin: bool,
+    opcode: u8,
+    payload: &[u8],
+    to_server: bool,
+) -> Sent {
+    if write_frame(w, fin, opcode, payload, to_server).await.is_err() {
+        return Sent::Failed;
+    }
+    if opcode == OPCODE_CLOSE {
+        return Sent::Closed;
+    }
+    Sent::Ok
+}
+
+/// The ordinary leg: read a frame, decide about it, write it.
+async fn pump_direct<R, W>(mut r: R, mut w: W, mut ctx: FrameCtx)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let frame = match read_frame(&mut r).await {
+            Ok(Some(f)) => f,
+            _ => break,
+        };
+        let (fin, opcode) = (frame.fin, frame.opcode);
+        let Some(payload) = ctx.process(frame, false).await else {
             continue;
-        }
-        state.record_frame(record);
-        if write_frame(&mut w, frame.fin, frame.opcode, &payload, to_server)
-            .await
-            .is_err()
-        {
-            break;
-        }
-        if frame.opcode == OPCODE_CLOSE {
+        };
+        if deliver(&mut w, fin, opcode, &payload, ctx.to_server).await != Sent::Ok {
             break;
         }
     }
+}
+
+/// A frame this leg has read, captured and is holding.
+type HeldFrame = (bool, u8, Bytes);
+
+/// The leg of a direction `enable://pauseSend|pauseReceive` held.
+///
+/// The read moves to a companion task so this one can wait on the peer and on
+/// the console's release at the same time. It has to: [`read_frame`] takes a
+/// frame in several reads, so cancelling it as a losing `select!` arm would
+/// discard the bytes it had already taken — and a release with nothing arriving
+/// behind it is precisely the case that has to work.
+async fn pump_held<R, W>(r: R, mut w: W, mut ctx: FrameCtx, pause: Arc<SessionPause>, dir: Dir)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let gate = pause.of(dir);
+    let (tx, mut rx) = mpsc::channel::<Frame>(1);
+    let reader = tokio::spawn(async move {
+        let mut r = r;
+        while let Ok(Some(frame)) = read_frame(&mut r).await {
+            if tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut held: Vec<HeldFrame> = Vec::new();
+    let mut held_bytes = 0usize;
+    // The probe runs on a fixed period from the moment the hold starts, not from
+    // the last thing that happened on this leg. A frame arriving on a held
+    // direction is exactly what the peer being written to *cannot* see, so
+    // letting one postpone the probe would defeat it. Its first tick is
+    // immediate and is taken here, which is where the period begins.
+    let mut probe = tokio::time::interval(KEEPALIVE);
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    probe.tick().await;
+
+    'leg: loop {
+        // The queue empties before anything behind it goes out, wherever the
+        // release happened to land — a pause that reordered the conversation it
+        // was asked to hold would be worse than no pause at all.
+        if !gate.paused()
+            && !held.is_empty()
+            && !flush(&mut w, &mut held, &mut held_bytes, &ctx, gate).await
+        {
+            break;
+        }
+        let frame = loop {
+            if !gate.paused() {
+                match rx.recv().await {
+                    Some(frame) => break frame,
+                    None => break 'leg,
+                }
+            }
+            let room = held.len() < MAX_HELD_FRAMES && held_bytes < MAX_HELD_BYTES;
+            tokio::select! {
+                // A release outranks a frame that arrived with it: the queue
+                // goes first either way, and taking it first says so plainly.
+                biased;
+                () = gate.released() => continue 'leg,
+                // Full: stop taking frames, so the reader stops reading and the
+                // peer is back-pressured. See `MAX_HELD_FRAMES`.
+                frame = rx.recv(), if room => match frame {
+                    Some(frame) => break frame,
+                    None => break 'leg,
+                },
+                _ = probe.tick() => {
+                    if !keepalive(&mut w, ctx.to_server).await {
+                        break 'leg;
+                    }
+                }
+            }
+        };
+        let (fin, opcode) = (frame.fin, frame.opcode);
+        let holding = gate.paused();
+        let Some(payload) = ctx.process(frame, holding).await else {
+            continue;
+        };
+        if holding {
+            held_bytes += payload.len();
+            held.push((fin, opcode, payload));
+            gate.held.store(held.len(), Ordering::Release);
+            continue;
+        }
+        if deliver(&mut w, fin, opcode, &payload, ctx.to_server).await != Sent::Ok {
+            break;
+        }
+    }
+    // This leg is over however it ended, and the reader may still be parked on a
+    // peer that is never going to speak again. Nothing is left to read what it
+    // would produce, so let it go and let it drop its half of the socket with it.
+    reader.abort();
+}
+
+/// Let a released direction's queue go, oldest first. `false` when the leg is
+/// over — the peer went away, or the queue held the close that ends it.
+///
+/// The captures are unmarked here rather than by the endpoint that lifted the
+/// pause because this task is the only writer of that mark, so there is no
+/// window in which a frame is recorded as held after its release. A frame still
+/// marked when the connection ended is one that genuinely never went anywhere.
+async fn flush<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    held: &mut Vec<HeldFrame>,
+    held_bytes: &mut usize,
+    ctx: &FrameCtx,
+    gate: &DirPause,
+) -> bool {
+    let mut sent = 0usize;
+    let mut alive = true;
+    for (fin, opcode, payload) in held.drain(..) {
+        match deliver(w, fin, opcode, &payload, ctx.to_server).await {
+            Sent::Ok => sent += 1,
+            Sent::Closed => {
+                sent += 1;
+                alive = false;
+                break;
+            }
+            Sent::Failed => {
+                alive = false;
+                break;
+            }
+        }
+    }
+    *held_bytes = 0;
+    gate.held.store(held.len(), Ordering::Release);
+    clear_held_marks(&ctx.state, ctx.session, ctx.direction, sent);
+    alive
+}
+
+/// Clear the `held` flag on the oldest `count` still-held captures of one
+/// direction. They were recorded in arrival order and go out in it, so the
+/// oldest `count` of them are exactly the ones just delivered.
+fn clear_held_marks(state: &AppState, session: u64, direction: &str, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let mut left = count;
+    let mut frames = state.ws_frames.lock().unwrap();
+    for frame in frames.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        if frame.session == session && frame.dir == direction && frame.held {
+            frame.held = false;
+            left -= 1;
+        }
+    }
+}
+
+/// Keep the peer this direction has gone quiet on from timing out. `false` once
+/// it has stopped listening.
+///
+/// The frames are the proxy's own and are deliberately not captured: upstream
+/// writes them straight to the socket, below the layer that reports frames
+/// (`res.write(PONG)` / `req.write(PING)`,
+/// `_original/lib/socket-mgr.js:370,:500`). An unsolicited pong is a legal
+/// unidirectional heartbeat (RFC 6455 §5.5.3); the ping asks the client for one
+/// back, which is what keeps *its* idle timer quiet too.
+async fn keepalive<W: AsyncWrite + Unpin>(w: &mut W, to_server: bool) -> bool {
+    let opcode = if to_server { OPCODE_PONG } else { OPCODE_PING };
+    write_frame(w, true, opcode, &[], to_server).await.is_ok()
 }
 
 /// Whether a frame carries application data, and so may be offered to a plugin.
@@ -492,15 +936,15 @@ mod tests {
     }
 
     fn spawn_tunnel(state: &Arc<AppState>, plan: FramePlan, script: Option<String>) -> Wire {
-        spawn_tunnel_with(state, plan, script, IgnoreDirs::default())
+        spawn_tunnel_with(state, plan, script, FrameFlow::default())
     }
 
-    /// As [`spawn_tunnel`], with the `ignore` flags a rule would supply.
+    /// As [`spawn_tunnel`], with the per-direction modes a rule would supply.
     fn spawn_tunnel_with(
         state: &Arc<AppState>,
         plan: FramePlan,
         script: Option<String>,
-        ignore: IgnoreDirs,
+        flow: FrameFlow,
     ) -> Wire {
         let (client, client_io) = tokio::io::duplex(1 << 16);
         let (server, upstream_io) = tokio::io::duplex(1 << 16);
@@ -509,7 +953,7 @@ mod tests {
             upstream_io,
             script,
             plan,
-            ignore,
+            flow,
             state.clone(),
             7,
         ));
@@ -726,7 +1170,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                IgnoreDirs { send: true, receive: false },
+                FrameFlow { send: DirMode::Ignore, receive: DirMode::Pass },
             );
 
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"muted", true)
@@ -764,7 +1208,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                IgnoreDirs { send: false, receive: true },
+                FrameFlow { send: DirMode::Pass, receive: DirMode::Ignore },
             );
 
             // Data from the origin is dropped…
@@ -792,6 +1236,343 @@ mod tests {
             assert!(frames.iter().any(|f| f.opcode == "ping" && !f.ignored));
             assert!(frames.iter().any(|f| f.preview == "sent" && !f.ignored));
         });
+    }
+
+    // ── enable://pauseSend | pauseReceive ──
+
+    /// The pause state of session 7, which every test here uses. Waits for it:
+    /// the tunnel registers itself from its own task, after dialling whatever
+    /// plugins the plan named.
+    async fn gate_of(state: &AppState) -> Arc<SessionPause> {
+        for _ in 0..10_000 {
+            let found = state.ws_pause.lock().unwrap().get(&7).cloned();
+            if let Some(gate) = found {
+                return gate;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("a paused session is registered for release");
+    }
+
+    /// How many of the captures are still waiting to be let go.
+    fn still_held(state: &AppState) -> usize {
+        state.ws_frames.lock().unwrap().iter().filter(|f| f.held).count()
+    }
+
+    /// Wait until `cond` holds. The legs pump on tasks of their own, so a test
+    /// that asserted the instant after it wrote would be asserting on a race.
+    /// The ten-second ceiling is a stuck-test guard, not a deadline: these
+    /// settle in milliseconds on a machine that is not otherwise busy.
+    async fn until(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..10_000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// True when nothing crosses in 50ms — as close to "never" as a test gets.
+    async fn stays_silent<R: AsyncRead + Unpin>(r: &mut R) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), read_frame(r))
+            .await
+            .is_err()
+    }
+
+    /// The per-direction modes a rule set resolves to, as the proxy reads them.
+    fn flow_for(rules: &str) -> FrameFlow {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(rules);
+        let info = apply::build_req_info(
+            "GET",
+            "ws",
+            "ws.test",
+            80,
+            "/chat",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        FrameFlow::of(&mgr.resolve_once(&info, false))
+    }
+
+    /// `enable://pauseSend` holds what the client sends until someone releases
+    /// it — and then lets all of it out at once, in the order it arrived, which
+    /// is the only granularity upstream's console offers either
+    /// (`setConnStatus`, `_original/lib/socket-mgr.js:63-84`).
+    #[test]
+    fn pause_send_holds_every_frame_until_the_console_releases_it() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://pauseSend\n");
+            let mut wire = spawn_tunnel_with(
+                &state,
+                plan,
+                None,
+                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass },
+            );
+
+            for payload in [&b"one"[..], b"two"] {
+                write_frame(&mut wire.client, true, OPCODE_TEXT, payload, true)
+                    .await
+                    .expect("client write");
+            }
+            until("both frames held", || still_held(&state) == 2).await;
+            assert!(stays_silent(&mut wire.server).await, "and none of it crosses");
+
+            let gate = gate_of(&state).await;
+            assert!(gate.send.paused());
+            assert_eq!(gate.send.held(), 2);
+            assert!(!gate.receive.paused(), "the other direction was not asked for");
+
+            // Which is also how we know the tunnel is alive rather than merely
+            // quiet: the unheld direction still carries.
+            write_frame(&mut wire.server, true, OPCODE_TEXT, b"down", false)
+                .await
+                .expect("server write");
+            let back = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            assert_eq!(back.payload, b"down");
+
+            assert_eq!(gate.send.release(), 2, "the release says what it freed");
+            for expected in [&b"one"[..], b"two"] {
+                let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+                assert_eq!(got.payload, expected, "in the order they were sent");
+            }
+            // A frame that went out is no longer waiting, so the console stops
+            // showing it as such.
+            until("the marks cleared", || still_held(&state) == 0).await;
+            assert_eq!(gate.send.held(), 0);
+            assert!(!gate.send.paused());
+
+            // And the direction is open from here on, not held again.
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"three", true)
+                .await
+                .expect("client write");
+            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            assert_eq!(got.payload, b"three");
+            finish(wire).await;
+
+            let frames = state.ws_frames.lock().unwrap();
+            assert_eq!(frames.len(), 4, "every frame is captured as it arrives");
+            assert!(frames.iter().all(|f| !f.ignored), "held is not dropped");
+        });
+    }
+
+    /// The mirror image, and the difference from `ignore`: a pause holds this
+    /// direction's **control** frames too. Upstream pauses the byte stream, so a
+    /// `ping` sharing a chunk with held data is held with it
+    /// (`handleFrame`, `_original/lib/socket-mgr.js:232-247`) — where its ignore
+    /// path only ever withholds data.
+    #[test]
+    fn pause_receive_holds_one_direction_only_control_frames_included() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://pauseReceive\n");
+            let mut wire = spawn_tunnel_with(
+                &state,
+                plan,
+                None,
+                FrameFlow { send: DirMode::Pass, receive: DirMode::Pause },
+            );
+
+            write_frame(&mut wire.server, true, OPCODE_TEXT, b"later", false)
+                .await
+                .expect("server write");
+            write_frame(&mut wire.server, true, OPCODE_PING, b"", false)
+                .await
+                .expect("server ping");
+            until("both frames held", || still_held(&state) == 2).await;
+            assert!(stays_silent(&mut wire.client).await, "the ping waits with the text");
+
+            // The client's own direction is untouched by this flag.
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"sent", true)
+                .await
+                .expect("client write");
+            let up = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            assert_eq!(up.payload, b"sent");
+
+            let gate = gate_of(&state).await;
+            assert_eq!(gate.receive.release(), 2);
+            let text = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            assert_eq!(text.payload, b"later");
+            let ping = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            assert_eq!(ping.opcode, OPCODE_PING);
+            finish(wire).await;
+        });
+    }
+
+    /// The hold is bounded by a frame count, because nothing else bounds it: this
+    /// port reads ahead so the console can show what is waiting, where upstream
+    /// simply stops reading the socket. Past the bound the leg stops taking
+    /// frames and the peer is back-pressured instead — nothing is lost, and
+    /// nothing beyond the bound is captured until the release.
+    #[test]
+    fn the_hold_queue_stops_at_its_frame_bound() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://pauseSend\n");
+            let mut wire = spawn_tunnel_with(
+                &state,
+                plan,
+                None,
+                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass },
+            );
+
+            let total = MAX_HELD_FRAMES + 16;
+            for i in 0..total {
+                write_frame(&mut wire.client, true, OPCODE_TEXT, format!("{i}").as_bytes(), true)
+                    .await
+                    .expect("client write");
+            }
+            let gate = gate_of(&state).await;
+            until("the queue to fill", || gate.send.held() == MAX_HELD_FRAMES).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(gate.send.held(), MAX_HELD_FRAMES, "and to stay there");
+            assert_eq!(still_held(&state), MAX_HELD_FRAMES, "nothing past it is captured");
+
+            // The back-pressured frames were never dropped, only not yet read.
+            gate.send.release();
+            for i in 0..total {
+                let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+                assert_eq!(got.payload, format!("{i}").as_bytes(), "all of it, in order");
+            }
+            finish(wire).await;
+        });
+    }
+
+    /// And by a byte budget, because 64 frames of 8 MiB is not a bound.
+    #[test]
+    fn the_hold_queue_stops_at_its_byte_bound_too() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://pauseSend\n");
+            let wire = spawn_tunnel_with(
+                &state,
+                plan,
+                None,
+                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass },
+            );
+
+            // Five one-mebibyte frames against a four-mebibyte budget. They go
+            // out from a task of their own: the fifth cannot be written until
+            // the release, which is the whole point.
+            let chunk = vec![b'x'; 1024 * 1024];
+            let mut wire = wire;
+            let mut client = wire.client;
+            let writer = tokio::spawn(async move {
+                for _ in 0..5 {
+                    write_frame(&mut client, true, OPCODE_BINARY, &chunk, true)
+                        .await
+                        .expect("client write");
+                }
+                client
+            });
+
+            let gate = gate_of(&state).await;
+            let cap = MAX_HELD_BYTES / (1024 * 1024);
+            until("the budget to fill", || gate.send.held() == cap).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(gate.send.held(), cap, "the fifth frame is not held, it is unread");
+
+            gate.send.release();
+            for _ in 0..5 {
+                let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+                assert_eq!(got.payload.len(), 1024 * 1024);
+            }
+            wire.client = writer.await.expect("writer");
+            finish(wire).await;
+        });
+    }
+
+    /// A session nobody paused is not registered at all — the registry answers
+    /// "which connections is somebody holding", and an entry per WebSocket would
+    /// make it answer something else. A paused one is registered for exactly as
+    /// long as it lasts, and frames still held when it ends stay flagged: they
+    /// never reached the peer, and the capture should not pretend otherwise.
+    #[test]
+    fn only_a_paused_session_is_registered_and_only_while_it_lasts() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plain = spawn_tunnel(&state, plan_for(&state, "ws.test resHeaders://x=1\n"), None);
+            write_frame(&mut { plain.client }, true, OPCODE_TEXT, b"hi", true)
+                .await
+                .expect("client write");
+            assert!(state.ws_pause.lock().unwrap().is_empty());
+
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://pauseSend\n");
+            let mut wire = spawn_tunnel_with(
+                &state,
+                plan,
+                None,
+                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass },
+            );
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"stranded", true)
+                .await
+                .expect("client write");
+            until("the frame held", || still_held(&state) == 1).await;
+
+            // A peer that leaves while its frames are held ends the leg even
+            // though nothing released it.
+            finish(wire).await;
+            assert!(
+                state.ws_pause.lock().unwrap().is_empty(),
+                "a session that ended cannot be released"
+            );
+            let frames = state.ws_frames.lock().unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(frames[0].held, "and what it was holding is still marked as held");
+        });
+    }
+
+    /// A held direction is a silent one, and a silent connection is one an idle
+    /// timeout closes. Upstream answers that with a keep-alive of its own every
+    /// 22 seconds while the pause lasts (`INTERVAL`, `PING`,
+    /// `_original/lib/socket-mgr.js:8,:11,:496-505`); so does this. It is the
+    /// proxy's own traffic, so it is not captured as part of the conversation.
+    #[test]
+    fn a_held_direction_keeps_its_peer_alive() {
+        rt().block_on(async {
+            // The clock is the test's, not the wall's: 22 seconds of it pass as
+            // soon as everything else has stopped.
+            tokio::time::pause();
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://pauseReceive\n");
+            let mut wire = spawn_tunnel_with(
+                &state,
+                plan,
+                None,
+                FrameFlow { send: DirMode::Pass, receive: DirMode::Pause },
+            );
+
+            let probe = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            assert_eq!(probe.opcode, OPCODE_PING, "with nothing at all flowing");
+            assert!(probe.payload.is_empty());
+            assert!(
+                state.ws_frames.lock().unwrap().is_empty(),
+                "the proxy's own keep-alive is not part of the capture"
+            );
+            finish(wire).await;
+        });
+    }
+
+    /// The two flags of one direction are one status upstream, and it tests the
+    /// pause first (`initStatus`, `_original/lib/socket-mgr.js:86-97`), so a
+    /// direction that names both is paused rather than ignored — and stays open
+    /// once released instead of quietly starting to drop.
+    #[test]
+    fn pause_outranks_ignore_on_the_same_direction() {
+        assert_eq!(flow_for("ws.test enable://pauseSend\n").send, DirMode::Pause);
+        assert_eq!(flow_for("ws.test enable://ignoreSend\n").send, DirMode::Ignore);
+        assert_eq!(flow_for("ws.test resHeaders://x=1\n").send, DirMode::Pass);
+
+        let both = flow_for("ws.test enable://pauseSend|ignoreSend\n");
+        assert_eq!(both.send, DirMode::Pause);
+        assert_eq!(both.receive, DirMode::Pass);
+
+        let mixed = flow_for("ws.test enable://pauseReceive|ignoreSend\n");
+        assert_eq!(mixed.send, DirMode::Ignore, "each direction is judged alone");
+        assert_eq!(mixed.receive, DirMode::Pause);
     }
 
     /// Dropping a *fragment* empties it instead of removing it: the message

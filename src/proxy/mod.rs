@@ -18,7 +18,7 @@ pub mod upstream;
 pub mod webui;
 pub mod ws;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -173,6 +173,11 @@ pub struct AppState {
     pub sessions: Mutex<VecDeque<Session>>,
     /// Bounded ring buffer of captured WebSocket frames, keyed by session id.
     pub ws_frames: Mutex<VecDeque<WsFrame>>,
+    /// The live WebSocket sessions a rule paused, so the console can find one
+    /// and let it go again. Only `enable://pauseSend|pauseReceive` puts an entry
+    /// here, and the tunnel removes its own when it ends, so this holds exactly
+    /// the connections someone is waiting on — see [`ws::SessionPause`].
+    pub ws_pause: Mutex<HashMap<u64, Arc<ws::SessionPause>>>,
     next_id: AtomicU64,
     /// Optional session persistence (JSONL on disk).
     session_store: Option<persist::SessionStore>,
@@ -210,6 +215,7 @@ impl AppState {
             plugins,
             sessions: Mutex::new(VecDeque::new()),
             ws_frames: Mutex::new(VecDeque::new()),
+            ws_pause: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             session_store: None,
             observer: std::sync::OnceLock::new(),
@@ -998,6 +1004,11 @@ pub struct WsFrame {
     /// the same thing (`ignore`, `_original/lib/socket-mgr.js:401,:531`) so the
     /// view shows a dropped frame rather than a gap.
     pub ignored: bool,
+    /// True while `enable://pauseSend|pauseReceive` is holding this frame: it
+    /// was seen and recorded, and is waiting for someone to release it from the
+    /// console. Cleared when it goes out; a frame still marked when the
+    /// connection ended never reached the peer at all.
+    pub held: bool,
 }
 
 impl WsFrame {
@@ -1029,6 +1040,7 @@ impl WsFrame {
             len: payload.len(),
             preview,
             ignored: false,
+            held: false,
         }
     }
 }
@@ -3464,10 +3476,11 @@ async fn serve_upgrade(
     } else {
         ws::FramePlan::default()
     };
-    // Which directions `enable://ignoreSend|ignoreReceive` silences. Read here
-    // rather than inside the plan: the plan collapses to its default when no
-    // plugin is named, and these flags have to survive that.
-    let frame_ignore = ws::IgnoreDirs::of(resolved);
+    // What `enable://ignoreSend|ignoreReceive|pauseSend|pauseReceive` asked to
+    // happen to each direction. Read here rather than inside the plan: the plan
+    // collapses to its default when no plugin is named, and these flags have to
+    // survive that.
+    let frame_flow = ws::FrameFlow::of(resolved);
     let client_upgrade = hyper::upgrade::on(&mut req);
 
     // Build the upstream handshake request (upgrades carry no body, so
@@ -3534,7 +3547,7 @@ async fn serve_upgrade(
                         u,
                         frame_script,
                         frame_plan,
-                        frame_ignore,
+                        frame_flow,
                         state,
                         session_id,
                     )
