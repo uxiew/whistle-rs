@@ -1447,6 +1447,14 @@ fn value_source(op: &RuleOp) -> Option<ValueSource> {
     if value.is_empty() {
         return None;
     }
+    // A URL on `re[qs]Cors://` is the **origin**, not a location: upstream tests
+    // `isCors` and folds a `GEN_URL_RE` value into `{ origin: value }` before
+    // `readRuleValue` is ever reached (`_original/lib/util/index.js:1344,:1361-1370`).
+    // `GEN_URL_RE` (`:44`) also admits the scheme-relative `//host`, so both
+    // spellings are excluded here.
+    if is_cors_origin(op, value) {
+        return None;
+    }
     // [`is_http_url`] is whistle's `HTTP_RE` (`util/common.js:58`), which is the
     // test `pluginMgr.resolveKey` uses to decide that a value is fetched rather
     // than read (`lib/plugins/index.js:1521-1528`). It wants an explicit scheme,
@@ -1465,6 +1473,21 @@ fn value_source(op: &RuleOp) -> Option<ValueSource> {
     let loadable = LOADABLE_TEXT_OPS.contains(&op.protocol.as_str())
         || LOADABLE_FILE_ONLY_OPS.contains(&op.protocol.as_str());
     loadable.then(|| ValueSource::File(value.to_string()))
+}
+
+/// Is this a `re[qs]Cors://` value that whistle reads as an origin URL rather
+/// than as somewhere to read from? See [`value_source`].
+fn is_cors_origin(op: &RuleOp, value: &str) -> bool {
+    if op.protocol != "reqCors" && op.protocol != "resCors" {
+        return false;
+    }
+    // `GEN_URL_RE = /^\s*(?:https?:)?\/\/\w[^\s]*\s*$/i` — a word character has
+    // to follow the `//`, which is what separates `//cdn.test/x` from a path.
+    let rest = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        .or_else(|| value.strip_prefix("//"));
+    matches!(rest.and_then(|r| r.chars().next()), Some(c) if c.is_alphanumeric() || c == '_')
 }
 
 /// Does this value name a filesystem path outright? See [`value_source`] for why
@@ -6922,8 +6945,13 @@ mod tests {
         assert_eq!(resolved.value("resBody"), Some(""));
     }
 
-    /// Values that are **not** locations are not read — the loader must cost a
-    /// rule set that does not use it nothing but a walk.
+    /// Values that are **not** locations are not read — a rule set that does not
+    /// use the feature must cost a walk over its own operators and nothing else.
+    ///
+    /// Asserted on the gate rather than on the outcome: a value the loader
+    /// wrongly claimed would still *look* untouched afterwards (a failed read
+    /// leaves a JSON operator's text alone), and a wrongly claimed URL would
+    /// quietly become an outbound request with a 16-second budget.
     #[test]
     fn only_a_value_shaped_like_a_location_is_read() {
         let untouched = [
@@ -6935,17 +6963,41 @@ mod tests {
             // A bare relative value stays the literal this port documents.
             ("resBody", "console.log('patched')"),
             ("resAppend", "tail"),
+            ("reqBody", "INJECTED"),
             // A URL on the js/css families still means `<script src=…>`.
             ("jsAppend", "https://cdn.test/a.js"),
             ("cssAppend", "https://cdn.test/a.css"),
+            // …and a URL on `re[qs]Cors://` is the allowed **origin**, which
+            // upstream folds into `{origin: …}` before it would read anything.
+            ("resCors", "https://app.test"),
+            ("reqCors", "//app.test"),
             // Operators outside the loadable set keep their value whatever its
             // shape: `file://` does its own reading, `redirect://` is a target.
             ("resType", "/json"),
             ("redirect", "https://b.com/x"),
+            ("file", "/tmp/mock.json"),
+            ("rulesFile", "/tmp/extra.rules"),
         ];
         for (proto, value) in untouched {
-            let resolved = loaded(&format!("a.com {proto}://{value}\n"));
-            assert_eq!(resolved.value(proto), Some(value), "{proto}://{value}");
+            let resolved = resolve(&format!("a.com {proto}://{value}\n"), "http://a.com/");
+            let op = resolved.get(proto).expect(proto);
+            assert_eq!(value_source(op), None, "{proto}://{value}");
+        }
+
+        // The mirror image, so the gate cannot be "always no".
+        for (proto, value, want) in [
+            ("reqHeaders", "/etc/h.json", ValueSource::File("/etc/h.json".into())),
+            ("resBody", "~/mock.html", ValueSource::File("~/mock.html".into())),
+            ("jsAppend", "/tmp/d.js", ValueSource::File("/tmp/d.js".into())),
+            (
+                "resBody",
+                "https://cdn.test/m.json",
+                ValueSource::Url("https://cdn.test/m.json".into()),
+            ),
+        ] {
+            let resolved = resolve(&format!("a.com {proto}://{value}\n"), "http://a.com/");
+            let op = resolved.get(proto).expect(proto);
+            assert_eq!(value_source(op), Some(want), "{proto}://{value}");
         }
     }
 

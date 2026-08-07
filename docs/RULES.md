@@ -375,6 +375,11 @@ which is the documented one — and never fetches for those six.
 starts at the root (`/tmp/x`), the home directory (`~/x`, also the full-width
 `～/x`), a Windows drive (`C:\x`), or an explicit `./` / `../`.
 
+One exception, and it is upstream's: a URL on `reqCors://` / `resCors://` is the
+allowed **origin**, folded into `{"origin":…}` before anything would be read
+(`isCors`, `_original/lib/util/index.js:1344,:1361-1370`). `resCors://https://app.test`
+is a CORS rule, not a fetch. A *path* there is still read.
+
 > **Deliberately narrower than upstream.** whistle has no shape test: for the
 > text operators *every* non-inline value is a path, and a bare
 > `resBody://patched` is a read of `./patched` — relative to the rules file's
