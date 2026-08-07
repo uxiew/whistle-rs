@@ -1102,11 +1102,24 @@ or a bare `!` (`includeFilter://`, `includeFilter://!`); a header key left empty
 own `!` (`reqH.!!=v` — the first `!` is the value's); and an `i:`/`ip:`/`clientIp:`/
 `serverIp:` whose value is neither an address nor a regexp (`i:localhost`).
 
-That is the opposite of a condition that merely never holds, which *stops* the rule —
-and the two are a character apart. A header key that was empty to begin with is kept
-(`reqH.=v` asks for a header named `""`), and a name with nothing after its separator
-is not a condition at all (`includeFilter://reqH.` is a URL pattern no URL matches).
-Each is upstream's answer, measured.
+A dropped condition **fails open**: it is as if it were never written, so the line
+widens whichever spelling carried it. That is worth knowing precisely, because it is
+the reverse of what a malformed [pattern](#patterns) does — a pattern that fails its
+own checks matches nothing and silences its one rule, while a condition that fails
+these unleashes the rule it was gating. The blast radius is opposite for the same
+kind of typo.
+
+The sharp case is an exemption. `excludeFilter://i:127.0.0.1` keeps a rule off local
+traffic; write `excludeFilter://i:localhost` and the condition is dropped, so the rule
+applies to *everything*, local traffic included. Nothing reports it.
+
+A condition that merely **never holds** is a different thing, and only on the include
+side: it stops an include dead, while leaving an exclude as inert as a dropped one.
+Two spellings a character apart land on either side of that line — a header key empty
+to begin with is kept (`reqH.=v` asks for a header named `""`, and no message has
+one), and a name with nothing after its separator is not a condition at all
+(`includeFilter://reqH.` is a URL pattern no URL matches). Each is upstream's answer,
+measured.
 
 ### Disabling operators
 
