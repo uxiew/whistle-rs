@@ -158,6 +158,14 @@ A pattern with **no host** matches nothing: `http://`, `http:///api`, `:80/api`
 and `///example.com` are all dead text, because upstream compares the pattern
 against the request URL and every URL has an authority.
 
+That is the general answer for a pattern nobody can evaluate — no host, a regexp
+that will not compile, a port that is not a number: it matches **nothing**, and
+the line it is on does nothing. A pattern is the gate itself rather than a
+modifier on one, so there is no third state for it to fall into and the failure
+is always to leave the gate shut. A [filter condition](#filter-conditions) is
+the modifier, and it does have one — which is why an unparseable *filter* is the
+more dangerous of the two, and is written up there rather than here.
+
 A pattern may carry a query **instead of** a path — `example.com?a=1` means
 `example.com/?a=1` — and such a pattern still counts as "a host and nothing
 else", so it applies on any port.
