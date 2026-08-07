@@ -4507,6 +4507,51 @@ mod documented_rules {
         assert_eq!(DOCUMENTED.len(), 92, "the sidebar had 92 entries when this was written");
     }
 
+    /// Every documented rule is *measured* against real whistle, not merely
+    /// recognised by the parser.
+    ///
+    /// The test above asks the parser a question the parser answers. This one
+    /// asks whether anybody ever put the rule in front of the real thing —
+    /// `tests/differential/` is where that happens, and a rule with no case
+    /// there has been verified by reading only.
+    ///
+    /// It exists because the coverage figure kept being *quoted*. Twice today a
+    /// number survived several rounds of reporting purely because using it never
+    /// re-derived it; the remedy is to make quoting it the same act as running
+    /// it. A name appearing in a corpus is a weak claim — it says a case exists,
+    /// not that the case discriminates — but it is a claim that cannot rot
+    /// silently, and today's other lesson is that the weak checks are the ones
+    /// worth automating.
+    #[test]
+    fn every_documented_rule_has_a_differential_case() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/differential");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            // A checkout without the bench is not a failing checkout.
+            return;
+        };
+        let mut corpus = String::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "js")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                corpus.push_str(&text);
+            }
+        }
+        assert!(
+            corpus.contains("reqHeaders://"),
+            "read no corpus at all from {dir:?} — the check would pass vacuously"
+        );
+        let missing: Vec<_> = DOCUMENTED
+            .iter()
+            .filter(|name| !corpus.contains(&format!("{name}://")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "documented but never put in front of real whistle: {missing:?}"
+        );
+    }
+
     /// The same walk, printed. Not a gate — a report, for when the question is
     /// "what does this port do with each of them" rather than "does it".
     ///
