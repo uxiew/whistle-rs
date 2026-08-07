@@ -3725,3 +3725,163 @@ mod parse_text_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod documented_rules {
+    //! Every rule the documentation lists, checked against the parser.
+    //!
+    //! The list is the sidebar of <https://wproxy.org/docs/rules/>, which is the
+    //! contract a user reads. Checking against it is a different question from
+    //! checking against `protocols.js`: the docs name aliases and destination
+    //! forms the registry does not (`reqMerge`, `tlsOptions`, `ws`, `tunnel`),
+    //! and they are what people actually type.
+    //!
+    //! Grepping for the names was tried first and answered wrong twice — once
+    //! because a name is built with `format!`, once because `"intercept"` also
+    //! appears as a JSON key in an unrelated hook. So this asks the parser.
+
+    use super::*;
+
+    /// What one documented name turns into when a rule is written with it.
+    #[derive(PartialEq, Debug)]
+    enum Lands {
+        /// A named operator, after alias folding — the ordinary case. The
+        /// string is the protocol as resolved, so an alias shows what it became.
+        Operator(String),
+        /// A destination rewrite. Correct for the `Map Remote` family: a
+        /// `ws://…` token *is* a URL, and upstream files it the same way.
+        Destination,
+        /// A line property, not an operator (`lineProps`).
+        LineProp,
+        /// A filter condition rather than an operator.
+        Filter,
+        /// Nothing at all: the name configures nothing.
+        Nothing,
+    }
+
+    fn lands(name: &str) -> Lands {
+        // A value shaped so every family has something plausible to parse.
+        let value = match name {
+            "lineProps" => "important",
+            "excludeFilter" | "includeFilter" => "m:GET",
+            _ => "x",
+        };
+        // `lineProps` is a modifier, not an operator: a line carrying nothing
+        // else configures nothing and is dropped — by this port and by upstream
+        // alike. So it is probed alongside an operator, which is the only way it
+        // is ever written.
+        let line = match name {
+            "lineProps" => format!("example.com ua://probe {name}://{value}\n"),
+            _ => format!("example.com {name}://{value}\n"),
+        };
+        let rules = parse_text(&line);
+        let Some(rule) = rules.first() else {
+            return Lands::Nothing;
+        };
+        if name == "lineProps" {
+            return match rule.ops.first().is_some_and(|op| op.props.has("important")) {
+                true => Lands::LineProp,
+                false => Lands::Nothing,
+            };
+        }
+        if !rule.filters.is_empty() && rule.ops.is_empty() {
+            return Lands::Filter;
+        }
+        match rule.ops.first() {
+            None => Lands::Nothing,
+            Some(op) if op.protocol == protocols::URL_REPLACE => Lands::Destination,
+            Some(op) => Lands::Operator(op.protocol.clone()),
+        }
+    }
+
+    /// The 92 names the documentation's rules sidebar lists.
+    const DOCUMENTED: &[&str] = &[
+        // Map Local
+        "file", "xfile", "tpl", "xtpl", "rawfile", "xrawfile",
+        // Map Remote — destinations, not named operators
+        "https", "http", "wss", "ws", "tunnel",
+        // DNS spoofing
+        "host", "xhost", "proxy", "xproxy", "https-proxy", "xhttps-proxy", "socks", "xsocks", "pac",
+        // Rewrite request
+        "urlParams", "pathReplace", "sniCallback", "method", "tlsOptions", "reqHeaders",
+        "forwardedFor", "ua", "auth", "cache", "referer", "reqType", "reqCharset", "reqCookies",
+        "reqCors", "reqBody", "reqMerge", "reqPrepend", "reqAppend", "reqReplace", "reqWrite",
+        "reqWriteRaw", "reqRules", "reqScript",
+        // Rewrite response
+        "statusCode", "replaceStatus", "redirect", "locationHref", "resHeaders", "responseFor",
+        "resType", "resCharset", "resCookies", "attachment", "resCors", "resBody", "resMerge",
+        "resPrepend", "resAppend", "resReplace", "htmlPrepend", "htmlBody", "htmlAppend",
+        "cssPrepend", "cssBody", "cssAppend", "jsPrepend", "jsBody", "jsAppend", "trailers",
+        "resWrite", "resWriteRaw", "resRules", "resScript", "frameScript",
+        // General
+        "pipe", "delete", "headerReplace",
+        // Throttle
+        "reqDelay", "resDelay", "reqSpeed", "resSpeed",
+        // Tools
+        "weinre", "log",
+        // Settings
+        "style", "enable", "disable", "lineProps",
+        // Filters
+        "excludeFilter", "includeFilter", "ignore", "skip",
+    ];
+
+    /// **What this proves and what it does not.** It proves every documented
+    /// name reaches an operator rather than falling through the parser. It says
+    /// nothing about whether that operator *behaves* like upstream's — that is
+    /// what the unit tests and `tests/differential` are for, and it is the
+    /// harder half. `style` is recognised here and deliberately has no traffic
+    /// effect at all (it colours a row in whistle's own rule list).
+    ///
+    /// Not one of the 92 may configure nothing.
+    ///
+    /// `Destination` is a pass for the `Map Remote` family and only for it —
+    /// those *are* URLs, and a name landing there by accident (because the
+    /// parser did not recognise it) is exactly the fail-open this port has
+    /// found and fixed four times.
+    #[test]
+    fn every_documented_rule_is_recognised() {
+        const MAP_REMOTE: &[&str] = &["https", "http", "wss", "ws", "tunnel"];
+        let mut missing = Vec::new();
+        let mut stray = Vec::new();
+        for name in DOCUMENTED {
+            match lands(name) {
+                Lands::Nothing => missing.push(*name),
+                Lands::Destination if !MAP_REMOTE.contains(name) => stray.push(*name),
+                _ => {}
+            }
+        }
+        assert!(missing.is_empty(), "configure nothing: {missing:?}");
+        assert!(
+            stray.is_empty(),
+            "silently became a destination rewrite, which is fail-open: {stray:?}"
+        );
+        assert_eq!(DOCUMENTED.len(), 92, "the sidebar had 92 entries when this was written");
+    }
+
+    /// The same walk, printed. Not a gate — a report, for when the question is
+    /// "what does this port do with each of them" rather than "does it".
+    ///
+    /// `cargo test --lib -- --ignored --nocapture documented_rules::report`
+    #[test]
+    #[ignore]
+    fn report() {
+        let mut by_kind: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+        for name in DOCUMENTED {
+            let kind = match lands(name) {
+                Lands::Operator(p) => match *name == p {
+                    true => "operator".to_string(),
+                    false => format!("alias -> {p}"),
+                },
+                Lands::Destination => "destination rewrite".to_string(),
+                Lands::LineProp => "line property".to_string(),
+                Lands::Filter => "filter condition".to_string(),
+                Lands::Nothing => "NOTHING".to_string(),
+            };
+            by_kind.entry(kind).or_default().push(name);
+        }
+        println!("\n{} documented rules\n", DOCUMENTED.len());
+        for (kind, names) in &by_kind {
+            println!("  {:22} {:>3}   {}", kind, names.len(), names.join(" "));
+        }
+    }
+}
