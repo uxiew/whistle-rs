@@ -2305,8 +2305,23 @@ Known gaps in the operator layer, deliberately left:
   them. They are *skipped* rather than run as JavaScript — the script whistle-rs
   executes is the first entry not spelled `resRules://`, which is the one
   upstream executes too.
-- **Injected text is UTF-8.** whistle re-encodes it into the response's declared
-  charset; a `charset=gbk` page will see mojibake in the injected fragment.
+- **A response with no declared charset is not sniffed.** When a `charset=` is
+  present the response operators honour it — the body is decoded before the text
+  transforms and re-encoded after, and injected values are written in that
+  charset, as whistle does. When there is none, whistle reads the first 25 KB and
+  guesses UTF-8 or GB18030; whistle-rs treats the body as UTF-8 and, if it is not,
+  leaves it alone. So a non-UTF-8 page that never says so is rewritten by whistle
+  and passed through here.
+- **A request body's charset is not undone.** whistle wraps `reqReplace://` in the
+  same decode/encode pair it uses for responses; whistle-rs works on the bytes, so
+  the operator is a no-op on a non-UTF-8 request body.
+- **A response trailer section only reaches clients that asked for one.** The
+  origin's trailers and `trailers://` are both sent only when the client's request
+  carried `TE: trailers` — hyper's HTTP/1 server drops the trailer section
+  otherwise (`Conn::write_trailers`, hyper 1.10.1 `src/proto/h1/conn.rs:729-733`,
+  from the `TE` header read at `conn.rs:328-332`). whistle sends them regardless.
+  Nothing else about the response changes; `curl --raw -H 'TE: trailers'` shows the
+  full behaviour.
 - **`params://` into a body is buffered, not streamed.** whistle rewrites a
   multipart body part by part so an upload never lands in memory; whistle-rs has
   the body in hand already (every other request-body operator buffers) and splits

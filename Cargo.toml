@@ -18,6 +18,11 @@ brotli = "8"
 bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"
+# The response charset round-trip: whistle runs its text transforms inside an
+# `iconv` decode/encode pair keyed on `charset=` (`getPipeIconvStream`,
+# `_original/lib/util/index.js:1622-1664`). Without one, `resReplace://` on a
+# `charset=gbk` page found nothing and did nothing.
+encoding_rs = "0.8"
 flate2 = "1"
 http-body-util = "0.1.3"
 hyper = { version = "1.10.1", features = ["http1", "server", "client", "http2"] }
@@ -28,7 +33,13 @@ regex = "1.12.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+# `preserve_order`: whistle's JSON bodies are JavaScript objects, which keep
+# insertion order. Without this `serde_json::Map` is a `BTreeMap` and every body
+# it re-serialises comes back alphabetised — `resMerge://{"extra":1}` over
+# `{"a":1,"keep":"yes"}` returned `{"a":1,"extra":1,"keep":"yes"}` where whistle
+# returns `{"a":1,"keep":"yes","extra":1}`. The bytes a client receives are not
+# the place to reorder anything.
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = "0.1.44"

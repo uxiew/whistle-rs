@@ -409,9 +409,10 @@ mod tests {
         };
         assert_eq!(
             headers,
+            // Source order, not alphabetical: upstream walks `Object.keys`.
             vec![
-                ("proxy-authorization".to_string(), "Basic x".to_string()),
                 ("x-whistle-user".to_string(), "bob".to_string()),
+                ("proxy-authorization".to_string(), "Basic x".to_string()),
             ]
         );
     }

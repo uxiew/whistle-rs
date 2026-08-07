@@ -2713,6 +2713,14 @@ fn restore_content_encoding(
     if !restore.plain {
         return arrived_as;
     }
+    // A body that goes back out under the coding it arrived under keeps the
+    // origin's spelling of it. `x-gzip` is the pre-RFC name for the same bytes,
+    // and rewriting the header to `gzip` announced a change this proxy did not
+    // make — the response is the origin's, down to how it named its encoding.
+    if let Some(arrived) = arrived_as.filter(|a| coding::Coding::of(Some(a)) == encoded_as) {
+        set_header_raw(headers, "content-encoding", &arrived);
+        return Some(arrived);
+    }
     coding::set_content_encoding(headers, encoded_as);
     encoded_as.header_value().map(str::to_string)
 }
@@ -3732,7 +3740,28 @@ async fn serve(
                 body::tee(body, cap)
             }
             body::Capped::Whole { bytes, .. } => {
-                let new = apply::transform_req_body(bytes, &resolved, body_ctx);
+                // Decompress before rewriting, exactly as the response path
+                // does. Upstream reaches it from the other end: every request
+                // body operator goes through `addTextTransform`/`addZipTransform`,
+                // both of which set `_needGunzip` (`_original/lib/init.js:90-112`),
+                // which puts a decoder in front and an encoder behind
+                // (`inspectors/rules.js:64-146`).
+                //
+                // Without it a `reqReplace://` searched the deflate stream and
+                // found nothing, a `reqAppend://` wrote its text *after* the
+                // gzip stream, and `reqBody://` sent plain text still labelled
+                // `Content-Encoding: gzip` — a request the origin cannot read.
+                //
+                // No `enable://gzip` here: upstream calls `getEncoder(req)` with
+                // one argument (`rules.js:164`), so its `req.enable` lookup is on
+                // `undefined` and the flag never reaches the request side. The
+                // body goes back under the coding it arrived with, or none.
+                let decoded = coding::decode_for_rewrite(bytes, req_enc.as_deref());
+                let restore = decoded.restore;
+                let new = apply::transform_req_body(decoded.body, &resolved, body_ctx);
+                let (new, encoded_as) = coding::reencode(new, restore, None);
+                let req_enc =
+                    restore_content_encoding(&mut parts.headers, restore, encoded_as, req_enc.clone());
                 if let Some(path) = &req_write {
                     write_body_file(path, &new, force_write);
                 }

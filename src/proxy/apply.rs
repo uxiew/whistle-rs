@@ -3451,6 +3451,12 @@ fn encode_non_latin1(s: &str) -> String {
 /// runs — it looks only at whether a rule produced content
 /// (`_original/lib/inspectors/res.js:1093`) — so a refused injection still
 /// costs the response its CSP and its cacheability.
+///
+/// "Produced content" is the operative half, and it is a truthiness test on the
+/// assembled value, not on the operator having matched: a `resPrepend://()`
+/// leaves `data.top` undefined and the strip never runs. This port asked only
+/// whether the operator matched, so an operator written with no value stripped
+/// the CSP off a page it did not otherwise touch and marked it `no-store`.
 fn injects_into_body(headers: &HeaderMap, resolved: &Resolved, status: u16, method: &str) -> bool {
     // A response with no body has nothing to inject into, so nothing to clear a
     // CSP or a cache for either. Upstream's `hasResBody` gate covers both
@@ -3464,11 +3470,17 @@ fn injects_into_body(headers: &HeaderMap, resolved: &Resolved, status: u16, meth
         .and_then(|v| v.to_str().ok())
         .and_then(res_class);
     let families = BodyFamilies::of(class);
+    let writes = |protocol: String| {
+        resolved
+            .all(&protocol)
+            .iter()
+            .any(|op| !op.value.is_empty())
+    };
     ["Body", "Prepend", "Append"].iter().any(|slot| {
-        resolved.value(&format!("res{slot}")).is_some()
-            || (families.html && resolved.value(&format!("html{slot}")).is_some())
-            || (families.js && resolved.value(&format!("js{slot}")).is_some())
-            || (families.css && resolved.value(&format!("css{slot}")).is_some())
+        writes(format!("res{slot}"))
+            || (families.html && writes(format!("html{slot}")))
+            || (families.js && writes(format!("js{slot}")))
+            || (families.css && writes(format!("css{slot}")))
     })
 }
 
@@ -3873,6 +3885,29 @@ struct Injection {
 }
 
 impl Injection {
+    /// Re-encode every injected piece into the response's own charset.
+    ///
+    /// A rule's value is UTF-8 — it came out of a rules file — and the page it
+    /// is pasted into is not. whistle encodes each value as it reads it
+    /// (`toBuffer(value, charset)`, `_original/lib/util/index.js:1388`) and once
+    /// more in the transform (`WhistleTransform`,
+    /// `_original/lib/util/whistle-transform.js:21-45`), so a `htmlAppend://中文`
+    /// lands on a `charset=gbk` page as GBK rather than as four bytes the page
+    /// renders as mojibake.
+    ///
+    /// The separators stay as they are: CRLF and the doctype are ASCII, and
+    /// every charset with a `charset=` label worth honouring is ASCII-compatible.
+    fn recode(&mut self, encoding: &'static encoding_rs::Encoding) {
+        for slot in [&mut self.top, &mut self.body, &mut self.bottom] {
+            for piece in slot.iter_mut() {
+                *piece = super::coding::encode_charset(
+                    encoding,
+                    &String::from_utf8_lossy(std::mem::take(piece).as_slice()),
+                );
+            }
+        }
+    }
+
     /// Wrap `data` in whatever the slots hold.
     fn apply(self, data: Vec<u8>, doctype: bool) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
@@ -4399,11 +4434,25 @@ pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option
     // The gate is built from the body as it arrived: whistle decides once, from
     // the *original* first non-whitespace byte, whether injection is allowed.
     let gate = InjectionGate::new(resolved, families.html, &body);
+    // A declared `charset=` other than UTF-8 puts the text operators inside a
+    // decode/encode pair, and encodes the injected values on the way in. Both
+    // halves are upstream's — see [`super::coding::charset_of`].
+    let charset = super::coding::charset_of(content_type);
 
-    let mut data = apply_res_merge(body.to_vec(), resolved, class, &del);
+    let mut data = match charset {
+        None => body.to_vec(),
+        Some(enc) => super::coding::decode_charset(enc, &body).into_bytes(),
+    };
+    data = apply_res_merge(data, resolved, class, &del);
     data = apply_replace(data, resolved, "resReplace", class);
+    if let Some(enc) = charset {
+        data = super::coding::encode_charset(enc, &String::from_utf8_lossy(&data));
+    }
 
-    let injection = collect_res_injection(&gate, families);
+    let mut injection = collect_res_injection(&gate, families);
+    if let Some(enc) = charset {
+        injection.recode(enc);
+    }
     // Only an HTML response gets the doctype, and `disable://doctype` opts out.
     let doctype = families.html && !is_disabled(resolved, "doctype");
     Bytes::from(injection.apply(data, doctype))
@@ -4414,19 +4463,14 @@ pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option
 ///
 /// Several lines carrying the same operator are CRLF-joined in resolution order
 /// and pushed as one part. That is byte-identical to pushing each line
-/// separately — the typed families that follow use the same separator — but it
-/// keeps the "matched but blank" case distinguishable, which the body slot
-/// needs.
+/// separately, since the typed families that follow use the same separator.
 fn collect_generic(injection: &mut Injection, gate: &InjectionGate<'_>, prefix: &str) {
     if let Some(joined) = gate.joined(&format!("{prefix}Body")).filter(Joined::claims_body) {
         injection.replaces_body = true;
-        // Pushed even when blank, so that a typed `*Body` behind it is
-        // CRLF-*appended* to the empty buffer rather than replacing it — an
-        // upstream quirk of `EMPTY_BUFFER` being truthy (`res.js:1085-1087`).
         injection.body.push(joined.bytes);
     }
-    // `*Prepend`/`*Append` carry no such marker: upstream assigns the raw value
-    // and tests it for truthiness, so an all-blank one contributes nothing
+    // `*Prepend`/`*Append` are tested the same way: upstream assigns the raw
+    // value and tests it for truthiness, so an all-blank one contributes nothing
     // (`_original/lib/inspectors/res.js:1008-1009,1082-1092`).
     for (protocol, slot) in [
         (format!("{prefix}Prepend"), &mut injection.top),
@@ -4576,13 +4620,6 @@ impl<'a> InjectionGate<'a> {
         let values: Vec<&str> = kept.iter().map(|(v, _)| *v).collect();
         Some(Joined {
             bytes: join_values(&values),
-            // Read from the *ungated* list on purpose: what distinguishes a
-            // blank operator from a refused one is what it was written with.
-            had_content: self
-                .resolved
-                .all(protocol)
-                .iter()
-                .any(|op| !op.value.is_empty()),
         })
     }
 }
@@ -4591,24 +4628,29 @@ impl<'a> InjectionGate<'a> {
 struct Joined {
     /// The CRLF-join of the lines that survived the gate.
     bytes: Vec<u8>,
-    /// Whether any matching line carried content *before* gating. Together with
-    /// `bytes` this separates "matched blank" from "matched and was refused",
-    /// which the body slot treats differently — see [`Joined::claims_body`].
-    had_content: bool,
 }
 
 impl Joined {
     /// Whether a generic `*Body` operator with this contribution replaces the
     /// body.
     ///
-    /// A blank one does: upstream never builds a list for it and assigns an
-    /// empty buffer instead (`resBody || util.EMPTY_BUFFER`,
-    /// `_original/lib/inspectors/res.js:1005`). One whose every line the HTML
-    /// gate refused does not: its list survives to the transform, where
-    /// `filterHtml` empties it and the join yields the falsy `''`
-    /// (`_original/lib/util/whistle-transform.js:47-60,110`).
+    /// Only when it actually carries something. A blank `resBody://` does
+    /// **not** empty the response, which is the opposite of what this port used
+    /// to do: upstream assigns `resBody || util.EMPTY_BUFFER`
+    /// (`_original/lib/inspectors/res.js:1001-1003`) and `EMPTY_BUFFER` is
+    /// `toBuffer('')`, which returns `undefined` for a falsy argument
+    /// (`_original/lib/util/common.js:1630-1632`) — not an empty buffer. So
+    /// `data.body` stays falsy, `isWhistleTransformData` finds nothing to do
+    /// (`_original/lib/util/index.js:1615-1620`), and no transform is built at
+    /// all. Measured against whistle 2.10.8: `resBody://()` returns the origin's
+    /// page untouched there, and returned an empty body here.
+    ///
+    /// An operator whose every line the HTML gate refused lands in the same
+    /// place by a different route — `filterHtml` empties its list and the join
+    /// yields the falsy `''` (`_original/lib/util/whistle-transform.js:47-60,110`)
+    /// — so the two need not be told apart.
     fn claims_body(&self) -> bool {
-        !self.bytes.is_empty() || !self.had_content
+        !self.bytes.is_empty()
     }
 }
 
@@ -6382,6 +6424,49 @@ mod tests {
         assert!(wants_req_body(&some, body_ctx(None)));
         let out = transform_req_body(Bytes::from_static(b"orig"), &some, body_ctx(Some("text/plain")));
         assert_eq!(&out[..], b"HELLO");
+    }
+
+    /// A compressed **request** body is decompressed before the operators see it
+    /// and compressed again on the way out — the same pair the response path
+    /// uses, and for the same reason.
+    ///
+    /// Without it `reqReplace://` searched a gzip stream for plaintext and found
+    /// nothing, `reqAppend://` wrote its text after the end of that stream, and
+    /// `reqBody://` sent plain bytes still labelled `Content-Encoding: gzip` —
+    /// a request the origin cannot inflate. Measured against whistle 2.10.8,
+    /// which delivered `"REWRITTEN body"`, `"ORIGINAL bodyEND"` and `"NEW"`
+    /// gzipped where this port delivered the original, a truncated stream and
+    /// unreadable plain text.
+    #[test]
+    fn a_compressed_request_body_is_rewritten_inside_its_coding() {
+        use crate::proxy::coding;
+
+        let sent = |rule: &str, ct: &str| {
+            let wire = coding::encode(coding::Coding::Gzip, b"ORIGINAL body").expect("gzip");
+            let decoded = coding::decode_for_rewrite(Bytes::from(wire), Some("gzip"));
+            let restore = decoded.restore;
+            let new = transform_req_body(
+                decoded.body,
+                &resolve(&format!("example.com {rule}\n"), "http://example.com/"),
+                body_ctx(Some(ct)),
+            );
+            let (out, coded) = coding::reencode(new, restore, None);
+            assert_eq!(coded, coding::Coding::Gzip, "{rule} must go back out gzipped");
+            String::from_utf8(coding::decode(coding::Coding::Gzip, &out).expect("inflates"))
+                .expect("utf-8")
+        };
+
+        assert_eq!(sent("reqReplace://ORIGINAL=REWRITTEN", "text/plain"), "REWRITTEN body");
+        assert_eq!(sent("reqAppend://END", "text/plain"), "ORIGINAL bodyEND");
+        assert_eq!(sent("reqBody://NEW", "text/plain"), "NEW");
+
+        // A coding this proxy cannot undo is not re-encoded over: the operators
+        // run on bytes they will not usefully match, and nothing is corrupted.
+        let opaque = coding::decode_for_rewrite(Bytes::from_static(b"not really zstd"), Some("zstd"));
+        assert!(!opaque.restore.plain);
+        let (out, coded) = coding::reencode(opaque.body, opaque.restore, None);
+        assert_eq!(coded, coding::Coding::Identity);
+        assert_eq!(&out[..], b"not really zstd");
     }
 
     #[test]
@@ -8949,8 +9034,63 @@ mod tests {
             HTML,
         );
         assert_eq!(out, "<!--t--><b>new</b><!--b-->");
-        // A blank `resBody` empties the body (`resBody || util.EMPTY_BUFFER`).
-        assert_eq!(inject("example.com/x resBody://\n", "keep?", "text/plain"), "");
+        // A blank `resBody` is not an empty body: `util.EMPTY_BUFFER` is
+        // `undefined`, so upstream builds no transform. See `Joined::claims_body`.
+        assert_eq!(
+            inject("example.com/x resBody://\n", "keep?", "text/plain"),
+            "keep?"
+        );
+    }
+
+    /// An injecting operator written with **no value** does nothing at all —
+    /// neither to the body nor to the headers that come with an injection.
+    ///
+    /// Both halves were wrong here. `resBody://()` emptied the response, because
+    /// this port read `util.EMPTY_BUFFER` as an empty buffer when it is
+    /// `undefined` (`toBuffer('')`, `_original/lib/util/common.js:1630-1632`);
+    /// and every blank operator still stripped the page's CSP and marked it
+    /// `no-store`, because the gate asked whether the operator *matched* rather
+    /// than whether it produced anything (`res.js:1093`). Measured against
+    /// whistle 2.10.8: `resBody://()`, `htmlBody://()` and `resPrepend://()` each
+    /// return the origin's page with its `Cache-Control` and CSP intact.
+    #[test]
+    fn an_operator_written_with_no_value_leaves_the_response_alone() {
+        for rule in ["resBody://()", "resBody://", "htmlBody://()", "resPrepend://()"] {
+            assert_eq!(
+                inject(&format!("example.com/x {rule}\n"), "<p>keep</p>", HTML),
+                "<p>keep</p>",
+                "{rule} must not touch the body"
+            );
+
+            let (info, resolved) =
+                resolve_with_info(&format!("example.com/x {rule}\n"), "http://example.com/x");
+            let mut parts = hyper::Response::new(()).into_parts().0;
+            parts.headers.insert(hyper::header::CONTENT_TYPE, HTML.parse().unwrap());
+            parts.headers.insert("cache-control", "max-age=600".parse().unwrap());
+            parts
+                .headers
+                .insert("content-security-policy", "default-src 'self'".parse().unwrap());
+            apply_response_for(&mut parts, &resolved, Some(&info));
+            assert_eq!(
+                parts.headers.get("cache-control").unwrap(),
+                "max-age=600",
+                "{rule} must not bust the cache"
+            );
+            assert!(
+                parts.headers.contains_key("content-security-policy"),
+                "{rule} must not strip the CSP"
+            );
+        }
+
+        // The same operators with a value do all of it, which is the point.
+        let (info, resolved) =
+            resolve_with_info("example.com/x resPrepend://(<!--t-->)\n", "http://example.com/x");
+        let mut parts = hyper::Response::new(()).into_parts().0;
+        parts.headers.insert(hyper::header::CONTENT_TYPE, HTML.parse().unwrap());
+        parts.headers.insert("content-security-policy", "default-src 'self'".parse().unwrap());
+        apply_response_for(&mut parts, &resolved, Some(&info));
+        assert!(!parts.headers.contains_key("content-security-policy"));
+        assert_eq!(parts.headers.get("cache-control").unwrap(), "no-store");
     }
 
     /// whistle stamps a doctype in front of any `top` it injects into an HTML
@@ -9143,14 +9283,17 @@ mod tests {
             .unwrap()
         };
         // Disjoint keys from both lines land, and the body's own key survives.
+        // The order is the body's keys first, then the patch's in fold order —
+        // `extend` assigns onto a JavaScript object, which keeps what it was
+        // given in the order it was given it. Byte-identical to whistle 2.10.8.
         assert_eq!(
             merge("example.com/x resMerge://{\"a\":1}\nexample.com/x resMerge://{\"b\":2}\n"),
-            "{\"a\":1,\"b\":2,\"keep\":0}"
+            "{\"keep\":0,\"b\":2,\"a\":1}"
         );
         // Contested key: the first line wins.
         assert_eq!(
             merge("example.com/x resMerge://{\"a\":1}\nexample.com/x resMerge://{\"a\":2}\n"),
-            "{\"a\":1,\"keep\":0}"
+            "{\"keep\":0,\"a\":1}"
         );
         // Shallow by default, so the second line's nested object is replaced
         // wholesale rather than merged into.
@@ -9168,8 +9311,118 @@ mod tests {
                  example.com/x resMerge://{\"n\":{\"b\":2}}\n\
                  example.com/x resMerge://true\n"
             ),
-            "{\"keep\":0,\"n\":{\"a\":1,\"b\":2}}"
+            // The fold's target is the *last* line, so its keys come first.
+            "{\"keep\":0,\"n\":{\"b\":2,\"a\":1}}"
         );
+    }
+
+    /// A page that declares a charset reaches the text operators as text, and
+    /// goes back out in the charset it declared.
+    ///
+    /// Before this the substitution ran over the raw GBK bytes, `String::from_utf8`
+    /// refused them, and `resReplace://` on a `charset=gbk` page did nothing at
+    /// all — silently, on exactly the pages whistle is most used to debug.
+    /// Byte-identical to whistle 2.10.8 through the differential bench.
+    #[test]
+    fn a_declared_charset_is_undone_for_the_text_operators_and_put_back_after() {
+        // `<html><body>中文 ORIGINAL</body></html>`, the two CJK glyphs in GBK.
+        let page = |tail: &[u8]| {
+            let mut v = b"<html><body>\xd6\xd0\xce\xc4 ".to_vec();
+            v.extend_from_slice(tail);
+            v
+        };
+        let gbk = "text/html; charset=gbk";
+        let run = |rules: &str, ct: &str| {
+            transform_res_body(
+                Bytes::from(page(b"ORIGINAL</body></html>")),
+                &resolve(rules, "http://example.com/x"),
+                Some(ct),
+            )
+        };
+
+        // An ASCII pattern now matches, and the page's own GBK bytes survive.
+        assert_eq!(
+            &run("example.com/x resReplace://ORIGINAL=REWRITTEN", gbk)[..],
+            &page(b"REWRITTEN</body></html>")[..]
+        );
+        // A replacement written in the rules file — UTF-8 — lands as GBK.
+        assert_eq!(
+            &run("example.com/x resReplace://ORIGINAL=中文", gbk)[..],
+            &page(b"\xd6\xd0\xce\xc4</body></html>")[..]
+        );
+        // An undeclared charset is left alone: guessing is upstream's answer,
+        // not this port's. See `docs/RULES.md`.
+        assert_eq!(
+            &run("example.com/x resReplace://ORIGINAL=REWRITTEN", "text/html")[..],
+            &page(b"ORIGINAL</body></html>")[..]
+        );
+    }
+
+    /// An injected value is written in the page's own charset, not pasted in as
+    /// UTF-8 for the browser to render as mojibake.
+    #[test]
+    fn an_injected_value_is_encoded_into_the_pages_charset() {
+        let inject = |rules: &str, ct: &str| {
+            transform_res_body(
+                Bytes::from_static(b"<html><body>x</body></html>"),
+                &resolve(rules, "http://example.com/x"),
+                Some(ct),
+            )
+        };
+        let gbk = "text/html; charset=gbk";
+
+        assert!(
+            inject("example.com/x htmlAppend://<i>中文</i>", gbk).ends_with(
+                b"<i>\xd6\xd0\xce\xc4</i>"
+            ),
+            "htmlAppend must land as GBK"
+        );
+        // The `js`/`css` families are wrapped first, then encoded whole.
+        assert!(
+            inject("example.com/x jsAppend://alert('中文')", gbk)
+                .ends_with(b"<script>alert('\xd6\xd0\xce\xc4')</script>"),
+            "the wrapper and its content are one piece"
+        );
+        // `resBody://` replaces the body outright, and in the page's charset.
+        assert_eq!(
+            &inject("example.com/x resBody://中文", gbk)[..],
+            b"\xd6\xd0\xce\xc4"
+        );
+        // With no charset declared, the value stays UTF-8 — as upstream's does.
+        assert!(
+            inject("example.com/x htmlAppend://<i>中文</i>", "text/html")
+                .ends_with("<i>中文</i>".as_bytes())
+        );
+    }
+
+    /// A merged body keeps the order the origin wrote its keys in, with the
+    /// patch's new ones appended.
+    ///
+    /// `JSON.stringify` walks a JavaScript object in insertion order, so this is
+    /// what upstream emits; `serde_json::Map` is a `BTreeMap` unless the
+    /// `preserve_order` feature is on, and without it every JSON body this proxy
+    /// touched came back alphabetised. Measured against whistle 2.10.8 through
+    /// the differential bench: `{"a":1,"keep":"yes","extra":1}` there against
+    /// `{"a":1,"extra":1,"keep":"yes"}` here.
+    #[test]
+    fn a_merged_body_keeps_the_key_order_the_origin_sent() {
+        let merged = transform_res_body(
+            Bytes::from_static(b"{\"a\":1,\"keep\":\"yes\"}"),
+            &resolve(
+                "example.com/x resMerge://{\"extra\":1}",
+                "http://example.com/x",
+            ),
+            Some("application/json"),
+        );
+        assert_eq!(&merged[..], br#"{"a":1,"keep":"yes","extra":1}"#);
+
+        // The same for a property removal, which re-serialises the body too.
+        let pruned = transform_res_body(
+            Bytes::from_static(b"{\"z\":1,\"m\":2,\"a\":3}"),
+            &resolve("example.com/x delete://resBody.m", "http://example.com/x"),
+            Some("application/json"),
+        );
+        assert_eq!(&pruned[..], br#"{"z":1,"a":3}"#);
     }
 
     /// `urlReplace` merges its lines into one map like the body `*Replace`
@@ -9298,8 +9551,8 @@ mod tests {
     }
 
     /// A blank line inside an accumulating operator is dropped before the join —
-    /// it must not leave a stray separator behind — while a `*Body` that is blank
-    /// on *every* line still empties the body.
+    /// it must not leave a stray separator behind — and a `*Body` that is blank
+    /// on *every* line leaves the origin's body where it is.
     #[test]
     fn blank_lines_drop_out_of_the_join() {
         assert_eq!(
@@ -9324,7 +9577,7 @@ mod tests {
                 "gone",
                 "text/plain",
             ),
-            ""
+            "gone"
         );
     }
 
@@ -9356,8 +9609,7 @@ mod tests {
             "{\"json\":1}"
         );
         // A request-wide `enable://strictHtml` shuts the injection off wholesale
-        // (`allowInject` returns false), so even a blank `resBody` — which would
-        // otherwise empty the body — does nothing.
+        // (`allowInject` returns false).
         assert_eq!(
             inject(
                 "example.com/x resBody:// enable://strictHtml\n",
@@ -9366,10 +9618,11 @@ mod tests {
             ),
             "{\"json\":1}"
         );
-        // Without it, the blank line empties the body as usual.
+        // And a blank line is inert with or without the gate: an empty value is
+        // not an empty body.
         assert_eq!(
             inject("example.com/x resBody://\n", "{\"json\":1}", HTML),
-            ""
+            "{\"json\":1}"
         );
     }
 

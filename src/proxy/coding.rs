@@ -281,6 +281,53 @@ pub fn reencode(body: Bytes, restore: Restore, forced: Option<Coding>) -> (Bytes
     }
 }
 
+/// The character encoding a response declares, when it is one this proxy has to
+/// undo before a text operator can read the body.
+///
+/// whistle runs every text transform inside an `iconv` decode/encode pair keyed
+/// on the `charset=` parameter (`getPipeIconvStream`,
+/// `_original/lib/util/index.js:1622-1664`), and encodes each injected value
+/// into the same charset (`toBuffer(value, charset)`, `index.js:1388`;
+/// `WhistleTransform`, `util/whistle-transform.js:21-45`). Without that a
+/// `resReplace://` on a `text/html; charset=gbk` page searched bytes that are
+/// not UTF-8, found nothing, and left the page exactly as it arrived — silently.
+///
+/// `None` means "the bytes are already the text": no `charset=`, `utf-8`, or a
+/// label no decoder knows. The last is deliberate — upstream's `getCharset`
+/// returns nothing for a charset `iconv` cannot name (`common.js:1605-1615`),
+/// and a body decoded under a guess is worse than one left alone.
+///
+/// Matches upstream's `CHARSET_RE` (`/charset=([\w-]+)/i`, `common.js:1603`),
+/// which is looser than the media-type grammar: it finds the parameter anywhere
+/// in the header.
+pub fn charset_of(content_type: Option<&str>) -> Option<&'static encoding_rs::Encoding> {
+    let ct = content_type?;
+    let at = ct.to_ascii_lowercase().find("charset=")? + "charset=".len();
+    let label: String = ct[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let encoding = encoding_rs::Encoding::for_label(label.as_bytes())?;
+    // UTF-8 needs no round trip: the operators already work on UTF-8.
+    (encoding != encoding_rs::UTF_8).then_some(encoding)
+}
+
+/// Decode a body written in `charset` into the UTF-8 the operators work on.
+///
+/// Lossy on purpose, as `iconv.decodeStream` is: a byte the charset cannot
+/// explain becomes U+FFFD rather than failing the response. The alternative —
+/// refusing — is what this port did before, and it made the operator silently
+/// inert on exactly the pages whistle exists to debug.
+pub fn decode_charset(encoding: &'static encoding_rs::Encoding, body: &[u8]) -> String {
+    encoding.decode(body).0.into_owned()
+}
+
+/// Put `text` back into `charset` on the way out, so the body still matches the
+/// `Content-Type` the client was given.
+pub fn encode_charset(encoding: &'static encoding_rs::Encoding, text: &str) -> Vec<u8> {
+    encoding.encode(text).0.into_owned()
+}
+
 /// Set (or remove) `Content-Encoding` so it describes `coding`.
 ///
 /// Removing it for identity matters as much as setting it: a body that arrived
@@ -411,6 +458,37 @@ mod tests {
         assert!(h.get(hyper::header::CONTENT_ENCODING).is_none());
         set_content_encoding(&mut h, Coding::Brotli);
         assert_eq!(h.get(hyper::header::CONTENT_ENCODING).unwrap(), "br");
+    }
+
+    /// Which `charset=` values put a body through the round trip, and which are
+    /// already the text the operators want.
+    #[test]
+    fn only_a_charset_that_is_not_utf8_needs_undoing() {
+        let label = |ct: &str| charset_of(Some(ct)).map(|e| e.name());
+        assert_eq!(label("text/html; charset=gbk"), Some("GBK"));
+        assert_eq!(label("text/html;charset=GB2312"), Some("GBK"));
+        assert_eq!(label("text/html; charset=big5"), Some("Big5"));
+        assert_eq!(label("text/plain; charset=iso-8859-1"), Some("windows-1252"));
+        // Already UTF-8, in either spelling: nothing to undo.
+        assert_eq!(label("text/html; charset=utf-8"), None);
+        assert_eq!(label("text/html; charset=UTF8"), None);
+        // No parameter, and a label no decoder knows — both left alone.
+        assert_eq!(label("text/html"), None);
+        assert_eq!(label("text/html; charset=nonesuch"), None);
+        assert_eq!(charset_of(None), None);
+    }
+
+    /// The round trip is lossless for text the charset can express, and lossy
+    /// rather than fatal for what it cannot — which is `iconv`'s behaviour too.
+    #[test]
+    fn a_charset_round_trip_returns_the_bytes_it_was_given() {
+        let gbk = charset_of(Some("text/html; charset=gbk")).expect("gbk");
+        let bytes = b"\xd6\xd0\xce\xc4 ORIGINAL";
+        let text = decode_charset(gbk, bytes);
+        assert_eq!(text, "中文 ORIGINAL");
+        assert_eq!(encode_charset(gbk, &text), bytes);
+        // A glyph GBK cannot write becomes its replacement rather than an error.
+        assert!(!encode_charset(gbk, "🦀").is_empty());
     }
 
     /// `deflate` is sent both zlib-wrapped and raw; both are accepted.
