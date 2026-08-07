@@ -2401,6 +2401,17 @@ async fn resolve_response_phase(
         resolved.merge_response_phase(extra);
         added = true;
     }
+    // `resRules://` last, because what a rules text produces wins over the file
+    // that named it and the merge is an overwrite — upstream's `mergeRules(req,
+    // …, true)` at the end of `getResRules`.
+    if apply::merge_res_rules(resolved, info, is_internal_req) {
+        {
+            let values = state.values.read().unwrap();
+            apply::substitute_values(resolved, &values, tpl_ctx(&host, state.config.port, info));
+        }
+        apply::substitute_config_vars(resolved, state.config.port, crate::config::VERSION);
+        added = true;
+    }
     // Operators this pass added have never been past the value loader — a
     // `resBody:///tmp/mock.json includeFilter://s:404` line withholds its
     // `resBody` from the request pass entirely. Ones that already loaded carry
@@ -2465,8 +2476,6 @@ struct ResBodyOps {
     script: Option<String>,
     /// `weinre://` — debug-agent id to inject.
     weinre: Option<String>,
-    /// `locationHref://` — client-side redirect to inject.
-    location_href: Option<String>,
     /// `resWrite://` / `resWriteRaw://` — dump paths, already carrying the
     /// `.<status>` suffix a non-200 gets.
     write: Option<String>,
@@ -2658,7 +2667,6 @@ impl ResBodyOps {
                 .map(|op| op.value.as_str())
                 .and_then(script::load_script),
             weinre: resolved.value("weinre").map(|s| s.to_string()),
-            location_href: resolved.value("locationHref").map(|s| s.to_string()),
             write: apply::res_write_path(resolved, status),
             write_raw: apply::res_write_raw_path(resolved, status),
             force_write: apply::forces_write(resolved),
@@ -2681,7 +2689,6 @@ impl ResBodyOps {
             || self.speed.is_some()
             || self.script.is_some()
             || self.weinre.is_some()
-            || self.location_href.is_some()
             || self.write.is_some()
             || self.write_raw.is_some()
             || !self.trailers.is_empty()
@@ -2791,14 +2798,6 @@ fn inject_res_body(
     {
         let src = weinre_src(id, &state.config);
         let tag = format!("<script src=\"{src}\"></script>");
-        new = inject_into_html(&new, &tag);
-    }
-    // locationHref: inject a client-side redirect into HTML responses.
-    if let Some(url) = &ops.location_href
-        && is_html(&parts.headers)
-    {
-        let safe = url.replace('\\', "\\\\").replace('\'', "\\'");
-        let tag = format!("<script>location.href='{safe}'</script>");
         new = inject_into_html(&new, &tag);
     }
     if let Some(path) = &ops.write {

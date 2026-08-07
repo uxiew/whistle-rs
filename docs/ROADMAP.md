@@ -176,7 +176,7 @@
 | 项 | 类别 | 说明 |
 |----|------|------|
 | `whistle.<name>://` / `plugin.<name>://` 变成目的地重写 | **失败开放** | `PLUGIN_RE`（`rules.js:24`）把两者归入 `plugin`；本移植不识别该协议，于是整个 token 成了 URL 替换，`whistle.vase://x` 把流量发到名为 `x` 的主机。而 `whistle.<name>` 正是 npm 插件的标准写法 |
-| `responseFor://` 发起未经请求的外连 | **失败开放 + 安全** | 上游 `setResponseFor`（`util/index.js:3214-3261`）**不发任何网络请求**，只把 `x-whistle-response-for` 写到**响应**头；本移植对每个命中请求 GET 一次规则里写的 URL，并把结果写到**出站请求**头上 |
+| ~~`responseFor://` 发起未经请求的外连~~ → 已修 | **失败开放 + 安全** | 上游 `setResponseFor`（`util/index.js:3214-3261`）**不发任何网络请求**，只把 `x-whistle-response-for` 写到**响应**头；本移植此前对每个命中请求 GET 一次规则里写的 URL，并把结果写到**出站请求**头上。现已按上游改写响应头，两种取值形式（裸值与 `name=`）均已对齐 |
 | 裸 `$` / `!` 匹配一切 | **失败开放** | 无 host/path/scheme/port 的 token 落到 `Pattern::Any`；上游直接丢弃该规则（`rules.js:1247-1249`）。新增 `Pattern::Nothing` |
 | `example.com/api` 命中 `example.com:8080/api` | **失败开放** | 带路径的 pattern 上游按 URL 文本（含端口）匹配，去端口回退只对纯域名 pattern 开放（`rule.isDomain`，`rules.js:1081-1083,:1343-1348`） |
 | `ignore://` 只认一个词 | **失败开放** | 上游认 `*`/`All`/`allRules`/`allProtocols`、按 `&` 也分隔、支持 `-name`/`!name` 豁免与 `-*` 取消（`util/index.js:1891-1932`）。`ignore://*` 与 `ignore://host&ua` 此前什么都不丢 |
@@ -449,7 +449,7 @@ H2 会话复用）。
 | `internal-http-proxy` / `internal-https-proxy` | ✅ |
 | `x` 前缀代理变体 | ✅ 九个拼写全部识别（按 `PROXY_RE` 的 `x?` 推导），握手无法建立时回退直连 |
 | 代理 URL 的 `?host=` / `proxyTunnel` 链式 CONNECT | ✅ |
-| `locationHref` 算子 | ✅ HTML 注入跳转脚本 |
+| `locationHref` 算子 | ✅ **短路应答**一份自跳转文档（与 `file://` 争同一个目的地槽位，不回源）；`js:` / `html:` / `replace:` 三种前缀与 `Sec-Fetch-Dest: script` 推断均已对齐 |
 | 流量落盘持久化 | ✅ JSONL 追加写入 + 每日轮转 + 启动恢复 (`--no-persist` / `--persist-days`) |
 | 请求重放 | ✅ `POST /api/replay` self-loopback + UI ↻ 按钮 |
 | 规则分组管理 | ✅ 多组 CRUD + toggle + 持久化到 `storage_dir/rules/` |
@@ -751,9 +751,13 @@ H2 会话复用）。
       写作 `reqRules://` 的行**全部保留**，其余拼写只保留**第一条**（候选脚本），
       保留者按解析顺序拼成**一份**规则文本再解析 —— 因此跨文件争用单值算子由包含顺序决定。
       `resScript` 现在跳过 `resRules://` 拼写去找真正的脚本（此前会把规则文件丢给 JS 引擎）。
+      `resRules://` 的条目也有了归宿：响应头到齐后按规则文本解析并合并，只保留
+      `resProtocols` 那一半（`mergeRules(req, …, isResRules)`，`_original/lib/util/index.js:2198-2203`），
+      因此写在里面的 `host://` / `reqHeaders://` 会被解析后丢弃 —— 那时请求早已发出。
+      `rulesFile` 家族的 `{value}` / `(inline)` 取值形式此前会被当成路径去开文件，
+      于是整条规则静默失效，现已按 `readRuleValue` 对齐（`lib/util/index.js:1177-1179`）。
       仍未做：上游会把内容像 JS 的候选项**执行**并把它吐出的规则拼回去（`isRulesContent`），
-      本移植没有动态规则脚本；`resScript` 的 `resRules://` 条目也无处安放 ——
-      本移植的 `resScript` 是直接改响应的 JS 钩子，不是规则生产者。
+      本移植没有动态规则脚本。
 - [x] ~~`params://` 合并进请求体~~ → 已完成，三种体都实现了：`multipart`（按 `name=` 整段替换 /
       追加新段）、`x-www-form-urlencoded`（仅 POST，与上游 `isUrlEncoded` 一致）、JSON
       （深合并进第一段 JSON 形状的子串）。与上游一样**二选一**：体接走了 `params` 就不再
