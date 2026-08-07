@@ -1448,9 +1448,56 @@ Injected before `</head>` (or after `<body>`). A plain id builds the conventiona
 `//host:port/weinre/target/target-script-min.js#id` URL; a URL/path value is used
 verbatim. The weinre inspector server itself is external (not bundled).
 
+Injecting costs the response its `Content-Security-Policy` and its cacheability,
+exactly as the `html*`/`js*`/`css*` operators do — an agent a page's own CSP
+forbids never runs, and one the browser caches outlives the rule that asked for
+it (`_original/lib/inspectors/weinre.js:37-38`). `enable://keepCSP` and
+`enable://keepCache` opt out of each.
+
+**How this differs from whistle**, measured against 2.10.8 by
+`tests/differential/cases-compose.js`: whistle appends its **own bundled agent**
+— the whole of `assets/js/weinre.js`, inline, at the *end* of the body — pointed
+at a weinre server whistle runs itself. whistle-rs bundles neither, so it emits a
+`<script src>` naming the conventional URL and puts it in the `<head>`. Two
+further consequences: whistle also reaches **JavaScript** responses, appending
+the agent bare (`weinre.js:33-35`), where a `<script src>` tag would mean
+nothing; and whistle rewrites a **gzipped** body, where this port leaves a
+compressed response alone.
+
 ```
 .example.com   weinre://mysession
 example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
+```
+
+### `locationHref://` — a page that redirects itself
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `locationHref` | `[js:\|html:\|replace:]<url>` | **Answer** the request with a document that navigates the client to `<url>` |
+
+It is a mock, not an injection: whistle files it with `file://` and friends
+(`isFileProxy`, `_original/lib/rules/protocols.js:282`), so it shares the one
+destination slot with them — whichever line was written first wins — and the
+origin is never contacted at all.
+
+| Value | Answer |
+|-------|--------|
+| `<url>` | `text/html`, `<script>window.location.href = "<url>";</script>` |
+| `js:<url>` | `application/javascript`, the assignment with no tag around it |
+| `html:<url>` | forced to the HTML form |
+| `replace:<url>` | `window.location.replace(…)`, which leaves no history entry |
+| empty | `200`, `text/html`, and an empty body |
+
+With no prefix, a request the browser made *for a script*
+(`Sec-Fetch-Dest: script`) gets the JavaScript form, so a redirect written for a
+page does not arrive nested inside another `<script>`. A value that resolves to
+the request's **own** URL answers nothing — the request goes out normally, rather
+than redirecting to itself forever.
+
+```
+old.example.com    locationHref://https://new.example.com/
+cdn.example.com    locationHref://js:https://cdn2.example.com/app.js
+example.com/old    locationHref://replace:/new
 ```
 
 ### Flags, includes & values
@@ -1461,9 +1508,9 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 | `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Add HTTP response trailer headers (forces chunked) — see below |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
-| `responseFor` | a URL | Prefetch the URL; annotate the request with `x-whistle-response-for-*` |
+| `responseFor` | a name, or `name=<headers>` | Annotate the **response** with `x-whistle-response-for` — see below |
 | `rule` | value name | Include the named value's rules and apply them too |
-| `rulesFile` | file path | Include rules from a file and apply them too. Also spelled `reqRules://`, `ruleFile://`, `ruleScript://`, `rulesScript://`, `reqScript://` — see below |
+| `rulesFile` | file path, `{value}`, or `(inline)` | Include rules and apply them too. Also spelled `reqRules://`, `ruleFile://`, `ruleScript://`, `rulesScript://`, `reqScript://` — see below |
 | `pipe` | plugin name | Route through a registered server (like `plugin`) |
 
 `{name}` as a **whole** operator value, and `${name}` anywhere inside one, are
@@ -1575,7 +1622,7 @@ static.example.com  disable://cache
 example.com         trailers://x-checksum=abc123
 example.com         headerReplace://{"resH.set-cookie:/Domain=[^;]+/":"Domain=example.com"}
 example.com         headerReplace://{"resH.location:/^http:/":"https:"}
-page.example.com    responseFor://http://auth.internal/verify
+page.example.com    responseFor://name=x-served-by,req.x-request-id
 example.com         resBody://{mockJson}        # {mockJson} from the values store
 example.com         rulesFile:///etc/whistle/extra.rules
 ```
@@ -1672,6 +1719,52 @@ example.com   rulesFile:///etc/whistle/d.rules    # dropped
 > JavaScript rather than rules (`isRulesContent`, `_original/lib/rules/index.js:41`),
 > and splices the rules the script emits into the join. whistle-rs has no dynamic-rules
 > script: every kept file is read as rules text.
+
+The text does not have to be a file. `reqRules://{extra}` names a **value** — from
+`--value`, from the console's Values pane, or from a ``` ``` ``` block in the rules
+file itself — and `reqRules://(…)` is the inline form; both are `readRuleValue`
+returning `rule.value` before it ever looks at a disk
+(`_original/lib/util/index.js:1177-1179`).
+
+#### What produced rules can and cannot do
+
+Measured against whistle 2.10.8 (`tests/differential/cases-compose.js`):
+
+* **Composition is one level deep.** A `reqRules://` written *inside* a produced
+  text is parsed and never followed: `resolveRulesFile` reads the include once
+  and merges it, and nothing asks the merged set for a `rulesFile` of its own. A
+  self-reference and a two-step cycle therefore both terminate, having applied
+  one round.
+* **What is produced wins** over the file that named it, on the same line or on
+  another — `mergeRule` returns the new rule for a single-value protocol and puts
+  the new list first for a multi-match one (`lib/util/index.js:2147-2170`).
+* **`lineProps://important` still outranks it.** An important including line keeps
+  a single-value protocol, and for a multi-match one every important operator —
+  from either side — sorts ahead of every normal one.
+* **The produced rules are matched against the request as it now is**, so a line
+  above that rewrote the URL decides which produced patterns match.
+* A produced text that is not rules, is empty, names a value that does not exist,
+  or names a file that does not exist contributes nothing and is not an error.
+
+#### `resRules://` — rules for the response
+
+`resRules://` is the response-phase twin: whistle keeps it in the same
+accumulating list as `resScript://` and tells the two apart by spelling, then
+parses what the `resRules://` lines hold and merges it once the response head is
+in (`getResRules`, `_original/lib/plugins/index.js:1337-1360`).
+
+Only the **response** half of the produced text applies — upstream's
+`mergeRules(req, …, isResRules)` is restricted to `resProtocols`
+(`lib/util/index.js:2198-2203`) — so a `host://` or a `reqHeaders://` inside it is
+parsed and dropped: by the time the text is read the request has gone out. What
+does apply is everything response-side, `replaceStatus://` and the body operators
+included, and a condition on the response (`includeFilter://s:404`) is answerable
+because the head is already in hand.
+
+```
+example.com   resRules://{late}          # a value
+example.com   resRules:///etc/whistle/response.rules
+```
 
 ### Dump files
 
@@ -2219,12 +2312,12 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Category | Operators |
 |----------|-----------|
 | Routing / upstream | `host`, `proxy`, `http-proxy`, `https-proxy`, `internal-proxy`, `internal-http-proxy`, `internal-https-proxy`, `https2http-proxy`, `http2https-proxy`, `socks`, `pac`, and `x`/`xs`-prefixed proxy variants |
-| Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw`, `responseFor` |
-| Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw`, `trailers`, `headerReplace` |
+| Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw` |
+| Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw`, `trailers`, `headerReplace`, `responseFor` |
 | Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` (the JS and CSS families reach HTML responses too, wrapped as markup) |
 | Short-circuit / flags | `redirect`, `location`, `locationHref`, `statusCode` mock, `enable`, `disable` |
 | Local file / template | `file`, `rawfile`, `tpl`, `jsonp`, `dust`, and their `x`/`xs` fallback variants (`xfile`, `xrawfile`, …) |
-| Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
+| Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` (`reqRules`), `resRules` |
 | TLS | `cipher` (upstream TLS version pin + OpenSSL cipher-string evaluation), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
@@ -2232,7 +2325,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 (case-insensitive); an operator value that names a file or a URL is
 [read before the operator applies](#values-read-from-a-file-or-a-url), and one
 wrapped in backticks is [rendered against the request](#backtick-templates);
-`locationHref://` injects a client-side redirect into HTML responses.
+`locationHref://` **answers** the request with a page that redirects itself.
 
 **Alias operators** are normalised to their canonical form, so all of these work too:
 `hosts→host`, `xhost→host` (same operator, but the `x` spelling also falls back — see
@@ -2269,6 +2362,20 @@ what rustls can express — see [What `cipher://` can pin](#what-cipher-can-pin)
 `minVersion` / `maxVersion` / `secureProtocol` (or a bare `cipher://TLSv1.2`
 token) pin the **upstream** TLS protocol version. rustls offers TLS 1.2 and 1.3
 only, so a pin older than 1.2 clamps up to 1.2.
+
+> **This is one of the places the port does more than whistle, deliberately.**
+> Measured with `tests/differential/https-bench.js`, which now reports the TLS
+> version the origin negotiated: a version pin is **inert upstream on a
+> connection that works**. whistle builds the options in `getTlsOptions`
+> (`_original/lib/rules/index.js:680-733`) but only ever extends the socket
+> options with them while *retrying a ciphers error*
+> (`lib/inspectors/res.js:495-497`, `lib/util/common.js:1769-1771`); the first,
+> successful handshake never sees them, so `tlsOptions://{"maxVersion":"TLSv1.2"}`
+> still negotiates TLS 1.3 there. A bare `cipher://TLSv1.2` does not get even
+> that far: `SEP_CIPHER_RE = /[^a-z\d:!-]/i` rejects the dot, so whistle does not
+> read it as a cipher string, and it is not JSON either — the value falls through
+> to being opened as a *file*. whistle-rs applies the pin on the first attempt,
+> which is what the rule says it does.
 
 `ciphers` is an **OpenSSL cipher string**, and whistle-rs evaluates it. Not
 matches names against a table — evaluates the language: aliases (`HIGH`,

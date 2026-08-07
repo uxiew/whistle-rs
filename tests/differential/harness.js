@@ -223,6 +223,24 @@ const FIXED = {
     { 'cache-control': 'max-age=600', 'content-security-policy': "default-src 'self'" }],
 };
 
+/**
+ * The same idea for the injection operators, which key off a content type.
+ * `[content-type, body, content-encoding?]`. Separate from `FIXED` because it
+ * is matched **exactly** rather than by path, so a corpus asking the origin for
+ * `/js/app.js` still gets the echo.
+ */
+const SHAPES = {
+  '/script.js': ['application/javascript', 'var origin = 1;'],
+  '/style.css': ['text/css', 'body{color:red}'],
+  '/plain.txt': ['text/plain', 'PLAIN'],
+  '/empty.html': ['text/html', ''],
+  '/gzipped.html': [
+    'text/html',
+    zlib.gzipSync('<html><body>ZIPPED</body></html>'),
+    'gzip',
+  ],
+};
+
 /** The origin: echoes exactly what reached it. */
 function startOrigin() {
   return new Promise((res) => {
@@ -262,6 +280,16 @@ function startOrigin() {
         if (q.url.startsWith('/html')) {
           r.writeHead(200, { 'content-type': 'text/html' });
           return r.end(HTML);
+        }
+        // One body per content type the injection operators single out, plus an
+        // empty one and a compressed one. Matched **exactly**, not by prefix, so
+        // that a corpus asking the origin for `/js/app.js` still gets the echo.
+        if (SHAPES[q.url]) {
+          const [type, body, encoding] = SHAPES[q.url];
+          const headers = { 'content-type': type };
+          if (encoding) headers['content-encoding'] = encoding;
+          r.writeHead(200, headers);
+          return r.end(body);
         }
         r.writeHead(200, { 'content-type': 'application/json', 'x-origin': 'yes' });
         r.end(JSON.stringify({

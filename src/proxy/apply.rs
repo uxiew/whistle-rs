@@ -369,33 +369,70 @@ pub fn response_phase_of(
 /// `extend` — so a rule you pulled in specifically to override something lost
 /// to the thing it was meant to override.
 ///
-/// The order key follows the precedence rather than contradicting it. It was
-/// `u64::MAX`, which is what made merged operators lose; it is now the lowest
-/// possible, so they win the `min_by_key` that picks an upstream proxy and sort
-/// ahead of the host file's operators when the response phase inserts by the
-/// same key. Equal keys keep insertion order, so several merged sets stay in
-/// the sequence they were merged in.
+/// **Except that `important` still outranks it.** `mergeRule` keeps the
+/// including rule for a single-value protocol when it is important and the new
+/// one is not, and re-partitions a multi-match list so that every important
+/// operator — from either side — comes before every normal one. So
+///
+/// ```text
+/// example.com  reqHeaders://x=outer  lineProps://important
+/// example.com  reqRules://{extra}
+/// ```
+///
+/// sends `outer`, and this port sent `inner`.
+///
+/// The order key carries all of that, because [`crate::rules::order_key`] already
+/// puts important operators below `1 << 32` and normal ones above it: a merged
+/// operator is stamped [`MERGED_ORDER`] when it is important and
+/// [`MERGED_AFTER_IMPORTANT`] when it is not, which is exactly "ahead of
+/// everything in its own class, behind the class above". Equal keys keep
+/// insertion order, so several merged sets stay in the sequence they were merged
+/// in.
 fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
+    let key = |op: &RuleOp| match op.props.has("important") {
+        true => MERGED_ORDER,
+        false => MERGED_AFTER_IMPORTANT,
+    };
     for (k, mut v) in sub.single {
-        v.order = MERGED_ORDER;
-        resolved.single.insert(k, v);
+        v.order = key(&v);
+        match resolved.single.get(&k) {
+            // `isImportant(curRule) && !isImportant(newRule) ? curRule : newRule`
+            Some(cur) if cur.order < v.order => {}
+            _ => {
+                resolved.single.insert(k, v);
+            }
+        }
     }
     for (k, vs) in sub.multi {
         let list = resolved.multi.entry(k).or_default();
-        for (at, mut op) in vs.into_iter().enumerate() {
-            op.order = MERGED_ORDER;
+        // The scan resumes after the last insertion so the merged set keeps its
+        // own order among equals — the same walk `merge_response_phase` does.
+        let mut from = 0;
+        for mut op in vs {
+            op.order = key(&op);
+            let at = list[from..]
+                .iter()
+                .position(|cur| cur.order > op.order)
+                .map_or(list.len(), |i| from + i);
             list.insert(at, op);
+            from = at + 1;
         }
     }
 }
 
-/// The resolution order stamped on every operator merged in mid-request, chosen
-/// so that merged operators win every contest decided by this key. See
+/// The resolution order stamped on an **important** operator merged in
+/// mid-request, chosen so that it wins every contest decided by this key. See
 /// [`merge_resolved`].
 const MERGED_ORDER: u64 = 0;
 
+/// The order stamped on a merged operator that is *not* important: below every
+/// normal operator's key and above every important one's, which is where
+/// upstream's stable important-first partition leaves it.
+const MERGED_AFTER_IMPORTANT: u64 = 1 << 32;
+
 /// Merge the rules pulled in by `rule://<name>` (from the values store) and
-/// `rulesFile://<path>` (from disk), resolved in the request's own scope.
+/// `rulesFile://<path>` (from disk, or from a value), resolved in the request's
+/// own scope.
 ///
 /// The managers are returned so the response phase can resolve them again —
 /// see [`merge_response_phase_of`].
@@ -414,9 +451,21 @@ pub fn merge_included_rules(
     }
     // Every `rulesFile://` line contributes, joined into one rules text — see
     // `accumulated_script_ops`.
+    //
+    // A value already *is* the rules text when the line named one — `{name}`
+    // resolved out of the values store, or the inline `(…)` form — which is
+    // upstream's `readRuleValue` returning `rule.value` before it ever looks at
+    // a disk (`_original/lib/util/index.js:1177-1179`). This port went to the
+    // filesystem unconditionally, so `reqRules://{extra}` opened the *contents*
+    // of `extra` as a path, found nothing, and silently produced no rules at
+    // all — the value form of the whole family (`reqRules`, `rulesFile`,
+    // `ruleFile`, `ruleScript`, `rulesScript`, `reqScript`) was inert.
     let joined = rules_file_ops(resolved)
         .iter()
-        .filter_map(|op| std::fs::read_to_string(&op.value).ok())
+        .filter_map(|op| match op.value_is_content {
+            true => Some(op.value.clone()),
+            false => std::fs::read_to_string(&op.value).ok(),
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if !joined.trim().is_empty() {
@@ -446,14 +495,59 @@ pub fn rules_file_ops(resolved: &Resolved) -> Vec<&RuleOp> {
 /// This port used the first entry whatever its spelling, so a file of rules
 /// written ahead of the script was handed to the JS engine instead of it.
 ///
-/// The `resRules://` entries themselves are **not** applied here: upstream folds
-/// them into a rules text that the response phase parses, whereas this port's
-/// `resScript` is a JavaScript hook that mutates the response directly. See
-/// `docs/ROADMAP.md`.
+/// The `resRules://` entries themselves are applied by [`merge_res_rules`]:
+/// they are rules text, not a script, and this port's `resScript` is a
+/// JavaScript hook that mutates the response directly.
 pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
     accumulated_script_ops(resolved, "resScript", "resRules")
         .into_iter()
         .find(|op| raw_protocol(op) != Some("resRules"))
+}
+
+/// `resRules://` — a rules text that applies to the **response**, merged once
+/// the response head is in.
+///
+/// Upstream keeps these in the same accumulating list as `resScript://` and
+/// tells them apart by spelling (`_original/lib/rules/rules.js:2258-2272`).
+/// `getResRules` collects what they hold, parses it, and merges the result with
+/// `isResRules` set (`parseRulesList` → `mergeRules(req, …, true)`,
+/// `_original/lib/plugins/index.js:808-820,:1337-1360`) — so only the response
+/// half of the produced text applies, and it **wins** over the file that named
+/// it, as every mid-request merge does.
+///
+/// Every `resRules://` line contributes; the value is the text itself for the
+/// `{name}` and inline forms and a path otherwise, exactly as
+/// [`merge_included_rules`] reads its own. Nothing here was applied before —
+/// `resRules://` parsed, resolved, and then went nowhere.
+pub fn merge_res_rules(resolved: &mut Resolved, info: &ReqInfo, is_internal_req: bool) -> bool {
+    let texts = accumulated_script_ops(resolved, "resScript", "resRules")
+        .into_iter()
+        .filter(|op| raw_protocol(op) == Some("resRules"))
+        .filter_map(|op| match op.value_is_content {
+            true => Some(op.value.clone()),
+            false => std::fs::read_to_string(&op.value).ok(),
+        })
+        .collect::<Vec<_>>();
+    let mut merged = false;
+    for text in texts {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(&text);
+        // Both passes, as the top-level rules get: a `resHeaders://x=1
+        // includeFilter://s:404` line inside the text is withheld by the first
+        // and answered by the second.
+        let mut sub = mgr.resolve_scoped(info, is_internal_req);
+        if let Some(late) = mgr.resolve_response(info, is_internal_req) {
+            sub.merge_response_phase(late);
+        }
+        sub.single.retain(|proto, _| crate::rules::protocols::is_res_protocol(proto));
+        sub.multi.retain(|proto, _| crate::rules::protocols::is_res_protocol(proto));
+        if sub.single.is_empty() && sub.multi.is_empty() {
+            continue;
+        }
+        merge_resolved(resolved, sub);
+        merged = true;
+    }
+    merged
 }
 
 /// The entries upstream keeps for `rulesFile` / `resScript`
@@ -1043,7 +1137,7 @@ fn parse_host_value(value: &str, _default_port: u16) -> (Option<String>, Option<
 /// forwarded upstream in whistle and served the mock here — a silent
 /// disagreement in either direction depending on which line came first.
 fn slot_protocols() -> impl Iterator<Item = &'static str> {
-    ["redirect", "location", "statusCode"]
+    ["redirect", "location", "statusCode", "locationHref"]
         .into_iter()
         .chain(FILE_PROTOS.iter().copied())
         .chain(std::iter::once(crate::rules::protocols::URL_REPLACE))
@@ -1132,6 +1226,7 @@ fn short_circuit_inner(
             }
             Some(resp)
         }
+        "locationHref" => serve_loc_href(&op.value, info),
         // The destination rewrite won: nothing is answered here, the request
         // goes out to where it now points.
         p if p == crate::rules::protocols::URL_REPLACE => None,
@@ -1159,6 +1254,130 @@ fn short_circuit_inner(
             }
             Some(resp)
         }
+    }
+}
+
+/// `locationHref://` — **answer** the request with a page that redirects itself
+/// (`handleLocHref`, `_original/lib/handlers/file-proxy.js:193-231`).
+///
+/// It is a mock, not an injection: `isFileProxy` admits it (`protocols.js:282`)
+/// so it shares the slot with `file://` and a destination rewrite, and the
+/// origin is never contacted. This port had it as an HTML injection — a
+/// `<script>` pushed into the origin's own `<head>` — which meant a request the
+/// origin answers with JSON, or with nothing, or with an error got no redirect
+/// at all, and one it answers with HTML paid for a round trip whose body was
+/// then thrown away by the client. `docs/RULES.md` described the injection.
+///
+/// Three prefixes choose the shape, case-insensitively; with none, a request the
+/// browser made *for a script* gets bare JavaScript, so a redirect written for a
+/// page does not arrive nested inside another `<script>`.
+///
+/// Returns `None` when the target is the request's own URL, which is upstream's
+/// `handleLocHref` returning false: the request goes out normally rather than
+/// answering itself forever. (Upstream compares against the percent-decoded URL
+/// as well; that arm is not replicated, so a value written decoded against an
+/// encoded request URL still answers here.)
+fn serve_loc_href(value: &str, info: &ReqInfo) -> Option<Response<DynBody>> {
+    let lower = value.to_ascii_lowercase();
+    let (as_js, replace, target) = if lower.starts_with("js:") {
+        (true, false, &value[3..])
+    } else if lower.starts_with("html:") {
+        (false, false, &value[5..])
+    } else if lower.starts_with("replace:") {
+        (false, true, &value[8..])
+    } else {
+        let wants_js = req_header(Some(info), "sec-fetch-dest") == Some("script");
+        (wants_js, false, value)
+    };
+
+    let mut body = String::new();
+    if !target.is_empty() {
+        // `urlToStr`: backslashes go, quotes are escaped so they cannot close
+        // the string literal, and every whitespace character becomes a space.
+        let escaped: String = target
+            .chars()
+            .filter(|c| *c != '\\')
+            .map(|c| match c.is_whitespace() {
+                true => ' ',
+                false => c,
+            })
+            .flat_map(|c| match c {
+                '"' => vec!['\\', '"'],
+                c => vec![c],
+            })
+            .collect();
+        let no_hash = escaped.split('#').next().unwrap_or(&escaped);
+        if abs_url(no_hash, &info.full_url) == info.full_url {
+            return None;
+        }
+        let call = match replace {
+            true => format!("window.location.replace(\"{escaped}\");"),
+            false => format!("window.location.href = \"{escaped}\";"),
+        };
+        body = match as_js {
+            true => call,
+            false => format!("<script>{call}</script>"),
+        };
+    }
+    let ctype = match as_js {
+        true => "application/javascript; charset=utf-8",
+        false => "text/html; charset=utf-8",
+    };
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, ctype)
+            .body(body::full(Bytes::from(body)))
+            .unwrap(),
+    )
+}
+
+/// Resolve a possibly-relative URL against the request's own
+/// (`getAbsUrl` + `formatUrl`, `_original/lib/util/common.js:526-557`).
+///
+/// Only [`serve_loc_href`]'s loop check needs it, and only its exact shape will
+/// do: whistle normalises both sides through `formatUrl`, which appends the `/`
+/// a bare host is missing, so `http://a.test` and `http://a.test/` compare
+/// equal.
+fn abs_url(url: &str, full_url: &str) -> String {
+    if is_http_url(url) {
+        return format_url(url);
+    }
+    if let Some(rest) = url.strip_prefix('/') {
+        // `fullUrl.indexOf('/', 8)` skips past `https://` to the first slash of
+        // the path. JavaScript's `substring(0, -1)` is the empty string, which
+        // is what a full URL with no path at all yields.
+        let base = full_url
+            .get(8..)
+            .and_then(|r| r.find('/'))
+            .map_or("", |i| &full_url[..i + 8]);
+        return format_url(&format!("{base}/{rest}"));
+    }
+    // `QUERY_RE = /\/[^/]*(?:\?.*)?$/` — the last path segment and the query go,
+    // and the relative value takes their place.
+    let stem = strip_last_segment(full_url);
+    format_url(&format!("{stem}/{url}"))
+}
+
+/// `formatUrl` — split the query off, and give a URL with no path a `/`.
+fn format_url(pattern: &str) -> String {
+    let (path, query) = match pattern.find('?') {
+        Some(at) => (&pattern[..at], &pattern[at..]),
+        None => (pattern, ""),
+    };
+    let from = path.find("://").map_or(0, |at| at + 3);
+    match path[from..].contains('/') {
+        true => format!("{path}{query}"),
+        false => format!("{path}/{query}"),
+    }
+}
+
+/// Drop the trailing `/<segment>` and any query — upstream's `QUERY_RE`.
+fn strip_last_segment(url: &str) -> &str {
+    let head = url.split('?').next().unwrap_or(url);
+    match head.rfind('/') {
+        Some(at) => &head[..at],
+        None => head,
     }
 }
 
@@ -3828,6 +4047,18 @@ fn injects_into_body(headers: &HeaderMap, resolved: &Resolved, status: u16, meth
             .iter()
             .any(|op| !op.value.is_empty())
     };
+    // `weinre://` is an injector too, and upstream clears the same two things
+    // for it (`_original/lib/inspectors/weinre.js:37-38`). It has to: a debug
+    // agent pushed into a page whose CSP forbids inline scripts never runs, and
+    // one the browser caches outlives the rule that asked for it. This port
+    // injected the script and left both standing.
+    //
+    // Upstream reaches JavaScript responses as well, appending the agent source
+    // bare; this port's injection is a `<script src>` tag, which only means
+    // anything in markup — see `docs/RULES.md`.
+    if families.html && resolved.value("weinre").is_some() {
+        return true;
+    }
     ["Body", "Prepend", "Append"].iter().any(|slot| {
         writes(format!("res{slot}"))
             || (families.html && writes(format!("html{slot}")))
@@ -7909,6 +8140,74 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// …but `important` still outranks it. `mergeRule` keeps an important
+    /// including rule for a single-value protocol, and its stable partition puts
+    /// every important operator ahead of every normal one for a multi-match one
+    /// (`_original/lib/util/index.js:2160-2170`). This port let the merged rule
+    /// win outright, so `lineProps://important` on the including line meant
+    /// nothing the moment that line pulled a file in.
+    #[test]
+    fn an_important_line_outranks_what_it_pulled_in() {
+        let values: HashMap<String, String> = [(
+            "extra".to_string(),
+            "example.com reqHeaders://x-w=inner host://9.9.9.9\n".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let merged = |rules: &str| {
+            let (info, mut resolved) = resolve_with_info(rules, "http://example.com/");
+            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            let _keep = merge_included_rules(&mut resolved, &info, &values, false);
+            let mut h = HeaderMap::new();
+            apply_header_ops(&mut h, &resolved, "reqHeaders");
+            (h.get("x-w").map(|v| v.to_str().unwrap().to_string()), resolved)
+        };
+
+        // Important on the including line: it holds both slots.
+        let (header, resolved) = merged(
+            "example.com reqHeaders://x-w=outer host://1.1.1.1 lineProps://important\nexample.com reqRules://{extra}\n",
+        );
+        assert_eq!(header.as_deref(), Some("outer"));
+        assert_eq!(resolved.value("host"), Some("1.1.1.1"));
+
+        // Not important: the merged rule wins, as before.
+        let (header, resolved) = merged(
+            "example.com reqHeaders://x-w=outer host://1.1.1.1\nexample.com reqRules://{extra}\n",
+        );
+        assert_eq!(header.as_deref(), Some("inner"));
+        assert_eq!(resolved.value("host"), Some("9.9.9.9"));
+    }
+
+    /// `reqRules://{name}` names a **value**, not a path, and every other
+    /// spelling of the family does too. Upstream's `readRuleValue` hands back
+    /// `rule.value` and never reaches a disk (`_original/lib/util/index.js:
+    /// 1177-1179`); this port read the filesystem unconditionally, so the
+    /// contents of the value were opened as a path, nothing was found, and the
+    /// produced rules vanished without a word.
+    #[test]
+    fn a_produced_rules_text_may_come_from_a_value() {
+        let values: HashMap<String, String> =
+            [("extra".to_string(), "example.com resHeaders://x-src=inc\n".to_string())]
+                .into_iter()
+                .collect();
+        for spelling in ["reqRules", "rulesFile", "ruleFile", "ruleScript", "rulesScript", "reqScript"] {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(&format!("example.com {spelling}://{{extra}}\n"));
+            let info =
+                build_req_info("GET", "http", "example.com", 80, "/x", &HeaderMap::new(), None);
+            let mut resolved = mgr.resolve(&info);
+            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            let _keep = merge_included_rules(&mut resolved, &info, &values, false);
+            let mut headers = HeaderMap::new();
+            apply_header_ops(&mut headers, &resolved, "resHeaders");
+            assert_eq!(
+                headers.get("x-src").map(|v| v.to_str().unwrap()),
+                Some("inc"),
+                "{spelling}://{{extra}}"
+            );
+        }
+    }
+
     /// `${name}` inside an operator's value reads the values store. This port
     /// only ever replaced a value that *was* exactly `{name}`, so
     /// `resHeaders://x-v=${myval}` reached the origin with the eight literal
@@ -8563,6 +8862,103 @@ mod tests {
         }
     }
 
+    /// A short-circuit response's body, as text.
+    fn body_text(resp: Response<DynBody>) -> String {
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(async { http_body_util::BodyExt::collect(resp.into_body()).await })
+            .expect("collect body")
+            .to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// `locationHref://` **answers** the request — it is one of upstream's
+    /// file-proxy protocols (`isFileProxy`, `protocols.js:282`), not a rewrite
+    /// of whatever the origin happened to send. This port injected a `<script>`
+    /// into the origin's HTML instead, so the origin was contacted for a body
+    /// nobody would read, and a JSON or empty answer got no redirect at all.
+    #[test]
+    fn location_href_answers_the_request_itself() {
+        let body_of = |rule: &str, info: &ReqInfo| {
+            let resolved = resolve(&format!("a.com/x {rule}\n"), "http://a.com/x");
+            let resp = short_circuit(info, &resolved, test_env())?;
+            let ctype = resp
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap().to_string());
+            Some((ctype, body_text(resp)))
+        };
+        let plain = build_req_info("GET", "http", "a.com", 80, "/x", &HeaderMap::new(), None);
+
+        assert_eq!(
+            body_of("locationHref://http://b.com/go", &plain),
+            Some((
+                Some("text/html; charset=utf-8".to_string()),
+                "<script>window.location.href = \"http://b.com/go\";</script>".to_string()
+            ))
+        );
+        // `js:` and a request the browser made for a script both drop the tag.
+        let mut script = HeaderMap::new();
+        script.insert("sec-fetch-dest", HeaderValue::from_static("script"));
+        let as_script = build_req_info("GET", "http", "a.com", 80, "/x", &script, None);
+        for (rule, info) in [
+            ("locationHref://js:http://b.com/go", &plain),
+            ("locationHref://http://b.com/go", &as_script),
+        ] {
+            assert_eq!(
+                body_of(rule, info),
+                Some((
+                    Some("application/javascript; charset=utf-8".to_string()),
+                    "window.location.href = \"http://b.com/go\";".to_string()
+                )),
+                "{rule}"
+            );
+        }
+        // `html:` overrides that guess; `replace:` swaps the call.
+        assert_eq!(
+            body_of("locationHref://html:http://b.com/go", &as_script).map(|(_, b)| b),
+            Some("<script>window.location.href = \"http://b.com/go\";</script>".to_string())
+        );
+        assert_eq!(
+            body_of("locationHref://replace:http://b.com/go", &plain).map(|(_, b)| b),
+            Some("<script>window.location.replace(\"http://b.com/go\");</script>".to_string())
+        );
+        // An empty value is still an answer, with an empty body.
+        assert_eq!(
+            body_of("locationHref://", &plain),
+            Some((Some("text/html; charset=utf-8".to_string()), String::new()))
+        );
+        // Pointing at the request's own URL would loop: the request goes out.
+        assert_eq!(body_of("locationHref://http://a.com/x", &plain), None);
+        assert_eq!(body_of("locationHref:///x", &plain), None);
+        // A relative value resolves against the request, so this one is *not*
+        // the request's own URL and does answer.
+        assert_eq!(
+            body_of("locationHref://y", &plain).map(|(_, b)| b),
+            Some("<script>window.location.href = \"y\";</script>".to_string())
+        );
+    }
+
+    /// `locationHref://` shares the one destination slot with the file family
+    /// and a URL replacement, because upstream files all of them under `rule`.
+    /// Whichever line came first answers; the others do not apply.
+    #[test]
+    fn location_href_shares_the_destination_slot() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/x", &HeaderMap::new(), None);
+        let first = resolve(
+            "a.com/x locationHref://http://b.com/go\na.com/x file://(MOCK)\n",
+            "http://a.com/x",
+        );
+        assert_eq!(slot_winner(&first).map(|(p, _)| p), Some("locationHref"));
+        let second = resolve(
+            "a.com/x file://(MOCK)\na.com/x locationHref://http://b.com/go\n",
+            "http://a.com/x",
+        );
+        assert_eq!(slot_winner(&second).map(|(p, _)| p), Some("file"));
+        assert_eq!(body_text(short_circuit(&info, &second, test_env()).unwrap()), "MOCK");
+    }
+
     /// Only the file family. `redirect://` and `statusCode://` are answered by
     /// a different handler upstream and carry no automatic CORS.
     #[test]
@@ -8898,6 +9294,56 @@ mod tests {
             res_script_op(&two).map(|op| op.value.as_str()),
             Some("/one.js")
         );
+    }
+
+    /// A `resRules://` text is rules, and they apply to the response. Every
+    /// line contributes, from a file or from a value alike, and what a text
+    /// produces beats the line that named it. This port parsed `resRules://`,
+    /// resolved it, and then dropped it on the floor.
+    #[test]
+    fn a_res_rules_text_applies_to_the_response() {
+        let fx = Fixtures::new("res-rules");
+        let file = fx.write("res.txt", b"example.com resHeaders://x-file=1\n");
+        let values: HashMap<String, String> = [
+            ("r", "example.com resHeaders://x-w=inner\n"),
+            ("q", "example.com host://192.0.2.1 reqHeaders://x-late=1\n"),
+            ("g", "example.com resHeaders://x-g=1 includeFilter://s:404\n"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let headers_of = |rules: &str, status: u16| {
+            let (mut info, mut resolved) = resolve_with_info(rules, "http://example.com/");
+            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            info.res = Some(build_res_info(status, &HeaderMap::new(), None, None));
+            merge_res_rules(&mut resolved, &info, false);
+            let mut h = HeaderMap::new();
+            apply_header_ops(&mut h, &resolved, "resHeaders");
+            (h, resolved)
+        };
+
+        let (h, _) = headers_of(&format!("example.com resRules://{file}\n"), 200);
+        assert_eq!(h.get("x-file").unwrap(), "1");
+
+        // The produced text wins over the line that named it.
+        let (h, _) = headers_of(
+            "example.com resHeaders://x-w=outer resRules://{r}\n",
+            200,
+        );
+        assert_eq!(h.get("x-w").unwrap(), "inner");
+
+        // A request-side operator inside the text is dropped: by the time it is
+        // read the request has gone out. `mergeRules(…, isResRules)` keeps only
+        // `resProtocols`.
+        let (_, resolved) = headers_of("example.com resRules://{q}\n", 200);
+        assert!(resolved.value("host").is_none());
+        assert!(resolved.all("reqHeaders").is_empty());
+
+        // A response filter inside the text is answered with the head in hand.
+        let gated = "example.com resRules://{g}\n";
+        assert!(headers_of(gated, 200).0.get("x-g").is_none());
+        assert_eq!(headers_of(gated, 404).0.get("x-g").unwrap(), "1");
     }
 
     /// Serve a file rule for `GET http://x.com/`, returning status, content type
@@ -10986,6 +11432,39 @@ mod tests {
                 "example.com cssAppend://a{}\n",
                 &[
                     ("content-type", "application/javascript"),
+                    ("content-security-policy", "default-src 'self'")
+                ],
+                "content-security-policy"
+            )
+            .is_some()
+        );
+    }
+
+    /// `weinre://` injects a `<script>` and so pays the same price
+    /// (`_original/lib/inspectors/weinre.js:37-38`). Before this the agent was
+    /// pushed into the page and then blocked by the page's own CSP.
+    #[test]
+    fn weinre_strips_csp_and_caching_too() {
+        let html = [
+            ("content-type", "text/html"),
+            ("content-security-policy", "default-src 'self'"),
+            ("cache-control", "max-age=600"),
+        ];
+        assert_eq!(
+            res_header("example.com weinre://mysession\n", &html, "content-security-policy"),
+            None
+        );
+        assert_eq!(
+            res_header("example.com weinre://mysession\n", &html, "cache-control"),
+            Some("no-store".to_string())
+        );
+        // Nothing is injected into a response that is not markup, so nothing is
+        // stripped from one either.
+        assert!(
+            res_header(
+                "example.com weinre://mysession\n",
+                &[
+                    ("content-type", "application/json"),
                     ("content-security-policy", "default-src 'self'")
                 ],
                 "content-security-policy"

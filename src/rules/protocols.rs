@@ -209,6 +209,22 @@ pub fn is_res_phase(name: &str) -> bool {
     RES_PHASE_PROTOCOLS.contains(&name)
 }
 
+/// May a rules text merged into the **response** set this operator?
+///
+/// `resProtocols` (`_original/lib/rules/protocols.js:112-120`) is
+/// [`RES_PHASE_PROTOCOLS`] plus the filtering machinery, and it is what
+/// `mergeRules(req, add, isResRules)` restricts itself to
+/// (`_original/lib/util/index.js:2198-2203`). So a `host://` written inside a
+/// `resRules://` text is parsed and then dropped: by the time the text is read
+/// the request has already gone out.
+pub fn is_res_protocol(name: &str) -> bool {
+    is_res_phase(name)
+        || matches!(
+            name,
+            "filter" | "enable" | "disable" | "ignore" | "style" | "delete" | "headerReplace"
+        )
+}
+
 /// Protocols that may legitimately appear multiple times in a resolved set
 /// (`multiMatchs`, `_original/lib/rules/protocols.js:186-226`). We keep every
 /// matching value for these instead of first-match-wins.

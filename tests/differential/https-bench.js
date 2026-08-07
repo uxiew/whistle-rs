@@ -41,7 +41,14 @@ function startOrigin() {
         q.on('data', (c) => (body += c));
         q.on('end', () => {
           r.writeHead(200, { 'content-type': 'application/json', 'x-origin': 'tls' });
-          r.end(JSON.stringify({ method: q.method, url: q.url, headers: q.headers, body }));
+          // `tls` is the version the *proxy* negotiated with this origin, which
+          // is the only place `cipher://` / `tlsOptions://` is observable at
+          // all: nothing about a version pin reaches the client. Without it a
+          // case that pins a version and a case that pins nothing look the same.
+          r.end(JSON.stringify({
+            method: q.method, url: q.url, headers: q.headers, body,
+            tls: q.socket.getProtocol(),
+          }));
         });
       },
     );
@@ -127,12 +134,25 @@ const norm = (h) => Object.fromEntries(
 );
 
 /**
- * The one deliberate difference, same as the plain bench's: whistle has
- * `notAllowCache` and never reaches it, so its own body rewrite vanishes on a
- * browser reload. This port busts the cache and is better for it.
+ * The deliberate differences.
+ *
+ * 1. whistle has `notAllowCache` and never reaches it, so its own body rewrite
+ *    vanishes on a browser reload. This port busts the cache and is better for
+ *    it.
+ * 2. A `cipher://` / `tlsOptions://` version pin is **inert upstream on a
+ *    connection that works**. whistle builds the options in `getTlsOptions`
+ *    (`_original/lib/rules/index.js:680-733`) but only ever extends the socket
+ *    options with them while *retrying a ciphers error*
+ *    (`lib/inspectors/res.js:495-497`, `lib/util/common.js:1769-1771`); the
+ *    first, successful handshake never sees them. A bare `tlsOptions://TLSv1.2`
+ *    does not even get that far — `SEP_CIPHER_RE = /[^a-z\d:!-]/i` rejects the
+ *    dot, so it is not read as a cipher string, and it is not JSON either.
+ *    whistle-rs applies the pin on the first attempt, which is what the rule
+ *    says it does. Declared in `docs/RULES.md`.
  */
 const EXPECTED = (p) =>
-  /req\.header\.(pragma|cache-control): whistle=undefined rs="no-cache"/.test(p);
+  /req\.header\.(pragma|cache-control): whistle=undefined rs="no-cache"/.test(p)
+  || /req\.tls: whistle="TLSv1\.3" rs="TLSv1\.2"/.test(p);
 
 const show = (v) => JSON.stringify(v);
 
@@ -148,6 +168,7 @@ function compare(w, rs) {
     if (wb.method !== rb.method) out.push(`req.method: whistle=${wb.method} rs=${rb.method}`);
     if (wb.url !== rb.url) out.push(`req.url: whistle=${wb.url} rs=${rb.url}`);
     if (wb.body !== rb.body) out.push(`req.body: whistle=${show(wb.body)} rs=${show(rb.body)}`);
+    if (wb.tls !== rb.tls) out.push(`req.tls: whistle=${show(wb.tls)} rs=${show(rb.tls)}`);
     const [whh, rhh] = [norm(wb.headers), norm(rb.headers)];
     for (const k of new Set([...Object.keys(whh), ...Object.keys(rhh)])) {
       if (show(whh[k]) !== show(rhh[k])) out.push(`req.header.${k}: whistle=${show(whh[k])} rs=${show(rhh[k])}`);
@@ -186,6 +207,24 @@ async function main() {
     { name: 'includeFilter on a request header over TLS', rules: `${O} reqHeaders://x-f=1 includeFilter://reqH.x-tag:yes`, request: { headers: { 'x-tag': 'yes' } } },
     { name: 'disable://cookie over TLS', rules: `${O} disable://cookie`, request: { headers: { cookie: 'sid=secret' } } },
     { name: 'delete reqHeaders over TLS', rules: `${O} reqHeaders://x-a=1 delete://reqHeaders.x-a` },
+    // The TLS knobs. `tlsOptions://` is an alias of `cipher://`
+    // (`aliasProtocols`, `_original/lib/rules/protocols.js:149`), and the only
+    // thing either of them changes is the handshake the proxy makes with the
+    // **origin** — which is why the origin now echoes the version it got.
+    { name: 'tlsOptions pins TLS 1.2', rules: `${O} tlsOptions://TLSv1.2` },
+    { name: 'tlsOptions pins TLS 1.3', rules: `${O} tlsOptions://TLSv1.3` },
+    { name: 'cipher is the same operator', rules: `${O} cipher://TLSv1.2` },
+    { name: 'tlsOptions in its JSON form', rules: `${O} tlsOptions://{"maxVersion":"TLSv1.2"}` },
+    { name: 'tlsOptions minVersion', rules: `${O} tlsOptions://{"minVersion":"TLSv1.3"}` },
+    { name: 'a cipher list pins no version', rules: `${O} tlsOptions://{"ciphers":"ECDHE-RSA-AES128-GCM-SHA256"}` },
+    { name: 'tlsOptions with nonsense in it', rules: `${O} tlsOptions://not-a-version` },
+    // `sniCallback://` asks a *plugin* which certificate to present, or whether
+    // to intercept at all (`_original/lib/https/load-cert.js:8-17`). Naming a
+    // plugin that is not installed leaves the connection exactly as it was.
+    { name: 'sniCallback naming no plugin', rules: `${O} sniCallback://nosuchplugin` },
+    { name: 'sniCallback with the whistle. prefix', rules: `${O} sniCallback://whistle.nosuchplugin` },
+    { name: 'sniCallback with a value', rules: `${O} sniCallback://nosuchplugin(staging)` },
+    { name: 'sniCallback next to a rule that fires', rules: `${O} sniCallback://nosuchplugin reqHeaders://x-a=1` },
   ];
 
   // A hard baseline. Two proxies that both fail identically compare *equal*,

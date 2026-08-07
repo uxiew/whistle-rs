@@ -38,19 +38,24 @@ PORT_BASE=19100 CASES=./cases-filters.js npm run bench
 It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0`.
 
-Two corpora are not clean on a bare run, by design:
+Three corpora are not clean on a bare run, by design:
 
 * `cases-filters.js` asks about `env:`, which reads the **proxy's** environment.
   Both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle
   *and* whistle-rs. Starting only the oracle reports five differences that are
   the launch, not the port.
-* `cases-delete.js` ends at `differing: 8`, and its own header still says ten.
-  All of them come from one fact: `EMPTY_BUFFER` is `undefined` in whistle
-  2.10.8, so upstream's "empty the body" paths forward the real body instead.
-  The two that closed are `reqBody with an empty value` and `resBody with an
-  empty value` — an operator written with *no value* now does nothing here too,
-  which is a different question from `delete://body`, where this port still
-  empties the body on purpose. The eight that remain are all `delete://`'s.
+* `cases-delete.js` ends at `differing: 8`. All eight come from one fact:
+  `EMPTY_BUFFER` is `undefined` in whistle 2.10.8, so upstream's "empty the
+  body" paths forward the real body instead. Two more used to be on that list —
+  `reqBody with an empty value` and `resBody with an empty value` — and closed
+  when the bodies audit matched upstream: an operator written with *no value*
+  now does nothing here either. That is a different question from
+  `delete://body`, where this port still empties the body on purpose.
+* `cases-compose.js` ends at `differing: 8`, also named at the top of the file:
+  six are `weinre://`, which appends whistle's own bundled debug agent and points
+  it at a weinre server whistle runs — neither of which this port has; one is
+  `intercept://`, which is not a protocol in either proxy and fails in each one's
+  own words; and one is the OS byte of a gzip header.
 
 ## The HTTPS bench
 
@@ -64,6 +69,11 @@ PORT_BASE=19600 node oracle.js &
 cargo run -- --port 19601 --no-persist --insecure-upstream --dir /tmp/rs-tls &
 PORT_BASE=19600 node https-bench.js
 ```
+
+Its origin also echoes the **TLS version it negotiated with the proxy**, which is
+the only place `cipher://` / `tlsOptions://` is observable at all: a version pin
+changes nothing the client can see. Without it, a case that pins a version and a
+case that pins nothing compare equal.
 
 It refuses to run its cases until a plain request really works through both —
 because it once reported "18 cases, 0 differences" while **every tunnel was
