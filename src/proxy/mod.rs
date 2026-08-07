@@ -2368,16 +2368,18 @@ async fn resolve_response_phase(
     info.res = Some(res);
     let host = bind_host(state);
     let mut added = false;
+    // The same map the request pass used. Reading `state.values` alone here made
+    // a response-phase operator the only place a ``` block in the rules text was
+    // invisible, so `resBody://{mock} includeFilter://s:404` served the six
+    // characters `{mock}`.
+    let values = effective_values(state);
     // Rules merged in mid-request get the same second pass. Upstream re-resolves
     // its `pRules`/`fRules`/`hRules` here too
     // (`_original/lib/plugins/index.js:1326-1335`); each manager answers from
     // its own precomputed flags, so a text with no response-dependent line
     // costs one comparison.
     if let Some(mut extra) = apply::response_phase_of(merged, info, is_internal_req) {
-        {
-            let values = state.values.read().unwrap();
-            apply::substitute_values(&mut extra, &values, tpl_ctx(&host, state.config.port, info));
-        }
+        apply::substitute_values(&mut extra, &values, tpl_ctx(&host, state.config.port, info));
         apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
         resolved.merge_response_phase(extra);
         added = true;
@@ -2393,22 +2395,26 @@ async fn resolve_response_phase(
             info.full_url,
             info.res.as_ref().map(|r| r.status).unwrap_or_default()
         );
-        {
-            let values = state.values.read().unwrap();
-            apply::substitute_values(&mut extra, &values, tpl_ctx(&host, state.config.port, info));
-        }
+        apply::substitute_values(&mut extra, &values, tpl_ctx(&host, state.config.port, info));
         apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
         resolved.merge_response_phase(extra);
         added = true;
     }
+    // Backtick templates on response-phase operators were left for this moment —
+    // they are the only values whose variables need the head that has just
+    // arrived (`apply::waits_for_the_response`). Everything else was substituted
+    // in the request pass and says so, so this walk touches only what it
+    // deferred.
+    added |= apply::substitute_values(resolved, &values, tpl_ctx(&host, state.config.port, info));
     // `resRules://` last, because what a rules text produces wins over the file
     // that named it and the merge is an overwrite — upstream's `mergeRules(req,
     // …, true)` at the end of `getResRules`.
+    //
+    // It substitutes against `values`, the same map every other pass here uses.
+    // Reading `state.values` directly is what made a response-phase operator the
+    // one place a ``` block in the rules text was invisible.
     if apply::merge_res_rules(resolved, info, is_internal_req) {
-        {
-            let values = state.values.read().unwrap();
-            apply::substitute_values(resolved, &values, tpl_ctx(&host, state.config.port, info));
-        }
+        apply::substitute_values(resolved, &values, tpl_ctx(&host, state.config.port, info));
         apply::substitute_config_vars(resolved, state.config.port, crate::config::VERSION);
         added = true;
     }
@@ -2739,7 +2745,14 @@ fn restore_content_encoding(
 /// the proxy runs — the console edits values, and a rules edit can add or
 /// remove an inline block. The cost is one map build over a handful of entries;
 /// a rules file with no ``` in it contributes an empty map without allocating.
-fn effective_values(state: &Arc<AppState>) -> std::collections::HashMap<String, String> {
+///
+/// **The layering is upside down relative to upstream, on purpose.**
+/// `getValueFor` asks the inline map first and only falls back to the store
+/// (`_original/lib/rules/rules.js:785-796`), so there a ``` block shadows a
+/// stored entry of the same name. Here `--value` is a run-scoped override that
+/// has to beat what a rules file brought — see `main.rs`. Recorded rather than
+/// aligned, and exercised in `tests/differential/cases-values.js`.
+fn effective_values(state: &AppState) -> std::collections::HashMap<String, String> {
     let mut values = state.rules.read().unwrap().inline_values();
     if values.is_empty() {
         return state.values.read().unwrap().clone();

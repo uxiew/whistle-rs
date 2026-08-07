@@ -385,8 +385,18 @@ example.com   tpl://{mock}
 example.com/api   file://{mock.json}
 ````
 
-这条路上有三件事要记住：
+这条路上有四件事要记住：
 
 - Content-Type 从**条目名**猜（`mock.json` → `application/json`），见 [Content-Type](#content-type)；
 - 请求路径**不会**拼上去 —— 内容不是位置，没有可延长的东西；
-- 没有 `Server` 响应头，因为没有读文件。
+- 没有 `Server` 响应头，因为没有读文件；
+- 取回来的是**内容，不是规则文本**。上游对一条规则的 matcher 只展开一次
+  （`resolveVar`，`_original/lib/rules/rules.js:774-783`），所以 mock 内容里的
+  `${…}`、`{…}`、`${port}`、乃至一段 ``` 围栏，都是 mock 自己要输出的字符。
+
+  唯一的例外是规则行整值加了反引号：那时候条目内容**会**被渲染一遍，捕获组也会
+  按 `${RegExp.$1}` 这个写法代入 —— 见 [`RULES.md` 的反引号模板](RULES.md#backtick-templates)。
+
+> **围栏值与 values 存储同名时**，上游用围栏块（`getValueFor` 先查内嵌表，
+> `rules.js:785-796`），whistle-rs 用存储里的那个 —— 好让 `--value` 与控制台的
+> 编辑能盖住规则文件带来的值。这是一处**刻意偏离**。

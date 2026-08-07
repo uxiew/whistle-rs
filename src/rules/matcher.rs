@@ -685,11 +685,17 @@ fn take(resolved: &mut Resolved, op: &RuleOp, order: u64, matched: &Matched<'_>)
     op.order = order;
     // Captures first, then the tail — upstream's order too (`resolveVar` and
     // `replaceSubMatcher` run before `getPathRule` joins anything).
-    if let Some(groups) = &matched.groups
-        && super::replace::has_reference(&op.value)
-    {
-        let refs: Vec<&str> = groups.iter().map(String::as_str).collect();
-        op.value = super::replace::expand(&op.value, &refs);
+    if let Some(groups) = &matched.groups {
+        if super::replace::has_reference(&op.value) {
+            let refs: Vec<&str> = groups.iter().map(String::as_str).collect();
+            op.value = super::replace::expand(&op.value, &refs);
+        }
+        // Kept for the text the values store contributes later, which this pass
+        // cannot see and upstream expands in the same sweep — see
+        // [`RuleOp::captures`].
+        if super::names_a_value(&op.value) {
+            op.captures = Some(groups.to_vec());
+        }
     }
     if joins_tail(&op) && !matched.tail.is_empty() {
         op.value = join_each_path(&op.protocol, &op.value, &matched.tail);

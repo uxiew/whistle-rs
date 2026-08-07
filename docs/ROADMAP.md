@@ -440,7 +440,7 @@ H2 会话复用）。
 | 领域 | 状态 |
 |------|------|
 | 插件运行时（Rust 进程内 + 子进程 + 远程） | ✅ 二进制响应体、就绪等待、失败重试 |
-| `@`-includes（从 URL / 文件引入规则） | ✅ 加载时解析 |
+| `@`-includes（从 URL / 文件引入规则） | ⚠️ 只对 `-r` / `--rule` 的启动规则生效；控制台 / `POST /api/rules` 的文本不展开，上游两边都展开 |
 | `${port}` / `${version}` 配置变量 | ✅ |
 | 响应体解码（gzip / deflate / brotli）用于查看 | ✅ 流式解码，界限 16 KB，不影响转发 |
 | HAR 1.2 导出（`/sessions.har` + UI 下载） | ✅ |
@@ -905,6 +905,21 @@ H2 会话复用）。
       （已移除）、第一遍正则曾每请求重新编译。
 - [x] ~~`{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量~~ → **本移植无物可替，
       按非目标关闭**（理由见下方 Non-goals）。
+- [x] ~~**values / 模板 / 内联载荷四项差异**~~ → 已修（差分对照 `cases-values.js`，
+      109 例）。① **同一个算子的值被展开了两次**：`substitute_values` 在合并
+      `rule://` / `rulesFile://` 之后会再跑一遍，于是 mock 内容里的 `${x}` 被当成引用
+      展开、`{x}` 被整体替换、首尾是反引号的内容各被吃掉一个 —— 上游对一条规则的
+      matcher 只展开一次（`resolveVar`，`rules.js:774-783`）。现按 `RuleOp::values_substituted`
+      只做一次。② **整值 `` `{name}` `` 不渲染取回来的内容**（上游 `rules.js:826-833`
+      的 `if (rule.isTpl)`），连带 `${RegExp.$1}` 这个「捕获组进 values 内容」的唯一写法
+      也不生效。③ **捕获组与 values 的展开顺序反了**：上游先 `resolveVar` 再
+      `replaceSubMatcher`（`rules.js:1010-1012`），所以写在共享 value 里的 `$1` 到达算子时
+      是展开过的；本移植在匹配时就展开，晚到的内容里那六个字符原样送到源站。
+      ④ **响应期算子的反引号模板在请求阶段就渲染了**，`${statusCode}`、`${serverIp}`、
+      `${serverPort}`、`${resHeaders.*}` 因此恒为空 —— 与 `TEMPLATES.md` 和 `RULES.md`
+      当时的说法相反。现推迟到响应头到手之后（`apply::waits_for_the_response`）。
+      同一处还修了：响应期算子看不到围栏块声明的 value（那一遍只读了 values 存储），
+      以及 `${port}` / `${version}` 会被替换进 mock 内容里。
 - [x] ~~`lineProps`（whistle 规则行级属性系统）~~ → 见 [`LINE_PROPS.md`](LINE_PROPS.md)。
       解析层与原版完全对齐；`important`、`safeHtml`/`strictHtml` 注入门禁、
       `internal`/`internalOnly` 作用域、`proxyFirst`/`proxyHost`/`proxyHostOnly`、

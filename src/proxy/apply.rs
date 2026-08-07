@@ -145,12 +145,37 @@ fn render_backticks(op: &crate::rules::RuleOp, tpl: TplCtx<'_>) -> Option<String
 /// (`_original/lib/rules/rules.js:774-783`) is: `renderTpl` runs first, and
 /// whether it *found* a template then decides what happens to the result of
 /// every `${name}` lookup below it.
+/// Returns whether it substituted anything, which the response phase uses to
+/// decide whether the value loader has new work — see [`waits_for_the_response`].
 pub fn substitute_values(
     resolved: &mut Resolved,
     values: &HashMap<String, String>,
     tpl: TplCtx<'_>,
-) {
-    fn sub(op: &mut crate::rules::RuleOp, values: &HashMap<String, String>, tpl: TplCtx<'_>) {
+) -> bool {
+    fn sub(op: &mut crate::rules::RuleOp, values: &HashMap<String, String>, tpl: TplCtx<'_>) -> bool {
+        // Upstream expands a matcher exactly once. This runs again whenever
+        // rules are merged in mid-request, and a second pass over an operator
+        // whose value is *already* the store's content would read that content
+        // as rule text — see `RuleOp::values_substituted`.
+        if op.values_substituted || waits_for_the_response(op, tpl) {
+            return false;
+        }
+        op.values_substituted = true;
+        // `$0`…`$9` for the text the store is about to hand back — the two
+        // branches below spell them differently, and each wants them. Taken
+        // rather than borrowed: an operator that has been substituted is done
+        // with its pattern.
+        let captures = op.captures.take();
+        // The `${name}` branch's spelling: a plain `$1`, because upstream's
+        // `replaceSubMatcher` sweeps the whole matcher after `resolveVar` has
+        // pasted the content into it.
+        let expand = |text: &str| match &captures {
+            Some(groups) if crate::rules::replace::has_reference(text) => {
+                let refs: Vec<&str> = groups.iter().map(String::as_str).collect();
+                crate::rules::replace::expand(text, &refs)
+            }
+            _ => text.to_string(),
+        };
         // `renderTpl` first, so the backticks are gone before the value store is
         // consulted — and remember whether there were any.
         let is_tpl = match render_backticks(op, tpl) {
@@ -167,14 +192,33 @@ pub fn substitute_values(
             && let Some(content) = values.get(name)
         {
             let name = name.to_string();
-            *value = content.clone();
+            // A backticked `{name}` renders what the store returned, captures
+            // and all (`if (rule.isTpl && regExp) … if (rule.isTpl) …`,
+            // `_original/lib/rules/rules.js:826-833`). Without the backticks the
+            // content is bytes, and a `${method}` in a mock body is text the mock
+            // meant to contain.
+            //
+            // One shade wider than upstream: it keeps a group table only for a
+            // *regexp* pattern (`result.regExp`, `rules.js:1016`) — which is most
+            // of them, since the `^host/**` spelling compiles to one — so a
+            // `.example.com` wildcard's captures never reach a `{name}` there.
+            // Here the same captures are the same captures.
+            *value = match (is_tpl, &captures) {
+                (true, Some(groups)) => super::template::render_vars(
+                    &substitute_regexp_vars(content, groups),
+                    tpl.info,
+                    tpl.env,
+                ),
+                (true, None) => super::template::render_vars(content, tpl.info, tpl.env),
+                (false, _) => content.clone(),
+            };
             // What came back is the content, not a place to find it — see
             // `RuleOp::value_is_content`.
             op.value_is_content = true;
             // The name outlives the substitution because the file family guesses
             // a content type from it — see `RuleOp::value_key`.
             op.value_key = Some(name);
-            return;
+            return true;
         }
         // `${name}` anywhere *inside* a value, which is the other half of
         // `resolveVar` (`VAR_RE = /\${([^{}]+)}/g`,
@@ -191,24 +235,97 @@ pub fn substitute_values(
         // `rules.js:779`). That is the only way a stored value ever sees the
         // request: a named value is written once and reused, so the backticks on
         // the rule line are what say "render what this expands to".
+        //
+        // The store's answer is capture-expanded on its way in, which is
+        // upstream's order: `resolveVar` runs before `replaceSubMatcher`
+        // (`rules.js:1010-1012`), so a `$1` written into a shared value reaches
+        // the operator as what the pattern captured.
         if value.contains("${") {
             *value = substitute_braced(value, |name| {
                 let stored = values.get(name)?;
                 Some(match is_tpl && !stored.is_empty() {
-                    true => super::template::render_vars(stored, tpl.info, tpl.env),
-                    false => stored.clone(),
+                    true => super::template::render_vars(&expand(stored), tpl.info, tpl.env),
+                    false => expand(stored),
                 })
             });
         }
+        true
     }
+    let mut did = false;
     for op in resolved.single.values_mut() {
-        sub(op, values, tpl);
+        did |= sub(op, values, tpl);
     }
     for list in resolved.multi.values_mut() {
         for op in list {
-            sub(op, values, tpl);
+            did |= sub(op, values, tpl);
         }
     }
+    did
+}
+
+/// Must this operator's value wait for the response head before it is rendered?
+///
+/// A backtick template on a response-phase operator is where `${statusCode}`,
+/// `${serverIp}`, `${serverPort}`, `${resHeaders.x}` and `${resCookies.x}` come
+/// from: upstream re-resolves every `pureResProtocols` rule once the head is in
+/// (`resolveResRules` → `resolveRules(req, false, true)`,
+/// `_original/lib/rules/rules.js:2306,:2221-2236`), against a request object
+/// `res.js` has just stamped those fields onto (`lib/inspectors/res.js:799-801`).
+///
+/// This port resolves a rule once, in the request pass, and re-resolves only the
+/// rules whose *filters* ask about the response — so rendering here would answer
+/// every one of those names with an empty string, which is what
+/// `docs/TEMPLATES.md` said did not happen. Deferring the render is the narrow
+/// version of upstream's second pass: the operator keeps its backticks until
+/// [`crate::proxy::resolve_response_phase`] runs, and every path that produces a
+/// response goes through that, mocked responses included.
+fn waits_for_the_response(op: &crate::rules::RuleOp, tpl: TplCtx<'_>) -> bool {
+    tpl.info.res.is_none()
+        && crate::rules::protocols::is_res_phase(&op.protocol)
+        && op.value.len() > 1
+        && op.value.starts_with('`')
+        && op.value.ends_with('`')
+}
+
+/// Replace `${RegExp.$1}` … `${RegExp.$9}` and `${RegExp.$&}` with what the
+/// pattern captured (`SUB_VAR_RE`, `_original/lib/rules/rules.js:99,:826-830`).
+///
+/// This is the *only* spelling that reaches inside a values-store entry named by
+/// a whole-value `{name}`: a plain `$1` written there is left as written, because
+/// `replaceSubMatcher` ran on the reference — six characters with no `$` in them
+/// — long before the store answered, and nothing rescans the content afterwards.
+/// The `${name}` form is the other way round and takes the plain spelling.
+///
+/// `$&` selects group 0, which for a pattern match is the whole request URL
+/// (`regExp['0'] = curUrl`, `rules.js:1009`).
+fn substitute_regexp_vars(text: &str, groups: &[String]) -> String {
+    const OPEN: &str = "${RegExp.$";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        let (before, from) = rest.split_at(at);
+        out.push_str(before);
+        let body = &from[OPEN.len()..];
+        let selector = match body.as_bytes() {
+            [b'&', b'}', ..] => Some(0),
+            [d @ b'0'..=b'9', b'}', ..] => Some((d - b'0') as usize),
+            _ => None,
+        };
+        match selector {
+            Some(i) => {
+                out.push_str(groups.get(i).map_or("", String::as_str));
+                rest = &body[2..];
+            }
+            // Not a reference after all: emit the marker and carry on, so the
+            // scan cannot loop.
+            None => {
+                out.push_str(OPEN);
+                rest = body;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Replace every `${name}` in `text` with whatever `lookup` returns for it,
@@ -245,22 +362,34 @@ fn substitute_braced(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Str
 }
 
 /// Substitute whistle config variables `${port}` / `${version}` (case-insensitive)
-/// anywhere in operator values. Ported from `CONFIG_VAR_RE` in the original util.
+/// anywhere in operator values.
+///
+/// **Wider than upstream, and declared in `docs/RULES.md`.** `CONFIG_VAR_RE`
+/// (`_original/lib/util/index.js:3262`) has exactly one reader there — the URL
+/// of a backticked `@`-include (`getRemoteRules`, `:3284`) — so a `${port}` in
+/// an ordinary operator value is left as written, or, with backticks around the
+/// whole value, answered by `resolveTplVar` like any other variable. Here it is
+/// answered in both spellings, which is the more useful reading of a name that
+/// can only mean one thing.
+///
+/// What it must **not** touch is content. A value the store returned, or an
+/// inline `(…)` payload, is bytes a rules file typed out: a `${port}` in a mock
+/// body is text the mock meant to contain, and upstream never rescans it.
 pub fn substitute_config_vars(resolved: &mut Resolved, port: u16, version: &str) {
     let port = port.to_string();
-    let sub = |value: &mut String| {
-        if !value.contains("${") {
+    let sub = |op: &mut RuleOp| {
+        if op.value_is_content || !op.value.contains("${") {
             return;
         }
-        *value = replace_ci(value, "${port}", &port);
-        *value = replace_ci(value, "${version}", version);
+        op.value = replace_ci(&op.value, "${port}", &port);
+        op.value = replace_ci(&op.value, "${version}", version);
     };
     for op in resolved.single.values_mut() {
-        sub(&mut op.value);
+        sub(op);
     }
     for list in resolved.multi.values_mut() {
         for op in list {
-            sub(&mut op.value);
+            sub(op);
         }
     }
 }
@@ -8324,6 +8453,139 @@ mod tests {
         assert_eq!(of("a.com reqHeaders://${hdr}\n").as_deref(), Some("x-m=${method}"));
     }
 
+    /// A stored value is **content**, and content is not rescanned. Upstream
+    /// expands a matcher exactly once (`resolveVar`, `rules.js:774-783`); this
+    /// pass runs several times over one resolved set, once per merge of rules
+    /// pulled in mid-request, so it has to know what it has already done.
+    ///
+    /// Every assertion below is a way the second pass corrupted a mock body:
+    /// a `${x}` in it was expanded, a `{x}` in it was replaced wholesale, and a
+    /// body that opened and closed with a backtick lost one from each end to the
+    /// template test.
+    #[test]
+    fn a_value_is_substituted_once_however_often_the_pass_runs() {
+        let values: HashMap<String, String> = [
+            ("inner".to_string(), "INNER".to_string()),
+            ("braced".to_string(), "outer-${inner}".to_string()),
+            ("whole".to_string(), "{inner}".to_string()),
+            ("fenced".to_string(), "```\ncode\n```".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let of = |text: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
+            let mut resolved = mgr.resolve(&info);
+            let tpl = TplCtx { info: &info, env: test_env() };
+            substitute_values(&mut resolved, &values, tpl);
+            // The second call is the one the proxy makes after merging an
+            // include, and it must change nothing here.
+            substitute_values(&mut resolved, &values, tpl);
+            resolved.value("resBody").map(str::to_string)
+        };
+
+        assert_eq!(of("a.com resBody://{braced}\n").as_deref(), Some("outer-${inner}"));
+        assert_eq!(of("a.com resBody://{whole}\n").as_deref(), Some("{inner}"));
+        assert_eq!(of("a.com resBody://{fenced}\n").as_deref(), Some("```\ncode\n```"));
+    }
+
+    /// The whole-value form takes the backticks too: `resolveValue` renders what
+    /// the store returned when the rule was a template, and substitutes the
+    /// pattern's captures into it first
+    /// (`if (rule.isTpl && regExp) … if (rule.isTpl) …`,
+    /// `_original/lib/rules/rules.js:826-833`).
+    #[test]
+    fn a_backticked_value_key_renders_what_the_store_returned() {
+        let values: HashMap<String, String> = [(
+            "hdr".to_string(),
+            "x-m=${method}&x-g=${RegExp.$1}&x-p=$1".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let of = |text: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
+            let mut resolved = mgr.resolve(&info);
+            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            resolved.value("reqHeaders").map(str::to_string)
+        };
+
+        // `${RegExp.$1}` is the capture; the plain `$1` beside it is left as
+        // written, because nothing rescans a store entry for one.
+        assert_eq!(
+            of("/a\\.(com)/ reqHeaders://`{hdr}`\n").as_deref(),
+            Some("x-m=GET&x-g=com&x-p=$1")
+        );
+        // Without the backticks the content is bytes: a `${method}` in a mock
+        // body is text the mock meant to contain.
+        assert_eq!(
+            of("/a\\.(com)/ reqHeaders://{hdr}\n").as_deref(),
+            Some("x-m=${method}&x-g=${RegExp.$1}&x-p=$1")
+        );
+    }
+
+    /// Upstream expands the values store **before** it substitutes captures —
+    /// `resolveVar` then `replaceSubMatcher`, in every branch of
+    /// `resolveRuleList` (`rules.js:1010-1012`) — so a `$1` written inside a
+    /// shared value reaches the operator as what the pattern captured. This port
+    /// expands captures at match time, and the six characters `got-$1` went to
+    /// the origin as written.
+    #[test]
+    fn a_pattern_capture_reaches_the_text_a_value_contributed() {
+        let values: HashMap<String, String> =
+            [("tag".to_string(), "got-$1".to_string())].into_iter().collect();
+        let of = |text: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
+            let mut resolved = mgr.resolve(&info);
+            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            resolved.value("reqHeaders").map(str::to_string)
+        };
+
+        assert_eq!(of("/a\\.(com)/ reqHeaders://x=${tag}\n").as_deref(), Some("x=got-com"));
+        // A wildcard's captures are the same captures.
+        assert_eq!(of("^http://a.com/* reqHeaders://x=${tag}\n").as_deref(), Some("x=got-p"));
+        // A pattern that captured nothing leaves the `$1` alone, exactly as it
+        // does for a `$1` written on the rule line itself.
+        assert_eq!(of("a.com reqHeaders://x=${tag}\n").as_deref(), Some("x=got-$1"));
+    }
+
+    /// `${statusCode}` and the rest of the response-side names are what a
+    /// backtick value on a response operator is *for*, and they are answerable
+    /// only once the head has arrived. Upstream re-resolves every
+    /// `pureResProtocols` rule then (`resolveResRules`, `rules.js:2306`); this
+    /// port re-resolves only the rules whose filters ask about the response, so
+    /// rendering in the request pass answered every one of them with an empty
+    /// string — which is not what `docs/TEMPLATES.md` says.
+    #[test]
+    fn a_backtick_on_a_response_operator_waits_for_the_response_head() {
+        let none = HashMap::new();
+        let mut mgr = RuleManager::new();
+        mgr.set_text("a.com resHeaders://`x-s=${statusCode}` reqHeaders://`x-m=${method}`\n");
+        let mut info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
+        let mut resolved = mgr.resolve(&info);
+        substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+
+        // The request-side operator rendered; the response-side one is still a
+        // template, waiting.
+        assert_eq!(resolved.value("reqHeaders"), Some("x-m=GET"));
+        assert_eq!(resolved.value("resHeaders"), Some("`x-s=${statusCode}`"));
+
+        info.res = Some(crate::rules::ResInfo {
+            status: 503,
+            headers: Vec::new(),
+            server_ip: None,
+            server_port: None,
+        });
+        assert!(substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() }));
+        assert_eq!(resolved.value("resHeaders"), Some("x-s=503"));
+        // And the request-side one was not rendered a second time.
+        assert_eq!(resolved.value("reqHeaders"), Some("x-m=GET"));
+    }
+
     /// `log://` and `weinre://` opt out at parse time upstream
     /// (`rule.isTpl = false`, `rules.js:1357-1359`): their values name a
     /// channel, and a backtick in one is a backtick.
@@ -9024,6 +9286,21 @@ mod tests {
         substitute_config_vars(&mut r, 8899, "1.2.3");
         assert_eq!(r.value("ua"), Some("agent-8899"));
         assert_eq!(r.value("resType"), Some("type-1.2.3"));
+    }
+
+    /// …but not inside **content**. A mock body that mentions `${port}` means
+    /// those seven characters; upstream reads a value once and never rescans it.
+    #[test]
+    fn config_vars_leave_a_mock_body_alone() {
+        let values: HashMap<String, String> =
+            [("mock".to_string(), "listening on ${port}".to_string())].into_iter().collect();
+        let mut r = substituted("a.com resBody://{mock}\n", &values);
+        substitute_config_vars(&mut r, 8899, "1.2.3");
+        assert_eq!(r.value("resBody"), Some("listening on ${port}"));
+        // The inline form is content too.
+        let mut r = substituted("a.com resBody://(port-${port})\n", &HashMap::new());
+        substitute_config_vars(&mut r, 8899, "1.2.3");
+        assert_eq!(r.value("resBody"), Some("port-${port}"));
     }
 
     #[test]

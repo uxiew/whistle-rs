@@ -185,6 +185,31 @@ pub struct RuleOp {
     /// URL (`_original/lib/handlers/file-proxy.js:270-272`). A named value is
     /// the only body whose extension is written nowhere else.
     pub value_key: Option<String>,
+    /// `$0`…`$9` from the pattern that matched, kept for the text the values
+    /// store contributes *after* the match.
+    ///
+    /// Upstream substitutes captures **after** it expands values — `resolveVar`
+    /// runs first and `replaceSubMatcher` second, in every branch of
+    /// `resolveRuleList` (`_original/lib/rules/rules.js:957-958,:1010-1012,:1057-1058,:1084-1085`)
+    /// — so a `$1` written inside a stored value reaches the operator expanded.
+    /// This port expands at match time, before the store is consulted, which is
+    /// the right order for the value as *written*; the groups ride along so that
+    /// [`crate::proxy::apply::substitute_values`] can expand what the store
+    /// hands back too.
+    pub captures: Option<Vec<String>>,
+    /// Has [`crate::proxy::apply::substitute_values`] already run on this
+    /// operator?
+    ///
+    /// It runs more than once over the same resolved set — once before rules are
+    /// merged in from a `rule://` or `rulesFile://` include and once after, and
+    /// again after a plugin injects rules — because each merge brings operators
+    /// that have never seen the values store. Upstream expands each rule's
+    /// matcher exactly once (`resolveVar`, `rules.js:774-783`), and a second pass
+    /// over an *already expanded* value is not a no-op: it re-reads the store
+    /// content as if it were rule text, so a `${name}` or `{name}` inside a mock
+    /// body gets expanded and a body that opens and closes with a backtick loses
+    /// one from each end to the backtick-template test.
+    pub values_substituted: bool,
     /// Where this operator sits in the resolution order — important lines first,
     /// then source order (see [`order_key`]). Stamped when a rule resolves.
     ///
@@ -1461,6 +1486,24 @@ pub fn lift_inline_values(text: &str) -> (String, HashMap<String, String>) {
     (kept.join("\n"), values)
 }
 
+/// Does this operator value ask the values store for anything?
+///
+/// Either spelling counts: the whole-value `{name}` reference and the `${name}`
+/// one that may sit anywhere inside a value (`VALUE_KEY_RE` and `VAR_RE`,
+/// `_original/lib/rules/rules.js:42,:39`). Both are answered with text this
+/// parser never sees, which is why the question is asked at all — see
+/// [`RuleOp::captures`].
+fn names_a_value(value: &str) -> bool {
+    // A backtick template hides the reference from a naive test: the whole
+    // value of ``reqHeaders://`{name}` `` is the template, and the `{name}` is
+    // inside it.
+    let inner = value
+        .strip_prefix('`')
+        .and_then(|rest| rest.strip_suffix('`'))
+        .unwrap_or(value);
+    url::is_values_key(inner) || inner.contains("${")
+}
+
 /// Parse whole rules text into a list of [`Rule`]s.
 /// Mirrors `parseText` in `_original/lib/rules/rules.js:1738`.
 pub fn parse_text(text: &str) -> Vec<Rule> {
@@ -1578,7 +1621,13 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
         .any(|op| protocols::is_res_phase(&op.protocol) || op.protocol == "ignore");
     let res_dependent = filters.iter().any(|f| f.cond.may_need_response());
     let has_body_filter = filters.iter().any(|f| matches!(f.cond, Cond::Body(_)));
-    let has_capture_ref = ops.iter().any(|op| replace::has_reference(&op.value));
+    // A line that names a values-store entry needs the groups too: the store's
+    // content can carry its own `$1`, and upstream expands captures *after* the
+    // store has answered — see [`RuleOp::captures`]. `has_reference` cannot see
+    // that text, so the reference itself is what arms the collection.
+    let has_capture_ref = ops
+        .iter()
+        .any(|op| replace::has_reference(&op.value) || names_a_value(&op.value));
     let has_exact_skip = ops
         .iter()
         .any(|op| op.protocol == "ignore" && parse_exact_skip(&op.value, is_skip_token(&op.raw)).is_some());
