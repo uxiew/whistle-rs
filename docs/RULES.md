@@ -615,6 +615,11 @@ speaks, which is the whole point of their names:
   so two whistle-rs instances chain the way whistle does. Point one at a proxy
   you do not control and the request travels in the clear.
 
+`lineProps://internalProxy` says the second of those about an ordinary
+`proxy://` line, without changing its spelling — written on the proxy line, on
+the `host://` line, or request-wide as `enable://internalProxy`
+(`isInternalProxy`, `_original/lib/util/index.js:3801-3807`).
+
 **How the hop is made.** Only a plain HTTP proxy fetching a plain HTTP origin
 sends the request in absolute-form (`GET http://host/path`); a TLS origin, a
 SOCKS proxy, an HTTPS proxy, and an address override travelling with the proxy
@@ -1418,7 +1423,7 @@ the request on its way out, or from the response on its way back:
 | `cache` | `Cache-Control: no-cache` plus a past `Expires` and `Pragma` |
 | `csp` | drops the `Content-Security-Policy` headers |
 | `301` | turns a `301 Moved Permanently` into a `302 Found`, so the browser does not cache the redirect |
-| `userLogin` | withholds the `WWW-Authenticate` / `Proxy-Authenticate` challenge a `replaceStatus://401\|407` would send (`enable://userLogin` wins over it) |
+| `userLogin` | withholds the `WWW-Authenticate` / `Proxy-Authenticate` challenge a `statusCode://401\|407` or a changed `replaceStatus://401\|407` would send (`enable://userLogin` wins over it, and `lineProps://disableUserLogin` says it for one line — see [`LINE_PROPS.md`](LINE_PROPS.md)) |
 | `trailers` / `trailer` | sends no trailer section at all — the origin's included |
 | `trailerHeader` | sends the trailers without the `Trailer:` header announcing them |
 | `doctype` | no `<!DOCTYPE html>` before an HTML prepend |
@@ -1656,7 +1661,7 @@ is 500 ms as you would hope, but `resDelay://1s` is **1 millisecond**, and
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `replaceStatus` / `statusCode` | status number | Replace the upstream response status. A **changed** 401/407 also sends the matching auth challenge; `disable://userLogin` withholds it |
+| `replaceStatus` / `statusCode` | status number | Replace the upstream response status. A mocked `statusCode://401\|407`, and a `replaceStatus://` that actually **changed** the status to one of those, also send the matching auth challenge — the header that makes a browser ask for credentials; `disable://userLogin` or `lineProps://disableUserLogin` withholds it |
 | `resHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace response headers. An empty value sends an **empty header**, not a deletion — use `delete://resHeaders.x`. `set-cookie` merges instead of replacing; see below. Accumulates across lines. |
 | `resType` | MIME type or short name | Set the response `Content-Type` |
 | `resCharset` | charset | Set the charset on the response `Content-Type` |
@@ -2432,8 +2437,9 @@ api.test/data file:///srv/mock.json
 
 The operators that rewrite a request body need it in memory, and the body is
 whatever the client decided to send. whistle bounds that at **2 MB**, raised to
-**16 MB** by `enable://reqMergeBigData` (`MAX_REQ_SIZE` / `BIG_MAX_REQ_SIZE`,
-`_original/lib/inspectors/req.js:19-20,:163`), and whistle-rs does the same.
+**16 MB** by `enable://reqMergeBigData` or by `lineProps://enableBigData` on the
+`reqMerge://` line (`MAX_REQ_SIZE` / `BIG_MAX_REQ_SIZE`,
+`_original/lib/inspectors/req.js:19-20,:163,:564`), and whistle-rs does the same.
 
 Past the ceiling the request is **not** failed and **not** truncated: the body
 streams on to the origin byte for byte, and only the rewriting stops —

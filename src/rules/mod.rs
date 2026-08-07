@@ -53,8 +53,8 @@ pub const LINE_PROP_ACTIONS: &[&str] = &[
 
 /// Per-line properties declared with `lineProps://<action>[|&<action>…]`.
 ///
-/// `lineProps` (`resolveMatchFilter` in `_original/lib/rules/rules.js:1552`,
-/// `parseLineProps` in `_original/lib/util/index.js:1877`) is the line-scoped
+/// `lineProps` (`resolveMatchFilter` in `_original/lib/rules/rules.js:1542`,
+/// `parseLineProps` in `_original/lib/util/index.js:1892`) is the line-scoped
 /// counterpart of the global `enable://`/`disable://` switches: the actions
 /// listed on a rule line only affect the operators written on *that* line.
 /// Every operator of a line therefore carries a copy — see [`RuleOp::props`].
@@ -90,7 +90,7 @@ impl LineProps {
     /// The proxy layer folds the request-scoped `enable://safeHtml` /
     /// `enable://strictHtml` switches into the same gate as the per-line ones —
     /// upstream stamps them onto every injecting rule of the request
-    /// (`_original/lib/inspectors/res.js:970-987`).
+    /// (`_original/lib/inspectors/res.js:966-982`).
     pub fn from_actions<'a>(actions: impl IntoIterator<Item = &'a str>) -> Self {
         let mut props = LineProps::default();
         for action in actions {
@@ -116,7 +116,7 @@ impl LineProps {
 
     /// `important` — like CSS's `!important`, this line's operators outrank the
     /// same protocol from non-important lines regardless of file position
-    /// (`isImportant` in `_original/lib/util/index.js:2141`).
+    /// (`isImportant` in `_original/lib/util/index.js:2156`).
     pub fn important(&self) -> bool {
         self.has("important")
     }
