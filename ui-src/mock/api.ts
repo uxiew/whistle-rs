@@ -268,8 +268,9 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-function send(res: ServerResponse, body: unknown, type = 'application/json'): void {
+function send(res: ServerResponse, body: unknown, type = 'application/json', status = 200): void {
   const text = type === 'application/json' ? JSON.stringify(body) : String(body);
+  res.statusCode = status;
   res.setHeader('Content-Type', type);
   res.end(text);
 }
@@ -287,8 +288,8 @@ export function mockApi(): Plugin {
 
     // Slow the answers down a touch: a detail panel that fills
     // instantly hides the loading states it is supposed to have.
-    const reply = (body: unknown, type?: string) =>
-      setTimeout(() => send(res, body, type), 60);
+    const reply = (body: unknown, type?: string, status?: number) =>
+      setTimeout(() => send(res, body, type, status), 60);
 
     switch (path) {
       case '/sessions.json':
@@ -329,6 +330,36 @@ export function mockApi(): Plugin {
               ]
             : [],
         });
+      }
+      case '/api/composer': {
+        const c = JSON.parse((await readBody(req)) || '{}');
+        const typed = String(c.url || '').trim();
+        if (!typed) return reply({ ok: false, error: 'a URL is required' }, undefined, 400);
+        // The proxy fills in a missing scheme and refuses a header line that is
+        // not one; both are visible in the console, so the mock does them too.
+        const url = typed.includes('://') ? typed : `http://${typed}`;
+        const lines = String(c.headers || '')
+          .split('\n')
+          .map((l: string) => l.trim())
+          .filter(Boolean);
+        const bad = lines.find((l: string) => !l.includes(':'));
+        if (bad) return reply({ ok: false, error: `not a header: ${bad}` }, undefined, 400);
+        const body = String(c.body || '');
+        const composed: MockSession = {
+          ...session({ id: nextId++ }),
+          time_ms: Date.now(),
+          method: String(c.method || 'GET').trim().toUpperCase() || 'GET',
+          url,
+          client_ip: '127.0.0.1',
+          target: url.replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, ''),
+          req_headers: lines.map((l: string): [string, string] => {
+            const at = l.indexOf(':');
+            return [l.slice(0, at).trim().toLowerCase(), l.slice(at + 1).trim()];
+          }),
+          ...(body ? { req_body: { len: body.length, truncated: false, text: body } } : {}),
+        };
+        sessions.push(composed);
+        return reply({ ok: true, url, sent: body.length });
       }
       case '/api/rules':
         if (method === 'POST') {

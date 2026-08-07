@@ -142,6 +142,35 @@ export interface ReplayResult {
   sessions?: ReplayedSession[];
 }
 
+/**
+ * A request written by hand in the Composer.
+ *
+ * `headers` is the raw text of the headers box — `Name: value`, one per line —
+ * rather than pairs, because that is what a person types and what they paste
+ * out of somebody else's terminal. The proxy parses it; see `composed_request`.
+ */
+export interface Composition {
+  method: string;
+  url: string;
+  headers: string;
+  body: string;
+}
+
+/**
+ * What `POST /api/composer` answers.
+ *
+ * `url` is the URL as the proxy *resolved* it, which is not always the one that
+ * was typed: a bare `example.com/x` acquires an `http://`. `error` is a sentence
+ * naming what was wrong — a header line that is not one, a method that is not a
+ * method — and the Composer shows it rather than sending something else.
+ */
+export interface ComposeResult {
+  ok: boolean;
+  url?: string;
+  sent?: number;
+  error?: string;
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: ${res.status}`);
@@ -171,6 +200,9 @@ export const api = {
   // The endpoint also takes `{ ids: [...] }` for a batch, which nothing calls:
   // the request table is single-select. See `replay_session` in `webui.rs`.
   replay: (id: number) => postJson<ReplayResult>('/api/replay', { id }),
+  // Sent through the proxy's own port, exactly as a replay is, so the rules
+  // apply to it and it is captured — see `send_through_self` in `webui.rs`.
+  compose: (c: Composition) => postJson<ComposeResult>('/api/composer', c),
 
   rules: async () => (await fetch('/api/rules')).text(),
   saveRules: (text: string) => postText<{ ok: boolean; rules: number }>('/api/rules', text),

@@ -11,6 +11,7 @@ import { asCurl } from '../curl';
 import { hostOf } from '../format';
 import {
   DETAIL_TABS,
+  composeFrom,
   copyText,
   loadFrames,
   selectedSession,
@@ -54,6 +55,12 @@ watch(
         <div class="url">{{ session ? session.url : 'Pick a row above to inspect it.' }}</div>
       </div>
       <span v-if="session" class="d-actions">
+        <!-- Next to "Copy as cURL" on purpose: both take this request somewhere
+             it can be edited and sent again, one into a terminal and one into
+             the console's own Composer. -->
+        <button class="btn tiny" title="Open in the Composer" @click="composeFrom(session, state.detail)">
+          Edit &amp; Resend
+        </button>
         <button class="btn tiny" @click="copyText(asCurl(session, state.detail), 'cURL copied')">
           Copy as cURL
         </button>

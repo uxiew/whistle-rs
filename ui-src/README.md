@@ -47,12 +47,26 @@ src/store.ts            one reactive store (see the note at the top of it)
 src/columns.ts          the request table's columns
 src/format.ts           bytes, times, hosts, JSON
 src/curl.ts             the request as a curl command
-src/sidebar/*.vue       the four source lists, one per pane
-src/panes/*.vue         the four panes and the detail tabs
+src/sidebar/*.vue       the five source lists, one per pane
+src/panes/*.vue         the five panes and the detail tabs
 src/components/*.vue    toolbar, side item, card, editor
 src/editor/             the rules language for CodeMirror 6
 src/styles/app.css      the palette and everything painted with it
 ```
+
+## The Composer
+
+`panes/ComposerPane.vue` writes a request by hand and posts it to
+`/api/composer`, which sends it **through the proxy's own port** — the same
+loopback hop Replay uses (`send_through_self`, `src/proxy/webui.rs`). So a
+composed request is matched, rewritten and captured like any other, and
+`from:composer` matches it. Nothing here speaks to an origin directly, and
+nothing should: a Composer that did would only be a second `curl`.
+
+"Edit & Resend" in the detail panel seeds it from a captured request — the
+reverse of `curl.ts`, and the reason most compositions exist. The draft and the
+last twenty sent requests live in `localStorage`, because the page you are
+reloading is served by the proxy you are reconfiguring.
 
 ## The rules editor
 

@@ -5,11 +5,12 @@
 // console ships as a file embedded in a binary — so the only thing a store
 // library would add here is bytes. What Pinia is actually for (many stores,
 // hot-swapped modules, devtools timelines) never comes up in a single window
-// with four panes.
+// with five panes.
 
-import { computed, reactive } from 'vue';
+import { computed, reactive, watch } from 'vue';
 import { api } from './api';
 import type {
+  Composition,
   ProxyStatus,
   ReplayedSession,
   RuleGroup,
@@ -20,7 +21,7 @@ import type {
 import { COLUMNS } from './columns';
 import { clientOf, fmtBytes } from './format';
 
-export type Pane = 'requests' | 'rules' | 'values' | 'status';
+export type Pane = 'requests' | 'composer' | 'rules' | 'values' | 'status';
 export type DetailTab =
   | 'general'
   | 'rules'
@@ -45,6 +46,11 @@ export const DETAIL_TABS: { key: DetailTab; label: string }[] = [
 ];
 
 const THEME_KEY = 'whistle-rs-theme';
+const COMPOSE_KEY = 'whistle-rs-composer';
+const COMPOSE_HISTORY_KEY = 'whistle-rs-composer-history';
+
+/** How many sent compositions the source list keeps. Upstream keeps 100. */
+const COMPOSE_HISTORY_MAX = 20;
 
 interface State {
   pane: Pane;
@@ -79,7 +85,38 @@ interface State {
   valuesText: string;
   valuesStatus: string;
 
+  /** The request being written in the Composer, and the ones already sent. */
+  compose: Composition;
+  composeStatus: string;
+  composeHistory: Composition[];
+
   status: ProxyStatus | null;
+}
+
+/** What the Composer opens on, and what "New request" goes back to. */
+function blankComposition(): Composition {
+  return { method: 'GET', url: '', headers: '', body: '' };
+}
+
+/** The method as it will be *sent*: trimmed, uppercased, empty meaning GET. */
+export const methodOf = (c: Composition): string => (c.method.trim() || 'GET').toUpperCase();
+
+function readStored<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    // Private mode, or a value written by a version that shaped it differently.
+    return fallback;
+  }
+}
+
+function writeStored(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* private mode */
+  }
 }
 
 export const state = reactive<State>({
@@ -110,8 +147,17 @@ export const state = reactive<State>({
   valuesText: '',
   valuesStatus: '',
 
+  // A half-written request survives a reload. It has to: the console is served
+  // by the proxy you are reconfiguring, so the page is reloaded far more often
+  // here than in an application you would merely be using.
+  compose: readStored(COMPOSE_KEY, blankComposition()),
+  composeStatus: '',
+  composeHistory: readStored<Composition[]>(COMPOSE_HISTORY_KEY, []),
+
   status: null,
 });
+
+watch(() => state.compose, (c) => writeStored(COMPOSE_KEY, c), { deep: true });
 
 // ── derived ────────────────────────────────────────────────────────────────
 
@@ -360,6 +406,117 @@ export async function copyText(text: string, note: string): Promise<void> {
     }
   }
   flashNote(note);
+}
+
+// ── composer ───────────────────────────────────────────────────────────────
+
+/** The bytes a string will actually be sent as, which is what `sent` counts. */
+const byteLength = (text: string): number => new TextEncoder().encode(text).length;
+
+/**
+ * Open a captured request in the Composer, ready to be edited and sent again.
+ *
+ * The most valuable thing the Composer does: almost nothing anyone composes is
+ * written from nothing — it is a request that already happened, with one header
+ * changed. `curl.ts` renders the same request for a terminal; this is the same
+ * journey without leaving the console.
+ *
+ * `content-length` and `host` are left out on purpose. Both are recomputed by
+ * the proxy from the URL and the body as they stand when Send is pressed, so
+ * seeding them would only offer a stale number to edit.
+ */
+export function composeFrom(s: SessionSummary, d: SessionDetail | null): void {
+  state.compose = {
+    method: s.method,
+    url: s.url,
+    headers: (d?.req_headers ?? [])
+      .filter(([name]) => !/^(content-length|host)$/i.test(name))
+      .map(([name, value]) => `${name}: ${value}`)
+      .join('\n'),
+    body: d?.req_body?.text ?? '',
+  };
+  // A capture is a capped preview, so what is seeded is not always what was
+  // sent. Saying so is the point: a composition silently missing 190 KB of a
+  // 200 KB upload would come back 200 and be read as proof the endpoint works.
+  const body = d?.req_body;
+  state.composeStatus =
+    body?.truncated === true
+      ? `Seeded from #${s.id} · the capture held ${fmtBytes(byteLength(body.text))} of a ${fmtBytes(body.len)} body`
+      : `Seeded from #${s.id}`;
+  showPane('composer');
+}
+
+/** Load one of the sent compositions back into the editor. */
+export function useComposition(c: Composition): void {
+  state.compose = { ...c };
+  state.composeStatus = '';
+}
+
+export function newComposition(): void {
+  state.compose = blankComposition();
+  state.composeStatus = '';
+}
+
+/** Put a composition at the head of the history, deduplicated as upstream's is. */
+function remember(c: Composition): void {
+  const same = (h: Composition) =>
+    h.method === c.method && h.url === c.url && h.headers === c.headers && h.body === c.body;
+  state.composeHistory = [c, ...state.composeHistory.filter((h) => !same(h))].slice(
+    0,
+    COMPOSE_HISTORY_MAX,
+  );
+  writeStored(COMPOSE_HISTORY_KEY, state.composeHistory);
+}
+
+/**
+ * Send what is in the Composer through the proxy.
+ *
+ * The proxy sends it to *itself*, so the composition is matched, rewritten and
+ * captured like any other request rather than being a private conversation
+ * between the console and an origin — which is what makes the Composer a way to
+ * test rules and not merely a second curl.
+ */
+export async function sendComposition(): Promise<void> {
+  const sending = { ...state.compose };
+  if (!sending.url.trim()) {
+    state.composeStatus = 'A URL is required';
+    return;
+  }
+  // Everything already captured, so the request this one becomes can be told
+  // apart from the traffic that was there before it.
+  const before = state.sessions.reduce((max, s) => Math.max(max, s.id), 0);
+  const res = await reach(() => api.compose(sending));
+  if (!res) {
+    state.composeStatus = 'Could not reach the proxy';
+    return;
+  }
+  if (!res.ok) {
+    state.composeStatus = res.error || 'The proxy refused it';
+    return;
+  }
+  remember(sending);
+  const url = res.url || sending.url;
+  state.composeStatus = `Sent · ${url}`;
+  flashNote(`Sent ${methodOf(sending)} ${url}`);
+  // Fire-and-forget on the proxy's side, as a replay is: the answer arrives in
+  // the session list, not here, so give it the same moment to come back around.
+  setTimeout(() => void revealComposed(sending, url, before), 400);
+}
+
+/**
+ * Show what the composition became.
+ *
+ * The Composer's result is a row in the request list, so that is where this
+ * goes — and it selects the row when it can recognise it. It often cannot: a
+ * rule that rewrote the URL makes the captured request a different one, which
+ * is precisely the case where you most want the list rather than a claim.
+ */
+async function revealComposed(sent: Composition, url: string, after: number): Promise<void> {
+  await loadSessions();
+  const method = methodOf(sent);
+  const hit = state.sessions.find((s) => s.id > after && s.url === url && s.method === method);
+  showPane('requests');
+  if (hit) void selectRow(hit.id);
 }
 
 // ── rules ──────────────────────────────────────────────────────────────────
