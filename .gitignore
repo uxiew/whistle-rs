@@ -4,3 +4,6 @@ target
 # Left in the working directory by tooling and by hand; not repository content.
 .playwright-mcp/
 requests.png
+
+# Agent worktrees live here; they are their own checkouts, never content.
+.claude/worktrees/
