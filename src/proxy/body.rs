@@ -343,3 +343,115 @@ mod capped_tests {
         assert!(matches!(got, Capped::Whole(b) if b.is_empty()));
     }
 }
+
+/// Put `top` in front of a body and `bottom` after it, without waiting for it.
+///
+/// This is what `resPrepend://` and `resAppend://` mean for a body that is
+/// still arriving. Neither needs the body: one goes before the first byte and
+/// the other after the last, and the bytes in between are forwarded as they
+/// come. The buffered path reaches the same bytes by concatenation
+/// ([`crate::proxy::apply`]'s `Injection::apply`); this reaches them without
+/// holding the stream, which is the only way an event stream can have them at
+/// all.
+///
+/// No doctype is stamped and no HTML gate is consulted, because neither applies:
+/// upstream stamps a doctype only for an HTML response and its `allowInject`
+/// lets everything through when `isHtml` is unset
+/// (`_original/lib/util/whistle-transform.js:80-…`). A caller that has an HTML
+/// body has an ending too, and belongs on the buffered path.
+pub fn surround(body: DynBody, top: Vec<u8>, bottom: Vec<u8>) -> DynBody {
+    SurroundBody {
+        top: (!top.is_empty()).then(|| Bytes::from(top)),
+        inner: Box::pin(body),
+        bottom: (!bottom.is_empty()).then(|| Bytes::from(bottom)),
+        inner_done: false,
+    }
+    .boxed()
+}
+
+/// Body impl backing [`surround`].
+struct SurroundBody {
+    /// Taken on the first poll, so it goes out ahead of everything.
+    top: Option<Bytes>,
+    inner: Pin<Box<DynBody>>,
+    /// Taken when the inner body ends, so it goes out exactly once.
+    bottom: Option<Bytes>,
+    inner_done: bool,
+}
+
+impl Body for SurroundBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(top) = this.top.take() {
+            return Poll::Ready(Some(Ok(Frame::data(top))));
+        }
+        if !this.inner_done {
+            match this.inner.as_mut().poll_frame(cx) {
+                Poll::Ready(None) => this.inner_done = true,
+                other => return other,
+            }
+        }
+        match this.bottom.take() {
+            Some(bottom) => Poll::Ready(Some(Ok(Frame::data(bottom)))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod surround_tests {
+    use super::*;
+
+    async fn drain(body: DynBody) -> Vec<u8> {
+        let mut body = Box::pin(body);
+        let mut out = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Some(data) = frame.expect("no error").data_ref() {
+                out.extend_from_slice(data);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn the_top_and_bottom_land_around_the_body() {
+        let got = surround(full("MIDDLE"), b"TOP".to_vec(), b"BOTTOM".to_vec());
+        assert_eq!(drain(got).await, b"TOPMIDDLEBOTTOM");
+    }
+
+    /// The point of doing it this way: the prefix is on the wire before the
+    /// body has produced anything, so a stream that never ends still gets it.
+    #[tokio::test]
+    async fn the_top_goes_out_before_the_body_is_polled() {
+        let (tx, rx) = channel(4);
+        let mut body = Box::pin(surround(rx, b"TOP".to_vec(), b"BOTTOM".to_vec()));
+        let first = body.frame().await.expect("a frame").expect("no error");
+        assert_eq!(
+            first.data_ref().map(|d| &d[..]),
+            Some(&b"TOP"[..]),
+            "the prefix does not wait for the origin"
+        );
+        tx.send(Ok(Bytes::from_static(b"x"))).await.expect("send");
+        drop(tx);
+        let mut rest = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Some(d) = frame.expect("no error").data_ref() {
+                rest.extend_from_slice(d);
+            }
+        }
+        assert_eq!(rest, b"xBOTTOM");
+    }
+
+    #[tokio::test]
+    async fn an_empty_slot_adds_no_frame() {
+        assert_eq!(drain(surround(full("B"), Vec::new(), Vec::new())).await, b"B");
+        assert_eq!(drain(surround(full("B"), b"T".to_vec(), Vec::new())).await, b"TB");
+        assert_eq!(drain(surround(full("B"), Vec::new(), b"E".to_vec())).await, b"BE");
+    }
+}
