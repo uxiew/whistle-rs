@@ -159,6 +159,12 @@ pub struct Target {
     /// The `cipher` operator's `ciphers` string, evaluated. `None` when the
     /// rule named none — see [`super::ciphers`].
     pub tls_ciphers: Option<Arc<super::ciphers::CipherPolicy>>,
+    /// `disable://proxyUA` — do not echo the client's `User-Agent` on the
+    /// CONNECT to an upstream proxy (`_original/lib/inspectors/res.js:329-333`).
+    pub no_proxy_ua: bool,
+    /// `disable://proxyConnection` — ask the upstream proxy to close rather than
+    /// keep the connection alive (`res.js:314-318`).
+    pub proxy_connection_close: bool,
     /// True when [`Self::connect_host`] came from an `xhost://` rule rather than
     /// a `host://` one: the address is a preference, not a requirement, and a
     /// connection that cannot be *established* to it is retried against the
@@ -615,6 +621,10 @@ struct Hop {
     /// The client's own `Proxy-Authorization`, used when the proxy URL carries
     /// no credentials of its own (`res.js:290-294`).
     client_proxy_auth: Option<String>,
+    /// `disable://proxyUA` — see [`Target::no_proxy_ua`].
+    no_proxy_ua: bool,
+    /// `disable://proxyConnection` — see [`Target::proxy_connection_close`].
+    proxy_connection_close: bool,
 }
 
 impl Hop {
@@ -628,7 +638,17 @@ impl Hop {
         Hop {
             user_agent: get(hyper::header::USER_AGENT),
             client_proxy_auth: get(hyper::header::PROXY_AUTHORIZATION),
+            ..Hop::default()
         }
+    }
+
+    /// Carry the connection-shaping `disable://` flags across from the target,
+    /// which is where the rules put them — a `Hop` is otherwise built from the
+    /// request's own headers and knows nothing about the rule set.
+    fn with_target(mut self, target: &Target) -> Self {
+        self.no_proxy_ua = target.no_proxy_ua;
+        self.proxy_connection_close = target.proxy_connection_close;
+        self
     }
 
     /// The `Proxy-Authorization` to present on this hop, if any.
@@ -757,7 +777,7 @@ async fn tunnel_once(target: &Target) -> Result<BoxedIo> {
     // credentials still apply, which is how a proxy rule normally carries them.
     // A tunnel has no session to report phases to; they are measured and
     // dropped rather than threaded through a path with nowhere to put them.
-    origin_stream(target, &Hop::default(), &Timings::new())
+    origin_stream(target, &Hop::default().with_target(target), &Timings::new())
         .await
         .map(|(io, _)| io)
 }
@@ -820,7 +840,7 @@ async fn forward_once(
             request: req,
         })));
     }
-    let hop = Hop::from_request(&req);
+    let hop = Hop::from_request(&req).with_target(target);
 
     // Connect before touching the request. Nothing is sent yet, so a hop that
     // cannot be established hands `req` back untouched — which is what lets an
@@ -1118,10 +1138,17 @@ async fn http_connect(
     inner: bool,
 ) -> Result<BoxedIo> {
     let authority = join_host_port(host, port, 0);
+    // `keep-alive` unless a rule asked otherwise — upstream picks between the
+    // two the same way (`res.js:314-318`).
+    let keep = match hop.proxy_connection_close {
+        true => "close",
+        false => "keep-alive",
+    };
     let mut req = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n"
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: {keep}\r\n"
     );
     if let Some(ua) = &hop.user_agent
+        && !hop.no_proxy_ua
         && is_header_value(ua)
     {
         req.push_str(&format!("User-Agent: {ua}\r\n"));
@@ -1279,6 +1306,8 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
     let (host, port) = split_host_port(authority, if tls { 443 } else { 80 });
     let target = Target {
         tls_ciphers: None,
+        no_proxy_ua: false,
+        proxy_connection_close: false,
         connect_host: host.clone(),
         connect_port: port,
         tls,
@@ -1507,6 +1536,8 @@ mod tests {
     fn target(host: &str, port: u16, proxy: Option<ProxyConfig>) -> Target {
         Target {
             tls_ciphers: None,
+            no_proxy_ua: false,
+            proxy_connection_close: false,
             connect_host: host.to_string(),
             connect_port: port,
             tls: false,
@@ -1762,6 +1793,37 @@ mod tests {
             let lower = head.to_lowercase();
             assert!(lower.contains("proxy-connection: keep-alive\r\n"), "{head:?}");
             assert!(lower.contains("user-agent: probe/1.0\r\n"), "{head:?}");
+        });
+    }
+
+    /// `disable://proxyUA` and `disable://proxyConnection` shape that CONNECT:
+    /// upstream omits the echoed `User-Agent` for the first and asks the proxy
+    /// to close instead of keeping alive for the second
+    /// (`_original/lib/inspectors/res.js:314-318,:329-333`). Both were parsed
+    /// here and neither reached the wire.
+    #[test]
+    fn the_connect_headers_answer_to_their_disable_flags() {
+        rt().block_on(async {
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_port = proxy.local_addr().unwrap().port();
+            let seen = tokio::spawn(async move {
+                let (mut s, _) = proxy.accept().await.unwrap();
+                let head = read_head(&mut s).await;
+                // Refused: the CONNECT head is all this test is about.
+                s.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await.unwrap();
+                head
+            });
+
+            let cfg = parse_proxy(ProxyKind::Http, &format!("127.0.0.1:{proxy_port}")).unwrap();
+            let mut t = target("example.com", 443, Some(cfg));
+            t.tls = true;
+            t.no_proxy_ua = true;
+            t.proxy_connection_close = true;
+            let _ = forward(&t, get("/x", "example.com")).await;
+
+            let head = seen.await.unwrap().to_lowercase();
+            assert!(head.contains("proxy-connection: close\r\n"), "{head:?}");
+            assert!(!head.contains("user-agent:"), "the UA is not echoed: {head:?}");
         });
     }
 

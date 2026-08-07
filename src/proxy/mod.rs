@@ -5203,6 +5203,8 @@ mod internal_req_tests {
     fn the_stripped_tls_marker_is_set_by_the_hop_and_consumed_on_arrival() {
         let target = |tls: bool, stripped: bool| upstream::Target {
             tls_ciphers: None,
+            no_proxy_ua: false,
+            proxy_connection_close: false,
             connect_host: "example.com".into(),
             connect_port: 80,
             tls,

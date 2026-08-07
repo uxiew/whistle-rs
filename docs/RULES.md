@@ -2287,6 +2287,16 @@ If a rule doesn't do what you expect, run with `-v` (debug logging) — each req
 logs its resolved destination or short-circuit decision.
 
 
+### Shaping the CONNECT to an upstream proxy
+
+`disable://proxyUA` drops the client's `User-Agent` from the CONNECT this proxy
+sends to an upstream one, and `disable://proxyConnection` asks that proxy to
+close rather than keep the connection alive — `Proxy-Connection: close` instead
+of `keep-alive` (`_original/lib/inspectors/res.js:314-318,:329-333`). Both are
+read straight off `disable`, without the `enable://` cancellation, as upstream
+reads them.
+
+
 ### Response bodies have a ceiling too
 
 whistle rewrites a response with **stream transforms** (`addTextTransform` /

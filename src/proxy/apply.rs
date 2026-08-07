@@ -666,8 +666,12 @@ pub async fn resolve_target(
         Ok(policy) => policy.flatten(),
         Err(e) => bail!("cipher://: {e}"),
     };
+    let disabled = disabled_flags(resolved);
     Ok(Target {
         tls_ciphers,
+        // Read straight off `disable`, as upstream reads them.
+        no_proxy_ua: disabled.contains("proxyUA"),
+        proxy_connection_close: disabled.contains("proxyConnection"),
         connect_host,
         connect_port,
         tls,

@@ -1002,6 +1002,8 @@ mod tests {
                 // A tunnel this port agreed not to intercept performs its own
                 // handshake; no suite of ours is offered on it.
                 tls_ciphers: None,
+                no_proxy_ua: false,
+                proxy_connection_close: false,
                 connect_host: addr.ip().to_string(),
                 connect_port: addr.port(),
                 // Set on purpose, to pin that the relay ignores it: the client is
