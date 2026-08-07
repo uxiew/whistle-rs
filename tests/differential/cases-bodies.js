@@ -170,4 +170,42 @@ module.exports = [
   { name: 'resReplace just under the rewrite ceiling', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/big?n=16777100' } },
   { name: 'resReplace just over the rewrite ceiling', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/big?n=16777300' } },
   { name: 'resAppend just over the rewrite ceiling', rules: `${P} resAppend://(TAIL)`, request: { path: '/big?n=16777300' } },
+
+  // ── the injection family's remaining spellings ──────────────────────────
+  //
+  // `cssBody`, `cssPrepend` and `jsPrepend` were the three names in the family
+  // that no corpus mentioned.
+  //
+  // Their selection is **not** one type each. `isJs = isHtml || resType ===
+  // 'JS'` and `isCss = isHtml || resType === 'CSS'`
+  // (`_original/lib/inspectors/res.js:947-949`), so the js and css families
+  // both reach an HTML page as well — wrapped in `<script>` / `<style>` there,
+  // bare on their own type. Only the `html*` three are HTML-only. Each is
+  // therefore asked on its own type, on HTML, and on the *other* family's type,
+  // which is the one place it must stay out.
+  //
+  // No payload here contains a space: a rules line is split on whitespace
+  // before an operator's brackets are read, so `jsAppend://(var TOP=1;)` is two
+  // tokens and does nothing. That is pinned as its own case below rather than
+  // left to silently hollow out the others — it hollowed out three of these
+  // while they were being written, and they still passed.
+  { name: 'cssBody on a css response', rules: `${P} cssBody://(.b{color:green})`, request: { path: '/style.css' } },
+  { name: 'cssBody on an html page wraps in style', rules: `${P} cssBody://(.b{color:green})`, request: { path: '/html' } },
+  { name: 'cssBody stays out of a js response', rules: `${P} cssBody://(.b{color:green})`, request: { path: '/script.js' } },
+  { name: 'cssPrepend on a css response', rules: `${P} cssPrepend://(/*TOP*/)`, request: { path: '/style.css' } },
+  { name: 'cssPrepend on an html page', rules: `${P} cssPrepend://(/*TOP*/)`, request: { path: '/html' } },
+  { name: 'cssPrepend stays out of a js response', rules: `${P} cssPrepend://(/*TOP*/)`, request: { path: '/script.js' } },
+  { name: 'jsPrepend on a js response', rules: `${P} jsPrepend://(TOP=1)`, request: { path: '/script.js' } },
+  { name: 'jsPrepend on an html page wraps in script', rules: `${P} jsPrepend://(TOP=1)`, request: { path: '/html' } },
+  { name: 'jsPrepend stays out of a css response', rules: `${P} jsPrepend://(TOP=1)`, request: { path: '/style.css' } },
+  // The pair on one type, so a shared slot between them would show as one
+  // winning over the other.
+  { name: 'cssPrepend and cssBody on one line', rules: `${P} cssPrepend://(/*TOP*/) cssBody://(.b{color:green})`, request: { path: '/style.css' } },
+  { name: 'jsPrepend beside jsAppend', rules: `${P} jsPrepend://(TOP=1) jsAppend://(END=1)`, request: { path: '/script.js' } },
+  // On a compressed body, where the injection has to decode and re-encode.
+  { name: 'jsPrepend on a gzip page', rules: `${P} jsPrepend://(TOP=1)`, request: { path: '/gz' } },
+  // The space. Both proxies read two tokens and inject nothing — the second
+  // token is not an operator, so it is a pattern nothing matches.
+  { name: 'an inline payload cannot contain a space', rules: `${P} jsAppend://(var TOP=1;)`, request: { path: '/html' } },
+  { name: 'the same payload without the space does inject', rules: `${P} jsAppend://(var_TOP=1;)`, request: { path: '/html' } },
 ];
