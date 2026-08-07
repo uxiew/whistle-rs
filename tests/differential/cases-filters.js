@@ -360,4 +360,16 @@ module.exports = [
   { name: 'a URL filter with the ui flags', rules: `${P} ${REQ} includeFilter:///ECHO$/ui` },
   { name: 'filter:// takes only the i flag', rules: `${P} ${REQ} filter://echo$/g` },
   { name: 'filter:// with the u flag is not the regexp form', rules: `${P} ${REQ} filter://echo$/u` },
+
+  // ── dropped versus never-holding, in both directions ───────────────────
+  // A dropped condition is as if it were never written, so it *widens* the
+  // line whichever spelling carried it. A condition that never holds widens an
+  // exclude the same way but stops an include dead — so the two are
+  // distinguishable only on the include side, where they are opposites.
+  { name: 'exclude that is dropped: the exemption is lost', rules: `${P} ${REQ} excludeFilter://i:localhost` },
+  { name: 'exclude that holds: the exemption works', rules: `${P} ${REQ} excludeFilter://i:127.0.0.1` },
+  { name: 'exclude that never holds, empty key', rules: `${P} ${REQ} excludeFilter://reqH.=yes`, request: TAGGED },
+  { name: 'exclude that never holds, no value', rules: `${P} ${REQ} excludeFilter://reqH.`, request: TAGGED },
+  { name: 'include that is dropped, empty payload', rules: `${P} ${REQ} includeFilter://` },
+  { name: 'include that never holds, empty key', rules: `${P} ${REQ} includeFilter://reqH.=yes`, request: TAGGED },
 ];
