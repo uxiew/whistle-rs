@@ -1535,6 +1535,15 @@ mod tests {
     #[test]
     fn upstream_verification_is_on_unless_opted_out() {
         assert!(!insecure_upstream(), "verification must default to on");
+        // Build the shared configs before flipping the flag. They are `Lazy` and
+        // read it exactly once, so a config first built by a neighbouring test
+        // inside the window below would cache the permissive setting for the
+        // life of the process — the same shape of race as `LISTEN` and
+        // `CONNECT_BUDGET`, and the reason production must call the setter
+        // before serving starts.
+        let _ = super::client_config_for(super::TlsVersions::Default, None);
+        let _ = super::client_config_for(super::TlsVersions::Only12, None);
+        let _ = super::client_config_for(super::TlsVersions::Only13, None);
         set_insecure_upstream(true);
         assert!(insecure_upstream());
         set_insecure_upstream(false);

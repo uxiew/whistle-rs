@@ -13,7 +13,7 @@
 > **算子取值可以指向文件或 URL**（`readRuleValue`），**反引号整值按请求渲染**（`renderTpl`）。
 > **⚠️ 「已应用」不等于「与上游逐位一致」** —— 四路审计确认了 45 项行为差异，
 > **失败开放已清空**；不再维护一个精确的「已修 N 项」整数，下一节的清单才是准的。
-> 单元测试 **704** 项全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
+> 单元测试 **714** 项全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
 > 与 `cargo test --doc` 均 **0 警告 / 0 失败**（clippy 由 `Cargo.toml` 的
 > `[lints.clippy]` 把住）。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取、
@@ -302,7 +302,74 @@
       并按上游拆开：`disable://pong` 禁掉握住 send 方向时发往**源站**的那条，
       `disable://ping` 禁掉握住 receive 方向时发往**客户端**的那条。
 
+### 标志族的机械对照（本轮：不看自己的清单，看上游源码）
+
+上一轮的结论是「清单清空」，但那份清单是我自己写的 —— 拿它当检查表是循环论证。
+本轮改用上游源码本身：把 `lib/` 里每一处 `enable.X` / `disable.X` / `isEnable(req,'X')`
+读取点抽出来（127 处，去重后 **99 个标志**），逐个在本移植的源码里对照。
+
+机械对照报 44 个「未出现」，逐个查上游用途后的实情：
+
+**真缺口，已实现（4）**
+
+| 标志 | 后果 |
+|------|------|
+| `disable://intercept`（及 `https`/`capture` 两种拼法） | **最重要的一个**。「不要解密这台主机」——证书固定的 App 必须用它。本移植只有全局的 `--no-intercept-https`，无法逐规则说。已实现并实测：客户端看到的证书指纹与源站**完全一致**，而无规则时是伪造的 |
+| `disable://autoCors` | 它要关掉的那个功能本身缺失 —— 见下方「自动 CORS」 |
+| `disable://proxyUA` | 到上游代理的 CONNECT 无法去掉回显的 `User-Agent` |
+| `disable://proxyConnection` | 同上，无法要求 `Proxy-Connection: close` |
+
+**上游有、本移植无对应物（不是缺口，是没有那个机制）**
+
+`clientId`/`clientID`/`clientid`/`keepClientId`/`multiClient`/`singleClient`/`userLogin`
+/`proxifier`/`interceptConsole`/`additionalHeaders` —— whistle 自有的客户端标识、
+多租户与 UI 基础设施，本移植没有 client-id 概念（这一点 ROADMAP 早已记过）。
+`customParser`/`customFrames`/`forHttp`/`forHttps`/`useLocalHost`/`useSafePort` ——
+上游插件加载器的机制，本移植的插件是讲自研协议的外部 HTTP server。
+`requestWithMatchedRules`/`responseWithMatchedRules` —— 把命中规则回传给插件的开关，
+本移植的插件协议里规则是**始终**随钩子送达的。
+`keepH2Session`/`auto2http`/`lacalhostCompatible`（上游自己的拼写错误）—— 上游连接池与
+兼容性开关，本移植不做上游连接池。
+`clientCert`/`requestCert`/`secureOptions` —— 向**客户端**索要证书（mTLS 的服务端一侧），
+本移植的 MITM 不做客户端证书请求。
+`wsDecompress` —— 关掉 WebSocket 的 `permessage-deflate` 解压；本移植不做该扩展的解压，
+无物可禁（与 `disable://ping`/`pong` 曾经的处境相同，若将来做了解压，这个标志就有了意义）。
+`flushHeaders` —— Node 的 `res.flushHeaders()`；hyper 在响应头就绪时即写出，没有对应的推迟行为。
+`rejectUnauthorized` —— 上游用它对**内部请求**关闭源站证书校验；本移植的默认姿态是
+**校验**（唯一一处刻意不照抄上游默认值），逐规则放宽与该姿态冲突，保持不做。
+`bigData`/`largeData`/`resMergeBigData`/`captureStream` 一族 —— 抓取上限的调节，
+本移植用 `--body-preview-limit` 与新增的 `--body-rewrite-limit` 表达同一件事。
+`captureIp`/`captureIP`/`captureSNI`/`captureNoSNI`/`captureHttp`/`captureHttps`/`inspect`
+/`socket`/`http2`/`tunnelAuthHeader`/`tunnelHeadersFirst`/`logDoctype` —— 上游握手期与
+日志注入的细分开关，各自依赖本移植没有的机制（client-info 头回灌、weinre 注入、
+H2 会话复用）。
+
+**对照器自己的假阳性**，一并记下来，因为它们说明这种机械对照要怎么读：
+`reqPrepend`/`reqAppend` 报「未出现」是因为本移植用 `format!("{prefix}Prepend")` 动态拼名字；
+`enable.length` 根本不是标志，是数组的 `.length`；而第一轮把 `intercept` 报成「已存在」，
+是因为 `sniCallback` 返回的 JSON 里有个同名的键 —— 那是完全不同的东西，
+真正的 `disable://intercept` 当时并不存在。
+
 ### 本轮顺带修掉的、不在上述清单里的
+
+- **自动 CORS 缺失**（`isAutoCors`，`file-proxy.js:178-191`）。用 `file://` mock 一个
+  API、而页面在另一个源上 —— whistle 的核心用法之一 —— 在本移植里被浏览器直接拒掉。
+  上游对本地文件响应在请求带 `Origin` 时自动补 CORS 头，并且**对预检 `OPTIONS` 直接答
+  200 而根本不打开文件**。后一半更要命：文件不存在就会 404 掉预检，真实请求永远不会发生。
+  `docs/LINE_PROPS.md` 当时引用了准确的上游行号，却把结论写成「本移植没有可抑制的对象，
+  为了能关掉它而先实现自动 CORS 是本末倒置」—— 自动 CORS 本身就是那个功能。
+- **`resCors://` 的预检答错了头名**。写的是单数 `access-control-allow-method`，还附了一条
+  「这是上游的笔误，照抄以保持一致」的注释。上游没有这个笔误（`setResCors` 两处分支都是
+  复数），而单数那个名字浏览器根本不读 —— 预检因此缺了让真实请求得以继续的那个头，
+  算子从代理侧看正常、从浏览器侧看完全不生效。
+- **响应改写的缓冲无上限**。上游的响应改写是流式的，所以不需要上限；本移植是缓冲的，
+  所以需要。实测一条最普通的 `resReplace://` 撞上 800MB 下载，RSS 从 9.9MB 涨到 **1.97GB**。
+  现按 16MiB 设限（`--body-rewrite-limit`），过限即原样放行并打 WARN；同一下载峰值 **33MB**、
+  字节完整。
+- **两个偶发失败的测试，同一个成因**：进程级全局被并行测试反复写。`LISTEN`（自循环防护的
+  端口表）与 `CONNECT_BUDGET`（连接超时预算）。前者的根因还是个真 bug —— `set_listen`
+  是整体覆盖，而一个进程可以起多个 `embed::Proxy`，第二个启动会抹掉第一个的自循环防护。
+  第三个同型窗口（`INSECURE_UPSTREAM` 与 `Lazy` 的 TLS 配置）没有观察到失败，也一并关掉了。
 
 - **请求体的读取此前完全无上限**（两处：`b:` 筛选器的预读，以及 body 算子的缓冲）。
   一个代理只要照单全收客户端发来的东西，就离被操作系统杀掉只差一次上传，而触发它
