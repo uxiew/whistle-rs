@@ -1342,6 +1342,61 @@ mod tests {
         // A template short-circuits before any upstream response exists.
         assert_eq!(render_url("[${statusCode}]", "http://x.com/?a=1"), "[]");
         assert_eq!(render_url("[${resHeaders.x}]", "http://x.com/?a=1"), "[]");
+        assert_eq!(render_url("[${serverIp}]", "http://x.com/?a=1"), "[]");
+        assert_eq!(render_url("[${resCookies.sid}]", "http://x.com/?a=1"), "[]");
+    }
+
+    /// …but the same names *do* answer once the response head is in hand, which
+    /// is the state a backtick value on a `resHeaders://` rule renders in.
+    /// Upstream reads them straight off the request object, where `res.js` has
+    /// stamped them (`_original/lib/inspectors/res.js:802-806`).
+    #[test]
+    fn the_response_side_variables_answer_once_there_is_a_response() {
+        let mut info = req("http://x.com/p?a=1", &[]);
+        info.client_port = Some(51234);
+        info.res = Some(crate::rules::ResInfo {
+            status: 404,
+            headers: vec![
+                ("x-served-by".to_string(), "edge-7".to_string()),
+                ("set-cookie".to_string(), "sid=abc; Path=/; HttpOnly".to_string()),
+                ("set-cookie".to_string(), "theme=dark".to_string()),
+            ],
+            server_ip: Some("93.184.216.34".to_string()),
+            server_port: Some(443),
+        });
+        let of = |body: &str| render_vars(body, &info, ENV);
+
+        assert_eq!(of("${statusCode}"), "404");
+        assert_eq!(of("${serverIp}:${serverPort}"), "93.184.216.34:443");
+        assert_eq!(of("${resHeaders.x-served-by}"), "edge-7");
+        assert_eq!(of("${resH.X-Served-By}"), "edge-7");
+        assert_eq!(of("${clientPort}"), "51234");
+        // A named cookie gives its value; `${resCookies}` the whole set.
+        assert_eq!(of("${resCookies.sid}"), "abc");
+        assert_eq!(of("${resCookies.theme}"), "dark");
+        assert_eq!(of("${resCookies}"), "sid=abc; Path=/; HttpOnly, theme=dark");
+        // Attributes do not resolve, and neither does a cookie named after one:
+        // upstream builds an `item` for them and never stores it — see
+        // `res_cookie`.
+        assert_eq!(of("[${resCookies.sid.domain}]"), "[]");
+        assert_eq!(of("[${resCookies.path}]"), "[]");
+        // `.value` is the one property the stored object has.
+        assert_eq!(of("${resCookies.sid.value}"), "abc");
+
+        // A response whose peer address was never recorded reports upstream's
+        // own `127.0.0.1` rather than nothing — the response exists.
+        info.res.as_mut().unwrap().server_ip = None;
+        assert_eq!(render_vars("${serverIp}", &info, ENV), "127.0.0.1");
+    }
+
+    /// `render_vars` is pass 2 alone: no query interpolation, and none of
+    /// `file-proxy.js`'s `{…}` gate. A rule value is not a template file.
+    #[test]
+    fn render_vars_skips_the_query_pass_and_its_gate() {
+        let info = req("http://x.com/p?a=1", &[]);
+        // `{a}` would have become `1` in a `tpl://` file; here it is text.
+        assert_eq!(render_vars("{a}", &info, ENV), "{a}");
+        assert_eq!(render_vars("m=${method}", &info, ENV), "m=GET");
     }
 
     #[test]

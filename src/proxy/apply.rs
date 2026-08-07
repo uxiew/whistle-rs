@@ -6758,6 +6758,216 @@ mod tests {
         }
     }
 
+    /// Resolve `text` against a GET of `http://a.com/p?q=1`, substitute
+    /// `values`, and hand back the set — the two passes a request makes before
+    /// any operator is applied.
+    fn substituted(text: &str, values: &HashMap<String, String>) -> Resolved {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        let info = build_req_info("GET", "http", "a.com", 80, "/p?q=1", &HeaderMap::new(), None);
+        let mut resolved = mgr.resolve(&info);
+        substitute_values(&mut resolved, values, TplCtx { info: &info, env: test_env() });
+        resolved
+    }
+
+    /// A value wrapped in backticks is a template rendered against the request
+    /// (`renderTpl`, `_original/lib/rules/rules.js:762-772`). Without this the
+    /// backticks reached the origin as two literal characters wrapped around an
+    /// unexpanded `${…}`.
+    #[test]
+    fn a_backtick_value_renders_against_the_request() {
+        let none = HashMap::new();
+        let of = |text: &str, proto: &str| {
+            substituted(text, &none).value(proto).map(str::to_string)
+        };
+
+        assert_eq!(
+            of("a.com reqHeaders://`x-m=${method}`\n", "reqHeaders").as_deref(),
+            Some("x-m=GET")
+        );
+        // The whole vocabulary is shared with `tpl://`: `.key` subpaths,
+        // `${{…}}` encoding and the `.replace(…)` modifier all come along.
+        assert_eq!(
+            of("a.com reqHeaders://`x-q=${query.q}`\n", "reqHeaders").as_deref(),
+            Some("x-q=1")
+        );
+        assert_eq!(
+            of("a.com reqHeaders://`x-u=${{url}}`\n", "reqHeaders").as_deref(),
+            Some("x-u=http%3A%2F%2Fa.com%2Fp%3Fq%3D1")
+        );
+        // Not a template: the backticks have to wrap the *whole* value, and one
+        // backtick is not a pair.
+        for value in ["x=`${method}`&y=2", "`", "x=${method}"] {
+            let line = format!("a.com reqHeaders://{value}\n");
+            assert_eq!(of(&line, "reqHeaders").as_deref(), Some(value), "{value}");
+        }
+        // A name outside the whitelist survives, as it does in a `tpl://` file.
+        assert_eq!(
+            of("a.com reqHeaders://`x=${nosuchvar}`\n", "reqHeaders").as_deref(),
+            Some("x=${nosuchvar}")
+        );
+    }
+
+    /// `resolveVar`'s subtlety (`rules.js:774-783`): when the value *was* a
+    /// backtick template, what the values store hands back for a `${key}` is
+    /// rendered too. It is the only way a stored value ever sees the request —
+    /// it is written once and reused by every rule that names it.
+    #[test]
+    fn a_backtick_value_renders_what_the_values_store_returned() {
+        let values: HashMap<String, String> =
+            [("hdr".to_string(), "x-m=${method}".to_string())].into_iter().collect();
+        let of = |text: &str| {
+            substituted(text, &values).value("reqHeaders").map(str::to_string)
+        };
+
+        assert_eq!(of("a.com reqHeaders://`${hdr}`\n").as_deref(), Some("x-m=GET"));
+        // Without the backticks the stored text is used as written — upstream
+        // renders it only when `rule.isTpl`.
+        assert_eq!(of("a.com reqHeaders://${hdr}\n").as_deref(), Some("x-m=${method}"));
+    }
+
+    /// `log://` and `weinre://` opt out at parse time upstream
+    /// (`rule.isTpl = false`, `rules.js:1357-1359`): their values name a
+    /// channel, and a backtick in one is a backtick.
+    #[test]
+    fn the_tool_protocols_opt_out_of_backtick_rendering() {
+        let none = HashMap::new();
+        let resolved = substituted("a.com log://`${method}`\n", &none);
+        assert_eq!(resolved.value("log"), Some("`${method}`"));
+    }
+
+    /// Read `spec` as an operator value would be read, on a runtime of its own.
+    fn loaded(text: &str) -> Resolved {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(text);
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        let mut resolved = mgr.resolve(&info);
+        rt().block_on(load_rule_values(&mut resolved, &info));
+        resolved
+    }
+
+    /// A scratch directory for the value files these tests read.
+    fn value_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("whistle-rs-values-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// `reqHeaders:///etc/whistle/headers.json` used to set **nothing**: the
+    /// path was handed to the header parser, which found no `=` and no `{`, and
+    /// the rule quietly did nothing at all.
+    #[test]
+    fn an_operator_value_can_name_a_file() {
+        let dir = value_dir("read");
+        let json = dir.join("h.json");
+        std::fs::write(&json, r#"{"x-from-file":"1","x-b":"2"}"#).unwrap();
+        let body = dir.join("body.txt");
+        std::fs::write(&body, "MOCKED").unwrap();
+
+        let resolved = loaded(&format!(
+            "a.com reqHeaders://{}\na.com reqBody://{}\n",
+            json.display(),
+            body.display()
+        ));
+        let mut headers = HeaderMap::new();
+        apply_header_ops(&mut headers, &resolved, "reqHeaders");
+        assert_eq!(headers.get("x-from-file").unwrap(), "1");
+        assert_eq!(headers.get("x-b").unwrap(), "2");
+        assert_eq!(resolved.value("reqBody"), Some("MOCKED"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `readFileText` splits on `|` and **joins** what it read
+    /// (`_original/lib/util/file-mgr.js:96-102,:157-166`) — which is not the
+    /// first-one-wins of a `file://` rule. A missing alternative drops out of
+    /// the join rather than ending it.
+    #[test]
+    fn several_paths_in_one_value_join_rather_than_race() {
+        let dir = value_dir("join");
+        std::fs::write(dir.join("a.txt"), "first").unwrap();
+        std::fs::write(dir.join("c.txt"), "third").unwrap();
+
+        let resolved = loaded(&format!(
+            "a.com resBody://{}|{}|{}\n",
+            dir.join("a.txt").display(),
+            dir.join("gone.txt").display(),
+            dir.join("c.txt").display()
+        ));
+        assert_eq!(resolved.value("resBody"), Some("first\r\nthird"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two failure behaviours, which are not the same one.
+    ///
+    /// A JSON-valued operator keeps its text, because upstream's
+    /// `tryParseMatcher` (`_original/lib/util/index.js:1165-1171,:1303`) parses
+    /// the matcher as a query string once the read comes back empty. A
+    /// text-valued one is emptied instead: its text is a path, and a path must
+    /// never reach an origin as a request body.
+    #[test]
+    fn a_value_that_cannot_be_read_never_reaches_the_origin_as_a_path() {
+        let missing = "/nonexistent-whistle-rs/value.json";
+        let resolved = loaded(&format!(
+            "a.com reqHeaders://{missing}\na.com reqBody://{missing}\na.com resBody://{missing}\n"
+        ));
+        assert_eq!(resolved.value("reqHeaders"), Some(missing));
+        assert_eq!(resolved.value("reqBody"), Some(""));
+        assert_eq!(resolved.value("resBody"), Some(""));
+
+        // A `..` segment is refused before any read, exactly as `joinPath` does.
+        let resolved = loaded("a.com resBody:///tmp/../etc/passwd\n");
+        assert_eq!(resolved.value("resBody"), Some(""));
+    }
+
+    /// Values that are **not** locations are not read — the loader must cost a
+    /// rule set that does not use it nothing but a walk.
+    #[test]
+    fn only_a_value_shaped_like_a_location_is_read() {
+        let untouched = [
+            // Pairs are the JSON operators' own syntax; upstream reaches the
+            // same place the long way, by reading the path and falling back.
+            ("urlReplace", "/api/v1=/api/v2"),
+            ("reqHeaders", "x-a=1"),
+            ("resHeaders", "{\"x-a\":\"1\"}"),
+            // A bare relative value stays the literal this port documents.
+            ("resBody", "console.log('patched')"),
+            ("resAppend", "tail"),
+            // A URL on the js/css families still means `<script src=…>`.
+            ("jsAppend", "https://cdn.test/a.js"),
+            ("cssAppend", "https://cdn.test/a.css"),
+            // Operators outside the loadable set keep their value whatever its
+            // shape: `file://` does its own reading, `redirect://` is a target.
+            ("resType", "/json"),
+            ("redirect", "https://b.com/x"),
+        ];
+        for (proto, value) in untouched {
+            let resolved = loaded(&format!("a.com {proto}://{value}\n"));
+            assert_eq!(resolved.value(proto), Some(value), "{proto}://{value}");
+        }
+    }
+
+    /// `readRuleValue` returns before it looks at a disk when `rule.value` is
+    /// set (`_original/lib/util/index.js:1177-1179`) — the `(inline)` form and a
+    /// whole-value `{name}` the values store answered.
+    #[test]
+    fn content_short_circuits_the_read() {
+        let values: HashMap<String, String> =
+            [("mock".to_string(), "/etc/passwd".to_string())].into_iter().collect();
+        let mut mgr = RuleManager::new();
+        mgr.set_text("a.com reqBody://(/etc/passwd)\na.com resBody://{mock}\n");
+        let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+        let mut resolved = mgr.resolve(&info);
+        substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+        rt().block_on(load_rule_values(&mut resolved, &info));
+
+        // Both are content: the path text survives instead of being opened.
+        assert_eq!(resolved.value("reqBody"), Some("/etc/passwd"));
+        assert_eq!(resolved.value("resBody"), Some("/etc/passwd"));
+    }
+
     /// `file://`, `redirect://`, `statusCode://` and a bare destination URL
     /// share **one slot** upstream — none of their names is a protocol, so all
     /// of them land in the same list and the first match wins outright.
