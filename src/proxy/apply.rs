@@ -2854,10 +2854,24 @@ fn no_type_alias(_: &str) -> Option<&'static str> {
 }
 
 /// Milliseconds to delay before forwarding the request (`reqDelay`).
+///
+/// The delays and the speeds read their value **differently**, and the
+/// difference is not a choice anyone made — it falls out of where each one is
+/// used. A speed goes through `parseFloat` (`_original/lib/inspectors/res.js:914`),
+/// which takes the longest numeric prefix, so `resSpeed://600kb` is 600. A delay
+/// is never parsed at all: `exports.delay` compares the matcher's **string** to
+/// zero, `if (time > 0)` (`_original/lib/util/index.js:3686-3691`), and
+/// JavaScript's `>` converts that string with `Number`, which demands the whole
+/// text be numeric. `'400' > 0` is true; `'400ms' > 0` is `NaN > 0`, which is
+/// false, so a delay carrying its unit **does not delay**.
+///
+/// This port used `parseFloat` for both, so `reqDelay://400ms` waited 400 ms
+/// here and nothing upstream. Measured on the timing bench, which is the only
+/// place a delay is visible at all.
 pub fn req_delay_ms(resolved: &Resolved) -> Option<u64> {
     resolved
         .value("reqDelay")
-        .and_then(parse_leading_number)
+        .and_then(js_number)
         .filter(|ms| *ms > 0.0)
         .map(|ms| ms as u64)
 }
@@ -2866,7 +2880,7 @@ pub fn req_delay_ms(resolved: &Resolved) -> Option<u64> {
 pub fn res_delay_ms(resolved: &Resolved) -> Option<u64> {
     resolved
         .value("resDelay")
-        .and_then(parse_leading_number)
+        .and_then(js_number)
         .filter(|ms| *ms > 0.0)
         .map(|ms| ms as u64)
 }
@@ -2897,15 +2911,59 @@ pub fn res_speed_kbps(resolved: &Resolved) -> Option<f64> {
         .filter(|rate| *rate > 0.0)
 }
 
+/// JavaScript's `Number(string)`: the whole text, or nothing.
+///
+/// Returns `None` where JavaScript would give `NaN`, which is what a caller
+/// comparing `> 0` needs — every comparison against `NaN` is false.
+///
+/// The three shapes `Number` accepts that a plain float parse does not, and the
+/// two it rejects that Rust's does:
+///
+/// * an empty or all-whitespace string is **zero**, not an error;
+/// * `0x` / `0o` / `0b` are read in their radix, but only unsigned —
+///   `Number('-0x10')` is `NaN`;
+/// * `Infinity` is spelled exactly that way, capital `I`, optionally signed.
+///   Rust also accepts `inf`, `infinity` and `nan`, which JavaScript does not,
+///   so anything else carrying a letter besides an exponent's `e` is rejected.
+///
+/// Only the delays use this; see [`req_delay_ms`] for why they and the speeds
+/// read their values differently.
+fn js_number(value: &str) -> Option<f64> {
+    let text = value.trim();
+    if text.is_empty() {
+        return Some(0.0);
+    }
+    match text {
+        "Infinity" | "+Infinity" => return Some(f64::INFINITY),
+        "-Infinity" => return Some(f64::NEG_INFINITY),
+        _ => {}
+    }
+    if let Some(rest) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        return u64::from_str_radix(rest, 16).ok().map(|n| n as f64);
+    }
+    if let Some(rest) = text.strip_prefix("0o").or_else(|| text.strip_prefix("0O")) {
+        return u64::from_str_radix(rest, 8).ok().map(|n| n as f64);
+    }
+    if let Some(rest) = text.strip_prefix("0b").or_else(|| text.strip_prefix("0B")) {
+        return u64::from_str_radix(rest, 2).ok().map(|n| n as f64);
+    }
+    // `inf`, `infinity` and `nan` parse in Rust and are `NaN` in JavaScript.
+    if text.chars().any(|c| c.is_ascii_alphabetic() && c != 'e' && c != 'E') {
+        return None;
+    }
+    text.parse().ok().filter(|n: &f64| !n.is_nan())
+}
+
 /// JavaScript's `parseFloat`: the longest numeric prefix, ignoring whatever
 /// follows.
 ///
-/// whistle reads these values with `parseFloat`/`parseInt`
-/// (`_original/lib/inspectors/res.js:917-921`,
-/// `lib/util/index.js:3687-3693`), so `resSpeed://20kb` and `resDelay://500ms`
-/// are 20 and 500 there. Rust's `parse` rejects them outright, which turned a
-/// value with a unit suffix — the way anyone would first write one — into no
-/// throttle and no delay at all.
+/// whistle reads the **speeds** this way — `resSpeed = resSpeed &&
+/// parseFloat(resSpeed)` (`_original/lib/inspectors/res.js:914`,
+/// `req.js:524`) — so `resSpeed://20kb` is 20 there. Rust's `parse` rejects it
+/// outright, which turned a value with a unit suffix — the way anyone would
+/// first write one — into no throttle at all.
+///
+/// The delays do **not** go through here; see [`js_number`].
 fn parse_leading_number(value: &str) -> Option<f64> {
     let text = value.trim();
     let end = text
@@ -7680,12 +7738,58 @@ mod tests {
         };
         assert_eq!(res_speed_kbps(&of("a.com resSpeed://20kb\n")), Some(20.0));
         assert_eq!(req_speed_kbps(&of("a.com reqSpeed://3\n")), Some(3.0));
-        assert_eq!(res_delay_ms(&of("a.com resDelay://500ms\n")), Some(500));
         // Upstream's `> 0` guard: a zero or negative delay is no delay.
         assert_eq!(res_delay_ms(&of("a.com resDelay://0\n")), None);
         assert_eq!(res_delay_ms(&of("a.com resDelay://-5\n")), None);
         // Nothing numeric at all stays nothing.
         assert_eq!(res_speed_kbps(&of("a.com resSpeed://fast\n")), None);
+    }
+
+    /// A delay carrying its unit does **not** delay, and a speed carrying one
+    /// does throttle. The asymmetry is upstream's; see [`js_number`].
+    ///
+    /// This test replaces an assertion that said `resDelay://500ms` was 500 ms.
+    /// It read plausibly and it was wrong: `exports.delay` never parses, it
+    /// compares the matcher's string to zero, and `'500ms' > 0` is false. The
+    /// timing bench measured whistle answering in 3 ms where this port waited
+    /// 403.
+    #[test]
+    fn a_delay_is_read_as_a_whole_number_and_a_speed_is_not() {
+        let of = |text: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            mgr.resolve(&info)
+        };
+        assert_eq!(res_delay_ms(&of("a.com resDelay://500ms\n")), None);
+        assert_eq!(req_delay_ms(&of("a.com reqDelay://500ms\n")), None);
+        assert_eq!(res_speed_kbps(&of("a.com resSpeed://600kb\n")), Some(600.0));
+        // The plain spellings still work, exponent and sign included.
+        assert_eq!(res_delay_ms(&of("a.com resDelay://500\n")), Some(500));
+        assert_eq!(res_delay_ms(&of("a.com resDelay://500.7\n")), Some(500));
+        assert_eq!(res_delay_ms(&of("a.com resDelay://1e3\n")), Some(1000));
+        assert_eq!(res_delay_ms(&of("a.com resDelay://+400\n")), Some(400));
+    }
+
+    /// `Number(string)` in the corners, because a delay is decided by it.
+    #[test]
+    fn js_number_reads_what_javascript_reads() {
+        assert_eq!(js_number(""), Some(0.0));
+        assert_eq!(js_number("   "), Some(0.0));
+        assert_eq!(js_number(" 400 "), Some(400.0));
+        assert_eq!(js_number("400ms"), None);
+        assert_eq!(js_number(".5"), Some(0.5));
+        assert_eq!(js_number("0x10"), Some(16.0));
+        assert_eq!(js_number("0b101"), Some(5.0));
+        assert_eq!(js_number("0o17"), Some(15.0));
+        // A radix prefix takes no sign in JavaScript.
+        assert_eq!(js_number("-0x10"), None);
+        assert_eq!(js_number("Infinity"), Some(f64::INFINITY));
+        // Spellings Rust's float parser accepts and JavaScript's `Number` does not.
+        assert_eq!(js_number("inf"), None);
+        assert_eq!(js_number("infinity"), None);
+        assert_eq!(js_number("nan"), None);
+        assert_eq!(js_number("NaN"), None);
     }
 
     /// The same `> 0` guard on the speeds, which did not have it.

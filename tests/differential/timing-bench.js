@@ -49,6 +49,14 @@ function startOrigin() {
   });
 }
 
+/**
+ * A rules POST, with a deadline.
+ *
+ * The deadline is not decoration. Without one this bench sat for forty minutes
+ * on four seconds of CPU: a proxy that stops answering its own rules endpoint
+ * blocks here forever, and the run looks identical to a run that is merely
+ * slow. It now fails loudly instead.
+ */
 const post = (port, path, body, type) =>
   new Promise((res, rej) => {
     const req = http.request(
@@ -56,6 +64,7 @@ const post = (port, path, body, type) =>
       (r) => { let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => res(b)); },
     );
     req.on('error', rej);
+    req.setTimeout(10000, () => { req.destroy(); rej(new Error(`rules POST to :${port} timed out`)); });
     req.end(body);
   });
 
@@ -188,6 +197,9 @@ async function main() {
   let ran = 0, differing = 0;
   const report = [], table = [];
   for (const c of CASES) {
+    // Progress on stderr, so a run that stalls says where. stdout stays a
+    // single JSON document.
+    process.stderr.write(`· ${c.name}\n`);
     await setRules(c.rules);
     const [w, rs] = [await best(W, c.request), await best(RS, c.request)];
     ran++;

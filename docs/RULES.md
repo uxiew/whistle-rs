@@ -1719,10 +1719,22 @@ slow.example.com   resSpeed://800       # 800 kbit/s ≈ 100 kB/s download
 value as kilobytes until recently, so every throttle written against the old
 behaviour ran 8.192× too fast; multiply those values by 8.
 
-**Both families take only a number.** A unit suffix parses and is then
-*discarded*, not converted (`parseFloat`/`parseInt` semantics): `resDelay://500ms`
-is 500 ms as you would hope, but `resDelay://1s` is **1 millisecond**, and
-`resSpeed://20kb` is 20 kilobits. Write the number you mean.
+**Write a bare number.** The two families read their value differently, and the
+difference is upstream's, not a choice:
+
+| | reads the value with | `600ms` | `600` | `0` or `-600` |
+|---|---|---|---|---|
+| `reqSpeed` / `resSpeed` | `parseFloat` — the longest numeric prefix | 600, unit discarded | 600 | **no cap** |
+| `reqDelay` / `resDelay` | `Number` — the whole text or nothing | **no delay at all** | 600 | **no delay** |
+
+A speed suffix is *discarded, not converted*: `resSpeed://20kb` is 20 **kilobits**
+and `resSpeed://1mb` is 1. A delay suffix is worse — it silently switches the
+rule off, because `exports.delay` never parses anything, it compares the value's
+text to zero (`if (time > 0)`, `_original/lib/util/index.js:3686-3691`), and in
+JavaScript `'600ms' > 0` is false. Both proxies behave this way; measured on
+`tests/differential/timing-bench.js`.
+
+Zero and negative mean *no limit* in all four, upstream's `> 0` guard.
 
 ### Response rewriting
 
