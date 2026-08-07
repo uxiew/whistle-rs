@@ -2032,6 +2032,40 @@ pub(crate) mod tunnel_abort_tests {
         allowed.read_exact(&mut head).await.expect("a CONNECT reply");
         assert_eq!(&head, b"HTTP/1.1 200");
     }
+
+    /// An aborted *request* is recorded too, for the same reason an aborted
+    /// tunnel is: a row that never appears is indistinguishable from a rule
+    /// that never matched, and which of those happened is the only thing the
+    /// user wants to know when they write `enable://abort`.
+    #[tokio::test]
+    async fn an_aborted_request_is_recorded_rather_than_vanishing() {
+        let (state, addr) = proxy_with("blocked.test enable://abort").await;
+
+        let mut refused = tokio::net::TcpStream::connect(addr).await.unwrap();
+        refused
+            .write_all(b"GET http://blocked.test/a HTTP/1.1\r\nHost: blocked.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        refused.read_to_end(&mut got).await.ok();
+        assert!(
+            got.is_empty(),
+            "an abort answers nothing, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+
+        let sessions = state.sessions.lock().unwrap();
+        let session = sessions.iter().next().expect("the abort is on the list");
+        assert_eq!(session.method, "GET");
+        assert_eq!(session.url, "http://blocked.test/a");
+        assert_eq!(session.status, 0, "nothing answered");
+        assert_eq!(session.target, "aborted", "and nothing was dialled");
+        assert!(
+            session.rules.iter().any(|r| r.raw == "enable://abort"),
+            "the rule that did it is named: {:?}",
+            session.rules
+        );
+    }
 }
 
 /// Serve HTTP over an intercepted tunnel stream, optionally TLS-decrypting first.
@@ -3259,6 +3293,33 @@ async fn serve(
     // it lets the request go out and destroys the answer instead, further down.
     if apply::aborts_request(&resolved) {
         tracing::info!("{} {} -> aborted", info.method, info.full_url);
+        // Recorded, for the same reason an aborted tunnel is (see
+        // [`tunnel_aborted`]): upstream emits the session and then marks it
+        // aborted (`data.js:534-539` destroys the response, `tunnel.js:31-36`
+        // is where the status becomes `'aborted'`), and a request that vanishes
+        // from the console is indistinguishable from a rule that never matched
+        // — which is the one question the user is asking when they reach for
+        // `enable://abort`.
+        let (req_headers, req_body) =
+            capture_client_request(&mut req, state.config.body_preview_cap).await;
+        state.record(Session {
+            id: 0,
+            time_ms,
+            method: info.method.clone(),
+            url: info.full_url.clone(),
+            // Nothing answered and nothing will. 0 is the console's "no status",
+            // matching the tunnel gate rather than inventing a second spelling.
+            status: 0,
+            client_ip: client_ip.clone(),
+            // No address was dialled: the abort sits ahead of the forward.
+            target: "aborted".to_string(),
+            duration_ms: started.elapsed().as_millis(),
+            log: log_labels(&resolved),
+            rules: matched_ops(&resolved),
+            req_headers,
+            req_body,
+            ..Default::default()
+        });
         return Err(Destroyed.into());
     }
 
