@@ -158,10 +158,14 @@ pub fn substitute_values(
         if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
             && let Some(content) = values.get(name)
         {
+            let name = name.to_string();
             *value = content.clone();
             // What came back is the content, not a place to find it — see
             // `RuleOp::value_is_content`.
             op.value_is_content = true;
+            // The name outlives the substitution because the file family guesses
+            // a content type from it — see `RuleOp::value_key`.
+            op.value_key = Some(name);
             return;
         }
         // `${name}` anywhere *inside* a value, which is the other half of
@@ -658,7 +662,7 @@ pub async fn resolve_target(
     };
 
     let request_tls = super::dest::is_tls(&dest.scheme);
-    let tls = origin_tls(request_tls, proxy_proto);
+    let tls = origin_tls(request_tls, proxy_proto, resolved);
     let cipher = resolved.value("cipher");
     // A cipher string that names nothing this build has fails the request, as
     // it fails at context creation in Node. See `parse_cipher_suites`.
@@ -704,15 +708,40 @@ pub async fn resolve_target(
 ///   the operator's name asks for, and the receiving whistle restores the
 ///   scheme, but it is worth knowing before pointing one at a public proxy.
 ///
-/// A `pac://`-chosen proxy converts nothing: whistle reads the conversion off
-/// the rule's own protocol, and PAC results carry no whistle protocol.
-fn origin_tls(request_tls: bool, proxy_proto: Option<&str>) -> bool {
-    match proxy_proto {
-        Some("http2https-proxy") => true,
-        Some("https2http-proxy" | "internal-proxy" | "internal-http-proxy"
-            | "internal-https-proxy") => false,
-        _ => request_tls,
+/// A `pac://`-chosen proxy converts nothing of its own: whistle reads the
+/// conversion off the rule's own protocol, and PAC results carry no whistle
+/// protocol. `lineProps://internalProxy` still reaches it, as it reaches any
+/// other hop — see [`internal_proxy`].
+fn origin_tls(request_tls: bool, proxy_proto: Option<&str>, resolved: &Resolved) -> bool {
+    let Some(proto) = proxy_proto else {
+        return request_tls;
+    };
+    // Upstream asks `isInternal` before `isHttp2https`, so a hop that is somehow
+    // both is internal (`res.js:224-238`).
+    if matches!(
+        proto,
+        "https2http-proxy" | "internal-proxy" | "internal-http-proxy" | "internal-https-proxy"
+    ) || internal_proxy(resolved, proto)
+    {
+        return false;
     }
+    proto == "http2https-proxy" || request_tls
+}
+
+/// `internalProxy` — an ordinary `proxy://` hop is another whistle, so hand it
+/// the request in plaintext with the marker header, exactly as the `internal-*`
+/// spellings do (`isInternalProxy`, `_original/lib/util/index.js:3801-3807`).
+///
+/// `docs/LINE_PROPS.md` had this as exposed-only, on the grounds that this port
+/// has no "forward https to an upstream proxy in the clear" mode. It has had one
+/// since the `internal-*` protocols were ported — see [`origin_tls`]; what was
+/// missing was only the *other* way of asking for it. Upstream reads the
+/// property off the proxy line or the `host://` line, and `enable://internalProxy`
+/// says it request-wide.
+fn internal_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
+    resolved.props(proxy_proto).has("internalProxy")
+        || resolved.props("host").has("internalProxy")
+        || enabled_flags(resolved).contains("internalProxy")
 }
 
 /// Parse a `cipher://` value into an upstream TLS version constraint.
@@ -1078,12 +1107,22 @@ fn short_circuit_inner(
                 .ok()
                 .and_then(|c| StatusCode::from_u16(c).ok())
                 .unwrap_or(StatusCode::OK);
-            Some(
-                Response::builder()
-                    .status(status)
-                    .body(body::empty())
-                    .unwrap(),
-            )
+            let mut resp = Response::builder()
+                .status(status)
+                .body(body::empty())
+                .unwrap();
+            // A mocked `401`/`407` carries its challenge here as well, not only
+            // on the `replaceStatus://` path: upstream answers a `statusCode://`
+            // rule through `getStatusCodeFromRule`, which calls `handleStatusCode`
+            // for exactly this reason (`_original/lib/util/index.js:3566-3588`).
+            // Measured against the differential bench, `statusCode://401` came
+            // back from whistle with `WWW-Authenticate: Basic realm=User Login`
+            // and from here with nothing — so a mocked 401 never prompted, which
+            // is most of the point of mocking one.
+            if user_login_allowed(resolved, proto) {
+                handle_status_code(resp.headers_mut(), status);
+            }
+            Some(resp)
         }
         // The destination rewrite won: nothing is answered here, the request
         // goes out to where it now points.
@@ -1117,7 +1156,7 @@ fn short_circuit_inner(
 
 /// `weakRule` — the local-file rule steps aside for a matching `proxy`/`host`
 /// rule instead of answering the request, inverting the usual precedence
-/// (`filterWeakRule`, `_original/lib/util/index.js:3733-3745`).
+/// (`filterWeakRule`, `_original/lib/util/index.js:3731-3743`).
 ///
 /// Upstream drops the local rule when a `host://` rule matched, or when a proxy
 /// rule matched that is *not* `proxyHostOnly` — that spelling needs a host rule
@@ -1199,25 +1238,31 @@ fn serve_file_family(
     // arm upstream (`_original/lib/util/index.js:1178-1180`). `<path>` is the
     // third bracket form and means the opposite: a path pinned in place, which
     // the matcher has already honoured by not extending it.
+    //
+    // A body that came from the values store guesses its type from the *name*
+    // it was stored under — `rule.key` at `file-proxy.js:270-272` — because that
+    // is the only place `mock.json`'s extension is written down. An inline
+    // `(text)` has no such name and falls back to the request URL.
     if op.value_is_content {
         let bytes = value.as_bytes().to_vec();
+        let named = op.value_key.as_deref().unwrap_or(&info.full_url);
         return Some(if raw {
-            serve_raw_http(&bytes, &info.full_url, info)
+            serve_raw_value(&bytes)
         } else if templated {
-            serve_template(&bytes, &info.full_url, info, env)
+            serve_template(&bytes, named, info, env)
         } else {
-            serve_file_bytes(&bytes, &info.full_url, info)
+            serve_file_range(&bytes, named, info)
         });
     }
     let value = match crate::rules::url::fixed_value(value) {
         Some((crate::rules::url::Fixed::Inline, text)) => {
             let bytes = text.into_bytes();
             return Some(if raw {
-                serve_raw_http(&bytes, &info.full_url, info)
+                serve_raw_value(&bytes)
             } else if templated {
                 serve_template(&bytes, &info.full_url, info, env)
             } else {
-                serve_file_bytes(&bytes, &info.full_url, info)
+                serve_file_range(&bytes, &info.full_url, info)
             });
         }
         Some((crate::rules::url::Fixed::Verbatim, path)) => std::borrow::Cow::Owned(path),
@@ -1228,12 +1273,17 @@ fn serve_file_family(
     match candidates.read() {
         // The *matched* path drives the content type, not the rule value: with
         // `file:///tmp/mock/` it is `/tmp/mock/index.html` that was served.
+        //
+        // Only this arm names the proxy in a `Server` header: upstream builds it
+        // alongside the content type in the `readFiles` callback
+        // (`file-proxy.js:315-318`), so a body that never touched the filesystem
+        // — inline, values store, or the 404 — does not carry one.
         Some((path, data)) => Some(if raw {
             serve_raw_http(&data, &path, info)
         } else if templated {
-            serve_template(&data, &path, info, env)
+            with_server(serve_template(&data, &path, info, env))
         } else {
-            serve_file_bytes(&data, &path, info)
+            with_server(serve_file_range(&data, &path, info))
         }),
         // A cross (`x`/`xs`) rule falls through to the real server instead —
         // including when the path was refused (`file-proxy.js:298-303`).
@@ -1837,6 +1887,128 @@ fn serve_file_bytes(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody
         .unwrap()
 }
 
+/// Name the proxy that served a local file, as upstream names itself in the
+/// header block it builds beside the content type (`server: config.appName`,
+/// `_original/lib/handlers/file-proxy.js:315-318`).
+///
+/// Spelled honestly, for the reason [`mark_self_generated`] gives: this is not
+/// whistle. It is a *response* header the mock carries, not proxy bookkeeping,
+/// which is why it is set here and not on everything the proxy answers.
+fn with_server(mut resp: Response<DynBody>) -> Response<DynBody> {
+    set_header(resp.headers_mut(), "server", "whistle-rs");
+    resp
+}
+
+/// Serve `file://` bytes, honouring a `Range` request header.
+///
+/// Only this shape of response is rangeable: `getRawResByPath` asks for a range
+/// unless the protocol is `rawfile` (`file-proxy.js:100-102`), and the template
+/// branch never reaches it at all. So `rawfile://` and `tpl://` answer 200 with
+/// the whole body however the client asks.
+fn serve_file_range(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> {
+    let Some((start, end)) = parse_range(info, data.len()) else {
+        return serve_file_bytes(data, path, info);
+    };
+    Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(
+            hyper::header::CONTENT_TYPE,
+            content_type_for(path, &info.full_url),
+        )
+        .header(
+            hyper::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", data.len()),
+        )
+        .header(hyper::header::ACCEPT_RANGES, "bytes")
+        .body(body::full(Bytes::copy_from_slice(&data[start..=end])))
+        .unwrap()
+}
+
+/// whistle's `parseRange` (`_original/lib/util/index.js:3346-3382`), returning
+/// the inclusive byte range to serve, or `None` for "send the whole thing".
+///
+/// It is reproduced with its arithmetic intact rather than corrected, because
+/// two of its answers are load-bearing for anyone who already has mocks:
+///
+/// * a **suffix** range (`bytes=-500`) computes its start as `size - end` and
+///   then compares it against `end` itself, so `start > end` and the range is
+///   dropped — whistle answers 200 with the whole body, never the last 500
+///   bytes;
+/// * **several** ranges collapse into one spanning the lowest start and the
+///   highest end, so `bytes=0-1,5-6` serves bytes 0 through 6 as a single 206
+///   rather than a multipart response.
+///
+/// A zero-length body is never ranged (`size &&` guards the whole function).
+fn parse_range(info: &ReqInfo, size: usize) -> Option<(usize, usize)> {
+    if size == 0 {
+        return None;
+    }
+    let header = req_header(Some(info), "range")?;
+    let spec = header.trim_start();
+    // `BYTES_RANGE_RE = /^\s*bytes=/i` — the `=` has to follow the unit
+    // immediately, so `bytes =0-5` is not a range at all.
+    let spec = spec
+        .get(..6)
+        .filter(|unit| unit.eq_ignore_ascii_case("bytes="))
+        .map(|_| spec[6..].trim())?;
+    if spec.is_empty() {
+        return None;
+    }
+    // `parseInt(s, 10)`: skip leading whitespace, take a sign and then the
+    // leading digits, and answer `NaN` if there are none. Splitting on every
+    // `-` first is what makes `bytes=-3-5` an absent start and an end of `3`.
+    let leading_int = |s: &str| {
+        let s = s.trim_start();
+        let digits = s.strip_prefix('+').unwrap_or(s);
+        let len = digits.bytes().take_while(u8::is_ascii_digit).count();
+        digits[..len].parse::<i64>().ok()
+    };
+
+    let size = size as i64;
+    let (mut start, mut end) = (size, -1i64);
+    for item in spec.split(',') {
+        let mut parts = item.split('-');
+        let (first, second) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        let (s, e) = match (leading_int(first), leading_int(second)) {
+            (None, None) => continue,
+            (None, Some(e)) => (size - e, e),
+            (Some(s), None) => (s, size - 1),
+            (Some(s), Some(e)) => (s, e),
+        };
+        start = start.min(s);
+        end = end.max(e);
+    }
+    if start < 0 || end < 0 || start > end || end >= size {
+        return None;
+    }
+    Some((start as usize, end as usize))
+}
+
+/// Serve a `rawfile://` whose value *is* the response text, not a path to it
+/// (`getRawResByValue`, `_original/lib/handlers/file-proxy.js:84-98`).
+///
+/// It differs from the path form twice. With no blank line anywhere, `parseRes`
+/// is handed nothing and returns bare `{200, {}}`, so the body goes out with
+/// **no content type at all** — where a path with no blank line falls back to
+/// the file handler's own header block. And `content-encoding` is deleted
+/// (`fromValue`, `file-proxy.js:71-73`): a value is written as literal text in
+/// a rules file, so it cannot be the compressed bytes the header claims, and
+/// leaving it in makes the client fail to decode a body it can read.
+fn serve_raw_value(data: &[u8]) -> Response<DynBody> {
+    match find_headers_sep(data) {
+        Some((head_end, body_start)) => {
+            let mut resp =
+                raw_response(&data[..head_end], Bytes::copy_from_slice(&data[body_start..]));
+            resp.headers_mut().remove(hyper::header::CONTENT_ENCODING);
+            resp
+        }
+        None => Response::builder()
+            .status(StatusCode::OK)
+            .body(body::full(Bytes::copy_from_slice(data)))
+            .unwrap(),
+    }
+}
+
 /// How far into a `rawfile://` whistle looks for the header/body separator
 /// before giving up and serving the file as an ordinary body
 /// (`MAX_HEADERS_SIZE`, `_original/lib/handlers/file-proxy.js:13,151-158`).
@@ -1851,11 +2023,29 @@ const MAX_RAW_HEADERS: usize = 256 * 1024;
 fn serve_raw_http(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> {
     let budget = &data[..data.len().min(MAX_RAW_HEADERS)];
     let Some((head_end, body_start)) = find_headers_sep(budget) else {
-        return serve_file_bytes(data, path, info);
+        // Not a raw response, so it is served as an ordinary file — header block
+        // and all, which is what `reader.headers || headers` falls back to at
+        // `file-proxy.js:348`.
+        return with_server(serve_file_bytes(data, path, info));
     };
-    // Only the head is text; the body stays bytes so a binary payload survives.
-    let head = String::from_utf8_lossy(&data[..head_end]);
-    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
+    raw_response(
+        &data[..head_end],
+        Bytes::copy_from_slice(&data[body_start..]),
+    )
+}
+
+/// Build a response from a raw HTTP head and a body
+/// (`parseRes`, `_original/lib/handlers/file-proxy.js:61-78`).
+///
+/// Only the head is decoded as text; the body stays bytes so a binary payload
+/// survives. A head whose first line carries no numeric status is served as 200
+/// — upstream assigns `statusLine[1]` unchecked and then throws while writing
+/// the response, which reaches the client as a reset connection.
+fn raw_response(head: &[u8], body: Bytes) -> Response<DynBody> {
+    let head = String::from_utf8_lossy(head);
+    // `CRLF_RE = /\r\n|\r|\n/g` (`file-proxy.js:10`) — a lone CR ends a header
+    // line too, so `.http` fixtures written on any platform parse.
+    let mut lines = head.split(['\n', '\r']).filter(|l| !l.is_empty());
     let status = lines
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
@@ -1868,14 +2058,12 @@ fn serve_raw_http(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> 
             builder = builder.header(k.trim(), v.trim());
         }
     }
-    builder
-        .body(body::full(Bytes::copy_from_slice(&data[body_start..])))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(body::empty())
-                .unwrap()
-        })
+    builder.body(body::full(body)).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(body::empty())
+            .unwrap()
+    })
 }
 
 /// Locate the blank line separating a raw response's head from its body,
@@ -1950,23 +2138,55 @@ fn content_type_for(path: &str, full_url: &str) -> &'static str {
 
 /// Map a path's extension to a content type, or `None` when there is no
 /// extension in the final path segment.
+///
+/// Types and spellings are whatever the `mime` package upstream depends on
+/// answers for that extension; the `; charset=utf-8` suffix follows upstream's
+/// `util.isText` (`_original/lib/util/index.js:1494-1531`), which is a substring
+/// test — anything naming `javascript`, `css`, `html`, `json`, `xml` or starting
+/// `text/` is text, and only `image/*` that got past those is not. That is why
+/// `image/svg+xml` carries a charset and `image/png` does not.
+///
+/// The table is a subset of `mime`'s several hundred entries, covering what a
+/// mock tree holds. An extension outside it falls back to the request URL's, as
+/// it would for a file with no extension at all.
 fn content_type_of_ext(path: &str) -> Option<&'static str> {
     let last = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let ext = last.rsplit_once('.')?.1.to_ascii_lowercase();
     Some(match ext.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
+        "xhtml" => "application/xhtml+xml; charset=utf-8",
         "js" | "mjs" => "application/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
+        // A source map is JSON, and `.map` is how every bundler spells it.
+        "json" | "map" => "application/json; charset=utf-8",
         "xml" => "application/xml; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "yaml" | "yml" => "text/yaml; charset=utf-8",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml; charset=utf-8",
         "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
         "wasm" => "application/wasm",
         "pdf" => "application/pdf",
+        "bin" => "application/octet-stream",
         "txt" | "text" => "text/plain; charset=utf-8",
         _ => return None,
     })
@@ -2175,7 +2395,8 @@ struct Deletions {
     cookies: Vec<String>,
     /// `delete://trailer.x` — trailing header names to drop after the body
     /// (`TRAILER_RE`, `_original/lib/util/index.js:2663,:2812`). Response side
-    /// only, and unlike every other key here it is *not* scoped by `req`/`res`.
+    /// only, and unlike every other key here it is *not* scoped by `req`/`res`
+    /// and *not* case-insensitive.
     trailers: Vec<String>,
     /// `delete://resType` — drop the media type, keeping any charset.
     drop_type: bool,
@@ -2183,7 +2404,18 @@ struct Deletions {
     drop_charset: bool,
     /// `delete://body` / `delete://res.body` — empty the body outright, which
     /// also discards anything an operator meant to inject (`removeBody`,
-    /// `_original/lib/util/index.js:3592-3598`).
+    /// `_original/lib/util/index.js:3591-3598`).
+    ///
+    /// Deliberate divergence, and the second half is all upstream achieves.
+    /// `removeBody` writes `data.body = EMPTY_BUFFER`, and `EMPTY_BUFFER` is
+    /// `toBuffer('')` — whose first act is `if (!buf) return;`
+    /// (`_original/lib/util/common.js:1630-1632`), so the constant is
+    /// `undefined`. The assignment therefore leaves `data.body` falsy,
+    /// `isWhistleTransformData` says no, and no transform is added: upstream
+    /// drops the `reqBody`/`reqPrepend`/`reqAppend` injections and forwards the
+    /// real body untouched. The key is documented as removing the body
+    /// (<https://wproxy.org/docs/rules/delete.html>) and the code plainly means
+    /// to; this port does it.
     drop_body: bool,
     /// `delete://resBody.a.b` — dotted paths to remove from a JSON body.
     body_props: Vec<String>,
@@ -2220,14 +2452,15 @@ impl Deletions {
                     del.cookies.push(name.to_string());
                 } else if !request_side
                     && let Some(name) = key
-                        .to_ascii_lowercase()
                         .find("trailer.")
                         .map(|i| &key[i + "trailer.".len()..])
                         .filter(|n| !n.is_empty())
                 {
-                    // `TRAILER_RE` is unanchored at the front, so `resTrailer.x`
-                    // and a bare `trailer.x` both match — and so, upstream, does
-                    // anything else ending in `trailer.<name>`.
+                    // `TRAILER_RE` is unanchored at the front, so a bare
+                    // `trailer.x` matches and so does anything else ending in
+                    // `trailer.<name>`. It is also the one key here written
+                    // without the `i` flag, so the word must be lower case:
+                    // `delete://resTrailer.x` matches nothing and is inert.
                     del.trailers.push(name.to_string());
                 } else if let Some(path) = strip_del_scope(key, side, "B", "ody") {
                     del.body_props.push(path.to_string());
@@ -2466,6 +2699,16 @@ impl HeaderScope {
 }
 
 /// Remove a single cookie from the request `Cookie` header.
+///
+/// The header is *rebuilt*, not edited: upstream splits it, drops the named
+/// pair and renders the survivors as `name=value` joined by `"; "`
+/// (`setReqCookies`, `_original/lib/util/index.js:3052-3090`). Three
+/// consequences worth the rebuild: a pair that arrived without a `=` leaves
+/// with one, a trailing `;` becomes a nameless `=` pair of its own, and when
+/// nothing survives the header is set to the **empty string** rather than
+/// removed. `setHeader` assigns unconditionally, so the request still carries a
+/// `Cookie:` with nothing after it; a server that branches on the header's
+/// presence must see what whistle's would.
 fn remove_cookie(headers: &mut HeaderMap, name: &str) {
     let Some(cur) = headers
         .get(hyper::header::COOKIE)
@@ -2473,14 +2716,17 @@ fn remove_cookie(headers: &mut HeaderMap, name: &str) {
     else {
         return;
     };
-    let kept: Vec<&str> = cur
+    let kept = cur
         .split(';')
         .map(|s| s.trim())
-        .filter(|kv| kv.split_once('=').map(|(k, _)| k.trim() != name).unwrap_or(true))
-        .collect();
-    if kept.is_empty() {
-        headers.remove(hyper::header::COOKIE);
-    } else if let Ok(v) = HeaderValue::from_str(&kept.join("; ")) {
+        .filter(|kv| kv.split_once('=').map_or(*kv, |(k, _)| k) != name)
+        .map(|kv| match kv.contains('=') {
+            true => kv.to_string(),
+            false => format!("{kv}="),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if let Ok(v) = HeaderValue::from_str(&kept) {
         headers.insert(hyper::header::COOKIE, v);
     }
 }
@@ -2672,9 +2918,9 @@ pub fn apply_response_for(
     resolved: &Resolved,
     info: Option<&ReqInfo>,
 ) {
-    if let Some(code) = resolved
-        .value("replaceStatus")
-        .or_else(|| resolved.value("statusCode"))
+    if let Some((proto, code)) = ["replaceStatus", "statusCode"]
+        .into_iter()
+        .find_map(|p| resolved.value(p).map(|v| (p, v)))
         && let Some(status) = code
             .trim()
             .parse::<u16>()
@@ -2687,13 +2933,7 @@ pub fn apply_response_for(
         && status != parts.status
     {
         parts.status = status;
-        // `disable://userLogin` suppresses the challenge without suppressing the
-        // status change (`isDisableUserLogin`,
-        // `_original/lib/util/index.js:3558-3563`); `enable://userLogin` wins
-        // over it. Upstream also reads the two from the line's own properties,
-        // which this port does not carry this far.
-        let en = enabled_flags(resolved);
-        if en.contains("userLogin") || !disabled_flags(resolved).contains("userLogin") {
+        if user_login_allowed(resolved, proto) {
             handle_status_code(&mut parts.headers, status);
         }
     }
@@ -3277,8 +3517,29 @@ fn parse_origin(url: &str) -> String {
     }
 }
 
-/// `replaceStatus://401`/`407` also advertise the authentication whistle's own
-/// login flow expects (`handleStatusCode`, `_original/lib/util/index.js:398-405`).
+/// Does the rule that produced a `401`/`407` want the authentication challenge
+/// that goes with it?
+///
+/// `isDisableUserLogin` (`_original/lib/util/index.js:3557-3562`): the line's own
+/// `enableUserLogin` or a request-wide `enable://userLogin` forces it on and wins
+/// outright; `disableUserLogin` on the line or `disable://userLogin` turns it off.
+///
+/// `docs/LINE_PROPS.md` had the two properties as "not applicable, this port has
+/// no login box". They are not about whistle's own login box at all — they are
+/// about the `WWW-Authenticate: Basic realm=User Login` header a mocked `401`
+/// carries, which is the thing that *makes* a browser show one. This port writes
+/// that header, so there was always something here to turn off.
+fn user_login_allowed(resolved: &Resolved, proto: &str) -> bool {
+    let props = resolved.props(proto);
+    if props.has("enableUserLogin") || enabled_flags(resolved).contains("userLogin") {
+        return true;
+    }
+    !props.has("disableUserLogin") && !disabled_flags(resolved).contains("userLogin")
+}
+
+/// `statusCode://401`/`407` and `replaceStatus://401`/`407` also advertise the
+/// authentication a browser needs in order to ask for credentials
+/// (`handleStatusCode`, `_original/lib/util/index.js:401-408`).
 fn handle_status_code(headers: &mut HeaderMap, status: StatusCode) {
     match status.as_u16() {
         401 => set_header(headers, "www-authenticate", "Basic realm=User Login"),
@@ -3572,16 +3833,23 @@ pub fn forces_write(resolved: &Resolved) -> bool {
 /// This port has no `config.strict`, so the 1MB strict variant has no spelling
 /// here and the plain 2MB is the floor.
 ///
-/// Upstream also raises it from its own settings (the `enableBigData` argument);
-/// there is no such setting here, so the rule flag is the only way up — which is
-/// the way a user would reach for anyway, since it is per-request.
+/// `lineProps://enableBigData` on the `reqMerge://` line raises it too, and this
+/// read it as one of whistle's own settings rather than a line property — the
+/// `enableBigData` argument of `handleParams` is `reqMerge.lineProps.enableBigData`
+/// and nothing else (`req.js:564`). Measured against the differential bench, a
+/// 3 MB JSON body with `reqMerge://{"added":1} lineProps://enableBigData` was
+/// merged by whistle and forwarded unchanged here.
 pub fn req_body_limit(resolved: &Resolved) -> usize {
     /// `BIG_MAX_REQ_SIZE` (`req.js:20`).
     const BIG: usize = 16 * 1024 * 1024;
     // `isEnable` is the flag minus its cancellation, the same shape
-    // [`forces_write`] uses (`_original/lib/util/index.js:676-679`).
-    let on = enabled_flags(resolved).contains("reqMergeBigData")
-        && !disabled_flags(resolved).contains("reqMergeBigData");
+    // [`forces_write`] uses (`_original/lib/util/index.js:676-679`). The line
+    // property has no cancellation: upstream reads it straight off the rule.
+    // `params` is where `reqMerge://` lands here, as `reqRules.params` is where
+    // it lands upstream (`req.js:461`).
+    let on = resolved.props("params").has("enableBigData")
+        || (enabled_flags(resolved).contains("reqMergeBigData")
+            && !disabled_flags(resolved).contains("reqMergeBigData"));
     match on {
         true => BIG,
         false => REQ_BODY_LIMIT,
@@ -4542,7 +4810,7 @@ fn collect_res_injection(gate: &InjectionGate<'_>, families: BodyFamilies) -> In
 /// body — the `safeHtml` / `strictHtml` line properties.
 ///
 /// Ported from `WhistleTransform#allowInject` + `filterHtml`
-/// (`_original/lib/util/whistle-transform.js:66-89`). Three things matter:
+/// (`_original/lib/util/whistle-transform.js:78-100`). Three things matter:
 ///
 /// * the decision looks at the **original** upstream body, before any operator
 ///   has rewritten it, and at its first non-whitespace byte only;
@@ -4560,7 +4828,7 @@ struct InjectionGate<'a> {
     /// False when nothing is gated (non-HTML response, or the request side).
     html: bool,
     /// `enable://safeHtml` / `enable://strictHtml`, which upstream stamps onto
-    /// every injecting rule of the request (`_original/lib/inspectors/res.js:970-987`).
+    /// every injecting rule of the request (`_original/lib/inspectors/res.js:966-982`).
     global: LineProps,
 }
 
@@ -4717,13 +4985,13 @@ fn apply_res_merge(
     format!("{}{merged}{}", &text[..start], &text[end..]).into_bytes()
 }
 
-/// Remove dotted paths from a JSON value (`deleteProps` →
-/// `_original/lib/util/common.js:989-1084`). A numeric segment addressing an
-/// array element splices it out. The `\.`-escaped and `a[0]` spellings upstream
-/// also accepts are not ported.
+/// Remove dotted paths from a JSON value (`deleteProps`,
+/// `_original/lib/util/common.js:1105-1128`). A numeric segment addressing an
+/// array element splices it out.
 fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
     for path in paths {
-        let mut keys = path.split('.').map(str::trim).peekable();
+        let keys = parse_json_path(path);
+        let mut keys = keys.iter().peekable();
         let mut node = &mut *value;
         while let Some(key) = keys.next() {
             if keys.peek().is_none() {
@@ -4732,9 +5000,7 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
                         map.remove(key);
                     }
                     serde_json::Value::Array(list) => {
-                        if let Ok(i) = key.parse::<usize>()
-                            && i < list.len()
-                        {
+                        if let Some(i) = array_index(key).filter(|i| *i < list.len()) {
                             list.remove(i);
                         }
                     }
@@ -4745,7 +5011,7 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
             let next = match node {
                 serde_json::Value::Object(map) => map.get_mut(key),
                 serde_json::Value::Array(list) => {
-                    key.parse::<usize>().ok().and_then(|i| list.get_mut(i))
+                    array_index(key).and_then(|i| list.get_mut(i))
                 }
                 _ => None,
             };
@@ -4754,6 +5020,102 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
                 None => break,
             }
         }
+    }
+}
+
+/// Split a `delete://…Body.<path>` key into the segments the walk above follows
+/// (`parseKeys`, `_original/lib/util/common.js:1077-1103`).
+///
+/// Three spellings beyond the plain dot, all of them upstream's:
+///
+/// * `a\.b` names **one** key containing a dot. Backslashes are halved before
+///   the dot is read, so `a\\.b` is two segments whose first is `a\`, and
+///   `a\\\.b` is one segment `a\.b`;
+/// * `"k[0]"` — a quoted segment is taken literally, which is how a key that
+///   itself ends in brackets is named;
+/// * `a[0][1]` — trailing bracket indices become segments of their own, so the
+///   bracket form and `a.0.1` address the same element.
+fn parse_json_path(path: &str) -> Vec<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = path.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            match c {
+                '.' => segments.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+            continue;
+        }
+        // `DOT_RE` is `/(\\+)\./g`, so the run of backslashes is maximal and
+        // only one that ends at a dot is halved at all.
+        let mut run = 1;
+        while chars.next_if_eq(&'\\').is_some() {
+            run += 1;
+        }
+        if chars.next_if_eq(&'.').is_none() {
+            cur.extend(std::iter::repeat_n('\\', run));
+            continue;
+        }
+        cur.extend(std::iter::repeat_n('\\', run / 2));
+        match run % 2 {
+            1 => cur.push('.'),
+            _ => segments.push(std::mem::take(&mut cur)),
+        }
+    }
+    segments.push(cur);
+    segments.iter().flat_map(|s| parse_json_key(s.trim())).collect()
+}
+
+/// One segment of a path, with its quotes stripped and its trailing `[n]`
+/// indices split off (`parseKey`, `_original/lib/util/common.js:1051-1075`).
+fn parse_json_key(key: &str) -> Vec<String> {
+    if key.len() >= 2 && key.starts_with('"') && key.ends_with('"') {
+        return vec![key[1..key.len() - 1].to_string()];
+    }
+    let mut head = key;
+    let mut indices: Vec<String> = Vec::new();
+    while let Some((rest, index)) = strip_trailing_index(head) {
+        indices.insert(0, index.to_string());
+        head = rest;
+    }
+    if indices.is_empty() {
+        return vec![key.to_string()];
+    }
+    // `if (key)` — a bare `[0]` has no name in front of it and contributes none.
+    if !head.is_empty() {
+        indices.insert(0, head.to_string());
+    }
+    indices
+}
+
+/// Split a trailing `[n]` off a path segment, matching `ARR_RE`
+/// (`_original/lib/util/common.js:1003`): decimal, no leading zero beyond `0`
+/// itself, and bounded so the index stays a safe integer.
+fn strip_trailing_index(key: &str) -> Option<(&str, &str)> {
+    let inner = key.strip_suffix(']')?;
+    let open = inner.rfind('[')?;
+    let index = &inner[open + 1..];
+    let ok = match index.as_bytes() {
+        b"0" => true,
+        [first @ b'1'..=b'8', rest @ ..] | [first @ b'9', rest @ ..] => {
+            let bound = if *first == b'9' { 14 } else { 15 };
+            rest.len() <= bound && rest.iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    };
+    ok.then(|| (&inner[..open], index))
+}
+
+/// A path segment as an array index (`NUM_RE`,
+/// `_original/lib/util/common.js:1002`): decimal with no leading zero, which is
+/// what `deleteProp` requires before it splices rather than deletes
+/// (`common.js:1033-1043`).
+fn array_index(key: &str) -> Option<usize> {
+    match key.as_bytes() {
+        b"0" => Some(0),
+        [b'1'..=b'9', rest @ ..] if rest.iter().all(u8::is_ascii_digit) => key.parse().ok(),
+        _ => None,
     }
 }
 
@@ -5435,9 +5797,15 @@ impl CookieValue {
 /// Parse a `reqCookies`/`resCookies` value into `name` → value entries.
 ///
 /// Like the other JSON-shaped operators, the value is either `{json}` or a
-/// query string, so `reqCookies://a=1&b=2` is two cookies. A name with no `=`
-/// gets an **empty value** — it does not delete the cookie; that is
-/// `delete://reqCookies.<name>`.
+/// query string, so `reqCookies://a=1&b=2` is two cookies. Within that query a
+/// name with no `=` gets an **empty value** — it does not delete the cookie;
+/// that is `delete://reqCookies.<name>`.
+///
+/// A value with no `=` *anywhere* is not a query string at all: upstream reads
+/// it as a location and tries to load it, so `reqCookies://sid` names a file
+/// and sets no cookie (`tryParseMatcher` bails on `indexOf('=') === -1`,
+/// `_original/lib/util/index.js:1165-1171`). Same gate as
+/// [`parse_header_pairs`].
 fn parse_cookie_ops(value: &str) -> Vec<(String, CookieValue)> {
     let value = value.trim();
     if value.starts_with('{')
@@ -5447,6 +5815,9 @@ fn parse_cookie_ops(value: &str) -> Vec<(String, CookieValue)> {
             .into_iter()
             .map(|(k, v)| (k, CookieValue::of_json(v)))
             .collect();
+    }
+    if !value.contains('=') {
+        return Vec::new();
     }
     value
         .split('&')
@@ -5639,11 +6010,9 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
 /// of the same name, and it cannot tell which kind is out there.
 ///
 /// `host` adds two more, scoped to the parent domain, for a cookie that was set
-/// on `.example.com` rather than on the host itself. It is `Some` only for a
-/// request that arrived through an intercepted tunnel: upstream reads
-/// `req._w2hostname`, which is set on the tunnel path alone
-/// (`_original/lib/https/index.js:707`), so a plain forward-proxy request gets
-/// the two host-scoped entries and no more.
+/// on `.example.com` rather than on the host itself. Upstream reads
+/// `req._w2hostname`, which every request carries: it is the `Host` header's
+/// hostname, stamped before any rule runs (`_original/biz/index.js:40`).
 fn expiring_cookies(names: &[String], host: Option<&str>) -> Vec<(String, CookieValue)> {
     let expired = |secure: bool, domain: Option<&str>| {
         let mut map = serde_json::Map::new();
@@ -5700,9 +6069,7 @@ fn apply_res_cookies(
     // a `resCookies://x=…` on the same request: upstream folds the deletions in
     // with `extend(cookies, delKeys)`, so they overwrite (`index.js:3127-3129`).
     if !del.cookies.is_empty() {
-        // Only a tunnelled request has a hostname here; see `expiring_cookies`.
-        let host = info.filter(|i| i.from.tunnel).map(|i| i.host.as_str());
-        for (name, value) in expiring_cookies(&del.cookies, host) {
+        for (name, value) in expiring_cookies(&del.cookies, info.map(|i| i.host.as_str())) {
             match ops.iter_mut().find(|(k, _)| *k == name) {
                 Some(slot) => slot.1 = value,
                 None => ops.push((name, value)),
@@ -6141,20 +6508,45 @@ mod tests {
     }
 
     /// `reqCookies` merges into the existing header: a name already present
-    /// keeps its position, a new one is appended, and a bare name sets an
-    /// **empty** value rather than deleting the cookie (that is
-    /// `delete://reqCookies.<name>`).
+    /// keeps its position and a new one is appended. Within the query a name
+    /// with no `=` sets an **empty** value rather than deleting the cookie
+    /// (that is `delete://reqCookies.<name>`).
     #[test]
     fn req_cookies_merge_in_place() {
         let resolved = resolve(
-            "example.com reqCookies://a=1&b=2\nexample.com reqCookies://old\n",
+            "example.com reqCookies://a=1&b=2\nexample.com reqCookies://old=&c\n",
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
         headers.insert(hyper::header::COOKIE, "old=x; keep=y".parse().unwrap());
         apply_req_cookies(&mut headers, &resolved);
         let cookie = headers.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
-        assert_eq!(cookie, "old=; keep=y; a=1; b=2");
+        // The merge is `extend` over the *reversed* line list, so the later
+        // line's names are laid down first (`readRuleList`,
+        // `_original/lib/util/index.js:1325-1331`).
+        assert_eq!(cookie, "old=; keep=y; c=; a=1; b=2");
+    }
+
+    /// A whole value with no `=` is a *location*, not a query string: upstream
+    /// tries to load it as a file and sets no cookie at all
+    /// (`tryParseMatcher`, `_original/lib/util/index.js:1165-1171`). This port
+    /// read it as a name with an empty value, so `resCookies://sid` sent a
+    /// `Set-Cookie: sid=` real whistle never sends.
+    ///
+    /// Found by putting the same rule through real whistle and through this
+    /// port — `tests/differential/cases-delete.js`.
+    #[test]
+    fn a_cookie_value_with_no_equals_names_a_file_and_sets_nothing() {
+        let resolved = resolve("example.com reqCookies://sid\n", "http://example.com/");
+        let mut headers = HeaderMap::new();
+        headers.insert(hyper::header::COOKIE, "keep=y".parse().unwrap());
+        apply_req_cookies(&mut headers, &resolved);
+        assert_eq!(headers.get(hyper::header::COOKIE).unwrap(), "keep=y");
+
+        let resolved = resolve("example.com resCookies://sid\n", "http://example.com/");
+        let mut headers = HeaderMap::new();
+        apply_res_cookies(&mut headers, &resolved, &Deletions::default(), None);
+        assert!(headers.get(hyper::header::SET_COOKIE).is_none());
     }
 
     #[test]
@@ -6621,6 +7013,52 @@ mod tests {
 
     // ── `params://` merged into the request body ──
 
+    /// How much of a request body the merging operators are allowed to hold.
+    ///
+    /// `lineProps://enableBigData` on the `reqMerge://` line raises it, exactly
+    /// as `enable://reqMergeBigData` does — upstream passes the one straight
+    /// into the place it reads the other (`handleParams`,
+    /// `_original/lib/inspectors/req.js:163,:564`).
+    ///
+    /// This port read `enableBigData` as a setting of whistle's own rather than
+    /// a line property, so `docs/LINE_PROPS.md` called it exposed-only. The
+    /// differential bench disagreed: a 3 MB JSON body with the property written
+    /// was merged by whistle and forwarded unchanged here.
+    #[test]
+    fn enable_big_data_raises_the_request_body_ceiling() {
+        const BIG: usize = 16 * 1024 * 1024;
+        let limit = |rules: &str| req_body_limit(&resolve(rules, "http://example.com/p"));
+
+        assert_eq!(limit("example.com reqMerge://{\"a\":1}\n"), REQ_BODY_LIMIT);
+        assert_eq!(
+            limit("example.com reqMerge://{\"a\":1} lineProps://enableBigData\n"),
+            BIG
+        );
+        // `reqMerge` and `params` are one operator here as they are upstream.
+        assert_eq!(
+            limit("example.com params://a=1 lineProps://enableBigData\n"),
+            BIG
+        );
+        // The request-wide flag still says the same, and still answers to its
+        // cancellation — the line property has none to answer to.
+        assert_eq!(limit("example.com enable://reqMergeBigData\n"), BIG);
+        assert_eq!(
+            limit("example.com enable://reqMergeBigData disable://reqMergeBigData\n"),
+            REQ_BODY_LIMIT
+        );
+        assert_eq!(
+            limit(
+                "example.com params://a=1 lineProps://enableBigData disable://reqMergeBigData\n"
+            ),
+            BIG
+        );
+        // Line-scoped: on some other line it raises nothing.
+        assert_eq!(
+            limit("example.com params://a=1\nexample.com resHeaders://x=1 lineProps://enableBigData\n"),
+            REQ_BODY_LIMIT
+        );
+    }
+
     /// `transform_req_body` for a POST carrying `ct`.
     fn merged_body(rules: &str, ct: Option<&str>, body: &str) -> String {
         let resolved = resolve(rules, "http://example.com/p");
@@ -6733,6 +7171,59 @@ mod tests {
         );
     }
 
+    /// The path is `parseKeys`', not a plain split on dots: a backslash escapes
+    /// a dot into the key, quotes take a segment literally, and a trailing
+    /// `[n]` is an index of its own. This port split on dots alone, so
+    /// `delete://reqBody.a[0]` named a key no JSON body has and deleted
+    /// nothing.
+    ///
+    /// Found by putting the same rule through real whistle and through this
+    /// port — `tests/differential/cases-delete.js`.
+    #[test]
+    fn a_json_delete_path_reads_upstreams_escapes_and_indices() {
+        let json = |rule: &str, body: &str| {
+            merged_body(&format!("example.com delete://{rule}\n"), Some("application/json"), body)
+        };
+        // A backslash escapes the dot, naming one key that contains it.
+        assert_eq!(json(r"reqBody.a\.b", r#"{"a.b":1,"c":2}"#), r#"{"c":2}"#);
+        // Two backslashes are one backslash and a real separator, so this
+        // names the key `b` inside the key `a\`.
+        assert_eq!(json(r"reqBody.a\\.b", r#"{"a\\":{"b":1,"c":2}}"#), r#"{"a\\":{"c":2}}"#);
+        // Brackets index an array, at the top level and nested.
+        assert_eq!(json("reqBody.a[0]", r#"{"a":[1,2,3]}"#), r#"{"a":[2,3]}"#);
+        assert_eq!(json("reqBody.a.b[1]", r#"{"a":{"b":[1,2,3]}}"#), r#"{"a":{"b":[1,3]}}"#);
+        // …and the dotted spelling names the same element.
+        assert_eq!(json("reqBody.a.0", r#"{"a":[1,2,3]}"#), r#"{"a":[2,3]}"#);
+        // Quotes take a segment literally, which is how a key ending in
+        // brackets is named at all.
+        assert_eq!(json(r#"reqBody."a[0]""#, r#"{"a[0]":1,"b":2}"#), r#"{"b":2}"#);
+        // An index with a leading zero is not one (`NUM_RE`), so it deletes
+        // nothing rather than the wrong element.
+        assert_eq!(json("reqBody.a.01", r#"{"a":[1,2,3]}"#), r#"{"a":[1,2,3]}"#);
+    }
+
+    /// The pieces of `parseKeys` on their own, including the shapes a rule can
+    /// write but a body rarely carries.
+    #[test]
+    fn a_json_delete_path_splits_the_way_parse_keys_does() {
+        let path = |s: &str| parse_json_path(s);
+        assert_eq!(path("a.b.c"), ["a", "b", "c"]);
+        assert_eq!(path(" a . b "), ["a", "b"]);
+        assert_eq!(path(r"a\.b"), ["a.b"]);
+        // Backslashes are halved: two make one, and the dot separates again.
+        assert_eq!(path(r"a\\.b"), [r"a\", "b"]);
+        assert_eq!(path(r"a\\\.b"), [r"a\.b"]);
+        // A run not ending at a dot is left alone.
+        assert_eq!(path(r"a\\b"), [r"a\\b"]);
+        assert_eq!(path("a[0][12]"), ["a", "0", "12"]);
+        // A bare index has no name in front of it.
+        assert_eq!(path("[3]"), ["3"]);
+        // Not an index: a leading zero, and anything that is not decimal.
+        assert_eq!(path("a[01]"), ["a[01]"]);
+        assert_eq!(path("a[x]"), ["a[x]"]);
+        assert_eq!(path(r#""k[0]""#), ["k[0]"]);
+    }
+
     /// A multipart body: a part named by a param is replaced whole, one named
     /// by `delete://reqBody.` is dropped, and an unmatched param is appended.
     #[test]
@@ -6809,6 +7300,40 @@ mod tests {
         let c = h.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
         assert!(!c.contains("sid="));
         assert!(c.contains("keep=1"));
+    }
+
+    /// Deleting a request cookie **rebuilds** the header rather than editing it,
+    /// which is what `setReqCookies` does: a pair that arrived without a `=`
+    /// leaves with one, and when nothing survives the header is set empty
+    /// rather than removed. This port removed it, so a server that branches on
+    /// `Cookie` being present saw the opposite of what whistle sends.
+    ///
+    /// Found by putting the same rule through real whistle and through this
+    /// port — `tests/differential/cases-delete.js`.
+    #[test]
+    fn deleting_every_request_cookie_leaves_an_empty_header() {
+        let cookie_after = |rule: &str, sent: &str| {
+            let resolved = resolve(
+                &format!("example.com delete://{rule}\n"),
+                "http://example.com/",
+            );
+            let mut h = HeaderMap::new();
+            h.insert(hyper::header::COOKIE, sent.parse().unwrap());
+            apply_deletes(&mut h, &Deletions::of(&resolved, true), true);
+            h.get(hyper::header::COOKIE)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(cookie_after("reqCookies.sid", "sid=abc"), Some(String::new()));
+        // A valueless pair gains its `=`, and a trailing `;` becomes one.
+        assert_eq!(
+            cookie_after("reqCookies.sid", "sid=abc; flag; other=1;"),
+            Some("flag=; other=1; =".to_string())
+        );
+        // With no `Cookie` at all there is nothing to rebuild, and none is made.
+        let resolved = resolve("example.com delete://reqCookies.sid\n", "http://example.com/");
+        let mut h = HeaderMap::new();
+        apply_deletes(&mut h, &Deletions::of(&resolved, true), true);
+        assert!(h.get(hyper::header::COOKIE).is_none());
     }
 
     /// whistle matches `delete://` keys against a fixed set of anchored
@@ -8430,6 +8955,268 @@ mod tests {
         assert!(find_headers_sep(&data[..data.len().min(MAX_RAW_HEADERS)]).is_none());
     }
 
+    /// A raw response's header lines end at any of `\r\n`, `\r` or `\n`
+    /// (`CRLF_RE`, `file-proxy.js:10`). Splitting on `\n` alone read a
+    /// CR-terminated fixture as one long status line, so every header in it was
+    /// dropped — the body and the status arrived, the headers silently did not.
+    #[test]
+    fn raw_file_header_lines_end_at_a_bare_cr() {
+        let fx = Fixtures::new("rawcr");
+        let path = fx.write("cr.http", b"HTTP/1.1 202 Accepted\rX-Sep: cr\r\rcr body");
+        let info = build_req_info("GET", "http", "x.com", 80, "/", &HeaderMap::new(), None);
+        let op = RuleOp {
+            protocol: "rawfile".into(),
+            value: path,
+            ..Default::default()
+        };
+        let resp = serve_file_family("rawfile", &op, &info, test_env()).expect("served");
+        assert_eq!(resp.status().as_u16(), 202);
+        assert_eq!(
+            resp.headers().get("x-sep").and_then(|v| v.to_str().ok()),
+            Some("cr")
+        );
+    }
+
+    /// A `rawfile://` head with no status line: upstream takes the first line's
+    /// second word as the status code and throws while writing the response,
+    /// which the client sees as a reset connection. Serving it as 200 is a
+    /// deliberate deviation — there is no behaviour there to be faithful to.
+    #[test]
+    fn a_raw_response_with_no_status_line_falls_back_to_200() {
+        let fx = Fixtures::new("rawnostatus");
+        let path = fx.write("h.http", b"X-Only: header\r\n\r\nbody");
+        let (status, _, body) = serve("rawfile", &path).expect("served");
+        assert_eq!((status, body.as_slice()), (200, b"body".as_slice()));
+    }
+
+    /// Only a file read off disk carries `Server` (`file-proxy.js:315-318`);
+    /// an inline value, a values-store body and the 404 are all built elsewhere
+    /// and carry none. The asymmetry is upstream's and is worth keeping: the
+    /// header says the bytes came from the filesystem.
+    #[test]
+    fn only_a_file_read_from_disk_names_the_proxy_in_server() {
+        let fx = Fixtures::new("srvhdr");
+        let path = fx.write("a.txt", b"body");
+        let served = |proto: &str, value: &str| {
+            let info = build_req_info("GET", "http", "x.com", 80, "/", &HeaderMap::new(), None);
+            let op = RuleOp {
+                protocol: proto.into(),
+                value: value.into(),
+                ..Default::default()
+            };
+            let resp = serve_file_family(proto, &op, &info, test_env()).expect("served");
+            resp.headers()
+                .get("server")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(served("file", &path).as_deref(), Some("whistle-rs"));
+        assert_eq!(served("tpl", &path).as_deref(), Some("whistle-rs"));
+        assert_eq!(served("file", "(inline)"), None);
+        assert_eq!(served("file", &fx.path("nope.txt")), None);
+        // A parsed raw response brings its own headers and replaces the block
+        // `Server` lives in; one with no blank line falls back to it.
+        let raw = fx.write("r.http", b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nb");
+        assert_eq!(served("rawfile", &raw), None);
+        assert_eq!(served("rawfile", &path).as_deref(), Some("whistle-rs"));
+    }
+
+    /// The name a body was stored under is the only place its extension is
+    /// written, so it is what the content type is guessed from
+    /// (`rule.key`, `file-proxy.js:270-272`). Without this, `file://{mock.json}`
+    /// served JSON as `text/html` and a browser rendered it as a page.
+    #[test]
+    fn a_values_key_names_the_file_its_type_is_guessed_from() {
+        let typed = |key: Option<&str>, url: &str| {
+            let (host, path) = url.split_once('/').expect("host and path");
+            let info = build_req_info("GET", "http", host, 80, path, &HeaderMap::new(), None);
+            let op = RuleOp {
+                protocol: "file".into(),
+                value: "{\"a\":1}".into(),
+                value_is_content: true,
+                value_key: key.map(str::to_string),
+                ..Default::default()
+            };
+            let resp = serve_file_family("file", &op, &info, test_env()).expect("served");
+            resp.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(typed(Some("mock.json"), "x.com/echo"), "application/json; charset=utf-8");
+        // A key with no extension of its own falls back to the request URL's,
+        // and then to `text/html` — the same chain a nameless inline value takes.
+        assert_eq!(typed(Some("mockbody"), "x.com/thing.css"), "text/css; charset=utf-8");
+        assert_eq!(typed(None, "x.com/thing.css"), "text/css; charset=utf-8");
+        assert_eq!(typed(Some("mockbody"), "x.com/echo"), "text/html; charset=utf-8");
+    }
+
+    /// `util.isText` is a substring test, so a type merely *naming* xml or html
+    /// is text — which is why an SVG carries a charset and a PNG does not
+    /// (`_original/lib/util/index.js:1494-1531`).
+    #[test]
+    fn a_content_type_carries_a_charset_only_when_it_is_text() {
+        for (ext, want) in [
+            ("svg", "image/svg+xml; charset=utf-8"),
+            ("xhtml", "application/xhtml+xml; charset=utf-8"),
+            ("map", "application/json; charset=utf-8"),
+            ("md", "text/markdown; charset=utf-8"),
+            ("csv", "text/csv; charset=utf-8"),
+            ("yml", "text/yaml; charset=utf-8"),
+            ("png", "image/png"),
+            ("woff2", "font/woff2"),
+            ("mp4", "video/mp4"),
+            ("zip", "application/zip"),
+        ] {
+            assert_eq!(content_type_of_ext(&format!("a.{ext}")), Some(want), "{ext}");
+        }
+    }
+
+    /// Serve a file rule for a `GET` carrying one request header.
+    fn serve_with_header(
+        proto: &str,
+        value: &str,
+        name: &str,
+        header: &str,
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+            header.parse().expect("header value"),
+        );
+        let info = build_req_info("GET", "http", "x.com", 80, "/", &headers, None);
+        let op = RuleOp {
+            protocol: proto.into(),
+            value: value.into(),
+            ..Default::default()
+        };
+        let resp = serve_file_family(proto, &op, &info, test_env()).expect("served");
+        let status = resp.status().as_u16();
+        let heads = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let body = rt()
+            .block_on(async { http_body_util::BodyExt::collect(resp.into_body()).await })
+            .expect("collect body")
+            .to_bytes()
+            .to_vec();
+        (status, heads, body)
+    }
+
+    #[test]
+    fn a_range_request_serves_part_of_a_file() {
+        let fx = Fixtures::new("range");
+        let path = fx.write("r.txt", b"ranged-0123456789-end");
+        let (status, heads, body) = serve_with_header("file", &path, "range", "bytes=0-5");
+        assert_eq!((status, body.as_slice()), (206, b"ranged".as_slice()));
+        assert!(heads.contains(&("content-range".into(), "bytes 0-5/21".into())), "{heads:?}");
+        assert!(heads.contains(&("accept-ranges".into(), "bytes".into())), "{heads:?}");
+        // An inline value is rangeable too — it is the same `if (!isRawFile)`
+        // arm upstream (`file-proxy.js:280-289`).
+        let (status, _, body) = serve_with_header("file", "(0123456789)", "range", "bytes=2-4");
+        assert_eq!((status, body.as_slice()), (206, b"234".as_slice()));
+    }
+
+    /// `rawfile://` asks for no range at all (`file-proxy.js:100-102`) and
+    /// `tpl://` never reaches the code that would; both answer whole.
+    #[test]
+    fn raw_and_template_responses_ignore_a_range_request() {
+        let fx = Fixtures::new("rangeskip");
+        let raw = fx.write("r.http", b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nabcdefgh");
+        let (status, _, body) = serve_with_header("rawfile", &raw, "range", "bytes=0-3");
+        assert_eq!((status, body.as_slice()), (200, b"abcdefgh".as_slice()));
+
+        let tpl = fx.write("t.txt", b"abcdefgh${nothing}");
+        let (status, _, body) = serve_with_header("tpl", &tpl, "range", "bytes=0-3");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 18);
+    }
+
+    /// whistle's range arithmetic, quirks included: a suffix range compares its
+    /// computed start against the *suffix length* and loses, and several ranges
+    /// collapse into the one span that covers them all.
+    #[test]
+    fn range_parsing_reproduces_upstreams_arithmetic() {
+        let parsed = |spec: &str, size: usize| {
+            let mut headers = HeaderMap::new();
+            headers.insert(hyper::header::RANGE, spec.parse().expect("range value"));
+            let info = build_req_info("GET", "http", "x.com", 80, "/", &headers, None);
+            parse_range(&info, size)
+        };
+        assert_eq!(parsed("bytes=0-5", 21), Some((0, 5)));
+        assert_eq!(parsed("bytes=7-", 21), Some((7, 20)));
+        assert_eq!(parsed("bytes=0-20", 21), Some((20 - 20, 20)));
+        assert_eq!(parsed("BYTES=0-5", 21), Some((0, 5)));
+        assert_eq!(parsed("  bytes=0-5", 21), Some((0, 5)));
+        // `bytes=0-1,5-6` is one span, not two parts.
+        assert_eq!(parsed("bytes=0-1,5-6", 21), Some((0, 6)));
+        // A suffix range: start becomes `21 - 5 = 16`, which is compared against
+        // the end `5` and rejected. Upstream sends the whole body.
+        assert_eq!(parsed("bytes=-5", 21), None);
+        assert_eq!(parsed("bytes=10-99", 21), None);
+        assert_eq!(parsed("bytes=9-2", 21), None);
+        assert_eq!(parsed("bytes=abc", 21), None);
+        assert_eq!(parsed("bytes=", 21), None);
+        assert_eq!(parsed("items=0-5", 21), None);
+        // `bytes =0-5` — the `=` has to follow the unit immediately.
+        assert_eq!(parsed("bytes =0-5", 21), None);
+        // Nothing is ranged out of an empty body.
+        assert_eq!(parsed("bytes=0-1", 0), None);
+    }
+
+    /// The inline form of `rawfile://` parses what it is given and no more: with
+    /// no blank line, `parseRes` receives nothing and answers a bare `{200, {}}`,
+    /// so the body goes out untyped (`getRawResByValue`, `file-proxy.js:84-98`).
+    /// The path form falls back to the file handler's header block instead.
+    #[test]
+    fn an_inline_raw_response_without_a_blank_line_is_untyped() {
+        let info = build_req_info("GET", "http", "x.com", 80, "/a.json", &HeaderMap::new(), None);
+        let op = RuleOp {
+            protocol: "rawfile".into(),
+            value: "(no-blank-line)".into(),
+            ..Default::default()
+        };
+        let resp = serve_file_family("rawfile", &op, &info, test_env()).expect("served");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(resp.headers().get(hyper::header::CONTENT_TYPE).is_none());
+    }
+
+    /// A raw response written as a *value* cannot be the compressed bytes a
+    /// `content-encoding` claims — it was typed into a rules file — so upstream
+    /// drops the header (`fromValue`, `file-proxy.js:71-73`). Keeping it made
+    /// the client try to gunzip plain text and fail on a body it could read.
+    /// A raw response read from a *file* keeps it: that one can really be gzip.
+    #[test]
+    fn a_raw_response_from_a_value_loses_its_content_encoding() {
+        let info = build_req_info("GET", "http", "x.com", 80, "/", &HeaderMap::new(), None);
+        let head = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\nplain";
+        let encoding_of = |op: &RuleOp| {
+            serve_file_family("rawfile", op, &info, test_env())
+                .expect("served")
+                .headers()
+                .get(hyper::header::CONTENT_ENCODING)
+                .map(|v| v.to_str().unwrap_or_default().to_string())
+        };
+        let from_value = RuleOp {
+            protocol: "rawfile".into(),
+            value: String::from_utf8_lossy(head).into_owned(),
+            value_is_content: true,
+            ..Default::default()
+        };
+        assert_eq!(encoding_of(&from_value), None);
+
+        let fx = Fixtures::new("rawenc");
+        let from_file = RuleOp {
+            protocol: "rawfile".into(),
+            value: fx.write("r.http", head),
+            ..Default::default()
+        };
+        assert_eq!(encoding_of(&from_file).as_deref(), Some("gzip"));
+    }
+
     #[test]
     fn missing_file_404s_with_an_escaped_path() {
         let (status, ctype, body) = serve("file", "/nonexistent/<script>").expect("served");
@@ -8749,6 +9536,47 @@ mod tests {
         assert!(!t.origin_tls_stripped);
     }
 
+    /// `lineProps://internalProxy` says of a plain `proxy://` hop what the
+    /// `internal-*` spellings say of themselves: it is another whistle, so hand
+    /// it the request in the clear (`isInternalProxy`,
+    /// `_original/lib/util/index.js:3801-3807`).
+    ///
+    /// `docs/LINE_PROPS.md` called this exposed-only because the port had no
+    /// cleartext-through-a-proxy mode. It has had one since the `internal-*`
+    /// protocols landed; only this way of asking for it was missing.
+    #[test]
+    fn internal_proxy_hands_an_https_origin_over_in_the_clear() {
+        // On the proxy line, on the `host://` line, and request-wide — the three
+        // places upstream reads it from.
+        for rules in [
+            "example.com proxy://127.0.0.1:8888 lineProps://internalProxy\n",
+            "example.com proxy://127.0.0.1:8888 lineProps://proxyHost\n\
+             example.com host://10.0.0.9 lineProps://internalProxy\n",
+            "example.com proxy://127.0.0.1:8888\nexample.com enable://internalProxy\n",
+        ] {
+            let t = target(rules, "https://example.com/");
+            assert!(!t.tls, "the hop should carry plaintext: {rules}");
+            assert!(t.origin_tls_stripped, "…and say so with the marker: {rules}");
+        }
+
+        // An http origin has no TLS to strip, so the property changes nothing.
+        let t = target(
+            "example.com proxy://127.0.0.1:8888 lineProps://internalProxy\n",
+            "http://example.com/",
+        );
+        assert!(!t.tls);
+        assert!(!t.origin_tls_stripped);
+
+        // The property belongs to the hop: with no proxy there is nothing to
+        // hand the request to, and an https origin stays https.
+        let t = target(
+            "example.com host://10.0.0.9 lineProps://internalProxy\n",
+            "https://example.com/",
+        );
+        assert!(t.tls, "no hop, no conversion");
+        assert!(!t.origin_tls_stripped);
+    }
+
     /// Every protocol in the family list is one `find_proxy` actually reads,
     /// with the transport its name implies. The list lives in the rules layer
     /// (it is what `ignore://proxy` means); this is the check that the two
@@ -8769,7 +9597,7 @@ mod tests {
     // ── weakRule ──
 
     /// `weakRule` on a local-file line makes it yield to a matching proxy or
-    /// host rule (`filterWeakRule`, `_original/lib/util/index.js:3733`).
+    /// host rule (`filterWeakRule`, `_original/lib/util/index.js:3731`).
     #[test]
     fn weak_rule_yields_to_proxy_or_host() {
         let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
@@ -8836,7 +9664,7 @@ mod tests {
     }
 
     /// `safeHtml` refuses a JSON-looking body; `strictHtml` refuses anything
-    /// that is not markup (`_original/lib/util/whistle-transform.js:66-89`).
+    /// that is not markup (`_original/lib/util/whistle-transform.js:78-100`).
     #[test]
     fn safe_and_strict_html_refuse_non_markup() {
         let json = "{\"a\":1}";
@@ -8913,7 +9741,7 @@ mod tests {
     }
 
     /// `enable://strictHtml` applies the strict gate to every line of the
-    /// request (`_original/lib/inspectors/res.js:970-987`).
+    /// request (`_original/lib/inspectors/res.js:966-982`).
     #[test]
     fn enable_strict_html_gates_every_line() {
         let out = inject(
@@ -10383,8 +11211,13 @@ mod tests {
         // …and the request-side spelling is not.
         assert!(lines("reqCookies.sid", None).is_empty());
 
-        // A tunnelled request adds two domain-scoped entries, because the
-        // cookie may have been set on the parent domain.
+        // A host with a parent domain adds two more entries scoped to it,
+        // because the cookie may have been set there rather than on the host.
+        // Every request has the hostname — `req._w2hostname` is the `Host`
+        // header's, stamped before any rule runs (`_original/biz/index.js:40`)
+        // — so a plain forward-proxy request gets them too. Reading it as a
+        // tunnel-only field left `delete://resCookies.x` sending half the
+        // `Set-Cookie` lines whistle sends.
         let mut info = build_req_info(
             "GET",
             "https",
@@ -10394,16 +11227,14 @@ mod tests {
             &HeaderMap::new(),
             None,
         );
-        info.from.tunnel = true;
         let out = lines("resCookies.sid", Some(&info));
         assert_eq!(out.len(), 4, "{out:?}");
         assert!(out[2].contains("Domain=b.example.com"), "{:?}", out[2]);
+        info.from.tunnel = true;
+        assert_eq!(lines("resCookies.sid", Some(&info)).len(), 4);
         // Three labels keep the leading dot; two have no parent at all.
         assert_eq!(parent_domain("b.example.com").as_deref(), Some(".example.com"));
         assert_eq!(parent_domain("example.com"), None);
-        // A forward-proxy request gets no domain-scoped entries.
-        info.from.tunnel = false;
-        assert_eq!(lines("resCookies.sid", Some(&info)).len(), 2);
     }
 
     /// The deletion wins over a `resCookies://` for the same name on the same
@@ -10438,10 +11269,16 @@ mod tests {
         assert!(t.get("x-a").is_none(), "the deleted trailer is gone");
         assert_eq!(t.get("x-b").unwrap(), "2", "the other one stays");
 
-        // The deletion applies after the operators, so both spellings of a
-        // name on one request end up without it.
+        // `TRAILER_RE` is the one delete key written without the `i` flag, so
+        // the word has to be lower case: `resTrailer.x-a` matches nothing.
         let resolved = resolve(
             "example.com trailers://x-a=1 delete://resTrailer.x-a\n",
+            "http://example.com/",
+        );
+        assert_eq!(build_trailers(&resolved).get("x-a").unwrap(), "1");
+        // Unanchored at the front, though, so a lower-cased prefix does match.
+        let resolved = resolve(
+            "example.com trailers://x-a=1 delete://restrailer.x-a\n",
             "http://example.com/",
         );
         assert!(build_trailers(&resolved).get("x-a").is_none());
@@ -10557,7 +11394,7 @@ mod tests {
         // Replacing a status with itself does not.
         assert_eq!(challenge("replaceStatus://401", 401), (401, None));
         // `disable://userLogin` suppresses the challenge without suppressing
-        // the status change (`isDisableUserLogin`, `util/index.js:3558-3563`)…
+        // the status change (`isDisableUserLogin`, `util/index.js:3557-3562`)…
         assert_eq!(
             challenge("replaceStatus://401 disable://userLogin", 200),
             (401, None)
@@ -10567,6 +11404,32 @@ mod tests {
             challenge("replaceStatus://401 disable://userLogin enable://userLogin", 200),
             (401, Some("Basic realm=User Login".to_string()))
         );
+        // The line's own properties say the same, and were read as being about
+        // whistle's login box rather than about this header — so `lineProps://
+        // disableUserLogin` left the challenge standing, which the differential
+        // bench caught.
+        assert_eq!(
+            challenge("replaceStatus://401 lineProps://disableUserLogin", 200),
+            (401, None)
+        );
+        assert_eq!(
+            challenge(
+                "replaceStatus://401 lineProps://disableUserLogin&enableUserLogin",
+                200
+            ),
+            (401, Some("Basic realm=User Login".to_string()))
+        );
+        // The property is line-scoped: written on another line it says nothing
+        // about this one.
+        let two_lines = "example.com replaceStatus://401\n\
+                         example.com resHeaders://x-a=1 lineProps://disableUserLogin\n";
+        let resolved = resolve(two_lines, "http://example.com/");
+        let mut parts = res_parts(&[]);
+        apply_response(&mut parts, &resolved);
+        assert_eq!(
+            parts.headers.get("www-authenticate").map(|v| v.to_str().unwrap()),
+            Some("Basic realm=User Login")
+        );
         // 407 takes the proxy spelling.
         let resolved = resolve("example.com replaceStatus://407\n", "http://example.com/");
         let mut parts = res_parts(&[]);
@@ -10574,6 +11437,48 @@ mod tests {
         assert_eq!(
             parts.headers.get("proxy-authenticate").unwrap(),
             "Basic realm=User Login"
+        );
+    }
+
+    /// A mocked `statusCode://401` carries the challenge too — upstream answers
+    /// such a rule through `getStatusCodeFromRule`, which calls `handleStatusCode`
+    /// unless the line said otherwise (`_original/lib/util/index.js:3566-3588`).
+    ///
+    /// This port answered with a bare 401, so mocking an unauthenticated
+    /// response never made a browser ask for credentials. Found with the
+    /// differential bench, not by reading.
+    #[test]
+    fn a_mocked_401_asks_the_browser_for_credentials() {
+        let challenge = |rule: &str, header: &str| {
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            let resolved = resolve(&format!("a.com {rule}\n"), "http://a.com/");
+            let resp = short_circuit(&info, &resolved, test_env()).expect("a status is answered");
+            (
+                resp.status().as_u16(),
+                resp.headers().get(header).map(|v| v.to_str().unwrap().to_string()),
+            )
+        };
+        let basic = || Some("Basic realm=User Login".to_string());
+
+        assert_eq!(challenge("statusCode://401", "www-authenticate"), (401, basic()));
+        assert_eq!(challenge("statusCode://407", "proxy-authenticate"), (407, basic()));
+        // Only those two statuses carry one.
+        assert_eq!(challenge("statusCode://403", "www-authenticate"), (403, None));
+        // …and the line, or the request, can decline it.
+        assert_eq!(
+            challenge("statusCode://401 lineProps://disableUserLogin", "www-authenticate"),
+            (401, None)
+        );
+        assert_eq!(
+            challenge("statusCode://401 disable://userLogin", "www-authenticate"),
+            (401, None)
+        );
+        assert_eq!(
+            challenge(
+                "statusCode://401 disable://userLogin lineProps://enableUserLogin",
+                "www-authenticate"
+            ),
+            (401, basic())
         );
     }
 

@@ -615,6 +615,11 @@ speaks, which is the whole point of their names:
   so two whistle-rs instances chain the way whistle does. Point one at a proxy
   you do not control and the request travels in the clear.
 
+`lineProps://internalProxy` says the second of those about an ordinary
+`proxy://` line, without changing its spelling — written on the proxy line, on
+the `host://` line, or request-wide as `enable://internalProxy`
+(`isInternalProxy`, `_original/lib/util/index.js:3801-3807`).
+
 **How the hop is made.** Only a plain HTTP proxy fetching a plain HTTP origin
 sends the request in absolute-form (`GET http://host/path`); a TLS origin, a
 SOCKS proxy, an HTTPS proxy, and an address override travelling with the proxy
@@ -871,7 +876,7 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 | Client port | `clientPort:<v>`, `remotePort:<v>` | the client socket's port |
 | Server address | `serverIp:<v>`, `serverIP:` | the address the request was actually sent to — the upstream proxy's when one was used (response phase) |
 | Server port | `serverPort:<v>` | the port the request was sent to (response phase) |
-| Host | `host:<v>`, `host=<v>` | request host |
+| Host | `host:<v>`, `host=<v>` | request host — a [deviation](#remaining-divergences-from-upstream) |
 | Request body | `b:<v>`, `body:<v>` | the request body **contains** `<v>` — see [the body condition](#the-body-condition) |
 | Environment | `env:<KEY>=<v>` | whistle's own process environment variable `<KEY>` contains `<v>`. The key is case-**sensitive**, and only `=` separates it |
 | Origin | `from:<marker>`, `from=<marker>` | where the request came from — see [origin markers](#origin-markers) |
@@ -884,6 +889,14 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 > require the value to be **equal**; it now matches by containment too, so it accepts
 > strictly more requests than before. Write `reqH.<key>:/^value$/` where you relied on
 > an exact match.
+
+A URL condition may be written as a regexp, and the four operators spell it two ways.
+`includeFilter://` and `excludeFilter://` take `/<expr>/[i]` with its delimiters, like
+any other value. `filter://` and `ignore://` instead read a payload whose **last**
+character is `/` (or that ends `/i`) as a regexp, with one leading `/` dropped if
+present — so `filter:///echo$/`, `filter://echo$/` and `ignore:///echo$/` are the same
+expression, and `filter://*/echo` without the trailing slash is a wildcard instead.
+Upstream's `PATTERN_FILTER_RE` and `util.isRegExp` (`rules.js:54`, `util/index.js:606`).
 
 A `!` inverts a condition. It goes in front of the value (`m:!GET`), straight after a
 header key (`reqH.x-tag!:v`), or in front of a URL pattern (`includeFilter://!*.cdn.com`);
@@ -1004,17 +1017,22 @@ whistle-rs follows upstream's:
 
 1. every line carrying a `b:` filter is collected at parse time into a list of its
    own (upstream's `_bodyFilters`, `_original/lib/rules/rules.js:1390-1392`);
-2. before resolution, the proxy asks whether any of those lines would match this
-   request *but for* the body condition — pattern, method, headers, everything else
-   is evaluated as usual. Only then is the body read
-   (`resolveBodyFilter` → `req.getPayload`, `rules.js:2455-2465`,
-   `lib/inspectors/rules.js:193-205`).
+2. before resolution, the proxy asks whether any of those lines' **patterns** accept
+   this request. Only then is the body read (`resolveBodyFilter` → `req.getPayload`,
+   `rules.js:2455-2465`, `lib/inspectors/rules.js:193-205`).
 
-So a rules file with no `b:` in it never touches a body, and one that has a `b:`
-scoped to a host or a method pays nothing on the requests it excludes. Measured on a
-500-rule file: **4.2 ns** per request with no `b:` line, **11 ns** with one that does
-not match this request, **12 ns** with one that does (plus the buffering itself) —
-against ~2.8 µs for the resolution that follows.
+The line's other conditions get no say in stage 2, and deliberately so: upstream's
+`resolveBodyFilter` passes `isFilter`, which short-circuits `checkFilter` before
+`matchExcludeFilters` runs (`rules.js:983`). Narrowing it by them looked free and was
+not — an `excludeFilter://b:` concluded from its own assumed-true condition that the
+line was already excluded, and never read the body it needed to decide that.
+
+So a rules file with no `b:` in it never touches a body, and one whose `b:` is scoped
+to a host or a path pays almost nothing on the requests that pattern turns away.
+Measured on a 500-rule file: **under 1 ns** per request with no `b:` line — one
+`is_empty()` per group — **4 ns** with one whose pattern turns the request away, and
+**11 ns** with one whose pattern accepts it, against ~2.8 µs for the resolution that
+follows.
 
 ```
 example.com  resBody://blocked  includeFilter://b:password
@@ -1081,13 +1099,19 @@ Every other condition this port parses now evaluates.
 | `i:` matches the client IP, then falls back to the server IP | client IP only | Upstream's server-IP arm is unreachable: `filterProp` reports an ip filter as handled the moment `req.clientIp` is null, so the `req.hostIp` line below it never runs for one (`rules.js:1824-1830,:1875-1880`). Write `serverIp:` for the server's address. |
 | the response pass wins when both passes resolve one protocol | source order wins | See [the response phase](#the-response-phase): upstream's two passes read disjoint protocols and never face the case. |
 | `remoteAddress:`/`remotePort:` are the raw socket, distinct from `clientIp:`/`clientPort:` | the same socket | The two differ upstream only for a request forwarded by another whistle, whose client-IP override headers this port does not honour. |
-| `filter://<url-pattern>` with no trailing `/` is a **pattern**, not a filter | an exclude URL filter | Upstream's `PATTERN_FILTER_RE` requires the payload to end in `/` or `/i`; the bare form falls out of its filter parser and becomes another pattern for the line. Every *documented* `filter://` URL spelling is an exclude filter in both. |
-| `host:<v>` routes to proxy-host filtering | matches the request host | `host:` (with a colon) is this port's own spelling; upstream has only `host=`/`host.`, for a different job. |
+| a `host` condition never decides whether a rule applies | matches the request host | Measured against whistle 2.10.8: `host=`/`host.` are filed under `hostFilter`, which only `util.checkProxyHost` reads — it decides which hosts a `proxy://` engages for. `host:` (with a colon) upstream does not recognise at all, and reads as a URL pattern that cannot match. Both spellings match the request's own host here. |
 | header values are also compared against `encodeURIComponent(value)` | not compared | That arm is unreachable upstream: the haystack is lowercased while `encodeURIComponent` emits upper-case hex. |
 
-A filter whose condition cannot be parsed at all (`includeFilter://`, an empty header
-key) is dropped, exactly as upstream drops it — the rule then applies without that
-condition.
+Some filters are **dropped**, and the rule then applies without them: an empty payload
+or a bare `!` (`includeFilter://`, `includeFilter://!`); a header key left empty by its
+own `!` (`reqH.!!=v` — the first `!` is the value's); and an `i:`/`ip:`/`clientIp:`/
+`serverIp:` whose value is neither an address nor a regexp (`i:localhost`).
+
+That is the opposite of a condition that merely never holds, which *stops* the rule —
+and the two are a character apart. A header key that was empty to begin with is kept
+(`reqH.=v` asks for a header named `""`), and a name with nothing after its separator
+is not a condition at all (`includeFilter://reqH.` is a URL pattern no URL matches).
+Each is upstream's answer, measured.
 
 ### Disabling operators
 
@@ -1418,7 +1442,7 @@ the request on its way out, or from the response on its way back:
 | `cache` | `Cache-Control: no-cache` plus a past `Expires` and `Pragma` |
 | `csp` | drops the `Content-Security-Policy` headers |
 | `301` | turns a `301 Moved Permanently` into a `302 Found`, so the browser does not cache the redirect |
-| `userLogin` | withholds the `WWW-Authenticate` / `Proxy-Authenticate` challenge a `replaceStatus://401\|407` would send (`enable://userLogin` wins over it) |
+| `userLogin` | withholds the `WWW-Authenticate` / `Proxy-Authenticate` challenge a `statusCode://401\|407` or a changed `replaceStatus://401\|407` would send (`enable://userLogin` wins over it, and `lineProps://disableUserLogin` says it for one line — see [`LINE_PROPS.md`](LINE_PROPS.md)) |
 | `trailers` / `trailer` | sends no trailer section at all — the origin's included |
 | `trailerHeader` | sends the trailers without the `Trailer:` header announcing them |
 | `doctype` | no `<!DOCTYPE html>` before an HTML prepend |
@@ -1656,7 +1680,7 @@ is 500 ms as you would hope, but `resDelay://1s` is **1 millisecond**, and
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `replaceStatus` / `statusCode` | status number | Replace the upstream response status. A **changed** 401/407 also sends the matching auth challenge; `disable://userLogin` withholds it |
+| `replaceStatus` / `statusCode` | status number | Replace the upstream response status. A mocked `statusCode://401\|407`, and a `replaceStatus://` that actually **changed** the status to one of those, also send the matching auth challenge — the header that makes a browser ask for credentials; `disable://userLogin` or `lineProps://disableUserLogin` withholds it |
 | `resHeaders` | `name=value` pairs (`&`-separated) or `{json}` | Set/replace response headers. An empty value sends an **empty header**, not a deletion — use `delete://resHeaders.x`. `set-cookie` merges instead of replacing; see below. Accumulates across lines. |
 | `resType` | MIME type or short name | Set the response `Content-Type` |
 | `resCharset` | charset | Set the charset on the response `Content-Type` |
@@ -1732,7 +1756,7 @@ nothing — you need a scope.
 | `headers.x` | the header on both sides (this spelling is case-**sensitive** and must be plural) |
 | `reqCookies.x` / `cookies.x` | that cookie from the request `Cookie` header |
 | `resCookies.x` / `cookies.x` | that cookie **in the client** — see below |
-| `trailer.x` | that trailing header (this key takes no `req`/`res` scope) |
+| `trailer.x` | that trailing header (this key takes no `req`/`res` scope, and is the one key that is case-**sensitive**) |
 | `query.x` / `params.x` / `urlParams.x` / `url.Param.x` | that query-string parameter, every repeat of it |
 | `query` / `params` / `urlParams` (bare) | the whole query string, `?` and all |
 | `pathname` | the whole path, keeping the query string |
@@ -1741,6 +1765,11 @@ nothing — you need a scope.
 | `resCharset` / `res.charset`, `reqCharset` / `req.charset` | the charset parameter |
 | `body`, `res.body`, `req.body` | the whole body, including anything an operator injects |
 | `resBody.a.b` / `resB.a.b`, `reqBody.a.b` | that dotted path from a JSON body |
+
+A body path is read the way whistle reads one: `reqBody.a\.b` names a single key
+containing a dot (backslashes are halved first, so `a\\.b` is two segments),
+`reqBody."k[0]"` takes a segment literally, and `reqBody.a[0]` indexes an array
+— the same element `reqBody.a.0` names.
 
 ```
 example.com   delete://resHeaders.server|resHeaders.x-powered-by
@@ -1768,20 +1797,31 @@ The URL keys have edges worth knowing, all inherited
   the same line just wrote;
 * an index out of range is a no-op rather than an error.
 
-> **One deliberate divergence.** A bare `delete://pathname` against a URL that
-> has a query string emits the query **twice** upstream (`/a?x=1` → `/?x=1?x=1`,
-> `util/index.js:1033,1057`). whistle-rs emits it once; the upstream form is a
-> request line no origin parses.
+> **Two deliberate divergences.**
+>
+> A bare `delete://pathname` against a URL that has a query string emits the
+> query **twice** upstream (`/a?x=1` → `/?x=1?x=1`, `util/index.js:1033,1057`).
+> whistle-rs emits it once; the upstream form is a request line no origin
+> parses.
+>
+> `delete://body` (and `req.body` / `res.body`) does **not** empty the body in
+> real whistle, only discard what `reqBody://`, `reqPrepend://` and their
+> response twins meant to inject. `removeBody` assigns `EMPTY_BUFFER`, and
+> `EMPTY_BUFFER` is `toBuffer('')` — whose first act is `if (!buf) return`
+> (`util/common.js:1630-1632`), so the constant is `undefined` and the
+> assignment leaves the body alone. whistle-rs empties it, which is what the
+> key is documented to do and what upstream's own code means to do.
 
 A response cannot reach into the browser and remove a cookie, so
 `delete://resCookies.x` sends back one that has **already expired**
 (`Max-Age=0` with a past `Expires`). Two go out per name, plain and `Secure`,
 because a `Secure` cookie is not overwritten by a non-`Secure` one and the proxy
-cannot tell which is out there. A request that arrived through an intercepted
-tunnel gets two more, scoped to the parent domain, for a cookie set on
-`.example.com` rather than on the host — matching upstream, which reads a
-hostname only set on that path. The deletion **wins** over a `resCookies://`
-naming the same cookie on the same request.
+cannot tell which is out there. A host with a parent domain worth naming gets
+two more scoped to it, for a cookie set on `.example.com` rather than on the
+host: `a.b.example.com` adds `Domain=b.example.com`, a three-label host keeps
+the leading dot (`.example.com`), and `example.com` has no parent and adds
+nothing. The deletion **wins** over a `resCookies://` naming the same cookie on
+the same request.
 
 ### Cookies
 
@@ -1790,10 +1830,15 @@ naming the same cookie on the same request.
 | `reqCookies` | `name=value` pairs (`&`-separated) or `{json}` | Merge into the request `Cookie` header. Accumulates across lines. |
 | `resCookies` | `name=value` pairs (`&`-separated) or `{json}` | Set `Set-Cookie` headers. Accumulates across lines. |
 
-A name written with no `=` gets an **empty value** — it does not delete the
-cookie. To remove one, use `delete://reqCookies.<name>`. A `resCookies` entry
-**replaces** a `Set-Cookie` the response already sent under the same name rather
-than adding a second one.
+A name written with no `=` *inside* a query gets an **empty value** — it does not
+delete the cookie; to remove one, use `delete://reqCookies.<name>`. A whole
+value with no `=` anywhere is not a query string at all but a **location**, so
+`resCookies://sid` reads a file of that name and sets nothing. A `resCookies`
+entry **replaces** a `Set-Cookie` the response already sent under the same name
+rather than adding a second one.
+
+Deleting every cookie from a request leaves `Cookie:` present and **empty**
+rather than removing it, which is upstream's `setHeader(data, 'cookie', '')`.
 
 ```
 example.com   reqCookies://sid=abc&locale=en
@@ -2100,8 +2145,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 | TLS | `cipher` (upstream TLS version pin + OpenSSL cipher-string evaluation), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
-**Rule-file features:** a line `@<url>` or `@<file>` includes rules fetched/read from
-that source at load time; `${port}` and `${version}` in operator values are substituted
+**Rule-file features:** `${port}` and `${version}` in operator values are substituted
 (case-insensitive); an operator value that names a file or a URL is
 [read before the operator applies](#values-read-from-a-file-or-a-url), and one
 wrapped in backticks is [rendered against the request](#backtick-templates);
@@ -2299,6 +2343,13 @@ in upstream whistle.
 
 Known gaps in the operator layer, deliberately left:
 
+- **A line that is just `@<file>` or `@<url>` does not include anything.**
+  Upstream reads the source at load time and parses its rules into the group —
+  put `@/tmp/mock/rules.txt` on a line by itself and the file's rules take
+  effect; point it at a path that does not exist and none do. whistle-rs drops
+  the line, and the request goes to the origin. Written with a pattern
+  (`example.com @/tmp/rules.txt`) neither proxy includes anything: that is the
+  `G://` global-value operator, not an include.
 - **`resRules://` entries of a `resScript` list are not applied.** Upstream folds
   them into a rules text the response phase parses; whistle-rs's `resScript` is a
   JavaScript hook that mutates the response directly, so it has nowhere to put
@@ -2447,8 +2498,9 @@ api.test/data file:///srv/mock.json
 
 The operators that rewrite a request body need it in memory, and the body is
 whatever the client decided to send. whistle bounds that at **2 MB**, raised to
-**16 MB** by `enable://reqMergeBigData` (`MAX_REQ_SIZE` / `BIG_MAX_REQ_SIZE`,
-`_original/lib/inspectors/req.js:19-20,:163`), and whistle-rs does the same.
+**16 MB** by `enable://reqMergeBigData` or by `lineProps://enableBigData` on the
+`reqMerge://` line (`MAX_REQ_SIZE` / `BIG_MAX_REQ_SIZE`,
+`_original/lib/inspectors/req.js:19-20,:163,:564`), and whistle-rs does the same.
 
 Past the ceiling the request is **not** failed and **not** truncated: the body
 streams on to the origin byte for byte, and only the rewriting stops —

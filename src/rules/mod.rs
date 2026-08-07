@@ -53,8 +53,8 @@ pub const LINE_PROP_ACTIONS: &[&str] = &[
 
 /// Per-line properties declared with `lineProps://<action>[|&<action>…]`.
 ///
-/// `lineProps` (`resolveMatchFilter` in `_original/lib/rules/rules.js:1552`,
-/// `parseLineProps` in `_original/lib/util/index.js:1877`) is the line-scoped
+/// `lineProps` (`resolveMatchFilter` in `_original/lib/rules/rules.js:1542`,
+/// `parseLineProps` in `_original/lib/util/index.js:1892`) is the line-scoped
 /// counterpart of the global `enable://`/`disable://` switches: the actions
 /// listed on a rule line only affect the operators written on *that* line.
 /// Every operator of a line therefore carries a copy — see [`RuleOp::props`].
@@ -90,7 +90,7 @@ impl LineProps {
     /// The proxy layer folds the request-scoped `enable://safeHtml` /
     /// `enable://strictHtml` switches into the same gate as the per-line ones —
     /// upstream stamps them onto every injecting rule of the request
-    /// (`_original/lib/inspectors/res.js:970-987`).
+    /// (`_original/lib/inspectors/res.js:966-982`).
     pub fn from_actions<'a>(actions: impl IntoIterator<Item = &'a str>) -> Self {
         let mut props = LineProps::default();
         for action in actions {
@@ -116,7 +116,7 @@ impl LineProps {
 
     /// `important` — like CSS's `!important`, this line's operators outrank the
     /// same protocol from non-important lines regardless of file position
-    /// (`isImportant` in `_original/lib/util/index.js:2141`).
+    /// (`isImportant` in `_original/lib/util/index.js:2156`).
     pub fn important(&self) -> bool {
         self.has("important")
     }
@@ -176,6 +176,15 @@ pub struct RuleOp {
     /// opened as a *path* — so the console reported "file not found" naming the
     /// JSON it was supposed to serve.
     pub value_is_content: bool,
+    /// The values-store name [`value`](RuleOp::value) came from, when it came
+    /// from one.
+    ///
+    /// It is upstream's `rule.key` (`getKey`, `_original/lib/rules/rules.js:817-820`),
+    /// and the local-file family reads it as a *filename*: the content type of
+    /// `file://{mock.json}` is guessed from `mock.json`, not from the request
+    /// URL (`_original/lib/handlers/file-proxy.js:270-272`). A named value is
+    /// the only body whose extension is written nowhere else.
+    pub value_key: Option<String>,
     /// Where this operator sits in the resolution order — important lines first,
     /// then source order (see [`order_key`]). Stamped when a rule resolves.
     ///
@@ -1467,7 +1476,7 @@ pub fn split_line<'t>(tokens: &[&'t str]) -> Option<(Vec<&'t str>, Vec<&'t str>)
 /// Is this token a filter condition rather than an operator? The console's
 /// editor asks the same question to colour it.
 pub fn is_filter_spelling(tok: &str) -> bool {
-    is_filter_token(tok) || parse_ignore_filter(tok).is_some()
+    is_filter_token(tok)
 }
 
 /// Parse one logical rule line into **one rule per pattern**.
@@ -1501,8 +1510,6 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
             // A filter whose condition does not parse is dropped, never demoted
             // to an operator named `includeFilter`.
             filters.extend(parse_filter(t));
-        } else if let Some(f) = parse_ignore_filter(t) {
-            filters.push(f);
         } else if let Some(op) = parse_op(t) {
             ops.push(op);
         }
@@ -1728,34 +1735,119 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("from", CondKind::From, true, true),
 ];
 
-/// `Some(excludes)` when `proto` is one of the filter operators.
+/// `Some(pure_ok)` when `proto` is one of the four filter operators, where
+/// `pure_ok` says whether it also takes the `.`/`=` separated *pure* forms.
 ///
-/// Only `includeFilter://` includes. whistle decides this with
-/// `isInclude = matcher[1] === 'n'` (`_original/lib/rules/rules.js:1563`), which
-/// is true for i**n**cludeFilter alone — `filter://` yields `'i'` and
-/// `ignore://` yields `'g'`, so both are *exclude* filters. This port used to
+/// The two spellings that do are `includeFilter` and `excludeFilter`, the only
+/// two `PURE_FILTER_RE` names (`_original/lib/rules/rules.js:59`) — and the same
+/// two whose URL branch differs from `filter://`'s, so one flag settles both.
+///
+/// Which of the four *include* is a separate question, and only
+/// `includeFilter://` does: whistle decides with `isInclude = matcher[1] === 'n'`
+/// (`rules.js:1563`), true for i**n**cludeFilter alone — `filter://` yields `'i'`
+/// and `ignore://` yields `'g'`, so both are *exclude* filters. This port used to
 /// read `filter://` as an include, which did not merely fail on a whistle rules
 /// file: it did the opposite of what the file asked, silently.
-fn filter_excludes(proto: &str) -> Option<bool> {
+fn filter_pure_form(proto: &str) -> Option<bool> {
     match proto {
-        "includeFilter" => Some(false),
-        "filter" | "excludeFilter" => Some(true),
+        "includeFilter" | "excludeFilter" => Some(true),
+        "filter" | "ignore" => Some(false),
         _ => None,
     }
 }
 
-/// Does a `filter://` payload name a URL, rather than protocols to suppress?
+/// `PATTERN_FILTER_RE` — `^(?:filter|ignore)://(.+)/(i)?$`, split into the
+/// expression and whether it carried the `i` flag.
 ///
-/// Upstream's two shapes: ending in `/` or `/i` (`PATTERN_FILTER_RE`), or
-/// starting with one or more `*` followed by `/` (`PATTERN_WILD_FILTER_RE`,
-/// which also allows a leading `!`).
-fn is_url_filter_payload(spec: &str) -> bool {
-    let body = spec.strip_prefix('!').unwrap_or(spec);
-    if body.starts_with('*') {
-        let stars = body.bytes().take_while(|b| *b == b'*').count();
-        return body[stars..].starts_with('/');
+/// The `(.+)` is greedy, so a payload that ends in `/` keeps everything before
+/// that last slash and takes no flag; only when it does not is the trailing `i`
+/// read as one. `filter://a/i/` is therefore the expression `a/i`, and
+/// `filter://a/i` the expression `a`, case-insensitively.
+fn pattern_filter_split(spec: &str) -> Option<(&str, bool)> {
+    if let Some(body) = spec.strip_suffix('/')
+        && !body.is_empty()
+    {
+        return Some((body, false));
     }
-    body.ends_with('/') || body.ends_with("/i")
+    let body = spec.strip_suffix("/i")?;
+    (!body.is_empty()).then_some((body, true))
+}
+
+/// `PATTERN_WILD_FILTER_RE` — `^(?:filter|ignore)://(!)?(\*+/)`, returning the
+/// payload with its `!` stripped and whether it carried one.
+fn wild_filter_split(spec: &str) -> Option<(&str, bool)> {
+    let (negate, body) = strip_negation(spec);
+    let stars = body.bytes().take_while(|b| *b == b'*').count();
+    (stars > 0 && body[stars..].starts_with('/')).then_some((body, negate))
+}
+
+/// Does a `filter://`/`ignore://` payload name a URL, rather than protocols to
+/// suppress? True for exactly the two shapes those two spellings accept.
+fn is_url_filter_payload(spec: &str) -> bool {
+    pattern_filter_split(spec).is_some() || wild_filter_split(spec).is_some()
+}
+
+/// Compile a filter's URL expression, which upstream rebuilds as
+/// `'/' + body + '/' + (caseIns ? 'i' : '')` (`_original/lib/rules/rules.js:1712`).
+///
+/// That rebuild is why a `/re/u` is case-**in**sensitive here: upstream tests
+/// the captured flags for truthiness, not for `i`.
+fn compile_url_regexp(body: &str, ignore_case: bool) -> Option<Regex> {
+    if body.is_empty() {
+        return None;
+    }
+    let src = match ignore_case {
+        true => format!("(?i){body}"),
+        false => body.to_string(),
+    };
+    Regex::new(&src).ok()
+}
+
+/// The URL filter that `filter://` and `ignore://` share — the first and third
+/// branches of `resolveFilterPattern` (`_original/lib/rules/rules.js:1469-1514`).
+///
+/// A payload ending `/` or `/i` is a **regexp**, after an optional `!` and an
+/// optional leading `/`; one beginning `*/` is a wildcard URL. This port read
+/// both through the wildcard compiler, so `filter:///echo$/` — the form the
+/// documentation leads with — silenced nothing.
+fn parse_pattern_url_filter(spec: &str) -> Option<(Cond, bool)> {
+    let (body, negate) = match pattern_filter_split(spec) {
+        Some((body, case_ins)) => {
+            let (negate, body) = strip_negation(body);
+            // `filter:///re/` and `filter://re/` are the same expression: one
+            // leading slash is the delimiter, and is dropped (`rules.js:1478`).
+            let body = body.strip_prefix('/').unwrap_or(body);
+            let re = compile_url_regexp(body, case_ins)?;
+            return Some((Cond::Url(Pattern::Regex(re)), negate));
+        }
+        None => wild_filter_split(spec)?,
+    };
+    let re = wildcard::parse_filter(body)?;
+    Some((Cond::Url(Pattern::Regex(re)), negate))
+}
+
+/// The URL filter `includeFilter://` and `excludeFilter://` take — the second
+/// branch of `resolveFilterPattern` (`_original/lib/rules/rules.js:1487-1511`).
+///
+/// Their `/re/` spelling is `util.isRegExp`, which allows the `u` flag the
+/// `filter://` form does not; everything else is the wildcard compiler.
+fn parse_url_filter(spec: &str) -> Option<(Cond, bool)> {
+    // Only here may a `!` precede the payload: with a condition name present it
+    // belongs to the value, so `includeFilter://!m:GET` is a (negated) URL
+    // pattern upstream, not a method condition.
+    let (negate, body) = strip_negation(spec);
+    if let Some(rest) = body.strip_prefix('/')
+        && let Some(end) = rest.rfind('/')
+        && matches!(&rest[end + 1..], "" | "i" | "u" | "iu" | "ui")
+        && let Some(re) = compile_url_regexp(&rest[..end], end + 1 < rest.len())
+    {
+        return Some((Cond::Url(Pattern::Regex(re)), negate));
+    }
+    // Anything else is a URL pattern — compiled the way *filters* are, which is
+    // not the way a rule's own pattern is: every filter is read as if it carried
+    // a `^`, so its stars wildcard the path too ([`wildcard::parse_filter`]).
+    let re = wildcard::parse_filter(body)?;
+    Some((Cond::Url(Pattern::Regex(re)), negate))
 }
 
 /// Is this token a filter condition (as opposed to an operator or a pattern)?
@@ -1766,100 +1858,73 @@ fn is_filter_token(tok: &str) -> bool {
     let Some((proto, spec)) = split_protocol(tok) else {
         return false;
     };
-    if filter_excludes(proto).is_none() {
+    let Some(pure_ok) = filter_pure_form(proto) else {
         return false;
-    }
-    // The `filter://` that names protocols is an operator, not a filter — see
-    // [`parse_filter`]. Reporting it as a filter here would drop it, since
-    // `parse_filter` refuses it.
-    !(proto == "filter" && !is_url_filter_payload(spec) && split_cond_name(spec, true).is_none())
+    };
+    // The `filter://`/`ignore://` that names protocols is an operator, not a
+    // filter — see [`parse_filter`]. Reporting it as a filter here would drop
+    // it, since `parse_filter` refuses it. Brackets come off first, exactly as
+    // they do there and in upstream's `INLINE_RE` pass.
+    let spec = strip_inline_brackets(spec);
+    pure_ok || is_url_filter_payload(spec) || split_cond_name(spec, false).is_some()
 }
 
-/// Parse a `filter://` / `includeFilter://` / `excludeFilter://` token.
-///
-/// Returns `None` for a token that is not a filter at all, and for one whose
-/// condition is unusable (an empty payload, an empty header key) — upstream
-/// drops those too (`resolveMatchFilter`, `_original/lib/rules/rules.js:1556`).
-fn parse_filter(tok: &str) -> Option<Filter> {
-    let (proto, spec) = split_protocol(tok)?;
-    // `filter://` is two operators wearing one name. Only a payload that ends
-    // `/` (or `/i`) or begins `*/` is a **URL** filter — `PATTERN_FILTER_RE` and
-    // `PATTERN_WILD_FILTER_RE` (`_original/lib/rules/rules.js:54,:61`). Anything
-    // else that is not a named condition is the *other* `filter://`: an operator
-    // whose value names protocols to suppress, folded into the ignore set
-    // (`resolveFilter`, `rules.js:2188-2196`). This port treated every payload
-    // as a URL filter, so `filter://host` excluded nothing and the `host://` it
-    // was written to suppress went on applying.
-    if proto == "filter" && !is_url_filter_payload(spec) && split_cond_name(spec, true).is_none() {
-        return None;
-    }
-    // A condition may be written inside brackets, which whistle strips before
-    // parsing (`INLINE_RE`, `_original/lib/rules/rules.js:62,:1549-1551`). The
-    // form exists so a condition containing characters that would otherwise end
-    // the token can be written at all. Unstripped, the payload fell through to
-    // the URL-pattern branch and could never hold, so an `includeFilter://(m:GET)`
-    // meant the rule never applied — silently.
-    let spec = match (spec.starts_with('(') && spec.ends_with(')'))
+/// A condition may be written inside brackets, which whistle strips before
+/// parsing (`INLINE_RE`, `_original/lib/rules/rules.js:62,:1549-1551`). The form
+/// exists so a condition containing characters that would otherwise end the
+/// token can be written at all. Unstripped, the payload fell through to the
+/// URL-pattern branch and could never hold, so an `includeFilter://(m:GET)`
+/// meant the rule never applied — silently.
+fn strip_inline_brackets(spec: &str) -> &str {
+    match (spec.starts_with('(') && spec.ends_with(')'))
         || (spec.starts_with('<') && spec.ends_with('>'))
     {
         true if spec.len() > 1 => &spec[1..spec.len() - 1],
         _ => spec,
+    }
+}
+
+/// Parse a `filter://` / `includeFilter://` / `excludeFilter://` / `ignore://`
+/// token.
+///
+/// Returns `None` for a token that is not a filter at all, and for one whose
+/// condition is unusable (an empty payload, a header key of only `!`, an `i:`
+/// that is neither an address nor a regexp) — upstream drops those too
+/// (`resolveMatchFilter`, `_original/lib/rules/rules.js:1556`).
+fn parse_filter(tok: &str) -> Option<Filter> {
+    let (proto, spec) = split_protocol(tok)?;
+    let pure_ok = filter_pure_form(proto)?;
+    let spec = strip_inline_brackets(spec);
+    let (cond, negate) = match split_cond_name(spec, pure_ok) {
+        Some((kind, rest)) => build_cond(kind, rest)?,
+        // `filter://` and `ignore://` are two operators wearing one name, and
+        // read a URL differently from the other two besides. A payload that is
+        // neither a named condition nor one of their two URL shapes is the
+        // *other* operator: a value naming protocols to suppress, folded into
+        // the ignore set (`resolveFilter`, `rules.js:2188-2196`). This port
+        // treated every payload as a URL filter, so `filter://host` excluded
+        // nothing and the `host://` it was written to suppress went on applying.
+        None if !pure_ok => parse_pattern_url_filter(spec)?,
+        // whistle drops these two before it reads the payload at all
+        // (`rules.js:1489-1491`), which leaves the *line* unfiltered.
+        None if spec.is_empty() || spec == "!" => return None,
+        None => parse_url_filter(spec)?,
     };
-    let exclude = filter_excludes(proto)?;
-    // `.`/`=` separated conditions are an includeFilter/excludeFilter-only form.
-    let pure_ok = proto != "filter";
-    if spec.is_empty() {
-        return None;
-    }
-    let (cond, negate) = parse_cond(spec, pure_ok)?;
     Some(Filter {
-        exclude,
+        exclude: proto != "includeFilter",
         negate,
         cond,
     })
-}
-
-/// `ignore://<condition>` — an exclude filter, exactly like `filter://`.
-///
-/// whistle's `ignore://` reaches `resolveMatchFilter` through the same
-/// `PROPS_FILTER_RE` (`_original/lib/rules/rules.js:57`) and, spelling `'g'` at
-/// index 1, lands in the exclude branch with it.
-///
-/// Only a *named* condition is read this way. A payload that is not one stays
-/// the `ignore://<protocol>` operator this port documents — the two can never
-/// collide, since protocol names carry no separator.
-fn parse_ignore_filter(tok: &str) -> Option<Filter> {
-    let spec = tok.strip_prefix("ignore://")?;
-    let (kind, rest) = split_cond_name(spec, false)?;
-    let (cond, negate) = build_cond(kind, rest)?;
-    Some(Filter {
-        exclude: true,
-        negate,
-        cond,
-    })
-}
-
-/// Parse the payload of a filter token into a condition plus its negation flag.
-fn parse_cond(spec: &str, pure_ok: bool) -> Option<(Cond, bool)> {
-    match split_cond_name(spec, pure_ok) {
-        Some((kind, rest)) => build_cond(kind, rest),
-        // Anything unrecognised is a URL pattern — compiled the way *filters*
-        // are, which is not the way a rule's own pattern is: every filter is
-        // read as if it carried a `^`, so its stars wildcard the path too
-        // ([`wildcard::parse_filter`]). Only here may a `!` precede the payload:
-        // with a condition name present it belongs to the value, so
-        // `includeFilter://!m:GET` is a (negated) URL pattern upstream, not a
-        // method condition.
-        None => {
-            let (negate, body) = strip_negation(spec);
-            let re = wildcard::parse_filter(body)?;
-            Some((Cond::Url(Pattern::Regex(re)), negate))
-        }
-    }
 }
 
 /// Split `<name><sep><rest>` when `<name>` is a known condition and `<sep>` is a
 /// separator that name accepts.
+///
+/// `<rest>` must not be empty: both of upstream's condition regexes end `(.+)`
+/// (`_original/lib/rules/rules.js:57-60`), so `includeFilter://reqH.` is not a
+/// header condition at all — it falls through to the URL branch and becomes a
+/// pattern that cannot match. Accepting it here dropped the filter instead, and
+/// a dropped include filter leaves the line applying to everything.
 fn split_cond_name(spec: &str, pure_ok: bool) -> Option<(CondKind, &str)> {
     for &(name, kind, props, pure) in COND_SPECS {
         let Some(rest) = spec.strip_prefix(name) else {
@@ -1871,7 +1936,7 @@ fn split_cond_name(spec: &str, pure_ok: bool) -> Option<(CondKind, &str)> {
             b'.' | b'=' => pure && pure_ok,
             _ => false,
         };
-        if accepted {
+        if accepted && rest.len() > 1 {
             return Some((kind, &rest[1..]));
         }
     }
@@ -1887,6 +1952,21 @@ fn strip_negation(value: &str) -> (bool, &str) {
     }
 }
 
+/// The value of an `i:`/`ip:`/`clientIp:`/`serverIp:` condition, or `None` when
+/// it is neither a regexp nor a literal address.
+///
+/// Upstream drops the *whole filter* for one that is neither
+/// (`net.isIP`, `_original/lib/rules/rules.js:1592-1594`), which is not the same
+/// as a condition that never holds: a dropped include filter leaves the line
+/// applying to everything, where a never-holding one would stop it. `i:localhost`
+/// is the spelling this catches, and it silently disabled the line here.
+fn address_value(rest: &str) -> Option<CondValue> {
+    match CondValue::parse(rest, false) {
+        CondValue::Literal(lit) if lit.parse::<std::net::IpAddr>().is_err() => None,
+        value => Some(value),
+    }
+}
+
 /// Build the condition for `kind` from everything after its separator.
 fn build_cond(kind: CondKind, rest: &str) -> Option<(Cond, bool)> {
     let (negate, rest) = strip_negation(rest);
@@ -1894,9 +1974,9 @@ fn build_cond(kind: CondKind, rest: &str) -> Option<(Cond, bool)> {
         // whistle compiles method regexps with a forced `i` flag.
         CondKind::Method => Cond::Method(CondValue::parse(rest, true)),
         CondKind::Host => Cond::Host(CondValue::parse(rest, false)),
-        CondKind::Ip => Cond::Ip(CondValue::parse(rest, false)),
-        CondKind::ClientIp => Cond::ClientIp(CondValue::parse(rest, false)),
-        CondKind::ServerIp => Cond::ServerIp(CondValue::parse(rest, false)),
+        CondKind::Ip => Cond::Ip(address_value(rest)?),
+        CondKind::ClientIp => Cond::ClientIp(address_value(rest)?),
+        CondKind::ServerIp => Cond::ServerIp(address_value(rest)?),
         CondKind::ClientPort => Cond::ClientPort(CondValue::parse(rest, false)),
         CondKind::ServerPort => Cond::ServerPort(CondValue::parse(rest, false)),
         CondKind::RemoteAddress => Cond::RemoteAddress(CondValue::parse(rest, false)),
@@ -1947,6 +2027,11 @@ fn build_cond(kind: CondKind, rest: &str) -> Option<(Cond, bool)> {
 /// `reqH.referer:http://x` splits at the *first* colon
 /// (`_original/lib/rules/rules.js:1645-1660`). A key left empty by its `!`
 /// drops the whole filter.
+///
+/// A key that was empty to begin with does **not**: upstream checks emptiness
+/// only inside the `!` arm (`rules.js:1657`), so `includeFilter://reqH.=v` keeps
+/// a condition that asks for a header named `""` and never finds one. Dropping
+/// it here left the line with no include filter, and so applying to everything.
 fn split_keyed_value(rest: &str, colon_separates: bool) -> Option<(&str, bool, &str)> {
     let sep = rest
         .find('=')
@@ -1955,14 +2040,11 @@ fn split_keyed_value(rest: &str, colon_separates: bool) -> Option<(&str, bool, &
         Some(i) => (&rest[..i], &rest[i + 1..]),
         None => (rest, ""),
     };
-    let (key, negate) = match key.strip_suffix('!') {
-        Some(k) => (k, true),
-        None => (key, false),
-    };
-    if key.is_empty() {
-        return None;
+    match key.strip_suffix('!') {
+        Some("") => None,
+        Some(k) => Some((k, true, value)),
+        None => Some((key, false, value)),
     }
-    Some((key, negate, value))
 }
 
 /// `chance:0.25` / `chance:25%` → the probability to sample at.
@@ -2843,14 +2925,13 @@ mod filter_parse_tests {
     }
 
     /// The `.`/`=` form belongs to `includeFilter`/`excludeFilter`; upstream's
-    /// `PROPS_FILTER_RE` is the only one `filter://` reaches, so `filter://`
-    /// with a dotted name is a URL pattern — as it is upstream.
+    /// `PROPS_FILTER_RE` is the only one `filter://` reaches. A dotted name is
+    /// therefore not a condition for `filter://` — and not a URL either, since
+    /// both of its URL shapes need a `/` marker — so the token stays an ordinary
+    /// operator, upstream's `matchers.push` (`_original/lib/rules/rules.js:1701`).
     #[test]
     fn pure_form_is_not_available_to_plain_filter() {
-        assert!(matches!(
-            cond_of("filter://reqH.x-tag:yes").cond,
-            Cond::Url(_)
-        ));
+        assert!(filters_of("filter://reqH.x-tag:yes").is_empty());
         assert!(matches!(
             cond_of("includeFilter://reqH.x-tag:yes").cond,
             Cond::Header { .. }
@@ -3103,12 +3184,57 @@ mod filter_parse_tests {
     fn unusable_filters_are_dropped_not_demoted() {
         for token in [
             "includeFilter://",
-            "includeFilter://reqH.:yes",
-            "includeFilter://reqH.!:yes",
+            // `!` alone, which whistle refuses before it reads the payload
+            // (`_original/lib/rules/rules.js:1489-1491`).
+            "includeFilter://!",
+            "excludeFilter://!",
+            // A key left empty by its own `!` (`rules.js:1657`). It takes two:
+            // the first is the value's negation, stripped before the key is cut.
+            "includeFilter://reqH.!!:yes",
+            "includeFilter://env.!!=v",
+            // An address condition naming no address (`rules.js:1592-1594`).
+            "includeFilter://i:localhost",
         ] {
             assert!(filters_of(token).is_empty(), "{token} should be dropped");
             let rules = parse_text(&format!("example.com host://1.1.1.1 {token}"));
             assert_eq!(rules[0].ops.len(), 1, "{token} must not become an operator");
+        }
+    }
+
+    /// Dropping a filter and keeping one that cannot hold are opposite
+    /// outcomes — the first leaves the line applying to everything, the second
+    /// stops it — so the line between them is worth pinning exactly.
+    ///
+    /// A header key that is empty *to begin with* is kept: upstream tests for
+    /// emptiness only inside its `!` arm, and then asks for a header named `""`
+    /// that no message carries (`_original/lib/rules/rules.js:1655-1661`).
+    #[test]
+    fn an_empty_header_key_is_kept_not_dropped() {
+        for token in [
+            "includeFilter://reqH.=yes",
+            "includeFilter://reqH.:yes",
+            "includeFilter://h:=yes",
+            // One `!` is the value's, and leaves the key empty but present.
+            "includeFilter://reqH.!:yes",
+        ] {
+            match cond_of(token).cond {
+                Cond::Header { name, .. } => assert_eq!(name, "", "{token}"),
+                other => panic!("{token} parsed as {other:?}"),
+            }
+        }
+    }
+
+    /// A condition name with nothing after its separator is not a condition:
+    /// both of upstream's regexes end `(.+)` (`_original/lib/rules/rules.js:57-60`).
+    /// It falls through to the URL branch, where `^reqH.` is a pattern no URL
+    /// matches — which is not the same as being dropped.
+    #[test]
+    fn a_condition_name_with_no_value_is_a_url_pattern() {
+        for token in ["includeFilter://reqH.", "includeFilter://m:", "includeFilter://s:"] {
+            assert!(
+                matches!(cond_of(token).cond, Cond::Url(_)),
+                "{token} should be a URL pattern"
+            );
         }
     }
 
