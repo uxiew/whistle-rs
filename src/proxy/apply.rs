@@ -158,10 +158,14 @@ pub fn substitute_values(
         if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
             && let Some(content) = values.get(name)
         {
+            let name = name.to_string();
             *value = content.clone();
             // What came back is the content, not a place to find it — see
             // `RuleOp::value_is_content`.
             op.value_is_content = true;
+            // The name outlives the substitution because the file family guesses
+            // a content type from it — see `RuleOp::value_key`.
+            op.value_key = Some(name);
             return;
         }
         // `${name}` anywhere *inside* a value, which is the other half of
@@ -1234,25 +1238,31 @@ fn serve_file_family(
     // arm upstream (`_original/lib/util/index.js:1178-1180`). `<path>` is the
     // third bracket form and means the opposite: a path pinned in place, which
     // the matcher has already honoured by not extending it.
+    //
+    // A body that came from the values store guesses its type from the *name*
+    // it was stored under — `rule.key` at `file-proxy.js:270-272` — because that
+    // is the only place `mock.json`'s extension is written down. An inline
+    // `(text)` has no such name and falls back to the request URL.
     if op.value_is_content {
         let bytes = value.as_bytes().to_vec();
+        let named = op.value_key.as_deref().unwrap_or(&info.full_url);
         return Some(if raw {
-            serve_raw_http(&bytes, &info.full_url, info)
+            serve_raw_value(&bytes)
         } else if templated {
-            serve_template(&bytes, &info.full_url, info, env)
+            serve_template(&bytes, named, info, env)
         } else {
-            serve_file_bytes(&bytes, &info.full_url, info)
+            serve_file_range(&bytes, named, info)
         });
     }
     let value = match crate::rules::url::fixed_value(value) {
         Some((crate::rules::url::Fixed::Inline, text)) => {
             let bytes = text.into_bytes();
             return Some(if raw {
-                serve_raw_http(&bytes, &info.full_url, info)
+                serve_raw_value(&bytes)
             } else if templated {
                 serve_template(&bytes, &info.full_url, info, env)
             } else {
-                serve_file_bytes(&bytes, &info.full_url, info)
+                serve_file_range(&bytes, &info.full_url, info)
             });
         }
         Some((crate::rules::url::Fixed::Verbatim, path)) => std::borrow::Cow::Owned(path),
@@ -1263,12 +1273,17 @@ fn serve_file_family(
     match candidates.read() {
         // The *matched* path drives the content type, not the rule value: with
         // `file:///tmp/mock/` it is `/tmp/mock/index.html` that was served.
+        //
+        // Only this arm names the proxy in a `Server` header: upstream builds it
+        // alongside the content type in the `readFiles` callback
+        // (`file-proxy.js:315-318`), so a body that never touched the filesystem
+        // — inline, values store, or the 404 — does not carry one.
         Some((path, data)) => Some(if raw {
             serve_raw_http(&data, &path, info)
         } else if templated {
-            serve_template(&data, &path, info, env)
+            with_server(serve_template(&data, &path, info, env))
         } else {
-            serve_file_bytes(&data, &path, info)
+            with_server(serve_file_range(&data, &path, info))
         }),
         // A cross (`x`/`xs`) rule falls through to the real server instead —
         // including when the path was refused (`file-proxy.js:298-303`).
@@ -1872,6 +1887,128 @@ fn serve_file_bytes(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody
         .unwrap()
 }
 
+/// Name the proxy that served a local file, as upstream names itself in the
+/// header block it builds beside the content type (`server: config.appName`,
+/// `_original/lib/handlers/file-proxy.js:315-318`).
+///
+/// Spelled honestly, for the reason [`mark_self_generated`] gives: this is not
+/// whistle. It is a *response* header the mock carries, not proxy bookkeeping,
+/// which is why it is set here and not on everything the proxy answers.
+fn with_server(mut resp: Response<DynBody>) -> Response<DynBody> {
+    set_header(resp.headers_mut(), "server", "whistle-rs");
+    resp
+}
+
+/// Serve `file://` bytes, honouring a `Range` request header.
+///
+/// Only this shape of response is rangeable: `getRawResByPath` asks for a range
+/// unless the protocol is `rawfile` (`file-proxy.js:100-102`), and the template
+/// branch never reaches it at all. So `rawfile://` and `tpl://` answer 200 with
+/// the whole body however the client asks.
+fn serve_file_range(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> {
+    let Some((start, end)) = parse_range(info, data.len()) else {
+        return serve_file_bytes(data, path, info);
+    };
+    Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(
+            hyper::header::CONTENT_TYPE,
+            content_type_for(path, &info.full_url),
+        )
+        .header(
+            hyper::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", data.len()),
+        )
+        .header(hyper::header::ACCEPT_RANGES, "bytes")
+        .body(body::full(Bytes::copy_from_slice(&data[start..=end])))
+        .unwrap()
+}
+
+/// whistle's `parseRange` (`_original/lib/util/index.js:3346-3382`), returning
+/// the inclusive byte range to serve, or `None` for "send the whole thing".
+///
+/// It is reproduced with its arithmetic intact rather than corrected, because
+/// two of its answers are load-bearing for anyone who already has mocks:
+///
+/// * a **suffix** range (`bytes=-500`) computes its start as `size - end` and
+///   then compares it against `end` itself, so `start > end` and the range is
+///   dropped — whistle answers 200 with the whole body, never the last 500
+///   bytes;
+/// * **several** ranges collapse into one spanning the lowest start and the
+///   highest end, so `bytes=0-1,5-6` serves bytes 0 through 6 as a single 206
+///   rather than a multipart response.
+///
+/// A zero-length body is never ranged (`size &&` guards the whole function).
+fn parse_range(info: &ReqInfo, size: usize) -> Option<(usize, usize)> {
+    if size == 0 {
+        return None;
+    }
+    let header = req_header(Some(info), "range")?;
+    let spec = header.trim_start();
+    // `BYTES_RANGE_RE = /^\s*bytes=/i` — the `=` has to follow the unit
+    // immediately, so `bytes =0-5` is not a range at all.
+    let spec = spec
+        .get(..6)
+        .filter(|unit| unit.eq_ignore_ascii_case("bytes="))
+        .map(|_| spec[6..].trim())?;
+    if spec.is_empty() {
+        return None;
+    }
+    // `parseInt(s, 10)`: skip leading whitespace, take a sign and then the
+    // leading digits, and answer `NaN` if there are none. Splitting on every
+    // `-` first is what makes `bytes=-3-5` an absent start and an end of `3`.
+    let leading_int = |s: &str| {
+        let s = s.trim_start();
+        let digits = s.strip_prefix('+').unwrap_or(s);
+        let len = digits.bytes().take_while(u8::is_ascii_digit).count();
+        digits[..len].parse::<i64>().ok()
+    };
+
+    let size = size as i64;
+    let (mut start, mut end) = (size, -1i64);
+    for item in spec.split(',') {
+        let mut parts = item.split('-');
+        let (first, second) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        let (s, e) = match (leading_int(first), leading_int(second)) {
+            (None, None) => continue,
+            (None, Some(e)) => (size - e, e),
+            (Some(s), None) => (s, size - 1),
+            (Some(s), Some(e)) => (s, e),
+        };
+        start = start.min(s);
+        end = end.max(e);
+    }
+    if start < 0 || end < 0 || start > end || end >= size {
+        return None;
+    }
+    Some((start as usize, end as usize))
+}
+
+/// Serve a `rawfile://` whose value *is* the response text, not a path to it
+/// (`getRawResByValue`, `_original/lib/handlers/file-proxy.js:84-98`).
+///
+/// It differs from the path form twice. With no blank line anywhere, `parseRes`
+/// is handed nothing and returns bare `{200, {}}`, so the body goes out with
+/// **no content type at all** — where a path with no blank line falls back to
+/// the file handler's own header block. And `content-encoding` is deleted
+/// (`fromValue`, `file-proxy.js:71-73`): a value is written as literal text in
+/// a rules file, so it cannot be the compressed bytes the header claims, and
+/// leaving it in makes the client fail to decode a body it can read.
+fn serve_raw_value(data: &[u8]) -> Response<DynBody> {
+    match find_headers_sep(data) {
+        Some((head_end, body_start)) => {
+            let mut resp =
+                raw_response(&data[..head_end], Bytes::copy_from_slice(&data[body_start..]));
+            resp.headers_mut().remove(hyper::header::CONTENT_ENCODING);
+            resp
+        }
+        None => Response::builder()
+            .status(StatusCode::OK)
+            .body(body::full(Bytes::copy_from_slice(data)))
+            .unwrap(),
+    }
+}
+
 /// How far into a `rawfile://` whistle looks for the header/body separator
 /// before giving up and serving the file as an ordinary body
 /// (`MAX_HEADERS_SIZE`, `_original/lib/handlers/file-proxy.js:13,151-158`).
@@ -1886,11 +2023,29 @@ const MAX_RAW_HEADERS: usize = 256 * 1024;
 fn serve_raw_http(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> {
     let budget = &data[..data.len().min(MAX_RAW_HEADERS)];
     let Some((head_end, body_start)) = find_headers_sep(budget) else {
-        return serve_file_bytes(data, path, info);
+        // Not a raw response, so it is served as an ordinary file — header block
+        // and all, which is what `reader.headers || headers` falls back to at
+        // `file-proxy.js:348`.
+        return with_server(serve_file_bytes(data, path, info));
     };
-    // Only the head is text; the body stays bytes so a binary payload survives.
-    let head = String::from_utf8_lossy(&data[..head_end]);
-    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
+    raw_response(
+        &data[..head_end],
+        Bytes::copy_from_slice(&data[body_start..]),
+    )
+}
+
+/// Build a response from a raw HTTP head and a body
+/// (`parseRes`, `_original/lib/handlers/file-proxy.js:61-78`).
+///
+/// Only the head is decoded as text; the body stays bytes so a binary payload
+/// survives. A head whose first line carries no numeric status is served as 200
+/// — upstream assigns `statusLine[1]` unchecked and then throws while writing
+/// the response, which reaches the client as a reset connection.
+fn raw_response(head: &[u8], body: Bytes) -> Response<DynBody> {
+    let head = String::from_utf8_lossy(head);
+    // `CRLF_RE = /\r\n|\r|\n/g` (`file-proxy.js:10`) — a lone CR ends a header
+    // line too, so `.http` fixtures written on any platform parse.
+    let mut lines = head.split(['\n', '\r']).filter(|l| !l.is_empty());
     let status = lines
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
@@ -1903,14 +2058,12 @@ fn serve_raw_http(data: &[u8], path: &str, info: &ReqInfo) -> Response<DynBody> 
             builder = builder.header(k.trim(), v.trim());
         }
     }
-    builder
-        .body(body::full(Bytes::copy_from_slice(&data[body_start..])))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(body::empty())
-                .unwrap()
-        })
+    builder.body(body::full(body)).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(body::empty())
+            .unwrap()
+    })
 }
 
 /// Locate the blank line separating a raw response's head from its body,
@@ -1985,23 +2138,55 @@ fn content_type_for(path: &str, full_url: &str) -> &'static str {
 
 /// Map a path's extension to a content type, or `None` when there is no
 /// extension in the final path segment.
+///
+/// Types and spellings are whatever the `mime` package upstream depends on
+/// answers for that extension; the `; charset=utf-8` suffix follows upstream's
+/// `util.isText` (`_original/lib/util/index.js:1494-1531`), which is a substring
+/// test — anything naming `javascript`, `css`, `html`, `json`, `xml` or starting
+/// `text/` is text, and only `image/*` that got past those is not. That is why
+/// `image/svg+xml` carries a charset and `image/png` does not.
+///
+/// The table is a subset of `mime`'s several hundred entries, covering what a
+/// mock tree holds. An extension outside it falls back to the request URL's, as
+/// it would for a file with no extension at all.
 fn content_type_of_ext(path: &str) -> Option<&'static str> {
     let last = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let ext = last.rsplit_once('.')?.1.to_ascii_lowercase();
     Some(match ext.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
+        "xhtml" => "application/xhtml+xml; charset=utf-8",
         "js" | "mjs" => "application/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
+        // A source map is JSON, and `.map` is how every bundler spells it.
+        "json" | "map" => "application/json; charset=utf-8",
         "xml" => "application/xml; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "yaml" | "yml" => "text/yaml; charset=utf-8",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml; charset=utf-8",
         "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
         "wasm" => "application/wasm",
         "pdf" => "application/pdf",
+        "bin" => "application/octet-stream",
         "txt" | "text" => "text/plain; charset=utf-8",
         _ => return None,
     })
@@ -8446,6 +8631,268 @@ mod tests {
         let mut data = vec![b'x'; MAX_RAW_HEADERS + 16];
         data.extend_from_slice(b"\r\n\r\nbody");
         assert!(find_headers_sep(&data[..data.len().min(MAX_RAW_HEADERS)]).is_none());
+    }
+
+    /// A raw response's header lines end at any of `\r\n`, `\r` or `\n`
+    /// (`CRLF_RE`, `file-proxy.js:10`). Splitting on `\n` alone read a
+    /// CR-terminated fixture as one long status line, so every header in it was
+    /// dropped — the body and the status arrived, the headers silently did not.
+    #[test]
+    fn raw_file_header_lines_end_at_a_bare_cr() {
+        let fx = Fixtures::new("rawcr");
+        let path = fx.write("cr.http", b"HTTP/1.1 202 Accepted\rX-Sep: cr\r\rcr body");
+        let info = build_req_info("GET", "http", "x.com", 80, "/", &HeaderMap::new(), None);
+        let op = RuleOp {
+            protocol: "rawfile".into(),
+            value: path,
+            ..Default::default()
+        };
+        let resp = serve_file_family("rawfile", &op, &info, test_env()).expect("served");
+        assert_eq!(resp.status().as_u16(), 202);
+        assert_eq!(
+            resp.headers().get("x-sep").and_then(|v| v.to_str().ok()),
+            Some("cr")
+        );
+    }
+
+    /// A `rawfile://` head with no status line: upstream takes the first line's
+    /// second word as the status code and throws while writing the response,
+    /// which the client sees as a reset connection. Serving it as 200 is a
+    /// deliberate deviation — there is no behaviour there to be faithful to.
+    #[test]
+    fn a_raw_response_with_no_status_line_falls_back_to_200() {
+        let fx = Fixtures::new("rawnostatus");
+        let path = fx.write("h.http", b"X-Only: header\r\n\r\nbody");
+        let (status, _, body) = serve("rawfile", &path).expect("served");
+        assert_eq!((status, body.as_slice()), (200, b"body".as_slice()));
+    }
+
+    /// Only a file read off disk carries `Server` (`file-proxy.js:315-318`);
+    /// an inline value, a values-store body and the 404 are all built elsewhere
+    /// and carry none. The asymmetry is upstream's and is worth keeping: the
+    /// header says the bytes came from the filesystem.
+    #[test]
+    fn only_a_file_read_from_disk_names_the_proxy_in_server() {
+        let fx = Fixtures::new("srvhdr");
+        let path = fx.write("a.txt", b"body");
+        let served = |proto: &str, value: &str| {
+            let info = build_req_info("GET", "http", "x.com", 80, "/", &HeaderMap::new(), None);
+            let op = RuleOp {
+                protocol: proto.into(),
+                value: value.into(),
+                ..Default::default()
+            };
+            let resp = serve_file_family(proto, &op, &info, test_env()).expect("served");
+            resp.headers()
+                .get("server")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(served("file", &path).as_deref(), Some("whistle-rs"));
+        assert_eq!(served("tpl", &path).as_deref(), Some("whistle-rs"));
+        assert_eq!(served("file", "(inline)"), None);
+        assert_eq!(served("file", &fx.path("nope.txt")), None);
+        // A parsed raw response brings its own headers and replaces the block
+        // `Server` lives in; one with no blank line falls back to it.
+        let raw = fx.write("r.http", b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nb");
+        assert_eq!(served("rawfile", &raw), None);
+        assert_eq!(served("rawfile", &path).as_deref(), Some("whistle-rs"));
+    }
+
+    /// The name a body was stored under is the only place its extension is
+    /// written, so it is what the content type is guessed from
+    /// (`rule.key`, `file-proxy.js:270-272`). Without this, `file://{mock.json}`
+    /// served JSON as `text/html` and a browser rendered it as a page.
+    #[test]
+    fn a_values_key_names_the_file_its_type_is_guessed_from() {
+        let typed = |key: Option<&str>, url: &str| {
+            let (host, path) = url.split_once('/').expect("host and path");
+            let info = build_req_info("GET", "http", host, 80, path, &HeaderMap::new(), None);
+            let op = RuleOp {
+                protocol: "file".into(),
+                value: "{\"a\":1}".into(),
+                value_is_content: true,
+                value_key: key.map(str::to_string),
+                ..Default::default()
+            };
+            let resp = serve_file_family("file", &op, &info, test_env()).expect("served");
+            resp.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(typed(Some("mock.json"), "x.com/echo"), "application/json; charset=utf-8");
+        // A key with no extension of its own falls back to the request URL's,
+        // and then to `text/html` — the same chain a nameless inline value takes.
+        assert_eq!(typed(Some("mockbody"), "x.com/thing.css"), "text/css; charset=utf-8");
+        assert_eq!(typed(None, "x.com/thing.css"), "text/css; charset=utf-8");
+        assert_eq!(typed(Some("mockbody"), "x.com/echo"), "text/html; charset=utf-8");
+    }
+
+    /// `util.isText` is a substring test, so a type merely *naming* xml or html
+    /// is text — which is why an SVG carries a charset and a PNG does not
+    /// (`_original/lib/util/index.js:1494-1531`).
+    #[test]
+    fn a_content_type_carries_a_charset_only_when_it_is_text() {
+        for (ext, want) in [
+            ("svg", "image/svg+xml; charset=utf-8"),
+            ("xhtml", "application/xhtml+xml; charset=utf-8"),
+            ("map", "application/json; charset=utf-8"),
+            ("md", "text/markdown; charset=utf-8"),
+            ("csv", "text/csv; charset=utf-8"),
+            ("yml", "text/yaml; charset=utf-8"),
+            ("png", "image/png"),
+            ("woff2", "font/woff2"),
+            ("mp4", "video/mp4"),
+            ("zip", "application/zip"),
+        ] {
+            assert_eq!(content_type_of_ext(&format!("a.{ext}")), Some(want), "{ext}");
+        }
+    }
+
+    /// Serve a file rule for a `GET` carrying one request header.
+    fn serve_with_header(
+        proto: &str,
+        value: &str,
+        name: &str,
+        header: &str,
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+            header.parse().expect("header value"),
+        );
+        let info = build_req_info("GET", "http", "x.com", 80, "/", &headers, None);
+        let op = RuleOp {
+            protocol: proto.into(),
+            value: value.into(),
+            ..Default::default()
+        };
+        let resp = serve_file_family(proto, &op, &info, test_env()).expect("served");
+        let status = resp.status().as_u16();
+        let heads = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let body = rt()
+            .block_on(async { http_body_util::BodyExt::collect(resp.into_body()).await })
+            .expect("collect body")
+            .to_bytes()
+            .to_vec();
+        (status, heads, body)
+    }
+
+    #[test]
+    fn a_range_request_serves_part_of_a_file() {
+        let fx = Fixtures::new("range");
+        let path = fx.write("r.txt", b"ranged-0123456789-end");
+        let (status, heads, body) = serve_with_header("file", &path, "range", "bytes=0-5");
+        assert_eq!((status, body.as_slice()), (206, b"ranged".as_slice()));
+        assert!(heads.contains(&("content-range".into(), "bytes 0-5/21".into())), "{heads:?}");
+        assert!(heads.contains(&("accept-ranges".into(), "bytes".into())), "{heads:?}");
+        // An inline value is rangeable too — it is the same `if (!isRawFile)`
+        // arm upstream (`file-proxy.js:280-289`).
+        let (status, _, body) = serve_with_header("file", "(0123456789)", "range", "bytes=2-4");
+        assert_eq!((status, body.as_slice()), (206, b"234".as_slice()));
+    }
+
+    /// `rawfile://` asks for no range at all (`file-proxy.js:100-102`) and
+    /// `tpl://` never reaches the code that would; both answer whole.
+    #[test]
+    fn raw_and_template_responses_ignore_a_range_request() {
+        let fx = Fixtures::new("rangeskip");
+        let raw = fx.write("r.http", b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nabcdefgh");
+        let (status, _, body) = serve_with_header("rawfile", &raw, "range", "bytes=0-3");
+        assert_eq!((status, body.as_slice()), (200, b"abcdefgh".as_slice()));
+
+        let tpl = fx.write("t.txt", b"abcdefgh${nothing}");
+        let (status, _, body) = serve_with_header("tpl", &tpl, "range", "bytes=0-3");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 18);
+    }
+
+    /// whistle's range arithmetic, quirks included: a suffix range compares its
+    /// computed start against the *suffix length* and loses, and several ranges
+    /// collapse into the one span that covers them all.
+    #[test]
+    fn range_parsing_reproduces_upstreams_arithmetic() {
+        let parsed = |spec: &str, size: usize| {
+            let mut headers = HeaderMap::new();
+            headers.insert(hyper::header::RANGE, spec.parse().expect("range value"));
+            let info = build_req_info("GET", "http", "x.com", 80, "/", &headers, None);
+            parse_range(&info, size)
+        };
+        assert_eq!(parsed("bytes=0-5", 21), Some((0, 5)));
+        assert_eq!(parsed("bytes=7-", 21), Some((7, 20)));
+        assert_eq!(parsed("bytes=0-20", 21), Some((20 - 20, 20)));
+        assert_eq!(parsed("BYTES=0-5", 21), Some((0, 5)));
+        assert_eq!(parsed("  bytes=0-5", 21), Some((0, 5)));
+        // `bytes=0-1,5-6` is one span, not two parts.
+        assert_eq!(parsed("bytes=0-1,5-6", 21), Some((0, 6)));
+        // A suffix range: start becomes `21 - 5 = 16`, which is compared against
+        // the end `5` and rejected. Upstream sends the whole body.
+        assert_eq!(parsed("bytes=-5", 21), None);
+        assert_eq!(parsed("bytes=10-99", 21), None);
+        assert_eq!(parsed("bytes=9-2", 21), None);
+        assert_eq!(parsed("bytes=abc", 21), None);
+        assert_eq!(parsed("bytes=", 21), None);
+        assert_eq!(parsed("items=0-5", 21), None);
+        // `bytes =0-5` — the `=` has to follow the unit immediately.
+        assert_eq!(parsed("bytes =0-5", 21), None);
+        // Nothing is ranged out of an empty body.
+        assert_eq!(parsed("bytes=0-1", 0), None);
+    }
+
+    /// The inline form of `rawfile://` parses what it is given and no more: with
+    /// no blank line, `parseRes` receives nothing and answers a bare `{200, {}}`,
+    /// so the body goes out untyped (`getRawResByValue`, `file-proxy.js:84-98`).
+    /// The path form falls back to the file handler's header block instead.
+    #[test]
+    fn an_inline_raw_response_without_a_blank_line_is_untyped() {
+        let info = build_req_info("GET", "http", "x.com", 80, "/a.json", &HeaderMap::new(), None);
+        let op = RuleOp {
+            protocol: "rawfile".into(),
+            value: "(no-blank-line)".into(),
+            ..Default::default()
+        };
+        let resp = serve_file_family("rawfile", &op, &info, test_env()).expect("served");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert!(resp.headers().get(hyper::header::CONTENT_TYPE).is_none());
+    }
+
+    /// A raw response written as a *value* cannot be the compressed bytes a
+    /// `content-encoding` claims — it was typed into a rules file — so upstream
+    /// drops the header (`fromValue`, `file-proxy.js:71-73`). Keeping it made
+    /// the client try to gunzip plain text and fail on a body it could read.
+    /// A raw response read from a *file* keeps it: that one can really be gzip.
+    #[test]
+    fn a_raw_response_from_a_value_loses_its_content_encoding() {
+        let info = build_req_info("GET", "http", "x.com", 80, "/", &HeaderMap::new(), None);
+        let head = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\nplain";
+        let encoding_of = |op: &RuleOp| {
+            serve_file_family("rawfile", op, &info, test_env())
+                .expect("served")
+                .headers()
+                .get(hyper::header::CONTENT_ENCODING)
+                .map(|v| v.to_str().unwrap_or_default().to_string())
+        };
+        let from_value = RuleOp {
+            protocol: "rawfile".into(),
+            value: String::from_utf8_lossy(head).into_owned(),
+            value_is_content: true,
+            ..Default::default()
+        };
+        assert_eq!(encoding_of(&from_value), None);
+
+        let fx = Fixtures::new("rawenc");
+        let from_file = RuleOp {
+            protocol: "rawfile".into(),
+            value: fx.write("r.http", head),
+            ..Default::default()
+        };
+        assert_eq!(encoding_of(&from_file).as_deref(), Some("gzip"));
     }
 
     #[test]

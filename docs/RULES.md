@@ -2105,8 +2105,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 | TLS | `cipher` (upstream TLS version pin + OpenSSL cipher-string evaluation), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
-**Rule-file features:** a line `@<url>` or `@<file>` includes rules fetched/read from
-that source at load time; `${port}` and `${version}` in operator values are substituted
+**Rule-file features:** `${port}` and `${version}` in operator values are substituted
 (case-insensitive); an operator value that names a file or a URL is
 [read before the operator applies](#values-read-from-a-file-or-a-url), and one
 wrapped in backticks is [rendered against the request](#backtick-templates);
@@ -2304,6 +2303,13 @@ in upstream whistle.
 
 Known gaps in the operator layer, deliberately left:
 
+- **A line that is just `@<file>` or `@<url>` does not include anything.**
+  Upstream reads the source at load time and parses its rules into the group —
+  put `@/tmp/mock/rules.txt` on a line by itself and the file's rules take
+  effect; point it at a path that does not exist and none do. whistle-rs drops
+  the line, and the request goes to the origin. Written with a pattern
+  (`example.com @/tmp/rules.txt`) neither proxy includes anything: that is the
+  `G://` global-value operator, not an include.
 - **`resRules://` entries of a `resScript` list are not applied.** Upstream folds
   them into a rules text the response phase parses; whistle-rs's `resScript` is a
   JavaScript hook that mutates the response directly, so it has nowhere to put

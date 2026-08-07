@@ -214,8 +214,26 @@ GET http://example.com/api?callback=cb123
 
 第 2 步是为什么 `example.com/a.json file:///tmp/mock` 能返回 JSON —— 即使 mock 文件没有扩展名。
 
-模板响应的状态码**恒为 200**，`content-length` 在渲染**之后**重新计算，且**不支持 Range 请求**
-（`file://` 目前也不支持，见「文件查找」末尾）。
+值来自 [values 存储](#与-values-存储的关系)时，「命中的文件」就是**存储条目的名字**
+（`rule.key`，`file-proxy.js:270-272`）—— `file://{mock.json}` 返回 `application/json`，
+因为那个 `.json` 只写在名字里。内联 `(text)` 没有名字，直接走第 2 步。
+
+`; charset=utf-8` 后缀跟着上游的 `util.isText`（`util/index.js:1494-1531`），那是个**子串判断**：
+类型里出现 `javascript`/`css`/`html`/`json`/`xml`，或以 `text/` 开头，都算文本。
+所以 `image/svg+xml` **带** charset，而 `image/png` 不带。
+
+扩展名表是上游 `mime` 那几百条的一个子集，覆盖 mock 目录里会出现的类型；
+表外的扩展名按「没有扩展名」处理，回落到第 2 步。
+
+模板响应的状态码**恒为 200**，`content-length` 在渲染**之后**重新计算，且**不支持 Range 请求** ——
+`getRawResByPath` 才会求 range，而模板分支根本不走那里（`file-proxy.js:100-102`）。
+
+### `Server`
+
+从磁盘读到的文件会带一个 `Server` 响应头（上游是 `server: config.appName`，`file-proxy.js:315-318`；
+whistle-rs 如实写自己的名字）。**只有真正读了文件的响应**有这个头 —— 内联值、values 存储的
+内容、以及 404 都是在别处拼出来的，都没有；解析成功的 `rawfile://` 用的是文件自带的响应头，
+也没有。换句话说，这个头等于「这些字节来自文件系统」。
 
 响应侧算子（`resHeaders://`、`resType://`、`resCors://` 等）**对模板/文件响应同样生效** ——
 和上游一样，短路产生的响应也会走一遍响应侧规则：
@@ -253,11 +271,26 @@ Content-Type: application/json
 分隔头和 body 的空行**接受任意 CR/LF 组合**（`HEADERS_SEP_RE`，`file-proxy.js:12`）：
 `\r\n\r\n`、`\n\n`、`\r\r`、`\n\r` 等八种写法都算，手写的 `.http` fixture 不必纠结换行符。
 
-两个边界行为：
+响应头之间的换行同样是**任意 CR/LF**（`CRLF_RE`，`file-proxy.js:10`）—— 单独一个 `\r` 也算行尾。
+
+几个边界行为：
 
 - **前 256 KB 内找不到空行就不当作 raw 响应**（`MAX_HEADERS_SIZE`，`file-proxy.js:13,151-158`），
   整个文件按普通文件返回，而不是把第一行误当成状态行。
 - body 按**字节**切分并原样返回，二进制内容（图片等）不会被 UTF-8 转换损坏。
+- **状态行缺失时按 200 处理**。这是一处**刻意的偏离**：上游把首行的第二个词直接当状态码赋值
+  （`statusLine[1]`，`file-proxy.js:75`），写响应时抛异常，客户端拿到的是连接被重置 ——
+  那里没有值得忠实复刻的行为。
+
+**值形式与路径形式不一样**（`getRawResByValue` vs `getRawResByPath`）：
+
+| | `rawfile:///path.http` | `rawfile://{name}` / `rawfile://(text)` |
+|--|--|--|
+| 找不到空行 | 整个文件按普通文件返回，带 Content-Type 和 `Server` | 整段按 body 返回，**没有 Content-Type** |
+| `content-encoding` | 保留 —— 文件里真的可能是 gzip | **删除**（`fromValue`，`file-proxy.js:71-73`）—— 值是规则文件里敲出来的文本，不可能是压缩字节 |
+
+> 内联 `(...)` 值是**一个不含空白的 token**：规则行先按空白切分，`file://(a b)` 会变成两个
+> token，谁都不是值。要写多行内容请用 [``` 围栏值](#与-values-存储的关系)。
 
 ---
 
@@ -272,6 +305,10 @@ Content-Type: application/json
 | `~/mock.json` | `$HOME/mock.json`（全角 `～/` 同样生效；单独一个 `~` 不展开） |
 | `/tmp/site/` | `/tmp/site`，然后 `/tmp/site/index.html` |
 | `tmp/x`（缺少前导 `/`） | `tmp/x`，然后 `/tmp/x` —— whistle-rs 自己的兜底 |
+| `/tmp/a%20b.json` | `/tmp/a b.json` —— 先截掉 `?`/`#` 之后的部分再百分号解码（`decodePath`，`util/index.js:1403-1418`） |
+
+最后一行是目录规则能用的前提：请求路径会被拼到值后面，所以 `/static/a%20b.json?v=2`
+要还原成文件名 `a b.json`。
 
 含 `..` 路径段的候选会被**拒绝**（`UP_PATH_REGEXP`，`_original/lib/util/common.js:29`），
 不参与查找；如果整条规则最终没找到文件，404 的正文里显示的就是这个标记：
@@ -296,14 +333,30 @@ Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写
 `file://` 的定位是在开发机上服务任意本地路径，因此除了上面的 `..` 校验**不做沙箱限制** ——
 上游对绝对路径同样不加限制。
 
+### Range 请求
+
+`file://` 支持 Range（206 + `content-range` + `accept-ranges`）；`rawfile://` 和 `tpl://` 不支持 ——
+上游只在非 `rawfile` 时求 range，而模板分支根本不走那段代码（`file-proxy.js:100-102`）。
+内联值和 values 存储的内容与真实文件一样可以被 range 切分（`file-proxy.js:280-289`）。
+
+区间算术**照抄上游的 `parseRange`**（`util/index.js:3346-3382`），包括两处会让人意外的结果：
+
+| 请求 | 结果 |
+|------|------|
+| `bytes=0-5` | `206`，前 6 字节 |
+| `bytes=7-` | `206`，第 7 字节到结尾 |
+| `bytes=0-1,5-6` | `206`，**合并成 0-6 的一段**，不是 multipart |
+| `bytes=-500` | **`200`，整份文件**。上游把起点算成 `size-500` 却拿它跟 `500` 比大小，`start > end` 于是整个区间被丢弃 |
+| `bytes=10-99`（超出长度） | `200`，整份文件 |
+| 空 body | 永远不切分（`size &&` 挡在最前面） |
+
+复刻而不是修正，是因为 mock 已经按这个行为写好了：后缀区间在原版拿到的就是整份文件。
+
 **尚未移植**：
 
 | 上游行为 | 现状 |
 |----------|------|
-| 路径先 `decodeURIComponent`，并截掉 `?`/`#` 之后的部分（`decodePath`，`util/index.js:1403-1418`） | 未实现。上游需要它是因为目录规则会把请求路径拼到值后面，whistle-rs 不拼；代价是 `file:///tmp/a%20b.json` 这种写法目前不会解码 |
 | 文件族的值从**远程 URL** / 插件 key 解析 | 未实现。**算子取值**这一侧已支持（见 [`RULES.md`](RULES.md#values-read-from-a-file-or-a-url)），但 `file://` 一族走的是上游另一条路（`getRuleFiles`，`util/index.js:1420-1444`），仍只认本地路径。values 存储引用（`file://{name}`）一直是支持的，见本文末尾 |
-| `file://` 的 Range 请求（206 + `content-range`，`file-proxy.js:102,166-176`） | 未实现，整份文件以 200 返回。Range 是可选的，客户端会自行处理；另外上游 `parseRange` 对 `bytes=-500` 这类后缀区间算错（`util/index.js:3364-3368`），复刻与否都需要额外决策 |
-| `rawfile://` 的**内联值**形式会删掉 `content-encoding`（`file-proxy.js:71-73`） | 无法触发：whistle-rs 的规则解析器不支持 `<...>` 内联值，文件族的值永远是路径 |
 
 ### 文件缓存
 
@@ -321,3 +374,19 @@ Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写
 # {mock} 是 values 里的一个条目名，值为文件路径
 example.com   tpl://{mock}
 ```
+
+条目的**内容**同样可以直接当 body —— 这时候值不是路径，而是要返回的字节本身，
+文件系统根本不会被碰到。规则文件里的 ``` 围栏块就是这么用的：
+
+````
+``` mock.json
+{"ok": true}
+```
+example.com/api   file://{mock.json}
+````
+
+这条路上有三件事要记住：
+
+- Content-Type 从**条目名**猜（`mock.json` → `application/json`），见 [Content-Type](#content-type)；
+- 请求路径**不会**拼上去 —— 内容不是位置，没有可延长的东西；
+- 没有 `Server` 响应头，因为没有读文件。

@@ -73,6 +73,12 @@ ask is whether the *bench* is right — it has been wrong twice:
 `repro`-style debugging is easiest by cutting the corpus down to one case in
 `cases.js` and printing both answers whole.
 
+And the third thing to suspect is whether the case exercises the rule at all.
+`cases-file.js` opened with eleven cases where `127.0.0.1:PORT file:///tmp/x.txt`
+was asked for `/echo` — the unmatched path is concatenated onto the value, so
+both proxies looked for `/tmp/x.txt/echo`, both 404'd, and eleven cases agreed on
+nothing. A rule that fires and a rule that misses look identical in the output.
+
 ## Adding cases
 
 `cases.js` is a list of `{ name, rules, request? }`. `rules` is the text both
