@@ -3436,27 +3436,56 @@ async fn serve(
         || req_write.is_some()
         || req_write_raw.is_some()
     {
-        let bytes = collect_body(incoming).await?;
-        let new = apply::transform_req_body(bytes, &resolved, body_ctx);
-        if let Some(path) = &req_write {
-            write_body_file(path, &new, force_write);
-        }
-        if let Some(path) = &req_write_raw {
-            let head = format!("{} {} HTTP/1.1\r\n{}", parts.method, parts.uri, header_dump(&parts.headers));
-            write_raw_file(path, &head, &new, force_write);
-        }
-        if !new.is_empty() {
-            req_body_cap = Some(Capture::from_bytes(
-                &new,
-                req_ct.clone(),
-                req_enc.as_deref(),
-                state.config.body_preview_cap,
-            ));
-        }
-        apply::strip_length_headers(&mut parts.headers);
-        match req_speed {
-            Some(kbps) => body::throttled(new, kbps),
-            None => body::full(new),
+        // Bounded: these operators need the body in memory, and the body is
+        // whatever the client decided to send. Past the bound whistle stops
+        // transforming and lets the rest through — see [`body::collect_capped`].
+        match collect_capped_body(incoming, apply::req_body_limit(&resolved)).await? {
+            body::Capped::TooBig { body, .. } => {
+                // Said out loud, because every other way for these operators to
+                // do nothing has turned out to be a bug worth fixing. This one
+                // is a deliberate refusal, and a rule that quietly stopped
+                // applying above some size would read exactly like the bugs.
+                tracing::warn!(
+                    "{} {}: request body is over {} bytes, so it is forwarded \
+                     unchanged — reqBody/reqReplace/params/reqWrite and reqSpeed \
+                     do not apply. `enable://reqMergeBigData` raises the limit",
+                    info.method,
+                    info.full_url,
+                    apply::req_body_limit(&resolved),
+                );
+                let cap =
+                    Capture::new(req_ct.clone(), req_enc.as_deref(), state.config.body_preview_cap);
+                req_body_cap = Some(cap.clone());
+                body::tee(body, cap)
+            }
+            body::Capped::Whole(bytes) => {
+                let new = apply::transform_req_body(bytes, &resolved, body_ctx);
+                if let Some(path) = &req_write {
+                    write_body_file(path, &new, force_write);
+                }
+                if let Some(path) = &req_write_raw {
+                    let head = format!(
+                        "{} {} HTTP/1.1\r\n{}",
+                        parts.method,
+                        parts.uri,
+                        header_dump(&parts.headers)
+                    );
+                    write_raw_file(path, &head, &new, force_write);
+                }
+                if !new.is_empty() {
+                    req_body_cap = Some(Capture::from_bytes(
+                        &new,
+                        req_ct.clone(),
+                        req_enc.as_deref(),
+                        state.config.body_preview_cap,
+                    ));
+                }
+                apply::strip_length_headers(&mut parts.headers);
+                match req_speed {
+                    Some(kbps) => body::throttled(new, kbps),
+                    None => body::full(new),
+                }
+            }
         }
     } else if has_request_body(&parts.headers) {
         // No transform: stream through, copying a bounded preview for inspection.
