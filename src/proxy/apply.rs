@@ -2175,7 +2175,8 @@ struct Deletions {
     cookies: Vec<String>,
     /// `delete://trailer.x` — trailing header names to drop after the body
     /// (`TRAILER_RE`, `_original/lib/util/index.js:2663,:2812`). Response side
-    /// only, and unlike every other key here it is *not* scoped by `req`/`res`.
+    /// only, and unlike every other key here it is *not* scoped by `req`/`res`
+    /// and *not* case-insensitive.
     trailers: Vec<String>,
     /// `delete://resType` — drop the media type, keeping any charset.
     drop_type: bool,
@@ -2183,7 +2184,18 @@ struct Deletions {
     drop_charset: bool,
     /// `delete://body` / `delete://res.body` — empty the body outright, which
     /// also discards anything an operator meant to inject (`removeBody`,
-    /// `_original/lib/util/index.js:3592-3598`).
+    /// `_original/lib/util/index.js:3591-3598`).
+    ///
+    /// Deliberate divergence, and the second half is all upstream achieves.
+    /// `removeBody` writes `data.body = EMPTY_BUFFER`, and `EMPTY_BUFFER` is
+    /// `toBuffer('')` — whose first act is `if (!buf) return;`
+    /// (`_original/lib/util/common.js:1630-1632`), so the constant is
+    /// `undefined`. The assignment therefore leaves `data.body` falsy,
+    /// `isWhistleTransformData` says no, and no transform is added: upstream
+    /// drops the `reqBody`/`reqPrepend`/`reqAppend` injections and forwards the
+    /// real body untouched. The key is documented as removing the body
+    /// (<https://wproxy.org/docs/rules/delete.html>) and the code plainly means
+    /// to; this port does it.
     drop_body: bool,
     /// `delete://resBody.a.b` — dotted paths to remove from a JSON body.
     body_props: Vec<String>,
@@ -2220,14 +2232,15 @@ impl Deletions {
                     del.cookies.push(name.to_string());
                 } else if !request_side
                     && let Some(name) = key
-                        .to_ascii_lowercase()
                         .find("trailer.")
                         .map(|i| &key[i + "trailer.".len()..])
                         .filter(|n| !n.is_empty())
                 {
-                    // `TRAILER_RE` is unanchored at the front, so `resTrailer.x`
-                    // and a bare `trailer.x` both match — and so, upstream, does
-                    // anything else ending in `trailer.<name>`.
+                    // `TRAILER_RE` is unanchored at the front, so a bare
+                    // `trailer.x` matches and so does anything else ending in
+                    // `trailer.<name>`. It is also the one key here written
+                    // without the `i` flag, so the word must be lower case:
+                    // `delete://resTrailer.x` matches nothing and is inert.
                     del.trailers.push(name.to_string());
                 } else if let Some(path) = strip_del_scope(key, side, "B", "ody") {
                     del.body_props.push(path.to_string());
@@ -2466,6 +2479,16 @@ impl HeaderScope {
 }
 
 /// Remove a single cookie from the request `Cookie` header.
+///
+/// The header is *rebuilt*, not edited: upstream splits it, drops the named
+/// pair and renders the survivors as `name=value` joined by `"; "`
+/// (`setReqCookies`, `_original/lib/util/index.js:3052-3090`). Three
+/// consequences worth the rebuild: a pair that arrived without a `=` leaves
+/// with one, a trailing `;` becomes a nameless `=` pair of its own, and when
+/// nothing survives the header is set to the **empty string** rather than
+/// removed. `setHeader` assigns unconditionally, so the request still carries a
+/// `Cookie:` with nothing after it; a server that branches on the header's
+/// presence must see what whistle's would.
 fn remove_cookie(headers: &mut HeaderMap, name: &str) {
     let Some(cur) = headers
         .get(hyper::header::COOKIE)
@@ -2473,14 +2496,17 @@ fn remove_cookie(headers: &mut HeaderMap, name: &str) {
     else {
         return;
     };
-    let kept: Vec<&str> = cur
+    let kept = cur
         .split(';')
         .map(|s| s.trim())
-        .filter(|kv| kv.split_once('=').map(|(k, _)| k.trim() != name).unwrap_or(true))
-        .collect();
-    if kept.is_empty() {
-        headers.remove(hyper::header::COOKIE);
-    } else if let Ok(v) = HeaderValue::from_str(&kept.join("; ")) {
+        .filter(|kv| kv.split_once('=').map_or(*kv, |(k, _)| k) != name)
+        .map(|kv| match kv.contains('=') {
+            true => kv.to_string(),
+            false => format!("{kv}="),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if let Ok(v) = HeaderValue::from_str(&kept) {
         headers.insert(hyper::header::COOKIE, v);
     }
 }
@@ -4675,13 +4701,13 @@ fn apply_res_merge(
     format!("{}{merged}{}", &text[..start], &text[end..]).into_bytes()
 }
 
-/// Remove dotted paths from a JSON value (`deleteProps` →
-/// `_original/lib/util/common.js:989-1084`). A numeric segment addressing an
-/// array element splices it out. The `\.`-escaped and `a[0]` spellings upstream
-/// also accepts are not ported.
+/// Remove dotted paths from a JSON value (`deleteProps`,
+/// `_original/lib/util/common.js:1105-1128`). A numeric segment addressing an
+/// array element splices it out.
 fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
     for path in paths {
-        let mut keys = path.split('.').map(str::trim).peekable();
+        let keys = parse_json_path(path);
+        let mut keys = keys.iter().peekable();
         let mut node = &mut *value;
         while let Some(key) = keys.next() {
             if keys.peek().is_none() {
@@ -4690,9 +4716,7 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
                         map.remove(key);
                     }
                     serde_json::Value::Array(list) => {
-                        if let Ok(i) = key.parse::<usize>()
-                            && i < list.len()
-                        {
+                        if let Some(i) = array_index(key).filter(|i| *i < list.len()) {
                             list.remove(i);
                         }
                     }
@@ -4703,7 +4727,7 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
             let next = match node {
                 serde_json::Value::Object(map) => map.get_mut(key),
                 serde_json::Value::Array(list) => {
-                    key.parse::<usize>().ok().and_then(|i| list.get_mut(i))
+                    array_index(key).and_then(|i| list.get_mut(i))
                 }
                 _ => None,
             };
@@ -4712,6 +4736,102 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
                 None => break,
             }
         }
+    }
+}
+
+/// Split a `delete://…Body.<path>` key into the segments the walk above follows
+/// (`parseKeys`, `_original/lib/util/common.js:1077-1103`).
+///
+/// Three spellings beyond the plain dot, all of them upstream's:
+///
+/// * `a\.b` names **one** key containing a dot. Backslashes are halved before
+///   the dot is read, so `a\\.b` is two segments whose first is `a\`, and
+///   `a\\\.b` is one segment `a\.b`;
+/// * `"k[0]"` — a quoted segment is taken literally, which is how a key that
+///   itself ends in brackets is named;
+/// * `a[0][1]` — trailing bracket indices become segments of their own, so the
+///   bracket form and `a.0.1` address the same element.
+fn parse_json_path(path: &str) -> Vec<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = path.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            match c {
+                '.' => segments.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+            continue;
+        }
+        // `DOT_RE` is `/(\\+)\./g`, so the run of backslashes is maximal and
+        // only one that ends at a dot is halved at all.
+        let mut run = 1;
+        while chars.next_if_eq(&'\\').is_some() {
+            run += 1;
+        }
+        if chars.next_if_eq(&'.').is_none() {
+            cur.extend(std::iter::repeat_n('\\', run));
+            continue;
+        }
+        cur.extend(std::iter::repeat_n('\\', run / 2));
+        match run % 2 {
+            1 => cur.push('.'),
+            _ => segments.push(std::mem::take(&mut cur)),
+        }
+    }
+    segments.push(cur);
+    segments.iter().flat_map(|s| parse_json_key(s.trim())).collect()
+}
+
+/// One segment of a path, with its quotes stripped and its trailing `[n]`
+/// indices split off (`parseKey`, `_original/lib/util/common.js:1051-1075`).
+fn parse_json_key(key: &str) -> Vec<String> {
+    if key.len() >= 2 && key.starts_with('"') && key.ends_with('"') {
+        return vec![key[1..key.len() - 1].to_string()];
+    }
+    let mut head = key;
+    let mut indices: Vec<String> = Vec::new();
+    while let Some((rest, index)) = strip_trailing_index(head) {
+        indices.insert(0, index.to_string());
+        head = rest;
+    }
+    if indices.is_empty() {
+        return vec![key.to_string()];
+    }
+    // `if (key)` — a bare `[0]` has no name in front of it and contributes none.
+    if !head.is_empty() {
+        indices.insert(0, head.to_string());
+    }
+    indices
+}
+
+/// Split a trailing `[n]` off a path segment, matching `ARR_RE`
+/// (`_original/lib/util/common.js:1003`): decimal, no leading zero beyond `0`
+/// itself, and bounded so the index stays a safe integer.
+fn strip_trailing_index(key: &str) -> Option<(&str, &str)> {
+    let inner = key.strip_suffix(']')?;
+    let open = inner.rfind('[')?;
+    let index = &inner[open + 1..];
+    let ok = match index.as_bytes() {
+        b"0" => true,
+        [first @ b'1'..=b'8', rest @ ..] | [first @ b'9', rest @ ..] => {
+            let bound = if *first == b'9' { 14 } else { 15 };
+            rest.len() <= bound && rest.iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    };
+    ok.then(|| (&inner[..open], index))
+}
+
+/// A path segment as an array index (`NUM_RE`,
+/// `_original/lib/util/common.js:1002`): decimal with no leading zero, which is
+/// what `deleteProp` requires before it splices rather than deletes
+/// (`common.js:1033-1043`).
+fn array_index(key: &str) -> Option<usize> {
+    match key.as_bytes() {
+        b"0" => Some(0),
+        [b'1'..=b'9', rest @ ..] if rest.iter().all(u8::is_ascii_digit) => key.parse().ok(),
+        _ => None,
     }
 }
 
@@ -5393,9 +5513,15 @@ impl CookieValue {
 /// Parse a `reqCookies`/`resCookies` value into `name` → value entries.
 ///
 /// Like the other JSON-shaped operators, the value is either `{json}` or a
-/// query string, so `reqCookies://a=1&b=2` is two cookies. A name with no `=`
-/// gets an **empty value** — it does not delete the cookie; that is
-/// `delete://reqCookies.<name>`.
+/// query string, so `reqCookies://a=1&b=2` is two cookies. Within that query a
+/// name with no `=` gets an **empty value** — it does not delete the cookie;
+/// that is `delete://reqCookies.<name>`.
+///
+/// A value with no `=` *anywhere* is not a query string at all: upstream reads
+/// it as a location and tries to load it, so `reqCookies://sid` names a file
+/// and sets no cookie (`tryParseMatcher` bails on `indexOf('=') === -1`,
+/// `_original/lib/util/index.js:1165-1171`). Same gate as
+/// [`parse_header_pairs`].
 fn parse_cookie_ops(value: &str) -> Vec<(String, CookieValue)> {
     let value = value.trim();
     if value.starts_with('{')
@@ -5405,6 +5531,9 @@ fn parse_cookie_ops(value: &str) -> Vec<(String, CookieValue)> {
             .into_iter()
             .map(|(k, v)| (k, CookieValue::of_json(v)))
             .collect();
+    }
+    if !value.contains('=') {
+        return Vec::new();
     }
     value
         .split('&')
@@ -5597,11 +5726,9 @@ fn apply_req_cookies(headers: &mut HeaderMap, resolved: &Resolved) {
 /// of the same name, and it cannot tell which kind is out there.
 ///
 /// `host` adds two more, scoped to the parent domain, for a cookie that was set
-/// on `.example.com` rather than on the host itself. It is `Some` only for a
-/// request that arrived through an intercepted tunnel: upstream reads
-/// `req._w2hostname`, which is set on the tunnel path alone
-/// (`_original/lib/https/index.js:707`), so a plain forward-proxy request gets
-/// the two host-scoped entries and no more.
+/// on `.example.com` rather than on the host itself. Upstream reads
+/// `req._w2hostname`, which every request carries: it is the `Host` header's
+/// hostname, stamped before any rule runs (`_original/biz/index.js:40`).
 fn expiring_cookies(names: &[String], host: Option<&str>) -> Vec<(String, CookieValue)> {
     let expired = |secure: bool, domain: Option<&str>| {
         let mut map = serde_json::Map::new();
@@ -5658,9 +5785,7 @@ fn apply_res_cookies(
     // a `resCookies://x=…` on the same request: upstream folds the deletions in
     // with `extend(cookies, delKeys)`, so they overwrite (`index.js:3127-3129`).
     if !del.cookies.is_empty() {
-        // Only a tunnelled request has a hostname here; see `expiring_cookies`.
-        let host = info.filter(|i| i.from.tunnel).map(|i| i.host.as_str());
-        for (name, value) in expiring_cookies(&del.cookies, host) {
+        for (name, value) in expiring_cookies(&del.cookies, info.map(|i| i.host.as_str())) {
             match ops.iter_mut().find(|(k, _)| *k == name) {
                 Some(slot) => slot.1 = value,
                 None => ops.push((name, value)),
@@ -6099,20 +6224,45 @@ mod tests {
     }
 
     /// `reqCookies` merges into the existing header: a name already present
-    /// keeps its position, a new one is appended, and a bare name sets an
-    /// **empty** value rather than deleting the cookie (that is
-    /// `delete://reqCookies.<name>`).
+    /// keeps its position and a new one is appended. Within the query a name
+    /// with no `=` sets an **empty** value rather than deleting the cookie
+    /// (that is `delete://reqCookies.<name>`).
     #[test]
     fn req_cookies_merge_in_place() {
         let resolved = resolve(
-            "example.com reqCookies://a=1&b=2\nexample.com reqCookies://old\n",
+            "example.com reqCookies://a=1&b=2\nexample.com reqCookies://old=&c\n",
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
         headers.insert(hyper::header::COOKIE, "old=x; keep=y".parse().unwrap());
         apply_req_cookies(&mut headers, &resolved);
         let cookie = headers.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
-        assert_eq!(cookie, "old=; keep=y; a=1; b=2");
+        // The merge is `extend` over the *reversed* line list, so the later
+        // line's names are laid down first (`readRuleList`,
+        // `_original/lib/util/index.js:1325-1331`).
+        assert_eq!(cookie, "old=; keep=y; c=; a=1; b=2");
+    }
+
+    /// A whole value with no `=` is a *location*, not a query string: upstream
+    /// tries to load it as a file and sets no cookie at all
+    /// (`tryParseMatcher`, `_original/lib/util/index.js:1165-1171`). This port
+    /// read it as a name with an empty value, so `resCookies://sid` sent a
+    /// `Set-Cookie: sid=` real whistle never sends.
+    ///
+    /// Found by putting the same rule through real whistle and through this
+    /// port — `tests/differential/cases-delete.js`.
+    #[test]
+    fn a_cookie_value_with_no_equals_names_a_file_and_sets_nothing() {
+        let resolved = resolve("example.com reqCookies://sid\n", "http://example.com/");
+        let mut headers = HeaderMap::new();
+        headers.insert(hyper::header::COOKIE, "keep=y".parse().unwrap());
+        apply_req_cookies(&mut headers, &resolved);
+        assert_eq!(headers.get(hyper::header::COOKIE).unwrap(), "keep=y");
+
+        let resolved = resolve("example.com resCookies://sid\n", "http://example.com/");
+        let mut headers = HeaderMap::new();
+        apply_res_cookies(&mut headers, &resolved, &Deletions::default(), None);
+        assert!(headers.get(hyper::header::SET_COOKIE).is_none());
     }
 
     #[test]
@@ -6648,6 +6798,59 @@ mod tests {
         );
     }
 
+    /// The path is `parseKeys`', not a plain split on dots: a backslash escapes
+    /// a dot into the key, quotes take a segment literally, and a trailing
+    /// `[n]` is an index of its own. This port split on dots alone, so
+    /// `delete://reqBody.a[0]` named a key no JSON body has and deleted
+    /// nothing.
+    ///
+    /// Found by putting the same rule through real whistle and through this
+    /// port — `tests/differential/cases-delete.js`.
+    #[test]
+    fn a_json_delete_path_reads_upstreams_escapes_and_indices() {
+        let json = |rule: &str, body: &str| {
+            merged_body(&format!("example.com delete://{rule}\n"), Some("application/json"), body)
+        };
+        // A backslash escapes the dot, naming one key that contains it.
+        assert_eq!(json(r"reqBody.a\.b", r#"{"a.b":1,"c":2}"#), r#"{"c":2}"#);
+        // Two backslashes are one backslash and a real separator, so this
+        // names the key `b` inside the key `a\`.
+        assert_eq!(json(r"reqBody.a\\.b", r#"{"a\\":{"b":1,"c":2}}"#), r#"{"a\\":{"c":2}}"#);
+        // Brackets index an array, at the top level and nested.
+        assert_eq!(json("reqBody.a[0]", r#"{"a":[1,2,3]}"#), r#"{"a":[2,3]}"#);
+        assert_eq!(json("reqBody.a.b[1]", r#"{"a":{"b":[1,2,3]}}"#), r#"{"a":{"b":[1,3]}}"#);
+        // …and the dotted spelling names the same element.
+        assert_eq!(json("reqBody.a.0", r#"{"a":[1,2,3]}"#), r#"{"a":[2,3]}"#);
+        // Quotes take a segment literally, which is how a key ending in
+        // brackets is named at all.
+        assert_eq!(json(r#"reqBody."a[0]""#, r#"{"a[0]":1,"b":2}"#), r#"{"b":2}"#);
+        // An index with a leading zero is not one (`NUM_RE`), so it deletes
+        // nothing rather than the wrong element.
+        assert_eq!(json("reqBody.a.01", r#"{"a":[1,2,3]}"#), r#"{"a":[1,2,3]}"#);
+    }
+
+    /// The pieces of `parseKeys` on their own, including the shapes a rule can
+    /// write but a body rarely carries.
+    #[test]
+    fn a_json_delete_path_splits_the_way_parse_keys_does() {
+        let path = |s: &str| parse_json_path(s);
+        assert_eq!(path("a.b.c"), ["a", "b", "c"]);
+        assert_eq!(path(" a . b "), ["a", "b"]);
+        assert_eq!(path(r"a\.b"), ["a.b"]);
+        // Backslashes are halved: two make one, and the dot separates again.
+        assert_eq!(path(r"a\\.b"), [r"a\", "b"]);
+        assert_eq!(path(r"a\\\.b"), [r"a\.b"]);
+        // A run not ending at a dot is left alone.
+        assert_eq!(path(r"a\\b"), [r"a\\b"]);
+        assert_eq!(path("a[0][12]"), ["a", "0", "12"]);
+        // A bare index has no name in front of it.
+        assert_eq!(path("[3]"), ["3"]);
+        // Not an index: a leading zero, and anything that is not decimal.
+        assert_eq!(path("a[01]"), ["a[01]"]);
+        assert_eq!(path("a[x]"), ["a[x]"]);
+        assert_eq!(path(r#""k[0]""#), ["k[0]"]);
+    }
+
     /// A multipart body: a part named by a param is replaced whole, one named
     /// by `delete://reqBody.` is dropped, and an unmatched param is appended.
     #[test]
@@ -6724,6 +6927,40 @@ mod tests {
         let c = h.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
         assert!(!c.contains("sid="));
         assert!(c.contains("keep=1"));
+    }
+
+    /// Deleting a request cookie **rebuilds** the header rather than editing it,
+    /// which is what `setReqCookies` does: a pair that arrived without a `=`
+    /// leaves with one, and when nothing survives the header is set empty
+    /// rather than removed. This port removed it, so a server that branches on
+    /// `Cookie` being present saw the opposite of what whistle sends.
+    ///
+    /// Found by putting the same rule through real whistle and through this
+    /// port — `tests/differential/cases-delete.js`.
+    #[test]
+    fn deleting_every_request_cookie_leaves_an_empty_header() {
+        let cookie_after = |rule: &str, sent: &str| {
+            let resolved = resolve(
+                &format!("example.com delete://{rule}\n"),
+                "http://example.com/",
+            );
+            let mut h = HeaderMap::new();
+            h.insert(hyper::header::COOKIE, sent.parse().unwrap());
+            apply_deletes(&mut h, &Deletions::of(&resolved, true), true);
+            h.get(hyper::header::COOKIE)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(cookie_after("reqCookies.sid", "sid=abc"), Some(String::new()));
+        // A valueless pair gains its `=`, and a trailing `;` becomes one.
+        assert_eq!(
+            cookie_after("reqCookies.sid", "sid=abc; flag; other=1;"),
+            Some("flag=; other=1; =".to_string())
+        );
+        // With no `Cookie` at all there is nothing to rebuild, and none is made.
+        let resolved = resolve("example.com delete://reqCookies.sid\n", "http://example.com/");
+        let mut h = HeaderMap::new();
+        apply_deletes(&mut h, &Deletions::of(&resolved, true), true);
+        assert!(h.get(hyper::header::COOKIE).is_none());
     }
 
     /// whistle matches `delete://` keys against a fixed set of anchored
@@ -10130,8 +10367,13 @@ mod tests {
         // …and the request-side spelling is not.
         assert!(lines("reqCookies.sid", None).is_empty());
 
-        // A tunnelled request adds two domain-scoped entries, because the
-        // cookie may have been set on the parent domain.
+        // A host with a parent domain adds two more entries scoped to it,
+        // because the cookie may have been set there rather than on the host.
+        // Every request has the hostname — `req._w2hostname` is the `Host`
+        // header's, stamped before any rule runs (`_original/biz/index.js:40`)
+        // — so a plain forward-proxy request gets them too. Reading it as a
+        // tunnel-only field left `delete://resCookies.x` sending half the
+        // `Set-Cookie` lines whistle sends.
         let mut info = build_req_info(
             "GET",
             "https",
@@ -10141,16 +10383,14 @@ mod tests {
             &HeaderMap::new(),
             None,
         );
-        info.from.tunnel = true;
         let out = lines("resCookies.sid", Some(&info));
         assert_eq!(out.len(), 4, "{out:?}");
         assert!(out[2].contains("Domain=b.example.com"), "{:?}", out[2]);
+        info.from.tunnel = true;
+        assert_eq!(lines("resCookies.sid", Some(&info)).len(), 4);
         // Three labels keep the leading dot; two have no parent at all.
         assert_eq!(parent_domain("b.example.com").as_deref(), Some(".example.com"));
         assert_eq!(parent_domain("example.com"), None);
-        // A forward-proxy request gets no domain-scoped entries.
-        info.from.tunnel = false;
-        assert_eq!(lines("resCookies.sid", Some(&info)).len(), 2);
     }
 
     /// The deletion wins over a `resCookies://` for the same name on the same
@@ -10185,10 +10425,16 @@ mod tests {
         assert!(t.get("x-a").is_none(), "the deleted trailer is gone");
         assert_eq!(t.get("x-b").unwrap(), "2", "the other one stays");
 
-        // The deletion applies after the operators, so both spellings of a
-        // name on one request end up without it.
+        // `TRAILER_RE` is the one delete key written without the `i` flag, so
+        // the word has to be lower case: `resTrailer.x-a` matches nothing.
         let resolved = resolve(
             "example.com trailers://x-a=1 delete://resTrailer.x-a\n",
+            "http://example.com/",
+        );
+        assert_eq!(build_trailers(&resolved).get("x-a").unwrap(), "1");
+        // Unanchored at the front, though, so a lower-cased prefix does match.
+        let resolved = resolve(
+            "example.com trailers://x-a=1 delete://restrailer.x-a\n",
             "http://example.com/",
         );
         assert!(build_trailers(&resolved).get("x-a").is_none());
