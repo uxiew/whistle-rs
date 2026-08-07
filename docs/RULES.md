@@ -2093,11 +2093,19 @@ untouched:
 
 - **a compressed event stream** — searching a deflate stream for a plaintext
   pattern finds nothing, and rewriting it would corrupt what the header promises;
-- **every other body operator** — `resBody://`, `resMerge://` and the
-  prepend/append/inject family genuinely need an ending, and an event stream has
-  none. A plugin that declares `responseBody` is skipped the same way, and logs a
-  `WARN` so the hook does not appear to have mysteriously not run. Use a streaming
-  hook (`pipe://`) instead — see [`PLUGINS.md`](PLUGINS.md).
+- **every other body operator.** `resBody://`, `resMerge://`, `resScript://` and
+  `resAppend://` need an ending the stream does not have. `resPrepend://` and the
+  typed injections (`htmlPrepend`, `jsAppend`, …) do *not* — prepending to a
+  stream is well defined — but they share the injection layer with the rest of
+  the family, and that layer works on a whole body because it also stamps a
+  doctype, gates on the response being HTML, and honours `safeHtml`/`strictHtml`.
+  Splitting it in two for a case where injecting arbitrary text would corrupt the
+  first event anyway is not a trade this port has made. Upstream does apply them,
+  so this is a **gap, not a non-goal**.
+
+  A plugin that declares `responseBody` is skipped the same way, and logs a
+  `WARN` so the hook does not appear to have mysteriously not run. Use a
+  streaming hook (`pipe://`) instead — see [`PLUGINS.md`](PLUGINS.md).
 
 `disable://trailers` applies to an event stream; `resWriteRaw://` and
 `trailers://` do not.
