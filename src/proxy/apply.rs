@@ -802,13 +802,33 @@ fn is_disabled(resolved: &Resolved, flag: &str) -> bool {
 /// (`socket-mgr.js:401,:531`). Discarding a frame without saying so would make a
 /// session look like the peer never sent anything.
 ///
-/// whistle's companion flags `pauseSend`/`pauseReceive` are not here: pausing
-/// holds a frame until someone releases it from the UI, and this port's UI has
-/// no such control, so a pause would be an unbreakable stall rather than a
-/// pause. Left unimplemented on purpose — see `docs/ROADMAP.md`.
+/// A direction `pauseSend`/`pauseReceive` also names is **not** reported as
+/// ignored: upstream reads the two flags as one status per direction and takes
+/// the pause branch first (`if (enable.pauseSend) … else if (enable.ignoreSend)`,
+/// `initStatus`, `_original/lib/socket-mgr.js:86-97`), so the flags cannot both
+/// apply. See [`paused_ws_dirs`].
 pub fn ignored_ws_dirs(resolved: &Resolved) -> (bool, bool) {
     let e = enabled_flags(resolved);
-    (e.contains("ignoreSend"), e.contains("ignoreReceive"))
+    let (pause_send, pause_receive) = paused_ws_dirs(resolved);
+    (
+        e.contains("ignoreSend") && !pause_send,
+        e.contains("ignoreReceive") && !pause_receive,
+    )
+}
+
+/// `enable://pauseSend` / `enable://pauseReceive` — hold one direction of a
+/// WebSocket session instead of delivering it, until someone releases it
+/// (`PAUSE_STATUS`, `initStatus`, `_original/lib/socket-mgr.js:13,:86-97`).
+///
+/// A pause is only half a feature without the release: upstream's console sets
+/// the direction back to 0 through `/cgi-bin/socket/change-status`
+/// (`changeStatus`, `socket-mgr.js:907-918`), and this port answers
+/// `POST /api/ws/release` for the same purpose. Held frames are captured and
+/// flagged as they arrive, so the console can show what is waiting rather than
+/// only that something is.
+pub fn paused_ws_dirs(resolved: &Resolved) -> (bool, bool) {
+    let e = enabled_flags(resolved);
+    (e.contains("pauseSend"), e.contains("pauseReceive"))
 }
 
 /// True when the request must be destroyed **before** it is sent

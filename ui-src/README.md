@@ -31,10 +31,12 @@ npm run typecheck # vue-tsc
 
 `mock/api.ts` is a Vite plugin that answers every route `src/proxy/webui.rs`
 answers, with a fixture chosen to reach the corners: a failed request, a request
-that timed out with status 0, a WebSocket with frames (one of them dropped by
-`enable://ignoreSend`), a truncated body, a body that is not JSON, a disabled
+that timed out with status 0, a WebSocket with frames (one dropped by
+`enable://ignoreSend`, two held by `enable://pauseSend` so the release control has
+something to release), a truncated body, a body that is not JSON, a disabled
 rule group, and a plugin that has never answered. It is dev-only — `apply:
-'serve'` keeps it out of the build.
+'serve'` keeps it out of the build. Its state is per-server-process: restart
+`npm run dev` to get the held frames back after releasing them.
 
 ## Layout
 

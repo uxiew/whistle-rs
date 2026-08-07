@@ -655,6 +655,36 @@ pre.dump {
 .frame .pv { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
 .frame.ignored { opacity: .5; }
 
+/* A frame `enable://pauseSend|pauseReceive` is holding: still here, not gone,
+   waiting on the control above the list. Marked rather than dimmed — an ignored
+   frame is over with, a held one is the thing you are about to act on. */
+.frame.held { background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.frame .waiting { color: var(--warn); }
+
+/* That control, one row per held direction. */
+.holds {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 10px;
+}
+
+.hold {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  font-size: 12px;
+}
+
+.hold .dir { font-family: var(--mono); font-size: 11.5px; }
+.hold .dir.send { color: var(--info); }
+.hold .dir.receive { color: var(--ok); }
+.hold .what { flex: 1 1 auto; color: var(--fg-dim); }
+
 /* ── editor panes (rules, values) ──────────────────────────────────────── */
 
 .editor-wrap {

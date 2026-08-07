@@ -184,19 +184,27 @@ const FIXTURE: MockSession[] = [
   }),
 ];
 
+// One of everything the list has to render: both directions, a control frame,
+// one dropped by `enable://ignoreSend`, and two still held by
+// `enable://pauseSend` — which is the state the release control exists for.
 const FRAMES = [
-  { dir: 'send', opcode: 'text', preview: '{"type":"subscribe","channel":"ticks"}', ignored: false },
-  { dir: 'receive', opcode: 'text', preview: '{"type":"ack","channel":"ticks"}', ignored: false },
-  { dir: 'receive', opcode: 'text', preview: '{"tick":1,"price":100.25}', ignored: false },
-  { dir: 'send', opcode: 'ping', preview: '', ignored: false },
-  { dir: 'receive', opcode: 'pong', preview: '', ignored: false },
-  { dir: 'receive', opcode: 'text', preview: '{"tick":2,"price":100.31}', ignored: true },
+  { dir: 'send', opcode: 'text', preview: '{"type":"subscribe","channel":"ticks"}', ignored: false, held: false },
+  { dir: 'receive', opcode: 'text', preview: '{"type":"ack","channel":"ticks"}', ignored: false, held: false },
+  { dir: 'receive', opcode: 'text', preview: '{"tick":1,"price":100.25}', ignored: false, held: false },
+  { dir: 'send', opcode: 'ping', preview: '', ignored: false, held: false },
+  { dir: 'receive', opcode: 'pong', preview: '', ignored: false, held: false },
+  { dir: 'receive', opcode: 'text', preview: '{"tick":2,"price":100.31}', ignored: true, held: false },
+  { dir: 'send', opcode: 'text', preview: '{"type":"order","side":"buy"}', ignored: false, held: true },
+  { dir: 'send', opcode: 'text', preview: '{"type":"order","side":"sell"}', ignored: false, held: true },
 ].map((f, i) => ({
   session: 7,
-  time_ms: now - (6 - i) * 900,
+  time_ms: now - (8 - i) * 900,
   len: f.preview.length,
   ...f,
 }));
+
+/** Session 7's send direction starts held, so the control has something to do. */
+const wsPause = { live: true, send: { paused: true }, receive: { paused: false } };
 
 const RULES_DEFAULT = `# The default group.
 example.com http://localhost:5173
@@ -301,6 +309,34 @@ export function mockApi(): Plugin {
       }
       case '/frames.json':
         return reply(FRAMES.filter((f) => f.session === id).slice().reverse());
+      case '/api/ws/status': {
+        // Only a live, paused session is in the proxy's registry; everything
+        // else answers `live: false` rather than failing, because this is what
+        // the Frames tab polls.
+        const held = (dir: string) => FRAMES.filter((f) => f.dir === dir && f.held).length;
+        if (id !== 7) {
+          return reply({
+            live: false,
+            send: { paused: false, held: 0 },
+            receive: { paused: false, held: 0 },
+          });
+        }
+        return reply({
+          live: true,
+          send: { paused: wsPause.send.paused, held: held('send') },
+          receive: { paused: wsPause.receive.paused, held: held('receive') },
+        });
+      }
+      case '/api/ws/release': {
+        const { id: want, dir } = JSON.parse((await readBody(req)) || '{}');
+        if (want !== 7 || (dir !== 'send' && dir !== 'receive')) {
+          return reply({ ok: false, error: 'no live paused WebSocket session with that id' });
+        }
+        const freed = FRAMES.filter((f) => f.dir === dir && f.held);
+        freed.forEach((f) => (f.held = false));
+        wsPause[dir as 'send' | 'receive'].paused = false;
+        return reply({ ok: true, released: freed.length });
+      }
       case '/sessions.har':
         return reply({ log: { version: '1.2', creator: { name: 'whistle-rs-mock' }, entries: [] } });
       case '/api/sessions/clear':

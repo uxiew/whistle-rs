@@ -1363,7 +1363,7 @@ example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
+| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `pauseSend`/`pauseReceive` (hold one direction until the console releases it), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
 | `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Add HTTP response trailer headers (forces chunked) — see below |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
@@ -2127,9 +2127,30 @@ disagreeing about whether the connection is over, and withholding a `ping`/`pong
 breaks the keep-alive the endpoints agreed on; whistle likewise only ever
 withholds data frames.
 
-whistle's companion flags `pauseSend`/`pauseReceive` are **not** implemented:
-upstream holds the frame until someone releases it from its UI, and this port's UI
-has no such control, so a pause here would be a stall nobody could lift.
+`enable://pauseSend` and `enable://pauseReceive` **hold** one direction instead of
+dropping it. The frames are captured and flagged as they arrive, and the Frames tab
+shows which direction is being held, how many frames are waiting, and a **Release**
+button that lets them out — in the order they arrived, all of them at once. That is
+the only granularity whistle has: its own console sets the direction's status back
+to normal, and there is no release-one-frame anywhere in it. A release goes to
+`POST /api/ws/release` with `{"id": <session>, "dir": "send"|"receive"}`, and
+`GET /api/ws/status?id=<session>` answers what is held.
+
+A pause is not an ignore with a delay, and two differences follow from that:
+
+- It holds this direction's **control** frames too — upstream pauses the byte
+  stream rather than the frames in it, so a `ping` sharing a chunk with held data
+  is held with it. To stop the peers timing out on a connection that has gone
+  quiet, the proxy sends a keep-alive of its own every 22 seconds while the pause
+  lasts, exactly as whistle does.
+- Both flags on the same direction is not a state: whistle keeps one status per
+  direction and tests the pause first, so `enable://pauseSend|ignoreSend` pauses,
+  and once released the direction stays open rather than starting to drop.
+
+A held direction reads ahead so the console can show what is waiting, up to 64
+frames or 4 MiB; past that the peer is back-pressured until the release, and
+nothing is lost. Frames still held when the connection ends stay flagged in the
+capture — they never reached the peer, and a release then has nothing to find.
 
 ### Multiple patterns and multi-line blocks
 
