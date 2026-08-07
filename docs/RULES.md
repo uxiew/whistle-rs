@@ -1877,10 +1877,35 @@ growing a file that is several runs concatenated with no boundary between them.
 | `reqWrite://` on a `GET`/`HEAD`/`OPTIONS`/`CONNECT` | not written — there is no body to capture (`req.js:582-584`). `reqWriteRaw://` still dumps the head |
 | `resWrite://` on a response with no body | not written, for the same reason. `resWriteRaw://` still dumps the head |
 
+**The path takes the unmatched part of the URL**, the same way `file://` does —
+the value is read through the tail-joined `rule.url` (`getWriteFilePath`,
+`util/index.js:1461-1464`). That is what makes one rule produce **one dump per
+URL** instead of one file for the whole run:
+
+```
+api.example.com   resWrite:///tmp/dump      # /users → /tmp/dump/users
+                                            # /v2/orders/7 → /tmp/dump/v2/orders/7
+api.example.com/users  resWrite:///tmp/dump # the pattern eats the path → /tmp/dump
+api.example.com   resWrite://</tmp/dump>    # <verbatim> refuses the join
+```
+
+The query is not part of the name — `/users?q=1` and `/users` write the same
+file — and a request for `/` joins nothing, so it writes `/tmp/dump` itself.
+
 ```
 api.example.com   reqWriteRaw:///tmp/api-request.http
 api.example.com   resWrite:///tmp/api-body.json  enable://forceReqWrite
 ```
+
+**One divergence in the raw dumps.** whistle writes each header name as it
+arrived, keeping a copy of the original spelling for the purpose
+(`rawHeaderNames`, `_original/lib/util/file-writer-transform.js:33`). hyper
+normalises every name to lower case before this port can see it, so a
+`reqWriteRaw`/`resWriteRaw` dump here reads `connection: keep-alive` where
+whistle's reads `Connection: keep-alive`. Recovering the original spelling would
+mean carrying a second copy of every header through the proxy for the benefit of
+a debug dump. Values, order, framing and body are identical; measured on
+`tests/differential/write-bench.js`.
 
 ### Delays & throttling
 

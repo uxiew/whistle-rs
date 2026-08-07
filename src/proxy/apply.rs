@@ -4278,12 +4278,16 @@ fn disable_res_store(headers: &mut HeaderMap) {
 /// worked and the request had no body" rather than "there was never a body to
 /// capture".
 pub fn req_write_path(resolved: &Resolved, method: &str) -> Option<String> {
-    method_allows_body(method).then(|| resolved.value("reqWrite"))?.map(str::to_string)
+    method_allows_body(method)
+        .then(|| resolved.value("reqWrite"))?
+        .map(dump_path)
 }
 
 /// File to write the response body to (`resWrite`), named for the status.
 pub fn res_write_path(resolved: &Resolved, status: u16) -> Option<String> {
-    resolved.value("resWrite").map(|f| writer_file(f, status))
+    resolved
+        .value("resWrite")
+        .map(|f| writer_file(&dump_path(f), status))
 }
 
 /// File to write the raw request (head + body) to (`reqWriteRaw`).
@@ -4291,13 +4295,36 @@ pub fn res_write_path(resolved: &Resolved, status: u16) -> Option<String> {
 /// Not gated on the method: the head is worth dumping whether or not a body
 /// followed it, and upstream does not gate it either (`req.js:586`).
 pub fn req_write_raw_path(resolved: &Resolved) -> Option<String> {
-    resolved.value("reqWriteRaw").map(str::to_string)
+    resolved.value("reqWriteRaw").map(dump_path)
 }
 
 /// File to write the raw response (head + body) to (`resWriteRaw`), named for
 /// the status.
 pub fn res_write_raw_path(resolved: &Resolved, status: u16) -> Option<String> {
-    resolved.value("resWriteRaw").map(|f| writer_file(f, status))
+    resolved
+        .value("resWriteRaw")
+        .map(|f| writer_file(&dump_path(f), status))
+}
+
+/// A dump operator's value as a filesystem path.
+///
+/// Two things the matcher's tail-join leaves behind, both removed by upstream's
+/// `getPath` before the path is opened (`_original/lib/util/index.js:1461-1464`,
+/// via `getPath` at `:1420-1433`):
+///
+/// * **the query.** `resWrite://…/d` on a request for `/echo?q=1` writes `d/echo`
+///   upstream; this port wrote a file literally named `echo?q=1`.
+/// * **`<verbatim>` brackets.** They are the documented way to refuse the join,
+///   and unwrapping them is what makes the refusal mean a path rather than a
+///   filename with angle brackets in it — which is what this port tried to open,
+///   so nothing was written at all.
+fn dump_path(value: &str) -> String {
+    let text = crate::rules::url::fixed_value(value)
+        .map_or_else(|| value.to_string(), |(_, inner)| inner);
+    match text.find('?') {
+        Some(i) => text[..i].to_string(),
+        None => text,
+    }
 }
 
 /// `getWriterFile` (`_original/lib/inspectors/res.js:147-153`): a response that

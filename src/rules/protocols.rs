@@ -349,6 +349,17 @@ pub fn is_file_protocol(name: &str) -> bool {
     matches!(base, "file" | "rawfile" | "dust" | "tpl" | "jsonp")
 }
 
+/// The four operators that dump the exchange to a file.
+///
+/// They are grouped because they share one property that matters to the
+/// matcher: their value is read through `getWriteFilePath`
+/// (`_original/lib/util/index.js:1461-1464`), which goes to the tail-joined
+/// `rule.url`, so a pattern that leaves part of the path unmatched gives each
+/// URL its own dump file. See [`crate::rules::matcher`]'s `joins_tail`.
+pub fn is_write_protocol(name: &str) -> bool {
+    matches!(name, "reqWrite" | "reqWriteRaw" | "resWrite" | "resWriteRaw")
+}
+
 /// Returns true if `name` is a protocol whistle recognises (canonical, alias, or
 /// a member of the local-file/template family).
 pub fn is_protocol(name: &str) -> bool {

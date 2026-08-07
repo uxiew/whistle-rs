@@ -623,12 +623,21 @@ fn collect_exact_skips(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) ->
 
 /// Does this operator's value take the tail of the URL its pattern matched?
 ///
-/// Only two families do, and it is not a choice of ours: upstream computes the
-/// join into `rule.url` and `rule.files` (`getPathRule`,
-/// `_original/lib/rules/rules.js:936-956`), and those two fields are read by
-/// exactly the URL-replacement rule (`util.rule.getUrl`) and the local-file
-/// family (`util.getRuleFiles`). Every other operator is read through
-/// `getMatcher`, which returns the matcher as written.
+/// Three families do, and it is not a choice of ours: upstream computes the join
+/// into `rule.url` and `rule.files` (`getPathRule`,
+/// `_original/lib/rules/rules.js:936-956`) for **every** prefix-matched rule,
+/// and three readers go to those fields — the URL-replacement rule
+/// (`util.rule.getUrl`), the local-file family (`util.getRuleFiles`), and the
+/// four dump operators (`getWriteFilePath`, `util/index.js:1461-1464`). Every
+/// other operator is read through `getMatcher`, which returns the matcher as
+/// written.
+///
+/// The write family was missing here, which is the difference between one dump
+/// file per URL and every request in the run appending into one. Measured
+/// against whistle 2.10.8 on `tests/differential/write-bench.js`: pattern
+/// `127.0.0.1:PORT` with `resWrite://…/d` writes `d/echo` for `/echo` and
+/// `d/a/b/c` for `/a/b/c`, while a pattern that consumes the path — `…/echo` —
+/// leaves nothing to join and writes `d` itself. The query is not joined.
 ///
 /// Three value shapes opt out, because upstream's `getRuleValue` prefers
 /// `rule.value` / `rule.path` over the joined `rule.url`
@@ -644,8 +653,9 @@ fn collect_exact_skips(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) ->
 ///   That rule is already broken, and leaving it alone reads better than
 ///   appending a path to it.
 fn joins_tail(op: &RuleOp) -> bool {
-    let takes_path =
-        op.protocol == protocols::URL_REPLACE || protocols::is_file_protocol(&op.protocol);
+    let takes_path = op.protocol == protocols::URL_REPLACE
+        || protocols::is_file_protocol(&op.protocol)
+        || protocols::is_write_protocol(&op.protocol);
     takes_path
         // Content is not a location, so there is nothing to extend. The inline
         // form has already been unwrapped by then, so the flag is what says so.
@@ -697,7 +707,19 @@ fn take(resolved: &mut Resolved, op: &RuleOp, order: u64, matched: &Matched<'_>)
             op.captures = Some(groups.to_vec());
         }
     }
-    if joins_tail(&op) && !matched.tail.is_empty() {
+    // A tail of exactly `/` joins nothing onto a dump path. Upstream's own tail
+    // is *empty* for a domain pattern meeting a root request — `filePath` becomes
+    // `/` only under `lineProps://originUrl`
+    // (`_original/lib/rules/rules.js:1100-1106`) — so `resWrite://…/d` on a
+    // request for `/` writes `d`, where `/a/` writes `d/a/index.html`. Measured
+    // both ways on `tests/differential/write-bench.js`.
+    //
+    // Scoped to the dump operators rather than fixed in the tail itself: for the
+    // file family `/dir` and `/dir/` name the same thing once a directory is
+    // served, so the distinction is invisible there and not worth disturbing a
+    // family the bench has at 124/0.
+    let root_only = protocols::is_write_protocol(&op.protocol) && matched.tail == "/";
+    if joins_tail(&op) && !matched.tail.is_empty() && !root_only {
         op.value = join_each_path(&op.protocol, &op.value, &matched.tail);
     }
     if protocols::is_multi_match(&op.protocol) {

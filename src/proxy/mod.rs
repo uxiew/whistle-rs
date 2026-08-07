@@ -4665,7 +4665,17 @@ fn header_dump(headers: &hyper::HeaderMap) -> String {
     out
 }
 
-/// Append a raw message (head + blank line + body + separator) to a file.
+/// Write a raw message — head, blank line, body — to a file.
+///
+/// Nothing follows the body. Upstream writes `getRawData(…)`, which is the
+/// first line, the headers and one blank line, and then pipes the body straight
+/// into the same stream (`FileWriterTransform`,
+/// `_original/lib/util/file-writer-transform.js:6-13,:53-58`). This port used to
+/// add a trailing `\r\n\r\n` on the end, on the theory that a dump might hold
+/// several messages — it never does, because `getFileWriter` refuses a path that
+/// already exists. What it produced instead was a dump of a bodiless request
+/// ending in four CRLFs where whistle's ends in two, which is not a raw record
+/// of anything that went over the wire.
 fn write_raw_file(path: &str, head: &str, body: &Bytes, force: bool) {
     use std::io::Write;
     let Some(mut f) = open_writer(path, force) else {
@@ -4674,7 +4684,6 @@ fn write_raw_file(path: &str, head: &str, body: &Bytes, force: bool) {
     let _ = f.write_all(head.as_bytes());
     let _ = f.write_all(b"\r\n");
     let _ = f.write_all(body);
-    let _ = f.write_all(b"\r\n\r\n");
 }
 
 /// True if the response declares an HTML content type.
@@ -4845,7 +4854,10 @@ mod writer_tests {
 
         write_raw_file(p, "GET / HTTP/1.1", &Bytes::from_static(b"body"), false);
         let written = std::fs::read(&path).expect("read");
-        assert_eq!(written, b"GET / HTTP/1.1\r\nbody\r\n\r\n");
+        // Head, blank line, body — and nothing after it. The trailing `\r\n\r\n`
+        // this used to add made a bodiless dump end in four CRLFs where
+        // whistle's ends in two; measured on `tests/differential/write-bench.js`.
+        assert_eq!(written, b"GET / HTTP/1.1\r\nbody");
 
         write_raw_file(p, "GET /other HTTP/1.1", &Bytes::from_static(b"x"), false);
         assert_eq!(std::fs::read(&path).expect("read"), written);
