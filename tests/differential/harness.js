@@ -165,7 +165,47 @@ const EXPECTED = [
     match: (p) => /req\.header\.x-host-filter:/.test(p),
     why: 'host: and host= match the request host here, by design',
   },
+  {
+    // Not a divergence at all: the bench straddling a second.
+    //
+    // Several rules render an HTTP date from the clock — an injection strips
+    // the cache and stamps `Expires`, `resCookies` with an `expires` renders
+    // one — and the two proxies are asked one after the other, so a run that
+    // crosses a second boundary reports a difference of exactly one second.
+    // It appeared about one run in six of `cases-bodies.js` and was an
+    // unidentified flake until a fourth round caught it by name.
+    //
+    // Scoped to **one second**: a real difference in either header, of any
+    // other size, still reports. Nothing here excuses a header that one proxy
+    // sent and the other did not — `oneSecondApart` needs two parseable dates.
+    match: (p) => oneSecondApart(p),
+    why: 'an HTTP date rendered from the clock, one second apart: the bench, not the port',
+  },
 ];
+
+/**
+ * True when a difference is two HTTP dates at most a second apart.
+ *
+ * Deliberately strict about what it will look at: only `expires` and
+ * `set-cookie`, only when **both** sides parse as dates, and only up to 1000 ms.
+ * Anything it cannot read, it declines.
+ */
+function oneSecondApart(problem) {
+  const m = /^res\.header\.(expires|set-cookie): whistle=(".*") rs=(".*")$/.exec(problem);
+  if (!m) return false;
+  const at = (quoted) => {
+    const text = JSON.parse(quoted);
+    const date = /(?:^|expires=)([A-Za-z]{3},[^;"]+GMT)/i.exec(text);
+    const t = date && Date.parse(date[1]);
+    return Number.isFinite(t) ? t : null;
+  };
+  const [a, b] = [at(m[2]), at(m[3])];
+  if (a === null || b === null) return false;
+  // The rest of the two values has to match, or a real change is hiding behind
+  // a date that happens to be close.
+  const strip = (quoted) => quoted.replace(/[A-Za-z]{3},[^;"]+GMT/i, '<date>');
+  return strip(m[2]) === strip(m[3]) && Math.abs(a - b) <= 1000;
+}
 
 const norm = (headers) => {
   const out = {};
