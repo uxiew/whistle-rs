@@ -2142,7 +2142,11 @@ A pause is not an ignore with a delay, and two differences follow from that:
   stream rather than the frames in it, so a `ping` sharing a chunk with held data
   is held with it. To stop the peers timing out on a connection that has gone
   quiet, the proxy sends a keep-alive of its own every 22 seconds while the pause
-  lasts, exactly as whistle does.
+  lasts, exactly as whistle does. `disable://pong` suppresses the one that goes
+  to the **server** while the send direction is held, and `disable://ping` the
+  one that goes to the **client** while the receive direction is held — the same
+  split whistle makes. Suppressing them means a quiet connection is left to
+  whatever idle timeout the peers have, which is the point of asking.
 - Both flags on the same direction is not a state: whistle keeps one status per
   direction and tests the pause first, so `enable://pauseSend|ignoreSend` pauses,
   and once released the direction stays open rather than starting to drop.

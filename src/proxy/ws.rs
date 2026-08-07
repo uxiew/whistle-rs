@@ -259,6 +259,8 @@ pub async fn capturing_tunnel<A, B>(
             hooks: send_hooks,
             mode: flow.send,
             pause: pause.clone(),
+            // This leg writes toward the server, so its keep-alive is the pong.
+            keepalive: !flow.no_pong,
         },
         state.clone(),
         session,
@@ -272,6 +274,8 @@ pub async fn capturing_tunnel<A, B>(
             hooks: receive_hooks,
             mode: flow.receive,
             pause: pause.clone(),
+            // …and this one writes toward the client, so it is the ping.
+            keepalive: !flow.no_ping,
         },
         state.clone(),
         session,
@@ -318,6 +322,12 @@ pub struct FrameFlow {
     pub send: DirMode,
     /// Frames travelling server → client.
     pub receive: DirMode,
+    /// `disable://ping` — no keep-alive toward the **client** while the receive
+    /// direction is held.
+    pub no_ping: bool,
+    /// `disable://pong` — no keep-alive toward the **server** while the send
+    /// direction is held.
+    pub no_pong: bool,
 }
 
 impl FrameFlow {
@@ -325,9 +335,12 @@ impl FrameFlow {
     pub fn of(resolved: &Resolved) -> Self {
         let (pause_send, pause_receive) = crate::proxy::apply::paused_ws_dirs(resolved);
         let (ignore_send, ignore_receive) = crate::proxy::apply::ignored_ws_dirs(resolved);
+        let (no_ping, no_pong) = crate::proxy::apply::ws_keepalive_disabled(resolved);
         FrameFlow {
             send: DirMode::of(pause_send, ignore_send),
             receive: DirMode::of(pause_receive, ignore_receive),
+            no_ping,
+            no_pong,
         }
     }
 
@@ -490,6 +503,9 @@ struct Leg {
     mode: DirMode,
     /// The console-visible pause state, when a rule paused either direction.
     pause: Option<Arc<SessionPause>>,
+    /// False when `disable://ping` / `disable://pong` asked for no keep-alive on
+    /// this leg — see [`crate::proxy::apply::ws_keepalive_disabled`].
+    keepalive: bool,
 }
 
 async fn pump<R, W>(r: R, w: W, leg: Leg, state: Arc<AppState>, session: u64)
@@ -503,6 +519,7 @@ where
         hooks,
         mode,
         pause,
+        keepalive,
     } = leg;
     let ctx = FrameCtx {
         direction: dir.label(),
@@ -514,7 +531,7 @@ where
         session,
     };
     match (mode, pause) {
-        (DirMode::Pause, Some(gate)) => pump_held(r, w, ctx, gate, dir).await,
+        (DirMode::Pause, Some(gate)) => pump_held(r, w, ctx, gate, dir, keepalive).await,
         // Everything else, which is very nearly every session: read, decide,
         // write, with no companion task and no channel between the two.
         _ => pump_direct(r, w, ctx).await,
@@ -652,8 +669,14 @@ type HeldFrame = (bool, u8, Bytes);
 /// frame in several reads, so cancelling it as a losing `select!` arm would
 /// discard the bytes it had already taken — and a release with nothing arriving
 /// behind it is precisely the case that has to work.
-async fn pump_held<R, W>(r: R, mut w: W, mut ctx: FrameCtx, pause: Arc<SessionPause>, dir: Dir)
-where
+async fn pump_held<R, W>(
+    r: R,
+    mut w: W,
+    mut ctx: FrameCtx,
+    pause: Arc<SessionPause>,
+    dir: Dir,
+    keepalive: bool,
+) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
@@ -708,8 +731,11 @@ where
                     Some(frame) => break frame,
                     None => break 'leg,
                 },
-                _ = probe.tick() => {
-                    if !keepalive(&mut w, ctx.to_server).await {
+                // `disable://ping` / `disable://pong` suppress the probe
+                // rather than the tick: the timer is cheap and the flag is
+                // about what goes on the wire.
+                _ = probe.tick(), if keepalive => {
+                    if !send_keepalive(&mut w, ctx.to_server).await {
                         break 'leg;
                     }
                 }
@@ -801,7 +827,7 @@ fn clear_held_marks(state: &AppState, session: u64, direction: &str, count: usiz
 /// `_original/lib/socket-mgr.js:370,:500`). An unsolicited pong is a legal
 /// unidirectional heartbeat (RFC 6455 §5.5.3); the ping asks the client for one
 /// back, which is what keeps *its* idle timer quiet too.
-async fn keepalive<W: AsyncWrite + Unpin>(w: &mut W, to_server: bool) -> bool {
+async fn send_keepalive<W: AsyncWrite + Unpin>(w: &mut W, to_server: bool) -> bool {
     let opcode = if to_server { OPCODE_PONG } else { OPCODE_PING };
     write_frame(w, true, opcode, &[], to_server).await.is_ok()
 }
@@ -1170,7 +1196,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Ignore, receive: DirMode::Pass },
+                FrameFlow { send: DirMode::Ignore, receive: DirMode::Pass, ..FrameFlow::default() },
             );
 
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"muted", true)
@@ -1208,7 +1234,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pass, receive: DirMode::Ignore },
+                FrameFlow { send: DirMode::Pass, receive: DirMode::Ignore, ..FrameFlow::default() },
             );
 
             // Data from the origin is dropped…
@@ -1309,7 +1335,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass },
+                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass, ..FrameFlow::default() },
             );
 
             for payload in [&b"one"[..], b"two"] {
@@ -1372,7 +1398,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pass, receive: DirMode::Pause },
+                FrameFlow { send: DirMode::Pass, receive: DirMode::Pause, ..FrameFlow::default() },
             );
 
             write_frame(&mut wire.server, true, OPCODE_TEXT, b"later", false)
@@ -1415,7 +1441,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass },
+                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass, ..FrameFlow::default() },
             );
 
             let total = MAX_HELD_FRAMES + 16;
@@ -1450,7 +1476,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass },
+                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass, ..FrameFlow::default() },
             );
 
             // Five one-mebibyte frames against a four-mebibyte budget. They go
@@ -1505,7 +1531,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass },
+                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass, ..FrameFlow::default() },
             );
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"stranded", true)
                 .await
@@ -1542,7 +1568,7 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pass, receive: DirMode::Pause },
+                FrameFlow { send: DirMode::Pass, receive: DirMode::Pause, ..FrameFlow::default() },
             );
 
             let probe = read_frame(&mut wire.client).await.expect("read").expect("frame");
@@ -1554,6 +1580,53 @@ mod tests {
             );
             finish(wire).await;
         });
+    }
+
+    /// `disable://ping` turns the keep-alive off, which is the whole of what
+    /// upstream's flag does (`req.disable.ping`,
+    /// `_original/lib/socket-mgr.js:496-498`). It had nothing to say here until
+    /// there was a keep-alive to suppress.
+    #[test]
+    fn disable_ping_silences_the_keepalive_the_pause_brought() {
+        rt().block_on(async {
+            tokio::time::pause();
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://pauseReceive disable://ping\n");
+            let flow = flow_for("ws.test enable://pauseReceive disable://ping\n");
+            assert!(flow.no_ping, "the flag is read");
+            assert!(!flow.no_pong, "and only the leg it names");
+            let mut wire = spawn_tunnel_with(&state, plan, None, flow);
+
+            // Nothing arrives where the probe would have: the origin sends a
+            // frame after the clock has run past several intervals, and it is
+            // the *held* frame's absence that proves the leg is alive but quiet.
+            tokio::time::advance(KEEPALIVE * 3).await;
+            write_frame(&mut wire.server, true, OPCODE_TEXT, b"held", false)
+                .await
+                .expect("server write");
+            until("the frame held", || still_held(&state) == 1).await;
+            assert_eq!(
+                state.ws_frames.lock().unwrap().len(),
+                1,
+                "one captured frame and no probe on the wire"
+            );
+            finish(wire).await;
+        });
+    }
+
+    /// The flags name one leg each, so the pong's flag says nothing about the
+    /// ping's. Upstream guards `res.write(PONG)` with `disable.pong` and
+    /// `req.write(PING)` with `disable.ping` (`socket-mgr.js:366-368,:496-498`).
+    #[test]
+    fn each_keepalive_flag_names_one_leg() {
+        let ping = flow_for("ws.test enable://pauseSend disable://ping\n");
+        assert!(ping.no_ping && !ping.no_pong);
+        let pong = flow_for("ws.test enable://pauseSend disable://pong\n");
+        assert!(pong.no_pong && !pong.no_ping);
+        let both = flow_for("ws.test enable://pauseSend disable://ping|pong\n");
+        assert!(both.no_ping && both.no_pong);
+        let neither = flow_for("ws.test enable://pauseSend\n");
+        assert!(!neither.no_ping && !neither.no_pong);
     }
 
     /// The two flags of one direction are one status upstream, and it tests the

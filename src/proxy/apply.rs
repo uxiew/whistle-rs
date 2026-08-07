@@ -831,6 +831,24 @@ pub fn paused_ws_dirs(resolved: &Resolved) -> (bool, bool) {
     (e.contains("pauseSend"), e.contains("pauseReceive"))
 }
 
+/// `disable://ping` / `disable://pong` — suppress the keep-alive the proxy
+/// writes on a direction it is holding, as `(ping, pong)`.
+///
+/// Upstream guards each leg with its own flag: the pong that goes to the
+/// **server** while the client's send direction is held is `disable.pong`
+/// (`res.write(PONG)`, `_original/lib/socket-mgr.js:366-368`), and the ping that
+/// goes to the **client** while the receive direction is held is `disable.ping`
+/// (`req.write(PING)`, `:496-498`). Read straight off `disable`, without the
+/// `enable://` cancellation, which is how upstream reads them.
+///
+/// These meant nothing here until there was a keep-alive to suppress — the
+/// port used to inject none, so `docs/ROADMAP.md` recorded them as having
+/// nothing to disable. Holding a direction brought one, and with it these.
+pub fn ws_keepalive_disabled(resolved: &Resolved) -> (bool, bool) {
+    let d = disabled_flags(resolved);
+    (d.contains("ping"), d.contains("pong"))
+}
+
 /// True when the request must be destroyed **before** it is sent
 /// (`needAbortReq`, `_original/lib/util/index.js:3893-3903`, applied from the
 /// `data` inspector at `_original/lib/inspectors/data.js:534-539` — which runs
