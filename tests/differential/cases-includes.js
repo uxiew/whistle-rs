@@ -37,6 +37,11 @@
 // invents rules out of an empty answer — which is worth pinning and is not the
 // same as saying the include ran.
 //
+// And the check that outranks both: **run against the build from before the
+// feature, this file reports `differing: 20`**, naming every case that expects
+// something to be included and nothing else. A corpus that cannot fail on the
+// bug it was written for is decoration.
+//
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
 // A clean run of this file is **`differing: 0`**.
