@@ -89,6 +89,12 @@
 //      routes for the same four-word rules file. **Found, not fixed**: matching
 //      it means a second resolution pass over exactly those four protocols and
 //      no others, which reaches well past the forwarding family.
+//   8. **`xhttps-proxy://` at an unreachable hop hangs upstream** (1 case).
+//      Measured against the same dead hop, written by name so no SNI objection
+//      is in play: `xproxy://` and `xsocks://` fall back and answer 200, plain
+//      `https-proxy://` answers 502 promptly, and `xhttps-proxy://` returns
+//      nothing at all until the client gives up. This port falls back, which is
+//      what the `x` prefix documents and what its three siblings do.
 //
 // **How much of this corpus does anything.** 83 of the 94 cases change what
 // real whistle answers, measured against the same request with no rule at all.
@@ -313,4 +319,23 @@ module.exports = [
   { name: 'proxy: on a POST with a body', rules: `${P} proxy://${HOP}`, request: { method: 'POST', body: 'payload', headers: { 'content-type': 'text/plain' } } },
   { name: 'proxy: two lines, the first wins', rules: `${P} proxy://${HOP}\n${P} proxy://${CLOSED}` },
   { name: 'proxy: a socks line and a proxy line share one slot', rules: `${P} socks://${SOCKS}\n${P} proxy://${HOP}` },
+
+  // ── the two `x` spellings nothing had asked about ────────────────────────
+  //
+  // `xsocks://` and `xhttps-proxy://` were the last two names in this family
+  // with no case anywhere. Each is asked twice, because one answer alone cannot
+  // tell the fallback from a proxy that was never engaged: at a dead hop, where
+  // the `x` prefix has to fall back to a direct connection, and at a live one,
+  // where it must not.
+  { name: 'fail: xsocks falls back to a direct connection', rules: `${P} xsocks://${CLOSED}` },
+  { name: 'proxy: xsocks at a hop that works is still used', rules: `${P} xsocks://${SOCKS}` },
+  // **This one differs, and the difference is upstream's.** Measured side by
+  // side at the same dead hop, written by name so no SNI objection is in play:
+  // `xproxy://` and `xsocks://` fall back and answer 200, plain
+  // `https-proxy://` answers 502 promptly — and `xhttps-proxy://` **hangs**.
+  // No fallback, no error, no response at all; the client times out. This port
+  // falls back, which is what the `x` prefix is documented to mean and what its
+  // three siblings do.
+  { name: 'fail: xhttps-proxy falls back to a direct connection', rules: `${P} xhttps-proxy://localhost:${PORTS.closed}` },
+  { name: 'proxy: xhttps-proxy at a hop that works is still used', rules: `${P} xhttps-proxy://${TLSHOP}` },
 ];
