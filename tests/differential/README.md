@@ -35,6 +35,15 @@ origin — so several benches can run at once, one per area under audit:
 PORT_BASE=19100 CASES=./cases-filters.js npm run bench
 ```
 
+One corpus claims more than three. `cases-proxy.js` is about **where a request is
+sent and through what**, which a response cannot show, so it stands up eight more
+servers at `PORT_BASE+10`…`+17` — a proxy that records the request line and
+headers it was given, a second echo origin, a proxy that answers 407, one that
+never answers, a SOCKS5 proxy, PAC files, and a TLS hop. Both proxies are pointed
+at the same recording proxy and their two recordings are compared. It needs
+`--insecure-upstream` for the TLS hop's self-signed certificate; the corpus header
+says which port is which.
+
 It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0` — except for the two corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
