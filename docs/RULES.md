@@ -2033,7 +2033,8 @@ Known gaps in the operator layer, deliberately left:
   multipart body part by part so an upload never lands in memory; whistle-rs has
   the body in hand already (every other request-body operator buffers) and splits
   on the boundary. Same result on a well-formed body, more memory on a large one.
-  Upstream's `reqMergeBigData` / `MAX_REQ_SIZE` ceilings have no counterpart here.
+  The size ceiling *is* implemented — see [Request bodies have a
+  ceiling](#request-bodies-have-a-ceiling).
 - **A non-UTF-8 request body is left alone** by the `params://` merge. whistle
   tries GB18030 and re-encodes afterwards; this port stays UTF-8, as it does for
   every other text transform.
@@ -2049,6 +2050,57 @@ Known gaps in the operator layer, deliberately left:
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.
+
+
+### Request bodies have a ceiling
+
+The operators that rewrite a request body need it in memory, and the body is
+whatever the client decided to send. whistle bounds that at **2 MB**, raised to
+**16 MB** by `enable://reqMergeBigData` (`MAX_REQ_SIZE` / `BIG_MAX_REQ_SIZE`,
+`_original/lib/inspectors/req.js:19-20,:163`), and whistle-rs does the same.
+
+Past the ceiling the request is **not** failed and **not** truncated: the body
+streams on to the origin byte for byte, and only the rewriting stops —
+`reqBody`, `reqReplace`, `params`, `reqWrite`/`reqWriteRaw` and `reqSpeed` do not
+apply. That is upstream's `interrupt` (`handleParams`, `req.js:169-185`), and it
+is the right failure for a debugging proxy: traffic must not be damaged by the
+inspection of it. whistle-rs logs a `WARN` naming the request when it happens,
+so a rule that stopped applying above some size does not look like a rule that
+never matched.
+
+`b:` body filters read the body too, in order to decide *which* rules apply, so
+they cannot consult a rule for the raised ceiling — they always use the plain
+2 MB and match on the prefix they read, as upstream's `resolveBodyFilter` does.
+
+
+### Event streams
+
+A `text/event-stream` response is never collected. Collecting one would not slow
+it down, it would withhold it: the body ends when the server decides, which for
+SSE is typically never, so the client would receive nothing at all.
+
+`resReplace://` still applies. It is the one body operator that does not need the
+whole body — it needs a window — so it travels with the stream, substituting as
+events arrive. whistle-rs holds back only a tail (just enough that a match
+straddling a chunk boundary cannot be missed) and flushes through the end of each
+complete event, which is upstream's own mechanism
+(`_original/lib/util/replace-string-transform.js`,
+`replace-pattern-transform.js`). A blank line written `\r\n\r\n` counts as an
+event boundary here, where upstream looks only for `\n\n`.
+
+Two cases are refused rather than attempted, and the stream passes through
+untouched:
+
+- **a compressed event stream** — searching a deflate stream for a plaintext
+  pattern finds nothing, and rewriting it would corrupt what the header promises;
+- **every other body operator** — `resBody://`, `resMerge://` and the
+  prepend/append/inject family genuinely need an ending, and an event stream has
+  none. A plugin that declares `responseBody` is skipped the same way, and logs a
+  `WARN` so the hook does not appear to have mysteriously not run. Use a streaming
+  hook (`pipe://`) instead — see [`PLUGINS.md`](PLUGINS.md).
+
+`disable://trailers` applies to an event stream; `resWriteRaw://` and
+`trailers://` do not.
 
 
 ## Origin certificate verification
