@@ -2326,15 +2326,16 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, want: Head
             .into_iter()
             .find(|(prefix, _)| key.starts_with(prefix))
             .map(|(_, s)| s);
-            // A key with no `:` has no pattern and is dropped: upstream slices
-            // the name up to `indexOf(':')`, which is then empty.
-            let Some(colon) = key.find(':') else {
-                continue;
-            };
+            let colon = key.find(':');
             let (scope, name) = match named {
                 // This key names its own scope, so the prefix is sliced off and
-                // the name is taken from it.
+                // the name is taken from it. With no `:` that slice is empty
+                // (`substring(dot + 1, -1)`), and upstream's `if (!name) return`
+                // drops the key.
                 Some(scope) => {
+                    let Some(colon) = colon else {
+                        continue;
+                    };
                     let name = key[key.find('.').map(|i| i + 1).unwrap_or(0)..colon].trim();
                     if name.is_empty() {
                         continue;
@@ -2353,7 +2354,15 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, want: Head
                 continue;
             }
             let name = name.as_str();
-            let pattern = &key[colon + 1..];
+            // `key.substring(index + 1)`, and `index` is `-1` when there is no
+            // colon — so the **whole key** is the pattern. That is what makes
+            // the documented `res.x:p1=v1&p2=v2` two substitutions on one
+            // header: the second entry is a bare pattern inheriting the first
+            // entry's scope and name.
+            let pattern = match colon {
+                Some(colon) => &key[colon + 1..],
+                None => key.as_str(),
+            };
             // An absent or empty header is left alone (`handleHeaderReplace`).
             if let Some(cur) = headers
                 .get(name)
@@ -6765,6 +6774,39 @@ mod tests {
         // Scope inheritance still works across the query-string form: the
         // second key names no scope, so it reuses `x-a`.
         assert_eq!(replaced("resH.x-a:/nope/=x&:/yes/=no"), Some("no".to_string()));
+    }
+
+    /// The form the documentation leads with — several `pattern=value` pairs on
+    /// one header (`res.header-name:p1=v1&p2=v2`,
+    /// <https://wproxy.org/docs/rules/headerReplace.html>).
+    ///
+    /// The second pair carries **no colon at all**, and upstream's
+    /// `key.substring(index + 1)` with `index === -1` makes the whole key the
+    /// pattern. This port required a colon and dropped the pair — so only the
+    /// first of the documented pairs applied. The earlier test here happened to
+    /// write the second pattern as `:/yes/`, with a colon, and walked straight
+    /// past the bug.
+    #[test]
+    fn several_patterns_may_share_one_header() {
+        let replaced = |rule: &str| {
+            let resolved = resolve(
+                &format!("example.com headerReplace://{rule}\n"),
+                "http://example.com/",
+            );
+            let mut h = HeaderMap::new();
+            h.insert("x-mark", "html-and-more".parse().unwrap());
+            apply_header_replace(&mut h, &resolved, HeaderScope::Response);
+            h.get("x-mark").map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(replaced("res.x-mark:html=X&more=Y"), Some("X-and-Y".to_string()));
+        // Three of them, and a regexp among the bare ones.
+        assert_eq!(
+            replaced("res.x-mark:html=X&/and/=AND&more=Y"),
+            Some("X-AND-Y".to_string())
+        );
+        // A *scoped* key with no colon has an empty name and is dropped, which
+        // is the case the colon check was written for.
+        assert_eq!(replaced("res.x-mark"), Some("html-and-more".to_string()));
     }
 
     /// A `headerReplace` pattern is a regexp only in the `/…/flags` spelling;

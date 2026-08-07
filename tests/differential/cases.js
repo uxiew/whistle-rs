@@ -51,7 +51,16 @@ module.exports = [
   { name: 'resCors star', rules: `${P} resCors://*` },
   { name: 'resCors enable echoes origin', rules: `${P} resCors://enable`, request: { headers: { origin: 'https://app.test' } } },
   { name: 'resCors preflight', rules: `${P} resCors://enable`, request: { method: 'OPTIONS', headers: { origin: 'https://app.test', 'access-control-request-method': 'PUT', 'access-control-request-headers': 'x-token' } } },
+  // The forms the documentation leads with —
+  // https://wproxy.org/docs/rules/headerReplace.html
   { name: 'headerReplace on a response header', rules: `${P} headerReplace://resH.x-origin:/yes/=no` },
+  { name: 'headerReplace doc form: req, literal', rules: `${P} headerReplace://req.accept:html=abc`, request: { headers: { accept: 'text/html,application/xhtml+xml' } } },
+  { name: 'headerReplace doc form: req, regexp global', rules: `${P} headerReplace://req.accept:/ml/g=abc`, request: { headers: { accept: 'text/html,application/xhtml+xml' } } },
+  { name: 'headerReplace doc form: res', rules: `${P} headerReplace://res.Content-Type:json=plain` },
+  // `p1=v1&p2=v2` on one header: the second pair carries no colon, so the whole
+  // key is its pattern. This port dropped it and applied only the first.
+  { name: 'headerReplace doc form: several patterns, one header', rules: `${P} headerReplace://res.x-origin:y=Y&es=ES` },
+  { name: 'headerReplace JSON form still works', rules: `${P} headerReplace://{"resH.x-origin:/yes/":"no"}` },
   { name: 'attachment', rules: `${P} attachment://out.json` },
   { name: 'cache', rules: `${P} cache://600` },
 
