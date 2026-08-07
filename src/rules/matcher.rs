@@ -159,11 +159,23 @@ fn pattern_accepts<'r>(
         // and no `joinUrl` (`_original/lib/rules/rules.js:1013`).
         Pattern::Any => Some(Matched::default()),
         Pattern::Nothing => None,
-        // Equality, not a prefix — and so it consumes the whole URL and leaves
-        // no tail for `joinUrl` to append.
-        Pattern::Exact(want) => {
-            Pattern::exact_matches(want, &req.full_url).then(Matched::default)
-        }
+        // Equality, not a prefix — so the path is fully consumed and only the
+        // *query* can be left over. Upstream hands that query to the
+        // destination (`getRelativePath`, `_original/lib/rules/rules.js:848-858`,
+        // reached from the `isExact` arm at `:1065-1074`): an exact pattern with
+        // no query of its own still forwards `?q=1` to where it points. This
+        // port dropped it, so `$a.com/search http://dev/search` lost every
+        // search term.
+        Pattern::Exact(want) => Pattern::exact_matches(want, &req.full_url).then(|| {
+            Matched::with_tail(match want.contains('?') {
+                // The pattern named the query too, so nothing is left of it.
+                true => Tail::Borrowed(""),
+                false => match req.full_url.find('?') {
+                    Some(i) => Tail::Borrowed(&req.full_url[i..]),
+                    None => Tail::Borrowed(""),
+                },
+            })
+        }),
         // Without a `$` reference on the line there is nothing to collect, and
         // `is_match` skips building the capture locations entirely.
         Pattern::Regex(re) if !want_groups => {
@@ -190,6 +202,7 @@ fn pattern_accepts<'r>(
             host,
             host_suffix,
             port,
+            is_domain,
             path,
         } => {
             if let Some(s) = scheme
@@ -217,10 +230,10 @@ fn pattern_accepts<'r>(
             // port and all; only a bare-host pattern gets the port-stripped
             // fallback. That is upstream's `rule.isDomain` guard on its
             // `domainUrl` arm (`_original/lib/rules/rules.js:1081-1083`, with
-            // `isDomain` at `:1343-1348` — true only when the pattern has no
-            // `/`). Without it `example.com/api` also matched
-            // `http://example.com:8080/api`, which is a different origin.
-            if !path.is_empty() && port.is_none() && req.port != default_port(&req.scheme) {
+            // `isDomain` at `:1343-1348`). Without it `example.com/api` also
+            // matched `http://example.com:8080/api`, which is a different
+            // origin.
+            if !is_domain && port.is_none() && req.port != default_port(&req.scheme) {
                 return None;
             }
             if path.is_empty() {
@@ -423,17 +436,22 @@ fn random_unit() -> f64 {
     (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// whistle treats `http`/`https`/`ws`/`wss`/`tunnel` with some equivalence.
+/// Does a pattern's scheme name the request's?
+///
+/// Only when it is the same word. whistle matches a pattern as a literal prefix
+/// of the request URL, and that URL names one scheme: `ws`/`wss` for a
+/// WebSocket, `tunnel` for a CONNECT, `http`/`https` otherwise (`getFullUrl`,
+/// `_original/lib/util/common.js:1231-1267`). So `http://example.com` does not
+/// reach a WebSocket on the same host, and `ws://example.com` does not reach a
+/// plain request — the pattern that reaches both is the one with no scheme at
+/// all, which is whistle's idiom for it.
+///
+/// This port used to fold `http` into `ws` and `https` into `wss` in both
+/// directions, on the reading that a WebSocket "is" an HTTP upgrade. Measured
+/// against whistle 2.10.8, `ws://host` matched a plain GET here and nothing
+/// there.
 fn scheme_matches(pat: &str, req: &str) -> bool {
-    if pat == req {
-        return true;
-    }
-    // ws rules also apply to their http transport and vice-versa is not implied;
-    // keep this conservative: exact, plus http<->ws family upgrades.
-    matches!(
-        (pat, req),
-        ("http", "ws") | ("https", "wss") | ("ws", "http") | ("wss", "https")
-    )
+    pat == req
 }
 
 /// Walk all rules and build the [`Resolved`] set for `req`.
@@ -513,14 +531,15 @@ fn resolve_walk(
             // for [`resolve_response_ops`], which is where upstream decides
             // them too; everything else on the line applies now.
             let defer_res = defer_res_phase && rule.needs_response_phase(req);
-            for op in &rule.ops {
+            let line = order_key(index, pass_important);
+            for (at, op) in rule.ops.iter().enumerate() {
                 if defer_res && protocols::is_res_phase(&op.protocol) {
                     continue;
                 }
                 if exact.silences_op(op) {
                     continue;
                 }
-                take(&mut resolved, op, order_key(index, pass_important), &matched);
+                take(&mut resolved, op, super::token_order(line, at), &matched);
             }
         }
     }
@@ -721,9 +740,9 @@ pub fn resolve_response_ops(
         let Some(matched) = match_rule(rule, req) else {
             continue;
         };
-        for op in &rule.ops {
+        for (at, op) in rule.ops.iter().enumerate() {
             if protocols::is_res_phase(&op.protocol) || op.protocol == "ignore" {
-                take(&mut resolved, op, *order, &matched);
+                take(&mut resolved, op, super::token_order(*order, at), &matched);
             }
         }
     }

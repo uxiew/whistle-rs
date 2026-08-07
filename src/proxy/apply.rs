@@ -31,17 +31,25 @@ pub fn build_req_info(
     headers: &HeaderMap,
     client_ip: Option<String>,
 ) -> ReqInfo {
-    let host = host.to_ascii_lowercase();
     let default_port = if scheme == "https" || scheme == "wss" {
         443
     } else {
         80
     };
+    // The URL every pattern is matched against, and the one `$0` and `${url}`
+    // report — so it carries the host **as the client wrote it**. Upstream
+    // builds it the same way (`getFullUrl`,
+    // `_original/lib/util/common.js:1231-1267`, which lower-cases nothing), and
+    // folding the case here meant a regexp pattern naming an upper-case host
+    // could never match one, and `$0` handed the rule a URL nobody had asked
+    // for. [`ReqInfo::host`] is still folded, because that one is compared as a
+    // *host* rather than as text.
     let full_url = if port == default_port {
         format!("{scheme}://{host}{path}")
     } else {
         format!("{scheme}://{host}:{port}{path}")
     };
+    let host = host.to_ascii_lowercase();
     let hdrs = headers
         .iter()
         .map(|(n, v)| (n.as_str().to_ascii_lowercase(), v.to_str().unwrap_or("").to_string()))
@@ -2933,8 +2941,18 @@ pub fn apply_response_for(
     resolved: &Resolved,
     info: Option<&ReqInfo>,
 ) {
+    // `statusCode` only speaks when it won the shared slot. Upstream reads it
+    // off `rules.rule` (`getStatusCodeFromRule`,
+    // `_original/lib/util/index.js:3566-3589`), which is the same single winner
+    // a `file://` or a destination would have taken — so a `statusCode` written
+    // below one of those, or after one on the same line, never reaches the
+    // response at all. Here it was applied unconditionally, and so overwrote the
+    // status of a file the rules had already chosen to serve. `replaceStatus`
+    // has a list of its own upstream and needs no such gate.
+    let has_slot = |p: &str| p != "statusCode" || slot_winner(resolved).is_some_and(|(w, _)| w == p);
     if let Some((proto, code)) = ["replaceStatus", "statusCode"]
         .into_iter()
+        .filter(|p| has_slot(p))
         .find_map(|p| resolved.value(p).map(|v| (p, v)))
         && let Some(status) = code
             .trim()
@@ -8118,6 +8136,99 @@ mod tests {
         // `rule://<name>` is the values-store include, not a destination, so it
         // does not compete.
         assert_eq!(winner("a.com rule://mocks\n", "http://a.com/"), None);
+
+        // Two of them on **one line**: the one written first wins there too.
+        // Upstream pushes a line's matchers onto the shared list in the order
+        // they are written (`matchers.forEach(parseRule)`,
+        // `_original/lib/rules/rules.js:1785-1789`). This port gave every
+        // operator on a line the same order key, so the tie fell to whatever
+        // order `slot_protocols` happened to list — and `statusCode` was first
+        // in that list, so `example.com file:///mock statusCode://204` served
+        // the mock upstream and answered 204 here.
+        assert_eq!(
+            winner("a.com file:///mock.json statusCode://204\n", "http://a.com/"),
+            Some("file")
+        );
+        assert_eq!(
+            winner("a.com statusCode://204 file:///mock.json\n", "http://a.com/"),
+            Some("statusCode")
+        );
+        assert_eq!(
+            winner("a.com redirect://http://x/ statusCode://204\n", "http://a.com/"),
+            Some("redirect")
+        );
+        assert_eq!(
+            winner("a.com http://127.0.0.1:9000 statusCode://204\n", "http://a.com/"),
+            Some("rule")
+        );
+        // A second bare host on a pattern-first line is an operator, not a
+        // pattern, and it takes the slot before anything written after it.
+        assert_eq!(
+            winner("a.com b.com statusCode://204\n", "http://a.com/"),
+            Some("rule")
+        );
+    }
+
+    /// `statusCode://` only speaks when it won the shared slot.
+    ///
+    /// Upstream reads it off `rules.rule` (`getStatusCodeFromRule`,
+    /// `_original/lib/util/index.js:3566-3589`) — the same single winner a
+    /// `file://` or a destination would have taken — so a `statusCode` written
+    /// below one of those never reaches the response. Here it was applied
+    /// unconditionally in the response phase, so it overwrote the status of a
+    /// file the rules had already chosen to serve, and of a response fetched
+    /// from a destination the rules had already chosen to forward to.
+    #[test]
+    fn a_status_code_that_lost_the_slot_stays_quiet() {
+        let status_after = |text: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            let resolved = mgr.resolve(&info);
+            let mut parts = Response::new(()).into_parts().0;
+            parts.status = StatusCode::OK;
+            apply_response(&mut parts, &resolved);
+            parts.status
+        };
+        // Alone, it still answers.
+        assert_eq!(status_after("a.com statusCode://204\n"), StatusCode::NO_CONTENT);
+        // Behind a destination — on its own line or on the same one — it does not.
+        assert_eq!(
+            status_after("a.com http://127.0.0.1:9000\na.com statusCode://204\n"),
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_after("a.com http://127.0.0.1:9000 statusCode://204\n"),
+            StatusCode::OK
+        );
+        assert_eq!(status_after("a.com file:///mock.json statusCode://204\n"), StatusCode::OK);
+        // In front of one, it wins the slot and speaks.
+        assert_eq!(
+            status_after("a.com statusCode://204\na.com http://127.0.0.1:9000\n"),
+            StatusCode::NO_CONTENT
+        );
+        // `replaceStatus` has a list of its own upstream and needs no slot.
+        assert_eq!(
+            status_after("a.com http://127.0.0.1:9000 replaceStatus://204\n"),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    /// The URL a pattern is matched against carries the host **as the client
+    /// wrote it**, because upstream's `getFullUrl`
+    /// (`_original/lib/util/common.js:1231-1267`) lower-cases nothing. Folding
+    /// it here meant a regexp pattern naming an upper-case host could never
+    /// match one, and `$0` handed the rule a URL nobody had asked for.
+    /// [`ReqInfo::host`] is still folded — that one is compared as a host.
+    #[test]
+    fn the_matched_url_keeps_the_host_as_written() {
+        let info = build_req_info("GET", "http", "API.Example.COM", 80, "/p", &HeaderMap::new(), None);
+        assert_eq!(info.full_url, "http://API.Example.COM/p");
+        assert_eq!(info.host, "api.example.com");
+        // The default port is still the one thing the URL drops, as upstream's
+        // `removeDefaultPort` does.
+        let ported = build_req_info("GET", "http", "a.com", 8080, "/p", &HeaderMap::new(), None);
+        assert_eq!(ported.full_url, "http://a.com:8080/p");
     }
 
     /// A header name repeated inside one operator value is a **list**, not a

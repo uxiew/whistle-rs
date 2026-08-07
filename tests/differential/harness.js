@@ -147,6 +147,16 @@ const EXPECTED = [
     why: 'a rawfile with no status line: upstream crashes, this serves it',
   },
   {
+    // Three pattern deviations, each declared in `docs/RULES.md` and each
+    // better than what it replaces: a host is matched case-insensitively, an
+    // explicit `:80` on an http pattern is a port rather than dead text, and an
+    // IPv6 literal survives the port-stripped comparison upstream's `removePort`
+    // mangles. The cases that exercise them carry this header and no other case
+    // uses it; `cases-patterns.js` names all three at the top.
+    match: (p) => /req\.header\.x-pattern-dev:/.test(p),
+    why: 'declared pattern deviations: host case, :80, and IPv6 literals',
+  },
+  {
     // whistle files a `host` filter condition under `hostFilter`, which only
     // `util.checkProxyHost` reads: it decides which hosts a `proxy://` engages
     // for, never whether a rule applies. whistle-rs matches the request's host
@@ -310,8 +320,17 @@ function decodeBody(headers, buf) {
   return buf.toString();
 }
 
-/** One request through one proxy; resolves to what the client saw. */
-function through(port, { method = 'GET', path = '/echo', headers = {}, body = '' }) {
+/**
+ * One request through one proxy; resolves to what the client saw.
+ *
+ * `url` names the whole absolute URL instead of a path under the echo origin,
+ * which is how a case reaches a host the origin does not have — the pattern
+ * corpus points `example.test` at the origin with a `host://` line and then
+ * asks which patterns match it. The `Host` header follows the URL's authority.
+ */
+function through(port, { method = 'GET', path = '/echo', url, headers = {}, body = '' }) {
+  const target = url || `http://127.0.0.1:${ORIGIN}${path}`;
+  const authority = target.slice(target.indexOf('://') + 3).split('/')[0];
   return new Promise((resolve) => {
     // A response whose head arrived and whose body never ends leaves `end`
     // unfired, and one such case used to stall the whole run with nothing
@@ -325,8 +344,8 @@ function through(port, { method = 'GET', path = '/echo', headers = {}, body = ''
     );
     const req = http.request({
       host: '127.0.0.1', port, method,
-      path: `http://127.0.0.1:${ORIGIN}${path}`,
-      headers: { host: `127.0.0.1:${ORIGIN}`, ...headers },
+      path: target,
+      headers: { host: authority, ...headers },
     }, (r) => {
       const chunks = [];
       r.on('data', (c) => chunks.push(c));

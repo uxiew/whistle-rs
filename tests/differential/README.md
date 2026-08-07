@@ -100,3 +100,9 @@ proxies are given; `request` defaults to a `GET /echo`, which the origin answers
 with a JSON echo of everything that reached it — so a rule that rewrites the
 *request* is visible too. A rule that rewrites the response body will make that
 echo unparseable, which is fine: the bench falls back to comparing the body.
+
+`request.url` names a whole absolute URL instead of a path under the echo origin.
+That is how `cases-patterns.js` asks about a **hostname** and about the **default
+port**, neither of which the origin's own `127.0.0.1:<port>` address can express:
+it points every host at the origin with a `* host://…` line and then asks which
+patterns match `http://a.example.test/echo`.

@@ -72,7 +72,8 @@ The operators worth knowing before the rest are
   [leading dot](#2-leading-dot-subdomain-match) · [wildcard](#3-wildcard) ·
   [`^`](#4---wildcards-everywhere) · [`$0`…`$9` captures](#09--what-the-pattern-captured) ·
   [regexp](#5-regular-expression) · [port](#6-port) · [`!` negation](#--negated-patterns) ·
-  [`$` exact](#--exact-patterns)
+  [`$` exact](#--exact-patterns) ·
+  [where they differ from upstream](#where-patterns-differ-from-upstream)
 - [Operators](#operators)
   - [Where the pattern sits](#where-the-pattern-sits) · [Shorthands](#shorthands)
   - [What an operator's value can be](#what-an-operators-value-can-be) —
@@ -148,9 +149,22 @@ Matching rules:
 
 | Pattern part | Behaviour |
 |--------------|-----------|
-| scheme (`http://`, `https://`, `ws://`, `wss://`) | optional; if present the request scheme must match (with `http↔ws` / `https↔wss` upgrade equivalence) |
-| host | matched **exactly** (case-insensitive), unless it starts with a dot (see below) |
+| scheme (`http://`, `https://`, `ws://`, `wss://`, `tunnel://`) | optional; if present it must be the request's own — a WebSocket's URL is `ws://…`, so `http://example.com` does **not** reach it and `example.com` does |
+| host | required, and matched **exactly** (case-insensitive — a [deviation](#where-patterns-differ-from-upstream)) unless it starts with a dot (see below) |
+| port | optional; `example.com:8080` matches that host only on that port |
 | path | matched as a **prefix** of the request path+query |
+
+A pattern with **no host** matches nothing: `http://`, `http:///api`, `:80/api`
+and `///example.com` are all dead text, because upstream compares the pattern
+against the request URL and every URL has an authority.
+
+A pattern may carry a query **instead of** a path — `example.com?a=1` means
+`example.com/?a=1` — and such a pattern still counts as "a host and nothing
+else", so it applies on any port.
+
+Only a host-and-nothing-else pattern ignores the port. `example.com` matches
+`http://example.com:8080/x`; `example.com/` and `example.com/api` do not, because
+a pattern carrying a path is compared against the URL text, port and all.
 
 ### Path matching stops at a segment boundary
 
@@ -247,12 +261,18 @@ one of its values stays as written.
 ### 5. Regular expression
 
 A pattern wrapped in slashes is a regex tested against the **full request URL**
-(`scheme://host[:port]/path?query`). A trailing `i` makes it case-insensitive:
+(`scheme://host[:port]/path?query`), with the host as the client wrote it. A
+trailing `i` makes it case-insensitive:
 
 ```
 /\.js(\?|$)/          resType://application/javascript
 /^https:\/\/cdn\./i   host://10.0.0.9
 ```
+
+The only flags are `i` and `u`, in either order — upstream's `REG_EXP_RE` is
+`/^\/(.+)\/(i?u?|ui)$/` and admits nothing else. `/echo/g`, `/echo/m` and
+`/echo/s` are **not** regexps; they fall through to the pattern kinds above,
+where they have no host and so match nothing.
 
 ### 6. Port
 
@@ -299,6 +319,15 @@ root:
 | `$http://example.com/p?a=1` | — | ✅ | — | — | — |
 | `$example.com` | — | — | — | — | ✅ |
 
+The request's **query** is still handed to the destination, since an exact
+pattern consumed only the path: `$example.com/search http://dev.test/search`
+forwards `?q=cat` along with it. A pattern that named the query itself has
+already consumed it.
+
+`$` in front of a **wildcard** is an exact wildcard, not an exact match against
+the literal text: `$*.example.com/api` names `/api` on any one-label subdomain
+and nothing under it.
+
 `!$…` is a **negated exact** pattern — every URL but that one. It is allowed
 where a negated plain pattern is not, because upstream's `$` branch runs before
 the check that drops those.
@@ -309,6 +338,25 @@ the check that drops those.
 > rule written *before* a `$` one still wins there, and `$example.com` named the
 > site root where this port matched every URL on the host. Importance has one
 > spelling: `lineProps://important`.
+
+### Where patterns differ from upstream
+
+Three, each measured against whistle 2.10.8 and each a place where upstream's
+answer is an accident of comparing the pattern against the URL **as text**. Every
+one of them turns a rule someone wrote into a rule that fires exactly never, so
+no rules file can be relying on the upstream answer.
+
+| Pattern | Upstream | Here |
+|---|---|---|
+| `EXAMPLE.com` (or a request whose `Host` is upper-case) | no match: the two strings differ | matches — a hostname is not case-sensitive |
+| `example.com:80` on an http request (`:443` on https) | no match ever: `getFullUrl` strips the default port before anything is compared, so the URL never contains `:80` | matches port 80, and only port 80 |
+| `[::1]` with no port, against `http://[::1]:8080/` | no match: a host-only pattern is also compared against the port-stripped URL, and `removePort` cuts at the first `:` after the scheme — which is inside the brackets, leaving `http://[` | matches |
+
+The case fold is for the plain host-prefix form only. A **regexp** or a
+**wildcard** pattern is matched against the URL exactly as the client wrote it,
+which is upstream's behaviour and what makes `$0` and `${url}` report the real
+request — so `/API\.example\.com/` matches an upper-case host and
+`/api\.example\.com/` does not.
 
 ---
 
@@ -2044,8 +2092,9 @@ api.test/data  resMerge://true            # …unless this asks for a deep fold
 
 For each request whistle-rs walks the rules and builds a resolved set:
 
-1. **Important first.** Rules whose pattern starts with `$` are considered before
-   normal rules.
+1. **Important first.** Lines carrying `lineProps://important` are considered
+   before normal ones. (`$` is *not* an importance marker — it is exact
+   matching; see [`$` — exact patterns](#--exact-patterns).)
 2. **First-match-wins** for single-value protocols (`host`, `redirect`, `ua`, …):
    the first matching rule (respecting importance) sets the value.
 3. **Accumulate** for multi-match protocols — whistle's `multiMatchs` list, kept
@@ -2058,8 +2107,29 @@ For each request whistle-rs walks the rules and builds a resolved set:
    port also accumulates) — where every matching value is kept, in top-to-bottom
    order.
 
-Within a pass, rules are evaluated in **file order**, so put more specific / higher
-priority rules earlier (or mark them `$`).
+Within a pass, rules are evaluated in **file order**, so put more specific /
+higher priority rules earlier (or mark them `lineProps://important`).
+
+Two orderings sit either side of "file order" and are easy to be surprised by:
+
+* **Rule groups.** Every enabled *named* group is walked first, in the order the
+  console lists them, and the **default group last** — so a named group overrides
+  the default one. That is upstream's order
+  (`addRules(defaultRules, 'Default')` after the named ones), and the reason its
+  console shows Default at the bottom.
+* **Tokens on one line.** Several operators share a **single slot**: a
+  destination (`http://…`, `example.com`, a bare host), the local-file family,
+  `statusCode://`, `redirect://` and `location://`. Only one of them answers a
+  request, and it is whichever was written first — on the earlier line, or
+  earlier on the same line:
+
+  ```
+  example.com  file:///mock.json  statusCode://204   # serves the file
+  example.com  statusCode://204  file:///mock.json   # answers 204
+  ```
+
+  A `statusCode://` that loses this contest is silent; it does not come back in
+  the response phase to overwrite the status of whatever won.
 
 ### How several lines of one operator combine
 
@@ -2083,12 +2153,13 @@ example.com/x  jsAppend://two()
 # → <!DOCTYPE html><!--head--><page><script>one()</script><script>two()</script>
 ```
 
-An `important` (`$`) line leads the list, so it both wins contested keys and comes
+An `important` line leads the list, so it both wins contested keys and comes
 first in a join:
 
 ```
 example.com/x  resAppend://normal
-$example.com/x resAppend://important     # → body + "important\r\nnormal"
+example.com/x  resAppend://important lineProps://important
+# → body + "important\r\nnormal"
 ```
 
 ---

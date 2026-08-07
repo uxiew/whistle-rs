@@ -141,7 +141,15 @@ example.com            http://localhost:5173
 
 ```
 example.com            http://localhost:5173
-$example.com/api/flags file://({"beta":true})
+example.com/api/flags  file://({"beta":true}) lineProps://important
+```
+
+The same family shares one slot **within a line** too, and there the winner is
+whichever was written first:
+
+```
+example.com  file://({"beta":true})  statusCode://204   # serves the file
+example.com  statusCode://204  file://({"beta":true})   # answers 204
 ```
 
 Operators that are *not* in that family — `resHeaders://`, `reqHeaders://`,
@@ -551,16 +559,19 @@ A filter's URL pattern always reads as if it were `^`-prefixed, which is why
 `excludeFilter://*/health` wildcards the path while the same token as a rule
 pattern would not.
 
-### `$` — important
+### `lineProps://important` — jump the queue
 
 ```
 example.com    host://1.1.1.1
-$example.com   host://2.2.2.2      # this one wins
+example.com    host://2.2.2.2  lineProps://important   # this one wins
 ```
 
 Important rules are resolved before normal ones, whatever their line order. It
 is the escape hatch for "my narrow rule is below a broad one and I do not want
 to reorder the file".
+
+`$` is **not** this. It is exact matching — `$example.com` names the site root
+and nothing under it — and it carries no precedence at all, in whistle or here.
 
 ### `ignore://` — carve a hole in a broad rule
 
@@ -594,6 +605,11 @@ curl --noproxy '*' http://127.0.0.1:8899/api/rule-groups
 
 Groups persist to `<storage_dir>/rules/` and come back on restart. A disabled
 group contributes nothing — not even the values its fenced blocks declare.
+
+**Named groups outrank the default one.** Every enabled named group is resolved
+first, in list order, and the default group last — whistle's own order, and the
+reason its console lists Default at the bottom. So a `staging` group is the place
+to put the overrides you switch on and off.
 
 ### Pull rules in from elsewhere
 

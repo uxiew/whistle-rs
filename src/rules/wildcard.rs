@@ -101,18 +101,22 @@ impl Wildcard {
 /// (`_original/lib/rules/rules.js:848-858`): an exact pattern consumed the path,
 /// so only a query string can be left, and only when the pattern did not carry
 /// one of its own.
+///
+/// Upstream's third test — whether the *destination* already has a `?`, which
+/// decides between `?q=1` and `&q=1` — is not made here, because
+/// [`crate::rules::url::join_url`] makes it for every other pattern kind and
+/// makes it the same way. This port made that test against the **pattern**
+/// instead of the destination, which inverted the first one: a pattern that
+/// carried its own query, and had therefore consumed the request's, appended it
+/// a second time as `&q=1`.
 fn relative_query<'u>(path: &str, rest: &'u str) -> std::borrow::Cow<'u, str> {
-    let Some(i) = rest.find('?') else {
-        return std::borrow::Cow::Borrowed("");
-    };
     if path.contains('?') {
-        let extra = &rest[i + 1..];
-        return match extra.is_empty() {
-            true => std::borrow::Cow::Borrowed(""),
-            false => std::borrow::Cow::Owned(format!("&{extra}")),
-        };
+        return std::borrow::Cow::Borrowed("");
     }
-    std::borrow::Cow::Borrowed(&rest[i..])
+    match rest.find('?') {
+        Some(i) => std::borrow::Cow::Borrowed(&rest[i..]),
+        None => std::borrow::Cow::Borrowed(""),
+    }
 }
 
 /// How [`parse`] read a token.
