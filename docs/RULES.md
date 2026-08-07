@@ -2281,19 +2281,24 @@ untouched:
 
 - **a compressed event stream** — searching a deflate stream for a plaintext
   pattern finds nothing, and rewriting it would corrupt what the header promises;
-- **every other body operator.** `resBody://`, `resMerge://`, `resScript://` and
-  `resAppend://` need an ending the stream does not have. `resPrepend://` and the
-  typed injections (`htmlPrepend`, `jsAppend`, …) do *not* — prepending to a
-  stream is well defined — but they share the injection layer with the rest of
-  the family, and that layer works on a whole body because it also stamps a
-  doctype, gates on the response being HTML, and honours `safeHtml`/`strictHtml`.
-  Splitting it in two for a case where injecting arbitrary text would corrupt the
-  first event anyway is not a trade this port has made. Upstream does apply them,
-  so this is a **gap, not a non-goal**.
+- **the operators that genuinely need an ending**: `resMerge://`, `resScript://`,
+  and the typed injections (`htmlPrepend`, `jsAppend`, …), which are selected by
+  the response being HTML/JS/CSS and so never match an event stream anyway.
 
   A plugin that declares `responseBody` is skipped the same way, and logs a
   `WARN` so the hook does not appear to have mysteriously not run. Use a
   streaming hook (`pipe://`) instead — see [`PLUGINS.md`](PLUGINS.md).
+
+`resPrepend://` and `resAppend://` **do** apply: one goes out ahead of the
+origin's first byte and the other after its last. On a stream that never ends,
+`resAppend://` never fires — there is no "after" a body that does not finish,
+and that is the honest answer rather than a missing feature.
+
+`resBody://` applies too, and says there is no origin body to wait for: the
+value is sent and the stream ends. That makes it a usable mock for an endpoint
+that would otherwise stream forever. No doctype is stamped and
+`safeHtml`/`strictHtml` do not gate any of the three, because all of that is
+upstream's HTML-injection machinery and an event stream is not HTML.
 
 `disable://trailers` applies to an event stream; `resWriteRaw://` and
 `trailers://` do not.

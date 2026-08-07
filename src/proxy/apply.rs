@@ -4565,6 +4565,55 @@ fn apply_replace(
 /// about whether the operator reaches this body at all: upstream refuses the
 /// whole operator for a response with no `content-type` or an image one
 /// (`handleReplace`, `_original/lib/inspectors/res.js:129-132`).
+/// What the injecting operators mean for a body that is **still arriving**.
+///
+/// The buffered path reaches these bytes by concatenation, which needs an
+/// ending. These three do not need one: `resPrepend://` goes before the first
+/// byte, `resAppend://` after the last, and `resBody://` says there is no origin
+/// body at all. See [`crate::proxy::body::surround`].
+pub struct StreamInjection {
+    /// `resPrepend://`, its lines already CRLF-joined.
+    pub top: Vec<u8>,
+    /// `resAppend://`, likewise. Never delivered on a stream that does not end,
+    /// which is the honest answer rather than a missing feature: there is no
+    /// "after" a body that never finishes.
+    pub bottom: Vec<u8>,
+    /// `resBody://` — the body *is* this, and the origin's is not waited for.
+    pub replacement: Option<Vec<u8>>,
+}
+
+/// The injection for a response whose body is still arriving, or `None` when no
+/// operator asks for one.
+///
+/// Only the generic `res*` family is collected. The typed families
+/// (`htmlPrepend`, `jsAppend`, …) are absent because they are selected by the
+/// response being HTML/JS/CSS, and a body that is still arriving here is an
+/// event stream — none of those.
+///
+/// The gate is [`InjectionGate::plain`]: no doctype is stamped and nothing is
+/// refused. Both follow from the response not being HTML — upstream stamps a
+/// doctype only there, and its `allowInject` returns true whenever `isHtml` is
+/// unset (`_original/lib/util/whistle-transform.js:80-83`). `safeHtml` and
+/// `strictHtml` gate HTML injection specifically and so have nothing to say.
+pub fn res_stream_injection(resolved: &Resolved) -> Option<StreamInjection> {
+    let mut injection = Injection::default();
+    collect_generic(&mut injection, &InjectionGate::plain(resolved), "res");
+    let (mut top, mut bottom) = (Vec::new(), Vec::new());
+    join_into(&mut top, std::mem::take(&mut injection.top));
+    join_into(&mut bottom, std::mem::take(&mut injection.bottom));
+    let replacement = injection.replaces_body.then(|| {
+        let mut body = Vec::new();
+        join_into(&mut body, std::mem::take(&mut injection.body));
+        body
+    });
+    let empty = top.is_empty() && bottom.is_empty() && replacement.is_none();
+    (!empty).then_some(StreamInjection {
+        top,
+        bottom,
+        replacement,
+    })
+}
+
 pub fn res_replace_pairs(resolved: &Resolved, content_type: Option<&str>) -> Vec<(String, String)> {
     let class = content_type.and_then(res_class);
     if matches!(class, None | Some(ResClass::Img)) {

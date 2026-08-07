@@ -1255,6 +1255,50 @@ mod forced_encoding_tests {
         assert!(!apply::res_replace_pairs(&r, Some("text/event-stream")).is_empty());
     }
 
+    /// `resPrepend://` and `resAppend://` do not need a body either — one goes
+    /// before the first byte, the other after the last.
+    #[test]
+    fn an_event_stream_can_be_prepended_to_and_appended_to() {
+        let r = resolved_for("resPrepend://(BEFORE) resAppend://(AFTER)");
+        let inject = stream_injection(&r, Some("text/event-stream")).expect("an injection");
+        assert_eq!(inject.top, b"BEFORE");
+        assert_eq!(inject.bottom, b"AFTER");
+        assert!(inject.replacement.is_none(), "the origin's body still flows");
+        // A body with an end belongs to the buffered path, which also applies
+        // the typed families and the HTML gating this one cannot.
+        assert!(stream_injection(&r, Some("text/html")).is_none());
+    }
+
+    /// `resBody://` says there is no origin body to wait for, which is what
+    /// makes it usable as a mock for a stream that would never end.
+    #[test]
+    fn res_body_replaces_a_stream_rather_than_waiting_for_it() {
+        // No space inside the parentheses: a rules line is whitespace-separated
+        // tokens, so a multi-word body is named with `{a-value}` or a file.
+        let r = resolved_for("resBody://(data:mocked)");
+        let inject = stream_injection(&r, Some("text/event-stream")).expect("an injection");
+        assert_eq!(inject.replacement.as_deref(), Some(&b"data:mocked"[..]));
+    }
+
+    /// Nothing here reads the origin's bytes, so unlike the substitution an
+    /// encoded stream is no obstacle.
+    #[test]
+    fn an_injection_does_not_care_what_the_stream_is_encoded_as() {
+        let r = resolved_for("resPrepend://(X)");
+        assert!(stream_injection(&r, Some("text/event-stream")).is_some());
+        assert!(
+            stream_replace(&resolved_for("resReplace://a=b"), Some("text/event-stream"), Some("gzip"))
+                .is_none(),
+            "…where the substitution still refuses one"
+        );
+    }
+
+    /// A line with none of these operators installs nothing.
+    #[test]
+    fn a_stream_no_operator_touches_gets_no_injection() {
+        assert!(stream_injection(&resolved_for("log://x"), Some("text/event-stream")).is_none());
+    }
+
     /// `disable://trailers` costs no buffering, so an event stream keeps it
     /// where it loses the operators that need the whole body.
     #[test]
@@ -2436,6 +2480,20 @@ fn stream_replace(
     }
     let pairs = apply::res_replace_pairs(resolved, res_ct);
     restream::TextReplace::new(&pairs, true)
+}
+
+/// The prepend / append / replace-body injection for a response still arriving,
+/// or `None` to leave the stream alone.
+///
+/// Gated on the response being an event stream for the same reason
+/// [`stream_replace`] is: a body with an end belongs to the buffered path, which
+/// applies the typed families and the HTML gating too. Unlike the substitution
+/// there is no encoding question — nothing here reads the origin's bytes, so a
+/// compressed stream can be prepended to as safely as a plain one.
+fn stream_injection(resolved: &Resolved, res_ct: Option<&str>) -> Option<apply::StreamInjection> {
+    is_event_stream(res_ct)
+        .then(|| apply::res_stream_injection(resolved))
+        .flatten()
 }
 
 impl ResBodyOps {
@@ -3874,6 +3932,28 @@ async fn serve(
                     // assumption.
                     parts.headers.remove(hyper::header::CONTENT_LENGTH);
                     restream::wrap(body, transform)
+                }
+                None => body,
+            };
+            // …and three more that do not need the whole body either:
+            // `resPrepend://` goes ahead of the first byte, `resAppend://`
+            // after the last, and `resBody://` says there is no origin body to
+            // wait for. They sit *after* the substitution because that is the
+            // buffered path's order too — upstream's text transforms run ahead
+            // of the injection, so a `resReplace://` never sees what a
+            // `resPrepend://` put there (`_original/lib/inspectors/res.js`, and
+            // see `transform_res_body`).
+            let body = match stream_injection(&resolved, res_ct.as_deref()) {
+                Some(inject) => {
+                    parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                    let origin = match inject.replacement {
+                        // `resBody://` replaces the body, so the origin's is
+                        // not waited for — dropping it here is what makes this
+                        // usable as a mock for a stream that never ends.
+                        Some(replacement) => body::full(replacement),
+                        None => body,
+                    };
+                    body::surround(origin, inject.top, inject.bottom)
                 }
                 None => body,
             };
