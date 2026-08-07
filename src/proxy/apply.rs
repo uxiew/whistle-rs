@@ -1036,6 +1036,28 @@ pub fn short_circuit(
     resolved: &Resolved,
     env: super::template::ProxyEnv<'_>,
 ) -> Option<Response<DynBody>> {
+    let mut resp = short_circuit_inner(info, resolved, env)?;
+    mark_self_generated(resp.headers_mut());
+    Some(resp)
+}
+
+/// The header whistle puts on every response it makes itself — `x-server`, set
+/// from `config.appName` by `wrapResponse` (`_original/lib/util/index.js:1080-1090`).
+///
+/// It answers the question a mocked response otherwise leaves open: did this
+/// come from the origin or from the proxy? Worth having for the same reason
+/// upstream has it, and worth spelling honestly: this is not whistle, so it does
+/// not say `Whistle`. A tool keying off the exact upstream value will not see
+/// it, which is the correct outcome — it is not talking to whistle.
+fn mark_self_generated(headers: &mut HeaderMap) {
+    set_header(headers, "x-server", "whistle-rs");
+}
+
+fn short_circuit_inner(
+    info: &ReqInfo,
+    resolved: &Resolved,
+    env: super::template::ProxyEnv<'_>,
+) -> Option<Response<DynBody>> {
     let (proto, op) = slot_winner(resolved)?;
     match proto {
         "redirect" | "location" => {
@@ -2278,7 +2300,7 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, want: Head
         // Order matters here, and `serde_json::Map` sorts: a key with no scope
         // prefix inherits the *previous* key's scope, so the entries have to be
         // seen in the order they were written.
-        let Some(entries) = json_object_in_order(value.trim()) else {
+        let Some(entries) = ordered_pairs(value.trim()) else {
             continue;
         };
         // Carried over from the last key that named a scope — *both* the scope
@@ -2343,6 +2365,40 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, want: Head
             }
         }
     }
+}
+
+/// The entries of a `headerReplace://` value, in source order, in either
+/// spelling upstream accepts.
+///
+/// `readRuleList` reads these operators as JSON **or** as a query string
+/// (`parseRuleJson` → `tryParseMatcher` → `parseQuery`,
+/// `_original/lib/util/index.js`), and the query-string form is the shorter of
+/// the two: `headerReplace://resH.x-origin:/yes/=no`. This port took only the
+/// JSON one, so that rule parsed, matched, and rewrote nothing — silently,
+/// which is the failure mode the whole audit keeps turning up.
+///
+/// Splitting is upstream's `parseQuery`: `&` between entries, the **first** `=`
+/// between key and value. A key here is `<scope>.<name>:<pattern>` and the
+/// pattern may well contain `/` and `:`, which is why only the first `=` counts.
+fn ordered_pairs(text: &str) -> Option<Vec<(String, serde_json::Value)>> {
+    if text.starts_with('{') {
+        return json_object_in_order(text);
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let pairs: Vec<(String, serde_json::Value)> = text
+        .split('&')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('=') {
+            Some((k, v)) => (k.to_string(), serde_json::Value::String(v.to_string())),
+            // A key with no `=` replaces its pattern with nothing, which is how
+            // `parseQuery` reads a bare name — an empty string, not a missing
+            // entry.
+            None => (entry.to_string(), serde_json::Value::String(String::new())),
+        })
+        .collect();
+    (!pairs.is_empty()).then_some(pairs)
 }
 
 /// Parse a JSON object into its entries **in source order**.
@@ -6677,6 +6733,40 @@ mod tests {
         assert!(del.drop_type && del.drop_charset && del.headers.is_empty());
     }
 
+    /// `headerReplace://` is read as JSON **or** as a query string, and the
+    /// second is the shorter spelling people actually write. This port took
+    /// only the first, so `headerReplace://resH.x-a:/yes/=no` parsed, matched
+    /// and rewrote nothing.
+    ///
+    /// Found by putting the same rule through real whistle and through this
+    /// port and comparing the answers — see the differential bench in the
+    /// commit that added it.
+    #[test]
+    fn header_replace_reads_the_query_string_spelling_too() {
+        let replaced = |rule: &str| {
+            let resolved = resolve(
+                &format!("example.com headerReplace://{rule}\n"),
+                "http://example.com/",
+            );
+            let mut h = HeaderMap::new();
+            h.insert("x-a", "yes".parse().unwrap());
+            h.insert("x-b", "keep".parse().unwrap());
+            apply_header_replace(&mut h, &resolved, HeaderScope::Response);
+            h.get("x-a").map(|v| v.to_str().unwrap().to_string())
+        };
+        // The two spellings mean the same thing.
+        assert_eq!(replaced("resH.x-a:/yes/=no"), Some("no".to_string()));
+        assert_eq!(replaced(r#"{"resH.x-a:/yes/":"no"}"#), Some("no".to_string()));
+        // `&` separates entries and the *first* `=` splits one — a pattern may
+        // contain `/` and `:` but the value starts after the first `=`.
+        assert_eq!(replaced("resH.x-b:/keep/=x&resH.x-a:/yes/=no"), Some("no".to_string()));
+        // A literal pattern, not a regexp, in the same spelling.
+        assert_eq!(replaced("resH.x-a:yes=no"), Some("no".to_string()));
+        // Scope inheritance still works across the query-string form: the
+        // second key names no scope, so it reuses `x-a`.
+        assert_eq!(replaced("resH.x-a:/nope/=x&:/yes/=no"), Some("no".to_string()));
+    }
+
     /// A `headerReplace` pattern is a regexp only in the `/…/flags` spelling;
     /// anything else is a literal, replaced everywhere it occurs.
     #[test]
@@ -7514,6 +7604,23 @@ mod tests {
             // …and with it off, the preflight is the file's own answer again.
             let resp = short_circuit(&cross_origin("OPTIONS"), &resolved, test_env()).expect("f");
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{rule}");
+        }
+    }
+
+    /// Every response the proxy makes itself says so — upstream's `x-server`
+    /// (`wrapResponse`, `_original/lib/util/index.js:1080-1090`). It answers the
+    /// question a mock otherwise leaves open: origin, or proxy?
+    #[test]
+    fn a_self_made_response_says_who_made_it() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/x", &HeaderMap::new(), None);
+        for rule in ["statusCode://204", "redirect://http://b.com/", "file:///nope"] {
+            let resolved = resolve(&format!("a.com/x {rule}\n"), "http://a.com/x");
+            let resp = short_circuit(&info, &resolved, test_env()).expect("an answer");
+            assert_eq!(
+                resp.headers().get("x-server").map(|v| v.to_str().unwrap()),
+                Some("whistle-rs"),
+                "{rule}"
+            );
         }
     }
 

@@ -1416,6 +1416,22 @@ rather than failing the rule.
 > conditional request answers `304 Not Modified` with no body, and the rewrite
 > silently does nothing — intermittently, since it depends on what the client
 > already holds.
+>
+> **This is a deliberate improvement on whistle, not an alignment with it, and
+> the entry used to claim otherwise.** whistle has `notAllowCache` and never
+> reaches it: it reads `req.rules`, and all seventeen of those operators are in
+> `pureResProtocols`, which the *request* pass skips. Measured against real
+> whistle 2.10.8, with `resBody://(REWRITTEN)` against an origin that honours
+> `If-None-Match`:
+>
+> ```
+>              plain request        with If-None-Match (a browser reload)
+> whistle      200 "REWRITTEN"      304 ""
+> whistle-rs   200 "REWRITTEN"      200 "REWRITTEN"
+> ```
+>
+> So the rewrite disappears on reload in whistle. whistle-rs does what
+> whistle's code says rather than what whistle does.
 
 #### Trailers
 
@@ -2285,6 +2301,19 @@ Known gaps in the operator layer, deliberately left:
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.
+
+
+### `x-server` on a response the proxy made itself
+
+Every response whistle generates rather than forwards carries `x-server`
+(`wrapResponse`, `_original/lib/util/index.js:1080-1090`) — a `statusCode://`,
+a `redirect://`, a `file://` mock, a preflight it answered. It says what a
+mocked response otherwise leaves open: this came from the proxy, not the
+origin.
+
+whistle-rs does the same and writes `whistle-rs`, because it is not whistle.
+Tooling keying off the exact upstream value will not match, which is the right
+outcome — it is not talking to whistle.
 
 
 ### Not decrypting a connection
