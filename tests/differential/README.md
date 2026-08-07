@@ -38,6 +38,26 @@ PORT_BASE=19100 CASES=./cases-filters.js npm run bench
 It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0`.
 
+## The HTTPS bench
+
+`https-bench.js` is the same idea over a **TLS** origin: it opens a real CONNECT
+tunnel through each proxy, trusting that proxy's own root CA, and compares the
+decrypted exchange. Nothing the plain bench runs touches CONNECT, certificate
+forging, SNI, or the `https://` half of pattern matching.
+
+```sh
+PORT_BASE=19600 node oracle.js &
+cargo run -- --port 19601 --no-persist --insecure-upstream --dir /tmp/rs-tls &
+PORT_BASE=19600 node https-bench.js
+```
+
+It refuses to run its cases until a plain request really works through both —
+because it once reported "18 cases, 0 differences" while **every tunnel was
+dying of `EPROTO`**. Two proxies that fail identically compare equal. The cause
+was in the bench: the tunnel's socket is already decrypted, so what travels
+inside it is plain HTTP, and using an HTTPS client on it negotiated TLS a second
+time.
+
 ## Reading a difference
 
 Two divergences are **deliberate** and declared in `EXPECTED` at the top of
