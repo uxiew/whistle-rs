@@ -40,6 +40,9 @@ pub struct Config {
     pub values: HashMap<String, String>,
     /// Max bytes of each captured body kept for the inspection preview.
     pub body_preview_cap: usize,
+    /// Max bytes of a **response** body this proxy will hold in memory in order
+    /// to rewrite it. See [`DEFAULT_BODY_REWRITE_CAP`].
+    pub body_rewrite_cap: usize,
     /// Whether to persist captured sessions to disk (JSONL).
     pub persist_sessions: bool,
     /// Number of days of session JSONL files to retain.
@@ -81,6 +84,7 @@ impl Default for Config {
             plugins: HashMap::new(),
             values: HashMap::new(),
             body_preview_cap: DEFAULT_BODY_PREVIEW_CAP,
+            body_rewrite_cap: DEFAULT_BODY_REWRITE_CAP,
             persist_sessions: true,
             persist_days: DEFAULT_PERSIST_DAYS,
         }
@@ -89,6 +93,24 @@ impl Default for Config {
 
 /// Default preview cap: 16 KB of each body kept for inspection.
 pub const DEFAULT_BODY_PREVIEW_CAP: usize = 16 * 1024;
+
+/// Default ceiling on a response body held in memory to rewrite it: 16 MiB.
+///
+/// **This bound exists because this port's body layer is buffered and whistle's
+/// is not.** whistle rewrites a response with stream transforms
+/// (`addTextTransform` / `addZipTransform`, `_original/lib/inspectors/res.js`),
+/// so a rule never costs it the body; the one place it accumulates —
+/// `resMerge://` — carries an explicit ceiling of its own (`MAX_RES_SIZE`,
+/// `res.js:21-22`). Here any body operator collects the whole response, and
+/// measured against an 800 MB download with a single `resReplace://` matching,
+/// resident memory went from 9.9 MB to **1.97 GB**.
+///
+/// 16 MiB is upstream's own "big data" number (`BIG_MAX_RES_SIZE`), which is
+/// generous for the pages, bundles and JSON payloads rewriting is actually
+/// aimed at, and far below the point where a download costs the proxy its life.
+/// Past it the response streams through untouched — see
+/// `crate::proxy::body::collect_capped`.
+pub const DEFAULT_BODY_REWRITE_CAP: usize = 16 * 1024 * 1024;
 
 /// Default number of days to retain persisted session files.
 pub const DEFAULT_PERSIST_DAYS: u32 = 7;

@@ -60,6 +60,11 @@ struct Cli {
     #[arg(long, default_value_t = whistle_rs::config::DEFAULT_BODY_PREVIEW_CAP)]
     body_preview_limit: usize,
 
+    /// Max bytes of a response body held in memory to rewrite it. Past this a
+    /// response streams through untouched and the body operators do not apply.
+    #[arg(long, default_value_t = whistle_rs::config::DEFAULT_BODY_REWRITE_CAP)]
+    body_rewrite_limit: usize,
+
     /// Disable session persistence to disk.
     #[arg(long)]
     no_persist: bool,
@@ -153,6 +158,7 @@ async fn main() -> Result<()> {
         plugins,
         values,
         body_preview_cap: cli.body_preview_limit,
+        body_rewrite_cap: cli.body_rewrite_limit,
         persist_sessions: !cli.no_persist,
         persist_days: cli.persist_days,
         timeout_ms: cli.timeout,

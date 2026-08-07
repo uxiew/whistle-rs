@@ -189,8 +189,13 @@ impl Body for ThrottledBody {
 
 /// The result of reading a body up to a limit — see [`collect_capped`].
 pub enum Capped {
-    /// The whole body arrived within the limit.
-    Whole(Bytes),
+    /// The whole body arrived within the limit, with the trailer section it
+    /// carried. Collecting a body drops its trailers otherwise, and a response
+    /// that arrived with them must not reach the client without them.
+    Whole {
+        bytes: Bytes,
+        trailers: Option<hyper::HeaderMap>,
+    },
     /// The body is larger than the limit. Nothing has been lost: `body` is the
     /// same body from its first byte, with the part already read queued in
     /// front of the part still arriving, and it can only be streamed rather
@@ -235,7 +240,8 @@ pub async fn collect_capped(body: DynBody, limit: usize) -> Result<Capped, BodyE
             });
         }
     }
-    Ok(Capped::Whole(flatten(&seen, total)))
+    let trailers = seen.iter().find_map(|f| f.trailers_ref().cloned());
+    Ok(Capped::Whole { bytes: flatten(&seen, total), trailers })
 }
 
 /// The data bytes of `frames`, in order. Trailer frames carry none and are
@@ -306,7 +312,7 @@ mod capped_tests {
     async fn a_body_within_the_limit_comes_back_whole() {
         let got = collect_capped(framed(&[b"hello ", b"world"]), 1024).await.expect("ok");
         match got {
-            Capped::Whole(bytes) => assert_eq!(&bytes[..], b"hello world"),
+            Capped::Whole { bytes, .. } => assert_eq!(&bytes[..], b"hello world"),
             Capped::TooBig { .. } => panic!("11 bytes is not too big for 1024"),
         }
     }
@@ -317,7 +323,7 @@ mod capped_tests {
     async fn a_body_over_the_limit_still_arrives_byte_for_byte() {
         let got = collect_capped(framed(&[b"aaaa", b"bbbb", b"cccc"]), 6).await.expect("ok");
         match got {
-            Capped::Whole(_) => panic!("12 bytes is too big for 6"),
+            Capped::Whole { .. } => panic!("12 bytes is too big for 6"),
             Capped::TooBig { prefix, body } => {
                 // What a body filter gets to match on: the part that had been
                 // read when the limit was passed, not nothing at all.
@@ -332,7 +338,51 @@ mod capped_tests {
     #[tokio::test]
     async fn a_body_exactly_at_the_limit_is_still_whole() {
         let got = collect_capped(framed(&[b"123456"]), 6).await.expect("ok");
-        assert!(matches!(got, Capped::Whole(b) if &b[..] == b"123456"));
+        assert!(matches!(got, Capped::Whole { bytes, .. } if &bytes[..] == b"123456"));
+    }
+
+    /// The trailer section survives the collection. Dropping it is how a
+    /// response that arrived with trailers reached the client without them.
+    #[tokio::test]
+    async fn a_collected_body_keeps_its_trailers() {
+        let (tx, body) = channel(2);
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert("x-checksum", "abc".parse().unwrap());
+        tx.try_send(Ok(Bytes::from_static(b"data"))).expect("capacity");
+        drop(tx);
+        // `channel` carries data frames only, so the trailer is added by hand
+        // through the same path a real body would take.
+        let with_trailers = TrailerAfter { inner: Box::pin(body), trailers: Some(trailers) }.boxed();
+        match collect_capped(with_trailers, 1024).await.expect("ok") {
+            Capped::Whole { bytes, trailers } => {
+                assert_eq!(&bytes[..], b"data");
+                assert_eq!(trailers.expect("kept").get("x-checksum").unwrap(), "abc");
+            }
+            Capped::TooBig { .. } => panic!("4 bytes is not too big"),
+        }
+    }
+
+    /// A body that ends with a trailer frame, for the test above.
+    struct TrailerAfter {
+        inner: Pin<Box<DynBody>>,
+        trailers: Option<hyper::HeaderMap>,
+    }
+
+    impl Body for TrailerAfter {
+        type Data = Bytes;
+        type Error = BodyError;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            match this.inner.as_mut().poll_frame(cx) {
+                Poll::Ready(None) => Poll::Ready(
+                    this.trailers.take().map(|t| Ok(Frame::trailers(t))),
+                ),
+                other => other,
+            }
+        }
     }
 
     /// An empty body is whole, not a stream to give up on: `b:!x` has to hold
@@ -340,7 +390,7 @@ mod capped_tests {
     #[tokio::test]
     async fn an_empty_body_is_whole() {
         let got = collect_capped(empty(), 1024).await.expect("ok");
-        assert!(matches!(got, Capped::Whole(b) if b.is_empty()));
+        assert!(matches!(got, Capped::Whole { bytes, .. } if bytes.is_empty()));
     }
 }
 

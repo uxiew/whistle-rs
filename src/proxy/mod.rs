@@ -148,23 +148,6 @@ async fn collect_capped_body(body: DynBody, limit: usize) -> Result<body::Capped
     }
 }
 
-/// As [`collect_body`], keeping the trailer section the body carried.
-///
-/// Collecting a body drops its trailers, and dropping them is not an option:
-/// upstream forwards the origin's own trailer section whatever else it does to
-/// the response (`extend(trailers, newTrailers)`,
-/// `_original/lib/inspectors/res.js:1264-1273`), so buffering here must hand
-/// them on rather than swallow them.
-async fn collect_with_trailers(body: DynBody) -> Result<(Bytes, Option<hyper::HeaderMap>)> {
-    match body.collect().await {
-        Ok(collected) => {
-            let trailers = collected.trailers().cloned();
-            Ok((collected.to_bytes(), trailers))
-        }
-        Err(e) => Err(anyhow::anyhow!("reading body: {e}")),
-    }
-}
-
 /// Monotonic id handed to plugins so their request and response hooks can be
 /// correlated. Distinct from a [`Session`] id, which is only assigned once the
 /// transaction is recorded — far too late for the request hook.
@@ -3316,7 +3299,7 @@ async fn serve(
             // which rules apply is the question this buffering exists to
             // answer, so consulting it would be circular.
             match collect_capped_body(body::from_incoming(incoming), apply::REQ_BODY_LIMIT).await? {
-                body::Capped::Whole(bytes) => (
+                body::Capped::Whole { bytes, .. } => (
                     Request::from_parts(parts, body::full(bytes.clone())),
                     Some(bytes),
                 ),
@@ -3748,7 +3731,7 @@ async fn serve(
                 req_body_cap = Some(cap.clone());
                 body::tee(body, cap)
             }
-            body::Capped::Whole(bytes) => {
+            body::Capped::Whole { bytes, .. } => {
                 let new = apply::transform_req_body(bytes, &resolved, body_ctx);
                 if let Some(path) = &req_write {
                     write_body_file(path, &new, force_write);
@@ -3960,25 +3943,58 @@ async fn serve(
         );
     }
     let mut res_body_cap: Option<Capture> = None;
-    let res_body: DynBody =
-        if must_collect_body(
-            &ops,
-            plugin_wants_res_body,
-            plugin_res_override.is_some(),
-            res_ct.as_deref(),
-        ) {
+    // Decide first, then act — because the buffered path may hand the body back.
+    // A response too large to hold is not rewritten at all, and then this is the
+    // streaming path after all.
+    //
+    // The origin's trailer section is lifted off with the bytes and handed to
+    // `finish_res_body`. Collecting a body discards it otherwise, which is how a
+    // response that arrived with trailers reached the client without them the
+    // moment *any* body operator matched — including one that had nothing to do
+    // with trailers.
+    let mut collected: Option<(Bytes, Option<hyper::HeaderMap>)> = None;
+    let mut streamed: Option<DynBody> = None;
+    if must_collect_body(
+        &ops,
+        plugin_wants_res_body,
+        plugin_res_override.is_some(),
+        res_ct.as_deref(),
+    ) {
+        match &plugin_res_override {
             // A plugin that replaced the body outright makes the upstream bytes
-            // irrelevant — don't wait on them.
-            //
-            // The origin's trailer section is lifted off with the bytes and
-            // handed to `finish_res_body`. Collecting a body discards it
-            // otherwise, which is how a response that arrived with trailers
-            // reached the client without them the moment *any* body operator
-            // matched — including one that had nothing to do with trailers.
-            let (bytes, origin_trailers) = match &plugin_res_override {
-                Some(new) => (Bytes::from(new.clone()), None),
-                None => collect_with_trailers(body).await?,
-            };
+            // irrelevant — don't wait on them, and don't measure them either:
+            // they are already in memory and were never read from a socket.
+            Some(new) => collected = Some((Bytes::from(new.clone()), None)),
+            None => {
+                match collect_capped_body(body, state.config.body_rewrite_cap).await? {
+                    body::Capped::Whole { bytes, trailers } => {
+                        collected = Some((bytes, trailers));
+                    }
+                    body::Capped::TooBig { body, .. } => {
+                        // whistle never needs this bound: its response rewriting
+                        // is a stream transform, so a rule costs it no memory.
+                        // This port collects, so it has to stop somewhere — and
+                        // it says where, because a rule that quietly stopped
+                        // applying above some size reads exactly like a bug.
+                        tracing::warn!(
+                            "{} {}: response body is over {} bytes, so it is \
+                             forwarded unchanged — the body operators, \
+                             enable://gzip and any plugin responseBody hook do \
+                             not apply. Raise --body-rewrite-limit to allow it",
+                            info.method,
+                            info.full_url,
+                            state.config.body_rewrite_cap,
+                        );
+                        streamed = Some(body);
+                    }
+                }
+            }
+        }
+    } else {
+        streamed = Some(body);
+    }
+    let res_body: DynBody =
+        if let Some((bytes, origin_trailers)) = collected {
             // Decompress before rewriting. Every body operator works on text,
             // and most origins answer compressed — so without this a
             // `resReplace://` against a gzipped page searched the deflate
@@ -4037,6 +4053,7 @@ async fn serve(
             }
             finish_res_body(&mut parts, new, ops, origin_trailers)
         } else {
+            let body = streamed.expect("collected or streamed, never neither");
             // Stream through, copying a bounded preview for inspection. The
             // origin's trailers ride along untouched — unless a `disable://`
             // asked for them to go, which this path acts on.

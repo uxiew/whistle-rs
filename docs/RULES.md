@@ -2287,6 +2287,29 @@ If a rule doesn't do what you expect, run with `-v` (debug logging) — each req
 logs its resolved destination or short-circuit decision.
 
 
+### Response bodies have a ceiling too
+
+whistle rewrites a response with **stream transforms** (`addTextTransform` /
+`addZipTransform`, `_original/lib/inspectors/res.js`), so a rule never costs it
+the body. This port's body layer is buffered, so it does: any matching body
+operator collects the whole response before touching it.
+
+Measured against an 800 MB download with a single `resReplace://` matching,
+resident memory went from 9.9 MB to **1.97 GB** — one ordinary rule and one
+large file.
+
+Bounded at **16 MiB** now (`--body-rewrite-limit`), which is upstream's own
+"big data" number (`BIG_MAX_RES_SIZE`, `res.js:22`) and generous for the pages,
+bundles and JSON payloads rewriting is aimed at. Past it the response streams
+through **untouched**: the body operators, `enable://gzip` and any plugin
+`responseBody` hook do not apply, and a `WARN` names the request and the limit.
+The same 800 MB download now peaks at **33 MB** and arrives byte-complete.
+
+This is one of the few places where the port needs a knob upstream does not,
+and the reason is architectural rather than a preference — see
+[`ROADMAP.md`](ROADMAP.md).
+
+
 ### 跨域 mock：自动 CORS
 
 用 `file://`（以及 `rawfile`/`tpl`/`dust`/`jsonp` 和它们的 `x`/`xs` 变体）mock 一个
