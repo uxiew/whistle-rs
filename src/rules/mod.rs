@@ -194,7 +194,7 @@ pub fn order_key(index: usize, important: bool) -> u64 {
     // `+ 1` so that **zero belongs to nobody**. Operators merged in mid-request
     // are stamped `MERGED_ORDER = 0` to make them win every contest decided by
     // this key (`crate::proxy::apply::merge_resolved`), and without the shift an
-    // `$`-important rule on the first line of a file would land on 0 as well.
+    // `lineProps://important` rule on the first line would land on 0 as well.
     // The two would then tie, and `min_by_key` resolves a tie by iteration
     // order — which is a map's, not the file's. Both passes derive the key from
     // this one function, so shifting it shifts nothing relative to itself.
@@ -223,6 +223,14 @@ pub enum Pattern {
         /// Path prefix (may be empty).
         path: String,
     },
+    /// `$`-prefixed: the request URL must **equal** this, not begin with it
+    /// (`isExact`, `_original/lib/rules/rules.js:1265-1267`, matched at
+    /// `:1070-1071` by `pattern === url || pattern === curUrl`).
+    ///
+    /// The stored string is normalised: a pattern with no path gets `/`, so
+    /// `$example.com` names the site root and nothing else. Measured against
+    /// whistle 2.10.8 — see [`Pattern::exact_matches`] for the truth table.
+    Exact(String),
     /// Matches every request (bare operator lines aren't produced here, but
     /// kept for completeness / `*` patterns collapse to this when trivial).
     Any,
@@ -233,6 +241,34 @@ pub enum Pattern {
 }
 
 impl Pattern {
+    /// Does an exact (`$`-prefixed) pattern name this URL?
+    ///
+    /// Upstream compares the pattern against two forms of the request
+    /// (`pattern === url || pattern === curUrl`), and the pair of them is what
+    /// produces this behaviour — measured against whistle 2.10.8:
+    ///
+    /// ```text
+    /// pattern                      /p    /p?a=1  /p?b=2  /p/s   /
+    /// $http://example.test/p       HIT   HIT     HIT     -      -
+    /// $http://example.test/p?a=1   -     HIT     -       -      -
+    /// $example.test                -     -       -       -      HIT
+    /// ```
+    ///
+    /// So: a pattern **without** a query matches on the path alone, a pattern
+    /// **with** one must match the query too, and the scheme is optional in the
+    /// pattern. A sub-path never matches, which is the whole point of `$` and
+    /// what this port used to get wrong — `$example.test` matched every URL on
+    /// the host rather than its root.
+    fn exact_matches(pattern: &str, full_url: &str) -> bool {
+        let without_query = full_url.split('?').next().unwrap_or(full_url);
+        // The pattern may omit the scheme, so each form is offered with and
+        // without one.
+        [full_url, without_query].into_iter().any(|form| {
+            let bare = form.split_once("://").map_or(form, |(_, rest)| rest);
+            pattern == form || pattern == bare
+        })
+    }
+
     /// Is this a bare host pattern, with no path of its own? Upstream's
     /// `isDomain` (`_original/lib/rules/rules.js:1343-1348`) — a non-regexp,
     /// non-negated pattern whose protocol- and query-stripped form has no `/`.
@@ -247,7 +283,13 @@ pub struct Rule {
     pub pattern: Pattern,
     pub ops: Vec<RuleOp>,
     pub raw_line: String,
-    /// `$`-prefixed exact/important patterns win over normal ones.
+    /// `lineProps://important` — this line outranks the ones before it.
+    ///
+    /// Only that spelling. A `$` pattern used to set this too, on the reading
+    /// that `$` meant "important"; it does not. Measured against whistle
+    /// 2.10.8, a normal rule written *before* a `$` one still wins there, so
+    /// the extra precedence was this port's invention. `$` is exact matching —
+    /// see [`Pattern::Exact`].
     pub important: bool,
     /// `!`-prefixed pattern: the rule applies to every request the pattern does
     /// *not* match (`NON_RE`, `_original/lib/rules/rules.js:19`; the inversion
@@ -1495,7 +1537,7 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
                 pattern: parsed.pattern,
                 ops: ops.clone(),
                 raw_line: raw_line.to_string(),
-                important: parsed.important,
+                important: props.important(),
                 negate: parsed.negate,
                 filters: filters.clone(),
                 props: props.clone(),
@@ -2280,12 +2322,15 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
 }
 
 /// A pattern token after its `!` / `$` prefixes have been peeled off.
+///
+/// The comment that used to sit here called `$` "this port's important-rule
+/// shorthand" and noted, correctly, that upstream uses it for exact-URL
+/// matching — and then kept the shorthand anyway. That was a divergence
+/// invented rather than inherited, and it made `$example.com` match every URL
+/// on the host instead of its root. `$` is exact matching now, and importance
+/// is `lineProps://important` alone.
 struct ParsedPattern {
     pattern: Pattern,
-    /// `$` — this port's important-rule shorthand. (Upstream spells importance
-    /// `lineProps://important` and uses `$` for exact-URL matching, so its
-    /// `!$url` "negative exact" form has no equivalent here.)
-    important: bool,
     /// `!` — invert the pattern test.
     negate: bool,
 }
@@ -2302,10 +2347,9 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
         Some(rest) => (true, rest),
         None => (false, tok),
     };
-    let done = |pattern, important| {
+    let done = |pattern| {
         Some(ParsedPattern {
             pattern,
-            important,
             negate,
         })
     };
@@ -2315,16 +2359,32 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
     // is consulted before anything else in `parseRule` (`rules.js:1226-1234`) —
     // and the result is a plain regexp over the whole URL.
     if let Some(re) = wildcard::parse_reg_url(tok) {
-        return done(Pattern::Regex(re), false);
+        return done(Pattern::Regex(re));
     }
 
     // Port pattern: `:8080` scopes the rule to one port.
     if let Some(re) = port_pattern(tok) {
-        return done(Pattern::Regex(re), false);
+        return done(Pattern::Regex(re));
     }
 
-    let important = tok.starts_with('$');
-    let tok = tok.strip_prefix('$').unwrap_or(tok);
+    // `$` is exact matching, not precedence. This port read it as an
+    // "important" marker that also won ties, which upstream does not do:
+    // measured, a normal rule written *before* a `$` one still wins there.
+    if let Some(rest) = tok.strip_prefix('$') {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            // A bare `$` names nothing — upstream drops the rule.
+            return done(Pattern::Nothing);
+        }
+        // No path means the site root, so `$example.com` is the root and not
+        // the whole host.
+        let authority_end = rest.split_once("://").map_or(rest, |(_, r)| r);
+        let normalised = match authority_end.contains('/') {
+            true => rest.to_string(),
+            false => format!("{rest}/"),
+        };
+        return done(Pattern::Exact(normalised));
+    }
     // `//host/path` is scheme-relative: the `//` comes off and any scheme
     // matches (`NO_SCHEMA_RE`, `rules.js:1241-1244`). Without this the `//`
     // ended up in the *path*, and the pattern matched every host.
@@ -2347,7 +2407,7 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
         }
         pat.push_str(body);
         if let Ok(re) = Regex::new(&pat) {
-            return done(Pattern::Regex(re), important);
+            return done(Pattern::Regex(re));
         }
     }
 
@@ -2355,7 +2415,7 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
     // asks in that order, and it is `parseWildcard` that decides a *negated*
     // wildcard is dropped (`rules.js:1171-1173`).
     match wildcard::parse(tok, negate) {
-        wildcard::Parsed::Wildcard(w) => return done(Pattern::Wildcard(w), important),
+        wildcard::Parsed::Wildcard(w) => return done(Pattern::Wildcard(w)),
         wildcard::Parsed::Dropped => return None,
         wildcard::Parsed::NotWildcard => {}
     }
@@ -2370,7 +2430,7 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
     }
 
     // Scheme/host/path prefix.
-    done(parse_prefix(tok), important)
+    done(parse_prefix(tok))
 }
 
 /// Compile a `:8080`-style port pattern.
@@ -3226,14 +3286,56 @@ mod pattern_tests {
         assert!(parse_text("!example.test other.test host://1.1.1.1").is_empty());
     }
 
-    /// The `$` important shorthand still works, and survives a `!` in front.
+    /// `$` is **exact matching**, and it carries no precedence.
+    ///
+    /// This port read it as an "important" shorthand — a divergence it invented
+    /// rather than inherited. Two things were wrong with that, both measured
+    /// against whistle 2.10.8: a normal rule written *before* a `$` one still
+    /// wins there, and `$example.test` names the site **root**, where this port
+    /// matched every URL on the host.
     #[test]
-    fn important_prefix_after_negation() {
+    fn a_dollar_pattern_is_exact_and_not_important() {
         let rules = parse_text("$example.test host://1.1.1.1");
-        assert!(rules[0].is_important());
+        assert!(!rules[0].is_important(), "`$` is not a precedence marker");
         assert!(!rules[0].negate);
-        // `!$…` parses as negate + important; being literal, it is dropped.
-        assert!(parse_text("!$example.test host://1.1.1.1").is_empty());
+        assert!(matches!(&rules[0].pattern, Pattern::Exact(p) if p == "example.test/"));
+
+        // Importance has one spelling, and it is not this one.
+        let rules = parse_text("example.test host://1.1.1.1 lineProps://important");
+        assert!(rules[0].is_important());
+    }
+
+    /// `!$…` is a **negated exact** pattern: everything but that one URL.
+    ///
+    /// Upstream allows it where it refuses a negated literal, because the `$`
+    /// branch runs first and the `else if (not) return` never fires
+    /// (`_original/lib/rules/rules.js:1265-1268`). Confirmed against whistle:
+    /// `!$http://example.test/p` matched `/p/s`, `/` and `/q`, and not `/p`.
+    #[test]
+    fn a_negated_exact_pattern_is_allowed_where_a_literal_is_not() {
+        let rules = parse_text("!$example.test/p host://1.1.1.1");
+        assert_eq!(rules.len(), 1, "not dropped, unlike a negated literal");
+        assert!(rules[0].negate);
+        assert!(matches!(&rules[0].pattern, Pattern::Exact(p) if p == "example.test/p"));
+        // …and the plain literal is still refused.
+        assert!(parse_text("!example.test host://1.1.1.1").is_empty());
+    }
+
+    /// The truth table the oracle produced, pinned.
+    #[test]
+    fn exact_matching_follows_the_measured_table() {
+        let hits = |pattern: &str, url: &str| Pattern::exact_matches(pattern, url);
+        // No query in the pattern: the path must match, the query may be anything.
+        assert!(hits("example.test/p", "http://example.test/p"));
+        assert!(hits("example.test/p", "http://example.test/p?a=1"));
+        assert!(!hits("example.test/p", "http://example.test/p/s"), "no sub-paths");
+        // A query in the pattern makes both exact.
+        assert!(hits("http://example.test/p?a=1", "http://example.test/p?a=1"));
+        assert!(!hits("http://example.test/p?a=1", "http://example.test/p"));
+        assert!(!hits("http://example.test/p?a=1", "http://example.test/p?b=2"));
+        // The root, and only the root.
+        assert!(hits("example.test/", "http://example.test/"));
+        assert!(!hits("example.test/", "http://example.test/p"));
     }
 }
 

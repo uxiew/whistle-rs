@@ -159,6 +159,11 @@ fn pattern_accepts<'r>(
         // and no `joinUrl` (`_original/lib/rules/rules.js:1013`).
         Pattern::Any => Some(Matched::default()),
         Pattern::Nothing => None,
+        // Equality, not a prefix — and so it consumes the whole URL and leaves
+        // no tail for `joinUrl` to append.
+        Pattern::Exact(want) => {
+            Pattern::exact_matches(want, &req.full_url).then(Matched::default)
+        }
         // Without a `$` reference on the line there is nothing to collect, and
         // `is_match` skips building the capture locations entirely.
         Pattern::Regex(re) if !want_groups => {
@@ -1232,7 +1237,10 @@ mod tests {
     #[test]
     fn important_rule_wins() {
         let mut m = crate::rules::RuleManager::new();
-        m.set_text("example.com host://1.1.1.1\n$example.com host://2.2.2.2\n");
+        m.set_text(
+            "example.com host://1.1.1.1\n\
+             example.com host://2.2.2.2 lineProps://important\n",
+        );
         let r = m.resolve(&req("http://example.com/"));
         assert_eq!(r.value("host"), Some("2.2.2.2"));
     }
@@ -1244,8 +1252,10 @@ mod tests {
     fn a_multi_match_list_leads_with_the_important_lines() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text(
-            "example.com resAppend://n1\n$example.com resAppend://i1\n\
-             example.com resAppend://n2\n$example.com resAppend://i2\n",
+            "example.com resAppend://n1\n\
+             example.com resAppend://i1 lineProps://important\n\
+             example.com resAppend://n2\n\
+             example.com resAppend://i2 lineProps://important\n",
         );
         let r = m.resolve(&req("http://example.com/"));
         let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
@@ -2080,7 +2090,7 @@ mod response_phase_tests {
     #[test]
     fn importance_outranks_source_order_across_the_passes() {
         let text = "example.com resAppend://normal\n\
-                    $example.com resAppend://important includeFilter://s:404\n";
+                    example.com resAppend://important includeFilter://s:404 lineProps://important\n";
         let r = resolve(text, &req("http://example.com/"), Some(res(404)));
         let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
         assert_eq!(values, ["important", "normal"]);

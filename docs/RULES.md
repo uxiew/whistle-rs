@@ -53,7 +53,7 @@ match answers — see [Short-circuit](#short-circuit-no-upstream-request-is-made
 The four kinds of thing you can write as a pattern are a
 [domain or URL prefix](#1-domain--url-prefix-most-common), a
 [wildcard](#3-wildcard), a [regexp](#5-regular-expression) or a
-[port](#6-port); `$` in front makes a line [important](#--important-patterns) and
+[port](#6-port); `$` in front makes a pattern [exact](#--exact-patterns) and
 `^` in front makes [`*` a wildcard everywhere](#4---wildcards-everywhere).
 
 The operators worth knowing before the rest are
@@ -72,7 +72,7 @@ The operators worth knowing before the rest are
   [leading dot](#2-leading-dot-subdomain-match) · [wildcard](#3-wildcard) ·
   [`^`](#4---wildcards-everywhere) · [`$0`…`$9` captures](#09--what-the-pattern-captured) ·
   [regexp](#5-regular-expression) · [port](#6-port) · [`!` negation](#--negated-patterns) ·
-  [`$` important](#--important-patterns)
+  [`$` exact](#--exact-patterns)
 - [Operators](#operators)
   - [Where the pattern sits](#where-the-pattern-sits) · [Shorthands](#shorthands)
   - [What an operator's value can be](#what-an-operators-value-can-be) —
@@ -278,15 +278,37 @@ negated literal or wildcard pattern is **dropped at parse time**
 (`_original/lib/rules/rules.js:1259-1268`), so `!example.com host://x` configures
 nothing in either implementation.
 
-### `$` — important patterns
+### `$` — exact patterns
 
-Prefix any pattern with `$` to mark the rule **important**: important rules are
-resolved before normal ones and win ties.
+Prefix a pattern with `$` and the request URL must **equal** it, not begin with
+it. Without `$` a pattern is a prefix, which is what makes `example.com/api`
+cover everything under `/api`.
 
 ```
-example.com    host://1.1.1.1
-$example.com   host://2.2.2.2      # this one wins
+$http://example.com/api    file:///mock.json   # /api only
+http://example.com/api     file:///mock.json   # /api and everything under it
 ```
+
+The measured truth table — a pattern with no query matches on the path alone, a
+pattern with one must match that too, and a pattern with no path names the site
+root:
+
+| pattern | `/p` | `/p?a=1` | `/p?b=2` | `/p/s` | `/` |
+|---|---|---|---|---|---|
+| `$http://example.com/p` | ✅ | ✅ | ✅ | — | — |
+| `$http://example.com/p?a=1` | — | ✅ | — | — | — |
+| `$example.com` | — | — | — | — | ✅ |
+
+`!$…` is a **negated exact** pattern — every URL but that one. It is allowed
+where a negated plain pattern is not, because upstream's `$` branch runs before
+the check that drops those.
+
+> **`$` carries no precedence, and this port used to think it did.** It read the
+> prefix as an "important" shorthand — a divergence invented rather than
+> inherited. Two things followed, both measured against whistle 2.10.8: a normal
+> rule written *before* a `$` one still wins there, and `$example.com` named the
+> site root where this port matched every URL on the host. Importance has one
+> spelling: `lineProps://important`.
 
 ---
 
@@ -1164,7 +1186,7 @@ example.com            http://localhost:5173
 example.com/api/flags  file://({"beta":true})     # never served — the forward won
 ```
 
-Order the narrow rule above the broad one, or mark it `$`, which puts it first
+Order the narrow rule above the broad one, or mark it `lineProps://important`, which puts it first
 whatever the line order:
 
 ```

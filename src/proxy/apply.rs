@@ -7462,7 +7462,7 @@ mod tests {
 
         // An important line still wins over an earlier normal one — importance
         // is part of the resolution order the slot is decided by.
-        let important = "a.com file:///mock.json\n$a.com statusCode://204\n";
+        let important = "a.com file:///mock.json\na.com statusCode://204 lineProps://important\n";
         assert_eq!(winner(important, "http://a.com/"), Some("statusCode"));
 
         // `rule://<name>` is the values-store include, not a destination, so it
@@ -9061,7 +9061,8 @@ mod tests {
     fn important_lines_lead_the_accumulation() {
         assert_eq!(
             inject(
-                "example.com/x resAppend://normal\n$example.com/x resAppend://important\n",
+                "example.com/x resAppend://normal\n\
+                 example.com/x resAppend://important lineProps://important\n",
                 "body",
                 "text/plain",
             ),
@@ -9071,7 +9072,8 @@ mod tests {
         let out = transform_res_body(
             Bytes::from_static(b"x"),
             &resolve(
-                "example.com/x resReplace://x=normal\n$example.com/x resReplace://x=important\n",
+                "example.com/x resReplace://x=normal\n\
+                 example.com/x resReplace://x=important lineProps://important\n",
                 "http://example.com/x",
             ),
             Some("text/plain"),

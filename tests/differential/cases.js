@@ -116,5 +116,23 @@ module.exports = [
   { name: 'doc: skip is the same as ignore', rules: `${P} reqHeaders://x-a=1 skip://reqHeaders` },
   { name: 'doc: enable and disable on one line', rules: `${P} disable://cookie enable://abort`, request: { headers: { cookie: 'a=1' } } },
 
+  // ── pattern forms, from the docs' Pattern Matching page ────────────────
+  // `$` is exact matching: the path must equal the pattern, not begin with it.
+  // This port read `$` as an "important" marker and prefix-matched, so
+  // `$example.test` applied to every URL on the host instead of its root.
+  { name: 'doc pattern: $ exact matches its own path', rules: `$http://${P}/echo reqHeaders://x-hit=1` },
+  { name: 'doc pattern: $ ignores the query when it has none', rules: `$http://${P}/echo reqHeaders://x-hit=1`, request: { path: '/echo?a=1' } },
+  { name: 'doc pattern: $ does not match a sub-path', rules: `$http://${P}/echo reqHeaders://x-hit=1`, request: { path: '/echo/sub' } },
+  { name: 'doc pattern: $ with a query is exact in both', rules: `$http://${P}/echo?a=1 reqHeaders://x-hit=1`, request: { path: '/echo?a=1' } },
+  { name: 'doc pattern: $ with a query rejects another', rules: `$http://${P}/echo?a=1 reqHeaders://x-hit=1`, request: { path: '/echo?b=2' } },
+  { name: 'doc pattern: $ carries no precedence', rules: `${P}/echo reqHeaders://x-who=normal\n$http://${P}/echo reqHeaders://x-who=exact` },
+  { name: 'doc pattern: !$ is a negated exact', rules: `!$http://${P}/echo reqHeaders://x-hit=1` },
+  { name: 'doc pattern: !$ matches everything else', rules: `!$http://${P}/echo reqHeaders://x-hit=1`, request: { path: '/echo/sub' } },
+  { name: 'doc pattern: scheme-relative //host/path', rules: `//${P}/echo reqHeaders://x-hit=1` },
+  { name: 'doc pattern: ^ wildcard in a path', rules: `^http://${P}/ec*o reqHeaders://x-hit=1` },
+  { name: 'doc pattern: ^ with a trailing $ boundary', rules: `^http://${P}/ec*o$ reqHeaders://x-hit=1`, request: { path: '/echo/deep' } },
+  { name: 'doc pattern: port-only', rules: `:18800 reqHeaders://x-hit=1` },
+  { name: 'doc pattern: port-only that misses', rules: `:9999 reqHeaders://x-hit=1` },
+
   { name: 'values reference', rules: '```v\nfrom-a-value\n```\n' + `${P} reqHeaders://x-v={v}` },
 ];

@@ -1643,7 +1643,7 @@ mod matched_ops_tests {
         let ops = matched(concat!(
             "example.com reqHeaders://x-a=1\n",
             "example.com resHeaders://x-b=2\n",
-            "$example.com reqHeaders://x-c=3\n",
+            "example.com reqHeaders://x-c=3 lineProps://important\n",
         ));
         let seen: Vec<(&str, &str)> = ops
             .iter()
