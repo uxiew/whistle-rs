@@ -95,6 +95,29 @@ const through = (port, { method = 'GET', path: p = '/echo', headers = {}, body =
  * into twenty-one identical "present/absent" lines with the contents nowhere in
  * sight.
  */
+/**
+ * What was in the working directory before the run.
+ *
+ * A dump does not have to land where the rule pointed. `resWrite://` with an
+ * **empty value** makes whistle write to a path relative to its own cwd, and
+ * this bench reported that case as "neither proxy wrote anything" for as long
+ * as it only looked inside `DIR` — agreement produced by not looking. Anything
+ * new here is reported as `cwd:<name>` and compared like any other file.
+ */
+const CWD_BEFORE = new Set(fs.readdirSync(process.cwd()));
+
+/** Files a case left in the working directory, then removed. */
+function harvestCwd() {
+  const out = {};
+  for (const name of fs.readdirSync(process.cwd()).sort()) {
+    if (CWD_BEFORE.has(name)) continue;
+    const full = path.join(process.cwd(), name);
+    out['cwd:' + name] = fs.statSync(full).isDirectory() ? '<directory>' : fs.readFileSync(full).toString();
+    fs.rmSync(full, { recursive: true, force: true });
+  }
+  return out;
+}
+
 function harvest(dir = DIR, prefix = '') {
   const out = {};
   for (const name of fs.readdirSync(dir).sort()) {
@@ -196,6 +219,13 @@ const CASES = [
   // ── shape of the value ───────────────────────────────────────────────────
   { name: 'a write path that is a directory', rules: `${P} resWrite://${DIR}` },
   { name: 'a write path under a directory that does not exist', rules: `${P} resWrite://${F('no/such/dir/rs')}` },
+  // **A declared divergence, and the one case here that differs.** An empty
+  // value leaves the tail as the whole path, so upstream's write path is
+  // relative — `echo` — and whistle dumps into whatever directory it happens to
+  // have been started in. A rule with no path in it writing a file somewhere in
+  // the user's tree is not a behaviour worth reproducing; this port writes
+  // nothing. Reported as `cwd:echo`, which this bench could not see at all until
+  // it started watching its own working directory.
   { name: 'an empty write path', rules: `${P} resWrite://` },
   { name: 'two write rules naming the same file', rules: `${P} resWrite://${F('rs')} resWriteRaw://${F('rs')}` },
   // Both operators on one line, contested across two lines: first wins.
@@ -214,7 +244,7 @@ async function run(port, c) {
   // `end` on the response — give it a moment before reading, or a passing case
   // becomes an empty file.
   await new Promise((r) => setTimeout(r, 250));
-  return { answers, files: harvest() };
+  return { answers, files: { ...harvest(), ...harvestCwd() } };
 }
 
 async function main() {

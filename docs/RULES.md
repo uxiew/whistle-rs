@@ -1892,6 +1892,12 @@ api.example.com   resWrite://</tmp/dump>    # <verbatim> refuses the join
 The query is not part of the name — `/users?q=1` and `/users` write the same
 file — and a request for `/` joins nothing, so it writes `/tmp/dump` itself.
 
+An **empty** value has no path to join onto, so upstream's becomes relative and
+whistle dumps into whatever directory it was started in — `resWrite://` on a
+request for `/users` writes `./users`. A rule with no path in it writing a file
+somewhere in your tree is not a behaviour worth reproducing: whistle-rs writes
+nothing. Measured on `tests/differential/write-bench.js`.
+
 ```
 api.example.com   reqWriteRaw:///tmp/api-request.http
 api.example.com   resWrite:///tmp/api-body.json  enable://forceReqWrite
