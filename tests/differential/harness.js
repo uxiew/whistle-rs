@@ -58,6 +58,15 @@ const EXPECTED = [
     match: (p) => /res\.body: whistle="Not found file /.test(p),
     why: 'the same 404, phrased in each proxy\'s own words',
   },
+  {
+    // whistle files a `host` filter condition under `hostFilter`, which only
+    // `util.checkProxyHost` reads: it decides which hosts a `proxy://` engages
+    // for, never whether a rule applies. whistle-rs matches the request's host
+    // with it. Declared in `docs/RULES.md`; the cases that exercise it carry
+    // this header and no other case uses it.
+    match: (p) => /req\.header\.x-host-filter:/.test(p),
+    why: 'host: and host= match the request host here, by design',
+  },
 ];
 
 const norm = (headers) => {

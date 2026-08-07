@@ -871,7 +871,7 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 | Client port | `clientPort:<v>`, `remotePort:<v>` | the client socket's port |
 | Server address | `serverIp:<v>`, `serverIP:` | the address the request was actually sent to — the upstream proxy's when one was used (response phase) |
 | Server port | `serverPort:<v>` | the port the request was sent to (response phase) |
-| Host | `host:<v>`, `host=<v>` | request host |
+| Host | `host:<v>`, `host=<v>` | request host — a [deviation](#remaining-divergences-from-upstream) |
 | Request body | `b:<v>`, `body:<v>` | the request body **contains** `<v>` — see [the body condition](#the-body-condition) |
 | Environment | `env:<KEY>=<v>` | whistle's own process environment variable `<KEY>` contains `<v>`. The key is case-**sensitive**, and only `=` separates it |
 | Origin | `from:<marker>`, `from=<marker>` | where the request came from — see [origin markers](#origin-markers) |
@@ -884,6 +884,14 @@ upstream's split between its `PROPS_FILTER_RE` and `PURE_FILTER_RE`
 > require the value to be **equal**; it now matches by containment too, so it accepts
 > strictly more requests than before. Write `reqH.<key>:/^value$/` where you relied on
 > an exact match.
+
+A URL condition may be written as a regexp, and the four operators spell it two ways.
+`includeFilter://` and `excludeFilter://` take `/<expr>/[i]` with its delimiters, like
+any other value. `filter://` and `ignore://` instead read a payload whose **last**
+character is `/` (or that ends `/i`) as a regexp, with one leading `/` dropped if
+present — so `filter:///echo$/`, `filter://echo$/` and `ignore:///echo$/` are the same
+expression, and `filter://*/echo` without the trailing slash is a wildcard instead.
+Upstream's `PATTERN_FILTER_RE` and `util.isRegExp` (`rules.js:54`, `util/index.js:606`).
 
 A `!` inverts a condition. It goes in front of the value (`m:!GET`), straight after a
 header key (`reqH.x-tag!:v`), or in front of a URL pattern (`includeFilter://!*.cdn.com`);
@@ -1004,17 +1012,22 @@ whistle-rs follows upstream's:
 
 1. every line carrying a `b:` filter is collected at parse time into a list of its
    own (upstream's `_bodyFilters`, `_original/lib/rules/rules.js:1390-1392`);
-2. before resolution, the proxy asks whether any of those lines would match this
-   request *but for* the body condition — pattern, method, headers, everything else
-   is evaluated as usual. Only then is the body read
-   (`resolveBodyFilter` → `req.getPayload`, `rules.js:2455-2465`,
-   `lib/inspectors/rules.js:193-205`).
+2. before resolution, the proxy asks whether any of those lines' **patterns** accept
+   this request. Only then is the body read (`resolveBodyFilter` → `req.getPayload`,
+   `rules.js:2455-2465`, `lib/inspectors/rules.js:193-205`).
 
-So a rules file with no `b:` in it never touches a body, and one that has a `b:`
-scoped to a host or a method pays nothing on the requests it excludes. Measured on a
-500-rule file: **4.2 ns** per request with no `b:` line, **11 ns** with one that does
-not match this request, **12 ns** with one that does (plus the buffering itself) —
-against ~2.8 µs for the resolution that follows.
+The line's other conditions get no say in stage 2, and deliberately so: upstream's
+`resolveBodyFilter` passes `isFilter`, which short-circuits `checkFilter` before
+`matchExcludeFilters` runs (`rules.js:983`). Narrowing it by them looked free and was
+not — an `excludeFilter://b:` concluded from its own assumed-true condition that the
+line was already excluded, and never read the body it needed to decide that.
+
+So a rules file with no `b:` in it never touches a body, and one whose `b:` is scoped
+to a host or a path pays almost nothing on the requests that pattern turns away.
+Measured on a 500-rule file: **under 1 ns** per request with no `b:` line — one
+`is_empty()` per group — **4 ns** with one whose pattern turns the request away, and
+**11 ns** with one whose pattern accepts it, against ~2.8 µs for the resolution that
+follows.
 
 ```
 example.com  resBody://blocked  includeFilter://b:password
@@ -1081,13 +1094,19 @@ Every other condition this port parses now evaluates.
 | `i:` matches the client IP, then falls back to the server IP | client IP only | Upstream's server-IP arm is unreachable: `filterProp` reports an ip filter as handled the moment `req.clientIp` is null, so the `req.hostIp` line below it never runs for one (`rules.js:1824-1830,:1875-1880`). Write `serverIp:` for the server's address. |
 | the response pass wins when both passes resolve one protocol | source order wins | See [the response phase](#the-response-phase): upstream's two passes read disjoint protocols and never face the case. |
 | `remoteAddress:`/`remotePort:` are the raw socket, distinct from `clientIp:`/`clientPort:` | the same socket | The two differ upstream only for a request forwarded by another whistle, whose client-IP override headers this port does not honour. |
-| `filter://<url-pattern>` with no trailing `/` is a **pattern**, not a filter | an exclude URL filter | Upstream's `PATTERN_FILTER_RE` requires the payload to end in `/` or `/i`; the bare form falls out of its filter parser and becomes another pattern for the line. Every *documented* `filter://` URL spelling is an exclude filter in both. |
-| `host:<v>` routes to proxy-host filtering | matches the request host | `host:` (with a colon) is this port's own spelling; upstream has only `host=`/`host.`, for a different job. |
+| a `host` condition never decides whether a rule applies | matches the request host | Measured against whistle 2.10.8: `host=`/`host.` are filed under `hostFilter`, which only `util.checkProxyHost` reads — it decides which hosts a `proxy://` engages for. `host:` (with a colon) upstream does not recognise at all, and reads as a URL pattern that cannot match. Both spellings match the request's own host here. |
 | header values are also compared against `encodeURIComponent(value)` | not compared | That arm is unreachable upstream: the haystack is lowercased while `encodeURIComponent` emits upper-case hex. |
 
-A filter whose condition cannot be parsed at all (`includeFilter://`, an empty header
-key) is dropped, exactly as upstream drops it — the rule then applies without that
-condition.
+Some filters are **dropped**, and the rule then applies without them: an empty payload
+or a bare `!` (`includeFilter://`, `includeFilter://!`); a header key left empty by its
+own `!` (`reqH.!!=v` — the first `!` is the value's); and an `i:`/`ip:`/`clientIp:`/
+`serverIp:` whose value is neither an address nor a regexp (`i:localhost`).
+
+That is the opposite of a condition that merely never holds, which *stops* the rule —
+and the two are a character apart. A header key that was empty to begin with is kept
+(`reqH.=v` asks for a header named `""`), and a name with nothing after its separator
+is not a condition at all (`includeFilter://reqH.` is a URL pattern no URL matches).
+Each is upstream's answer, measured.
 
 ### Disabling operators
 
