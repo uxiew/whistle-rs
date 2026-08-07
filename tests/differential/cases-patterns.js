@@ -110,6 +110,11 @@ module.exports = [
   p('ws:// on a plain request', 'ws://a.example.test'),
   p('wss:// on a plain request', 'wss://a.example.test'),
   p('tunnel:// on a plain request', 'tunnel://a.example.test'),
+  // These two are inert on both sides because the token is not a *pattern* at
+  // all: only `http`/`https`/`ws`/`wss`/`tunnel` are pattern schemes
+  // (`WEB_PROTOCOL_RE`, case-sensitively), and anything else with a `://` is an
+  // operator. The line is then two operators and no pattern, and is dropped
+  // whole. What they pin is the scheme list and the splitter, not the matcher.
   p('an unknown scheme', 'ftp://a.example.test'),
   p('an upper-case scheme', 'HTTP://a.example.test'),
   p('//host takes any scheme', '//a.example.test'),
@@ -169,12 +174,18 @@ module.exports = [
   p('the u flag', '/echo/u'),
   p('the iu flags', '/ECHO/iu'),
   p('the ui flags', '/ECHO/ui'),
-  // The next five are inert on **both** sides, and not for the reason their
-  // names suggest: a token of `/` followed by a non-`/` that is not a valid
-  // regexp is a *file path*, and `formatShorthand` claims it before the line is
-  // even split (`FILE_RE.test(url) && !util.isRegExp(url)`,
+  // The five below, and `an unterminated regexp`, are inert on **both** sides
+  // and not for the reason their names suggest: a token of `/` followed by a
+  // non-`/` that is not a valid regexp is a *file path*, and `formatShorthand`
+  // claims it before the line is even split
+  // (`FILE_RE.test(url) && !util.isRegExp(url)`,
   // `_original/lib/rules/rules.js:1195`). The line then has no pattern at all.
-  // So they pin the shorthand's flag test, not the pattern parser's.
+  // So they pin the shorthand's flag test, not the pattern parser's — and the
+  // same goes for `a path with no host` above.
+  //
+  // `an invalid regexp` is the exception and does reach the parser: `/[/` has a
+  // valid flag set, so the shorthand leaves it alone and the compile failure is
+  // what makes it match nothing.
   p('the g flag is not a flag', '/echo/g'),
   p('the m flag is not a flag', '/echo/m'),
   p('the s flag is not a flag', '/echo/s'),
@@ -308,7 +319,17 @@ module.exports = [
   raw('a comment glued to the pattern', 'a.example#.test reqHeaders://x-hit=1'),
   raw('a whole line commented out', `#a.example.test ${HIT}`),
   { name: 'CRLF line endings', rules: `${MAP}\r\na.example.test ${HIT}\r\n`, request: { url: A } },
+  // A bare CR separates two rules upstream (`LINE_END_RE`). The obvious case —
+  // mapper, CR, probe — cannot show it: both lines still answer the same when
+  // merged into one, because the mapper's `*` matches anyway. So the pair below
+  // puts the pattern that must match on the *second* line, where a proxy that
+  // does not split never reaches it, and asks it in both orders.
   { name: 'CR-only line endings', rules: `${MAP}\ra.example.test ${HIT}\r`, request: { url: A } },
+  { name: 'CR, the matching rule second', rules: `${MAP}\rb.example.test statusCode://204\ra.example.test ${HIT}`, request: { url: A } },
+  { name: 'CR, the matching rule first', rules: `${MAP}\ra.example.test ${HIT}\rb.example.test statusCode://204`, request: { url: A } },
+  { name: 'CR between two rules that both match', rules: `${MAP}\ra.example.test reqHeaders://x-hit=one\ra.example.test reqHeaders://x-hit=two`, request: { url: A } },
+  { name: 'a doubled CR before a newline', rules: `${MAP}\r\r\na.example.test ${HIT}`, request: { url: A } },
+  { name: 'a newline then a CR', rules: `${MAP}\n\ra.example.test ${HIT}`, request: { url: A } },
   { name: 'a tab as the separator', rules: `${MAP}\na.example.test\t${HIT}`, request: { url: A } },
   { name: 'several spaces as the separator', rules: `${MAP}\na.example.test    ${HIT}`, request: { url: A } },
   { name: 'leading whitespace on the line', rules: `${MAP}\n   a.example.test ${HIT}`, request: { url: A } },
