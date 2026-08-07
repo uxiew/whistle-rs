@@ -266,11 +266,21 @@ impl Stage {
 
 /// How much of `chunk` has to go out now because it is a complete event.
 ///
-/// Two `\n` end an SSE message, so everything up to there is whole and holding
-/// it back would be holding back the point of the stream
+/// A blank line ends an SSE message, so everything up to there is whole and
+/// holding it back would be holding back the point of the stream
 /// (`replace-string-transform.js:27-32`,
 /// `replace-pattern-transform.js:42-47`). Zero when this is not an event stream,
 /// or when no event has completed yet.
+///
+/// **`\r\n\r\n` counts, where upstream looks only for `\n\n`.** An event-stream
+/// line ends with `\n`, `\r`, or `\r\n`, so the blank line between two events
+/// can be written either way — and a server that uses `\r\n` produces no `\n\n`
+/// anywhere. Upstream's scan simply never fires on such a stream and it falls
+/// back to the tail guard, which costs upstream nothing it did not already have.
+/// Here it would cost something real: this port passes event streams through
+/// untouched today, so a `\r\n` origin that suddenly waited for `TAIL` bytes to
+/// accumulate would be a latency regression *introduced by adding the feature* —
+/// exactly the trade the buffering gate was put in to prevent.
 ///
 /// **This is computed before the substitution, where upstream computes it
 /// after, and the difference is a bug fixed rather than a behaviour changed.**
@@ -286,10 +296,12 @@ impl Stage {
 /// are final too. The literal transform never had the problem, because it
 /// substitutes after truncating.
 fn event_cut(chunk: &str, sse: bool) -> usize {
-    match sse {
-        true => chunk.rfind("\n\n").map_or(0, |at| at + 2),
-        false => 0,
+    if !sse {
+        return 0;
     }
+    let lf = chunk.rfind("\n\n").map_or(0, |at| at + 2);
+    let crlf = chunk.rfind("\r\n\r\n").map_or(0, |at| at + 4);
+    lf.max(crlf)
 }
 
 /// Expand a replacement string against one match — the same expander the
@@ -610,6 +622,19 @@ mod tests {
         assert_eq!(
             String::from_utf8(t.push(b"data: ping\n\n")).unwrap(),
             "data: pong\n\n"
+        );
+    }
+
+    #[test]
+    fn an_event_terminated_with_crlf_flushes_too() {
+        // A `\r\n` origin writes no `\n\n` anywhere, so upstream's scan never
+        // fires. Falling back to the tail guard here would mean holding a live
+        // stream for `TAIL` bytes — the very latency this feature must not add.
+        let owned = vec![("/ti(c)k/g".to_string(), "to$1k".to_string())];
+        let mut t = TextReplace::new(&owned, true).expect("a stage");
+        assert_eq!(
+            String::from_utf8(t.push(b"data: tick\r\n\r\n")).unwrap(),
+            "data: tock\r\n\r\n"
         );
     }
 
