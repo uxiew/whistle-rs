@@ -1362,10 +1362,28 @@ fn remove_comment(line: &str) -> &str {
 ///
 /// Comments are stripped *before* this runs, matching `mergeLines`; the other
 /// order would change what a `#` inside a block does.
+/// Split a rules text into lines the way whistle does — `LINE_END_RE`
+/// (`_original/lib/rules/rules.js:44`) is `/\n|\r\n|\r/`, so a **bare carriage
+/// return separates two rules**.
+///
+/// Rust's `str::lines()` splits on `\n` and `\r\n` and leaves a lone `\r` inside
+/// the line. A rules file saved with classic Mac endings — or one line of it,
+/// pasted from somewhere that used them — was therefore a *single* rule here and
+/// several upstream, and the difference is silent: the tokens of the merged
+/// lines are simply read as more operators on the first line's pattern. A rule
+/// whose pattern sat on the second line never matched anything.
+/// The alternation is ordered, so `\r\n` counts as **one** separator and a
+/// doubled `\r\r\n` as two — which is what dropping the trailing `\r` before
+/// splitting the rest reproduces.
+fn split_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\n')
+        .flat_map(|line| line.strip_suffix('\r').unwrap_or(line).split('\r'))
+}
+
 fn merge_lines(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut block: Option<Vec<String>> = None;
-    for raw in text.lines() {
+    for raw in split_lines(text) {
         let trimmed = raw.trim();
         match &mut block {
             None => {
@@ -1424,7 +1442,7 @@ pub fn lift_inline_values(text: &str) -> (String, HashMap<String, String>) {
     }
     let mut values: HashMap<String, String> = HashMap::new();
     let mut kept: Vec<&str> = Vec::new();
-    let mut lines = text.lines().peekable();
+    let mut lines = split_lines(text).peekable();
 
     while let Some(line) = lines.next() {
         // An opening fence is a run of at least three backticks and a name, and
@@ -1466,15 +1484,14 @@ pub fn lift_inline_values(text: &str) -> (String, HashMap<String, String>) {
 pub fn parse_text(text: &str) -> Vec<Rule> {
     // Order matters: whistle's `mergeLines` strips comments over the whole text
     // and only then collapses `line`…`` blocks.
-    let stripped: String = text
-        .lines()
+    let stripped: String = split_lines(text)
         .map(remove_comment)
         .collect::<Vec<_>>()
         .join("\n");
     let merged = merge_lines(&stripped);
 
     let mut out = Vec::new();
-    for raw_line in merged.lines() {
+    for raw_line in split_lines(&merged) {
         let tokens: Vec<&str> = raw_line.split_whitespace().collect();
         if tokens.len() < 2 {
             // A lone token isn't a rule (whistle needs pattern + ≥1 operator).
@@ -3742,6 +3759,35 @@ mod pattern_tests {
         let rules = parse_text("///example.test host://1.1.1.1");
         assert_eq!(rules.len(), 1);
         assert!(matches!(rules[0].pattern, Pattern::Nothing));
+    }
+
+    /// A bare carriage return separates two rules — `LINE_END_RE = /\n|\r\n|\r/`
+    /// (`_original/lib/rules/rules.js:44`).
+    ///
+    /// Rust's `str::lines()` splits on `\n` and `\r\n` and leaves a lone `\r`
+    /// inside the line, so a text with classic Mac endings was **one** rule here
+    /// and several upstream. The failure is silent rather than loud: the second
+    /// line's tokens are read as more operators on the first line's pattern, so
+    /// a rule whose pattern sat on a later line simply never matched.
+    ///
+    /// The corpus case for this agreed on both sides for a year of an afternoon,
+    /// because its two lines still answer the same when merged. These do not:
+    /// the matching pattern is on the second line.
+    #[test]
+    fn a_bare_carriage_return_separates_two_rules() {
+        let text = "b.test statusCode://204\rexample.test host://1.1.1.1";
+        assert_eq!(parse_text(text).len(), 2);
+        assert!(hits(text, "http://example.test/"));
+        // …and the other order, where the merged reading would have matched.
+        let text = "example.test host://1.1.1.1\rb.test statusCode://204";
+        assert_eq!(parse_text(text).len(), 2);
+        assert!(hits(text, "http://example.test/"));
+
+        // `\r\n` is one separator, not two, and `\r\r\n` is two — the ordered
+        // alternation upstream's regexp gives.
+        assert_eq!(parse_text("a.test host://1.1.1.1\r\nb.test host://2.2.2.2").len(), 2);
+        assert_eq!(parse_text("a.test host://1.1.1.1\r\r\nb.test host://2.2.2.2").len(), 2);
+        assert_eq!(parse_text("a.test host://1.1.1.1\n\rb.test host://2.2.2.2").len(), 2);
     }
 
     /// A `ws://` pattern does not reach a plain request, and an `http://` one
