@@ -2054,7 +2054,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Short-circuit / flags | `redirect`, `location`, `locationHref`, `statusCode` mock, `enable`, `disable` |
 | Local file / template | `file`, `rawfile`, `tpl`, `jsonp`, `dust`, and their `x`/`xs` fallback variants (`xfile`, `xrawfile`, …) |
 | Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` |
-| TLS | `cipher` (upstream TLS version pin), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |
+| TLS | `cipher` (upstream TLS version pin + cipher-suite selection), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |
 | Scripting / extend | `resScript`, `frameScript`, `plugin`, `pipe`, `weinre` |
 
 **Rule-file features:** a line `@<url>` or `@<file>` includes rules fetched/read from
@@ -2091,10 +2091,42 @@ registered server like `plugin` (no mid-stream piping); a **bare URL** forwards 
 request (see [Destination](#destination)), while the `rule://` spelling of that same
 protocol key pulls extra rules in from the values store, as `rulesFile://` does from a
 file; `{name}` in any operator value is
-substituted from the values store. `cipher` honours the portable part of Node's TLS
-options — `minVersion`/`maxVersion`/`secureProtocol` (or a bare `cipher://TLSv1.2`
-token) pin the **upstream** TLS protocol version; rustls exposes TLS 1.2 / 1.3 only,
-so OpenSSL cipher-suite strings and older-than-1.2 pins are not honoured.
+substituted from the values store. `cipher` carries Node's TLS options and honours
+what rustls can express — see [What `cipher://` can pin](#what-cipher-can-pin).
+
+### What `cipher://` can pin
+
+`minVersion` / `maxVersion` / `secureProtocol` (or a bare `cipher://TLSv1.2`
+token) pin the **upstream** TLS protocol version. rustls offers TLS 1.2 and 1.3
+only, so a pin older than 1.2 clamps up to 1.2.
+
+`ciphers` is an **OpenSSL cipher string** in Node, and that is a small language:
+names joined by `:`, group aliases (`HIGH`, `DEFAULT`), exclusions (`!aNULL`,
+`-RC4`), and an ordering directive (`@STRENGTH`). rustls takes no string at all
+— it has a fixed list of suites and lets you choose a subset. So:
+
+- a token naming a suite rustls has, in **either** spelling, selects it:
+  `TLS_AES_128_GCM_SHA256` (IANA, and what TLS 1.3 and OpenSSL both use) or
+  `ECDHE-RSA-AES128-GCM-SHA256` (OpenSSL's TLS 1.2 spelling);
+- every other token is **logged as not honoured**, naming itself. It used to be
+  walked past in silence, so a rule that pinned a suite configured nothing and
+  looked exactly like one that had worked;
+- a string that named no usable suite leaves rustls's own list alone rather than
+  narrowing it to nothing — an empty suite list fails every handshake, which is
+  not what asking for a cipher meant.
+
+The selection is an **intersection** with what this build offers, so a
+`cipher://` can only ever narrow what the proxy will negotiate, never widen it.
+The nine suites available are the three TLS 1.3 ones and the six ECDHE
+AES-GCM / ChaCha20 ones; `openssl ciphers` names outside that set have no
+counterpart here.
+
+```
+# pins the suite — the origin really does negotiate it
+localhost:8443 cipher://{"ciphers":"ECDHE-RSA-AES256-GCM-SHA384"}
+# logs `HIGH, !aNULL, @STRENGTH not honoured` and negotiates normally
+localhost:8443 cipher://{"ciphers":"HIGH:!aNULL:@STRENGTH"}
+```
 
 **Upstream certificate verification differs from whistle's.** whistle sets
 `rejectUnauthorized: false` by default (`_original/lib/config.js:74`) and only

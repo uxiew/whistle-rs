@@ -999,6 +999,9 @@ mod tests {
             let prefixed = Prefixed::new(hello.clone(), client);
 
             let target = upstream::Target {
+                // A tunnel this port agreed not to intercept performs its own
+                // handshake; no suite of ours is offered on it.
+                tls_suites: crate::proxy::ciphers::Suites::ALL,
                 connect_host: addr.ip().to_string(),
                 connect_port: addr.port(),
                 // Set on purpose, to pin that the relay ignores it: the client is

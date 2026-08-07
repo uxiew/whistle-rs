@@ -659,7 +659,9 @@ pub async fn resolve_target(
 
     let request_tls = super::dest::is_tls(&dest.scheme);
     let tls = origin_tls(request_tls, proxy_proto);
+    let cipher = resolved.value("cipher");
     Ok(Target {
+        tls_suites: cipher.map(parse_cipher_suites).unwrap_or_default(),
         connect_host,
         connect_port,
         tls,
@@ -669,10 +671,7 @@ pub async fn resolve_target(
         sni: dest.host.clone(),
         request_port: dest.port,
         proxy,
-        tls_versions: resolved
-            .value("cipher")
-            .map(parse_cipher_versions)
-            .unwrap_or_default(),
+        tls_versions: cipher.map(parse_cipher_versions).unwrap_or_default(),
         host_fallback_direct,
     })
 }
@@ -744,6 +743,43 @@ fn parse_cipher_versions(value: &str) -> super::upstream::TlsVersions {
     } else {
         TlsVersions::Default
     }
+}
+
+/// Read the `ciphers` half of a `cipher://` value.
+///
+/// The other half of the operator — `minVersion`/`maxVersion` — is
+/// [`parse_cipher_versions`]. This one is the OpenSSL cipher string, which
+/// rustls cannot take as a string but can be partly satisfied by selecting
+/// suites; [`super::ciphers`] explains exactly how far that goes.
+///
+/// **The tokens that cannot be honoured are logged, once per resolution.** They
+/// used to be walked past in silence, so a rule that pinned a suite configured
+/// nothing and looked exactly like a rule that had worked — which is the failure
+/// mode this port keeps finding and removing.
+fn parse_cipher_suites(value: &str) -> super::ciphers::Suites {
+    let value = value.trim();
+    let spec = match value.starts_with('{') {
+        // Node's own option name, inside the JSON the operator carries.
+        true => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+            .ok()
+            .and_then(|m| m.get("ciphers").and_then(|v| v.as_str()).map(str::to_string)),
+        // A bare token is a version pin, not a cipher list — see
+        // `parse_cipher_versions`.
+        false => None,
+    };
+    let Some(spec) = spec else {
+        return super::ciphers::Suites::ALL;
+    };
+    let requested = super::ciphers::parse(&spec);
+    if !requested.unhonoured.is_empty() {
+        tracing::warn!(
+            "cipher://…\"ciphers\": {} not honoured — rustls selects from a fixed \
+             suite list and takes no OpenSSL cipher string. Name a suite directly \
+             (TLS_AES_128_GCM_SHA256, ECDHE-RSA-AES128-GCM-SHA256, …) to pin one",
+            requested.unhonoured.join(", ")
+        );
+    }
+    requested.suites
 }
 
 /// True if a version token names TLS 1.3.

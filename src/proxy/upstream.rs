@@ -20,6 +20,7 @@
 //! One hop is refused outright: an upstream proxy that turns out to be *this*
 //! process. See [`self_loop`].
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -122,7 +123,7 @@ pub struct ProxyConfig {
 /// Which TLS protocol versions to offer on the upstream (origin) handshake.
 /// Derived from the `cipher` operator's `minVersion`/`maxVersion`. rustls
 /// supports TLS 1.2 and 1.3 only, so older pins are clamped to the nearest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TlsVersions {
     /// Offer both TLS 1.2 and 1.3 (the shared default config).
     #[default]
@@ -155,6 +156,9 @@ pub struct Target {
     pub proxy: Option<ProxyConfig>,
     /// TLS version constraint for the origin handshake (`cipher` operator).
     pub tls_versions: TlsVersions,
+    /// Cipher suites the `cipher` operator's `ciphers` selected, when it named
+    /// any this port can offer — see [`super::ciphers`].
+    pub tls_suites: super::ciphers::Suites,
     /// True when [`Self::connect_host`] came from an `xhost://` rule rather than
     /// a `host://` one: the address is a preference, not a requirement, and a
     /// connection that cannot be *established* to it is retried against the
@@ -424,6 +428,38 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
 }
 
 fn build_client_config(versions: &[&'static rustls::SupportedProtocolVersion]) -> Arc<ClientConfig> {
+    build_client_config_with(versions, super::ciphers::Suites::ALL)
+}
+
+/// [`build_client_config`], additionally narrowing the cipher suites offered.
+///
+/// The narrowing is an **intersection** with what the provider already carries,
+/// so a `cipher://` can only ever reduce what this port will negotiate. A
+/// selection that matched nothing never reaches here — see [`super::ciphers`].
+fn build_client_config_with(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    suites: super::ciphers::Suites,
+) -> Arc<ClientConfig> {
+    if !suites.is_all() {
+        let wanted = suites.selected();
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.cipher_suites.retain(|cs| wanted.contains(cs));
+        let provider = Arc::new(provider);
+        let builder = ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(versions)
+            .expect("the provider carries every version asked for");
+        let cfg = if insecure_upstream() {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+                .with_no_client_auth()
+        } else {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+        return Arc::new(cfg);
+    }
     if insecure_upstream() {
         let provider = rustls::crypto::CryptoProvider::get_default()
             .cloned()
@@ -452,12 +488,48 @@ static CLIENT_CONFIG_12: Lazy<Arc<ClientConfig>> =
 static CLIENT_CONFIG_13: Lazy<Arc<ClientConfig>> =
     Lazy::new(|| build_client_config(&[&rustls::version::TLS13]));
 
-/// Pick the origin TLS config for a target's version constraint.
-fn client_config_for(versions: TlsVersions) -> Arc<ClientConfig> {
+/// Configs for the version pins that also narrow the cipher suites.
+///
+/// Kept apart from the three statics above so that the overwhelmingly common
+/// case — no `cipher://ciphers` at all — stays a clone of an already-built
+/// `Arc` and never touches a lock. Building a `ClientConfig` parses the root
+/// store, so a rule that names suites is worth caching rather than rebuilding
+/// per request; the map is bounded by the number of distinct `cipher://` values
+/// in the rules, which is bounded by the rules file.
+type SuiteConfigCache = RwLock<HashMap<(TlsVersions, super::ciphers::Suites), Arc<ClientConfig>>>;
+static SUITE_CONFIGS: Lazy<SuiteConfigCache> = Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Pick the origin TLS config for a target's TLS constraints.
+fn client_config_for(versions: TlsVersions, suites: super::ciphers::Suites) -> Arc<ClientConfig> {
+    if suites.is_all() {
+        return match versions {
+            TlsVersions::Default => CLIENT_CONFIG.clone(),
+            TlsVersions::Only12 => CLIENT_CONFIG_12.clone(),
+            TlsVersions::Only13 => CLIENT_CONFIG_13.clone(),
+        };
+    }
+    let key = (versions, suites);
+    if let Some(cfg) = SUITE_CONFIGS.read().unwrap().get(&key) {
+        return cfg.clone();
+    }
+    let built = build_client_config_with(protocol_versions(versions), suites);
+    SUITE_CONFIGS.write().unwrap().insert(key, built.clone());
+    built
+}
+
+/// The rustls version list a [`TlsVersions`] stands for.
+///
+/// `static` rather than a match arm returning a borrow: a `&[&…]` built in the
+/// arm would be a temporary, and the whole point is a `'static` slice the
+/// builder can keep.
+static ONLY_12: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+static ONLY_13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+
+fn protocol_versions(versions: TlsVersions) -> &'static [&'static rustls::SupportedProtocolVersion] {
     match versions {
-        TlsVersions::Default => CLIENT_CONFIG.clone(),
-        TlsVersions::Only12 => CLIENT_CONFIG_12.clone(),
-        TlsVersions::Only13 => CLIENT_CONFIG_13.clone(),
+        TlsVersions::Default => rustls::ALL_VERSIONS,
+        TlsVersions::Only12 => ONLY_12,
+        TlsVersions::Only13 => ONLY_13,
     }
 }
 
@@ -926,7 +998,7 @@ async fn origin_stream(
 
     timings.connect(connecting);
     if target.tls {
-        let connector = TlsConnector::from(client_config_for(target.tls_versions));
+        let connector = TlsConnector::from(client_config_for(target.tls_versions, target.tls_suites));
         let server_name = ServerName::try_from(target.sni.clone())
             .map_err(|_| anyhow!("invalid SNI host {}", target.sni))?;
         let shaking_hands = Instant::now();
@@ -1165,6 +1237,7 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
     let tls = scheme.eq_ignore_ascii_case("https");
     let (host, port) = split_host_port(authority, if tls { 443 } else { 80 });
     let target = Target {
+        tls_suites: super::ciphers::Suites::ALL,
         connect_host: host.clone(),
         connect_port: port,
         tls,
@@ -1392,6 +1465,7 @@ mod tests {
 
     fn target(host: &str, port: u16, proxy: Option<ProxyConfig>) -> Target {
         Target {
+            tls_suites: crate::proxy::ciphers::Suites::ALL,
             connect_host: host.to_string(),
             connect_port: port,
             tls: false,

@@ -7,6 +7,7 @@ pub mod apply;
 #[cfg(test)]
 mod bench;
 pub mod body;
+pub mod ciphers;
 pub mod coding;
 pub mod dest;
 pub mod persist;
@@ -5184,6 +5185,7 @@ mod internal_req_tests {
     #[test]
     fn the_stripped_tls_marker_is_set_by_the_hop_and_consumed_on_arrival() {
         let target = |tls: bool, stripped: bool| upstream::Target {
+            tls_suites: ciphers::Suites::ALL,
             connect_host: "example.com".into(),
             connect_port: 80,
             tls,
