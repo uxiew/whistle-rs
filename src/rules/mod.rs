@@ -1272,12 +1272,12 @@ fn merge_lines(text: &str) -> String {
 /// (`resolveInlineValues`, `_original/lib/util/index.js:208-218`; the shape is
 /// `MULTI_LINE_VALUE_RE` at `:98`):
 ///
-/// ```text
+/// ````text
 /// ``` mock.json
 /// {"ok": true}
 /// ```
 /// example.com file://{mock.json}
-/// ```
+/// ````
 ///
 /// Without this pass the fence lines were parsed as rules — three tokens that
 /// configure nothing — and `{mock.json}` resolved to nothing, so the rule
