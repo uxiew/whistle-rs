@@ -658,7 +658,7 @@ pub async fn resolve_target(
     };
 
     let request_tls = super::dest::is_tls(&dest.scheme);
-    let tls = origin_tls(request_tls, proxy_proto);
+    let tls = origin_tls(request_tls, proxy_proto, resolved);
     let cipher = resolved.value("cipher");
     // A cipher string that names nothing this build has fails the request, as
     // it fails at context creation in Node. See `parse_cipher_suites`.
@@ -704,15 +704,40 @@ pub async fn resolve_target(
 ///   the operator's name asks for, and the receiving whistle restores the
 ///   scheme, but it is worth knowing before pointing one at a public proxy.
 ///
-/// A `pac://`-chosen proxy converts nothing: whistle reads the conversion off
-/// the rule's own protocol, and PAC results carry no whistle protocol.
-fn origin_tls(request_tls: bool, proxy_proto: Option<&str>) -> bool {
-    match proxy_proto {
-        Some("http2https-proxy") => true,
-        Some("https2http-proxy" | "internal-proxy" | "internal-http-proxy"
-            | "internal-https-proxy") => false,
-        _ => request_tls,
+/// A `pac://`-chosen proxy converts nothing of its own: whistle reads the
+/// conversion off the rule's own protocol, and PAC results carry no whistle
+/// protocol. `lineProps://internalProxy` still reaches it, as it reaches any
+/// other hop — see [`internal_proxy`].
+fn origin_tls(request_tls: bool, proxy_proto: Option<&str>, resolved: &Resolved) -> bool {
+    let Some(proto) = proxy_proto else {
+        return request_tls;
+    };
+    // Upstream asks `isInternal` before `isHttp2https`, so a hop that is somehow
+    // both is internal (`res.js:224-238`).
+    if matches!(
+        proto,
+        "https2http-proxy" | "internal-proxy" | "internal-http-proxy" | "internal-https-proxy"
+    ) || internal_proxy(resolved, proto)
+    {
+        return false;
     }
+    proto == "http2https-proxy" || request_tls
+}
+
+/// `internalProxy` — an ordinary `proxy://` hop is another whistle, so hand it
+/// the request in plaintext with the marker header, exactly as the `internal-*`
+/// spellings do (`isInternalProxy`, `_original/lib/util/index.js:3801-3807`).
+///
+/// `docs/LINE_PROPS.md` had this as exposed-only, on the grounds that this port
+/// has no "forward https to an upstream proxy in the clear" mode. It has had one
+/// since the `internal-*` protocols were ported — see [`origin_tls`]; what was
+/// missing was only the *other* way of asking for it. Upstream reads the
+/// property off the proxy line or the `host://` line, and `enable://internalProxy`
+/// says it request-wide.
+fn internal_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
+    resolved.props(proxy_proto).has("internalProxy")
+        || resolved.props("host").has("internalProxy")
+        || enabled_flags(resolved).contains("internalProxy")
 }
 
 /// Parse a `cipher://` value into an upstream TLS version constraint.
@@ -1078,12 +1103,22 @@ fn short_circuit_inner(
                 .ok()
                 .and_then(|c| StatusCode::from_u16(c).ok())
                 .unwrap_or(StatusCode::OK);
-            Some(
-                Response::builder()
-                    .status(status)
-                    .body(body::empty())
-                    .unwrap(),
-            )
+            let mut resp = Response::builder()
+                .status(status)
+                .body(body::empty())
+                .unwrap();
+            // A mocked `401`/`407` carries its challenge here as well, not only
+            // on the `replaceStatus://` path: upstream answers a `statusCode://`
+            // rule through `getStatusCodeFromRule`, which calls `handleStatusCode`
+            // for exactly this reason (`_original/lib/util/index.js:3566-3588`).
+            // Measured against the differential bench, `statusCode://401` came
+            // back from whistle with `WWW-Authenticate: Basic realm=User Login`
+            // and from here with nothing — so a mocked 401 never prompted, which
+            // is most of the point of mocking one.
+            if user_login_allowed(resolved, proto) {
+                handle_status_code(resp.headers_mut(), status);
+            }
+            Some(resp)
         }
         // The destination rewrite won: nothing is answered here, the request
         // goes out to where it now points.
@@ -1117,7 +1152,7 @@ fn short_circuit_inner(
 
 /// `weakRule` — the local-file rule steps aside for a matching `proxy`/`host`
 /// rule instead of answering the request, inverting the usual precedence
-/// (`filterWeakRule`, `_original/lib/util/index.js:3733-3745`).
+/// (`filterWeakRule`, `_original/lib/util/index.js:3731-3743`).
 ///
 /// Upstream drops the local rule when a `host://` rule matched, or when a proxy
 /// rule matched that is *not* `proxyHostOnly` — that spelling needs a host rule
@@ -2672,9 +2707,9 @@ pub fn apply_response_for(
     resolved: &Resolved,
     info: Option<&ReqInfo>,
 ) {
-    if let Some(code) = resolved
-        .value("replaceStatus")
-        .or_else(|| resolved.value("statusCode"))
+    if let Some((proto, code)) = ["replaceStatus", "statusCode"]
+        .into_iter()
+        .find_map(|p| resolved.value(p).map(|v| (p, v)))
         && let Some(status) = code
             .trim()
             .parse::<u16>()
@@ -2687,13 +2722,7 @@ pub fn apply_response_for(
         && status != parts.status
     {
         parts.status = status;
-        // `disable://userLogin` suppresses the challenge without suppressing the
-        // status change (`isDisableUserLogin`,
-        // `_original/lib/util/index.js:3558-3563`); `enable://userLogin` wins
-        // over it. Upstream also reads the two from the line's own properties,
-        // which this port does not carry this far.
-        let en = enabled_flags(resolved);
-        if en.contains("userLogin") || !disabled_flags(resolved).contains("userLogin") {
+        if user_login_allowed(resolved, proto) {
             handle_status_code(&mut parts.headers, status);
         }
     }
@@ -3277,8 +3306,29 @@ fn parse_origin(url: &str) -> String {
     }
 }
 
-/// `replaceStatus://401`/`407` also advertise the authentication whistle's own
-/// login flow expects (`handleStatusCode`, `_original/lib/util/index.js:398-405`).
+/// Does the rule that produced a `401`/`407` want the authentication challenge
+/// that goes with it?
+///
+/// `isDisableUserLogin` (`_original/lib/util/index.js:3557-3562`): the line's own
+/// `enableUserLogin` or a request-wide `enable://userLogin` forces it on and wins
+/// outright; `disableUserLogin` on the line or `disable://userLogin` turns it off.
+///
+/// `docs/LINE_PROPS.md` had the two properties as "not applicable, this port has
+/// no login box". They are not about whistle's own login box at all — they are
+/// about the `WWW-Authenticate: Basic realm=User Login` header a mocked `401`
+/// carries, which is the thing that *makes* a browser show one. This port writes
+/// that header, so there was always something here to turn off.
+fn user_login_allowed(resolved: &Resolved, proto: &str) -> bool {
+    let props = resolved.props(proto);
+    if props.has("enableUserLogin") || enabled_flags(resolved).contains("userLogin") {
+        return true;
+    }
+    !props.has("disableUserLogin") && !disabled_flags(resolved).contains("userLogin")
+}
+
+/// `statusCode://401`/`407` and `replaceStatus://401`/`407` also advertise the
+/// authentication a browser needs in order to ask for credentials
+/// (`handleStatusCode`, `_original/lib/util/index.js:401-408`).
 fn handle_status_code(headers: &mut HeaderMap, status: StatusCode) {
     match status.as_u16() {
         401 => set_header(headers, "www-authenticate", "Basic realm=User Login"),
@@ -3560,16 +3610,23 @@ pub fn forces_write(resolved: &Resolved) -> bool {
 /// This port has no `config.strict`, so the 1MB strict variant has no spelling
 /// here and the plain 2MB is the floor.
 ///
-/// Upstream also raises it from its own settings (the `enableBigData` argument);
-/// there is no such setting here, so the rule flag is the only way up — which is
-/// the way a user would reach for anyway, since it is per-request.
+/// `lineProps://enableBigData` on the `reqMerge://` line raises it too, and this
+/// read it as one of whistle's own settings rather than a line property — the
+/// `enableBigData` argument of `handleParams` is `reqMerge.lineProps.enableBigData`
+/// and nothing else (`req.js:564`). Measured against the differential bench, a
+/// 3 MB JSON body with `reqMerge://{"added":1} lineProps://enableBigData` was
+/// merged by whistle and forwarded unchanged here.
 pub fn req_body_limit(resolved: &Resolved) -> usize {
     /// `BIG_MAX_REQ_SIZE` (`req.js:20`).
     const BIG: usize = 16 * 1024 * 1024;
     // `isEnable` is the flag minus its cancellation, the same shape
-    // [`forces_write`] uses (`_original/lib/util/index.js:676-679`).
-    let on = enabled_flags(resolved).contains("reqMergeBigData")
-        && !disabled_flags(resolved).contains("reqMergeBigData");
+    // [`forces_write`] uses (`_original/lib/util/index.js:676-679`). The line
+    // property has no cancellation: upstream reads it straight off the rule.
+    // `params` is where `reqMerge://` lands here, as `reqRules.params` is where
+    // it lands upstream (`req.js:461`).
+    let on = resolved.props("params").has("enableBigData")
+        || (enabled_flags(resolved).contains("reqMergeBigData")
+            && !disabled_flags(resolved).contains("reqMergeBigData"));
     match on {
         true => BIG,
         false => REQ_BODY_LIMIT,
@@ -4498,7 +4555,7 @@ fn collect_res_injection(gate: &InjectionGate<'_>, families: BodyFamilies) -> In
 /// body — the `safeHtml` / `strictHtml` line properties.
 ///
 /// Ported from `WhistleTransform#allowInject` + `filterHtml`
-/// (`_original/lib/util/whistle-transform.js:66-89`). Three things matter:
+/// (`_original/lib/util/whistle-transform.js:78-100`). Three things matter:
 ///
 /// * the decision looks at the **original** upstream body, before any operator
 ///   has rewritten it, and at its first non-whitespace byte only;
@@ -4516,7 +4573,7 @@ struct InjectionGate<'a> {
     /// False when nothing is gated (non-HTML response, or the request side).
     html: bool,
     /// `enable://safeHtml` / `enable://strictHtml`, which upstream stamps onto
-    /// every injecting rule of the request (`_original/lib/inspectors/res.js:970-987`).
+    /// every injecting rule of the request (`_original/lib/inspectors/res.js:966-982`).
     global: LineProps,
 }
 
@@ -6535,6 +6592,52 @@ mod tests {
     }
 
     // ── `params://` merged into the request body ──
+
+    /// How much of a request body the merging operators are allowed to hold.
+    ///
+    /// `lineProps://enableBigData` on the `reqMerge://` line raises it, exactly
+    /// as `enable://reqMergeBigData` does — upstream passes the one straight
+    /// into the place it reads the other (`handleParams`,
+    /// `_original/lib/inspectors/req.js:163,:564`).
+    ///
+    /// This port read `enableBigData` as a setting of whistle's own rather than
+    /// a line property, so `docs/LINE_PROPS.md` called it exposed-only. The
+    /// differential bench disagreed: a 3 MB JSON body with the property written
+    /// was merged by whistle and forwarded unchanged here.
+    #[test]
+    fn enable_big_data_raises_the_request_body_ceiling() {
+        const BIG: usize = 16 * 1024 * 1024;
+        let limit = |rules: &str| req_body_limit(&resolve(rules, "http://example.com/p"));
+
+        assert_eq!(limit("example.com reqMerge://{\"a\":1}\n"), REQ_BODY_LIMIT);
+        assert_eq!(
+            limit("example.com reqMerge://{\"a\":1} lineProps://enableBigData\n"),
+            BIG
+        );
+        // `reqMerge` and `params` are one operator here as they are upstream.
+        assert_eq!(
+            limit("example.com params://a=1 lineProps://enableBigData\n"),
+            BIG
+        );
+        // The request-wide flag still says the same, and still answers to its
+        // cancellation — the line property has none to answer to.
+        assert_eq!(limit("example.com enable://reqMergeBigData\n"), BIG);
+        assert_eq!(
+            limit("example.com enable://reqMergeBigData disable://reqMergeBigData\n"),
+            REQ_BODY_LIMIT
+        );
+        assert_eq!(
+            limit(
+                "example.com params://a=1 lineProps://enableBigData disable://reqMergeBigData\n"
+            ),
+            BIG
+        );
+        // Line-scoped: on some other line it raises nothing.
+        assert_eq!(
+            limit("example.com params://a=1\nexample.com resHeaders://x=1 lineProps://enableBigData\n"),
+            REQ_BODY_LIMIT
+        );
+    }
 
     /// `transform_req_body` for a POST carrying `ct`.
     fn merged_body(rules: &str, ct: Option<&str>, body: &str) -> String {
@@ -8664,6 +8767,47 @@ mod tests {
         assert!(!t.origin_tls_stripped);
     }
 
+    /// `lineProps://internalProxy` says of a plain `proxy://` hop what the
+    /// `internal-*` spellings say of themselves: it is another whistle, so hand
+    /// it the request in the clear (`isInternalProxy`,
+    /// `_original/lib/util/index.js:3801-3807`).
+    ///
+    /// `docs/LINE_PROPS.md` called this exposed-only because the port had no
+    /// cleartext-through-a-proxy mode. It has had one since the `internal-*`
+    /// protocols landed; only this way of asking for it was missing.
+    #[test]
+    fn internal_proxy_hands_an_https_origin_over_in_the_clear() {
+        // On the proxy line, on the `host://` line, and request-wide — the three
+        // places upstream reads it from.
+        for rules in [
+            "example.com proxy://127.0.0.1:8888 lineProps://internalProxy\n",
+            "example.com proxy://127.0.0.1:8888 lineProps://proxyHost\n\
+             example.com host://10.0.0.9 lineProps://internalProxy\n",
+            "example.com proxy://127.0.0.1:8888\nexample.com enable://internalProxy\n",
+        ] {
+            let t = target(rules, "https://example.com/");
+            assert!(!t.tls, "the hop should carry plaintext: {rules}");
+            assert!(t.origin_tls_stripped, "…and say so with the marker: {rules}");
+        }
+
+        // An http origin has no TLS to strip, so the property changes nothing.
+        let t = target(
+            "example.com proxy://127.0.0.1:8888 lineProps://internalProxy\n",
+            "http://example.com/",
+        );
+        assert!(!t.tls);
+        assert!(!t.origin_tls_stripped);
+
+        // The property belongs to the hop: with no proxy there is nothing to
+        // hand the request to, and an https origin stays https.
+        let t = target(
+            "example.com host://10.0.0.9 lineProps://internalProxy\n",
+            "https://example.com/",
+        );
+        assert!(t.tls, "no hop, no conversion");
+        assert!(!t.origin_tls_stripped);
+    }
+
     /// Every protocol in the family list is one `find_proxy` actually reads,
     /// with the transport its name implies. The list lives in the rules layer
     /// (it is what `ignore://proxy` means); this is the check that the two
@@ -8684,7 +8828,7 @@ mod tests {
     // ── weakRule ──
 
     /// `weakRule` on a local-file line makes it yield to a matching proxy or
-    /// host rule (`filterWeakRule`, `_original/lib/util/index.js:3733`).
+    /// host rule (`filterWeakRule`, `_original/lib/util/index.js:3731`).
     #[test]
     fn weak_rule_yields_to_proxy_or_host() {
         let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
@@ -8751,7 +8895,7 @@ mod tests {
     }
 
     /// `safeHtml` refuses a JSON-looking body; `strictHtml` refuses anything
-    /// that is not markup (`_original/lib/util/whistle-transform.js:66-89`).
+    /// that is not markup (`_original/lib/util/whistle-transform.js:78-100`).
     #[test]
     fn safe_and_strict_html_refuse_non_markup() {
         let json = "{\"a\":1}";
@@ -8828,7 +8972,7 @@ mod tests {
     }
 
     /// `enable://strictHtml` applies the strict gate to every line of the
-    /// request (`_original/lib/inspectors/res.js:970-987`).
+    /// request (`_original/lib/inspectors/res.js:966-982`).
     #[test]
     fn enable_strict_html_gates_every_line() {
         let out = inject(
@@ -10304,7 +10448,7 @@ mod tests {
         // Replacing a status with itself does not.
         assert_eq!(challenge("replaceStatus://401", 401), (401, None));
         // `disable://userLogin` suppresses the challenge without suppressing
-        // the status change (`isDisableUserLogin`, `util/index.js:3558-3563`)…
+        // the status change (`isDisableUserLogin`, `util/index.js:3557-3562`)…
         assert_eq!(
             challenge("replaceStatus://401 disable://userLogin", 200),
             (401, None)
@@ -10314,6 +10458,32 @@ mod tests {
             challenge("replaceStatus://401 disable://userLogin enable://userLogin", 200),
             (401, Some("Basic realm=User Login".to_string()))
         );
+        // The line's own properties say the same, and were read as being about
+        // whistle's login box rather than about this header — so `lineProps://
+        // disableUserLogin` left the challenge standing, which the differential
+        // bench caught.
+        assert_eq!(
+            challenge("replaceStatus://401 lineProps://disableUserLogin", 200),
+            (401, None)
+        );
+        assert_eq!(
+            challenge(
+                "replaceStatus://401 lineProps://disableUserLogin&enableUserLogin",
+                200
+            ),
+            (401, Some("Basic realm=User Login".to_string()))
+        );
+        // The property is line-scoped: written on another line it says nothing
+        // about this one.
+        let two_lines = "example.com replaceStatus://401\n\
+                         example.com resHeaders://x-a=1 lineProps://disableUserLogin\n";
+        let resolved = resolve(two_lines, "http://example.com/");
+        let mut parts = res_parts(&[]);
+        apply_response(&mut parts, &resolved);
+        assert_eq!(
+            parts.headers.get("www-authenticate").map(|v| v.to_str().unwrap()),
+            Some("Basic realm=User Login")
+        );
         // 407 takes the proxy spelling.
         let resolved = resolve("example.com replaceStatus://407\n", "http://example.com/");
         let mut parts = res_parts(&[]);
@@ -10321,6 +10491,48 @@ mod tests {
         assert_eq!(
             parts.headers.get("proxy-authenticate").unwrap(),
             "Basic realm=User Login"
+        );
+    }
+
+    /// A mocked `statusCode://401` carries the challenge too — upstream answers
+    /// such a rule through `getStatusCodeFromRule`, which calls `handleStatusCode`
+    /// unless the line said otherwise (`_original/lib/util/index.js:3566-3588`).
+    ///
+    /// This port answered with a bare 401, so mocking an unauthenticated
+    /// response never made a browser ask for credentials. Found with the
+    /// differential bench, not by reading.
+    #[test]
+    fn a_mocked_401_asks_the_browser_for_credentials() {
+        let challenge = |rule: &str, header: &str| {
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            let resolved = resolve(&format!("a.com {rule}\n"), "http://a.com/");
+            let resp = short_circuit(&info, &resolved, test_env()).expect("a status is answered");
+            (
+                resp.status().as_u16(),
+                resp.headers().get(header).map(|v| v.to_str().unwrap().to_string()),
+            )
+        };
+        let basic = || Some("Basic realm=User Login".to_string());
+
+        assert_eq!(challenge("statusCode://401", "www-authenticate"), (401, basic()));
+        assert_eq!(challenge("statusCode://407", "proxy-authenticate"), (407, basic()));
+        // Only those two statuses carry one.
+        assert_eq!(challenge("statusCode://403", "www-authenticate"), (403, None));
+        // …and the line, or the request, can decline it.
+        assert_eq!(
+            challenge("statusCode://401 lineProps://disableUserLogin", "www-authenticate"),
+            (401, None)
+        );
+        assert_eq!(
+            challenge("statusCode://401 disable://userLogin", "www-authenticate"),
+            (401, None)
+        );
+        assert_eq!(
+            challenge(
+                "statusCode://401 disable://userLogin lineProps://enableUserLogin",
+                "www-authenticate"
+            ),
+            (401, basic())
         );
     }
 

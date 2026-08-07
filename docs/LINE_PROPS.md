@@ -5,8 +5,8 @@
 `lineProps://` 是 whistle 的**行作用域修饰符**：它声明的开关只影响**同一行**上写的算子，
 是全局 `enable://` / `disable://` 的行内对应物。
 
-对应原版实现：`resolveMatchFilter`（`lib/rules/rules.js:1552`）、
-`parseLineProps`（`lib/util/index.js:1877`）。
+对应原版实现：`resolveMatchFilter`（`lib/rules/rules.js:1542`，识别令牌在 `:1552`）、
+`parseLineProps`（`lib/util/index.js:1892`）。
 
 ---
 
@@ -25,7 +25,7 @@ example.com  htmlAppend:///tmp/x.html  lineProps://safeHtml&important
 
 | 行为 | 说明 |
 |------|------|
-| 分隔符 | `\|` **和** `&` 都是分隔符（原版 `SEP_RE = /[\|&]/`），且**不支持转义** —— 这一点刻意不同于 `enable://` |
+| 分隔符 | `\|` **和** `&` 都是分隔符（原版 `SEP_RE = /[\|&]/`，`lib/util/index.js:52`），且**不支持转义** —— 这一点刻意不同于 `enable://`，后者走的是带转义的 `parseProps`（`lib/util/common.js:111`） |
 | 多次出现 | 一行上多个 `lineProps://` 令牌会合并 |
 | 空载荷 | `lineProps://`、`lineProps://\|` 均为 no-op，不会产生空动作 |
 | 未知属性 | 原样保留，不校验、不告警（原版同样不校验） |
@@ -41,8 +41,14 @@ example.com  htmlAppend:///tmp/x.html  lineProps://safeHtml&important
 
 ## 属性状态表
 
-诚实标注两种状态：**已接线**（真实影响流量，且有测试）、**仅暴露**（已解析，可通过
-`Resolved::props(protocol)` 读取，但无运行时效果 —— 每一条都注明了为什么）。
+> **2026-08-07 全表复核。** 起因是 `disableAutoCors` 一行被发现写反了 —— 它引对了上游行号，
+> 却得出了相反的结论。既然一张表里出了错，就该逐行验一遍，于是每一行都对着上游源码重读、
+> 并尽量放进[差分测试台](../tests/differential/README.md)跑过。结果是**又有四行是错的或过时的**：
+> `enableBigData`、`internalProxy`、`proxyTunnel`、`enableUserLogin`/`disableUserLogin`。
+> 错在哪里、为什么错，都留在下表对应行里 —— 本仓库记录自己的错误，而不是悄悄改掉。
+
+现在每一条已知属性都**已接线**（真实影响流量，且有测试）。仍有解析层的兜底：未列出的动作
+原样保留、不校验，`Resolved::props(protocol)` 可以读到，只是没有运行时含义。
 
 | 属性 | 状态 | 说明 |
 |------|------|------|
@@ -52,21 +58,33 @@ example.com  htmlAppend:///tmp/x.html  lineProps://safeHtml&important
 | `safeHtml` | ✅ **已接线** | 响应体不像标记语言（首字符是 `{`/`[`）时，拒绝把**该行**的内容注入进去 |
 | `strictHtml` | ✅ **已接线** | 同上，但只接受真正的标记语言（首字符 `<` 或空体）。优先级高于 `safeHtml` |
 | `proxyFirst` | ✅ **已接线** | `host` 与 `proxy` 同时命中时优先 `proxy`（默认优先 `host`） |
-| `proxyHost` | ✅ **已接线** | 让 `host` 与 `proxy` 同时生效：走代理，但代理连的是 `host://` 指定的地址 |
+| `proxyHost` | ✅ **已接线** | 让 `host` 与 `proxy` 同时生效：走代理，但代理连的是 `host://` 指定的地址。一处已知的机制差异见下节[「host 与 proxy 的优先级」](#host-与-proxy-的优先级) |
 | `proxyHostOnly` | ✅ **已接线** | 同上，但无 `host` 命中时丢弃 `proxy` |
 | `weakRule` | ✅ **已接线** | 反转默认优先级，使 `file` 族规则给命中的 `proxy`/`host` 让路 |
 | `originUrl` | ✅ **已接线** | **原版未文档化**：域名型 pattern（无自带路径）命中时，拼到转发/file 值后面的路径强制为 `/`，即只要目标自己的根（`lib/rules/rules.js:1105`）。带路径的 pattern 不受影响 —— 上游同样以 `rule.isDomain` 为前提 |
-| `disableAutoCors` | ✅ 已生效 | 关掉本地文件响应上的**自动 CORS**（`isAutoCors`，`_original/lib/handlers/file-proxy.js:178-191`）。此前这里写着「本移植没有可抑制的对象……为了能关掉它而先实现自动 CORS 是本末倒置」——结论写反了：自动 CORS 本身就是那个功能，见 [`RULES.md`](RULES.md#跨域-mock自动-cors) |
-| `disabledAutoCors` | ✅ 已生效 | 原版接受的拼写错误别名，同上 |
-| `enableBigData` | 仅暴露 | **本移植没有可抬高的上限**：`reqMerge`/`resMerge` 对整个已缓冲的 body 生效，不设 2MB 门槛（原版 `MAX_RES_SIZE`/`BIG_MAX_RES_SIZE`，`lib/inspectors/res.js:25-26,:1017`），等价于该开关恒为开 |
-| `internalProxy` | 仅暴露 | 本移植没有「经上游代理明文转发 https」这一模式：`internal-proxy://` 与 `proxy://` 走同一条 HTTP 代理路径，没有可切换的行为（原版 `isInternalProxy`，`lib/util/index.js:3799-3809`） |
-| `proxyTunnel` | 仅暴露 | 需要在 `upstream::Target` 上增加「明文请求也先 CONNECT」的开关，而 `src/proxy/upstream.rs` 不在本次改动范围内；且无法在没有上游代理的情况下做端到端验证 |
-| `enableUserLogin` | 不适用 | 本移植没有登录框，也没有 `disable://userLogin` |
-| `disableUserLogin` | 不适用 | 同上 |
+| `disableAutoCors` | ✅ **已接线** | 关掉本地文件响应上的**自动 CORS**（`isAutoCors`，`_original/lib/handlers/file-proxy.js:178-191`）。此前这里写着「本移植没有可抑制的对象……为了能关掉它而先实现自动 CORS 是本末倒置」——结论写反了：自动 CORS 本身就是那个功能，见 [`RULES.md`](RULES.md#跨域-mock自动-cors) |
+| `disabledAutoCors` | ✅ **已接线** | 原版接受的拼写错误别名，同上 |
+| `enableBigData` | ✅ **已接线**（请求侧） | 写在 `reqMerge://`（即 `params`）行上，把请求体上限从 2MB 抬到 16MB，与 `enable://reqMergeBigData` 等价（`handleParams`，`lib/inspectors/req.js:163,:564`）。**此前这行写着「本移植没有可抬高的上限」，是读错了**：`handleParams` 的 `enableBigData` 形参就是这条行属性本身，不是 whistle 的什么设置项。差分测试台上，3MB 的 JSON 体加上这条属性，原版合并、本移植原样转发。<br>响应侧确实没有对应物，但理由是另一回事：本移植的响应体上限（`--body-rewrite-limit`，默认 16 MiB）是**内存护栏**而非语义门槛，且已经等于上游抬高后的 `BIG_MAX_RES_SIZE`（`lib/inspectors/res.js:21-22,:1013`），没有可抬的余地 |
+| `internalProxy` | ✅ **已接线** | 让普通 `proxy://` 跳板按「对面也是 whistle」处理：剥掉源站 TLS、明文交给跳板，并带上 `x-whistle-https-request` 标记（`isInternalProxy`，`lib/util/index.js:3801-3807`）。可写在 proxy 行、`host://` 行，或用 `enable://internalProxy`。**此前这行写着「本移植没有『经上游代理明文转发 https』这一模式」，这是错的** —— `internal-proxy://` 系列协议落地时这个模式就有了（见 `apply.rs` 的 `origin_tls`），缺的只是另一种写法 |
+| `proxyTunnel` | ✅ **已接线** | 跳板本身也是代理，因此再 CONNECT 一层到真正的源站（`ProxyConfig::tunnel`）。**此前这行是过时的**：它写着「需要在 `upstream::Target` 上增加开关，而 `src/proxy/upstream.rs` 不在本次改动范围内」，而该开关后来就加上了 |
+| `enableUserLogin` | ✅ **已接线** | 强制保留 `401`/`407` 的认证挑战头，压过 `disableUserLogin` 与 `disable://userLogin`（`isDisableUserLogin`，`lib/util/index.js:3557-3562`） |
+| `disableUserLogin` | ✅ **已接线** | 让 `statusCode://401` / `replaceStatus://401`（`407` 同理）**只改状态码、不写** `WWW-Authenticate: Basic realm=User Login`。**此前这两行写着「本移植没有登录框，也没有 `disable://userLogin`」，两句都不成立**：这对属性管的根本不是 whistle 自己的登录框，而是那个让浏览器弹出登录框的响应头 —— 本移植一直在写它。顺带补上的还有 `statusCode://401` 的挑战头本身，此前只有 `replaceStatus://` 那条路会写 |
 
 
 `LINE_PROP_ACTIONS` 常量列出全部已知动作，仅作文档用途 —— 它**不是过滤器**，未列出的动作
 同样会被保留。
+
+### 差分测试台覆盖到哪里
+
+[`tests/differential/cases-lineprops.js`](../tests/differential/cases-lineprops.js) 把上表逐条
+放进真实 whistle 与本移植跑同一条规则。三条属性没有用例，原因在测试台而不在本移植：
+
+* `internalProxy` 只在**源站是 https** 时才有动作，而测试台从客户端到源站全程明文；
+* `proxyTunnel` 需要一个「跳板的对面还是跳板」的二级代理，测试台没有；
+* `originUrl` 需要「裸域名 pattern + 带路径的转发目标」，而这种形状对着测试台的源站时
+  两边都不改写目标 —— 用例只会钉住「都没做事」。
+
+这三条都由 `src/` 里的单元测试覆盖。
 
 ---
 
@@ -119,7 +137,7 @@ composer/replay 同样不是内部请求。等到有了这类调用方（例如�
 ## 注入门禁（`safeHtml` / `strictHtml`）
 
 对应原版 `WhistleTransform#allowInject` + `filterHtml`
-（`lib/util/whistle-transform.js:66-89`）。三个容易踩空的点：
+（`lib/util/whistle-transform.js:78-100` 与 `:58-72`）。三个容易踩空的点：
 
 1. 判定只看**原始响应体**的第一个非空白字节，且在任何算子改写它**之前**做出；
 2. 只有 **HTML 响应**会被门禁 —— 其余类型 `allowInject` 直接返回 true，所以给
@@ -136,7 +154,7 @@ composer/replay 同样不是内部请求。等到有了这类调用方（例如�
 被门禁的算子包括通用的 `resBody`/`resPrepend`/`resAppend` 与 `htmlBody`/`htmlPrepend`/
 `htmlAppend`（原版把它们放进同一个 `injectRules` 列表）。请求侧算子不受影响。
 全局的 `enable://safeHtml` / `enable://strictHtml` 会叠加到每一行上
-（`lib/inspectors/res.js:970-987`）。
+（`lib/inspectors/res.js:966-982`）。
 
 ---
 
@@ -156,13 +174,22 @@ composer/replay 同样不是内部请求。等到有了这类调用方（例如�
 代理 URL 自带的 `?proxyHost` 查询标记同样有效（原版 `PROXY_HOSTS_RE`），
 且该查询串不会混进代理地址。
 
+> **一处已知的机制差异**（差分测试台跑出来的）。原版只要 `proxyHost` 生效且有 `host://`
+> 命中，就无条件设 `req._phost`，而 `_phost` 会让**明文 http 请求也先 CONNECT**
+> （`lib/inspectors/res.js:288-295`）。本移植是从「连接地址是否真的变了」反推 `_phost`
+> （`Target::has_host_override`，`src/proxy/upstream.rs:200-203`），所以当 `host://`
+> 写的正是请求本来就要去的地址时，本移植发的是 absolute-form 请求而非 CONNECT。
+> 两边连到的地址相同，差别只在线路形态；地址真的不同时两边都 CONNECT。
+> 这不是行属性的接线问题，修它要动 `Target` 的形状，因此单独记在这里。
+
 `weakRule` 处理的是另一半优先级：默认 `file` 族规则会短路整个请求，写上它之后，
 只要同时命中了 `host://`（或非 `proxyHostOnly` 的 `proxy://`），本地文件就让路
-（原版 `filterWeakRule`，`lib/util/index.js:3733-3745`）。
+（原版 `filterWeakRule`，`lib/util/index.js:3731-3743`）。
 
 ---
 
 ## 尚未移植
 
-- `rawProps`（原版仅用于 WebUI 回显原始令牌）。
+- `rawProps`（`lib/rules/rules.js:1545,:1553,:1725`）：原版把原始令牌文本挂在规则上，
+  `lib/` 里没有任何地方读它，只有 WebUI 回显用得着。
 - 原版的 `lineProps` 对象按引用共享所导致的 `IS_JSON` 跨算子备忘缓存行为 —— 刻意不复刻。
