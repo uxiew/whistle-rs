@@ -514,10 +514,15 @@ fn matched_proxy_proto(resolved: &Resolved) -> Option<&'static str> {
 /// proxy has said where the request must go. When the address is unusable, or a
 /// PAC file cannot be fetched or throws, the request cannot go there — and
 /// sending it straight to the origin instead would quietly do the one thing the
-/// rule ruled out. whistle degrades to a direct connection in both cases (an
-/// empty matcher is falsy at `_original/lib/inspectors/res.js:214`; a failed PAC
-/// only reaches `logger.error`, `lib/rules/index.js:295`), so this port is
-/// deliberately stricter. See `docs/RULES.md`.
+/// rule ruled out.
+///
+/// Only the **PAC** half of that is stricter than upstream: a PAC failure
+/// reaches `logger.error` and nothing else (`_original/lib/rules/index.js:295`),
+/// so whistle connects direct. An unusable *address* it refuses as well —
+/// measured against 2.10.8, `proxy://`, `socks://`, `http-proxy://@` and
+/// `proxy://?proxyHost` all answer 502, because the matcher is still truthy and
+/// becomes the address `http://`, which the resolver cannot answer. See
+/// `docs/RULES.md`.
 async fn find_proxy(
     info: &ReqInfo,
     resolved: &Resolved,
@@ -589,30 +594,48 @@ fn proxy_host_flag(value: &str) -> bool {
 ///   proxy, but have the proxy connect to the `host://` address (`_phost`);
 /// * `proxyHostOnly` — as `proxyHost`, and additionally drop the proxy when no
 ///   `host://` rule matched, since there is then no host for it to apply;
-/// * `proxyFirst` (on either line) — prefer the proxy over the plain host.
+/// * `proxyFirst` (on either line) — prefer the proxy over the plain host. The
+///   host address is then **not used at all**: see [`host_travels_with_proxy`].
 ///
 /// `enable://proxyHost` / `enable://proxyFirst` say the same request-wide.
 fn proxy_survives_host(resolved: &Resolved, proxy_proto: &str, host_matched: bool) -> bool {
+    if !host_matched {
+        return !resolved.props(proxy_proto).has("proxyHostOnly");
+    }
+    host_travels_with_proxy(resolved, proxy_proto) || {
+        let host_props = resolved.props("host");
+        resolved.props(proxy_proto).has("proxyFirst")
+            || host_props.has("proxyFirst")
+            || enabled_flags(resolved).contains("proxyFirst")
+    }
+}
+
+/// Does the `host://` address travel *with* the proxy — as the address the hop
+/// is asked to connect to (whistle's `req._phost`) — rather than being dropped?
+///
+/// Only the `proxyHost` family says so. `proxyFirst` does not, and the
+/// difference is visible on the wire: whistle reaches `req._phost = …` only
+/// inside `if (proxyHost)`, and the `proxyFirst` test is that branch's `else if`
+/// (`_original/lib/rules/index.js:217-236`). So `proxyFirst` decides *which of
+/// the two rules wins*, the winner is the proxy, and the host address goes
+/// nowhere. This port kept it, which turned an absolute-form request for the
+/// requested origin into a CONNECT to an address the rule had just been told to
+/// prefer the proxy over.
+fn host_travels_with_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
     let proxy_props = resolved.props(proxy_proto);
     let host_props = resolved.props("host");
-    let proxy_host_only = proxy_props.has("proxyHostOnly");
-    if !host_matched {
-        return !proxy_host_only;
-    }
-    let enabled = enabled_flags(resolved);
+    // `?proxyHost` written into the proxy's own URL; a PAC rule has no URL of
+    // its own to carry it.
     let url_flag = proxy_proto != "pac"
         && resolved
             .value(proxy_proto)
             .map(proxy_host_flag)
             .unwrap_or(false);
-    proxy_host_only
+    proxy_props.has("proxyHostOnly")
         || url_flag
         || proxy_props.has("proxyHost")
         || host_props.has("proxyHost")
-        || enabled.contains("proxyHost")
-        || proxy_props.has("proxyFirst")
-        || host_props.has("proxyFirst")
-        || enabled.contains("proxyFirst")
+        || enabled_flags(resolved).contains("proxyHost")
 }
 
 /// Compute the upstream target, honouring `host://` (and `:port`) overrides.
@@ -660,6 +683,16 @@ pub async fn resolve_target(
         Some((proto, cfg)) => (Some(proto), Some(cfg)),
         None => (None, None),
     };
+    // A proxy that survived a `host://` rule on `proxyFirst` alone won *instead
+    // of* it, so the address that rule named is put back — see
+    // [`host_travels_with_proxy`].
+    if let Some(proto) = proxy_proto
+        && host_rule.is_some()
+        && !host_travels_with_proxy(resolved, proto)
+    {
+        connect_host = dest.host.clone();
+        connect_port = dest.port;
+    }
 
     let request_tls = super::dest::is_tls(&dest.scheme);
     let tls = origin_tls(request_tls, proxy_proto, resolved);
@@ -973,15 +1006,25 @@ pub fn forced_encoding(resolved: &Resolved) -> Option<super::coding::Coding> {
     }
 }
 
-/// Parse a PAC `FindProxyForURL` return value into a proxy (first usable entry).
+/// Parse a PAC `FindProxyForURL` return value into a proxy.
 ///
-/// `DIRECT` — anywhere in the list — yields `Ok(None)`: the script was asked
-/// where to send the request and answered "nowhere in particular". A result with
-/// no usable entry and no `DIRECT` is an error instead, because the script *did*
-/// name somewhere and we could not act on it. `SOCKS4` is such a case: this port
-/// speaks SOCKS5 only, and quietly going direct would hide that.
+/// The list is read in order, as a PAC list is meant to be: the first entry that
+/// names somewhere reachable wins. `DIRECT` reached before any usable proxy
+/// yields `Ok(None)` — the script was asked where to send the request and
+/// answered "nowhere in particular". A `DIRECT` *after* the chosen proxy is a
+/// fallback rather than a choice, and is carried as [`ProxyConfig::fallback_direct`]
+/// so a hop that cannot be established goes direct instead of failing. whistle
+/// arrives at the same place by rewriting the result into an `x`-prefixed rule
+/// when the word `direct` follows the proxy it picked (`prefix = 'x'`,
+/// `node-pac/lib/Pac.js:96-103`).
+///
+/// A result with no usable entry and no `DIRECT` is an error instead, because
+/// the script *did* name somewhere and we could not act on it. `SOCKS4` is such
+/// a case: this port speaks SOCKS5 only, and quietly going direct would hide
+/// that.
 fn parse_pac_result(result: &str) -> Result<Option<super::upstream::ProxyConfig>> {
-    for entry in result.split(';') {
+    let mut entries = result.split(';');
+    while let Some(entry) = entries.next() {
         let mut it = entry.split_whitespace();
         let kind = it.next().unwrap_or("").to_ascii_uppercase();
         let hostport = it.next().unwrap_or("");
@@ -993,7 +1036,12 @@ fn parse_pac_result(result: &str) -> Result<Option<super::upstream::ProxyConfig>
             "SOCKS" | "SOCKS5" => parse_proxy(ProxyKind::Socks, hostport),
             _ => None,
         };
-        if let Some(p) = parsed {
+        if let Some(mut p) = parsed {
+            p.fallback_direct = entries.any(|rest| {
+                rest.split_whitespace()
+                    .next()
+                    .is_some_and(|k| k.eq_ignore_ascii_case("DIRECT"))
+            });
             return Ok(Some(p));
         }
     }
@@ -1078,7 +1126,7 @@ pub fn short_circuit(
 /// upstream has it, and worth spelling honestly: this is not whistle, so it does
 /// not say `Whistle`. A tool keying off the exact upstream value will not see
 /// it, which is the correct outcome — it is not talking to whistle.
-fn mark_self_generated(headers: &mut HeaderMap) {
+pub(crate) fn mark_self_generated(headers: &mut HeaderMap) {
     set_header(headers, "x-server", "whistle-rs");
 }
 
@@ -9228,22 +9276,47 @@ mod tests {
         assert_eq!(t.proxy.expect("proxy").port, 8888);
     }
 
-    /// `proxyFirst` and `proxyHost` (on either line) keep both, so the request
-    /// goes through the proxy to the host address.
+    /// `proxyHost` (on either line, or request-wide) keeps both, so the request
+    /// goes through the proxy *to the host address*.
     #[test]
-    fn proxy_first_and_proxy_host_keep_both() {
+    fn proxy_host_keeps_both_the_proxy_and_the_host_address() {
         for rules in [
-            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyFirst\n",
-            "example.com host://1.2.3.4 lineProps://proxyFirst\nexample.com proxy://127.0.0.1:8888\n",
             "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyHost\n",
             "example.com host://1.2.3.4 lineProps://proxyHost\nexample.com proxy://127.0.0.1:8888\n",
-            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\nexample.com enable://proxyFirst\n",
             "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\nexample.com enable://proxyHost\n",
         ] {
             let t = target(rules, "http://example.com/");
             assert!(t.proxy.is_some(), "proxy should survive: {rules}");
             assert_eq!(t.connect_host, "1.2.3.4", "host override still applies");
         }
+    }
+
+    /// `proxyFirst` keeps the proxy and **drops** the host address — it settles
+    /// which of the two rules wins rather than combining them, and the winner is
+    /// the proxy. Measured against real whistle 2.10.8, which sends the request
+    /// to the hop in absolute form naming the *requested* origin, with no
+    /// CONNECT and no sign of the host rule
+    /// (`_original/lib/rules/index.js:217-236`; the bench case is
+    /// `both: proxyFirst prefers the proxy`).
+    #[test]
+    fn proxy_first_drops_the_host_address_rather_than_combining_it() {
+        for rules in [
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888 lineProps://proxyFirst\n",
+            "example.com host://1.2.3.4 lineProps://proxyFirst\nexample.com proxy://127.0.0.1:8888\n",
+            "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\nexample.com enable://proxyFirst\n",
+        ] {
+            let t = target(rules, "http://example.com/");
+            assert!(t.proxy.is_some(), "proxy should survive: {rules}");
+            assert_eq!(t.connect_host, "example.com", "the host address is dropped: {rules}");
+            assert_eq!(t.connect_port, 80);
+        }
+        // Both properties together: `proxyHost` is the one that speaks, so the
+        // address travels after all.
+        let t = target(
+            "example.com host://1.2.3.4 lineProps://proxyFirst\nexample.com proxy://127.0.0.1:8888 lineProps://proxyHost\n",
+            "http://example.com/",
+        );
+        assert_eq!(t.connect_host, "1.2.3.4");
     }
 
     /// `?proxyHost` in the proxy's own URL says the same thing, and is not part
@@ -9383,6 +9456,30 @@ mod tests {
         assert!(parse_pac_result("SOCKS4 1.2.3.4:1080").is_err());
         assert!(parse_pac_result("PROXY").is_err());
         assert!(parse_pac_result("").is_err());
+    }
+
+    /// A `DIRECT` *after* the chosen proxy is that proxy's fallback, not a
+    /// choice: the hop is tried, and a connection that cannot be established
+    /// goes direct rather than failing the request. This port ignored it, so
+    /// `PROXY dead; DIRECT` — the shape every corporate PAC file ends with —
+    /// answered 502 where whistle served the page. whistle turns the same result
+    /// into an `x`-prefixed rule (`prefix = 'x'`, `node-pac/lib/Pac.js:96-103`).
+    #[test]
+    fn a_pac_direct_after_the_proxy_is_that_proxys_fallback() {
+        let with = parse_pac_result("PROXY 1.2.3.4:8080; DIRECT").unwrap().unwrap();
+        assert!(with.fallback_direct, "the trailing DIRECT is a fallback");
+
+        let without = parse_pac_result("PROXY 1.2.3.4:8080").unwrap().unwrap();
+        assert!(!without.fallback_direct, "no DIRECT, no fallback");
+
+        // It may sit past an entry we cannot honour, and it is still a fallback.
+        let past = parse_pac_result("PROXY 1.2.3.4:8080; SOCKS4 9.9.9.9:1080; DIRECT")
+            .unwrap()
+            .unwrap();
+        assert!(past.fallback_direct);
+
+        // A `DIRECT` reached *first* is the answer itself, not a fallback.
+        assert!(parse_pac_result("DIRECT; PROXY 1.2.3.4:8080").unwrap().is_none());
     }
 
     /// `http2https-proxy://` upgrades an http origin to TLS

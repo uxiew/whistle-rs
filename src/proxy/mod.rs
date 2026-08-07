@@ -2217,6 +2217,41 @@ pub(crate) mod tunnel_abort_tests {
             session.rules
         );
     }
+
+    /// A gateway error is a response this proxy made itself, and says so.
+    ///
+    /// It is the most common thing a debugging proxy ever has to tell its user —
+    /// "I could not reach that" — and it went out as an unattributed body with
+    /// no declared type, so it could not be told apart from an origin's own
+    /// answer. whistle stamps the identical response through `wrapResponse`
+    /// (`_original/lib/util/index.js:1080-1109`).
+    #[tokio::test]
+    async fn a_gateway_error_names_the_proxy_that_made_it() {
+        // A port bound only long enough to know nothing else has it.
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let (_state, addr) = proxy_with(&format!("{dead} proxy://{dead}")).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // `Connection: close`, or the answer keeps the socket open and reading
+        // to the end never ends.
+        client
+            .write_all(
+                format!("GET http://{dead}/a HTTP/1.1\r\nHost: {dead}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.ok();
+        let got = String::from_utf8_lossy(&got).to_lowercase();
+
+        assert!(got.starts_with("http/1.1 502"), "{got}");
+        assert!(got.contains("x-server: whistle-rs"), "{got}");
+        assert!(got.contains("content-type: text/plain; charset=utf-8"), "{got}");
+    }
 }
 
 /// Serve HTTP over an intercepted tunnel stream, optionally TLS-decrypting first.
@@ -3187,6 +3222,15 @@ impl std::fmt::Display for Destroyed {
 impl std::error::Error for Destroyed {}
 
 /// Turn an internal error into a 502, except an abort, which gets no answer.
+///
+/// The 502 is dressed like every other answer this proxy makes itself: it says
+/// what it is (`Content-Type`) and who made it (`x-server`). It went out as an
+/// undeclared, unattributed body until the forwarding bench asked an unreachable
+/// upstream for one — the single most common thing a debugging proxy has to say,
+/// and the one response that did not name its author. whistle marks the same
+/// answer, from the same place (`wrapGatewayError` → `wrapResponse`,
+/// `_original/lib/util/index.js:1080-1109`); its body is HTML, and this one is
+/// the error chain as plain text, so it says `text/plain`.
 fn guard(result: Result<Response<DynBody>>) -> Result<Response<DynBody>, Destroyed> {
     match result {
         Ok(resp) => Ok(resp),
@@ -3195,10 +3239,13 @@ fn guard(result: Result<Response<DynBody>>) -> Result<Response<DynBody>, Destroy
             // `{err:#}` includes the full anyhow context chain (e.g. the
             // underlying rustls reason behind "upstream TLS handshake").
             tracing::debug!("request failed: {err:#}");
-            Ok(Response::builder()
+            let mut resp = Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
+                .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
                 .body(body::full(Bytes::from(format!("whistle-rs: {err:#}"))))
-                .unwrap())
+                .unwrap();
+            apply::mark_self_generated(resp.headers_mut());
+            Ok(resp)
         }
     }
 }

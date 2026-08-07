@@ -577,7 +577,10 @@ skips that wasted attempt.
 
 Route the forwarded request through another proxy. The address is
 `[user[:pass]@]host[:port]`; the port defaults to 80 (http), 443 (https) or
-1080 (socks), and an IPv6 literal may be bracketed (`[::1]:8888`) or bare.
+1080 (socks), and an IPv6 literal may be bracketed (`[::1]:8888`) or bare. The
+address ends there: a path or a query written after it (`proxy://10.0.0.1:8888/x`)
+is not part of it, and the query is where whistle's own flags live — see
+`?proxyHost` and `?host=` below.
 
 | Operator | Value | Effect |
 |----------|-------|--------|
@@ -634,7 +637,10 @@ honoured and a `host://` override is never handed to the upstream proxy.
 otherwise from the client's own `Proxy-Authorization`. A credential without a
 password (`proxy://user@host`) is base64'd verbatim, matching whistle: it sends
 `Basic base64("user")`, not `Basic base64("user:")`. SOCKS5 splits the same
-credential at the first colon and sends an empty password. Hostnames are handed
+credential at the first colon and sends an empty password, and offers
+username/password as the *only* authentication method when a credential is
+written — never alongside "no authentication", so a proxy that also accepts
+anonymous connections cannot quietly discard it. Hostnames are handed
 to the proxy unresolved (SOCKS5 address type 3), so the proxy does the DNS.
 
 **If the upstream proxy is unreachable** or refuses the `CONNECT`, the request
@@ -650,9 +656,16 @@ retry the same way (`piped`, `res.js:529`).
 
 A proxy operator whose value is empty or unusable (`proxy://`, `socks://@`) fails
 with `proxy:// is not a usable proxy address` rather than quietly becoming a
-direct connection. whistle drops such a rule and connects direct; a rule that
-names a proxy and is silently ignored is exactly the failure this port refuses
-to reproduce.
+direct connection. whistle refuses it too, though it says so less clearly: the
+matcher is still truthy, so it becomes the address `http://` and the request dies
+in the resolver with `DNS Lookup Failed`. (An earlier edition of this page said
+whistle connects direct here. It does not — measured against 2.10.8 for
+`proxy://`, `socks://`, `http-proxy://@` and `proxy://?proxyHost`, all four
+answer 502.) A **PAC** file that cannot be fetched or throws is the case where
+whistle really does fall back to a direct connection — its failure only reaches
+`logger.error` (`_original/lib/rules/index.js:295`) — and this port refuses that
+too, for the same reason: a rule that names a proxy has ruled a direct connection
+out.
 
 **Dropping the proxy.** `ignore://proxy` names the whole family, so it drops
 whichever proxy operator matched — `socks://`, `https-proxy://`,
@@ -683,8 +696,11 @@ the proxy is dropped. `proxyHost` (as `lineProps://proxyHost`, as
 `enable://proxyHost`, or written into the proxy's own URL as
 `http-proxy://…?proxyHost`) keeps both: the request reaches the origin through
 the proxy, and the proxy is asked to connect to the `host://` address.
-`proxyFirst` prefers the proxy, and `proxyHostOnly` behaves as `proxyHost` but
-additionally drops the proxy when no `host://` matched.
+`proxyFirst` prefers the proxy — and, unlike `proxyHost`, it settles which of the
+two rules wins rather than combining them, so the `host://` address is **not used
+at all**: the request goes to the proxy in absolute form, naming the origin it
+originally asked for. `proxyHostOnly` behaves as `proxyHost` but additionally
+drops the proxy when no `host://` matched.
 
 ```
 pinned.test        http-proxy://127.0.0.1:8888?proxyHost
@@ -744,9 +760,18 @@ example.com        socks://127.0.0.1:1080     # …and this one is not
 #### PAC
 
 `pac://<location>` evaluates a PAC file's `FindProxyForURL(url, host)` to pick
-the proxy. The result is read left to right; the first `PROXY`/`HTTP host:port`,
-`HTTPS host:port` or `SOCKS`/`SOCKS5 host:port` entry wins, and `DIRECT` —
-anywhere in the list — means connect without a proxy.
+the proxy. The result is read left to right, as a PAC list is meant to be: the
+first `PROXY`/`HTTP host:port`, `HTTPS host:port` or `SOCKS`/`SOCKS5 host:port`
+entry wins. A `DIRECT` reached **before** any of them is the answer — connect
+without a proxy. A `DIRECT` **after** the chosen proxy is that proxy's fallback,
+so `PROXY 10.0.0.1:8080; DIRECT` goes through the proxy when it can be reached
+and straight out when it cannot, exactly as `xproxy://` does.
+
+Upstream reads the same result with one regexp,
+`/(PROXY|SOCKS)\s+([^;\s]+)/i` (`node-pac/lib/Pac.js:7`), which has two
+consequences whistle-rs does not reproduce: `SOCKS5 host:port` matches nothing
+there and the request goes direct, and a `PROXY` entry wins even when `DIRECT`
+came first in the list. Order is respected here, and `SOCKS5` is honoured.
 
 The location may be a local file, a `http(s)://` URL, or (whistle-rs only) the
 script itself inline, which in practice means a script with no whitespace in it,

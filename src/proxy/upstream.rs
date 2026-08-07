@@ -1203,9 +1203,15 @@ async fn socks5_connect(
     port: u16,
     auth: &Option<ProxyAuth>,
 ) -> Result<BoxedIo> {
-    // Greeting: offer no-auth (and user/pass if we have credentials).
+    // Greeting. A credential written into the rule is offered *instead of*
+    // no-auth rather than alongside it, which is how whistle offers it:
+    // `getAuths` returns either `[socks.auth.None()]` or a list built only from
+    // the credentials, never both (`_original/lib/config.js:285-309`). Offering
+    // both let a proxy that also accepts anonymous connections select no-auth,
+    // and the credential the rule named was then never sent — the one thing its
+    // author asked for, dropped without a word.
     if auth.is_some() {
-        s.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
+        s.write_all(&[0x05, 0x01, 0x02]).await?;
     } else {
         s.write_all(&[0x05, 0x01, 0x00]).await?;
     }
@@ -1417,8 +1423,7 @@ fn parse_host_query(value: &str) -> Option<HostOverride> {
 /// address; this one additionally understands the `?host=` override that
 /// whistle reads straight off the matcher.
 pub fn parse_proxy_rule(kind: ProxyKind, matcher: &str) -> Option<ProxyConfig> {
-    let address = matcher.split('?').next().unwrap_or(matcher);
-    let mut cfg = parse_proxy(kind, address)?;
+    let mut cfg = parse_proxy(kind, matcher)?;
     cfg.host_override = parse_host_query(matcher);
     Some(cfg)
 }
@@ -1426,6 +1431,13 @@ pub fn parse_proxy_rule(kind: ProxyKind, matcher: &str) -> Option<ProxyConfig> {
 /// Parse a proxy operator value: `[user[:pass]@]host[:port]`.
 pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
     let value = value.trim().trim_start_matches("//");
+    // The authority ends at the first `/`, `?` or `#`. A proxy URL may carry a
+    // path and a query, and neither is part of the address: whistle keeps only
+    // `hostname` and `port` off `parseUrl(proxyUrl)`
+    // (`_original/lib/inspectors/res.js:277-286`). This port read the whole
+    // string, so `proxy://127.0.0.1:8888/x` asked the resolver for a host named
+    // `127.0.0.1:8888/x` and the hop was never made.
+    let value = &value[..value.find(['/', '?', '#']).unwrap_or(value.len())];
     if value.is_empty() {
         return None;
     }
@@ -1942,6 +1954,68 @@ mod tests {
                 assert!(pass.is_empty(), "empty password for {host}");
             });
         }
+    }
+
+    /// A SOCKS greeting offers the credential *instead of* no-auth, never both.
+    ///
+    /// Offering both let a proxy that also accepts anonymous connections choose
+    /// no-auth, and the credential written into the rule was then never sent.
+    /// whistle offers one or the other — `getAuths` returns `[None()]` or a list
+    /// built only from the credentials (`_original/lib/config.js:285-309`) — and
+    /// the difference is visible in the greeting bytes on the wire.
+    #[test]
+    fn a_socks_credential_is_offered_instead_of_no_auth() {
+        for (value, want) in [
+            ("bob:s3cr3t@127.0.0.1", vec![0x05u8, 0x01, 0x02]),
+            ("bob@127.0.0.1", vec![0x05, 0x01, 0x02]),
+            ("127.0.0.1", vec![0x05, 0x01, 0x00]),
+        ] {
+            rt().block_on(async {
+                let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = socks.local_addr().unwrap().port();
+                let seen = tokio::spawn(async move {
+                    let (mut s, _) = socks.accept().await.unwrap();
+                    let mut head = [0u8; 2];
+                    s.read_exact(&mut head).await.unwrap();
+                    let mut methods = vec![0u8; head[1] as usize];
+                    s.read_exact(&mut methods).await.unwrap();
+                    // Nothing past the greeting: the assertion is the greeting.
+                    [&head[..], &methods[..]].concat()
+                });
+
+                let cfg =
+                    parse_proxy(ProxyKind::Socks, &value.replace("127.0.0.1", &format!("127.0.0.1:{port}")))
+                        .unwrap();
+                let _ = forward(&target("a.com", 80, Some(cfg)), get("/", "a.com")).await;
+                assert_eq!(seen.await.unwrap(), want, "greeting for socks://{value}");
+            });
+        }
+    }
+
+    /// A proxy URL may carry a path and a query, and the address stops before
+    /// both — whistle keeps only `hostname` and `port` off `parseUrl(proxyUrl)`.
+    /// Read whole, `127.0.0.1:8888/x` became a hostname the resolver could never
+    /// answer, and the hop was silently never made.
+    #[test]
+    fn a_proxy_address_stops_at_the_path_and_the_query() {
+        for value in [
+            "127.0.0.1:8888",
+            "127.0.0.1:8888/",
+            "127.0.0.1:8888/some/path",
+            "127.0.0.1:8888/some/path?a=1",
+            "127.0.0.1:8888?a=1",
+            "127.0.0.1:8888#frag",
+            "//127.0.0.1:8888/some/path",
+        ] {
+            let p = parse_proxy(ProxyKind::Http, value).unwrap_or_else(|| panic!("{value}"));
+            assert_eq!((p.host.as_str(), p.port), ("127.0.0.1", 8888), "{value}");
+        }
+        // The credential is inside the authority, so it survives the cut.
+        let p = parse_proxy(ProxyKind::Http, "bob:s3cr3t@127.0.0.1:8888/x").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("127.0.0.1", 8888));
+        assert_eq!(p.auth.unwrap().header_value(), "Basic Ym9iOnMzY3IzdA==");
+        // A value that is only a path names no address at all.
+        assert!(parse_proxy(ProxyKind::Http, "/some/path").is_none());
     }
 
     /// `?host=` in a proxy URL names where the *proxy* should connect
