@@ -2202,9 +2202,11 @@ where
 /// without walking a single rule.
 ///
 /// Locking: takes the two `std::sync` read locks one after the other, never
-/// nested and never across an `.await` — there is none here, which is what lets
-/// this be called from `serve`'s future.
-fn resolve_response_phase(
+/// nested and each dropped before the `.await` at the end — which is what lets
+/// this be called from `serve`'s future. That await is the value loader, and it
+/// only ever does work when this pass added an operator whose value names a
+/// file or a URL.
+async fn resolve_response_phase(
     state: &AppState,
     info: &mut ReqInfo,
     resolved: &mut Resolved,
@@ -2213,6 +2215,8 @@ fn resolve_response_phase(
     merged: &[crate::rules::RuleManager],
 ) {
     info.res = Some(res);
+    let host = bind_host(state);
+    let mut added = false;
     // Rules merged in mid-request get the same second pass. Upstream re-resolves
     // its `pRules`/`fRules`/`hRules` here too
     // (`_original/lib/plugins/index.js:1326-1335`); each manager answers from
@@ -2221,30 +2225,56 @@ fn resolve_response_phase(
     if let Some(mut extra) = apply::response_phase_of(merged, info, is_internal_req) {
         {
             let values = state.values.read().unwrap();
-            apply::substitute_values(&mut extra, &values);
+            apply::substitute_values(&mut extra, &values, tpl_ctx(&host, state.config.port, info));
         }
         apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
         resolved.merge_response_phase(extra);
+        added = true;
     }
     let extra = {
         let rules = state.rules.read().unwrap();
         rules.resolve_response(info, is_internal_req)
     };
-    let Some(mut extra) = extra else {
-        return;
-    };
-    tracing::debug!(
-        "{} {} -> re-resolving rules for status {}",
-        info.method,
-        info.full_url,
-        info.res.as_ref().map(|r| r.status).unwrap_or_default()
-    );
-    {
-        let values = state.values.read().unwrap();
-        apply::substitute_values(&mut extra, &values);
+    if let Some(mut extra) = extra {
+        tracing::debug!(
+            "{} {} -> re-resolving rules for status {}",
+            info.method,
+            info.full_url,
+            info.res.as_ref().map(|r| r.status).unwrap_or_default()
+        );
+        {
+            let values = state.values.read().unwrap();
+            apply::substitute_values(&mut extra, &values, tpl_ctx(&host, state.config.port, info));
+        }
+        apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
+        resolved.merge_response_phase(extra);
+        added = true;
     }
-    apply::substitute_config_vars(&mut extra, state.config.port, crate::config::VERSION);
-    resolved.merge_response_phase(extra);
+    // Operators this pass added have never been past the value loader — a
+    // `resBody:///tmp/mock.json includeFilter://s:404` line withholds its
+    // `resBody` from the request pass entirely. Ones that already loaded carry
+    // `value_is_content` and are skipped.
+    if added {
+        apply::load_rule_values(resolved, info).await;
+    }
+}
+
+/// whistle's own bind address, empty when bound to all interfaces — see
+/// [`template::ProxyEnv`]. Owned because `Config` keeps an `IpAddr`.
+fn bind_host(state: &AppState) -> String {
+    state.config.host.map(|h| h.to_string()).unwrap_or_default()
+}
+
+/// The request context a backtick operator value renders against.
+fn tpl_ctx<'a>(host: &'a str, port: u16, info: &'a ReqInfo) -> apply::TplCtx<'a> {
+    apply::TplCtx {
+        info,
+        env: template::ProxyEnv {
+            host,
+            port,
+            version: crate::config::VERSION,
+        },
+    }
 }
 
 /// The address the request actually went to.
@@ -2809,7 +2839,7 @@ async fn finish_local_response(
         apply::build_res_info(parts.status.as_u16(), &parts.headers, None, None),
         is_internal_req,
         merged_rules,
-    );
+    ).await;
     if let Some(ms) = apply::res_delay_ms(resolved) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
@@ -3130,6 +3160,14 @@ async fn serve(
         .read()
         .unwrap()
         .resolve_scoped(&info, is_internal_req);
+    // `${host}` is whistle's own bind address, empty when bound to all
+    // interfaces — see ProxyEnv.
+    let bind_host = bind_host(&state);
+    let proxy_env = template::ProxyEnv {
+        host: &bind_host,
+        port: state.config.port,
+        version: crate::config::VERSION,
+    };
     // Rules merged in mid-request — a `rule://` value, the `rulesFile://` join,
     // and any a plugin injects below. Their parsed form is kept because the
     // response phase resolves them a second time, exactly as it does the
@@ -3139,12 +3177,18 @@ async fn serve(
         // Configured values are laid *over* those, so a `--value` or a
         // console-edited one of the same name wins over what a file brought.
         let values = effective_values(&state);
-        apply::substitute_values(&mut resolved, &values);
+        let tpl = tpl_ctx(&bind_host, state.config.port, &info);
+        apply::substitute_values(&mut resolved, &values, tpl);
         let managers = apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
-        apply::substitute_values(&mut resolved, &values);
+        apply::substitute_values(&mut resolved, &values, tpl);
         managers
     };
     apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
+    // Operator values that name a file or a URL are read here — the one point
+    // where the whole resolved set is in hand and the request has gone nowhere
+    // yet. A rule set that names no location walks its own operators and
+    // returns; see `apply::load_rule_values`.
+    apply::load_rule_values(&mut resolved, &info).await;
     let started = Instant::now();
     let time_ms = now_ms();
 
@@ -3226,8 +3270,14 @@ async fn serve(
                     &rules,
                     is_internal_req,
                 ));
-                let values = state.values.read().unwrap();
-                apply::substitute_values(&mut resolved, &values);
+                {
+                    let values = state.values.read().unwrap();
+                    let tpl = tpl_ctx(&bind_host, state.config.port, &info);
+                    apply::substitute_values(&mut resolved, &values, tpl);
+                }
+                // A plugin's rules can name a file or a URL too, and its
+                // operators have not been past the loader.
+                apply::load_rule_values(&mut resolved, &info).await;
             }
             plugin_set_headers.extend(result.set_headers);
             plugin_remove_headers.extend(result.remove_headers);
@@ -3323,15 +3373,8 @@ async fn serve(
         return Err(Destroyed.into());
     }
 
-    // Short-circuit rules (redirect, mocked status, file) skip the upstream.
-    // `${host}` is whistle's own bind address, empty when bound to all
-    // interfaces — see ProxyEnv.
-    let bind_host = state.config.host.map(|h| h.to_string()).unwrap_or_default();
-    let proxy_env = template::ProxyEnv {
-        host: &bind_host,
-        port: state.config.port,
-        version: crate::config::VERSION,
-    };
+    // Short-circuit rules (redirect, mocked status, file) skip the upstream;
+    // `proxy_env` was built with the rest of the template context above.
     // `reqDelay://` waits here, before anything answers. Upstream delays in a
     // pipeline stage of its own (`util.delay(...reqDelay)`,
     // `_original/lib/inspectors/data.js:534`) that runs ahead of the abort gate
@@ -3610,7 +3653,7 @@ async fn serve(
         ),
         is_internal_req,
         &merged_rules,
-    );
+    ).await;
 
     if let Some(ms) = apply::res_delay_ms(&resolved) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

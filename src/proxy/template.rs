@@ -110,6 +110,28 @@ pub fn render(body: &str, info: &ReqInfo, env: ProxyEnv<'_>) -> String {
     interpolate_vars(&stage1, info, &query, env)
 }
 
+/// Run **only** pass 2 over `text` — upstream's `resolveTplVar` itself
+/// (`_original/lib/rules/rules.js:715-758`), without the query-string pass and
+/// without the `{…}` gate that `file-proxy.js` puts in front of it.
+///
+/// Those two belong to the *file* handler, not to the variable vocabulary:
+/// `resolveTplVar` is exported on its own (`lib/rules/index.js:71`) and called
+/// with no query pass from `renderTpl` — which is what a backtick operator value
+/// goes through. Sharing this function is the point: the whitelist, the `.key`
+/// subpaths, `${{…}}` encoding and the `.replace(…)` modifier are one
+/// implementation, so a rule value and a `tpl://` file can never disagree about
+/// what `${query.id}` means.
+///
+/// The `${` test is not upstream's — it has none — but a string with no `${`
+/// cannot contain a match for `TPL_VAR_RE`, so it only skips work.
+pub fn render_vars(text: &str, info: &ReqInfo, env: ProxyEnv<'_>) -> String {
+    if !text.contains("${") {
+        return text.to_string();
+    }
+    let query = Query::parse(query_of(&info.full_url));
+    interpolate_vars(text, info, &query, env)
+}
+
 /// The handful of `${…}` variables that describe **whistle itself** rather than
 /// the request: `${host}`, `${port}`, `${realHost}`, `${realPort}` and
 /// `${version}` all read whistle's own config upstream
@@ -264,13 +286,51 @@ fn resolve_var(
             None => String::new(),
         },
 
-        // -- known to whistle, but empty for a short-circuited template ------
-        // There is no upstream response and no request-id/client bookkeeping in
-        // whistle-rs yet; whistle itself also yields "" for the response-side
-        // names here, because `tpl://` never reaches a server.
-        "statuscode" | "serverip" | "serverport" | "resh" | "resheader" | "resheaders"
-        | "rescookie" | "rescookies" | "id" | "reqid" | "clientid" | "clientport"
-        | "remoteaddress" | "remoteport" | "realurl" => String::new(),
+        // -- the response, once there is one --------------------------------
+        // Upstream reads all of these straight off the request object, where
+        // `res.js` has stamped the response head before the response rules
+        // resolve (`_original/lib/inspectors/res.js:802-806`) — which is exactly
+        // what [`ReqInfo::res`] holds. They were hardcoded empty here because
+        // the only caller was `tpl://`, which short-circuits before any origin
+        // answers; a backtick operator value on a `resHeaders://` rule does have
+        // the head in hand. With no response they are still "", which is
+        // upstream's `req.statusCode || ''` too.
+        "statuscode" => info
+            .res
+            .as_ref()
+            .map(|r| r.status.to_string())
+            .unwrap_or_default(),
+        // `resolveServerIpVar` (`rules.js:553-558`) falls back to `127.0.0.1`
+        // once a response exists but its peer address was never recorded.
+        "serverip" => match &info.res {
+            Some(res) => res.server_ip.clone().unwrap_or_else(|| "127.0.0.1".into()),
+            None => String::new(),
+        },
+        "serverport" => info
+            .res
+            .as_ref()
+            .and_then(|r| r.server_port)
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+        // `resolveResHeadersVar` → `resolvePropValue` (`rules.js:446-448`,
+        // `:560-562`): no sub-key means "", never the whole header set.
+        "resh" | "resheader" | "resheaders" => match (&info.res, key) {
+            (Some(res), Some(k)) => res_header(res, k),
+            _ => String::new(),
+        },
+        "rescookie" | "rescookies" => res_cookie(info, key),
+        "clientport" => info
+            .client_port
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+
+        // -- known to whistle, unavailable here ------------------------------
+        // whistle-rs has no request-id or client-identity bookkeeping, and
+        // nothing records the accepted socket's peer address separately from
+        // `${clientIp}`. Upstream's own answer for each of these is `''` when
+        // the field is unset, so "" is the same non-answer rather than a
+        // placeholder left in the output.
+        "id" | "reqid" | "clientid" | "remoteaddress" | "remoteport" | "realurl" => String::new(),
 
         // -- whistle's own config, not the request's
         "host" | "realhost" => env.host.to_string(),
@@ -294,6 +354,92 @@ fn header(info: &ReqInfo, name: &str) -> String {
         .map(|(_, v)| v.clone())
         .unwrap_or_default()
 }
+
+/// Look up a response header (names in [`crate::rules::ResInfo`] are lowercased).
+///
+/// Repeats keep the first, where Node's `res.headers` would have comma-joined
+/// them. The one header that repeats in practice is `set-cookie`, and Node
+/// keeps *that* one as an array — which `${resCookies.…}` below reads whole.
+fn res_header(res: &crate::rules::ResInfo, name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    res.headers
+        .iter()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
+}
+
+/// `resolveResCookiesVar` (`_original/lib/rules/rules.js:483-551`).
+///
+/// With no sub-key the answer is every `Set-Cookie` joined by `, `; with one it
+/// is that cookie's **value**.
+///
+/// **Attributes do not resolve, and that is upstream's behaviour rather than an
+/// omission.** Its `switch` builds an `item` for `domain`, `path`, `expires`,
+/// `max-age`, `httpOnly`, `secure`, `sameSite` and `partitioned` — and then
+/// stores nothing: only the `default:` arm reaches `cookies[key] = item`, and
+/// the item it stores holds `value` alone (`rules.js:504-538`). So
+/// `${resCookies.sid.domain}` is `''` there, and `${resCookies.sid.value}` is
+/// the value, because `value` is the one property the stored object has.
+///
+/// Upstream also passes no `escape` flag down here, so `$${resCookies.x}`
+/// decodes exactly like `${resCookies.x}` — unlike `$${reqCookies.x}`.
+fn res_cookie(info: &ReqInfo, key: Option<&str>) -> String {
+    let Some(res) = &info.res else {
+        return String::new();
+    };
+    let cookies: Vec<&str> = res
+        .headers
+        .iter()
+        .filter(|(n, _)| n == "set-cookie")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if cookies.is_empty() {
+        return String::new();
+    }
+    let Some(key) = key else {
+        return cookies.join(", ");
+    };
+    let (name, prop) = match key.split_once('.') {
+        Some((n, p)) => (n, Some(p)),
+        None => (key, None),
+    };
+    if !matches!(prop, None | Some("value")) {
+        return String::new();
+    }
+    // `parseQuery(c, '; ')` splits a whole `Set-Cookie` into pairs, so an
+    // attribute is a pair like any other — which is why the attribute names are
+    // skipped here as they are by upstream's `switch`: a cookie *called* `path`
+    // is not reachable there either. The first cookie to claim a name wins.
+    for cookie in cookies {
+        for pair in cookie.split(';') {
+            let (k, v) = match pair.split_once('=') {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => (pair.trim(), ""),
+            };
+            if COOKIE_ATTRS.contains(&k.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+            if decode(k, Decode::KeepPlus) == name {
+                return decode(v, Decode::KeepPlus);
+            }
+        }
+    }
+    String::new()
+}
+
+/// The `Set-Cookie` pair names upstream's `switch` peels off before it records a
+/// cookie (`_original/lib/rules/rules.js:507-531`).
+const COOKIE_ATTRS: &[&str] = &[
+    "domain",
+    "path",
+    "expires",
+    "max-age",
+    "httponly",
+    "secure",
+    "samesite",
+    "partitioned",
+];
 
 /// Extract one cookie from a `Cookie` header value.
 fn cookie_value(cookie: &str, name: &str, mode: Decode) -> String {
@@ -1196,6 +1342,61 @@ mod tests {
         // A template short-circuits before any upstream response exists.
         assert_eq!(render_url("[${statusCode}]", "http://x.com/?a=1"), "[]");
         assert_eq!(render_url("[${resHeaders.x}]", "http://x.com/?a=1"), "[]");
+        assert_eq!(render_url("[${serverIp}]", "http://x.com/?a=1"), "[]");
+        assert_eq!(render_url("[${resCookies.sid}]", "http://x.com/?a=1"), "[]");
+    }
+
+    /// …but the same names *do* answer once the response head is in hand, which
+    /// is the state a backtick value on a `resHeaders://` rule renders in.
+    /// Upstream reads them straight off the request object, where `res.js` has
+    /// stamped them (`_original/lib/inspectors/res.js:802-806`).
+    #[test]
+    fn the_response_side_variables_answer_once_there_is_a_response() {
+        let mut info = req("http://x.com/p?a=1", &[]);
+        info.client_port = Some(51234);
+        info.res = Some(crate::rules::ResInfo {
+            status: 404,
+            headers: vec![
+                ("x-served-by".to_string(), "edge-7".to_string()),
+                ("set-cookie".to_string(), "sid=abc; Path=/; HttpOnly".to_string()),
+                ("set-cookie".to_string(), "theme=dark".to_string()),
+            ],
+            server_ip: Some("93.184.216.34".to_string()),
+            server_port: Some(443),
+        });
+        let of = |body: &str| render_vars(body, &info, ENV);
+
+        assert_eq!(of("${statusCode}"), "404");
+        assert_eq!(of("${serverIp}:${serverPort}"), "93.184.216.34:443");
+        assert_eq!(of("${resHeaders.x-served-by}"), "edge-7");
+        assert_eq!(of("${resH.X-Served-By}"), "edge-7");
+        assert_eq!(of("${clientPort}"), "51234");
+        // A named cookie gives its value; `${resCookies}` the whole set.
+        assert_eq!(of("${resCookies.sid}"), "abc");
+        assert_eq!(of("${resCookies.theme}"), "dark");
+        assert_eq!(of("${resCookies}"), "sid=abc; Path=/; HttpOnly, theme=dark");
+        // Attributes do not resolve, and neither does a cookie named after one:
+        // upstream builds an `item` for them and never stores it — see
+        // `res_cookie`.
+        assert_eq!(of("[${resCookies.sid.domain}]"), "[]");
+        assert_eq!(of("[${resCookies.path}]"), "[]");
+        // `.value` is the one property the stored object has.
+        assert_eq!(of("${resCookies.sid.value}"), "abc");
+
+        // A response whose peer address was never recorded reports upstream's
+        // own `127.0.0.1` rather than nothing — the response exists.
+        info.res.as_mut().unwrap().server_ip = None;
+        assert_eq!(render_vars("${serverIp}", &info, ENV), "127.0.0.1");
+    }
+
+    /// `render_vars` is pass 2 alone: no query interpolation, and none of
+    /// `file-proxy.js`'s `{…}` gate. A rule value is not a template file.
+    #[test]
+    fn render_vars_skips_the_query_pass_and_its_gate() {
+        let info = req("http://x.com/p?a=1", &[]);
+        // `{a}` would have become `1` in a `tpl://` file; here it is text.
+        assert_eq!(render_vars("{a}", &info, ENV), "{a}");
+        assert_eq!(render_vars("m=${method}", &info, ENV), "m=GET");
     }
 
     #[test]
