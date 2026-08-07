@@ -340,4 +340,24 @@ module.exports = [
   { name: 'a bracketed ignore:// regexp URL', rules: `${P} ${REQ} ignore://(/echo$/)` },
   { name: 'a bracketed URL filter', rules: `${P} ${REQ} includeFilter://(*/echo)` },
   { name: 'a bracketed URL filter that misses', rules: `${P} ${REQ} includeFilter://(*/nope)` },
+
+  // ── which regexp flags are a regexp at all ─────────────────────────────
+  // `REG_EXP_RE` allows only ``|i|u|iu|ui (`_original/lib/util/index.js:606`).
+  // Anything else is not a regexp: the whole `/…/g` degrades to a **literal**,
+  // and a literal is compared by containment — which is not the same set of
+  // requests, and fails open rather than loudly.
+  { name: 'a header value with the g flag is a literal', rules: `${P} ${REQ} includeFilter://reqH.x-tag:/^yes$/g`, request: TAGGED },
+  { name: 'a header value whose literal form does match', rules: `${P} ${REQ} includeFilter://reqH.x-tag:/^yes$/g`, request: { headers: { 'x-tag': 'x/^yes$/gx' } } },
+  { name: 'a header value with the u flag is a regexp', rules: `${P} ${REQ} includeFilter://reqH.x-tag:/^yes$/u`, request: TAGGED },
+  { name: 'a header value with the iu flags', rules: `${P} ${REQ} includeFilter://reqH.x-tag:/^YES$/iu`, request: TAGGED },
+  { name: 'a header value with the ui flags', rules: `${P} ${REQ} includeFilter://reqH.x-tag:/^YES$/ui`, request: TAGGED },
+  { name: 'a header value with the m flag is a literal', rules: `${P} ${REQ} includeFilter://reqH.x-tag:/^yes$/m`, request: TAGGED },
+  { name: 'a method with the g flag is a literal', rules: `${P} ${REQ} includeFilter://m:/^get$/g` },
+  { name: 'a status with the g flag is a literal', rules: `${P} ${RES} includeFilter://s:/^2/g` },
+  { name: 'an ip with the g flag is not an address either', rules: `${P} ${REQ} includeFilter://i:/^127\\./g` },
+  { name: 'a body with the g flag is a literal', rules: `${P} ${REQ} includeFilter://b:/hello/g`, request: BODY },
+  { name: 'a URL filter with the g flag is not a regexp', rules: `${P} ${REQ} includeFilter:///echo$/g` },
+  { name: 'a URL filter with the ui flags', rules: `${P} ${REQ} includeFilter:///ECHO$/ui` },
+  { name: 'filter:// takes only the i flag', rules: `${P} ${REQ} filter://echo$/g` },
+  { name: 'filter:// with the u flag is not the regexp form', rules: `${P} ${REQ} filter://echo$/u` },
 ];

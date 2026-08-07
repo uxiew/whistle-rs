@@ -1841,6 +1841,31 @@ mod filter_tests {
         assert!(hits("filter://!echo$/", &echo));
     }
 
+    /// Which flags make a URL filter a regexp, and which leave it a wildcard
+    /// path. `includeFilter`/`excludeFilter` go through `util.isRegExp`, whose
+    /// `REG_EXP_RE` allows ``|i|u|iu|ui (`_original/lib/util/index.js:606`);
+    /// `filter`/`ignore` go through `PATTERN_FILTER_RE`, which allows `i` alone
+    /// (`rules.js:54`).
+    ///
+    /// Getting this wrong is quiet in both directions: an unrecognised flag
+    /// does not fail, it silently means a different set of requests.
+    #[test]
+    fn a_url_filters_flags_decide_whether_it_is_a_regexp() {
+        let echo = req("http://example.com/echo");
+        for ok in ["/echo$/", "/echo$/u", "/ECHO$/i", "/ECHO$/iu", "/ECHO$/ui"] {
+            assert!(hits(&format!("includeFilter://{ok}"), &echo), "{ok}");
+        }
+        // `/echo$/g` is not a regexp, so it is read as the `/`-wildcard path
+        // `echo$/g`, which no URL has.
+        for not in ["/echo$/g", "/echo$/m", "/echo$/gi"] {
+            assert!(!hits(&format!("includeFilter://{not}"), &echo), "{not}");
+        }
+        // `filter://` takes `i` and nothing else, so only the first excludes.
+        assert!(!hits("filter://ECHO$/i", &echo));
+        assert!(hits("filter://echo$/g", &echo));
+        assert!(hits("filter://echo$/u", &echo));
+    }
+
     /// `ignore://` takes the wildcard URL filter too: upstream's
     /// `PATTERN_WILD_FILTER_RE` names `filter` and `ignore` together
     /// (`_original/lib/rules/rules.js:61`). Only its named conditions were read
