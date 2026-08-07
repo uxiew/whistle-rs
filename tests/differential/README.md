@@ -108,6 +108,15 @@ ask is whether the *bench* is right — it has been wrong twice:
 `repro`-style debugging is easiest by cutting the corpus down to one case in
 `cases.js` and printing both answers whole.
 
+**A rare flake exists and has not been identified.** Roughly one run in four to
+eight of `cases.js` or `cases-bodies.js` reports exactly one difference; every
+re-run of the same corpus immediately afterwards comes back clean, and five
+consecutive rounds aimed at catching its name produced nothing. So a *single*
+difference that vanishes on a re-run is probably this, and a difference that
+survives a re-run is not. Do not treat the first as a regression, and do not
+treat the second as the flake — the distinguishing test is one re-run, which
+costs less than the argument.
+
 And the third thing to suspect is whether the case exercises the rule at all.
 `cases-file.js` opened with eleven cases where `127.0.0.1:PORT file:///tmp/x.txt`
 was asked for `/echo` — the unmatched path is concatenated onto the value, so
