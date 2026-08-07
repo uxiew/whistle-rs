@@ -2865,13 +2865,28 @@ pub fn res_delay_ms(resolved: &Resolved) -> Option<u64> {
 
 /// Request-body throughput cap in kilobits/s (`reqSpeed`) — see
 /// [`super::body::throttled`] for why the unit is bits.
+///
+/// Only a **positive** rate is a cap. Upstream gates both speeds on
+/// `if (reqSpeed > 0)` / `if (resSpeed > 0)`
+/// (`_original/lib/inspectors/req.js:523-527`, `res.js:913-917`), so `0` and a
+/// negative value mean *no throttle*, the same way `reqDelay://0` means no
+/// delay. Without this filter `resSpeed://0` reached [`super::body::throttled`],
+/// whose `.max(1.0)` floor turned it into one byte per 50 ms — 20 B/s, or four
+/// hours for a 300 KB body. A value meaning "no limit" became the slowest limit
+/// expressible, which reads to a client as a hang.
 pub fn req_speed_kbps(resolved: &Resolved) -> Option<f64> {
-    resolved.value("reqSpeed").and_then(parse_leading_number)
+    resolved
+        .value("reqSpeed")
+        .and_then(parse_leading_number)
+        .filter(|rate| *rate > 0.0)
 }
 
 /// Response-body throughput cap in kilobits/s (`resSpeed`).
 pub fn res_speed_kbps(resolved: &Resolved) -> Option<f64> {
-    resolved.value("resSpeed").and_then(parse_leading_number)
+    resolved
+        .value("resSpeed")
+        .and_then(parse_leading_number)
+        .filter(|rate| *rate > 0.0)
 }
 
 /// JavaScript's `parseFloat`: the longest numeric prefix, ignoring whatever
@@ -7653,6 +7668,31 @@ mod tests {
         assert_eq!(res_delay_ms(&of("a.com resDelay://-5\n")), None);
         // Nothing numeric at all stays nothing.
         assert_eq!(res_speed_kbps(&of("a.com resSpeed://fast\n")), None);
+    }
+
+    /// The same `> 0` guard on the speeds, which did not have it.
+    ///
+    /// `resSpeed://0` used to reach `body::throttled`, whose `.max(1.0)` floor
+    /// made it one byte per 50 ms. The timing bench found it by hanging: a
+    /// 300 KB body would have taken over four hours. Upstream gates on
+    /// `if (resSpeed > 0)` (`_original/lib/inspectors/res.js:913-917`), so the
+    /// value that means "no limit" must produce no throttle.
+    #[test]
+    fn a_zero_or_negative_speed_is_no_throttle_at_all() {
+        let of = |text: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            mgr.resolve(&info)
+        };
+        assert_eq!(res_speed_kbps(&of("a.com resSpeed://0\n")), None);
+        assert_eq!(req_speed_kbps(&of("a.com reqSpeed://0\n")), None);
+        assert_eq!(res_speed_kbps(&of("a.com resSpeed://-600\n")), None);
+        assert_eq!(req_speed_kbps(&of("a.com reqSpeed://-600\n")), None);
+        // `0kb` parses to zero the same way, and means the same thing.
+        assert_eq!(res_speed_kbps(&of("a.com resSpeed://0kb\n")), None);
+        // A positive rate is still a rate.
+        assert_eq!(res_speed_kbps(&of("a.com resSpeed://0.5\n")), Some(0.5));
     }
 
     /// `x-forwarded-for` — the header a client must not be able to dictate.
