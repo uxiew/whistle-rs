@@ -8,14 +8,15 @@
 > 现状快照：注册算子中只有 `G` 与 `style` **有意不产生流量效果**（二者都不是逐请求的
 > 算子，见 Non-goals），其余全部已在运行时应用，加上**转发规则**（原版无名的
 > `rule` 协议）、别名算子层、本地文件/模板家族（含两遍替换与 `${var}` 运行时变量）、
-> `@`-includes、规则行级属性；**筛选器条件已全部可求值**；
+> **`@`-includes（每一份规则文本都展开，并按上游的节奏轮询重读）**、规则行级属性；
+> **筛选器条件已全部可求值**；
 > **pattern 层已按上游三种通配符语义重写，`$0`–`$9` 子匹配传值可用**；
 > **算子取值可以指向文件或 URL**（`readRuleValue`），**反引号整值按请求渲染**（`renderTpl`）。
 > **⚠️ 「已应用」不等于「与上游逐位一致」** —— 四路审计确认了 45 项行为差异，
 > **失败开放已清空**；不再维护一个精确的「已修 N 项」整数，下一节的清单才是准的。
-> 单元测试 **782** 项全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
+> 单元测试 **805** 项全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
 > 与 `cargo test --doc` 均 **0 警告 / 0 失败**（clippy 由 `Cargo.toml` 的
-> `[lints.clippy]` 把住）。此外还有 **1444 条差分用例**对着真 whistle 2.10.8 实测，
+> `[lints.clippy]` 把住）。此外还有 **1479 条差分用例**对着真 whistle 2.10.8 实测，
 > 见下一节——本轮的 bug 绝大多数出自那里，通读源码一个都没找到。
 > 已完整验证：HTTP 正向代理、HTTPS MITM、HTTP/2、WebSocket（含逐帧抓取、
 > **逐方向扣留与放行**）、上游代理、自研插件体系 v2（Rust 进程内 + JS/TS SDK）、
@@ -60,7 +61,8 @@
 | `cases-bodies.js`（body 改写与编码） | 180 | 0 差异 |
 | `cases-delete.js`（`delete://` 与类型算子） | 215 | 8 项**有意偏离**，逐条具名 |
 | `cases-compose.js`（规则组合与脚本注入） | 91 | 7 项，同上 |
-| `cases-values.js`（取值与模板） | 109 | 13 项，同上 |
+| `cases-values.js`（取值与模板） | 109 | 11 项，同上 |
+| `cases-includes.js`（`@` 引入） | 35 | 0 差异（其中 24 项在真 whistle 一侧确有改变） |
 | `cases-proxy.js`（转发族） | 98 | 25 项，同上 |
 | `https-bench.js`（MITM 隧道内） | 29 | 0 差异 |
 | `timing-bench.js`（延时与限速） | 33 | 0 差异 |
@@ -496,7 +498,7 @@ H2 会话复用）。
 | 领域 | 状态 |
 |------|------|
 | 插件运行时（Rust 进程内 + 子进程 + 远程） | ✅ 二进制响应体、就绪等待、失败重试 |
-| `@`-includes（从 URL / 文件引入规则） | ⚠️ 只对 `-r` / `--rule` 的启动规则生效；控制台 / `POST /api/rules` 的文本不展开，上游两边都展开 |
+| `@`-includes（从 URL / 文件引入规则） | ✅ **对每一份规则文本都生效** —— 控制台、`POST /api/rules`、具名分组、`-r`/`--rule`、导入的配置包、重启后从磁盘读回的文本；就地splice、围栏 value 一并带入（外层同名者胜）、单层不递归、上限 20 条；文件 5 秒 / URL 10~30 秒轮询重读（上游 `getInterval`），抓取失败**保留上一次成功的文本**（上游连败三次后清空——见 `docs/RULES.md`）。仅 `@whistle.<插件>` / `@$<key>` 两种来源未实现 |
 | `${port}` / `${version}` 配置变量 | ✅ |
 | 响应体解码（gzip / deflate / brotli）用于查看 | ✅ 流式解码，界限 16 KB，不影响转发 |
 | HAR 1.2 导出（`/sessions.har` + UI 下载） | ✅ |

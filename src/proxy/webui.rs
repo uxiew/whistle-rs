@@ -627,12 +627,36 @@ async fn rules_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         crate::rules::storage::save_groups(&rules_dir(state), &mgr);
         mgr.len()
     };
+    fetch_new_includes(state);
     tracing::info!("rules updated via UI: {count} rules");
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(format!("{{\"ok\":true,\"rules\":{count}}}"))))
         .unwrap()
+}
+
+/// A rules text that just changed may name an `@` source nothing has fetched.
+///
+/// Spawned rather than awaited, and this is the whole contract of the feature:
+/// someone typing in the console gets their answer back at the speed of the
+/// parse, and the include lands when the fetch lands — at which point the
+/// groups that carry an `@` line are re-parsed under the write lock. Blocking
+/// the save on an intranet that is down would make a rules editor unusable for
+/// exactly the reason includes exist.
+///
+/// Costs nothing when there is nothing to fetch: [`load_pending`] reads the set
+/// of never-loaded sources, which is empty in every rule set that names none.
+///
+/// [`load_pending`]: crate::rules::include::load_pending
+fn fetch_new_includes(state: &Arc<AppState>) {
+    if !state.rules.read().unwrap().resolves_includes() {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        crate::rules::include::load_pending(&state.rules).await;
+    });
 }
 
 // ── Rule group management API ──
@@ -762,6 +786,7 @@ async fn bundle_import(state: &Arc<AppState>, req: Request<Incoming>) -> Respons
         crate::rules::storage::save_values(&values_dir(state), &store);
         counts
     };
+    fetch_new_includes(state);
     tracing::info!("imported {groups} rule groups and {values} values via UI");
     let body = format!("{{\"ok\":true,\"groups\":{groups},\"values\":{values}}}");
     Response::builder()
@@ -847,6 +872,7 @@ async fn rule_groups_add(state: &Arc<AppState>, req: Request<Incoming>) -> Respo
         ok
     };
     if ok {
+        fetch_new_includes(state);
         json_ok()
     } else {
         json_error("group already exists")
@@ -872,6 +898,9 @@ async fn rule_group_toggle(state: &Arc<AppState>, req: Request<Incoming>) -> Res
     };
     match result {
         Some(enabled) => {
+            // A group switched back on re-registers its sources, which may
+            // never have been fetched — or were swept while it was off.
+            fetch_new_includes(state);
             let body = format!("{{\"ok\":true,\"enabled\":{enabled}}}");
             Response::builder()
                 .status(StatusCode::OK)
@@ -905,6 +934,7 @@ async fn rule_group_update(state: &Arc<AppState>, req: Request<Incoming>) -> Res
         ok
     };
     if ok {
+        fetch_new_includes(state);
         json_ok()
     } else {
         json_error("group not found")

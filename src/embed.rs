@@ -87,8 +87,18 @@ impl Proxy {
     }
 
     /// Replace the rules while running. The next request uses them.
+    ///
+    /// An `@` include the new text names is fetched in the background, so this
+    /// returns at the speed of the parse and the include lands when it lands —
+    /// the same contract the console's own save has.
     pub fn set_rules(&self, text: &str) {
         self.state.rules.write().unwrap().set_text(text);
+        let state = self.state.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                crate::rules::include::load_pending(&state.rules).await;
+            });
+        }
     }
 
     /// Stop accepting, and wait for the accept loop to finish.
@@ -230,7 +240,10 @@ impl Builder {
         }
 
         let ca = CertAuthority::load_or_create(&config)?;
-        let mut rules = RuleManager::new();
+        // `with_includes`: an embedded proxy's rules are as long-lived as the
+        // program holding it, so an `@` line names something worth fetching and
+        // worth keeping fresh — see [`crate::rules::include`].
+        let mut rules = RuleManager::with_includes();
         if let Some(text) = &self.rules {
             rules.set_text(text);
         }

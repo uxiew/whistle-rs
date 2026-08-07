@@ -31,10 +31,10 @@
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// A clean run of this file is **`differing: 16`**. They are not in `harness.js`'s
+// A clean run of this file is **`differing: 11`**. They are not in `harness.js`'s
 // `EXPECTED` because a matcher wide enough to catch them would hide real news in
 // another corpus; what makes them expected is the rule, which a matcher on the
-// output cannot see. Four deliberate divergences, already declared in the code:
+// output cannot see. Two deliberate divergences, already declared in the code:
 //
 //   * **A value a text operator cannot read is used as written here.**
 //     (`a value that names nothing …` ×3, `an unterminated fence …`,
@@ -53,15 +53,6 @@
 //     `fixed_value` (`src/rules/url.rs`) asks the question only where the form is
 //     documented, and leaves injected markup intact.
 //
-//   * **An empty text value empties the body here; upstream leaves it alone.**
-//     (`an empty value on a body operator`, `an empty inline payload`,
-//     `an empty inline payload on a request body`.)
-//     `EMPTY_BUFFER` is `toBuffer('')` and `toBuffer` returns `undefined` on a
-//     falsy argument, so `data.body = resBody || util.EMPTY_BUFFER` assigns
-//     `undefined` and no transform is built (`_original/lib/inspectors/res.js:1001-1002`,
-//     `lib/util/whistle-transform.js:38-43`). Same defect, same decision, as the
-//     ten declared in `cases-delete.js`.
-//
 //   * **`{name}` must end the value here.** (`trailing text after a reference`.)
 //     `getKey` takes everything up to the **last** `}` and discards the rest
 //     (`rules.js:817-824`), so upstream reads `file://{mock}/x` as `{mock}` and
@@ -69,12 +60,13 @@
 //     value, so the text stays a literal — which is wrong in a different
 //     direction, and louder.
 //
-//   * **`@<file>` includes nothing here.** (`an @ include of a rules file`,
-//     `an @ include declaring its own value`.)
-//     Upstream splices the file in at load (`REMOTE_RULES_RE` +
-//     `getRemoteRulesResolver`, `_original/lib/util/index.js:3294-3307`, applied
-//     from `lib/rules/util.js:73-88`), values and all, up to 20 includes.
-//     whistle-rs drops the line — see `docs/RULES.md`.
+// Five cases that used to be on this list have closed. Three were an operator
+// written with **no value**, which now does nothing here either, as the bodies
+// audit established; two were the `@` includes below, which now work for a
+// rules text set at runtime. The include family has grown its own corpus —
+// `cases-includes.js` — and the five cases here are what is left of it: enough
+// that this file notices if the feature regresses, not enough to be the place
+// it is tested.
 //
 // One divergence in this area cannot be written as a case at all, because
 // `harness.js` sets rules and not values: when a ``` block and a **values-store**
@@ -251,10 +243,13 @@ module.exports = [
   { name: 'rawfile parses a fenced value', rules: `${B}r.http\nHTTP/1.1 418 Teapot\r\nX-F: yes\r\n\r\nteapot body\n${B}\n${A} rawfile://{r.http}` },
 
   // ── @ includes ─────────────────────────────────────────────────────────
-  // A line that is only `@` and an absolute path or a URL is spliced in at load
-  // (`REMOTE_RULES_RE`, `_original/lib/util/index.js:3296`). A relative path is
-  // not — the regexp requires `/`, `~/`, a drive letter or `http(s)://` — and a
-  // line with a pattern in front of it is the `G://` operator, not an include.
+  // A line that is only `@` and an absolute path or a URL is spliced in where
+  // it stands (`REMOTE_RULES_RE`, `_original/lib/util/index.js:3295`), values
+  // and all. A relative path is not — the regexp requires `/`, `~/`, a drive
+  // letter or `http(s)://` — and a line with a pattern in front of it is the
+  // `G://` operator, not an include. The rest of the family, including the
+  // `@<url>` half and where the spliced lines land in precedence, is in
+  // `cases-includes.js`.
   { name: 'an @ include of a rules file', rules: `@${F('inc.rules')}` },
   { name: 'an @ include declaring its own value', rules: `@${F('inc-values.rules')}` },
   { name: 'an @ include of a relative path is not an include', rules: '@inc.rules' },
