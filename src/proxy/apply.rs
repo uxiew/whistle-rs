@@ -4089,6 +4089,23 @@ fn apply_replace(
     text.into_bytes()
 }
 
+/// The `resReplace://` substitutions in force for a response of this content
+/// type, in the order they apply.
+///
+/// The same list [`apply_replace`] walks, exposed for the body layer that runs
+/// on a response still arriving ([`crate::proxy::restream`]). It carries the
+/// content-type gate with it so the two paths cannot come to different answers
+/// about whether the operator reaches this body at all: upstream refuses the
+/// whole operator for a response with no `content-type` or an image one
+/// (`handleReplace`, `_original/lib/inspectors/res.js:129-132`).
+pub fn res_replace_pairs(resolved: &Resolved, content_type: Option<&str>) -> Vec<(String, String)> {
+    let class = content_type.and_then(res_class);
+    if matches!(class, None | Some(ResClass::Img)) {
+        return Vec::new();
+    }
+    merge_rule_maps(resolved, "resReplace")
+}
+
 /// Collapse every matching line of a key/value operator into one ordered map,
 /// the way `readRuleList`'s JSON branch does
 /// (`_original/lib/util/index.js:1300-1312`).

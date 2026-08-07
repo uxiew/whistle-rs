@@ -1170,6 +1170,78 @@ mod forced_encoding_tests {
         assert!(is_event_stream(Some("text/event-streamlike")));
     }
 
+    /// A `Resolved` for one rule line, for the gate tests below.
+    fn resolved_for(rule: &str) -> Resolved {
+        let mut m = RuleManager::new();
+        m.set_text(&format!("example.com {rule}\n"));
+        let info = apply::build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        m.resolve(&info)
+    }
+
+    /// Not being collected is not the same as not being rewritten.
+    /// `resReplace://` travels with the stream, so the operator that the gate
+    /// above drops from the buffered path is picked up here instead.
+    #[test]
+    fn a_substitution_rides_along_with_an_event_stream() {
+        let r = resolved_for("resReplace://tick=TOCK");
+        let mut t = stream_replace(&r, Some("text/event-stream"), None)
+            .expect("a substitution for an event stream");
+        assert_eq!(
+            String::from_utf8(t.push(b"data: tick\n\n")).unwrap(),
+            "data: TOCK\n\n"
+        );
+    }
+
+    /// The three refusals, each for its own reason — see [`stream_replace`].
+    #[test]
+    fn a_stream_that_cannot_be_substituted_is_left_alone() {
+        let r = resolved_for("resReplace://tick=TOCK");
+        assert!(
+            stream_replace(&r, Some("text/html"), None).is_none(),
+            "a body with an end belongs to the buffered path"
+        );
+        assert!(
+            stream_replace(&r, Some("text/event-stream"), Some("gzip")).is_none(),
+            "a compressed stream cannot be searched for a plaintext pattern"
+        );
+        assert!(
+            stream_replace(&resolved_for("log://x"), Some("text/event-stream"), None).is_none(),
+            "no substitutions means no transform to install"
+        );
+        // `identity` is the spelling of "no coding", so it is not a refusal.
+        assert!(stream_replace(&r, Some("text/event-stream"), Some("identity")).is_some());
+    }
+
+    /// The operator gate and the stream gate must agree about which bodies
+    /// `resReplace://` reaches, or a substitution would be applied on one path
+    /// and skipped on the other for the same response.
+    #[test]
+    fn the_content_type_gate_is_the_same_on_both_paths() {
+        // Upstream refuses the operator outright for an image, and an event
+        // stream can carry one — `text/event-stream` is only the usual case.
+        let r = resolved_for("resReplace://a=b");
+        assert!(apply::res_replace_pairs(&r, Some("image/png")).is_empty());
+        assert!(apply::res_replace_pairs(&r, None).is_empty());
+        assert!(!apply::res_replace_pairs(&r, Some("text/event-stream")).is_empty());
+    }
+
+    /// `disable://trailers` costs no buffering, so an event stream keeps it
+    /// where it loses the operators that need the whole body.
+    #[test]
+    fn an_event_stream_still_drops_the_trailers_it_was_told_to() {
+        let ops = ops_ct("disable://trailers", true, Some("text/event-stream"));
+        assert!(ops.no_trailers);
+        assert!(!ops.needs_body(), "and still does not hold the stream shut");
+    }
+
     /// Gating the rule operators was not enough: a plugin declaring
     /// `responseBody` reaches the same collection through its own door, and is
     /// not a rule operator. Measured against a live SSE origin — not one byte
@@ -1987,6 +2059,43 @@ fn must_collect_body(
     ops.needs_body() || plugin_wants_body
 }
 
+/// The substitution to run on a response body that is **still arriving**, or
+/// `None` to stream it through untouched.
+///
+/// This is the half of the body layer an event stream can have. Collecting one
+/// withholds it (see [`must_collect_body`]), so the operators that need the
+/// whole body — `resBody://`, the injections, `resMerge://` — stay dropped. But
+/// `resReplace://` never needed the whole body: it needs a window, and
+/// [`crate::proxy::restream`] holds exactly one.
+///
+/// Two things disqualify a stream, and both are refusals rather than attempts:
+///
+/// * **an encoded body**, because searching a deflate stream for a plaintext
+///   pattern finds nothing and rewriting it would corrupt what the header
+///   promises. The buffered path decompresses first; there is no streaming
+///   decoder here, so the honest answer is to leave the bytes alone. In practice
+///   an event stream is served uncompressed — `text/event-stream` and
+///   `content-encoding` together are rare, and this declines rather than guesses.
+/// * **anything that is not an event stream**, because a body with an end
+///   belongs to the buffered path, which applies every operator rather than one.
+///   Reaching here with substitutions and no event stream would mean
+///   [`ResBodyOps::needs_body`] disagreed with this function about `content`.
+fn stream_replace(
+    resolved: &Resolved,
+    res_ct: Option<&str>,
+    res_enc: Option<&str>,
+) -> Option<restream::TextReplace> {
+    if !is_event_stream(res_ct) {
+        return None;
+    }
+    // `identity` is the spelling of "no coding"; anything else is a coding.
+    if res_enc.is_some_and(|enc| !enc.trim().eq_ignore_ascii_case("identity")) {
+        return None;
+    }
+    let pairs = apply::res_replace_pairs(resolved, res_ct);
+    restream::TextReplace::new(&pairs, true)
+}
+
 impl ResBodyOps {
     /// The body operators in force, given what the response *is*.
     ///
@@ -2015,18 +2124,24 @@ impl ResBodyOps {
             // withholds it: the client receives nothing at all, where without
             // the rule it would have received events for as long as it listened.
             //
-            // So the operators are dropped and the stream is passed through.
-            // They do not apply to SSE in this port — a real gap, and the honest
-            // shape of it, because upstream *does* transform event streams. It
-            // can because its body layer is streaming end to end: the replace
-            // transforms hold back only a chunk tail, and for SSE flush through
-            // the last `\n\n` so a complete event is never held back
-            // (`_original/lib/util/replace-string-transform.js:27-33`). This
-            // port collects and then transforms, so it has no such tail to hold.
+            // So the operators that need the whole body are dropped and the
+            // stream is passed through. `resReplace://` is *not* among them and
+            // is not dropped here — it needs a window rather than the whole
+            // body, and it travels with the stream instead. See
+            // [`stream_replace`] and [`crate::proxy::restream`], which is
+            // upstream's own mechanism: hold back only a chunk tail, and for an
+            // event stream flush through the last `\n\n` so a complete event is
+            // never held (`_original/lib/util/replace-string-transform.js:27-33`).
             //
-            // Passing the stream through is the behaviour the two ports share:
-            // events keep arriving. Buffering shares nothing with it.
-            return ResBodyOps::default();
+            // `disable://trailers` survives because the streaming path reads it
+            // — it drops the origin's trailer section, which costs no buffering.
+            // The rest of the header operators here (`resWriteRaw://`,
+            // `trailers://`) have no reader on that path, so setting them would
+            // announce an effect that does not happen.
+            return ResBodyOps {
+                no_trailers: apply::trailers_disabled(resolved),
+                ..ResBodyOps::default()
+            };
         }
         if !has_body {
             // The trailers still apply: they are headers, not a body, and
@@ -3322,10 +3437,27 @@ async fn serve(
             }
             finish_res_body(&mut parts, new, ops, origin_trailers)
         } else {
-            // No transform: stream through, copying a bounded preview for
-            // inspection. The origin's trailers ride along untouched — unless a
-            // `disable://` asked for them to go, which is the one thing this
-            // path still has to act on.
+            // Stream through, copying a bounded preview for inspection. The
+            // origin's trailers ride along untouched — unless a `disable://`
+            // asked for them to go, which this path acts on.
+            //
+            // One operator can travel with a body that is still arriving:
+            // `resReplace://` needs a window, not the whole thing. See
+            // [`stream_replace`] for what disqualifies a stream.
+            let body = match stream_replace(&resolved, res_ct.as_deref(), res_enc.as_deref()) {
+                Some(transform) => {
+                    // A substitution changes the length, so a promise about it
+                    // cannot be kept. An event stream does not carry one, but
+                    // the removal belongs with the rewrite rather than with the
+                    // assumption.
+                    parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                    restream::wrap(body, transform)
+                }
+                None => body,
+            };
+            // The capture records what the client receives, so it sits *after*
+            // the substitution — as it does on the buffered path, where the
+            // preview is built from the rewritten bytes.
             let cap = Capture::new(res_ct.clone(), res_enc.as_deref(), state.config.body_preview_cap);
             res_body_cap = Some(cap.clone());
             let teed = body::tee(body, cap);
