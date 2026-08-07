@@ -264,6 +264,36 @@ body {
 
 .side-add:hover { color: var(--accent); border-color: var(--accent); }
 
+/* Import and export, below the "+ New …" button. Set back from it: creating a
+   group is the everyday act, moving one between machines is not. */
+.side-transfer {
+  display: flex;
+  gap: 4px;
+  margin: 5px 6px 0;
+  font-size: 11px;
+}
+
+.side-transfer button,
+.side-transfer a {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 3px 2px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--fg-faint);
+  font: inherit;
+  text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.side-transfer button:hover,
+.side-transfer a:hover { background: var(--line-soft); color: var(--fg); }
+
 .work {
   flex: 1 1 auto;
   display: flex;

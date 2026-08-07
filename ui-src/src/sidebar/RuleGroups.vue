@@ -4,7 +4,8 @@
 
 import { computed } from 'vue';
 import SideItem from '../components/SideItem.vue';
-import { addGroup, selectGroup, state, toggleGroup } from '../store';
+import SideTransfer from '../components/SideTransfer.vue';
+import { addGroup, exportGroup, selectGroup, state, toggleGroup } from '../store';
 
 const named = computed(() => state.groups.filter((g) => g.name !== 'default'));
 </script>
@@ -32,4 +33,8 @@ const named = computed(() => state.groups.filter((g) => g.name !== 'default'));
   />
 
   <div class="side-add" @click="addGroup()">+ New group</div>
+  <SideTransfer
+    :export-title="`Save ${state.group} as a rules file`"
+    @export="exportGroup()"
+  />
 </template>

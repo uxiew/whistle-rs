@@ -133,6 +133,12 @@ export interface OkResult {
   error?: string;
 }
 
+/** What an applied bundle carried — see `/api/export` and `/api/import`. */
+export interface ImportResult extends OkResult {
+  groups?: number;
+  values?: number;
+}
+
 /**
  * What one replayed request will actually carry.
  *
@@ -232,6 +238,13 @@ export const api = {
   renameValue: (name: string, to: string) =>
     postJson<OkResult>('/api/value/rename', { name, to }),
   deleteValue: (name: string) => postJson<OkResult>('/api/value', { name }, 'DELETE'),
+
+  /**
+   * Apply an exported bundle. The proxy refuses anything without the marker
+   * `/api/export` writes, so a file that merely happens to be JSON is never
+   * read as a setup.
+   */
+  importBundle: (bundle: unknown) => postJson<ImportResult>('/api/import', bundle),
 
   status: () => getJson<ProxyStatus>('/api/status'),
 };

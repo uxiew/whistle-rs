@@ -6,7 +6,8 @@
 
 import { computed } from 'vue';
 import SideItem from '../components/SideItem.vue';
-import { addValue, selectValue, state } from '../store';
+import SideTransfer from '../components/SideTransfer.vue';
+import { addValue, exportValues, selectValue, state } from '../store';
 
 const names = computed(() => Object.keys(state.values).sort());
 </script>
@@ -29,4 +30,8 @@ const names = computed(() => Object.keys(state.values).sort());
   />
 
   <div class="side-add" @click="addValue()">+ New value</div>
+  <SideTransfer
+    :export-title="state.valueKey === null ? 'Save every value as one JSON file' : `Save ${state.valueKey} as a file`"
+    @export="exportValues()"
+  />
 </template>

@@ -425,6 +425,38 @@ export function mockApi(): Plugin {
           return reply({ ok: true, rules: ruleCount(rules) });
         }
         return reply(rules, 'text/plain');
+      case '/api/export':
+        // Everything the console can edit, in the shape `bundle_of` writes it.
+        return reply({
+          whistle_rs: '0.1.0-mock',
+          rules: [
+            { name: 'default', enabled: true, text: rules },
+            ...groups.map((g) => ({ name: g.name, enabled: g.enabled, text: g.text })),
+          ],
+          values,
+        });
+      case '/api/import': {
+        const bundle = JSON.parse((await readBody(req)) || '{}');
+        if (!('whistle_rs' in bundle)) {
+          return reply({ ok: false, error: 'not an exported bundle' });
+        }
+        let count = 0;
+        for (const g of bundle.rules || []) {
+          if (!g.name?.trim()) continue;
+          count++;
+          if (g.name === 'default') {
+            rules = g.text || '';
+            continue;
+          }
+          // Updated where it stands: group order is precedence, as in `webui.rs`.
+          const at = groups.findIndex((x) => x.name === g.name);
+          if (at < 0) groups.push({ name: g.name, enabled: g.enabled !== false, text: g.text || '' });
+          else groups[at] = { name: g.name, enabled: g.enabled !== false, text: g.text || '' };
+        }
+        const named = Object.entries(bundle.values || {});
+        for (const [name, value] of named) values[name] = String(value);
+        return reply({ ok: true, groups: count, values: named.length });
+      }
       case '/api/rule-groups': {
         if (method === 'POST') {
           const g = JSON.parse((await readBody(req)) || '{}');

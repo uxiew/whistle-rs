@@ -520,6 +520,112 @@ export async function deleteValue(name: string): Promise<void> {
   await loadValues();
 }
 
+// ── import / export ────────────────────────────────────────────────────────
+
+/** The marker the proxy writes into a bundle, and the only way one is known. */
+const BUNDLE_MARKER = 'whistle_rs';
+
+/** Hand `text` to the browser as a file, without leaving the page. */
+export function downloadText(name: string, text: string, type = 'text/plain'): void {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** The selected group, as the rules file it is — the editor's text, as shown. */
+export function exportGroup(): void {
+  downloadText(`${state.group}.rules`, state.rulesText);
+}
+
+/** The selected value, or the whole store as the JSON object it is kept as. */
+export function exportValues(): void {
+  if (state.valueKey === null) downloadText('values.json', state.valuesText, 'application/json');
+  else downloadText(state.valueKey, state.valueText);
+}
+
+/** The parsed object if `text` is an exported bundle, and `null` otherwise. */
+function asBundle(text: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (value && typeof value === 'object' && BUNDLE_MARKER in value) {
+      return value as Record<string, unknown>;
+    }
+  } catch {
+    // Not JSON at all, which is what a rules file is.
+  }
+  return null;
+}
+
+/** A JSON object of strings — the shape a plain values export has. */
+function asValueStore(text: string): Record<string, string> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const entries = Object.entries(value);
+    if (!entries.length || !entries.every(([, v]) => typeof v === 'string')) return null;
+    return Object.fromEntries(entries) as Record<string, string>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read a file back in.
+ *
+ * A bundle — recognised by its marker, never by guessing — restores the groups,
+ * their switches and the values in one act. Anything else is the plain text it
+ * looks like: a rules file becomes the group it is named after, a values export
+ * becomes its keys, and any other file becomes one value.
+ *
+ * Which of the two a plain file lands in follows the pane it was imported from.
+ * A rules group and a value are both just text, and nothing inside the file
+ * tells them apart.
+ */
+export async function importFile(file: File): Promise<void> {
+  const text = await file.text();
+  const bundle = asBundle(text);
+  if (bundle) {
+    const res = await api.importBundle(bundle);
+    if (!res.ok) {
+      alert(res.error || 'Import failed');
+      return;
+    }
+    const note = `Imported ${res.groups ?? 0} groups and ${res.values ?? 0} values`;
+    await loadRules();
+    await loadValues();
+    state.rulesStatus = note;
+    state.valuesStatus = note;
+    return;
+  }
+
+  const name = file.name.replace(/\.(rules|txt|json)$/i, '') || file.name;
+  if (state.pane === 'rules') {
+    // A group that already exists is updated rather than refused, so a file
+    // exported from here imports back over the group it came from.
+    const res = state.groups.some((g) => g.name === name)
+      ? await api.updateRuleGroup(name, text)
+      : await api.addRuleGroup(name, text);
+    if (!res.ok) {
+      alert(res.error || 'Import failed');
+      return;
+    }
+    state.group = name;
+    await loadRules();
+    state.rulesStatus = `Imported ${file.name}`;
+    return;
+  }
+
+  const store = asValueStore(text);
+  for (const [key, value] of Object.entries(store ?? { [name]: text })) {
+    await api.setValue(key, value);
+  }
+  await loadValues();
+  state.valuesStatus = `Imported ${file.name}`;
+}
+
 // ── status ─────────────────────────────────────────────────────────────────
 
 export async function loadStatus(): Promise<void> {
