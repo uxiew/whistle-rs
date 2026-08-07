@@ -169,6 +169,12 @@ module.exports = [
   p('the u flag', '/echo/u'),
   p('the iu flags', '/ECHO/iu'),
   p('the ui flags', '/ECHO/ui'),
+  // The next five are inert on **both** sides, and not for the reason their
+  // names suggest: a token of `/` followed by a non-`/` that is not a valid
+  // regexp is a *file path*, and `formatShorthand` claims it before the line is
+  // even split (`FILE_RE.test(url) && !util.isRegExp(url)`,
+  // `_original/lib/rules/rules.js:1195`). The line then has no pattern at all.
+  // So they pin the shorthand's flag test, not the pattern parser's.
   p('the g flag is not a flag', '/echo/g'),
   p('the m flag is not a flag', '/echo/m'),
   p('the s flag is not a flag', '/echo/s'),
@@ -178,6 +184,13 @@ module.exports = [
   p('an unterminated regexp', '/echo'),
   p('a regexp with an empty body', '//i'),
   p('two slashes', '//'),
+  // These two are the pair that *does* discriminate the pattern parser's flag
+  // set, because a `//`-led token escapes the file shorthand and reaches it.
+  // `////` has empty flags and is the regexp `//`, which fires; `///host` has
+  // flags of `a.example.test`, which is not a flag set, so it is no regexp and
+  // ends up a pattern with no host. Reading the flags loosely turned the second
+  // into the regexp `/` — matching every URL there is — and it is the case that
+  // caught it.
   p('four slashes', '////'),
   p('a regexp with two bodies', '/a/b/'),
   p('an anchored regexp', '/^http:\\/\\/a\\.example\\.test\\/echo$/'),
