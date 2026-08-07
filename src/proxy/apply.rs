@@ -3026,9 +3026,14 @@ fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&Re
     } else if auto
         && let Some(method) = req_header(info, "access-control-request-method")
     {
-        // Singular, and not a real CORS header — upstream's typo, kept so
-        // both implementations emit the same thing.
-        set_header(headers, "access-control-allow-method", method);
+        // Plural. This was singular here, with a comment calling it upstream's
+        // typo — upstream has no such typo (`setResCors`,
+        // `_original/lib/util/index.js:2967`, is plural in both of its two
+        // branches, and the singular form appears nowhere in its tree). The
+        // singular name is not a CORS header at all, so no browser reads it:
+        // a preflight answered by `resCors://enable` was missing the one header
+        // that lets the real request follow, and the operator looked inert.
+        set_header(headers, "access-control-allow-methods", method);
     }
     if let Some(max_age) = spec.get("maxage") {
         set_header(headers, "access-control-max-age", max_age);
@@ -9442,9 +9447,9 @@ mod tests {
             Some("x-token".to_string())
         );
         assert_eq!(
-            cors("*", "OPTIONS", &preflight, "access-control-allow-method"),
+            cors("*", "OPTIONS", &preflight, "access-control-allow-methods"),
             Some("PUT".to_string()),
-            "upstream writes the singular, non-standard name here"
+            "the header a browser actually reads, and the one upstream writes"
         );
 
         // The query-string form.
