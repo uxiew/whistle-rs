@@ -4,6 +4,7 @@
 
 import { computed } from 'vue';
 import InfoCard from '../components/InfoCard.vue';
+import Waterfall from './Waterfall.vue';
 import type { Pair } from '../components/InfoCard.vue';
 import type { SessionDetail, SessionSummary } from '../api';
 import { fmtBytes, fmtDateTime, headerOf } from '../format';
@@ -59,5 +60,12 @@ const content = computed<Pair[]>(() => [
     <InfoCard title="Client" :pairs="client" />
     <InfoCard v-if="detail" title="Content" :pairs="content" />
   </div>
+  <!-- Below the cards rather than inside one: it is a picture, and a card is a
+       list of pairs. Only shown once the detail has loaded, because the phases
+       live on the detail — the summary carries the total and nothing else. -->
+  <section v-if="detail" class="wf-section">
+    <h3>Where the time went</h3>
+    <Waterfall :timings="detail.timings" />
+  </section>
   <p v-if="!detail" class="hint">loading headers…</p>
 </template>

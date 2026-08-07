@@ -72,11 +72,33 @@ export interface BodyBytes {
 export type HeaderPair = [string, string];
 
 /** `/session.json?id=` — a summary plus what was captured of the exchange. */
+/**
+ * Where a request's time went, in milliseconds — HAR 1.2's phase names.
+ *
+ * Every phase is optional and a missing one **did not happen**: a plain
+ * connection has no `ssl`, a request answered by a rule has no phases at all,
+ * and `receive` is absent while the body is still arriving — which for an event
+ * stream is permanent. The proxy deliberately does not send zeros for these, so
+ * the console must not turn an absent phase into a zero-width bar.
+ *
+ * `send` is absent by design and not merely unmeasured: hyper offers no
+ * observation point between the last byte written and the first byte read, so
+ * its duration is inside `wait`. See `src/proxy/timing.rs`.
+ */
+export interface Timings {
+  dns?: number;
+  connect?: number;
+  ssl?: number;
+  wait?: number;
+  receive?: number;
+}
+
 export interface SessionDetail extends SessionSummary {
   req_headers?: HeaderPair[];
   res_headers?: HeaderPair[];
   req_body?: BodyCapture;
   res_body?: BodyCapture;
+  timings?: Timings;
 }
 
 export interface WsFrame {

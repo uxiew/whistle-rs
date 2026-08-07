@@ -962,3 +962,80 @@ pre.dump.hex {
   border-radius: 3px;
   padding: 0 3px;
 }
+
+/* ── The timing waterfall (panes/Waterfall.vue) ───────────────────────────── */
+
+.wf-section {
+  margin: 14px 0 4px;
+}
+.wf-section h3 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.wf-track {
+  display: flex;
+  height: 14px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+.wf-bar {
+  height: 100%;
+}
+/* Five hues that stay apart in both themes and do not read as status colours —
+   a green bar next to a red one would be taken for pass/fail. */
+.wf-dns {
+  background: #8b7fd4;
+}
+.wf-connect {
+  background: #4f8ff0;
+}
+.wf-ssl {
+  background: #d9a441;
+}
+.wf-wait {
+  background: #5aab7a;
+}
+.wf-receive {
+  background: #4bb3c4;
+}
+.wf-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.wf-legend li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.wf-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex: none;
+}
+.wf-name {
+  color: var(--muted);
+}
+.wf-ms {
+  font-variant-numeric: tabular-nums;
+}
+.wf-total .wf-name {
+  color: var(--fg);
+  font-weight: 600;
+}
+.wf-absent {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}

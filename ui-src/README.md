@@ -52,7 +52,7 @@ src/columns.ts          the request table's columns
 src/format.ts           bytes, times, hosts, JSON
 src/curl.ts             the request as a curl command
 src/sidebar/*.vue       the five source lists, one per pane
-src/panes/*.vue         the five panes and the detail tabs
+src/panes/*.vue         the five panes, the detail tabs and the timing waterfall
 src/components/*.vue    toolbar, side item, card, editor, import/export
 src/editor/             the rules language for CodeMirror 6
 src/styles/app.css      the palette and everything painted with it

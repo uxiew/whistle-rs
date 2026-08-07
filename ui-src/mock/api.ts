@@ -47,6 +47,19 @@ interface MockSession {
   res_headers: [string, string][];
   req_body?: MockBody;
   res_body?: MockBody;
+  /**
+   * Where the time went. Optional and each phase optional in turn, because that
+   * is how the proxy sends it — a missing phase did not happen. The fixture
+   * covers all three shapes on purpose: a TLS request with every phase, a plain
+   * one with no `ssl`, and a mocked one with no phases at all.
+   */
+  timings?: {
+    dns?: number;
+    connect?: number;
+    ssl?: number;
+    wait?: number;
+    receive?: number;
+  };
 }
 
 /** A text body, which is what most of the fixture is. */
@@ -102,6 +115,7 @@ function session(over: Partial<MockSession> & { id: number }): MockSession {
       ['content-length', String(JSON_RES.length)],
     ],
     res_body: text(JSON_RES),
+    timings: { dns: 3.2, connect: 11.4, ssl: 28.7, wait: 42.1, receive: 1.8 },
     ...over,
   };
 }
@@ -132,6 +146,10 @@ const FIXTURE: MockSession[] = [
       ['x-tenant', 'acme'],
     ],
     req_body: text('{"name":"third","tags":["a","b"]}', false, 38),
+    // Answered by its own `resBody://`, so no connection was ever opened and
+    // there are no phases — the waterfall has to say that rather than draw an
+    // empty bar.
+    timings: undefined,
   }),
   session({
     id: 3,
@@ -172,6 +190,8 @@ const FIXTURE: MockSession[] = [
     duration_ms: 30000,
     res_headers: [],
     res_body: undefined,
+    // Resolved, then nothing: the connect never completed, so only `dns` exists.
+    timings: { dns: 8.4 },
   }),
   session({
     id: 7,
@@ -195,6 +215,8 @@ const FIXTURE: MockSession[] = [
     duration_ms: 3,
     res_headers: [['content-type', 'text/javascript']],
     res_body: text('import { createHotContext } from "/@vite";', false, 41),
+    // Plain HTTP: every phase but `ssl`.
+    timings: { dns: 0.1, connect: 0.4, wait: 2.1, receive: 0.3 },
   }),
   session({
     id: 9,
