@@ -93,10 +93,65 @@ pub fn build_res_info(
     }
 }
 
+/// The request facts a backtick operator value renders against — see
+/// [`render_backticks`]. Copied rather than borrowed so it can ride along
+/// beside the `&mut Resolved` these functions take.
+#[derive(Clone, Copy)]
+pub struct TplCtx<'a> {
+    pub info: &'a ReqInfo,
+    pub env: super::template::ProxyEnv<'a>,
+}
+
+/// whistle's `renderTpl` (`_original/lib/rules/rules.js:762-772`): an operator
+/// whose **whole** value is wrapped in backticks is a template, rendered against
+/// the request with `resolveTplVar` before anything else looks at it.
+///
+/// Upstream matches `TPL_RE = /^((?:[\w.-]+:)?\/\/)?(`.*`)$/` against the rule's
+/// whole matcher, so the optional first group is the `proto://` prefix. Here the
+/// protocol has already been split off, which leaves exactly the second group:
+/// the value must open and close with a backtick and nothing may sit outside
+/// them. `.*` does not cross a newline upstream and a token cannot contain one
+/// here, so the two agree.
+///
+/// Returns `None` when the value is not a template, which is also the answer for
+/// the two protocols upstream opts out at parse time (`rule.isTpl = false` for
+/// `log://` and `weinre://`, `rules.js:1357-1359`) — their values are channel
+/// names, and a backtick in one is a backtick.
+fn render_backticks(op: &crate::rules::RuleOp, tpl: TplCtx<'_>) -> Option<String> {
+    if op.protocol == "log" || op.protocol == "weinre" {
+        return None;
+    }
+    // A lone backtick is not a pair: `strip_suffix` on the empty remainder says
+    // so, which is upstream's `(`.*`)` needing two characters.
+    let inner = op
+        .value
+        .strip_prefix('`')
+        .and_then(|rest| rest.strip_suffix('`'))?;
+    Some(super::template::render_vars(inner, tpl.info, tpl.env))
+}
+
 /// Replace operator values of the form `{name}` with the named value's content
-/// (whistle's Values store references).
-pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, String>) {
-    fn sub(op: &mut crate::rules::RuleOp, values: &HashMap<String, String>) {
+/// (whistle's Values store references), after rendering a backtick template.
+///
+/// The two are one function because upstream's `resolveVar`
+/// (`_original/lib/rules/rules.js:774-783`) is: `renderTpl` runs first, and
+/// whether it *found* a template then decides what happens to the result of
+/// every `${name}` lookup below it.
+pub fn substitute_values(
+    resolved: &mut Resolved,
+    values: &HashMap<String, String>,
+    tpl: TplCtx<'_>,
+) {
+    fn sub(op: &mut crate::rules::RuleOp, values: &HashMap<String, String>, tpl: TplCtx<'_>) {
+        // `renderTpl` first, so the backticks are gone before the value store is
+        // consulted — and remember whether there were any.
+        let is_tpl = match render_backticks(op, tpl) {
+            Some(rendered) => {
+                op.value = rendered;
+                true
+            }
+            None => false,
+        };
         let value = &mut op.value;
         // The whole value is a reference: it is replaced by the content, which
         // is how a mock body or a rules text gets in.
@@ -118,16 +173,28 @@ pub fn substitute_values(resolved: &mut Resolved, values: &HashMap<String, Strin
         // A name with no value is left as written — upstream returns the whole
         // match from its replacer when the lookup misses — so a typo shows up
         // as itself rather than as an empty string.
+        //
+        // When the value *was* a backtick template, what the store hands back is
+        // rendered too (`rule.isTpl && key ? resolveTplVar(key, req) : key`,
+        // `rules.js:779`). That is the only way a stored value ever sees the
+        // request: a named value is written once and reused, so the backticks on
+        // the rule line are what say "render what this expands to".
         if value.contains("${") {
-            *value = substitute_braced(value, |name| values.get(name).cloned());
+            *value = substitute_braced(value, |name| {
+                let stored = values.get(name)?;
+                Some(match is_tpl && !stored.is_empty() {
+                    true => super::template::render_vars(stored, tpl.info, tpl.env),
+                    false => stored.clone(),
+                })
+            });
         }
     }
     for op in resolved.single.values_mut() {
-        sub(op, values);
+        sub(op, values, tpl);
     }
     for list in resolved.multi.values_mut() {
         for op in list {
-            sub(op, values);
+            sub(op, values, tpl);
         }
     }
 }
@@ -1259,6 +1326,318 @@ fn read_cached(path: &Path) -> Option<Arc<Vec<u8>>> {
         return Some(data);
     }
     std::fs::read(path).ok().map(Arc::new)
+}
+
+// ---------------------------------------------------------------------------
+// Operator values read from a file or a URL (`readRuleValue`)
+// ---------------------------------------------------------------------------
+
+/// The operators whose value upstream *reads* rather than uses
+/// (`readRuleValue`, `_original/lib/util/index.js:1189-1213`), when that value
+/// carries JSON or `k=v` pairs.
+///
+/// The set is not a property of the protocol table: it is whoever passes a rule
+/// to `parseRuleJson`. Every caller in the tree contributes —
+/// `_original/lib/inspectors/req.js:463-472` (`reqHeaders`, `reqCookies`,
+/// `auth`, `params`, `reqCors`, `reqReplace`, `urlReplace`, `urlParams`),
+/// `lib/inspectors/res.js:830-841` (`resHeaders`, `resCookies`, `resCors`,
+/// `resReplace`, `resMerge`, `trailers`), `lib/rules/index.js:691` (`cipher`),
+/// and the tunnel/HTTPS paths at `lib/tunnel.js:343,:752` and
+/// `lib/https/index.js:671-680,:746`, which add no name the first two do not.
+const LOADABLE_JSON_OPS: &[&str] = &[
+    "reqHeaders",
+    "reqCookies",
+    "auth",
+    "params",
+    "urlParams",
+    "reqCors",
+    "reqReplace",
+    "urlReplace",
+    "resHeaders",
+    "resCookies",
+    "resCors",
+    "resReplace",
+    "resMerge",
+    "trailers",
+    "cipher",
+];
+
+/// The operators whose value upstream reads as **content** — `getRuleValue`
+/// (`_original/lib/util/index.js:1409-1416`), from
+/// `lib/inspectors/req.js:545-548` and `lib/inspectors/res.js:984` — split by
+/// whether a URL value means "fetch this" or "this URL".
+///
+/// `readRuleValue`'s `checkUrl` argument is what splits them: it is
+/// `isJsHtml || isCssHtml` (`util/index.js:1339`), so for the `js*`/`css*`
+/// families a URL value is handed back **as the URL** when the response is HTML
+/// — that is how `jsAppend://https://cdn/a.js` becomes `<script src=…>`. On a
+/// non-HTML response the same value is fetched and inlined instead. This port
+/// cannot make that choice here: the loader runs in the request phase, before
+/// there is a response to classify. So those two families load from a **file**
+/// only, and a URL keeps the meaning this port already documents.
+const LOADABLE_TEXT_OPS: &[&str] = &[
+    "reqBody",
+    "reqPrepend",
+    "reqAppend",
+    "resBody",
+    "resPrepend",
+    "resAppend",
+    "htmlBody",
+    "htmlPrepend",
+    "htmlAppend",
+];
+
+/// The `js*`/`css*` families: a file value loads, a URL value does not — see
+/// [`LOADABLE_TEXT_OPS`].
+const LOADABLE_FILE_ONLY_OPS: &[&str] = &[
+    "jsBody",
+    "jsPrepend",
+    "jsAppend",
+    "cssBody",
+    "cssPrepend",
+    "cssAppend",
+];
+
+/// Where an operator's value says its content lives.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ValueSource {
+    /// One or more local paths, `|`-separated as upstream's `readFileText` has
+    /// them (`_original/lib/util/file-mgr.js:157-166`).
+    File(String),
+    /// An `http(s)://` URL, fetched once per matching request.
+    Url(String),
+}
+
+/// The value of a loadable operator is a **location** only when it looks like
+/// one: an `http(s)://` URL, or a path that starts at the root, the home
+/// directory, a Windows drive, or an explicit `./` / `../`.
+///
+/// **Deliberately narrower than upstream, and the narrowing is the interesting
+/// part.** whistle has no shape test at all: for the text operators *every*
+/// non-inline value is a path, and for the JSON ones every value that is not
+/// `{json}` and not `k=v`. A bare `resBody://patched` there is a read of
+/// `./patched` relative to the rules file's root — `rule.root`, which only
+/// exists for rules a plugin or an `@`-include brought in — or, with no root, to
+/// whistle's own working directory. It fails, and the operator quietly sets an
+/// empty body.
+///
+/// This port has no `rule.root` to resolve against, and a path relative to the
+/// proxy's working directory is not something a rules file can rely on. So a
+/// bare value stays the literal it already is here (`docs/RULES.md` documents
+/// `resBody://` as taking replacement text), and every spelling that *works*
+/// upstream — an absolute path, `~/…`, a URL — loads. The difference is
+/// confined to values that upstream reads from a relative path, which is to say
+/// values that upstream almost always fails to read.
+///
+/// The JSON operators additionally keep any value containing `=`: those pairs
+/// are the operator's own syntax, and upstream reaches the same place by a
+/// longer road — it reads the path, gets nothing, and then falls back to parsing
+/// the matcher as a query string (`tryParseMatcher`,
+/// `_original/lib/util/index.js:1165-1171,:1303`). Skipping the read that can
+/// only fail is what keeps a `urlReplace:///api/v1=/api/v2` rule from
+/// `stat()`-ing a nonexistent file on every request.
+fn value_source(op: &RuleOp) -> Option<ValueSource> {
+    // Already content, not a location: the `(inline)` form and a whole-value
+    // `{name}` the values store answered. Upstream's `if (rule.value)` returns
+    // before it looks at a disk (`util/index.js:1177-1179`).
+    if op.value_is_content {
+        return None;
+    }
+    let value = op.value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // [`is_http_url`] is whistle's `HTTP_RE` (`util/common.js:58`), which is the
+    // test `pluginMgr.resolveKey` uses to decide that a value is fetched rather
+    // than read (`lib/plugins/index.js:1521-1528`). It wants an explicit scheme,
+    // which is what keeps the POSIX path `//srv/x` from being read as a URL.
+    if is_http_url(value) {
+        let loadable = LOADABLE_JSON_OPS.contains(&op.protocol.as_str())
+            || LOADABLE_TEXT_OPS.contains(&op.protocol.as_str());
+        return loadable.then(|| ValueSource::Url(value.to_string()));
+    }
+    if !looks_like_path(value) {
+        return None;
+    }
+    if LOADABLE_JSON_OPS.contains(&op.protocol.as_str()) {
+        return (!value.contains('=')).then(|| ValueSource::File(value.to_string()));
+    }
+    let loadable = LOADABLE_TEXT_OPS.contains(&op.protocol.as_str())
+        || LOADABLE_FILE_ONLY_OPS.contains(&op.protocol.as_str());
+    loadable.then(|| ValueSource::File(value.to_string()))
+}
+
+/// Does this value name a filesystem path outright? See [`value_source`] for why
+/// the question is asked at all.
+fn looks_like_path(value: &str) -> bool {
+    let first = value.split('|').next().unwrap_or(value);
+    if first.starts_with('/')
+        || first.starts_with("~/")
+        || first.starts_with("～/")
+        || first.starts_with("./")
+        || first.starts_with("../")
+        || first.starts_with('\\')
+    {
+        return true;
+    }
+    // `C:\x` / `C:/x` — upstream's `FILE_RE` (`_original/lib/rules/rules.js:35`)
+    // spells the same drive-letter test.
+    let bytes = first.as_bytes();
+    bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+/// How long a URL-valued operator may hold a request up.
+///
+/// Upstream's own budget for the same fetch — `TIMEOUT = 16000` in
+/// `_original/lib/util/http-mgr.js:14`, which `pluginMgr.requestText` reaches
+/// through `util.request`. There it is an *idle* timer rearmed on every chunk;
+/// here it is a deadline on the whole exchange, which can only be stricter. A
+/// value that never arrives must not be able to hold a request open forever,
+/// and this is the only place a rule can make an outbound call before the
+/// request it belongs to has gone anywhere.
+const VALUE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16);
+
+/// The most a URL-valued operator may contribute (`MAX_URL_VAL_LEN`,
+/// `_original/lib/plugins/index.js:1497`).
+///
+/// Upstream enforces it *while* reading and aborts the response; this port asks
+/// the shared one-shot helper for the whole body and then rejects an oversized
+/// one, because [`super::upstream::simple_get`] collects before it returns and
+/// growing a second, capped variant of it is not this change's business. The
+/// deadline above is what bounds the exchange in the meantime.
+const MAX_URL_VALUE: usize = 256 * 1024;
+
+/// Read the content an operator's value points at.
+///
+/// `None` is a failure, and every failure is the same one: upstream's file read
+/// yields `undefined` and its URL fetch yields `''` for a non-200, a timeout or
+/// an oversized body (`requestValue`, `_original/lib/plugins/index.js:1500-1512`).
+/// What the caller does with it differs by family — see [`load_rule_values`].
+async fn read_value_source(source: &ValueSource) -> Option<String> {
+    match source {
+        // `readFileText` splits on `|` and joins what it read with CRLF, missing
+        // files dropping out (`_original/lib/util/file-mgr.js:96-102,:157-166`).
+        // That is *not* the first-one-wins of a `file://` rule: several files
+        // concatenate into one value.
+        ValueSource::File(spec) => {
+            let mut parts: Vec<String> = Vec::new();
+            for entry in spec.split('|') {
+                let path = expand_home(&decode_path(entry.trim()));
+                if has_parent_ref(&path) {
+                    tracing::warn!("rule value {path}: refused, path contains '..'");
+                    continue;
+                }
+                match read_cached(Path::new(&path)) {
+                    // A rule value is a string; a binary mock body has to go
+                    // through `file://`, which never decodes.
+                    Some(data) => parts.push(String::from_utf8_lossy(&data).into_owned()),
+                    None => tracing::warn!("rule value {path}: not readable"),
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join("\r\n"))
+        }
+        ValueSource::Url(url) => {
+            let fetch = super::upstream::simple_get(url);
+            match tokio::time::timeout(VALUE_FETCH_TIMEOUT, fetch).await {
+                Ok(Ok((200, bytes))) if bytes.len() <= MAX_URL_VALUE => {
+                    Some(String::from_utf8_lossy(&bytes).into_owned())
+                }
+                Ok(Ok((200, bytes))) => {
+                    tracing::warn!("rule value {url}: {} bytes exceeds the limit", bytes.len());
+                    None
+                }
+                Ok(Ok((status, _))) => {
+                    tracing::warn!("rule value {url}: responded {status}");
+                    None
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!("rule value {url}: {err}");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!("rule value {url}: timed out");
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Load every operator value that names a file or a URL, in place.
+///
+/// This is upstream's `readRuleValue` (`_original/lib/util/index.js:1189-1213`),
+/// moved to one pass over the resolved set instead of one call per consumer.
+/// Upstream reads at the moment each inspector wants the value, which lets it
+/// pass a `checkUrl`/`needRawData` pair per call site; doing it once here costs
+/// a rule set that uses the feature at most one read per *distinct* location,
+/// however many operators name it, and costs a rule set that does not use it a
+/// walk over the operators it already has — no syscall, no allocation, no await
+/// that yields.
+///
+/// **Failure differs by family, and both halves are upstream's.**
+///
+/// * A JSON-valued operator keeps its value as written. Upstream reads the path,
+///   gets nothing back, and `tryParseMatcher` then parses the *matcher* as a
+///   query string (`util/index.js:1165-1171,:1303,:1327`) — so an unreadable
+///   `reqHeaders://x=1` still sets the header. Blanking it here would break
+///   rules that never asked for this feature.
+/// * A text-valued operator becomes **empty**, which is `readFileText`'s `''`
+///   and, downstream, `data.body = reqBody || util.EMPTY_BUFFER`
+///   (`lib/inspectors/req.js:548`). It deliberately does not fall back to the
+///   text as written: that text is a path, and sending a path to an origin as a
+///   request body is the fail-open this exists to avoid.
+///
+/// Loaded values are marked [`RuleOp::value_is_content`], so a second call —
+/// the response phase merges operators that were withheld from the request pass
+/// — reads nothing twice.
+pub async fn load_rule_values(resolved: &mut Resolved, at: &ReqInfo) {
+    fn ops_mut(resolved: &mut Resolved) -> impl Iterator<Item = &mut RuleOp> {
+        resolved
+            .single
+            .values_mut()
+            .chain(resolved.multi.values_mut().flatten())
+    }
+    let mut wanted: HashMap<ValueSource, Option<String>> = HashMap::new();
+    for op in ops_mut(resolved) {
+        if let Some(source) = value_source(op) {
+            wanted.entry(source).or_default();
+        }
+    }
+    if wanted.is_empty() {
+        return;
+    }
+    for (source, slot) in wanted.iter_mut() {
+        *slot = read_value_source(source).await;
+    }
+    for op in ops_mut(resolved) {
+        let Some(source) = value_source(op) else {
+            continue;
+        };
+        match wanted.get(&source).and_then(Option::as_ref) {
+            Some(content) => {
+                op.value = content.clone();
+                op.value_is_content = true;
+            }
+            // See the failure note above: the JSON operators keep their text so
+            // upstream's `tryParseMatcher` fallback still holds, the text ones
+            // are emptied so a path can never reach an origin as a body.
+            None if LOADABLE_JSON_OPS.contains(&op.protocol.as_str()) => {
+                tracing::warn!(
+                    "{} {}: {}:// value kept as written, nothing loaded",
+                    at.method,
+                    at.full_url,
+                    op.protocol
+                );
+            }
+            None => {
+                op.value = String::new();
+                op.value_is_content = true;
+            }
+        }
+    }
 }
 
 /// Serve raw file bytes with a guessed content type (`file://`).
@@ -6350,7 +6729,7 @@ mod tests {
             let info =
                 build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
             let mut resolved = mgr.resolve(&info);
-            substitute_values(&mut resolved, &values);
+            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
             resolved.value(proto).map(str::to_string)
         };
 
