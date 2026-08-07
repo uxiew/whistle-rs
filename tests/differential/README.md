@@ -38,6 +38,16 @@ PORT_BASE=19100 CASES=./cases-filters.js npm run bench
 It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0`.
 
+Two corpora are not clean on a bare run, by design:
+
+* `cases-filters.js` asks about `env:`, which reads the **proxy's** environment.
+  Both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle
+  *and* whistle-rs. Starting only the oracle reports five differences that are
+  the launch, not the port.
+* `cases-delete.js` ends at `differing: 10`. Those ten are named at the top of
+  the file: `EMPTY_BUFFER` is `undefined` in whistle 2.10.8, so upstream's
+  "empty the body" paths forward the real body instead.
+
 ## The HTTPS bench
 
 `https-bench.js` is the same idea over a **TLS** origin: it opens a real CONNECT
