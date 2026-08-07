@@ -199,6 +199,9 @@ pub struct RuleOp {
 /// The resolution-order key of the rule at `index`: important lines sort before
 /// normal ones, source order within each group. Both passes derive it from the
 /// same rule list, so a key means the same thing in either.
+///
+/// The bottom [`TOKEN_ORDER_BITS`] are left free for [`token_order`], so that
+/// two operators on the *same* line still have an order between them.
 pub fn order_key(index: usize, important: bool) -> u64 {
     // `+ 1` so that **zero belongs to nobody**. Operators merged in mid-request
     // are stamped `MERGED_ORDER = 0` to make them win every contest decided by
@@ -207,7 +210,26 @@ pub fn order_key(index: usize, important: bool) -> u64 {
     // The two would then tie, and `min_by_key` resolves a tie by iteration
     // order — which is a map's, not the file's. Both passes derive the key from
     // this one function, so shifting it shifts nothing relative to itself.
-    ((!important as u64) << 32) | (index as u64 + 1)
+    ((!important as u64) << (32 + TOKEN_ORDER_BITS)) | ((index as u64 + 1) << TOKEN_ORDER_BITS)
+}
+
+/// How many low bits of an [`order_key`] belong to the operator's position on
+/// its own line. 16 is more tokens than any line has.
+const TOKEN_ORDER_BITS: u64 = 16;
+
+/// Fold an operator's position on its line into its line's [`order_key`].
+///
+/// Upstream pushes a line's matchers onto their protocol lists in the order they
+/// are written (`matchers.forEach(parseRule)`,
+/// `_original/lib/rules/rules.js:1785-1789`), and several of them — `file://`,
+/// `statusCode://`, `redirect://`, a bare destination, a `rule://` include —
+/// share **one** list, so which of those answers a request is decided by which
+/// was typed first. Without this the whole line shared one key, and the tie fell
+/// to whatever order [`crate::proxy::apply::slot_winner`] happened to enumerate
+/// the protocols in: `example.com file:///mock statusCode://204` served the mock
+/// upstream and answered 204 here.
+pub fn token_order(line: u64, at: usize) -> u64 {
+    line + (at as u64).min((1 << TOKEN_ORDER_BITS) - 1)
 }
 
 /// How a rule's pattern decides whether a request matches.
@@ -229,7 +251,15 @@ pub enum Pattern {
         /// Explicit port written in the pattern (`example.com:8080`), which
         /// scopes the rule to that port. `None` means "any port".
         port: Option<u16>,
-        /// Path prefix (may be empty).
+        /// Upstream's `rule.isDomain` (`_original/lib/rules/rules.js:1343-1348`):
+        /// the pattern is a host and nothing else, its query not counted. Only
+        /// these are also matched against the port-stripped URL, which is what
+        /// makes `example.com` apply on every port while `example.com/` does
+        /// not.
+        is_domain: bool,
+        /// Path prefix (may be empty). A pattern that carries only a query
+        /// keeps the `/` upstream's `formatUrl` puts in front of it, so this is
+        /// `/?q=1` rather than `?q=1`.
         path: String,
     },
     /// `$`-prefixed: the request URL must **equal** this, not begin with it
@@ -1021,8 +1051,10 @@ fn body_candidates(rules: &[Rule]) -> Vec<u32> {
 /// Holds rule groups and answers match queries.
 #[derive(Debug, Default)]
 pub struct RuleManager {
-    /// Ordered list of rule groups. Rules from earlier groups take precedence
-    /// (first-match-wins across groups, top to bottom).
+    /// Rule groups in console order. Rules from earlier groups take precedence
+    /// (first-match-wins across groups, top to bottom) — with one exception the
+    /// order alone does not show: the **default group is resolved last**, so a
+    /// named group overrides it. See [`RuleManager::resolution_order`].
     groups: Vec<RuleGroup>,
 }
 
@@ -1180,7 +1212,7 @@ impl RuleManager {
         }
         let mut candidates: Vec<(u64, &Rule)> = Vec::new();
         let mut base = 0;
-        for group in self.groups.iter().filter(|g| g.enabled) {
+        for group in self.resolution_order() {
             for &i in &group.res_candidates {
                 let rule = &group.rules[i as usize];
                 if rule.needs_response_phase(req) {
@@ -1200,16 +1232,31 @@ impl RuleManager {
         ))
     }
 
+    /// The enabled groups in the order they are *resolved*, which is not the
+    /// order they are stored in: the **default group goes last**.
+    ///
+    /// Upstream builds its rule list by walking every selected named group and
+    /// only then appending the default one (`addRules(defaultRules, 'Default')`
+    /// after the `getAllRulesFile().forEach`,
+    /// `_original/lib/rules/util.js:94-101`), which is why its console lists
+    /// Default at the bottom: a named group overrides it. This port resolved the
+    /// default group first, so a named group could never override anything —
+    /// measured against whistle 2.10.8 with two groups setting the same
+    /// single-value operator, which answers with the *named* group's value there
+    /// and answered with the default group's here.
+    fn resolution_order(&self) -> impl Iterator<Item = &RuleGroup> {
+        self.groups
+            .iter()
+            .filter(|g| g.enabled && g.name != "default")
+            .chain(self.groups.iter().filter(|g| g.enabled && g.name == "default"))
+    }
+
     /// Every rule of every enabled group, with its resolution index.
     ///
     /// Both passes enumerate the same sequence, so a rule keeps its index — and
     /// therefore its [`order_key`] — across them.
     fn enabled_rules(&self) -> impl Iterator<Item = (usize, &Rule)> {
-        self.groups
-            .iter()
-            .filter(|g| g.enabled)
-            .flat_map(|g| &g.rules)
-            .enumerate()
+        self.resolution_order().flat_map(|g| &g.rules).enumerate()
     }
 
     // ── Group management API ──
@@ -2449,6 +2496,36 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
         return done(Pattern::Regex(re));
     }
 
+    // `//host/path` is scheme-relative: the `//` comes off and any scheme
+    // matches (`NO_SCHEMA_RE`, `rules.js:1241-1244`). Without this the `//`
+    // ended up in the *path*, and the pattern matched every host.
+    let tok = match tok.strip_prefix("//") {
+        Some(rest) if !rest.starts_with('/') => rest,
+        _ => tok,
+    };
+
+    // Regexp pattern: /body/flags
+    if let Some(re) = slash_regexp(tok) {
+        return done(Pattern::Regex(re));
+    }
+
+    // A host wildcard. Asked before the negation check below because upstream
+    // asks in that order, and it is `parseWildcard` that decides a *negated*
+    // wildcard is dropped (`rules.js:1171-1173`).
+    //
+    // Asked before the `$` branch for the same reason: upstream runs
+    // `parseWildcard` first and only reads `$` as exact matching when the
+    // pattern is **not** a wildcard (`if (!wildcard && isExactPattern(pattern))`,
+    // `rules.js:1263-1270`). `parseWildcard` reads the `$` itself, so
+    // `$*.example.com/api` is an exact *wildcard*. With the two the other way
+    // round it was an exact match against the literal text `*.example.com/api`,
+    // which no request can ever be.
+    match wildcard::parse(tok, negate) {
+        wildcard::Parsed::Wildcard(w) => return done(Pattern::Wildcard(w)),
+        wildcard::Parsed::Dropped => return None,
+        wildcard::Parsed::NotWildcard => {}
+    }
+
     // `$` is exact matching, not precedence. This port read it as an
     // "important" marker that also won ties, which upstream does not do:
     // measured, a normal rule written *before* a `$` one still wins there.
@@ -2459,47 +2536,19 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
             return done(Pattern::Nothing);
         }
         // No path means the site root, so `$example.com` is the root and not
-        // the whole host.
-        let authority_end = rest.split_once("://").map_or(rest, |(_, r)| r);
+        // the whole host. `formatUrl` puts the `/` *before* the query, so
+        // `$example.com?q=1` names `example.com/?q=1`
+        // (`_original/lib/util/common.js:526-536`).
+        let (base, query) = match rest.find('?') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        let authority_end = base.split_once("://").map_or(base, |(_, r)| r);
         let normalised = match authority_end.contains('/') {
             true => rest.to_string(),
-            false => format!("{rest}/"),
+            false => format!("{base}/{query}"),
         };
         return done(Pattern::Exact(normalised));
-    }
-    // `//host/path` is scheme-relative: the `//` comes off and any scheme
-    // matches (`NO_SCHEMA_RE`, `rules.js:1241-1244`). Without this the `//`
-    // ended up in the *path*, and the pattern matched every host.
-    let tok = match tok.strip_prefix("//") {
-        Some(rest) if !rest.starts_with('/') => rest,
-        _ => tok,
-    };
-
-    // Regexp pattern: /body/flags
-    if tok.starts_with('/')
-        && tok.len() > 1
-        && let Some(end) = tok.rfind('/')
-        && end > 0
-    {
-        let body = &tok[1..end];
-        let flags = &tok[end + 1..];
-        let mut pat = String::new();
-        if flags.contains('i') {
-            pat.push_str("(?i)");
-        }
-        pat.push_str(body);
-        if let Ok(re) = Regex::new(&pat) {
-            return done(Pattern::Regex(re));
-        }
-    }
-
-    // A host wildcard. Asked before the negation check below because upstream
-    // asks in that order, and it is `parseWildcard` that decides a *negated*
-    // wildcard is dropped (`rules.js:1171-1173`).
-    match wildcard::parse(tok, negate) {
-        wildcard::Parsed::Wildcard(w) => return done(Pattern::Wildcard(w)),
-        wildcard::Parsed::Dropped => return None,
-        wildcard::Parsed::NotWildcard => {}
     }
 
     // Everything below is a literal pattern, and whistle refuses to negate
@@ -2513,6 +2562,35 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
 
     // Scheme/host/path prefix.
     done(parse_prefix(tok))
+}
+
+/// Compile a `/body/flags` regexp pattern — `util.isRegExp` / `util.toRegExp`
+/// (`_original/lib/util/index.js:606-612,:726-735`).
+///
+/// `REG_EXP_RE = /^\/(.+)\/(i?u?|ui)$/` admits **four** flag spellings and no
+/// others: nothing, `i`, `u`, and the two orderings of `iu`. A token whose
+/// trailing characters are anything else is not a regexp at all, and falls
+/// through to the pattern kinds below it.
+///
+/// This port read everything after the last `/` as flags and looked only for an
+/// `i` in it, which made `/echo/g` a regexp upstream does not have — and, worse,
+/// turned `///a.example.com` into the regexp `/`, matching every URL that
+/// contains a slash. That is every URL.
+fn slash_regexp(tok: &str) -> Option<Regex> {
+    let body_and_flags = tok.strip_prefix('/')?;
+    let end = body_and_flags.rfind('/')?;
+    let (body, flags) = (&body_and_flags[..end], &body_and_flags[end + 1..]);
+    // `(.+)` demands a body, and `$` demands the flags be one of the four.
+    if body.is_empty() || !matches!(flags, "" | "i" | "u" | "iu" | "ui") {
+        return None;
+    }
+    // `u` is Unicode mode, which this regexp engine is always in; only `i`
+    // changes what matches.
+    let prefix = match flags.contains('i') {
+        true => "(?i)",
+        false => "",
+    };
+    Regex::new(&format!("{prefix}{body}")).ok()
 }
 
 /// Compile a `:8080`-style port pattern.
@@ -2539,7 +2617,14 @@ fn parse_prefix(tok: &str) -> Pattern {
         Some(i) => (Some(tok[..i].to_lowercase()), &tok[i + 3..]),
         None => (None, tok),
     };
-    let (host_part, path) = match rest.find('/') {
+    // The authority ends at the first `/` **or `?`** — upstream splits the query
+    // off before it looks for the path (`formatUrl`,
+    // `_original/lib/util/common.js:526-536`), and puts the `/` back between the
+    // two: `example.com?q=1` is the pattern `example.com/?q=1`. Splitting on `/`
+    // alone left the whole `example.com?q=1` in the *host*, where it matched
+    // nothing at all.
+    let (host_part, path) = match rest.find(['/', '?']) {
+        Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, String::new()),
     };
@@ -2560,12 +2645,20 @@ fn parse_prefix(tok: &str) -> Pattern {
     } else {
         (false, host_no_port.to_lowercase())
     };
-    if host.is_empty() && path.is_empty() && scheme.is_none() && port.is_none() {
-        // Nothing to match on. Upstream drops such a rule (`if (!pattern) return`,
-        // `_original/lib/rules/rules.js:1247-1249`); reaching `Pattern::Any` here
-        // meant a stray token — a lone `$`, a lone `!` — silently applied its
-        // line's operators to **every** request. `Pattern::Any` stays for the
-        // callers that construct it deliberately.
+    if host.is_empty() {
+        // No host to match on. Upstream is matching the pattern as a literal
+        // prefix of the request URL, and a URL always carries an authority — so
+        // `http://`, `http:///echo`, `:80/echo` and `///example.com` all compile
+        // to text (`http:///echo`, `http://:80/echo`) that no request can begin
+        // with, and the rule is dead (`setProtocol` + `formatUrl`,
+        // `rules.js:294-305`). Here they were a *scheme* filter, a *path* filter
+        // and a *port* filter over every host on the proxy — `http://` alone
+        // applied its line's operators to every plain-HTTP request that arrived.
+        //
+        // A pattern with no host and no anything else is the same answer for the
+        // older reason: upstream drops it (`if (!pattern) return`,
+        // `rules.js:1247-1249`), and reaching `Pattern::Any` here meant a stray
+        // token — a lone `$`, a lone `!` — matched everything.
         return Pattern::Nothing;
     }
     Pattern::Prefix {
@@ -2573,6 +2666,13 @@ fn parse_prefix(tok: &str) -> Pattern {
         host,
         host_suffix,
         port,
+        // `rule.isDomain` (`rules.js:1343-1348`): the pattern names a host and
+        // nothing else, once its scheme and query are taken off. Those are the
+        // only patterns matched against the *port-stripped* URL as well, which
+        // is what lets `example.com` apply on every port while `example.com/`
+        // does not. The query goes before the `/` test, so `example.com?q=1`
+        // counts as one of them.
+        is_domain: path.is_empty() || path.starts_with("/?"),
         path,
     }
 }
@@ -2651,6 +2751,38 @@ mod group_tests {
         mgr.set_text("other.com host://2.2.2.2");
         assert_eq!(mgr.groups().len(), 1);
         assert!(mgr.resolve(&req("http://example.com/")).single.is_empty());
+    }
+
+    /// The **default group resolves last**, so a named group overrides it.
+    ///
+    /// Upstream appends it after every selected named group
+    /// (`addRules(defaultRules, 'Default')`,
+    /// `_original/lib/rules/util.js:94-101`), which is why its console lists
+    /// Default at the bottom. This port resolved it first, so a named group
+    /// could never override anything — measured against whistle 2.10.8, which
+    /// answers with the named group's value where this answered with the default
+    /// group's.
+    #[test]
+    fn the_default_group_resolves_last() {
+        let host_of = |mgr: &RuleManager| {
+            mgr.resolve(&req("http://example.com/"))
+                .value("host")
+                .map(str::to_string)
+        };
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com host://1.1.1.1");
+        mgr.add_group("named", "example.com host://2.2.2.2", true);
+        assert_eq!(host_of(&mgr).as_deref(), Some("2.2.2.2"));
+
+        // Named groups keep their own order between themselves.
+        mgr.add_group("later", "example.com host://3.3.3.3", true);
+        assert_eq!(host_of(&mgr).as_deref(), Some("2.2.2.2"));
+
+        // A disabled named group is not in the running at all.
+        mgr.toggle_group("named");
+        assert_eq!(host_of(&mgr).as_deref(), Some("3.3.3.3"));
+        mgr.toggle_group("later");
+        assert_eq!(host_of(&mgr).as_deref(), Some("1.1.1.1"));
     }
 }
 
@@ -3445,6 +3577,189 @@ mod pattern_tests {
         assert!(matches!(&rules[0].pattern, Pattern::Exact(p) if p == "example.test/p"));
         // …and the plain literal is still refused.
         assert!(parse_text("!example.test host://1.1.1.1").is_empty());
+    }
+
+    /// `$` in front of a **wildcard** is an exact wildcard, not an exact match
+    /// against the literal text `*.example.test/echo`.
+    ///
+    /// Upstream asks `parseWildcard` first and only reads `$` as exact matching
+    /// when the answer is no (`if (!wildcard && isExactPattern(pattern))`,
+    /// `_original/lib/rules/rules.js:1263-1270`); `parseWildcard` reads the `$`
+    /// itself and sets `isExact` on the wildcard it builds. This port asked in
+    /// the other order, so every `$`-prefixed wildcard matched nothing at all.
+    #[test]
+    fn an_exact_pattern_may_be_a_wildcard() {
+        let text = "$*.example.test/echo host://1.1.1.1";
+        assert!(hits(text, "http://a.example.test/echo"));
+        assert!(hits(text, "http://a.example.test/echo?q=1"), "the query may differ");
+        assert!(!hits(text, "http://a.example.test/echo/more"), "still exact");
+        assert!(!hits(text, "http://a.example.test/ec"));
+        assert!(!hits(text, "http://a.b.example.test/echo"), "one label only");
+        // The leading-dot and multi-star hosts are wildcards too.
+        assert!(hits("$.example.test/echo host://1.1.1.1", "http://a.example.test/echo"));
+        assert!(hits("$**.example.test/echo host://1.1.1.1", "http://a.b.example.test/echo"));
+        // And a `$` with no wildcard in it is still a plain exact pattern.
+        assert!(matches!(
+            &parse_text("$example.test/p host://1.1.1.1")[0].pattern,
+            Pattern::Exact(p) if p == "example.test/p"
+        ));
+    }
+
+    /// An exact match consumed the path, so only the request's **query** is left
+    /// — and upstream hands it to the destination (`getRelativePath`,
+    /// `_original/lib/rules/rules.js:848-858`). This port dropped it, so
+    /// `$a.test/search http://dev/search` lost every search term.
+    #[test]
+    fn an_exact_match_hands_the_query_to_its_destination() {
+        let url_for = |text: &str, url: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            mgr.resolve(&req(url))
+                .value(protocols::URL_REPLACE)
+                .map(str::to_string)
+        };
+        assert_eq!(
+            url_for("$a.test/p http://dev.test/x", "http://a.test/p?q=1").as_deref(),
+            Some("http://dev.test/x?q=1")
+        );
+        // A destination that already has a query takes it as another parameter —
+        // the `?`-or-`&` decision `join_url` makes for every other pattern kind.
+        assert_eq!(
+            url_for("$a.test/p http://dev.test/x?k=1", "http://a.test/p?q=1").as_deref(),
+            Some("http://dev.test/x?k=1&q=1")
+        );
+        // A pattern that named the query has already consumed it.
+        assert_eq!(
+            url_for("$a.test/p?q=1 http://dev.test/x", "http://a.test/p?q=1").as_deref(),
+            Some("http://dev.test/x")
+        );
+        assert_eq!(
+            url_for("$a.test/p http://dev.test/x", "http://a.test/p").as_deref(),
+            Some("http://dev.test/x")
+        );
+        // The same three answers for the wildcard spelling, whose own
+        // `relative_query` made the second test against the *pattern* rather
+        // than the destination and so appended a query it had already consumed.
+        assert_eq!(
+            url_for("$*.test/p http://dev.test/x", "http://a.test/p?q=1").as_deref(),
+            Some("http://dev.test/x?q=1")
+        );
+        assert_eq!(
+            url_for("$*.test/p?q=1 http://dev.test/x", "http://a.test/p?q=1").as_deref(),
+            Some("http://dev.test/x")
+        );
+    }
+
+    /// A pattern may carry a query **instead of** a path: upstream's `formatUrl`
+    /// splits the query off before it looks for the path and puts a `/` between
+    /// the two (`_original/lib/util/common.js:526-536`), so `example.test?q=1`
+    /// is the pattern `example.test/?q=1`.
+    ///
+    /// This port split the token on `/` alone, leaving `example.test?q=1` in the
+    /// *host*, where it matched nothing.
+    #[test]
+    fn a_pattern_may_carry_a_query_instead_of_a_path() {
+        let text = "example.test?q=1 host://1.1.1.1";
+        assert!(hits(text, "http://example.test/?q=1"));
+        assert!(hits(text, "http://example.test/?q=1&r=2"), "a query prefix");
+        assert!(!hits(text, "http://example.test/?q=2"));
+        assert!(!hits(text, "http://example.test/"), "the request has no query");
+        // The query goes before the `/` test that decides `rule.isDomain`
+        // (`rules.js:1343-1348`), so this is still a domain pattern and still
+        // matches on any port.
+        assert!(hits(text, "http://example.test:8080/?q=1"));
+        // …where a pattern with a real path is scoped to the default port.
+        assert!(!hits("example.test/p host://1.1.1.1", "http://example.test:8080/p"));
+        // A bare `?` is a query prefix of everything.
+        assert!(hits("example.test? host://1.1.1.1", "http://example.test/?q=1"));
+    }
+
+    /// A pattern with no host matches nothing.
+    ///
+    /// Upstream compares the pattern as a literal prefix of the request URL, and
+    /// a URL always carries an authority — so `http://`, `http:///echo`,
+    /// `:80/echo` and `///example.test` all compile to text no request can begin
+    /// with. Here each was a filter over **every host on the proxy**: `http://`
+    /// alone applied its line to every plain-HTTP request that arrived.
+    #[test]
+    fn a_pattern_with_no_host_matches_nothing() {
+        for pattern in ["http://", "http:///", "http:///echo", ":80/echo", "///example.test", "/echo"] {
+            assert!(
+                !hits(&format!("{pattern} host://1.1.1.1"), "http://example.test/echo"),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// A `/re/` token takes **four** flag spellings and no others — upstream's
+    /// `REG_EXP_RE = /^\/(.+)\/(i?u?|ui)$/`
+    /// (`_original/lib/util/common.js:606`). Anything else is not a regexp, and
+    /// falls through to the pattern kinds below it.
+    ///
+    /// This port read everything after the last `/` as flags and looked only for
+    /// an `i`, which made `/echo/g` a regexp upstream does not have — and turned
+    /// `///example.test` into the regexp `/`, matching every URL there is.
+    #[test]
+    fn only_i_and_u_are_regexp_flags() {
+        for flags in ["", "i", "u", "iu", "ui"] {
+            assert!(
+                hits(&format!("/echo/{flags} host://1.1.1.1"), "http://example.test/echo"),
+                "/echo/{flags}"
+            );
+        }
+        for flags in ["g", "m", "s", "gi", "ig", "xyz", "I"] {
+            assert!(
+                !hits(&format!("/echo/{flags} host://1.1.1.1"), "http://example.test/echo"),
+                "/echo/{flags}"
+            );
+        }
+        // `i` is the only one that changes what matches.
+        assert!(hits("/ECHO/i host://1.1.1.1", "http://example.test/echo"));
+        assert!(!hits("/ECHO/ host://1.1.1.1", "http://example.test/echo"));
+        // A body is required, and an unterminated token is not a regexp.
+        assert!(!hits("//i host://1.1.1.1", "http://example.test/echo"));
+        assert!(!hits("/echo host://1.1.1.1", "http://example.test/echo"));
+
+        // Where each of them ends up, so the assertions above cannot pass for
+        // the wrong reason. `/echo/g` is not a regexp, so `format_shorthand`
+        // reads it as a **file path** and the line loses its only pattern —
+        // upstream's answer too, and for the same two lines of code
+        // (`FILE_RE.test(url) && !util.isRegExp(url)`, `rules.js:1195`).
+        assert!(parse_text("/echo/g host://1.1.1.1").is_empty());
+        // `///host` is no file path, so it stays a pattern — one that used to
+        // compile to the regexp `/`, which every URL contains.
+        let rules = parse_text("///example.test host://1.1.1.1");
+        assert_eq!(rules.len(), 1);
+        assert!(matches!(rules[0].pattern, Pattern::Nothing));
+    }
+
+    /// A `ws://` pattern does not reach a plain request, and an `http://` one
+    /// does not reach a WebSocket.
+    ///
+    /// whistle matches the pattern as a prefix of the request URL, and that URL
+    /// names exactly one scheme — `ws`/`wss` for a WebSocket, `http`/`https`
+    /// otherwise (`getFullUrl`, `_original/lib/util/common.js:1266`). The
+    /// pattern that reaches both is the one with no scheme. This port folded the
+    /// two families together in both directions.
+    #[test]
+    fn a_scheme_names_one_scheme() {
+        let ws = |url: &str| {
+            let mut r = req(url);
+            r.scheme = "ws".into();
+            r
+        };
+        let matched = |text: &str, info: &ReqInfo| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            mgr.resolve(info).value("host").is_some()
+        };
+        assert!(!hits("ws://example.test host://1.1.1.1", "http://example.test/"));
+        assert!(!hits("wss://example.test host://1.1.1.1", "https://example.test/"));
+        assert!(!matched("http://example.test host://1.1.1.1", &ws("ws://example.test/c")));
+        assert!(matched("ws://example.test host://1.1.1.1", &ws("ws://example.test/c")));
+        // A pattern with no scheme reaches both, which is whistle's idiom for it.
+        assert!(matched("example.test host://1.1.1.1", &ws("ws://example.test/c")));
+        assert!(hits("example.test host://1.1.1.1", "http://example.test/"));
     }
 
     /// The truth table the oracle produced, pinned.

@@ -162,8 +162,11 @@ test.local            127.0.0.1:9099
 example.com           reqHeaders://x-token=abc
 example.com           resHeaders://x-mitm=intercepted
 
-# $-prefix = important; wins over normal rules
-$example.com          host://2.2.2.2
+# lineProps://important wins over normal rules, whatever the line order
+example.com           host://2.2.2.2  lineProps://important
+
+# $-prefix = exact match: the site root, and nothing under it
+$example.com          host://3.3.3.3
 ```
 
 Three things about that grammar are worth knowing before you write a rules file,

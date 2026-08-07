@@ -131,7 +131,14 @@ example.com            http://localhost:5173
 
 ```
 example.com            http://localhost:5173
-$example.com/api/flags file://({"beta":true})
+example.com/api/flags  file://({"beta":true}) lineProps://important
+```
+
+同一家族在**一行之内**也共用一个槽位，先写的那个赢：
+
+```
+example.com  file://({"beta":true})  statusCode://204   # 服务文件
+example.com  statusCode://204  file://({"beta":true})   # 回 204
 ```
 
 **不属于**这个家族的算子 —— `resHeaders://`、`reqHeaders://`、`resDelay://`、筛选器 ——
@@ -510,15 +517,18 @@ include 之间是 **OR**；任意一条 exclude 命中就否决整条规则，�
 筛选器里的 URL pattern **总是**按 `^` 解读，这就是 `excludeFilter://*/health`
 能通配路径、而同样的 token 作为规则 pattern 却不能的原因。
 
-### `$` —— important
+### `lineProps://important` —— 插队
 
 ```
 example.com    host://1.1.1.1
-$example.com   host://2.2.2.2      # 这条赢
+example.com    host://2.2.2.2  lineProps://important   # 这条赢
 ```
 
 important 规则先于普通规则解析，与行序无关。当你的窄规则在宽规则下面、又不想重排文件时，
 这就是那个逃生口。
+
+`$` **不是**它。`$` 是精确匹配 —— `$example.com` 指的是站点根路径、且不含其下任何路径 ——
+它在上游和这里都不带任何优先级。
 
 ### `ignore://` —— 在宽规则上挖个洞
 
@@ -551,6 +561,10 @@ curl --noproxy '*' http://127.0.0.1:8899/api/rule-groups
 
 分组持久化到 `<存储目录>/rules/`，重启后自动回来。被禁用的组什么都不贡献 ——
 连它围栏块声明的 value 也不贡献。
+
+**具名分组压过默认分组。** 每个启用的具名分组按列表顺序先解析，默认分组最后 ——
+这是上游自己的顺序，也是它的控制台把 Default 列在最下面的原因。所以那些你要随手开关的
+覆盖规则，应该放进一个具名分组里。
 
 ### 从别处引入规则
 
