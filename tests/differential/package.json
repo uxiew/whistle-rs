@@ -1,0 +1,7 @@
+{
+  "name": "whistle-rs-differential",
+  "private": true,
+  "description": "Runs the same rules through real whistle and through whistle-rs and compares the answers.",
+  "scripts": { "bench": "node harness.js" },
+  "dependencies": { "whistle": "2.10.8" }
+}
