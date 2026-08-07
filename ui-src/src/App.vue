@@ -14,7 +14,15 @@ import RequestsPane from './panes/RequestsPane.vue';
 import RulesPane from './panes/RulesPane.vue';
 import StatusPane from './panes/StatusPane.vue';
 import ValuesPane from './panes/ValuesPane.vue';
-import { clearSelection, loadSessions, moveSelection, sendComposition, state } from './store';
+import {
+  actingOn,
+  clearSelection,
+  loadSessions,
+  moveSelection,
+  sendComposition,
+  state,
+  toggleMark,
+} from './store';
 import type { Pane } from './store';
 
 const toolbar = ref<InstanceType<typeof AppToolbar> | null>(null);
@@ -53,12 +61,16 @@ function onKeydown(e: KeyboardEvent): void {
   if (inEditable) return;
   if (e.key === 'ArrowDown') {
     e.preventDefault();
-    moveSelection(1);
+    // Shift-arrow is the keyboard's spelling of a shift-click: the anchor stays
+    // where it was and the range grows from it.
+    moveSelection(1, e.shiftKey);
   } else if (e.key === 'ArrowUp') {
     e.preventDefault();
-    moveSelection(-1);
+    moveSelection(-1, e.shiftKey);
   } else if (e.key === 'Escape') {
     clearSelection();
+  } else if (e.key === 'm' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    toggleMark(actingOn.value);
   }
 }
 

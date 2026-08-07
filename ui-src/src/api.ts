@@ -50,6 +50,23 @@ export interface BodyCapture {
   len: number;
   truncated: boolean;
   text: string;
+  /**
+   * `text` is a `[binary, N bytes]` marker rather than the body.
+   *
+   * The proxy's verdict, not one re-derived here: it applies the same rule when
+   * it decides whether to store the preview as text at all, and two copies of
+   * that rule would drift. The bytes themselves come from `/body.bin`.
+   */
+  binary: boolean;
+}
+
+/** The captured bytes of one body, as `/body.bin` hands them over. */
+export interface BodyBytes {
+  bytes: Uint8Array;
+  /** The Content-Type the proxy recorded, without its parameters. */
+  type: string;
+  /** What to call the file, as the proxy named it — `partial-` when capped. */
+  filename: string;
 }
 
 export type HeaderPair = [string, string];
@@ -141,6 +158,12 @@ export interface OkResult {
   error?: string;
 }
 
+/** What an applied bundle carried — see `/api/export` and `/api/import`. */
+export interface ImportResult extends OkResult {
+  groups?: number;
+  values?: number;
+}
+
 /**
  * What one replayed request will actually carry.
  *
@@ -217,19 +240,41 @@ async function postText<T>(url: string, text: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** The `filename="…"` of a `Content-Disposition`, if it carries one. */
+function dispositionName(header: string | null): string {
+  return /filename="([^"]*)"/.exec(header || '')?.[1] || 'body.bin';
+}
+
 export const api = {
   sessions: () => getJson<SessionSummary[]>('/sessions.json'),
   session: (id: number) => getJson<SessionDetail | null>(`/session.json?id=${id}`),
+  /**
+   * The captured body as bytes — what the hex view, the image preview and the
+   * download are all built from. Separate from `/session.json` on purpose: see
+   * `session_body_bytes` in `webui.rs`.
+   */
+  bodyBytes: async (id: number, side: 'req' | 'res'): Promise<BodyBytes> => {
+    const res = await fetch(`/body.bin?id=${id}&side=${side}`);
+    if (!res.ok) throw new Error(`/body.bin: ${res.status}`);
+    return {
+      bytes: new Uint8Array(await res.arrayBuffer()),
+      type: (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(),
+      // Named by the proxy rather than re-derived here, so the file a download
+      // produces and the file `curl` produces have the same name.
+      filename: dispositionName(res.headers.get('content-disposition')),
+    };
+  },
   frames: (id: number) => getJson<WsFrame[]>(`/frames.json?id=${id}`),
   wsPause: (id: number) => getJson<WsPauseStatus>(`/api/ws/status?id=${id}`),
   // Per session and per direction, and all of it at once: that is the only
   // granularity whistle has — there is no release-one-frame anywhere in it.
   releaseWs: (id: number, dir: 'send' | 'receive') =>
     postJson<OkResult & { released?: number }>('/api/ws/release', { id, dir }),
-  clearSessions: () => postJson<OkResult>('/api/sessions/clear', {}),
-  // The endpoint also takes `{ ids: [...] }` for a batch, which nothing calls:
-  // the request table is single-select. See `replay_session` in `webui.rs`.
-  replay: (id: number) => postJson<ReplayResult>('/api/replay', { id }),
+  /** No ids forgets everything; a list forgets exactly those sessions. */
+  clearSessions: (ids?: number[]) => postJson<OkResult>('/api/sessions/clear', ids ? { ids } : {}),
+  replay: (ids: number[]) => postJson<ReplayResult>('/api/replay', { ids }),
+  /** A HAR of the given sessions, as a link the browser downloads. */
+  harUrl: (ids: number[]) => `/sessions.har?ids=${ids.join(',')}`,
   // Sent through the proxy's own port, exactly as a replay is, so the rules
   // apply to it and it is captured — see `send_through_self` in `webui.rs`.
   compose: (c: Composition) => postJson<ComposeResult>('/api/composer', c),
@@ -250,6 +295,19 @@ export const api = {
 
   values: () => getJson<Record<string, string>>('/api/values'),
   saveValues: (json: string) => postText<OkResult>('/api/values', json),
+  // One key at a time. Editing the store as a whole object rewrites every key
+  // on every save, so a typo anywhere loses all of them.
+  setValue: (name: string, value: string) => postJson<OkResult>('/api/value', { name, value }),
+  renameValue: (name: string, to: string) =>
+    postJson<OkResult>('/api/value/rename', { name, to }),
+  deleteValue: (name: string) => postJson<OkResult>('/api/value', { name }, 'DELETE'),
+
+  /**
+   * Apply an exported bundle. The proxy refuses anything without the marker
+   * `/api/export` writes, so a file that merely happens to be JSON is never
+   * read as a setup.
+   */
+  importBundle: (bundle: unknown) => postJson<ImportResult>('/api/import', bundle),
 
   status: () => getJson<ProxyStatus>('/api/status'),
 };

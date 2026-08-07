@@ -264,6 +264,36 @@ body {
 
 .side-add:hover { color: var(--accent); border-color: var(--accent); }
 
+/* Import and export, below the "+ New …" button. Set back from it: creating a
+   group is the everyday act, moving one between machines is not. */
+.side-transfer {
+  display: flex;
+  gap: 4px;
+  margin: 5px 6px 0;
+  font-size: 11px;
+}
+
+.side-transfer button,
+.side-transfer a {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 3px 2px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--fg-faint);
+  font: inherit;
+  text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.side-transfer button:hover,
+.side-transfer a:hover { background: var(--line-soft); color: var(--fg); }
+
 .work {
   flex: 1 1 auto;
   display: flex;
@@ -343,6 +373,45 @@ table.requests tbody tr[aria-selected="true"] td {
 
 table.requests tbody tr[aria-selected="true"] .status-dot { filter: brightness(1.7); }
 table.requests tbody tr[aria-selected="true"] .muted { color: var(--accent-fg); opacity: .85; }
+
+/* With several rows selected, one of them is the row the detail panel is
+   showing. It gets an edge rather than a second colour: the selection is
+   already the loudest thing on screen, and "which of these am I reading" is a
+   quieter question than "which of these did I pick". */
+table.requests tbody tr.current td:first-child { box-shadow: inset 3px 0 0 var(--accent-fg); }
+table.requests tbody tr.current:not([aria-selected="true"]) td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* The mark. Deliberately not the selection's colour: a mark outlives the
+   selection that made it, and survives filtering and re-render. */
+.mark {
+  width: 7px;
+  height: 9px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  fill: var(--warn);
+}
+
+table.requests tbody tr[aria-selected="true"] .mark { fill: var(--accent-fg); }
+
+/* Bulk actions, above the table, only while there is a selection or a mark. */
+.picked-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-bar));
+  border-bottom: 1px solid var(--line);
+}
+
+.picked-bar .count { font-size: 11.5px; color: var(--fg-dim); }
+
+/* An `<a>` cannot be `:disabled`, so an export with nothing to export is set
+   back and made unclickable by hand. */
+.picked-bar a.btn { text-decoration: none; color: var(--fg); }
+.picked-bar a.btn.off { opacity: .45; pointer-events: none; }
 
 .status-dot {
   display: inline-block;
@@ -589,6 +658,63 @@ pre.dump {
   font-size: 11.5px;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* A hex dump is a fixed grid: it must not wrap or the columns stop lining up,
+   so it scrolls sideways instead. */
+pre.dump.hex {
+  white-space: pre;
+  word-break: normal;
+  overflow-x: auto;
+}
+
+/* The line above a body: what was captured, how to look at it, how to save it. */
+.bodybar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 2px 7px;
+}
+
+.bodybar .warn { color: var(--warn); }
+
+/* The Text/Hex/Image switch. The tab strip's shape at the size of a hint. */
+.viewsel {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.viewsel button {
+  padding: 1px 8px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: var(--bg-sub);
+  color: var(--fg-dim);
+  font: inherit;
+  cursor: pointer;
+}
+
+.viewsel button:last-child { border-right: 0; }
+.viewsel button:hover { color: var(--fg); }
+.viewsel button[aria-selected="true"] { background: var(--accent); color: var(--accent-fg); }
+
+/* A checkerboard behind the image, so a transparent PNG reads as transparent
+   rather than as whatever the theme happens to be. */
+.img-preview {
+  padding: 10px;
+  border-radius: 7px;
+  background:
+    conic-gradient(var(--line-soft) 25%, transparent 0 50%, var(--line-soft) 0 75%, transparent 0)
+    0 0 / 16px 16px,
+    var(--bg-sub);
+  text-align: center;
+}
+
+.img-preview img {
+  max-width: 100%;
+  border-radius: 3px;
 }
 
 /* "No rule matched" is a sentence, not a label: let it breathe and wrap. */

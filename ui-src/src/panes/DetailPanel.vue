@@ -90,8 +90,21 @@ watch(
       <RulesTab v-else-if="activeTab === 'rules'" :rules="session.rules" />
       <HeaderList v-else-if="activeTab === 'req-head'" :pairs="state.detail?.req_headers" />
       <HeaderList v-else-if="activeTab === 'res-head'" :pairs="state.detail?.res_headers" />
-      <BodyDump v-else-if="activeTab === 'req-body'" :body="state.detail?.req_body" />
-      <BodyDump v-else-if="activeTab === 'res-body'" :body="state.detail?.res_body" />
+      <!-- Which session and which side, so the panel can ask for the body's
+           bytes: a hex view, an image preview and a download need the body
+           itself, which `/session.json` does not carry. -->
+      <BodyDump
+        v-else-if="activeTab === 'req-body'"
+        :body="state.detail?.req_body"
+        :session="session.id"
+        side="req"
+      />
+      <BodyDump
+        v-else-if="activeTab === 'res-body'"
+        :body="state.detail?.res_body"
+        :session="session.id"
+        side="res"
+      />
       <FrameList v-else-if="activeTab === 'frames'" :frames="state.frames" />
     </div>
   </div>

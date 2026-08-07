@@ -62,7 +62,15 @@ interface State {
   sessions: SessionSummary[];
   /** `null` = every client. */
   client: string | null;
+  /** The row the detail panel is showing — one of `selection`, or `null`. */
   selected: number | null;
+  /** Every row the table has selected, in the order they were picked. */
+  selection: number[];
+  /** Where a shift-click measures its range from. */
+  anchor: number | null;
+  /** Rows flagged by hand — see [`toggleMark`]. */
+  marked: number[];
+  markedOnly: boolean;
   detail: SessionDetail | null;
   frames: WsFrame[] | null;
   /** Whether the selected WebSocket is being held — `null` until asked. */
@@ -72,8 +80,10 @@ interface State {
   prettyBody: boolean;
   /** Bumped when the selection moved by keyboard and wants scrolling into view. */
   revealSeq: number;
-  /** A value name the source list asked the Values editor to jump to. */
-  valueReveal: { key: string; seq: number };
+  /** The value being edited, or `null` for the whole store as one JSON object. */
+  valueKey: string | null;
+  /** The selected value's content, edited on its own. */
+  valueText: string;
   /** A transient message shown where the request count normally is. */
   note: string | null;
   /** True once a call to the proxy failed, until one succeeds. */
@@ -131,6 +141,10 @@ export const state = reactive<State>({
   sessions: [],
   client: null,
   selected: null,
+  selection: [],
+  anchor: null,
+  marked: [],
+  markedOnly: false,
   detail: null,
   frames: null,
   wsPause: null,
@@ -138,7 +152,8 @@ export const state = reactive<State>({
   sort: { key: 'id', dir: 'desc' },
   prettyBody: true,
   revealSeq: 0,
-  valueReveal: { key: '', seq: 0 },
+  valueKey: null,
+  valueText: '',
   note: null,
   offline: false,
 
@@ -170,6 +185,7 @@ const visibleSessions = computed(() => {
   const q = state.filter.trim().toLowerCase();
   return state.sessions.filter((s) => {
     if (state.client && clientOf(s) !== state.client) return false;
+    if (state.markedOnly && !state.marked.includes(s.id)) return false;
     if (!q) return true;
     return (
       (s.url || '').toLowerCase().includes(q) ||
@@ -294,7 +310,14 @@ export async function loadSessions(): Promise<void> {
   if (!list) return;
   state.sessions = list;
   if (state.client && !list.some((s) => clientOf(s) === state.client)) state.client = null;
-  if (state.selected !== null && !list.some((s) => s.id === state.selected)) {
+  // A session that has fallen out of the proxy's ring takes its selection and
+  // its mark with it: both name a row by an id that now belongs to nothing.
+  const live = new Set(list.map((s) => s.id));
+  state.selection = state.selection.filter((id) => live.has(id));
+  state.marked = state.marked.filter((id) => live.has(id));
+  if (state.markedOnly && !state.marked.length) state.markedOnly = false;
+  if (state.anchor !== null && !live.has(state.anchor)) state.anchor = null;
+  if (state.selected !== null && !live.has(state.selected)) {
     state.selected = null;
     state.detail = null;
     state.frames = null;
@@ -302,25 +325,63 @@ export async function loadSessions(): Promise<void> {
   }
 }
 
-export async function selectRow(id: number): Promise<void> {
+/** What a click carried, as the table's modifier keys mean it. */
+export interface Pick {
+  /** ⌘/Ctrl: add this row to the selection, or take it out. */
+  toggle?: boolean;
+  /** Shift: select everything between the anchor and this row. */
+  extend?: boolean;
+}
+
+export async function selectRow(id: number, pick: Pick = {}): Promise<void> {
+  const rows = shownRows.value.map((s) => s.id);
+  const from = state.anchor === null ? -1 : rows.indexOf(state.anchor);
+  if (pick.extend && from >= 0 && rows.includes(id)) {
+    // The range runs through the rows *as shown*, not by id: the table sorts,
+    // and a shift-click means "these, between here and there".
+    const to = rows.indexOf(id);
+    state.selection = rows.slice(Math.min(from, to), Math.max(from, to) + 1);
+  } else if (pick.toggle) {
+    state.selection = state.selection.includes(id)
+      ? state.selection.filter((x) => x !== id)
+      : [...state.selection, id];
+    state.anchor = id;
+  } else {
+    state.selection = [id];
+    state.anchor = id;
+  }
+  // Un-picking the row being shown moves the panel to whatever is still picked,
+  // rather than leaving it on a row the table no longer highlights.
+  await showDetail(state.selection.includes(id) ? id : (state.selection.at(-1) ?? null));
+}
+
+/** Fill the detail panel from one session, or empty it. */
+async function showDetail(id: number | null): Promise<void> {
+  if (id === state.selected) return;
   state.selected = id;
   state.detail = null;
   state.frames = null;
   state.wsPause = null;
+  if (id === null) return;
   const detail = await reach(() => api.session(id));
   if (state.selected !== id || detail === undefined) return;
   state.detail = detail;
 }
 
 export function clearSelection(): void {
-  state.selected = null;
-  state.detail = null;
-  state.frames = null;
-  state.wsPause = null;
+  state.selection = [];
+  state.anchor = null;
+  // `showDetail(null)` is what empties the panel — including the pause banner,
+  // which is read from the session being shown.
+  void showDetail(null);
 }
 
-/** Move the selection `delta` rows through the list, and keep it in view. */
-export function moveSelection(delta: number): void {
+/**
+ * Move the selection `delta` rows through the list, and keep it in view.
+ * With `extend`, the anchor stays put and the range grows — shift-arrow, the
+ * keyboard's spelling of a shift-click.
+ */
+export function moveSelection(delta: number, extend = false): void {
   const list = shownRows.value;
   if (!list.length) return;
   const at = list.findIndex((s) => s.id === state.selected);
@@ -330,8 +391,41 @@ export function moveSelection(delta: number): void {
         ? 0
         : list.length - 1
       : Math.max(0, Math.min(list.length - 1, at + delta));
-  void selectRow(list[next].id);
+  void selectRow(list[next].id, { extend });
   state.revealSeq++;
+}
+
+/**
+ * Flag rows, or clear the flag — all of them at once, so a marked selection
+ * un-marks and a mixed one marks.
+ *
+ * Marks live in this window and nowhere else, deliberately. A mark names a
+ * session by the id the proxy gave it, and those ids start again at 1 every
+ * time the proxy restarts — kept in `localStorage`, a mark would come back
+ * attached to whatever request took its number next, which is worse than not
+ * keeping it. Nor is there anywhere on the proxy to put it: the session ring
+ * records what crossed the wire, not what someone thought about it.
+ */
+export function toggleMark(ids: number[]): void {
+  if (!ids.length) return;
+  state.marked = ids.every((id) => state.marked.includes(id))
+    ? state.marked.filter((id) => !ids.includes(id))
+    : [...new Set([...state.marked, ...ids])];
+  if (!state.marked.length) state.markedOnly = false;
+}
+
+/** The rows the bulk actions act on: the selection, or the one row shown. */
+export const actingOn = computed(() =>
+  state.selection.length ? state.selection : state.selected === null ? [] : [state.selected],
+);
+
+/** Forget the selected sessions, and only those. */
+export async function clearSelected(): Promise<void> {
+  const ids = actingOn.value.slice();
+  if (!ids.length) return;
+  if (!(await reach(() => api.clearSessions(ids)))) return;
+  clearSelection();
+  await loadSessions();
 }
 
 export function toggleSort(key: string): void {
@@ -378,11 +472,14 @@ export async function clearSessions(): Promise<void> {
 }
 
 export async function replaySelected(): Promise<void> {
-  if (state.selected === null) return;
-  const id = state.selected;
-  const res = await reach(() => api.replay(id));
+  const ids = actingOn.value.slice();
+  if (!ids.length) return;
+  const res = await reach(() => api.replay(ids));
   if (!res) return;
-  flashNote(replayNote(res.sessions?.[0]));
+  // One replay is reported in full — whether its body survived the capture is
+  // the thing worth saying. A batch reports the count; naming which of twenty
+  // requests lost bytes belongs on the rows, not in a one-line note.
+  flashNote(ids.length > 1 ? `Replayed ${res.replayed} requests` : replayNote(res.sessions?.[0]));
   // The replay is fired off asynchronously by the proxy; give it a moment to
   // come back around through the capture before asking for the list again.
   setTimeout(() => void loadSessions(), 400);
@@ -627,11 +724,30 @@ export async function loadValues(): Promise<void> {
   }
   state.values = values;
   state.valuesText = JSON.stringify(values, null, 2);
+  // A key that is no longer there — deleted, or renamed from another window —
+  // falls back to the whole store rather than editing something that is gone.
+  if (state.valueKey !== null && !(state.valueKey in values)) state.valueKey = null;
+  if (state.valueKey !== null) state.valueText = values[state.valueKey];
 }
 
-/** Ask the Values editor to jump to a key, from the source list. */
-export function revealValue(key: string): void {
-  state.valueReveal = { key, seq: state.valueReveal.seq + 1 };
+/** Edit one value, or `null` for the whole store as one JSON object. */
+export function selectValue(name: string | null): void {
+  state.valueKey = name;
+  state.valuesStatus = '';
+  state.valueText = name === null ? '' : (state.values[name] ?? '');
+}
+
+/** Save whichever of the two the Values pane is showing. */
+export async function saveValue(): Promise<void> {
+  if (state.valueKey === null) return saveValues();
+  const name = state.valueKey;
+  const res = await reach(() => api.setValue(name, state.valueText));
+  if (!res) {
+    state.valuesStatus = 'Save failed';
+    return;
+  }
+  state.valuesStatus = res.ok ? 'Saved' : res.error || 'Save failed';
+  await loadValues();
 }
 
 export async function saveValues(): Promise<void> {
@@ -648,6 +764,147 @@ export async function saveValues(): Promise<void> {
   } catch {
     state.valuesStatus = 'Save failed';
   }
+}
+
+export async function addValue(): Promise<void> {
+  const name = prompt('Value name:');
+  if (!name || !name.trim()) return;
+  const res = await api.setValue(name.trim(), '');
+  if (!res.ok) {
+    alert(res.error || 'Failed');
+    return;
+  }
+  await loadValues();
+  selectValue(name.trim());
+}
+
+export async function renameValue(name: string): Promise<void> {
+  const to = prompt('Rename value to:', name);
+  if (!to || !to.trim() || to.trim() === name) return;
+  const res = await api.renameValue(name, to.trim());
+  if (!res.ok) {
+    alert(res.error || 'Failed');
+    return;
+  }
+  state.valueKey = to.trim();
+  await loadValues();
+}
+
+export async function deleteValue(name: string): Promise<void> {
+  if (!confirm(`Delete value "${name}"?`)) return;
+  const res = await api.deleteValue(name);
+  if (!res.ok) {
+    alert(res.error || 'Failed');
+    return;
+  }
+  selectValue(null);
+  await loadValues();
+}
+
+// ── import / export ────────────────────────────────────────────────────────
+
+/** The marker the proxy writes into a bundle, and the only way one is known. */
+const BUNDLE_MARKER = 'whistle_rs';
+
+/** Hand `text` to the browser as a file, without leaving the page. */
+export function downloadText(name: string, text: string, type = 'text/plain'): void {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** The selected group, as the rules file it is — the editor's text, as shown. */
+export function exportGroup(): void {
+  downloadText(`${state.group}.rules`, state.rulesText);
+}
+
+/** The selected value, or the whole store as the JSON object it is kept as. */
+export function exportValues(): void {
+  if (state.valueKey === null) downloadText('values.json', state.valuesText, 'application/json');
+  else downloadText(state.valueKey, state.valueText);
+}
+
+/** The parsed object if `text` is an exported bundle, and `null` otherwise. */
+function asBundle(text: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (value && typeof value === 'object' && BUNDLE_MARKER in value) {
+      return value as Record<string, unknown>;
+    }
+  } catch {
+    // Not JSON at all, which is what a rules file is.
+  }
+  return null;
+}
+
+/** A JSON object of strings — the shape a plain values export has. */
+function asValueStore(text: string): Record<string, string> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const entries = Object.entries(value);
+    if (!entries.length || !entries.every(([, v]) => typeof v === 'string')) return null;
+    return Object.fromEntries(entries) as Record<string, string>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read a file back in.
+ *
+ * A bundle — recognised by its marker, never by guessing — restores the groups,
+ * their switches and the values in one act. Anything else is the plain text it
+ * looks like: a rules file becomes the group it is named after, a values export
+ * becomes its keys, and any other file becomes one value.
+ *
+ * Which of the two a plain file lands in follows the pane it was imported from.
+ * A rules group and a value are both just text, and nothing inside the file
+ * tells them apart.
+ */
+export async function importFile(file: File): Promise<void> {
+  const text = await file.text();
+  const bundle = asBundle(text);
+  if (bundle) {
+    const res = await api.importBundle(bundle);
+    if (!res.ok) {
+      alert(res.error || 'Import failed');
+      return;
+    }
+    const note = `Imported ${res.groups ?? 0} groups and ${res.values ?? 0} values`;
+    await loadRules();
+    await loadValues();
+    state.rulesStatus = note;
+    state.valuesStatus = note;
+    return;
+  }
+
+  const name = file.name.replace(/\.(rules|txt|json)$/i, '') || file.name;
+  if (state.pane === 'rules') {
+    // A group that already exists is updated rather than refused, so a file
+    // exported from here imports back over the group it came from.
+    const res = state.groups.some((g) => g.name === name)
+      ? await api.updateRuleGroup(name, text)
+      : await api.addRuleGroup(name, text);
+    if (!res.ok) {
+      alert(res.error || 'Import failed');
+      return;
+    }
+    state.group = name;
+    await loadRules();
+    state.rulesStatus = `Imported ${file.name}`;
+    return;
+  }
+
+  const store = asValueStore(text);
+  for (const [key, value] of Object.entries(store ?? { [name]: text })) {
+    await api.setValue(key, value);
+  }
+  await loadValues();
+  state.valuesStatus = `Imported ${file.name}`;
 }
 
 // ── status ─────────────────────────────────────────────────────────────────
@@ -669,5 +926,5 @@ export function showPane(name: Pane): void {
 /** ⌘S saves whichever pane is showing, and nothing else has one. */
 export function saveCurrentPane(): void {
   if (state.pane === 'rules') void saveRules();
-  else if (state.pane === 'values') void saveValues();
+  else if (state.pane === 'values') void saveValue();
 }

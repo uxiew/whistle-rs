@@ -12,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use super::body::{self, DynBody};
-use super::{AppState, ReplayBody, Session, WsFrame};
+use super::{AppState, Capture, ReplayBody, Session, WsFrame};
 
 /// Route a direct (non-proxied) request to the UI / API.
 pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
@@ -27,15 +27,21 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         (_, "/rootCA.crt") | (_, "/rootca.crt") => root_ca(state),
         (_, "/proxy.pac") | (_, "/pac") => pac(state, &req),
         (_, "/sessions.json") => sessions_json(state),
-        (_, "/sessions.har") => sessions_har(state),
+        (_, "/sessions.har") => sessions_har(state, &req),
         (_, "/session.json") => session_detail_json(state, &req),
+        (_, "/body.bin") => session_body_bytes(state, &req),
         (_, "/frames.json") => frames_json(state, &req),
         ("GET", "/api/rules") => rules_get(state),
         ("POST", "/api/rules") => rules_post(state, req).await,
         ("GET", "/api/values") => values_get(state),
         ("POST", "/api/values") => values_post(state, req).await,
+        ("POST", "/api/value") => value_set(state, req).await,
+        ("POST", "/api/value/rename") => value_rename(state, req).await,
+        ("DELETE", "/api/value") => value_delete(state, req).await,
         ("POST", "/api/replay") => replay_session(state, req).await,
         ("POST", "/api/composer") => compose_request(state, req).await,
+        ("GET", "/api/export") => bundle_export(state),
+        ("POST", "/api/import") => bundle_import(state, req).await,
         ("GET", "/api/rule-groups") => rule_groups_get(state),
         ("POST", "/api/rule-groups") => rule_groups_add(state, req).await,
         ("POST", "/api/rule-group/toggle") => rule_group_toggle(state, req).await,
@@ -44,7 +50,8 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
         ("GET", "/api/ws/status") => ws_status(state, &req),
         ("POST", "/api/ws/release") => ws_release(state, req).await,
-        ("POST", "/api/sessions/clear") => sessions_clear(state),
+        // Takes a body now: the console can forget just the rows it selected.
+        ("POST", "/api/sessions/clear") => sessions_clear(state, req).await,
         ("GET", "/api/status") => status_json(state).await,
         ("GET", "/plugin") => redirect_to("/plugin/"),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
@@ -222,12 +229,35 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
         .unwrap()
 }
 
-/// Export captured traffic as a HAR 1.2 file (importable into DevTools etc.).
-fn sessions_har(state: &Arc<AppState>) -> Response<DynBody> {
-    let sessions: Vec<Session> = {
-        let q = state.sessions.lock().unwrap();
-        q.iter().cloned().collect()
+/// A captured body as a HAR field carries it: `(size, text, base64)`.
+///
+/// A body that is not text goes out **base64-encoded**, which is what HAR 1.2
+/// defines `content.encoding` for. Until this did that, a binary body was
+/// exported as the console's own `[binary, N bytes]` marker, written into the
+/// `text` field where every tool that reads a HAR would take it for the body —
+/// a sentence delivered as if it were an image.
+///
+/// The same key is used on `postData`, which HAR 1.2 does not define it for. It
+/// is the least surprising extension available: a reader that ignores it still
+/// receives the body, recoverable, rather than a sentence that never was one.
+fn har_body(cap: Option<&Capture>) -> (usize, String, bool) {
+    let Some(cap) = cap else {
+        return (0, String::new(), false);
     };
+    let (len, _, text) = cap.snapshot();
+    if !cap.is_binary() {
+        return (len, text, false);
+    }
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        cap.preview_bytes().bytes,
+    );
+    (len, encoded, true)
+}
+
+/// One HAR 1.2 entry for one session. Separate from [`sessions_har`] so the
+/// shape can be asserted on without a proxy behind it.
+fn har_entry(s: &Session) -> serde_json::Value {
     let har_headers = |pairs: &[(String, String)]| -> Vec<serde_json::Value> {
         pairs
             .iter()
@@ -241,62 +271,75 @@ fn sessions_har(state: &Arc<AppState>) -> Response<DynBody> {
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "application/octet-stream".to_string())
     };
+    let encoding = |base64: bool| match base64 {
+        true => serde_json::json!("base64"),
+        false => serde_json::Value::Null,
+    };
 
-    let entries: Vec<serde_json::Value> = sessions
-        .iter()
-        .map(|s| {
-            let (req_len, _, req_text) = s
-                .req_body
-                .as_ref()
-                .map(|c| c.snapshot())
-                .unwrap_or((0, false, String::new()));
-            let (res_len, _, res_text) = s
-                .res_body
-                .as_ref()
-                .map(|c| c.snapshot())
-                .unwrap_or((0, false, String::new()));
-            let post_data = if req_len > 0 {
-                serde_json::json!({ "mimeType": mime_of(&s.req_headers), "text": req_text })
-            } else {
-                serde_json::Value::Null
-            };
-            serde_json::json!({
-                "startedDateTime": super::iso8601_utc(s.time_ms),
-                "time": s.duration_ms,
-                "request": {
-                    "method": s.method,
-                    "url": s.url,
-                    "httpVersion": "HTTP/1.1",
-                    "cookies": [],
-                    "headers": har_headers(&s.req_headers),
-                    "queryString": [],
-                    "postData": post_data,
-                    "headersSize": -1,
-                    "bodySize": req_len,
-                },
-                "response": {
-                    "status": s.status,
-                    "statusText": "",
-                    "httpVersion": "HTTP/1.1",
-                    "cookies": [],
-                    "headers": har_headers(&s.res_headers),
-                    "content": {
-                        "size": res_len,
-                        "mimeType": mime_of(&s.res_headers),
-                        "text": res_text,
-                    },
-                    "redirectURL": "",
-                    "headersSize": -1,
-                    "bodySize": res_len,
-                },
-                "cache": {},
-                "timings": { "send": 0, "wait": s.duration_ms, "receive": 0 },
-                "serverIPAddress": "",
-                "_target": s.target,
-                "_clientIp": s.client_ip,
-            })
+    let (req_len, req_text, req_b64) = har_body(s.req_body.as_ref());
+    let (res_len, res_text, res_b64) = har_body(s.res_body.as_ref());
+    let post_data = if req_len > 0 {
+        serde_json::json!({
+            "mimeType": mime_of(&s.req_headers),
+            "text": req_text,
+            "encoding": encoding(req_b64),
         })
-        .collect();
+    } else {
+        serde_json::Value::Null
+    };
+    serde_json::json!({
+        "startedDateTime": super::iso8601_utc(s.time_ms),
+        "time": s.duration_ms,
+        "request": {
+            "method": s.method,
+            "url": s.url,
+            "httpVersion": "HTTP/1.1",
+            "cookies": [],
+            "headers": har_headers(&s.req_headers),
+            "queryString": [],
+            "postData": post_data,
+            "headersSize": -1,
+            "bodySize": req_len,
+        },
+        "response": {
+            "status": s.status,
+            "statusText": "",
+            "httpVersion": "HTTP/1.1",
+            "cookies": [],
+            "headers": har_headers(&s.res_headers),
+            "content": {
+                "size": res_len,
+                "mimeType": mime_of(&s.res_headers),
+                "text": res_text,
+                "encoding": encoding(res_b64),
+            },
+            "redirectURL": "",
+            "headersSize": -1,
+            "bodySize": res_len,
+        },
+        "cache": {},
+        "timings": { "send": 0, "wait": s.duration_ms, "receive": 0 },
+        "serverIPAddress": "",
+        "_target": s.target,
+        "_clientIp": s.client_ip,
+    })
+}
+
+/// Export captured traffic as a HAR 1.2 file (importable into DevTools etc.).
+///
+/// `?ids=1,2,3` exports only those sessions, in the order the capture holds
+/// them — what the request table's multi-selection asks for. Without it the
+/// answer is everything, as before.
+fn sessions_har(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let wanted = id_list(req, "ids");
+    let sessions: Vec<Session> = {
+        let q = state.sessions.lock().unwrap();
+        q.iter()
+            .filter(|s| wanted.as_ref().is_none_or(|ids| ids.contains(&s.id)))
+            .cloned()
+            .collect()
+    };
+    let entries: Vec<serde_json::Value> = sessions.iter().map(har_entry).collect();
 
     let har = serde_json::json!({
         "log": {
@@ -337,6 +380,117 @@ fn session_detail_json(state: &Arc<AppState>, req: &Request<Incoming>) -> Respon
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(body)))
         .unwrap()
+}
+
+/// One query parameter, undecoded. Every caller here reads digits, a side name
+/// or a comma-separated id list, none of which percent-encoding reaches.
+fn query_param(req: &Request<Incoming>, name: &str) -> Option<String> {
+    req.uri().query().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+            .map(|v| v.to_string())
+    })
+}
+
+/// A `?name=1,2,3` session-id list. `None` when the parameter is absent, which
+/// every caller reads as "all of them" — an *empty* list is a selection of
+/// nothing and stays distinct from it.
+fn id_list(req: &Request<Incoming>, name: &str) -> Option<Vec<u64>> {
+    query_param(req, name)
+        .map(|v| v.split(',').filter_map(|id| id.trim().parse().ok()).collect())
+}
+
+/// The captured bytes of one body (`?id=N&side=req|res`).
+///
+/// The hex view, the image preview and the download all need the body as bytes,
+/// and until this route existed the console never saw them: a non-textual body
+/// was replaced by a `[binary, N bytes]` marker as it was serialized, so there
+/// was nothing behind the marker to render.
+///
+/// `/session.json` deliberately does not grow a base64 copy instead. It is
+/// fetched on every selection, and encoding two 16 KiB previews into it would be
+/// paid on every click, by everyone, to serve the small minority of bodies
+/// anyone opens as bytes. A HAR has no such choice — it is one file that has to
+/// carry everything — which is why [`har_body`] does base64 and this does not.
+///
+/// The response is **always** an attachment, whatever type was recorded. These
+/// bytes are whatever the inspected site sent, and they are served from the
+/// console's own origin: a captured `text/html` body rendered as a page here
+/// would be someone else's script with reach into `/api/rules`. An attachment
+/// is never rendered as a page, and `nosniff` stops the browser deciding the
+/// type for itself. Neither `fetch` nor `<img>` honours the disposition, and
+/// those are the only two ways the console reads this route.
+fn session_body_bytes(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let want: Option<u64> = query_param(req, "id").and_then(|v| v.parse().ok());
+    let side = query_param(req, "side").unwrap_or_else(|| "res".to_string());
+    let found: Option<Session> = want.and_then(|id| {
+        let q = state.sessions.lock().unwrap();
+        q.iter().find(|s| s.id == id).cloned()
+    });
+    let Some(sess) = found else {
+        return not_found();
+    };
+    let capture = match side.as_str() {
+        "req" => sess.req_body.as_ref(),
+        "res" => sess.res_body.as_ref(),
+        _ => return not_found(),
+    };
+    let Some(preview) = capture.map(|c| c.preview_bytes()) else {
+        return not_found();
+    };
+    let content_type = preview
+        .content_type
+        .as_deref()
+        .and_then(|ct| hyper::header::HeaderValue::from_str(ct).ok())
+        .unwrap_or_else(|| hyper::header::HeaderValue::from_static("application/octet-stream"));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, content_type)
+        .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(
+            hyper::header::CONTENT_DISPOSITION,
+            format!(
+                "attachment; filename=\"{}\"",
+                body_filename(&sess, &side, preview.truncated)
+            ),
+        )
+        .body(body::full(preview.bytes))
+        .unwrap()
+}
+
+/// What to call a downloaded body: the last segment of the URL when it has one,
+/// and the session it came from when it does not.
+///
+/// A capped preview is named `partial-…`. The bytes are a prefix of the body and
+/// nothing inside the file can say so — a truncated PNG saved under the name of
+/// the whole one is a wrong answer that looks like a corrupt server.
+fn body_filename(sess: &Session, side: &str, truncated: bool) -> String {
+    let without_query = sess.url.split(['?', '#']).next().unwrap_or("");
+    // The path, never the authority: `https://example.com/` has no filename in
+    // it, and the last `/`-segment of the whole URL would be the host.
+    let path = match without_query.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map(|(_, p)| p).unwrap_or(""),
+        None => without_query,
+    };
+    // Only the characters a filename needs. The rest is dropped rather than
+    // escaped: this ends up inside a quoted `Content-Disposition` filename, and
+    // the URL is the inspected site's to choose — a quote or a CRLF in it would
+    // close the filename early and start a header of its own.
+    let name: String = path
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    let name = match name.trim_matches('.').is_empty() {
+        true => format!("session-{}-{side}.bin", sess.id),
+        false => name,
+    };
+    match truncated {
+        true => format!("partial-{name}"),
+        false => name,
+    }
 }
 
 /// Captured WebSocket frames as JSON. `?id=<session>` filters to one
@@ -481,6 +635,131 @@ fn values_dir(state: &Arc<AppState>) -> std::path::PathBuf {
 
 fn rules_dir(state: &Arc<AppState>) -> std::path::PathBuf {
     state.config.data_dir().join("rules")
+}
+
+/// The marker that identifies an exported bundle, so a file that merely happens
+/// to be JSON is never applied as one.
+const BUNDLE_MARKER: &str = "whistle_rs";
+
+/// Everything the console can edit, as one object: every rule group with the
+/// text and the enabled state it has, and the whole values store.
+///
+/// A group is plain text and the console can save one straight out of its
+/// editor, so this exists for what a per-group file cannot carry: a *setup*.
+/// Exporting groups one at a time loses which of them were switched off, and
+/// loses the values store entirely — which is how a set of rules arrives on
+/// another machine resolving `{mock.json}` to nothing at all.
+fn bundle_of(
+    mgr: &crate::rules::RuleManager,
+    values: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let groups: Vec<serde_json::Value> = mgr
+        .groups()
+        .iter()
+        .map(|g| serde_json::json!({ "name": g.name, "enabled": g.enabled, "text": g.text }))
+        .collect();
+    serde_json::json!({
+        BUNDLE_MARKER: crate::config::VERSION,
+        "rules": groups,
+        "values": values,
+    })
+}
+
+/// Apply an exported bundle, returning how many groups and values it carried.
+///
+/// A group that is already there is updated **in place**. Group order is
+/// precedence, so removing and re-adding one would move it to the back and
+/// quietly change which rule wins — an import that says it restored a setup
+/// must not reorder the rules that were already in it. A group that is not
+/// there is appended, in the order the bundle lists it.
+///
+/// The default group is set rather than added, for the reason
+/// [`crate::rules::storage::load_groups`] does the same: it always exists, and
+/// `add_group` would refuse it and drop what the bundle carried for it.
+fn apply_bundle(
+    mgr: &mut crate::rules::RuleManager,
+    values: &mut std::collections::HashMap<String, String>,
+    bundle: &serde_json::Value,
+) -> (usize, usize) {
+    let mut groups = 0;
+    for g in bundle.get("rules").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+        let Some(name) = g.get("name").and_then(|v| v.as_str()).map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let text = g.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let enabled = g.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let was = mgr.groups().iter().find(|x| x.name == name).map(|x| x.enabled);
+        match (name, was) {
+            ("default", _) => mgr.set_text(text),
+            (_, Some(_)) => {
+                mgr.update_group(name, text);
+            }
+            (_, None) => {
+                mgr.add_group(name, text, enabled);
+            }
+        }
+        // `update_group` and `set_text` leave the switch alone, so it is moved
+        // separately — and only when it differs, since a toggle is all there is.
+        if was.is_some_and(|w| w != enabled) {
+            mgr.toggle_group(name);
+        }
+        groups += 1;
+    }
+    let mut count = 0;
+    if let Some(map) = bundle.get("values").and_then(|v| v.as_object()) {
+        for (name, value) in map {
+            let Some(value) = value.as_str() else { continue };
+            values.insert(name.clone(), value.to_string());
+            count += 1;
+        }
+    }
+    (groups, count)
+}
+
+fn bundle_export(state: &Arc<AppState>) -> Response<DynBody> {
+    let bundle = {
+        let mgr = state.rules.read().unwrap();
+        let values = state.values.read().unwrap();
+        bundle_of(&mgr, &values)
+    };
+    let body = serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| "{}".into());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(
+            hyper::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"whistle-rs-rules-and-values.json\"",
+        )
+        .body(body::full(Bytes::from(body)))
+        .unwrap()
+}
+
+async fn bundle_import(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let bundle = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if bundle.get(BUNDLE_MARKER).is_none() {
+        return json_error("not an exported bundle");
+    }
+    let (groups, values) = {
+        let mut mgr = state.rules.write().unwrap();
+        let mut store = state.values.write().unwrap();
+        let counts = apply_bundle(&mut mgr, &mut store, &bundle);
+        crate::rules::storage::save_groups(&rules_dir(state), &mgr);
+        crate::rules::storage::save_values(&values_dir(state), &store);
+        counts
+    };
+    tracing::info!("imported {groups} rule groups and {values} values via UI");
+    let body = format!("{{\"ok\":true,\"groups\":{groups},\"values\":{values}}}");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body)))
+        .unwrap()
 }
 
 fn rule_groups_get(state: &Arc<AppState>) -> Response<DynBody> {
@@ -751,9 +1030,35 @@ async fn status_json(state: &Arc<AppState>) -> Response<DynBody> {
         .unwrap()
 }
 
-fn sessions_clear(state: &Arc<AppState>) -> Response<DynBody> {
-    state.clear_sessions();
-    tracing::info!("sessions cleared via UI");
+/// Forget captured sessions: all of them, or only the `{"ids":[…]}` the request
+/// table's selection names.
+///
+/// A body that names no ids clears everything, which is both what the console
+/// sent before multi-select existed (`{}`) and the only reading of "clear" that
+/// an empty request can have.
+async fn sessions_clear(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let ids: Option<Vec<u64>> = read_json_body(req).await.ok().and_then(|v| {
+        let list = v.get("ids")?.as_array()?;
+        Some(list.iter().filter_map(|id| id.as_u64()).collect())
+    });
+    let Some(ids) = ids else {
+        state.clear_sessions();
+        tracing::info!("sessions cleared via UI");
+        return json_ok();
+    };
+    // The frames go with the sessions they belong to, exactly as they do in
+    // `clear_sessions` — a frame whose connection has been forgotten is
+    // unreachable in the console and would only sit in the ring.
+    {
+        let mut q = state.sessions.lock().unwrap();
+        q.retain(|s| !ids.contains(&s.id));
+    }
+    state
+        .ws_frames
+        .lock()
+        .unwrap()
+        .retain(|f| !ids.contains(&f.session));
+    tracing::info!("{} sessions cleared via UI", ids.len());
     json_ok()
 }
 
@@ -791,6 +1096,119 @@ async fn values_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<
             .status(StatusCode::BAD_REQUEST)
             .body(body::full(Bytes::from_static(b"expected a JSON object")))
             .unwrap(),
+    }
+}
+
+/// Read-modify-write the values store, persisting whatever the edit left.
+///
+/// The disk write happens under the same lock as the edit. Editing one key at a
+/// time means the console makes several of these calls in quick succession, and
+/// a save that ran outside the lock could write a copy of the store taken before
+/// its neighbour's change — a key that comes back after a restart having quietly
+/// lost an edit is the same failure this store was fixed for once already.
+fn edit_values(
+    state: &Arc<AppState>,
+    edit: impl FnOnce(&mut std::collections::HashMap<String, String>) -> bool,
+) -> bool {
+    let mut values = state.values.write().unwrap();
+    if !edit(&mut values) {
+        return false;
+    }
+    crate::rules::storage::save_values(&values_dir(state), &values);
+    true
+}
+
+/// Move a value from one name to another.
+///
+/// Refuses to rename onto a name that is taken: `{name}` references resolve by
+/// name, so overwriting one here would silently repoint every rule that used it
+/// at somebody else's content.
+fn rename_value(
+    values: &mut std::collections::HashMap<String, String>,
+    from: &str,
+    to: &str,
+) -> Result<(), &'static str> {
+    let Some(content) = values.get(from).cloned() else {
+        return Err("value not found");
+    };
+    if from == to {
+        return Ok(());
+    }
+    if values.contains_key(to) {
+        return Err("a value by that name already exists");
+    }
+    values.remove(from);
+    values.insert(to.to_string(), content);
+    Ok(())
+}
+
+/// The `name` a value endpoint was given, trimmed. A blank one is not a name:
+/// `{}` resolves to nothing, so a value stored under it could never be read.
+fn value_name(payload: &serde_json::Value, key: &str) -> Option<String> {
+    let name = payload.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Create or replace one named value (`{"name":…,"value":…}`).
+///
+/// Editing the store as a whole JSON object — the only way there was — means
+/// every edit rewrites every key, so a typo anywhere loses the lot and two
+/// tabs open on the pane overwrite each other silently.
+async fn value_set(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(name) = value_name(&payload, "name") else {
+        return json_error("name is required");
+    };
+    let value = payload
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    edit_values(state, |values| {
+        values.insert(name, value);
+        true
+    });
+    json_ok()
+}
+
+/// Rename one value (`{"name":…,"to":…}`).
+async fn value_rename(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let (Some(from), Some(to)) = (value_name(&payload, "name"), value_name(&payload, "to")) else {
+        return json_error("name is required");
+    };
+    let mut failure = None;
+    edit_values(state, |values| match rename_value(values, &from, &to) {
+        Ok(()) => true,
+        Err(why) => {
+            failure = Some(why);
+            false
+        }
+    });
+    match failure {
+        Some(why) => json_error(why),
+        None => json_ok(),
+    }
+}
+
+/// Delete one value (`{"name":…}`).
+async fn value_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(name) = value_name(&payload, "name") else {
+        return json_error("name is required");
+    };
+    match edit_values(state, |values| values.remove(&name).is_some()) {
+        true => json_ok(),
+        false => json_error("value not found"),
     }
 }
 
@@ -1184,6 +1602,279 @@ fn index_html(state: &Arc<AppState>) -> String {
         .replace("__VERSION__", crate::config::VERSION)
         .replace("__HOST__", &host)
         .replace("__PORT__", &state.config.port.to_string())
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+    use crate::rules::RuleManager;
+    use std::collections::HashMap;
+
+    /// A manager with a default group and two named ones, the second off.
+    fn setup() -> (RuleManager, HashMap<String, String>) {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com http://localhost:5173\n");
+        mgr.add_group("staging", "api.example.com host://10.0.0.9\n", true);
+        mgr.add_group("archive", "# kept, not applied\n", false);
+        let values = HashMap::from([("mock.json".to_string(), "{\"ok\":true}".to_string())]);
+        (mgr, values)
+    }
+
+    /// What a group list reduces to for comparison: name, switch and text, in
+    /// order — order being precedence, it is part of what has to survive.
+    fn shape(mgr: &RuleManager) -> Vec<(String, bool, String)> {
+        mgr.groups()
+            .iter()
+            .map(|g| (g.name.clone(), g.enabled, g.text.clone()))
+            .collect()
+    }
+
+    /// The whole point of the format: what comes out goes back in unchanged.
+    #[test]
+    fn a_bundle_restores_the_setup_it_was_taken_from() {
+        let (mgr, values) = setup();
+        let bundle = bundle_of(&mgr, &values);
+
+        let mut restored = RuleManager::new();
+        let mut restored_values = HashMap::new();
+        let (groups, count) = apply_bundle(&mut restored, &mut restored_values, &bundle);
+        assert_eq!((groups, count), (3, 1));
+        assert_eq!(shape(&restored), shape(&mgr));
+        assert_eq!(restored_values, values);
+    }
+
+    /// Applying a bundle over the setup it came from must be a no-op — not a
+    /// second copy of every group, and not a reordering of them.
+    #[test]
+    fn re_importing_a_bundle_changes_nothing() {
+        let (mut mgr, mut values) = setup();
+        let bundle = bundle_of(&mgr, &values);
+        let before = shape(&mgr);
+        apply_bundle(&mut mgr, &mut values, &bundle);
+        assert_eq!(shape(&mgr), before);
+    }
+
+    /// Group order is precedence. A group that is already there is updated
+    /// where it stands, so an import cannot silently change which rule wins.
+    #[test]
+    fn an_imported_group_keeps_the_position_it_had() {
+        let (mut mgr, mut values) = setup();
+        let bundle = serde_json::json!({
+            BUNDLE_MARKER: "test",
+            "rules": [{ "name": "staging", "enabled": true, "text": "changed\n" }],
+        });
+        apply_bundle(&mut mgr, &mut values, &bundle);
+        assert_eq!(
+            mgr.groups().iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            ["default", "staging", "archive"]
+        );
+        assert_eq!(mgr.groups()[1].text, "changed\n");
+    }
+
+    /// Whether a group is switched on is the thing a plain-text export cannot
+    /// carry, so the bundle has to.
+    #[test]
+    fn an_import_moves_a_groups_switch_to_what_the_bundle_says() {
+        let (mut mgr, mut values) = setup();
+        let bundle = serde_json::json!({
+            BUNDLE_MARKER: "test",
+            "rules": [
+                { "name": "staging", "enabled": false, "text": "api.example.com host://10.0.0.9\n" },
+                { "name": "archive", "enabled": true, "text": "# kept, not applied\n" },
+            ],
+        });
+        apply_bundle(&mut mgr, &mut values, &bundle);
+        assert!(!mgr.groups()[1].enabled);
+        assert!(mgr.groups()[2].enabled);
+    }
+
+    /// The default group always exists, so `add_group` refuses it — the same
+    /// trap `storage::load_groups` documents. Its text has to be *set*.
+    #[test]
+    fn a_bundle_can_restore_the_default_group() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("# whatever was here\n");
+        let mut values = HashMap::new();
+        let bundle = serde_json::json!({
+            BUNDLE_MARKER: "test",
+            "rules": [{ "name": "default", "enabled": true, "text": "a.com host://1.1.1.1\n" }],
+        });
+        apply_bundle(&mut mgr, &mut values, &bundle);
+        assert_eq!(mgr.text(), "a.com host://1.1.1.1\n");
+        assert_eq!(mgr.groups().len(), 1);
+    }
+
+    /// An import adds to the values store rather than replacing it: the bundle
+    /// says what it carries, not what the machine it lands on may keep.
+    #[test]
+    fn imported_values_are_laid_over_the_ones_already_there() {
+        let mut mgr = RuleManager::new();
+        let mut values = HashMap::from([
+            ("keep.txt".to_string(), "mine".to_string()),
+            ("mock.json".to_string(), "old".to_string()),
+        ]);
+        let bundle = serde_json::json!({
+            BUNDLE_MARKER: "test",
+            "values": { "mock.json": "new" },
+        });
+        apply_bundle(&mut mgr, &mut values, &bundle);
+        assert_eq!(values.get("keep.txt").map(String::as_str), Some("mine"));
+        assert_eq!(values.get("mock.json").map(String::as_str), Some("new"));
+    }
+}
+
+#[cfg(test)]
+mod value_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn store(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_renamed_value_keeps_its_content_under_the_new_name() {
+        let mut values = store(&[("mock.json", "{\"ok\":true}")]);
+        assert_eq!(rename_value(&mut values, "mock.json", "fixture.json"), Ok(()));
+        assert_eq!(values.get("fixture.json").map(String::as_str), Some("{\"ok\":true}"));
+        assert!(!values.contains_key("mock.json"));
+    }
+
+    /// A `{name}` reference resolves by name, so a rename onto a name that is
+    /// taken would repoint every rule that used it at somebody else's content —
+    /// and nothing in the rules text would have changed to say so.
+    #[test]
+    fn a_rename_will_not_overwrite_a_value_that_exists() {
+        let mut values = store(&[("a", "first"), ("b", "second")]);
+        assert!(rename_value(&mut values, "a", "b").is_err());
+        assert_eq!(values.get("b").map(String::as_str), Some("second"));
+        assert_eq!(values.get("a").map(String::as_str), Some("first"));
+    }
+
+    /// Renaming to the same name is what a rename dialogue answers with when
+    /// nothing was typed, and it must not read as a collision with itself.
+    #[test]
+    fn renaming_a_value_to_its_own_name_does_nothing() {
+        let mut values = store(&[("a", "first")]);
+        assert_eq!(rename_value(&mut values, "a", "a"), Ok(()));
+        assert_eq!(values.get("a").map(String::as_str), Some("first"));
+    }
+
+    #[test]
+    fn renaming_a_value_that_is_not_there_is_an_error() {
+        assert!(rename_value(&mut store(&[]), "gone", "new").is_err());
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use crate::proxy::Capture;
+
+    fn session(url: &str, id: u64) -> Session {
+        Session {
+            id,
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A PNG saved from the console should arrive under the name it had on the
+    /// site it came from.
+    #[test]
+    fn a_downloaded_body_is_named_after_its_url() {
+        let s = session("https://cdn.example.com/img/logo.png?v=2", 7);
+        assert_eq!(body_filename(&s, "res", false), "logo.png");
+    }
+
+    /// A URL with nothing to take a name from still has to produce one, and the
+    /// session it came from is the only thing left to name it after.
+    #[test]
+    fn a_body_from_a_url_with_no_filename_is_named_after_its_session() {
+        assert_eq!(
+            body_filename(&session("https://example.com/", 12), "req", false),
+            "session-12-req.bin"
+        );
+        assert_eq!(
+            body_filename(&session("https://example.com", 13), "res", false),
+            "session-13-res.bin"
+        );
+    }
+
+    /// The preview is capped, so what is downloaded is a prefix. Nothing inside
+    /// a truncated PNG can say so — saved under the name of the whole file it
+    /// would read as a corrupt server rather than a capped capture.
+    #[test]
+    fn a_truncated_download_says_so_in_its_name() {
+        let s = session("https://cdn.example.com/app.a91f.js", 3);
+        assert_eq!(body_filename(&s, "res", true), "partial-app.a91f.js");
+    }
+
+    /// A name is taken from the URL, not trusted from it: the value ends up in
+    /// a `Content-Disposition` header, where a quote or a newline would end the
+    /// filename early and start something else.
+    #[test]
+    fn a_downloaded_body_cannot_be_named_by_the_site_it_came_from() {
+        let s = session("https://evil.example.com/a\"b\r\nX-Evil:%201.bin", 1);
+        assert_eq!(body_filename(&s, "res", false), "abX-Evil201.bin");
+    }
+
+    /// The bug this closes: a HAR entry carried `[binary, N bytes]` in the field
+    /// a HAR reader takes for the body, so an exported capture handed every
+    /// image on to the next tool as that sentence.
+    #[test]
+    fn a_binary_body_is_exported_as_base64() {
+        let raw = [0x89, b'P', b'N', b'G', 0x0d];
+        let s = Session {
+            res_headers: vec![("content-type".into(), "image/png".into())],
+            res_body: Some(Capture::from_bytes(&raw, Some("image/png".into()), None, 64)),
+            ..session("https://example.com/logo.png", 1)
+        };
+        let entry = har_entry(&s);
+        let content = &entry["response"]["content"];
+        assert_eq!(content["encoding"], "base64");
+        assert_eq!(content["size"], 5);
+        assert_eq!(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                content["text"].as_str().unwrap()
+            )
+            .unwrap(),
+            raw
+        );
+    }
+
+    /// A text body is exported as itself, with no `encoding` for a reader to
+    /// have to understand.
+    #[test]
+    fn a_text_body_is_exported_as_text() {
+        let s = Session {
+            req_headers: vec![("content-type".into(), "application/json".into())],
+            req_body: Some(Capture::from_bytes(
+                br#"{"name":"third"}"#,
+                Some("application/json".into()),
+                None,
+                64,
+            )),
+            ..session("https://example.com/api/items", 1)
+        };
+        let post = &har_entry(&s)["request"]["postData"];
+        assert_eq!(post["text"], r#"{"name":"third"}"#);
+        assert!(post["encoding"].is_null());
+    }
+
+    /// A session with no bodies still exports, with the fields a HAR requires
+    /// and nothing invented behind them.
+    #[test]
+    fn a_session_without_bodies_exports_empty_ones() {
+        let entry = har_entry(&session("https://example.com/", 1));
+        assert!(entry["request"]["postData"].is_null());
+        assert_eq!(entry["response"]["content"]["size"], 0);
+        assert_eq!(entry["response"]["content"]["text"], "");
+    }
 }
 
 #[cfg(test)]

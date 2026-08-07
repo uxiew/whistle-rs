@@ -33,10 +33,12 @@ npm run typecheck # vue-tsc
 answers, with a fixture chosen to reach the corners: a failed request, a request
 that timed out with status 0, a WebSocket with frames (one dropped by
 `enable://ignoreSend`, two held by `enable://pauseSend` so the release control has
-something to release), a truncated body, a body that is not JSON, a disabled
-rule group, and a plugin that has never answered. It is dev-only — `apply:
-'serve'` keeps it out of the build. Its state is per-server-process: restart
-`npm run dev` to get the held frames back after releasing them.
+something to release), a truncated body, a body that is not JSON, an image, a
+binary body that is neither text nor an image and is truncated as well, a
+disabled rule group, and a plugin that has never answered. It is dev-only —
+`apply: 'serve'` keeps it out of the build. Its state is per-server-process:
+restart `npm run dev` to get the held frames back after releasing them.
+
 
 ## Layout
 
@@ -51,7 +53,7 @@ src/format.ts           bytes, times, hosts, JSON
 src/curl.ts             the request as a curl command
 src/sidebar/*.vue       the five source lists, one per pane
 src/panes/*.vue         the five panes and the detail tabs
-src/components/*.vue    toolbar, side item, card, editor
+src/components/*.vue    toolbar, side item, card, editor, import/export
 src/editor/             the rules language for CodeMirror 6
 src/styles/app.css      the palette and everything painted with it
 ```
