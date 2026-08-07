@@ -2913,6 +2913,40 @@ pub fn forces_write(resolved: &Resolved) -> bool {
         && !disabled_flags(resolved).contains("forceReqWrite")
 }
 
+/// How many bytes of a request body may be read into memory before the
+/// operators that rewrite it give up and let it stream past.
+///
+/// whistle's `MAX_REQ_SIZE` is 2MB, raised to `BIG_MAX_REQ_SIZE` (16MB) by
+/// `enable://reqMergeBigData` (`_original/lib/inspectors/req.js:19-20,:163`).
+/// This port has no `config.strict`, so the 1MB strict variant has no spelling
+/// here and the plain 2MB is the floor.
+///
+/// Upstream also raises it from its own settings (the `enableBigData` argument);
+/// there is no such setting here, so the rule flag is the only way up — which is
+/// the way a user would reach for anyway, since it is per-request.
+pub fn req_body_limit(resolved: &Resolved) -> usize {
+    /// `BIG_MAX_REQ_SIZE` (`req.js:20`).
+    const BIG: usize = 16 * 1024 * 1024;
+    // `isEnable` is the flag minus its cancellation, the same shape
+    // [`forces_write`] uses (`_original/lib/util/index.js:676-679`).
+    let on = enabled_flags(resolved).contains("reqMergeBigData")
+        && !disabled_flags(resolved).contains("reqMergeBigData");
+    match on {
+        true => BIG,
+        false => REQ_BODY_LIMIT,
+    }
+}
+
+/// The bound when no rule has been resolved yet — whistle's `MAX_REQ_SIZE`
+/// (`_original/lib/inspectors/req.js:19`).
+///
+/// The body-filter pass reads a request body *in order to decide which rules
+/// apply*, so it cannot ask a rule how much to read: [`req_body_limit`]'s raised
+/// bound is unavailable to it by construction. Upstream is in the same position
+/// and answers the same way — `resolveBodyFilter` buffers a prefix and matches
+/// on that.
+pub const REQ_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
 /// Build the response trailer headers from `trailers://` operators.
 ///
 /// `trailers` is one of `parseRuleJson`'s arguments (`_original/lib/inspectors/res.js:845-855`),

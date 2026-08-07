@@ -191,10 +191,16 @@ impl Body for ThrottledBody {
 pub enum Capped {
     /// The whole body arrived within the limit.
     Whole(Bytes),
-    /// The body is larger than the limit. Nothing has been lost: this is the
-    /// same body, from its first byte, with the part already read queued in
-    /// front of the part still arriving. It can only be streamed, not rewritten.
-    TooBig(DynBody),
+    /// The body is larger than the limit. Nothing has been lost: `body` is the
+    /// same body from its first byte, with the part already read queued in
+    /// front of the part still arriving, and it can only be streamed rather
+    /// than rewritten.
+    ///
+    /// `prefix` is that same read-so-far part on its own. A filter that asks
+    /// whether the body *contains* something can still answer from it, which is
+    /// what upstream's body filters do — they match on the prefix they buffered
+    /// rather than declining to match at all.
+    TooBig { prefix: Bytes, body: DynBody },
 }
 
 /// Read a body into memory, giving up if it exceeds `limit`.
@@ -223,18 +229,25 @@ pub async fn collect_capped(body: DynBody, limit: usize) -> Result<Capped, BodyE
         }
         seen.push(frame);
         if total > limit {
-            return Ok(Capped::TooBig(
-                QueuedBody { queued: seen.into(), inner: body }.boxed(),
-            ));
+            return Ok(Capped::TooBig {
+                prefix: flatten(&seen, total),
+                body: QueuedBody { queued: seen.into(), inner: body }.boxed(),
+            });
         }
     }
-    let mut whole = bytes::BytesMut::with_capacity(total);
-    for frame in seen {
-        if let Ok(data) = frame.into_data() {
-            whole.extend_from_slice(&data);
+    Ok(Capped::Whole(flatten(&seen, total)))
+}
+
+/// The data bytes of `frames`, in order. Trailer frames carry none and are
+/// skipped rather than dropped — the frames themselves are still queued.
+fn flatten(frames: &[Frame<Bytes>], total: usize) -> Bytes {
+    let mut out = bytes::BytesMut::with_capacity(total);
+    for frame in frames {
+        if let Some(data) = frame.data_ref() {
+            out.extend_from_slice(data);
         }
     }
-    Ok(Capped::Whole(whole.freeze()))
+    out.freeze()
 }
 
 /// Body impl backing [`Capped::TooBig`]: replays the frames already read, then
@@ -294,7 +307,7 @@ mod capped_tests {
         let got = collect_capped(framed(&[b"hello ", b"world"]), 1024).await.expect("ok");
         match got {
             Capped::Whole(bytes) => assert_eq!(&bytes[..], b"hello world"),
-            Capped::TooBig(_) => panic!("11 bytes is not too big for 1024"),
+            Capped::TooBig { .. } => panic!("11 bytes is not too big for 1024"),
         }
     }
 
@@ -305,7 +318,12 @@ mod capped_tests {
         let got = collect_capped(framed(&[b"aaaa", b"bbbb", b"cccc"]), 6).await.expect("ok");
         match got {
             Capped::Whole(_) => panic!("12 bytes is too big for 6"),
-            Capped::TooBig(body) => assert_eq!(drain(body).await, b"aaaabbbbcccc"),
+            Capped::TooBig { prefix, body } => {
+                // What a body filter gets to match on: the part that had been
+                // read when the limit was passed, not nothing at all.
+                assert_eq!(&prefix[..], b"aaaabbbb");
+                assert_eq!(drain(body).await, b"aaaabbbbcccc");
+            }
         }
     }
 

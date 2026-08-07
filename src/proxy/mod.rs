@@ -136,6 +136,16 @@ async fn collect_body(body: DynBody) -> Result<Bytes> {
     }
 }
 
+/// As [`collect_body`], but giving up past `limit` bytes rather than reading
+/// whatever the client decides to send. See [`body::collect_capped`] for what
+/// happens at the limit, and why it is not an error.
+async fn collect_capped_body(body: DynBody, limit: usize) -> Result<body::Capped> {
+    match body::collect_capped(body, limit).await {
+        Ok(capped) => Ok(capped),
+        Err(e) => Err(anyhow::anyhow!("reading body: {e}")),
+    }
+}
+
 /// As [`collect_body`], keeping the trailer section the body carried.
 ///
 /// Collecting a body drops its trailers, and dropping them is not an option:
@@ -2796,11 +2806,22 @@ async fn serve(
     let (req, prebuffered): (Request<DynBody>, Option<Bytes>) = {
         let (parts, incoming) = req.into_parts();
         if needs_req_body {
-            let bytes = incoming.collect().await?.to_bytes();
-            (
-                Request::from_parts(parts, body::full(bytes.clone())),
-                Some(bytes),
-            )
+            // Bounded, because this is a client's upload and the only thing
+            // asking for it is a `b:` filter that wants to read a prefix.
+            // Over the bound the body streams on and the filter answers from
+            // what was read — see [`body::collect_capped`]. The limit here is
+            // the plain one: `enable://reqMergeBigData` lives on a rule, and
+            // which rules apply is the question this buffering exists to
+            // answer, so consulting it would be circular.
+            match collect_capped_body(body::from_incoming(incoming), apply::REQ_BODY_LIMIT).await? {
+                body::Capped::Whole(bytes) => (
+                    Request::from_parts(parts, body::full(bytes.clone())),
+                    Some(bytes),
+                ),
+                body::Capped::TooBig { prefix, body } => {
+                    (Request::from_parts(parts, body), Some(prefix))
+                }
+            }
         } else {
             (
                 Request::from_parts(parts, body::from_incoming(incoming)),
