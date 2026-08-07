@@ -8,6 +8,7 @@ import type { Pane } from '../store';
 
 const PANES: { key: Pane; label: string }[] = [
   { key: 'requests', label: 'Requests' },
+  { key: 'composer', label: 'Composer' },
   { key: 'rules', label: 'Rules' },
   { key: 'values', label: 'Values' },
   { key: 'status', label: 'Status' },

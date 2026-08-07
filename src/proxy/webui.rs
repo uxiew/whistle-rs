@@ -35,6 +35,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("GET", "/api/values") => values_get(state),
         ("POST", "/api/values") => values_post(state, req).await,
         ("POST", "/api/replay") => replay_session(state, req).await,
+        ("POST", "/api/composer") => compose_request(state, req).await,
         ("GET", "/api/rule-groups") => rule_groups_get(state),
         ("POST", "/api/rule-groups") => rule_groups_add(state, req).await,
         ("POST", "/api/rule-group/toggle") => rule_group_toggle(state, req).await,
@@ -853,10 +854,7 @@ fn replay_request(sess: &Session, body: &ReplayBody) -> hyper::Request<body::Dyn
     let uri: hyper::Uri = sess.url.parse().unwrap_or_else(|_| "/".parse().unwrap());
     let mut builder = hyper::Request::builder().method(method).uri(uri);
     for (name, value) in &sess.req_headers {
-        if REPLAY_DROPPED_HEADERS
-            .iter()
-            .any(|h| name.eq_ignore_ascii_case(h))
-        {
+        if is_dropped_header(name) {
             continue;
         }
         if let (Ok(n), Ok(v)) = (
@@ -878,15 +876,39 @@ fn replay_request(sess: &Session, body: &ReplayBody) -> hyper::Request<body::Dyn
         .expect("a request rebuilt from a captured one")
 }
 
-/// Headers a replay sets for itself rather than copying — see [`replay_request`].
-const REPLAY_DROPPED_HEADERS: [&str; 3] =
-    ["content-length", "transfer-encoding", "content-encoding"];
+/// Headers a request sent back through our own port sets for itself rather than
+/// taking from the capture or the Composer's box — see [`replay_request`] and
+/// [`composed_request`]. All three describe a body that only exists here.
+const DROPPED_HEADERS: [&str; 3] = ["content-length", "transfer-encoding", "content-encoding"];
+
+/// True when `name` is one of [`DROPPED_HEADERS`].
+fn is_dropped_header(name: &str) -> bool {
+    DROPPED_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
 
 /// Send a captured session's request through the proxy's own port so it flows
 /// through the full rule-matching + forwarding pipeline again.
 async fn do_replay(
     proxy_port: u16,
     sess: &Session,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    send_through_self(proxy_port, replay_request(sess, &replay_body_of(sess))).await
+}
+
+/// Put a request on the proxy's own port, in absolute-form, and forget it.
+///
+/// This is the whole trick behind both Replay and the Composer: the request is
+/// not sent to the origin from here — it is sent to *us*, so it arrives as any
+/// other proxied request does and gets the full treatment, rules and capture
+/// included. Upstream does the same, pointing its composer's client at
+/// `config.host`/`config.port` rather than at the target
+/// (`_original/lib/service/composer.js:241-242`).
+///
+/// The response is dropped: what it was is already being recorded on the way
+/// past, and the console reads it out of the session list.
+async fn send_through_self(
+    proxy_port: u16,
+    req: hyper::Request<DynBody>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::net::TcpStream;
 
@@ -895,9 +917,167 @@ async fn do_replay(
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::spawn(conn);
 
-    let req = replay_request(sess, &replay_body_of(sess));
     let _resp = sender.send_request(req).await?;
     Ok(())
+}
+
+/// One request composed by hand in the console.
+///
+/// `headers` is the raw `Name: value` text of the console's box rather than an
+/// object, because that is what a person types and what they paste; upstream's
+/// composer takes the same string and parses it the same way
+/// (`parseHeaders`, `_original/lib/util/common.js:1699-1729`).
+///
+/// Every field defaults, so a composition that omits one is a composition with
+/// that field empty rather than a `400`: the console posts what its boxes hold,
+/// and an empty box is a normal state for three of the four.
+#[derive(serde::Deserialize)]
+struct Composed {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    headers: String,
+    #[serde(default)]
+    body: String,
+}
+
+/// Send a request composed in the console's Composer through our own port.
+///
+/// Takes `{ "method", "url", "headers", "body" }` and answers
+/// `{ "ok": true, "url": …, "sent": … }` — the URL as it was actually resolved,
+/// so the console can show that a scheme was filled in, and the body length that
+/// went out. Like Replay it is fire-and-forget: the transaction lands in the
+/// session list a moment later, which is where the console reads its result.
+async fn compose_request(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let body = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return refused("could not read body"),
+    };
+    let composed: Composed = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return refused("invalid JSON"),
+    };
+    let request = match composed_request(&composed) {
+        Ok(r) => r,
+        Err(e) => return refused(&e),
+    };
+    let url = request.uri().to_string();
+    let sent = composed.body.len();
+
+    let port = state.config.port;
+    tokio::spawn(async move {
+        if let Err(e) = send_through_self(port, request).await {
+            tracing::warn!("composed request failed: {e}");
+        }
+    });
+    let answer = serde_json::json!({ "ok": true, "url": url, "sent": sent });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(answer.to_string())))
+        .unwrap()
+}
+
+/// A `400` the console can read: everything it posts, it reads back as JSON.
+fn refused(error: &str) -> Response<DynBody> {
+    let answer = serde_json::json!({ "ok": false, "error": error });
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(answer.to_string())))
+        .unwrap()
+}
+
+/// Build what a composition puts on the wire, or say why it cannot.
+///
+/// Separate from [`compose_request`] so that what is sent can be asserted on
+/// without a socket — as with [`replay_request`], see the tests.
+fn composed_request(c: &Composed) -> Result<hyper::Request<DynBody>, String> {
+    // A bare `example.com/x` means `http://example.com/x`, as everywhere else in
+    // whistle (`setProtocol`, `_original/lib/util/common.js:508-510`).
+    let typed = c.url.trim();
+    if typed.is_empty() {
+        return Err("a URL is required".into());
+    }
+    let url = match typed.contains("://") {
+        true => typed.to_string(),
+        false => format!("http://{typed}"),
+    };
+    let uri: hyper::Uri = url
+        .parse()
+        .map_err(|_| format!("not a URL: {}", c.url.trim()))?;
+    // Absolute-form is what makes this a *proxy* request when it arrives back on
+    // our port rather than a hit on the console — see `proxy::top_level`. A URI
+    // with no authority never gets this far in practice (the parser refuses an
+    // empty one), but the Host header below has to come from somewhere.
+    let authority = uri
+        .authority()
+        .ok_or_else(|| format!("the URL needs a host: {url}"))?
+        .as_str()
+        .to_string();
+
+    // An empty method is a GET, as upstream's `getMethod`
+    // (`_original/lib/util/common.js:1664-1669`).
+    let spelled = c.method.trim().to_ascii_uppercase();
+    let method: hyper::Method = match spelled.is_empty() {
+        true => hyper::Method::GET,
+        false => spelled
+            .parse()
+            .map_err(|_| format!("not an HTTP method: {}", c.method.trim()))?,
+    };
+
+    let mut headers = hyper::HeaderMap::new();
+    for line in c.headers.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Upstream ignores a line with no colon and a name it cannot use
+        // (`parseHeaders`, and the `if (list)` walk that follows it). Here they
+        // are refused instead: a capture is ground truth and dropping an odd
+        // header from it is the lesser evil, but a composition is something a
+        // person just typed into a box, and quietly not sending it is the worst
+        // answer a debugging tool can give.
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| format!("not a header: {line}"))?;
+        let (name, value) = (name.trim(), value.trim());
+        if is_dropped_header(name) {
+            continue;
+        }
+        let n = hyper::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("not a header name: {name}"))?;
+        let v = hyper::header::HeaderValue::from_str(value)
+            .map_err(|_| format!("not a header value: {value}"))?;
+        // Appended, not inserted: `Set-Cookie:` twice is two headers, and a box
+        // you type header lines into is the one place that has to hold both.
+        headers.append(n, v);
+    }
+    // The host is the URL's, whatever was typed — upstream overwrites it the
+    // same way (`_original/lib/service/composer.js:391`). A request whose Host
+    // disagrees with its own absolute URI is not a request anyone means to send;
+    // moving the socket elsewhere is what `host://` rules are for.
+    headers.insert(
+        hyper::header::HOST,
+        hyper::header::HeaderValue::from_str(&authority)
+            .map_err(|_| format!("not a host: {authority}"))?,
+    );
+    let bytes = Bytes::from(c.body.clone());
+    headers.insert(hyper::header::CONTENT_LENGTH, bytes.len().into());
+    headers.insert(
+        hyper::header::HeaderName::from_static(super::COMPOSER_REQ_HEADER),
+        hyper::header::HeaderValue::from_static("1"),
+    );
+
+    let mut request = hyper::Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(body::full(bytes))
+        .map_err(|e| e.to_string())?;
+    *request.headers_mut() = headers;
+    Ok(request)
 }
 
 
@@ -1068,6 +1248,180 @@ mod replay_tests {
         assert_eq!(body.kind(), "partial");
         assert_eq!(body.bytes().map(|b| b.len()), Some(8));
         assert_eq!(sess.req_body.as_ref().unwrap().total(), 200);
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    /// A composition as the console posts it.
+    fn composed(method: &str, url: &str, headers: &str, body: &str) -> Composed {
+        Composed {
+            method: method.into(),
+            url: url.into(),
+            headers: headers.into(),
+            body: body.into(),
+        }
+    }
+
+    /// What the composition would put on the proxy's own port.
+    async fn sent(c: &Composed) -> (hyper::Method, String, Vec<(String, String)>, Bytes) {
+        let req = composed_request(c).expect("a composition that builds");
+        let method = req.method().clone();
+        let uri = req.uri().to_string();
+        let headers = req
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap().to_string()))
+            .collect();
+        let bytes = req
+            .into_body()
+            .collect()
+            .await
+            .expect("a full body")
+            .to_bytes();
+        (method, uri, headers, bytes)
+    }
+
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The whole point: what was typed is what goes out.
+    #[tokio::test]
+    async fn a_composition_is_sent_as_it_was_typed() {
+        let c = composed(
+            "post",
+            "https://example.com/api/items?page=1",
+            "Content-Type: application/json\nX-Tenant: acme",
+            r#"{"name":"third"}"#,
+        );
+        let (method, uri, headers, body) = sent(&c).await;
+        assert_eq!(method, hyper::Method::POST);
+        assert_eq!(uri, "https://example.com/api/items?page=1");
+        assert_eq!(header(&headers, "content-type"), Some("application/json"));
+        assert_eq!(header(&headers, "x-tenant"), Some("acme"));
+        assert_eq!(body, Bytes::from_static(br#"{"name":"third"}"#));
+    }
+
+    /// Composed traffic is the Composer's, so `from:composer` catches a hand-made
+    /// request as readily as it catches a replayed one.
+    #[tokio::test]
+    async fn a_composition_announces_itself() {
+        let (_, _, headers, _) = sent(&composed("GET", "example.com", "", "")).await;
+        assert_eq!(header(&headers, super::super::COMPOSER_REQ_HEADER), Some("1"));
+    }
+
+    /// Typing a bare host is how anyone reaches for a quick request, and whistle
+    /// has always read it as `http://`.
+    #[tokio::test]
+    async fn a_url_with_no_scheme_is_composed_as_http() {
+        let (_, uri, headers, _) = sent(&composed("GET", " example.com/ping ", "", "")).await;
+        assert_eq!(uri, "http://example.com/ping");
+        assert_eq!(header(&headers, "host"), Some("example.com"));
+    }
+
+    /// An empty method is a GET rather than a refusal — the box starts empty.
+    #[tokio::test]
+    async fn a_composition_without_a_method_is_a_get() {
+        let (method, _, _, _) = sent(&composed("  ", "http://example.com/", "", "")).await;
+        assert_eq!(method, hyper::Method::GET);
+    }
+
+    /// The length describes what is being sent, so a `Content-Length` seeded from
+    /// a capture — or typed and then forgotten — cannot make the request lie.
+    #[tokio::test]
+    async fn a_composed_body_carries_its_own_length() {
+        let c = composed(
+            "POST",
+            "http://example.com/",
+            "Content-Length: 402\nTransfer-Encoding: chunked\nContent-Encoding: gzip",
+            "abc",
+        );
+        let (_, _, headers, body) = sent(&c).await;
+        assert_eq!(body, Bytes::from_static(b"abc"));
+        assert_eq!(header(&headers, "content-length"), Some("3"));
+        assert_eq!(header(&headers, "transfer-encoding"), None);
+        assert_eq!(header(&headers, "content-encoding"), None);
+    }
+
+    /// The URL decides the host. A typed `Host:` that disagrees with the URL
+    /// describes a request nobody means to send.
+    #[tokio::test]
+    async fn the_host_header_follows_the_url() {
+        let c = composed("GET", "http://example.com/x", "Host: elsewhere.test", "");
+        let (_, _, headers, _) = sent(&c).await;
+        assert_eq!(header(&headers, "host"), Some("example.com"));
+    }
+
+    /// One name, twice, is two headers — a cookie jar has no other shape.
+    #[tokio::test]
+    async fn a_name_typed_twice_is_sent_twice() {
+        let c = composed("GET", "http://example.com/", "Cookie: a=1\nCookie: b=2", "");
+        let req = composed_request(&c).expect("a composition that builds");
+        let values: Vec<&str> = req
+            .headers()
+            .get_all(hyper::header::COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(values, ["a=1", "b=2"]);
+    }
+
+    /// Blank lines are how a headers box looks while it is being edited.
+    #[tokio::test]
+    async fn blank_lines_between_headers_are_not_headers() {
+        let c = composed("GET", "http://example.com/", "\n\nAccept: */*\n\n", "");
+        let (_, _, headers, _) = sent(&c).await;
+        assert_eq!(header(&headers, "accept"), Some("*/*"));
+    }
+
+    /// Refused rather than dropped: a line that will not be sent has to say so,
+    /// or the console shows a request that is not the one that went out.
+    #[test]
+    fn a_line_that_is_not_a_header_is_refused() {
+        let c = composed("GET", "http://example.com/", "Accept: */*\nX-Tenant acme", "");
+        assert_eq!(
+            composed_request(&c).err().as_deref(),
+            Some("not a header: X-Tenant acme")
+        );
+    }
+
+    /// A path is not a URL. Sent as one it would arrive back on our own port in
+    /// origin-form and be read as a hit on the console, not as traffic — so it
+    /// is refused here, naming what was typed rather than the `http://` this
+    /// would have prefixed to it.
+    #[test]
+    fn a_url_that_is_only_a_path_is_refused() {
+        assert_eq!(
+            composed_request(&composed("GET", "/api/items", "", ""))
+                .err()
+                .as_deref(),
+            Some("not a URL: /api/items")
+        );
+        assert_eq!(
+            composed_request(&composed("GET", "   ", "", ""))
+                .err()
+                .as_deref(),
+            Some("a URL is required")
+        );
+    }
+
+    /// The message names what was typed, because the box is the only place the
+    /// mistake can be corrected.
+    #[test]
+    fn a_method_that_is_not_a_method_is_refused() {
+        assert_eq!(
+            composed_request(&composed("G ET", "http://example.com/", "", ""))
+                .err()
+                .as_deref(),
+            Some("not an HTTP method: G ET")
+        );
     }
 }
 

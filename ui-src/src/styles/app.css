@@ -695,6 +695,105 @@ pre.dump {
 :root[data-theme="dark"] .tok-capture   { color: #ffa657; }
 :root[data-theme="dark"] .tok-reference { color: #b39ae8; }
 
+/* ── composer ──────────────────────────────────────────────────────────── */
+
+/* A request being written: the line you address it on, then the two things you
+   edit, side by side so both get the height an editor needs. */
+.compose {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+.compose-line {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+}
+
+.compose-line input {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.compose-line input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Wide enough for OPTIONS, and no wider: the URL is what wants the room. */
+.compose-method {
+  flex: 0 0 104px;
+  text-transform: uppercase;
+}
+
+.compose-url {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.compose-fields {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: 10px;
+}
+
+/* Under a narrow window the two stack and split the height evenly, rather than
+   squeezing a headers box no line of which would fit. */
+@media (max-width: 900px) {
+  .compose-fields {
+    grid-template-columns: minmax(0, 1fr);
+    grid-auto-rows: minmax(0, 1fr);
+  }
+}
+
+.compose-field {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.compose-field > label {
+  flex: 0 0 auto;
+  padding: 0 2px 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.compose-field textarea {
+  flex: 1 1 auto;
+  min-height: 0;
+  resize: none;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.compose-field textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .hint {
   margin: 6px 2px 0;
   font-size: 11.5px;
