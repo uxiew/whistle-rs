@@ -255,19 +255,52 @@ struct Listen {
     /// whistle's `isProxyPort` compares against the same list
     /// (`config.port`, `httpsPort`, `httpPort`, `socksPort`, `realPort`).
     ports: Vec<u16>,
-    /// The address we bound to, or `None` when bound to all interfaces.
-    bind: Option<IpAddr>,
+    /// The addresses proxies in this process bound to. Empty for a proxy bound
+    /// to all interfaces, which needs no entry: [`is_local_ip`] already answers
+    /// for loopback and the unspecified address.
+    binds: Vec<IpAddr>,
 }
 
 static LISTEN: Lazy<RwLock<Listen>> = Lazy::new(Default::default);
 
-/// Record where this proxy listens, so [`self_loop`] can recognise itself.
-/// Called once from [`crate::proxy::run`] before the first connection is served;
+/// Register where a proxy listens, so [`self_loop`] can recognise it.
+///
+/// Called from [`crate::proxy::run`] before the first connection is served;
 /// until then no port matches and the guard simply never fires.
-pub fn set_listen(bind: Option<IpAddr>, ports: &[u16]) {
+///
+/// **Registers rather than replaces**, because a process may run more than one
+/// proxy: [`crate::embed::Proxy`] is a library handle and an application can
+/// start several. Replacing meant the second one erased the first one's
+/// self-loop protection, so a rule pointing the first proxy at itself recursed
+/// until the process ran out of sockets — the exact thing this guard exists to
+/// prevent.
+///
+/// The trade-off is stated rather than hidden: an embedded proxy that is shut
+/// down leaves its port registered for the life of the process, so a *different*
+/// proxy later reached on that same port would be refused as a loop. That errs
+/// toward refusing a connection instead of recursing into one, which is the
+/// side to err on.
+pub fn register_listen(bind: Option<IpAddr>, ports: &[u16]) {
     if let Ok(mut listen) = LISTEN.write() {
-        listen.bind = bind;
-        listen.ports = ports.to_vec();
+        for port in ports {
+            if !listen.ports.contains(port) {
+                listen.ports.push(*port);
+            }
+        }
+        if let Some(bind) = bind
+            && !listen.binds.contains(&bind)
+        {
+            listen.binds.push(bind);
+        }
+    }
+}
+
+/// Forget every registration. Tests only: production registers once per proxy
+/// and never unregisters — see [`register_listen`].
+#[cfg(test)]
+fn reset_listen() {
+    if let Ok(mut listen) = LISTEN.write() {
+        *listen = Listen::default();
     }
 }
 
@@ -307,7 +340,7 @@ fn is_local_ip(ip: IpAddr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() {
         return true;
     }
-    if LISTEN.read().ok().and_then(|l| l.bind) == Some(ip) {
+    if LISTEN.read().is_ok_and(|l| l.binds.contains(&ip)) {
         return true;
     }
     *PRIMARY_LOCAL_IP == Some(ip)
@@ -1602,7 +1635,10 @@ mod tests {
             // Nothing is registered until the server starts: no port matches.
             assert!(self_loop(&target("a.com", 80, Some(cfg("127.0.0.1:8899")))).await.is_none());
 
-            set_listen(None, &[8899, 1080]);
+            // Registration is additive, so another test starting a proxy of
+            // its own can no longer erase these — which is what made this test
+            // fail about one run in four.
+            register_listen(None, &[8899, 1080]);
 
             let looped = target("a.com", 80, Some(cfg("127.0.0.1:8899")));
             assert_eq!(
@@ -1623,7 +1659,7 @@ mod tests {
             // A direct connection to our own port cannot recurse; not checked.
             assert!(self_loop(&target("127.0.0.1", 8899, None)).await.is_none());
 
-            set_listen(None, &[]);
+            reset_listen();
         });
     }
 

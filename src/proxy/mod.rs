@@ -1826,7 +1826,7 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
     // The *bound* port, not the requested one, or port 0 would register nothing.
     let mut own_ports = vec![addr.port()];
     own_ports.extend(state.config.socks_port);
-    upstream::set_listen(state.config.host, &own_ports);
+    upstream::register_listen(state.config.host, &own_ports);
     tracing::info!(
         "root CA: {} (download at http://{}/rootCA.crt)",
         state.config.root_ca_cert_path().display(),
