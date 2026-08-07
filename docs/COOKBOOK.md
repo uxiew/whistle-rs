@@ -615,15 +615,36 @@ to put the overrides you switch on and off.
 
 ```
 @/etc/whistle/team.rules          # a line starting with @ includes that file
-@https://intra/rules.txt          # …or that URL, fetched at startup
+@https://intra/rules.txt          # …or that URL
 ```
 
-`@` includes are resolved once, at load — and **only for the rules `-r` /
-`--rule` supplied**. A rules text typed into the console or posted to
-`/api/rules` keeps the line as written, and it configures nothing; upstream
-expands it there too. For rules you edit in the console, use `rulesFile://` for a
-file or `rule://` for a named value: both pull in more rules for the requests
-their pattern matches.
+This works wherever the rules came from — the console's editor, `POST
+/api/rules`, a named group, `-r`/`--rule`, an imported bundle. The lines are
+spliced in **where the `@` line stands**, so a rule above it still wins and a
+rule below it still loses.
+
+Two things you will want to know. The line you typed stays the line you typed:
+the console shows `@…`, not the file's contents, and saving does not bake them
+in — so to check whether an include landed, watch the rule *count*:
+
+```bash
+curl --noproxy '*' http://127.0.0.1:8899/api/rule-groups
+# [{"enabled":true,"name":"default","rules":1}]   ← before the fetch
+# [{"enabled":true,"name":"default","rules":9}]   ← after it
+```
+
+And each source is **re-read on a timer** — a file every 5 s, a URL every
+10–30 s — so a shared team rules file takes effect without anyone restarting
+anything. A fetch that fails keeps the last text that worked and says so in the
+log; it never quietly empties your rules.
+
+The line must be *only* `@` and the source: `@team.rules` (relative),
+`@ /etc/x` (a space after the `@`) and `example.com @/etc/x` (a pattern in
+front — that is `G://`) are not includes.
+
+For rules that should apply to **some requests only**, this is the wrong tool:
+use `rulesFile://` for a file or `rule://` for a named value, both of which are
+read per matching request rather than pulled into the file as text.
 
 ```
 example.com   rulesFile:///etc/whistle/team.rules

@@ -67,7 +67,7 @@ The operators worth knowing before the rest are
 
 ## Contents
 
-- [File format](#file-format)
+- [File format](#file-format) — [pulling in another rules text (`@`)](#pulling-in-another-rules-text-)
 - [Patterns](#patterns) — [prefix](#1-domain--url-prefix-most-common) ·
   [leading dot](#2-leading-dot-subdomain-match) · [wildcard](#3-wildcard) ·
   [`^`](#4---wildcards-everywhere) · [`$0`…`$9` captures](#09--what-the-pattern-captured) ·
@@ -129,6 +129,73 @@ whistle-rs -r rules.txt              # from a file
 whistle-rs --rule "example.com host://127.0.0.1:8080"   # inline
 whistle-rs -r rules.txt --rule "…"   # file first, then inline appended
 ```
+
+### Pulling in another rules text (`@`)
+
+A line that is **only** `@` and a source is replaced by the rules that source
+holds, where the line stands:
+
+```
+example.com          host://10.0.0.1
+@/etc/whistle/team.rules      # that file, re-read every 5 s
+@https://intra/rules.txt      # that URL, re-fetched every 10–30 s
+@~/personal.rules             # a path under $HOME
+```
+
+This works for **every** rules text: `-r`/`--rule`, the console's editor,
+`POST /api/rules`, a named group, an imported bundle, and whatever came back off
+disk on restart. Four things follow from how it is done, and each is worth
+knowing before you rely on it:
+
+- **It is spliced where the line stands.** The included lines are ordinary lines
+  of the text they went into, so [precedence](#precedence) is the ordering you
+  can see: a line above the `@` outranks what it brings in, a line below does
+  not, and a `lineProps://important` inside the included text outranks a plain
+  line above it exactly as it would if you had typed it there.
+- **The text you typed stays the text you typed.** The console shows the `@`
+  line, and saving does not bake the fetched rules into your file. To see
+  whether an include actually landed, ask `GET /api/rule-groups` — its `rules`
+  count is of the *parsed* rules, so it goes up when the source arrives.
+- **Setting rules never waits for the network.** The save returns immediately
+  and the include lands when the fetch does — normally within milliseconds, and
+  bounded at 16 s and 256 KB per source. Until then the line contributes
+  nothing, which is also upstream's behaviour.
+- **One level.** An `@` line *inside* an included text is not followed, so
+  there is no cycle to guard against. At most 20 `@` lines per rules text are
+  resolved (upstream's `MAX_REMOTE_RULES_COUNT`).
+
+A source is a `/absolute` path, a `~/` path, a Windows drive path, an
+`http(s)://` URL, a `whistle.<plugin>` name, or a `$<key>` plugin-store
+reference. The last two are **not implemented here** — plugins in whistle-rs are
+external HTTP servers with no such endpoint (see [`PLUGINS.md`](PLUGINS.md)) —
+and the line is logged and contributes nothing. Anything else is not an include
+and keeps whatever meaning it already had:
+
+```
+@team.rules              # relative: not an include (upstream's regexp agrees)
+@ /etc/team.rules        # a space after the @: not an include
+example.com @/etc/x      # a pattern in front: this is the G:// operator
+@/etc/team.rules extra   # trailing text: not an include
+@`/etc/team.rules`       # backticks are allowed, and ${port} resolves inside them
+@/etc/team.rules # note  # a trailing comment is allowed
+```
+
+An `@` line inside a ```` ``` ```` [fenced value](#values-declared-in-the-rules-text)
+is content, not a line, and is never fetched. A value the included text declares
+is available to the text that included it; when both declare the same name, the
+**including** text wins.
+
+> **One divergence, and it is the safer one.** A fetch that fails leaves the
+> last text that source yielded in place, and logs why. Upstream tolerates three
+> consecutive failures and then applies an empty text, deleting the rules that
+> source carried — and blanks it at once on a redirect, or when a file that was
+> there has gone (`updateBody` / `readFile`,
+> `_original/lib/util/http-mgr.js:280-294,:377-401`). A blip on an intranet
+> should not silently remove a team's rules from a running session, and the
+> state it would leave is indistinguishable from the include never having
+> worked. A source that has *never* loaded contributes nothing, which is
+> upstream's initial state too, and a source that answers `204` or an empty body
+> really does empty itself — that is an answer, not a failure.
 
 ---
 
@@ -2416,9 +2483,11 @@ resolve (so mixed rule files load) but have no distinct effect.
 
 **Rule-file features:** `${port}` and `${version}` in operator values are substituted
 (case-insensitive) — wider than upstream, where `CONFIG_VAR_RE`
-(`_original/lib/util/index.js:3262`) is read only for the URL of a backticked
-`@`-include, and a `${port}` elsewhere resolves only inside
-[backticks](#backtick-templates). It never reaches **content**: a `${port}` in an
+(`_original/lib/util/index.js:3262`) has one reader, the source of a backticked
+[`@`-include](#pulling-in-another-rules-text-), and a `${port}` elsewhere
+resolves only inside [backticks](#backtick-templates). That one reader is here
+too, and here it answers the source with or without the backticks. It never
+reaches **content**: a `${port}` in an
 inline `(…)` payload or in what a `{name}` returned is text the mock meant to
 contain. An operator value that names a file or a URL is
 [read before the operator applies](#values-read-from-a-file-or-a-url), and one
@@ -2631,22 +2700,19 @@ in upstream whistle.
 
 Known gaps in the operator layer, deliberately left:
 
-- **`@<file>` / `@<url>` includes are resolved for the startup rules only.**
-  A line that is just `@` and a source is replaced by the text it names. In
-  whistle-rs that happens once, in `main.rs`, for what `-r` / `--rule` supplied;
-  a rules text set through the console or `POST /api/rules` keeps the line, which
-  configures nothing. Upstream applies the same expansion to **every** rules
-  source, the console's own text included (`REMOTE_RULES_RE`,
-  `_original/lib/util/index.js:3296`; `getRemoteRulesResolver`, `:3300-3307`,
-  called from `lib/rules/util.js:73-88`), fenced values in the included text
-  included, up to `MAX_REMOTE_RULES_COUNT` = 20 of them, and re-reads each source
-  on a timer. Two shapes are not includes in either proxy: a line with a pattern
-  in front of it (`example.com @/tmp/rules.txt`) — that is the `G://` global-value
-  operator — and, upstream, a **relative** path, since the regexp wants `/`, `~/`,
-  a drive letter or `http(s)://`; whistle-rs resolves a relative one against the
-  rules file's own directory. Use `rulesFile://` for a file or `rule://` for a
-  named value when the rules come from the console: both are read per matching
-  request instead of once at load.
+- **`@` includes of a plugin's rules are not implemented.** The two source
+  shapes that name a plugin — `@whistle.<name>[/path]` and
+  `@$<key>/…` — reach a plugin's own UI server upstream (`getRemoteRules`,
+  `_original/lib/util/index.js:3271-3290`). Plugins here are external HTTP
+  servers speaking this port's protocol and have no such endpoint, so the line
+  is logged and contributes nothing. Every other source shape works, for every
+  rules text — see
+  [pulling in another rules text](#pulling-in-another-rules-text-).
+- **A `${port}` in an `@` source resolves only once the proxy has bound.** It is
+  answered from the *listening* port, which `--port 0` only settles after the
+  socket exists, so a source written before that is fetched with the variable
+  still in it — and says so in the log rather than fetching port 0. In practice
+  this is unreachable: the first fetch happens after the bind.
 - **`resRules://` entries of a `resScript` list are not applied.** Upstream folds
   them into a rules text the response phase parses; whistle-rs's `resScript` is a
   JavaScript hook that mutates the response directly, so it has nowhere to put

@@ -1810,6 +1810,11 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
     let mut own_ports = vec![addr.port()];
     own_ports.extend(state.config.socks_port);
     upstream::register_listen(state.config.host, &own_ports);
+
+    // The same fact the include layer needs for a `${port}` in a backticked
+    // `@` source: `--port 0` means the operating system chose, and this is the
+    // first moment anyone knows what it chose.
+    state.rules.write().unwrap().set_include_port(addr.port());
     tracing::info!(
         "root CA: {} (download at http://{}/rootCA.crt)",
         state.config.root_ca_cert_path().display(),
@@ -1836,6 +1841,21 @@ pub async fn accept_loop(
                 tracing::error!("SOCKS server error: {e}");
             }
         });
+    }
+
+    // `@` includes, before the first connection is answered.
+    //
+    // The socket is already bound, so a client connecting during a slow fetch
+    // waits in the backlog rather than being refused — and a rules file that
+    // says `@https://intra/rules.txt` is *in effect* for the first request
+    // rather than for the second. Each fetch is capped at 16 s and a proxy
+    // whose rules name no include does no work here at all.
+    let resolves_includes = state.rules.read().unwrap().resolves_includes();
+    if resolves_includes {
+        let landed = crate::rules::include::load_pending(&state.rules).await;
+        tracing::info!("resolved {landed} rules include(s)");
+        let poller = state.clone();
+        tokio::spawn(async move { crate::rules::include::poll(&poller.rules).await });
     }
 
     // `Either` rather than a `select!` per iteration: with no shutdown channel

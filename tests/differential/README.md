@@ -47,7 +47,11 @@ says which port is which.
 It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0` — except for the two corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
-`cases-delete.js` at `differing: 10` and `cases-values.js` at `differing: 16`.
+`cases-delete.js` at `differing: 8` and `cases-values.js` at `differing: 11`.
+
+One corpus claims a fourth port. `cases-includes.js` is about `@` includes, and
+half of them name a **URL**, so it stands up a rules-serving HTTP server at
+`PORT_BASE+10`. It runs clean at `differing: 0`.
 
 Three corpora are not clean on a bare run, by design:
 

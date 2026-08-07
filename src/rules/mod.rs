@@ -14,6 +14,7 @@
 //! What is intentionally simplified vs. the original is documented inline and in
 //! the project README.
 
+pub mod include;
 pub mod matcher;
 pub mod protocols;
 pub mod replace;
@@ -986,25 +987,41 @@ pub struct RuleGroup {
 }
 
 impl RuleGroup {
+    /// A group whose `@` lines are ordinary text. The manager builds its groups
+    /// through [`RuleGroup::unparsed`] instead, so that a group joining a rule
+    /// set that *does* resolve includes is parsed once, against that set's
+    /// [`include::Includes`].
     pub fn new(name: &str, text: &str, enabled: bool) -> Self {
-        let (body, inline_values) = lift_inline_values(text);
-        let rules = parse_text(&body);
+        let mut group = RuleGroup::unparsed(name, text, enabled);
+        group.reparse(&include::Includes::default());
+        group
+    }
+
+    /// A group holding `text` and nothing parsed from it yet.
+    fn unparsed(name: &str, text: &str, enabled: bool) -> Self {
         RuleGroup {
             name: name.to_string(),
             text: text.to_string(),
             enabled,
-            res_candidates: res_candidates(&rules),
-            body_candidates: body_candidates(&rules),
-            has_sni_callback: has_sni_callback(&rules),
-            has_no_intercept: has_no_intercept(&rules),
-            inline_values,
-            rules,
+            rules: Vec::new(),
+            inline_values: HashMap::new(),
+            res_candidates: Vec::new(),
+            body_candidates: Vec::new(),
+            has_sni_callback: false,
+            has_no_intercept: false,
         }
     }
 
     /// Re-parse rules from the current text.
-    fn reparse(&mut self) {
-        let (body, inline) = lift_inline_values(&self.text);
+    ///
+    /// The three steps are upstream's, in upstream's order: the text's own
+    /// ``` blocks are lifted out, then every `@` line is replaced by the text
+    /// its source last yielded, then what is left is parsed
+    /// (`addRules`, `_original/lib/rules/util.js:74-93`). Lifting first is
+    /// load-bearing — see [`include::Includes::expand`].
+    fn reparse(&mut self, includes: &include::Includes) {
+        let (body, mut inline) = lift_inline_values(&self.text);
+        let body = includes.expand(&body, &mut inline);
         self.inline_values = inline;
         self.rules = parse_text(&body);
         self.res_candidates = res_candidates(&self.rules);
@@ -1081,12 +1098,104 @@ pub struct RuleManager {
     /// order alone does not show: the **default group is resolved last**, so a
     /// named group overrides it. See [`RuleManager::resolution_order`].
     groups: Vec<RuleGroup>,
+    /// The `@` sources this rule set's text refers to, and what each last
+    /// yielded — see [`include::Includes`]. Inert unless the manager was built
+    /// by [`RuleManager::with_includes`].
+    includes: include::Includes,
 }
 
 impl RuleManager {
+    /// A rule set whose `@` lines are ordinary text.
+    ///
+    /// What a `rulesFile://` or a `rule://` produces for one request wants this
+    /// one: it is thrown away when the request ends, so a source it named would
+    /// be registered and polled by a proxy that can never use it again.
     pub fn new() -> Self {
         RuleManager {
             groups: Vec::new(),
+            includes: include::Includes::default(),
+        }
+    }
+
+    /// A rule set whose `@` lines pull in the text they name, and keep it fresh.
+    ///
+    /// The long-lived one: what the command line loaded, what the console saves,
+    /// and what came back off disk. See [`include`] for the shape of it.
+    pub fn with_includes() -> Self {
+        RuleManager {
+            groups: Vec::new(),
+            includes: include::Includes::resolving(),
+        }
+    }
+
+    pub(crate) fn includes(&self) -> &include::Includes {
+        &self.includes
+    }
+
+    /// Does this rule set resolve `@` lines? Answered before anything is spent
+    /// on them: a proxy whose rules name no include should never start a poller.
+    pub fn resolves_includes(&self) -> bool {
+        self.includes.resolves()
+    }
+
+    /// Tell the include layer which port this proxy bound, for a `${port}`
+    /// inside a backticked source. Called once the listening socket exists,
+    /// which is the first moment it is knowable — `--port 0` asks the operating
+    /// system.
+    pub fn set_include_port(&mut self, port: u16) {
+        if self.includes.set_port(port) {
+            self.sync_includes();
+            self.reparse_including_groups();
+        }
+    }
+
+    /// Record what a fetch yielded for one source, re-parsing the groups that
+    /// refer to it when the text changed. Returns whether anything changed.
+    pub(crate) fn record_include(&mut self, target: &str, body: Option<String>) -> bool {
+        if !self.includes.record(target, body) {
+            return false;
+        }
+        self.reparse_including_groups();
+        true
+    }
+
+    /// Re-register the sources every **enabled** group's text names.
+    ///
+    /// Upstream registers only the rules files it is about to parse, and an
+    /// unselected one is not among them (`_original/lib/rules/util.js:94-100`),
+    /// so a group switched off in the console stops its includes being fetched.
+    fn sync_includes(&mut self) {
+        if !self.includes.resolves() {
+            return;
+        }
+        let targets: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|g| g.enabled)
+            .flat_map(|g| include::targets_in(&g.text))
+            .map(|target| self.includes.source_of(&target))
+            .collect();
+        self.includes.set_referenced(&targets);
+    }
+
+    /// Re-parse every group whose text carries an `@` line. The groups that do
+    /// not are untouched, which is most of them in most setups.
+    fn reparse_including_groups(&mut self) {
+        let includes = &self.includes;
+        for group in self.groups.iter_mut() {
+            if !include::targets_in(&group.text).is_empty() {
+                group.reparse(includes);
+            }
+        }
+    }
+
+    /// Re-register sources and re-parse `name` — what every mutation of a
+    /// group's text or switch ends with.
+    fn after_change(&mut self, name: &str) {
+        self.sync_includes();
+        let includes = &self.includes;
+        if let Some(group) = self.groups.iter_mut().find(|g| g.name == name) {
+            group.reparse(includes);
         }
     }
 
@@ -1112,11 +1221,11 @@ impl RuleManager {
     pub fn set_text(&mut self, text: &str) {
         if let Some(g) = self.groups.iter_mut().find(|g| g.name == "default") {
             g.text = text.to_string();
-            g.reparse();
         } else {
             self.groups
-                .insert(0, RuleGroup::new("default", text, true));
+                .insert(0, RuleGroup::unparsed("default", text, true));
         }
+        self.after_change("default");
     }
 
     /// Is the default group empty — i.e. did nothing on the command line or in
@@ -1138,11 +1247,11 @@ impl RuleManager {
                 g.text.push('\n');
             }
             g.text.push_str(text);
-            g.reparse();
         } else {
             self.groups
-                .insert(0, RuleGroup::new("default", text, true));
+                .insert(0, RuleGroup::unparsed("default", text, true));
         }
+        self.after_change("default");
     }
 
     /// Resolve the winning operators for a request, considering only enabled
@@ -1310,7 +1419,8 @@ impl RuleManager {
         if self.groups.iter().any(|g| g.name == name) {
             return false;
         }
-        self.groups.push(RuleGroup::new(name, text, enabled));
+        self.groups.push(RuleGroup::unparsed(name, text, enabled));
+        self.after_change(name);
         true
     }
 
@@ -1318,22 +1428,32 @@ impl RuleManager {
     pub fn remove_group(&mut self, name: &str) -> bool {
         let before = self.groups.len();
         self.groups.retain(|g| g.name != name);
-        self.groups.len() < before
+        let removed = self.groups.len() < before;
+        if removed {
+            // The sources only that group named are no longer referenced, and
+            // stop being fetched.
+            self.sync_includes();
+        }
+        removed
     }
 
     /// Toggle a group's enabled state. Returns the new state, or None if not found.
     pub fn toggle_group(&mut self, name: &str) -> Option<bool> {
-        self.groups.iter_mut().find(|g| g.name == name).map(|g| {
+        let state = self.groups.iter_mut().find(|g| g.name == name).map(|g| {
             g.enabled = !g.enabled;
             g.enabled
-        })
+        })?;
+        // A group switched off stops registering its sources, and switching it
+        // back on re-registers them — so its text is re-parsed either way.
+        self.after_change(name);
+        Some(state)
     }
 
     /// Update a group's text. Returns false if not found.
     pub fn update_group(&mut self, name: &str, text: &str) -> bool {
         if let Some(g) = self.groups.iter_mut().find(|g| g.name == name) {
             g.text = text.to_string();
-            g.reparse();
+            self.after_change(name);
             true
         } else {
             false
