@@ -728,6 +728,113 @@ fn js_str(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// `isRulesContent`: rules text unless bracketed, unfenced, uncommented,
+    /// and naming `rules` or `values`.
+    #[test]
+    fn is_rules_content_matches_upstream() {
+        // Plain rules text — no bracket at all.
+        assert!(is_rules_content("a.com reqHeaders://x-a=1"));
+        // Bracketed but a comment, or a fence, or neither word: still rules.
+        assert!(is_rules_content("# a.com file://(mock)"));
+        assert!(is_rules_content("```v\nfoo\n```\na.com reqHeaders://x-a={v}"));
+        assert!(is_rules_content("a.com file://(a subshell of nothing)"));
+        // Bracketed, unfenced, uncommented, and names one of the two words:
+        // this is a script.
+        assert!(!is_rules_content("rules.push('a.com reqHeaders://x=1')"));
+        assert!(!is_rules_content("values['k'] = (1)"));
+        // The word has to stand alone, `\b(?:rules|values)\b`.
+        assert!(is_rules_content("myrules.push('a.com x://y')"));
+        assert!(is_rules_content("rulesfoo = (1)"));
+    }
+
+    /// A rules script pushes lines; an error discards them; `values` set by the
+    /// script does not resolve a `{name}` reference. All measured against
+    /// whistle 2.10.8 first.
+    #[test]
+    fn a_rules_script_pushes_lines_and_an_error_discards_them() {
+        fn ctx(body: &str) -> RulesScriptCtx<'_> {
+            RulesScriptCtx {
+                method: "GET",
+                full_url: "http://a.com/p?q=1",
+                headers: &[],
+                body,
+                client_ip: None,
+                client_port: None,
+                res: None,
+            }
+        }
+        assert_eq!(
+            run_rules_script("rules.push('a.com reqHeaders://x-a=1')", &ctx("")).as_deref(),
+            Some("a.com reqHeaders://x-a=1"),
+        );
+        // The url is readable.
+        assert_eq!(
+            run_rules_script(
+                "if (url.indexOf('q=1') !== -1) rules.push('a.com reqHeaders://x-u=1')",
+                &ctx(""),
+            )
+            .as_deref(),
+            Some("a.com reqHeaders://x-u=1"),
+        );
+        // An error after a push yields nothing at all.
+        assert_eq!(
+            run_rules_script("rules.push('a.com x://y'); throw new Error('boom')", &ctx("")),
+            None,
+        );
+        // A `values` write does not resolve `{name}` — the literal survives.
+        assert_eq!(
+            run_rules_script(
+                "values['m']='x'; rules.push('a.com reqHeaders://x-v={m}')",
+                &ctx(""),
+            )
+            .as_deref(),
+            Some("a.com reqHeaders://x-v={m}"),
+        );
+        // An empty push list is an empty string, not a rule.
+        assert_eq!(run_rules_script("var unused = 1;", &ctx("")).as_deref(), Some(""));
+    }
+
+    /// A `resScript` sees the response head; a request script sees empty strings
+    /// there, so `statusCode == 200` is false in the request pass.
+    #[test]
+    fn a_response_script_sees_the_status() {
+        let res = RulesScriptRes { status: 200, server_ip: None, headers: &[] };
+        let with_res = RulesScriptCtx {
+            method: "GET",
+            full_url: "http://a.com/",
+            headers: &[],
+            body: "",
+            client_ip: None,
+            client_port: None,
+            res: Some(res),
+        };
+        assert_eq!(
+            run_rules_script(
+                "if (statusCode == 200) rules.push('a.com resHeaders://x-r=1')",
+                &with_res,
+            )
+            .as_deref(),
+            Some("a.com resHeaders://x-r=1"),
+        );
+        let no_res = RulesScriptCtx {
+            method: "GET",
+            full_url: "http://a.com/",
+            headers: &[],
+            body: "",
+            client_ip: None,
+            client_port: None,
+            res: None,
+        };
+        assert_eq!(
+            run_rules_script(
+                "if (statusCode == 200) rules.push('a.com resHeaders://x-r=1')",
+                &no_res,
+            )
+            .as_deref(),
+            Some(""),
+        );
+    }
+
     #[test]
     fn res_script_mutates_status_and_body() {
         let src = "ctx.res.statusCode = 418; ctx.res.body = ctx.res.body + '!'; ctx.res.headers['x-s']='y';";
