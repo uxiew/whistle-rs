@@ -31,11 +31,6 @@ pub fn build_req_info(
     headers: &HeaderMap,
     client_ip: Option<String>,
 ) -> ReqInfo {
-    let default_port = if scheme == "https" || scheme == "wss" {
-        443
-    } else {
-        80
-    };
     // The URL every pattern is matched against, and the one `$0` and `${url}`
     // report — so it carries the host **as the client wrote it**. Upstream
     // builds it the same way (`getFullUrl`,
@@ -44,11 +39,7 @@ pub fn build_req_info(
     // could never match one, and `$0` handed the rule a URL nobody had asked
     // for. [`ReqInfo::host`] is still folded, because that one is compared as a
     // *host* rather than as text.
-    let full_url = if port == default_port {
-        format!("{scheme}://{host}{path}")
-    } else {
-        format!("{scheme}://{host}:{port}{path}")
-    };
+    let full_url = crate::rules::url::full_url(scheme, host, port, path);
     let host = host.to_ascii_lowercase();
     let hdrs = headers
         .iter()
@@ -869,6 +860,58 @@ fn host_travels_with_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
         || enabled_flags(resolved).contains("proxyHost")
 }
 
+/// Resolve the forwarding family a **second** time, against the URL a URL
+/// replacement produced, and lay the answer over the first pass.
+///
+/// This is upstream's `getProxy`, which is handed `options.href` rather than the
+/// request's own URL and re-matches `host://`, the proxy family and `pac://`
+/// against it (`_original/lib/rules/index.js:125-152`,
+/// `lib/inspectors/res.js:196,:207-210`). Without it a four-word rules file
+/// routes opposite ways in the two proxies: `a.com/ http://b.com/x` followed by
+/// `b.com proxy://hop` engages the hop upstream and not here, and the same pair
+/// written against `a.com` engages it here and not upstream.
+///
+/// The result *replaces* the first pass's answer for exactly the protocols
+/// [`crate::rules::protocols::forwarding_protocols`] names, including when the
+/// second pass matched nothing — upstream deletes `proxy` and `pac` before it
+/// starts and drops `host` when the second pass finds none. Everything else is
+/// the first pass untouched, which is what keeps `cipher://` and the
+/// `disable://proxyUA` family reading the URL the client asked for, as they do
+/// upstream.
+///
+/// `moved` is the second pass's subject; `top` and `merged` are the same rule
+/// sets the first pass walked, in the same order, so an included or
+/// plugin-injected `proxy://` line is re-matched too — upstream re-resolves all
+/// four of its managers (`pRules`, `rules`, `fRules`, `hRules`).
+///
+/// The caller skips this entirely when nothing moved the request: matching is a
+/// function of the rules and the request, so a second walk over an unchanged URL
+/// reaches the answer already in hand. (The one thing that would differ is a
+/// `chance:` filter, which upstream re-rolls; a rule whose engagement is random
+/// is not one this port will pay a resolution pass to re-roll.)
+pub fn reresolve_forwarding(
+    first: &Resolved,
+    moved: &ReqInfo,
+    top: &RuleManager,
+    merged: &[RuleManager],
+    is_internal_req: bool,
+) -> Resolved {
+    let mut second = top.resolve_scoped(moved, is_internal_req);
+    for mgr in merged {
+        merge_resolved(&mut second, mgr.resolve_scoped(moved, is_internal_req));
+    }
+    let mut out = first.clone();
+    for proto in crate::rules::protocols::forwarding_protocols() {
+        // Every one of them is single-match, so there is one operator to move
+        // and `remove` is the whole of "the second pass found nothing".
+        match second.single.remove(proto) {
+            Some(op) => out.single.insert(proto.to_string(), op),
+            None => out.single.remove(proto),
+        };
+    }
+    out
+}
+
 /// Compute the upstream target, honouring `host://` (and `:port`) overrides.
 ///
 /// `dest` is where the request is *addressed* — its own URL, unless a
@@ -881,6 +924,10 @@ fn host_travels_with_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
 ///
 /// Fails rather than falling back to a direct connection when a proxy rule
 /// matched but could not be honoured; see [`find_proxy`].
+///
+/// `resolved` is the forwarding resolution, not the request's own — see
+/// [`reresolve_forwarding`], which the caller applies when a rule moved the
+/// request.
 pub async fn resolve_target(
     info: &ReqInfo,
     dest: &super::dest::Destination,
@@ -13021,6 +13068,143 @@ mod tests {
         }
     }
 
+    // ── the forwarding family's second resolution pass ──────────────────────
+    //
+    // See `reresolve_forwarding`. Every case here writes a rules file whose two
+    // halves disagree about *which* URL they are about, which is the only way to
+    // tell the two passes apart at all.
+
+    /// A `ReqInfo` for a URL that carries a port of its own — which every case
+    /// below needs, because the two origins it plays off differ only by port.
+    fn req_at(url: &str) -> ReqInfo {
+        let (scheme, rest) = url.split_once("://").expect("a scheme");
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                (h, p.parse().expect("a port"))
+            }
+            _ => (authority, if scheme == "https" { 443 } else { 80 }),
+        };
+        build_req_info("GET", scheme, host, port, path, &HeaderMap::new(), None)
+    }
+
+    /// `rules` resolved for `url`, then the forwarding family resolved again
+    /// against wherever a replacement moved the request.
+    ///
+    /// The assertion is the inertness guard: a case whose replacement rule never
+    /// fires would exercise nothing and pass anyway.
+    fn second_pass(rules: &str, url: &str) -> Resolved {
+        let mut m = RuleManager::new();
+        m.set_text(rules);
+        let info = req_at(url);
+        let resolved = m.resolve(&info);
+        let dest = crate::proxy::dest::Destination::of(&info, &resolved);
+        assert!(dest.replaced, "the rules must actually move the request");
+        reresolve_forwarding(&resolved, &dest.moved_req_info(&info), &m, &[], false)
+    }
+
+    /// The whole arrangement `crate::proxy::forwarding_resolution` sets up, so
+    /// that one case proves the second pass reaches the connection decision and
+    /// not merely the resolved set.
+    fn forwarded_target(rules: &str, url: &str) -> Target {
+        let mut m = RuleManager::new();
+        m.set_text(rules);
+        let info = req_at(url);
+        let resolved = m.resolve(&info);
+        let dest = crate::proxy::dest::Destination::of(&info, &resolved);
+        let forwarding = match dest.replaced {
+            true => reresolve_forwarding(&resolved, &dest.moved_req_info(&info), &m, &[], false),
+            false => resolved,
+        };
+        rt().block_on(resolve_target(&info, &dest, &forwarding)).expect("resolve_target")
+    }
+
+    const MOVED: &str = "a.com/ http://b.com:9311/echo\n";
+
+    #[test]
+    fn a_proxy_only_the_replacement_matches_is_the_one_used() {
+        let r = second_pass(&format!("{MOVED}b.com proxy://127.0.0.1:9310\n"), "http://a.com/x");
+        assert_eq!(r.value("proxy"), Some("127.0.0.1:9310"));
+    }
+
+    #[test]
+    fn a_proxy_only_the_original_matched_is_dropped() {
+        let r = second_pass(&format!("{MOVED}a.com proxy://127.0.0.1:9310\n"), "http://a.com/x");
+        assert_eq!(r.value("proxy"), None);
+    }
+
+    /// The first pass's answer is replaced, not merged: upstream deletes `proxy`
+    /// and `pac` outright and drops a `host` the second pass did not find again.
+    #[test]
+    fn the_host_the_original_matched_is_dropped() {
+        let r = second_pass(&format!("{MOVED}a.com host://1.2.3.4\n"), "http://a.com/x");
+        assert_eq!(r.value("host"), None);
+    }
+
+    #[test]
+    fn the_replacements_host_beats_the_originals() {
+        let rules = format!("{MOVED}b.com host://1.2.3.4\na.com host://9.9.9.9\n");
+        assert_eq!(second_pass(&rules, "http://a.com/x").value("host"), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn a_pac_rule_is_matched_against_the_replacement_too() {
+        let hit = format!("{MOVED}b.com pac://http://127.0.0.1:9316/p.pac\n");
+        let miss = format!("{MOVED}a.com pac://http://127.0.0.1:9316/p.pac\n");
+        assert!(second_pass(&hit, "http://a.com/x").value("pac").is_some());
+        assert_eq!(second_pass(&miss, "http://a.com/x").value("pac"), None);
+    }
+
+    /// Only the forwarding family moves. Everything else keeps what the
+    /// request's own URL matched, which is what leaves `cipher://` and the
+    /// request-header operators reading the URL the client asked for.
+    #[test]
+    fn the_rest_of_the_rule_set_is_left_on_the_first_pass() {
+        let rules = format!("{MOVED}a.com reqHeaders://x-a=1 cipher://TLSv1.2\nb.com reqHeaders://x-b=2\n");
+        let r = second_pass(&rules, "http://a.com/x");
+        assert_eq!(r.value("reqHeaders"), Some("x-a=1"));
+        assert_eq!(r.value("cipher"), Some("TLSv1.2"));
+    }
+
+    /// A line filter is re-read, because the second pass is a whole resolution
+    /// walk. The pattern matches both URLs so that only the filter decides.
+    #[test]
+    fn a_line_filter_is_re_read_against_the_replacement() {
+        let tripped = format!("{MOVED}* proxy://127.0.0.1:9310 excludeFilter:///b\\.com/\n");
+        let spent = format!("{MOVED}* proxy://127.0.0.1:9310 excludeFilter:///a\\.com/\n");
+        assert_eq!(second_pass(&tripped, "http://a.com/x").value("proxy"), None);
+        assert_eq!(
+            second_pass(&spent, "http://a.com/x").value("proxy"),
+            Some("127.0.0.1:9310")
+        );
+    }
+
+    /// And so are the capture groups: `$1` is what the *replacement* URL put
+    /// there, which is the only reason to re-run the match rather than re-use
+    /// the operator the first pass produced.
+    #[test]
+    fn a_capture_group_is_taken_from_the_replacement() {
+        let rules = format!("{MOVED}/^http:\\/\\/([a-z]+)\\.com/ host://$1.example\n");
+        assert_eq!(second_pass(&rules, "http://a.com/x").value("host"), Some("b.example"));
+    }
+
+    /// End to end: the second pass reaches the connection decision, and the
+    /// `host://` it found applies to the *destination's* port rather than the
+    /// client's.
+    #[test]
+    fn the_second_pass_reaches_the_connection_decision() {
+        let t = forwarded_target(&format!("{MOVED}b.com host://1.2.3.4\n"), "http://a.com/x");
+        assert_eq!(t.connect_host, "1.2.3.4");
+        assert_eq!(t.connect_port, 9311);
+        // And with nothing matching the replacement, the address the request was
+        // moved to is the one dialled.
+        let t = forwarded_target(&format!("{MOVED}a.com host://1.2.3.4\n"), "http://a.com/x");
+        assert_eq!(t.connect_host, "b.com");
+        assert_eq!(t.connect_port, 9311);
+    }
 }
 
 

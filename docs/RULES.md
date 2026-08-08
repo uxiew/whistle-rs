@@ -733,6 +733,37 @@ static.example.com   file:///srv/a|/srv/b        # first one that exists wins
 > pulling a values-store entry in as more rules. Upstream files it in the same
 > place, where it can only ever produce the unusable URL `rule://<name>`.
 
+#### Which URL the routing rules are matched against
+
+Once a bare-URL rule has moved the request, `host://`, the [proxy
+family](#upstream-proxy) and `pac://` are matched against **the URL it moved to**,
+not the one the client asked for. Nothing else is: the request-header operators,
+the body operators, `cipher://`, the flags and the filters that guard them all
+keep what the client's own URL matched.
+
+```
+a.example.com/    http://b.internal:9311/echo
+b.internal        proxy://10.0.0.1:8888        # engages: it matches the destination
+a.example.com     proxy://10.0.0.2:8888        # does not: nothing matches this now
+```
+
+That is upstream's second resolution pass — `getProxy` is handed the request's
+rewritten URL and re-resolves those three against it
+(`_original/lib/rules/index.js:125-152`, `lib/inspectors/res.js:196,:207-210`). The
+second answer *replaces* the first, including when it is "nothing": a `host://`
+that only the original URL matched is dropped rather than kept. Line filters and
+`$1`-style captures are re-read against the destination too, since re-matching is
+what produces them.
+
+Two narrower things about that pass differ here, both measured in
+`tests/differential/cases-proxy.js`:
+
+* the URL is the one the **replacement rule** wrote, before `urlReplace://`,
+  `params://` or `delete://` rewrote its path — upstream's is after;
+* `enable://proxyHost`, `enable://proxyFirst` and `enable://proxyTunnel` are read
+  from the first pass only. Upstream takes the union of both passes for exactly
+  those three (`isProxyEnable`, `lib/rules/index.js:87,:154,:229`).
+
 `xhost://` retries **once**, against the host and port the request actually asked for,
 and only when the connection could not be *established* — once the request has been
 written to a socket it cannot be replayed, which is the same guard the `x`-prefixed
