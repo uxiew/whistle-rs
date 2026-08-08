@@ -243,13 +243,8 @@ pub fn substitute_values(
         true
     }
     let mut did = false;
-    for op in resolved.single.values_mut() {
+    for op in resolved.ops_mut() {
         did |= sub(op, values, tpl);
-    }
-    for list in resolved.multi.values_mut() {
-        for op in list {
-            did |= sub(op, values, tpl);
-        }
     }
     did
 }
@@ -375,13 +370,8 @@ pub fn substitute_config_vars(resolved: &mut Resolved, port: u16, version: &str)
         op.value = replace_ci(&op.value, "${port}", &port);
         op.value = replace_ci(&op.value, "${version}", version);
     };
-    for op in resolved.single.values_mut() {
+    for op in resolved.ops_mut() {
         sub(op);
-    }
-    for list in resolved.multi.values_mut() {
-        for op in list {
-            sub(op);
-        }
     }
 }
 
@@ -473,6 +463,10 @@ pub fn response_phase_of(
                 op
             }));
         }
+        if let Some(mut op) = extra.slot {
+            op.order = u64::MAX;
+            acc.insert(op);
+        }
     }
     out
 }
@@ -538,6 +532,14 @@ fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
             from = at + 1;
         }
     }
+    // The shared slot takes the same comparison, which is what makes a
+    // `statusCode://` inside an included file beat the `file://` that included
+    // it — `mergeRule` returning the new rule for a single-value protocol, with
+    // `rule` being one.
+    if let Some(mut op) = sub.slot {
+        op.order = key(&op);
+        resolved.insert(op);
+    }
 }
 
 /// The resolution order stamped on an **important** operator merged in
@@ -564,7 +566,7 @@ pub fn merge_included_rules(
     is_internal_req: bool,
 ) -> Vec<RuleManager> {
     let mut texts: Vec<String> = Vec::new();
-    if let Some(name) = resolved.value("rule")
+    if let Some(name) = resolved.value(crate::rules::protocols::RULE_INCLUDE)
         && let Some(content) = values.get(name)
     {
         texts.push(content.clone());
@@ -661,6 +663,10 @@ pub fn merge_res_rules(resolved: &mut Resolved, info: &ReqInfo, is_internal_req:
         }
         sub.single.retain(|proto, _| crate::rules::protocols::is_res_protocol(proto));
         sub.multi.retain(|proto, _| crate::rules::protocols::is_res_protocol(proto));
+        // No shared-slot member is a `resProtocols` name, so a `file://` or a
+        // destination written inside a `resRules://` text is dropped here — the
+        // request it would have redirected has already gone out.
+        sub.slot = None;
         if sub.single.is_empty() && sub.multi.is_empty() {
             continue;
         }
@@ -1365,52 +1371,12 @@ fn parse_host_value(value: &str, _default_port: u16) -> (Option<String>, Option<
     }
 }
 
-/// The operator families that share **one slot**.
-///
-/// None of these names is in upstream's `protocols` array, so `parseRule` files
-/// every one of them under the same `rule` list
-/// (`_original/lib/rules/rules.js:1313-1316`) and `getRule` returns the first
-/// match (`rules.js:799-800`). They cannot coexist: whichever line was written
-/// first wins outright and the rest do not apply.
-///
-/// This port keeps a key per protocol, so the slot has to be reconstructed —
-/// see [`slot_winner`]. Without it the port applied a fixed protocol priority
-/// (redirect, then statusCode, then file) *and* let a destination rewrite apply
-/// alongside a mock, so
-///
-/// ```text
-/// example.com      http://127.0.0.1:9000
-/// example.com/api  file:///mock/api.json
-/// ```
-///
-/// forwarded upstream in whistle and served the mock here — a silent
-/// disagreement in either direction depending on which line came first.
-fn slot_protocols() -> impl Iterator<Item = &'static str> {
-    ["redirect", "location", "statusCode", "locationHref"]
-        .into_iter()
-        .chain(FILE_PROTOS.iter().copied())
-        .chain(std::iter::once(crate::rules::protocols::URL_REPLACE))
-}
-
-/// Which of the shared-slot operators was written first, if any.
-///
-/// `RuleOp::order` is the resolution order — important lines first, then source
-/// order — which is exactly the sequence `getRule` walks.
-pub fn slot_winner(resolved: &Resolved) -> Option<(&'static str, &RuleOp)> {
-    slot_protocols()
-        .filter_map(|proto| resolved.get(proto).map(|op| (proto, op)))
-        // A `rule://<name>` is this port's values-store include, not a
-        // destination, so it is not competing for this slot.
-        .filter(|(proto, op)| {
-            *proto != crate::rules::protocols::URL_REPLACE || !op.raw.starts_with("rule://")
-        })
-        .min_by_key(|(_, op)| op.order)
-}
-
 /// Short-circuit responses produced without contacting upstream:
 /// `redirect`/`location`, mocked `statusCode`, and the local-file family.
 ///
-/// Only the operator that won the shared slot may answer — see [`slot_winner`].
+/// Only the operator that won the shared slot may answer, and
+/// [`Resolved::slot`](crate::rules::Resolved::slot) holds exactly that one —
+/// see [`crate::rules::protocols::SLOT_PROTOCOLS`].
 pub fn short_circuit(
     info: &ReqInfo,
     resolved: &Resolved,
@@ -1438,7 +1404,8 @@ fn short_circuit_inner(
     resolved: &Resolved,
     env: super::template::ProxyEnv<'_>,
 ) -> Option<Response<DynBody>> {
-    let (proto, op) = slot_winner(resolved)?;
+    let op = resolved.slot()?;
+    let proto = op.protocol.as_str();
     match proto {
         "redirect" | "location" => {
             let mut resp = Response::builder()
@@ -1683,14 +1650,6 @@ fn write_auto_cors(headers: &mut HeaderMap, info: &ReqInfo) {
     spec.insert("enable".to_string(), "true".to_string());
     write_res_cors(headers, &spec, Some(info));
 }
-
-/// The local-file / template protocols, in resolution order (base before `x`/`xs`
-/// variants doesn't matter — only one is expected per rule).
-const FILE_PROTOS: &[&str] = &[
-    "file", "rawfile", "tpl", "jsonp", "dust", "xfile", "xrawfile", "xtpl", "xjsonp", "xdust",
-    "xsfile", "xsrawfile", "xstpl", "xsjsonp", "xsdust",
-];
-
 
 /// Serve a matched file-family rule. Returns `None` only for a `x`/`xs` (cross)
 /// variant whose file is missing — that falls through to the real server.
@@ -2297,14 +2256,8 @@ async fn read_value_source(source: &ValueSource) -> Option<String> {
 /// the response phase merges operators that were withheld from the request pass
 /// — reads nothing twice.
 pub async fn load_rule_values(resolved: &mut Resolved, at: &ReqInfo) {
-    fn ops_mut(resolved: &mut Resolved) -> impl Iterator<Item = &mut RuleOp> {
-        resolved
-            .single
-            .values_mut()
-            .chain(resolved.multi.values_mut().flatten())
-    }
     let mut wanted: HashMap<ValueSource, Option<String>> = HashMap::new();
-    for op in ops_mut(resolved) {
+    for op in resolved.ops_mut() {
         if let Some(source) = value_source(op) {
             wanted.entry(source).or_default();
         }
@@ -2315,7 +2268,7 @@ pub async fn load_rule_values(resolved: &mut Resolved, at: &ReqInfo) {
     for (source, slot) in wanted.iter_mut() {
         *slot = read_value_source(source).await;
     }
-    for op in ops_mut(resolved) {
+    for op in resolved.ops_mut() {
         let Some(source) = value_source(op) else {
             continue;
         };
@@ -3473,12 +3426,11 @@ pub fn apply_response_for(
     // a `file://` or a destination would have taken — so a `statusCode` written
     // below one of those, or after one on the same line, never reaches the
     // response at all. Here it was applied unconditionally, and so overwrote the
-    // status of a file the rules had already chosen to serve. `replaceStatus`
-    // has a list of its own upstream and needs no such gate.
-    let has_slot = |p: &str| p != "statusCode" || slot_winner(resolved).is_some_and(|(w, _)| w == p);
+    // status of a file the rules had already chosen to serve. No gate is needed
+    // for that any more: a losing `statusCode` is not in the resolved set to be
+    // read. `replaceStatus` has a list of its own upstream and never was.
     if let Some((proto, code)) = ["replaceStatus", "statusCode"]
         .into_iter()
-        .filter(|p| has_slot(p))
         .find_map(|p| resolved.value(p).map(|v| (p, v)))
         && let Some(status) = code
             .trim()
@@ -8959,27 +8911,29 @@ mod tests {
             let info =
                 build_req_info("GET", scheme, host, 80, &path, &HeaderMap::new(), None);
             let resolved = mgr.resolve(&info);
-            slot_winner(&resolved).map(|(p, _)| p)
+            resolved.slot().map(|op| op.protocol.clone())
         };
+        let winner = |text: &str, url: &str| winner(text, url);
+        let is = |got: Option<String>, want: &str| assert_eq!(got.as_deref(), Some(want));
 
         // Written first wins, whatever the protocols are.
         let forward_first = "example.com http://127.0.0.1:9000\nexample.com/api file:///mock.json\n";
-        assert_eq!(winner(forward_first, "http://example.com/api"), Some("rule"));
+        is(winner(forward_first, "http://example.com/api"), "rule");
         let mock_first = "example.com/api file:///mock.json\nexample.com http://127.0.0.1:9000\n";
-        assert_eq!(winner(mock_first, "http://example.com/api"), Some("file"));
+        is(winner(mock_first, "http://example.com/api"), "file");
 
         // …including against the two that used to be hard-coded ahead of file.
         let file_first = "a.com file:///mock.json\na.com redirect://http://x/\n";
-        assert_eq!(winner(file_first, "http://a.com/"), Some("file"));
+        is(winner(file_first, "http://a.com/"), "file");
         let redirect_first = "a.com redirect://http://x/\na.com file:///mock.json\n";
-        assert_eq!(winner(redirect_first, "http://a.com/"), Some("redirect"));
+        is(winner(redirect_first, "http://a.com/"), "redirect");
         let status_first = "a.com statusCode://204\na.com file:///mock.json\n";
-        assert_eq!(winner(status_first, "http://a.com/"), Some("statusCode"));
+        is(winner(status_first, "http://a.com/"), "statusCode");
 
         // An important line still wins over an earlier normal one — importance
         // is part of the resolution order the slot is decided by.
         let important = "a.com file:///mock.json\na.com statusCode://204 lineProps://important\n";
-        assert_eq!(winner(important, "http://a.com/"), Some("statusCode"));
+        is(winner(important, "http://a.com/"), "statusCode");
 
         // `rule://<name>` is the values-store include, not a destination, so it
         // does not compete.
@@ -8990,31 +8944,16 @@ mod tests {
         // they are written (`matchers.forEach(parseRule)`,
         // `_original/lib/rules/rules.js:1785-1789`). This port gave every
         // operator on a line the same order key, so the tie fell to whatever
-        // order `slot_protocols` happened to list — and `statusCode` was first
-        // in that list, so `example.com file:///mock statusCode://204` served
-        // the mock upstream and answered 204 here.
-        assert_eq!(
-            winner("a.com file:///mock.json statusCode://204\n", "http://a.com/"),
-            Some("file")
-        );
-        assert_eq!(
-            winner("a.com statusCode://204 file:///mock.json\n", "http://a.com/"),
-            Some("statusCode")
-        );
-        assert_eq!(
-            winner("a.com redirect://http://x/ statusCode://204\n", "http://a.com/"),
-            Some("redirect")
-        );
-        assert_eq!(
-            winner("a.com http://127.0.0.1:9000 statusCode://204\n", "http://a.com/"),
-            Some("rule")
-        );
+        // order the slot protocols happened to be enumerated in — and
+        // `statusCode` came first, so `example.com file:///mock statusCode://204`
+        // served the mock upstream and answered 204 here.
+        is(winner("a.com file:///mock.json statusCode://204\n", "http://a.com/"), "file");
+        is(winner("a.com statusCode://204 file:///mock.json\n", "http://a.com/"), "statusCode");
+        is(winner("a.com redirect://http://x/ statusCode://204\n", "http://a.com/"), "redirect");
+        is(winner("a.com http://127.0.0.1:9000 statusCode://204\n", "http://a.com/"), "rule");
         // A second bare host on a pattern-first line is an operator, not a
         // pattern, and it takes the slot before anything written after it.
-        assert_eq!(
-            winner("a.com b.com statusCode://204\n", "http://a.com/"),
-            Some("rule")
-        );
+        is(winner("a.com b.com statusCode://204\n", "http://a.com/"), "rule");
     }
 
     /// `statusCode://` only speaks when it won the shared slot.
@@ -9143,7 +9082,7 @@ mod tests {
         let mut resolved = mgr.resolve(&info);
         let _keep = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
         assert_eq!(
-            slot_winner(&resolved).map(|(p, _)| p),
+            resolved.slot().map(|op| op.protocol.as_str()),
             Some("statusCode"),
             "the merged rule wins the slot outright"
         );
@@ -9395,12 +9334,12 @@ mod tests {
             "a.com/x locationHref://http://b.com/go\na.com/x file://(MOCK)\n",
             "http://a.com/x",
         );
-        assert_eq!(slot_winner(&first).map(|(p, _)| p), Some("locationHref"));
+        assert_eq!(first.slot().map(|op| op.protocol.as_str()), Some("locationHref"));
         let second = resolve(
             "a.com/x file://(MOCK)\na.com/x locationHref://http://b.com/go\n",
             "http://a.com/x",
         );
-        assert_eq!(slot_winner(&second).map(|(p, _)| p), Some("file"));
+        assert_eq!(second.slot().map(|op| op.protocol.as_str()), Some("file"));
         assert_eq!(body_text(short_circuit(&info, &second, test_env()).unwrap()), "MOCK");
     }
 

@@ -1426,6 +1426,15 @@ that is neither is read as a list of protocol names.
 > `ignore://example.com/path` looks for protocols with those names and finds
 > none. Upstream draws the same distinction (`rules.js:1129-1141`); if you are
 > not relying on it, prefer the explicit `matcher=` spelling.
+>
+> **And `skip://` silences earlier.** It does everything `ignore://` does, and
+> also drops the operator as the rules are *walked* rather than after
+> (`checkSkip`, `_original/lib/util/index.js:2004-2013`). On every operator with
+> a protocol key of its own the two come to the same nothing. On the
+> [shared slot](#short-circuit-no-upstream-request-is-made) they are opposite
+> answers: `skip://` hands the slot to whatever was written next, `ignore://`
+> leaves it empty. One more consequence: only `|` separates a `skip://` name
+> list, where `ignore://` also reads `&`.
 
 ### Short-circuit (no upstream request is made)
 
@@ -1468,11 +1477,37 @@ example.com/api/flags  file://({"beta":true})
 example.com            http://localhost:5173
 ```
 
-Within a *single* line the tie is broken by protocol, in the order `redirect`,
-`location`, `statusCode`, then the file family — so
-`file://({"id":7}) statusCode://201` answers `201` with an **empty body**. Use
+Within a *single* line there is no protocol precedence either: the one written
+first wins, because upstream pushes a line's operators onto the shared list in
+the order they are typed (`matchers.forEach(parseRule)`, `rules.js:1785-1789`).
+So `file://({"id":7}) statusCode://201` serves the file and
+`statusCode://201 file://({"id":7})` answers `201` with an **empty body**. Use
 [`replaceStatus://`](#response-rewriting) when you want the mock's body under a
 different status; it changes a response rather than manufacturing one.
+
+**Silencing one of them is not the same as choosing another.** `ignore://` runs
+after the slot has already been reduced to a single winner, so it can only take
+that winner out — it never promotes the next line:
+
+```
+example.com  statusCode://204  redirect://http://elsewhere/  ignore://statusCode
+```
+
+answers from the origin, not with the redirect. Naming a member that *lost*
+does nothing at all, because it is not in the resolved set to be named, and the
+name has to be the one the winner was **written** with: `ignore://rule` reaches
+whichever member holds the slot, `ignore://http` reaches a bare `http://…`
+destination, and an alias reaches nothing — a rule written `status://204` is
+silenced by neither `ignore://status` nor `ignore://statusCode`, only by
+`ignore://rule`. All of that is upstream's `ignoreForwardRule`
+(`_original/lib/util/index.js:2047-2059`), which reads the protocol name back
+out of the winner's URL.
+
+[`skip://`](#silencing-a-rule-by-its-text) is the spelling that **does** fall through: it silences
+the operator as the rules are walked rather than after, so the same line written
+`skip://statusCode` redirects. On every other operator the two are
+indistinguishable — the slot is the only place a fall-through has anywhere to
+go.
 
 ### Request rewriting
 

@@ -148,16 +148,15 @@ impl Destination {
 /// The URL a URL-replacement rule names, if one applies.
 ///
 /// The `rule://` spelling is excluded: it is this port's values-store include
-/// (see [`protocols::URL_REPLACE`]), and upstream can only ever read it as the
+/// (see [`protocols::RULE_INCLUDE`]), and upstream can only ever read it as the
 /// unusable URL `rule://<name>`.
+///
+/// The destination rewrite shares one slot with `file://`, `redirect://` and
+/// `statusCode://` — see [`protocols::SLOT_PROTOCOLS`]. Asking for it by name
+/// is asking whether it *won* that slot: if one of the others was written first
+/// it answers the request and this rewrite does not happen at all.
 fn replacement_url(resolved: &Resolved) -> Option<&String> {
-    // The destination rewrite shares one slot with `file://`, `redirect://` and
-    // `statusCode://` — see `apply::slot_winner`. If one of those was written
-    // first it answers the request, and this rewrite does not happen at all.
-    // Reading the operator directly would forward the request *and* serve the
-    // mock's rule, which is neither behaviour.
-    let (proto, op) = crate::proxy::apply::slot_winner(resolved)?;
-    (proto == protocols::URL_REPLACE).then_some(&op.value)
+    resolved.get(protocols::URL_REPLACE).map(|op| &op.value)
 }
 
 /// The scheme a URL-replacement rule named, when a plain HTTP request cannot be
