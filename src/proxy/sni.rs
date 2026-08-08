@@ -350,10 +350,6 @@ pub async fn decide(
         // `host://` and the proxy family through `rules.getProxy`.
         Ok(SniVerdict::Bypass) => {
             tracing::info!("sniCallback {plugin}: not intercepting {servername}");
-            // A connection we have promised not to read has no request to
-            // rewrite, so a URL-replacement rule has nothing to act on here;
-            // the destination is the request's own address, and `host://` and
-            // the proxy family route it as usual.
             relay_decision(state, &info, &resolved).await
         }
         Ok(SniVerdict::Cert(cert)) => {
