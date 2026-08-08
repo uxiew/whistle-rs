@@ -28,8 +28,14 @@ const IGNORE = new Set([
   'connection', 'keep-alive', 'proxy-connection', // hop-by-hop
   'transfer-encoding', 'content-length',          // framing, compared via body
   'host',                       // compared explicitly where it matters
+  // whistle's own bookkeeping, named one at a time rather than by prefix. A
+  // blanket `x-whistle*` also hid `x-whistle-matched-rules`, which is the whole
+  // observable effect of `enable://requestWithMatchedRules` — a case about that
+  // header could not fail. Removing the blanket was measured across six corpora
+  // and introduced no difference anywhere, so it was suppressing nothing these
+  // four do not already cover.
   'x-whistle-request-id', 'x-whistle-client-id', 'x-whistle-real-host',
-  'x-forwarded-from-whistle-uid',                 // whistle's own bookkeeping
+  'x-forwarded-from-whistle-uid',
   'accept-encoding',            // each proxy narrows this its own way
   'user-agent',                 // curl vs node client
   'accept',
@@ -212,7 +218,6 @@ const norm = (headers) => {
   for (const [k, v] of Object.entries(headers || {})) {
     const key = k.toLowerCase();
     if (IGNORE.has(key)) continue;
-    if (key.startsWith('x-whistle')) continue;
     out[key] = Array.isArray(v) ? v.join(', ') : String(v);
   }
   return out;
