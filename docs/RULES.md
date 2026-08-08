@@ -2935,13 +2935,20 @@ arrived from those pages would otherwise think whistle-rs had the bug.
 | The page says | whistle actually | Where |
 |---|---|---|
 | on an `OPTIONS` request `access-control-allow-headers` becomes `access-control-expose-headers` | exactly the inverse — `allow` on a preflight, `expose` otherwise | [`resCors`](#response-rewriting) above |
-| a line-format value with no `: ` "splits at the first colon" | a **space-free** value never reaches the line parser at all: `parseInlineJSON` claims it first and reads the whole line as one key with an empty value, so `x-a:1` sets a header literally named `x-a:1` and `urlParams://{u}` with `u` = `test1:1` produces `?test1%3A1=`. The documented colon split only happens once the value contains whitespace somewhere (`SPACE_RE`, `_original/lib/util/index.js:1127-1132`) | this port splits at the colon in both cases, which is what the page describes |
+| a line-format value with no `: ` "splits at the first colon" | a value written on the rule line reaches the line parser only when it has an `=` in it, and then it is a query string, not lines. Without one it produces **nothing at all**: `reqHeaders://x-a:1` and `reqHeaders://bare` both set no header, and `urlParams://test1:1` adds no query — while the same words on a line of a `{value}` do become entries, because loaded content takes the other road. Measured five ways; whistle-rs matches | see "The three spellings of a data value, and the two roads" above |
 | `ws://` / `wss://` / `tunnel://` "返回 502" for a plain HTTP request | it does, and the page is right — but only when the line is *read* as a destination. `127.0.0.1:8080 ws://host/x` is not: a bare host is no pattern to `indexOfPattern`, the `ws://` URL is, and the line swaps into "pattern `ws://host/x`, operator `host://127.0.0.1:8080`" (`_original/lib/rules/rules.js:1449-1467,:1774-1789`), which a plain request never matches | `cases.js`, the two "swaps into pattern and host" cases |
 | `delete://pathname` "删除请求路径（不包含请求参数）" | it deletes the path and then **doubles the query** | already recorded under [Deleting](#deleting) |
+| [`socks`](https://wproxy.org/docs/rules/socks.html) gives the default port as **443** | `1080`, from the one line that assigns all three — `isSocks ? 1080 : isHttpsProxy ? 443 : 80` (`_original/lib/inspectors/res.js:284`). The 443 looks copied from the `https-proxy` page | whistle-rs uses 1080; `src/proxy/upstream.rs` |
 
 The `ws://` row is the one worth remembering: the page is right, and the obvious
 way to test it is not — a bench case written as `<host:port> ws://…` is inert on
 both sides and proves nothing about the rule it names.
+
+The line-format row used to claim that whistle sets a header literally named
+`x-a:1`. It does not; it sets nothing, and so does this port. That row was
+itself a mis-measurement, in a table whose whole purpose is to record
+mis-statements — which is worth leaving on the record rather than quietly
+rewriting.
 
 
 ### `x-server` on a response the proxy made itself
