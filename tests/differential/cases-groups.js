@@ -92,6 +92,37 @@
 // Run against the build from before `remove_group` learned to refuse the
 // default group, it reports **`differing: 5`** — the fifth being `deleting the
 // Default group is refused`.
+//
+// ── What the two management APIs do not share ──────────────────────────────
+//
+// Audited endpoint by endpoint against `_original/biz/webui/cgi-bin/rules/*`.
+// No case below can reach any of it — a bench sets rules and makes a request —
+// so it is recorded here rather than measured.
+//
+// Upstream can do three things this API cannot, and all three are real:
+//
+//   * **rename** a group (`rename.js` → `renameRulesFile`, keeping it selected).
+//     `RuleManager::rename_group` exists and no route reaches it.
+//   * **reorder** groups (`move-to.js`, `move-top.js`). Group order *is*
+//     precedence here, so without this the only way to change which group wins
+//     is to delete one and add it again.
+//   * **switch every rule off at once** (`disable-all-rules.js`), and
+//     `backRulesFirst` (`enable-back-rules-first.js`), which reverses each
+//     file's lines and resolves it before the rest.
+//
+// And two differences that are shape rather than behaviour:
+//
+//   * upstream's list is single-select unless `allowMultipleChoice` is on; here
+//     every enabled group applies and there is no single-select mode. The
+//     harness pins the property on so the two are comparable at all.
+//   * upstream calls a `\r`-prefixed name a *group* — a folder holding rule
+//     files — and what this port calls a group is upstream's **file**. Same
+//     word, one level apart; there is no folder here.
+//
+// Where each API is stricter, this one is:  `add` with an empty name is
+// `400 name is required` where upstream writes nothing and says `ec: 0`;
+// `select` a name that does not exist **creates** it upstream (`select.js` adds
+// before it selects) where `toggle` here is `400 group not found`.
 
 const fs = require('fs');
 const path = require('path');
