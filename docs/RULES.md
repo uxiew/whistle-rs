@@ -2885,35 +2885,6 @@ Known gaps in the operator layer, deliberately left:
   them. They are *skipped* rather than run as JavaScript — the script whistle-rs
   executes is the first entry not spelled `resRules://`, which is the one
   upstream executes too.
-- **Only two of the three documented data-object formats are read, and not
-  everywhere.** whistle's operation page gives three
-  (<https://wproxy.org/docs/rules/operation.html>, "数据对象"): JSON, the inline
-  query form `k1=v1&k2=v2`, and the **line format** — `key: value` one per line,
-  splitting on the first `: `, with a dotted key nesting (`a.b.c: 123`) and `\.`
-  escaping the dot. Upstream reads all three, for every JSON-valued operator, via
-  `_parseJSON` → `parsePureJSON || parsePlainText`
-  (`_original/lib/util/index.js:1122-1145`, `lib/util/common.js:1134-1230`).
-  Here the line format is read only as a lucky one-line special case, and
-  `resMerge`/`reqMerge` read **JSON alone**. Measured against whistle 2.10.8:
-
-  | rule | whistle | here |
-  |---|---|---|
-  | `resMerge://test=123 file://({"name":"a"})` | `{"name":"a","test":"123"}` | unchanged |
-  | `resMerge://{m}` with `m` = `a.b.c: 123` | `{"name":"a","a":{"b":{"c":123}}}` | unchanged |
-  | `urlParams://{u}` with `u` = `test1: 1` | `?test1=1` | no query added |
-  | `reqHeaders://{h}` with `h` = three `k: v` lines | three headers | none |
-
-  The first of those is the *leading example* on both
-  [`resMerge`](https://wproxy.org/docs/rules/resMerge.html) and
-  [`reqMerge`](https://wproxy.org/docs/rules/reqMerge.html). A single `k: v` line
-  does work on the header operators, and JSON and `k=v&…` work everywhere.
-- **`resCookies://k=v;path=/` percent-encodes the attributes.** The inline form's
-  documented spelling puts a cookie's attributes after a `;` inside the value
-  (<https://wproxy.org/docs/rules/resCookies.html>) — whistle sends
-  `set-cookie: k=v;path=/`, whistle-rs sends `k=v%3Bpath=/`, so the attributes are
-  part of the value instead of attributes. The JSON form
-  (`resCookies://{"k":{"value":"v","path":"/"}}`) is byte-identical on both and is
-  the spelling to use meanwhile.
 - **A response with no declared charset is not sniffed.** When a `charset=` is
   present the response operators honour it — the body is decoded before the text
   transforms and re-encoded after, and injected values are written in that
