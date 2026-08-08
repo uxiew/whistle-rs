@@ -111,7 +111,7 @@
 //      nothing at all until the client gives up. This port falls back, which is
 //      what the `x` prefix documents and what its three siblings do.
 //
-// **How much of this corpus does anything.** 99 of the 111 cases change what
+// **How much of this corpus does anything.** 98 of the 111 cases change what
 // real whistle answers, measured against the same request with no rule at all —
 // including all eleven `reresolve:`/`residue:` cases. The other twelve are the
 // negative controls, and each is inert on purpose: the empty baseline, the two
@@ -423,11 +423,16 @@ module.exports = [
   // spelling that **won** takes the whole family with it — including the
   // fall-through to a lower-precedence proxy line, which this port used to
   // allow. It has to be the winner: naming a spelling that never matched
-  // changes nothing. The pair is what discriminates; either alone is
-  // ambiguous, since "went direct" and "the rule never applied" look the same
-  // from one side.
+  // changes nothing.
+  //
+  // These four are the corpus's one group whose baseline is **not** the
+  // no-rule request. Going direct *is* the no-rule answer, so measured that
+  // way three of the four read as inert and the negative control reads as
+  // firing — exactly backwards. Their baseline is the same line with its
+  // `ignore://` removed, and against that three fire and the control does
+  // not, which is the claim each name makes.
   { name: 'proxy: ignore of the winning spelling drops the family', rules: `${P} socks://${SOCKS} proxy://${HOP} ignore://socks` },
   { name: 'proxy: ignore of a spelling that did not win changes nothing', rules: `${P} proxy://${HOP} ignore://socks` },
-  { name: 'proxy: ignore of the loser leaves the winner', rules: `${P} socks://${SOCKS} proxy://${HOP} ignore://proxy` },
+  { name: 'proxy: ignore of the family name drops both spellings', rules: `${P} socks://${SOCKS} proxy://${HOP} ignore://proxy` },
   { name: 'proxy: ignore of the winning spelling takes the PAC fallback too', rules: `${P} socks://${SOCKS} pac://${PAC}/direct.pac ignore://socks` },
 ];
