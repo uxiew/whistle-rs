@@ -37,8 +37,15 @@ const IGNORE = new Set([
   'x-whistle-request-id', 'x-whistle-client-id', 'x-whistle-real-host',
   'x-forwarded-from-whistle-uid',
   'accept-encoding',            // each proxy narrows this its own way
-  'user-agent',                 // curl vs node client
-  'accept',
+  // `user-agent` and `accept` used to be here, from when this bench drove one
+  // side with curl and the other with node. It drives both with node now, which
+  // sends neither header unless a case asks for it — and the exemption was
+  // doing real damage, because these are headers *rules are written about*.
+  // Six cases could not fail while it stood: `ua://`, `disable://ua`, the two
+  // that pin which of two `ua://` lines wins (the whole of `lineProps://important`
+  // in this corpus), and both `headerReplace://` doc forms, which rewrite
+  // `accept`. Removing them was measured across all thirteen corpora and
+  // introduced no difference anywhere.
 ]);
 
 /**
@@ -278,6 +285,9 @@ const FIXED = {
   // Latin-1 bytes under an HTML type: a body no UTF-8 decoder accepts.
   '/notutf8': ['text/html', Buffer.from([0x4f, 0x52, 0x49, 0x47, 0xff, 0xfe, 0x49, 0x4e, 0x41, 0x4c]), {}],
   '/notype': [null, 'ORIGINAL untyped', {}],
+  // A whole HTTP response as a *body*, so a `rawfile://` rule can name a URL
+  // and get something it can parse.
+  '/rawres': ['text/plain', 'HTTP/1.1 201 Created\r\nx-raw: yes\r\n\r\nRAW BODY', {}],
   // Carries the two headers an injection is supposed to take away, so a case
   // can tell "injected nothing" from "injected an empty string".
   '/cached': ['text/html', HTML,
@@ -320,6 +330,13 @@ function startOrigin() {
           const [type, payload, extra] = fixed;
           r.writeHead(200, { ...(type ? { 'content-type': type } : {}), ...extra });
           return r.end(payload);
+        }
+        // Any status on demand — a file rule may name a URL, and what such a
+        // source answers with decides between a 404, a 502 and the bytes.
+        if (path === '/status') {
+          const code = Number(new URL(q.url, 'http://x').searchParams.get('code') || 200);
+          r.writeHead(code, { 'content-type': 'text/plain' });
+          return r.end('STATUS ' + code);
         }
         // A body of `n` bytes, for the rewrite ceiling. `PAD` keeps it text
         // without making it compressible to nothing.
@@ -582,6 +599,33 @@ function seenByOrigin(answer) {
 
 const show = (v) => JSON.stringify(v);
 
+/**
+ * Everything two answers to the same request disagree about.
+ *
+ * Pulled out of the run loop because it is asked twice, about two different
+ * pairs: whistle against this port, which is what the bench is for, and this
+ * port against **itself with the rules taken away**, which is
+ * [`unruled`](#discrimination).
+ */
+function problemsBetween(a, b) {
+  const problems = [];
+  if (a.status !== b.status) problems.push(`status: whistle=${a.status} rs=${b.status}`);
+  problems.push(...diff(a.headers, b.headers, 'res.header'));
+  problems.push(...diff(a.trailers, b.trailers, 'res.trailer'));
+  // Bodies are compared as text unless they are the origin's echo, which
+  // carries the request and is compared field by field instead.
+  const [as, bs] = [seenByOrigin(a), seenByOrigin(b)];
+  if (as && bs) {
+    if (as.method !== bs.method) problems.push(`req.method: whistle=${as.method} rs=${bs.method}`);
+    if (as.url !== bs.url) problems.push(`req.url: whistle=${as.url} rs=${bs.url}`);
+    if (as.body !== bs.body) problems.push(`req.body: whistle=${show(as.body)} rs=${show(bs.body)}`);
+    problems.push(...diff(as.headers, bs.headers, 'req.header'));
+  } else if (a.body !== b.body) {
+    problems.push(`res.body: whistle=${show(a.body.slice(0, 120))} rs=${show(b.body.slice(0, 120))}`);
+  }
+  return problems;
+}
+
 /** Compare two objects field by field, returning readable differences. */
 function diff(a, b, label) {
   const out = [];
@@ -596,11 +640,52 @@ function diff(a, b, label) {
   return out;
 }
 
+/**
+ * <a name="discrimination"></a>
+ * What each request answers with **no rules loaded at all**, one entry per
+ * distinct request shape.
+ *
+ * `differing: 0` says the two proxies agree. It does not say the case was
+ * *about* anything: a case whose rule never matched, or whose operator does
+ * nothing observable here, agrees with upstream perfectly and would go on
+ * agreeing if the operator were deleted from the source. Those two outcomes
+ * look identical in the output, which is this bench's oldest blind spot — the
+ * README already names eleven cases in `cases-file.js` that 404 on both sides
+ * and five in `cases-patterns.js` that are really about the layer above.
+ *
+ * So each answer is compared against this port answering the same request with
+ * its rules taken away. Identical means the case cannot tell an implementation
+ * that applies its rules from one that ignores them; `inert` counts those.
+ *
+ * It costs one wipe and one request per distinct request shape — not per case,
+ * because most corpora ask about a rule while sending the same plain `/echo`
+ * over and over.
+ *
+ * **Inert is not the same as wrong.** A case pinning that a filter correctly
+ * excludes a line, or that a malformed rule is ignored, *should* be inert, and
+ * so should one about an effect this bench cannot see (`resWrite://` goes to
+ * disk; `write-bench.js` is where that is measured). What the number is for is
+ * that each of them needs a reason, and until now none of them were even
+ * listed.
+ */
+async function collectUnruled(cases) {
+  await post(RS, '/api/rules', '', 'text/plain');
+  await new Promise((r) => setTimeout(r, 120));
+  const unruled = new Map();
+  for (const c of cases) {
+    const key = JSON.stringify(c.request || {});
+    if (unruled.has(key)) continue;
+    unruled.set(key, await through(RS, c.request || {}));
+  }
+  return unruled;
+}
+
 async function main() {
   const origin = await startOrigin();
   const CASES = require(CASES_FILE);
   let ran = 0, differing = 0;
   const report = [];
+  const inert = [];
 
   // Upstream selects **one** rule file at a time unless `allowMultipleChoice`
   // is on: `selectRulesFile` starts from an empty list when it is off
@@ -612,6 +697,9 @@ async function main() {
   // Both proxies persist their rule groups, so a corpus starts by clearing
   // whatever the last one left in the same data directory.
   await wipeNamedGroups();
+  // Before any rules exist — the one moment the unruled answers are cheap to
+  // take, and the reason this runs here rather than per case.
+  const unruled = await collectUnruled(CASES);
 
   for (const c of CASES) {
     // Progress on stderr, so a long corpus says where it is without touching
@@ -622,21 +710,14 @@ async function main() {
     const [w, rs] = [await through(W, req), await through(RS, req)];
     ran++;
 
-    const problems = [];
-    if (w.status !== rs.status) problems.push(`status: whistle=${w.status} rs=${rs.status}`);
-    problems.push(...diff(w.headers, rs.headers, 'res.header'));
-    problems.push(...diff(w.trailers, rs.trailers, 'res.trailer'));
-    // Bodies are compared as text unless they are the origin's echo, which
-    // carries the request and is compared field by field instead.
-    const [ws, rss] = [seenByOrigin(w), seenByOrigin(rs)];
-    if (ws && rss) {
-      if (ws.method !== rss.method) problems.push(`req.method: whistle=${ws.method} rs=${rss.method}`);
-      if (ws.url !== rss.url) problems.push(`req.url: whistle=${ws.url} rs=${rss.url}`);
-      if (ws.body !== rss.body) problems.push(`req.body: whistle=${show(ws.body)} rs=${show(rss.body)}`);
-      problems.push(...diff(ws.headers, rss.headers, 'req.header'));
-    } else if (w.body !== rs.body) {
-      problems.push(`res.body: whistle=${show(w.body.slice(0, 120))} rs=${show(rs.body.slice(0, 120))}`);
-    }
+    const problems = problemsBetween(w, rs);
+
+    // Did the case's own rules change anything this bench can see? Asked of
+    // the raw differences, not the filtered ones: `EXPECTED` excuses places
+    // where the two proxies disagree on purpose, which has nothing to do with
+    // whether the rule did something.
+    const bare = unruled.get(JSON.stringify(c.request || {}));
+    if (bare && problemsBetween(bare, rs).length === 0) inert.push(c.name);
 
     const news = problems.filter((p) => !EXPECTED.some((e) => e.match(p, c)));
     if (news.length) {
@@ -646,7 +727,7 @@ async function main() {
   }
 
   origin.close();
-  console.log(JSON.stringify({ ran, differing, report }, null, 2));
+  console.log(JSON.stringify({ ran, differing, report, inert: inert.length, inertCases: inert }, null, 2));
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

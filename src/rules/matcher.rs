@@ -795,14 +795,38 @@ fn joins_tail(op: &RuleOp) -> bool {
 /// regexp admits a single `x`) and is reproduced in
 /// [`crate::proxy::apply`]'s reader too.
 fn join_each_path(protocol: &str, value: &str, tail: &str) -> String {
+    let join = |path: &str| match names_a_remote_file(protocol, path) {
+        true => path.to_string(),
+        false => super::url::join_url(path, tail),
+    };
     if protocol.starts_with("xs") || !value.contains('|') {
-        return super::url::join_url(value, tail);
+        return join(value);
     }
-    value
-        .split('|')
-        .map(|path| super::url::join_url(path, tail))
-        .collect::<Vec<_>>()
-        .join("|")
+    value.split('|').map(join).collect::<Vec<_>>().join("|")
+}
+
+/// Is this entry of a **file** rule a URL rather than a path?
+///
+/// `file://http://host/mock.json` fetches that URL and serves what comes back as
+/// the mocked body: upstream's file reader hands every entry `util.isUrl`
+/// accepts to `pluginMgr.resolveKey`, which turns it into an HTTP request rather
+/// than a path (`_original/lib/plugins/index.js:1521-1529`, reached from
+/// `readFiles`, `lib/handlers/file-proxy.js:39-59`).
+///
+/// Such an entry does not take the tail, because upstream resolves it from the
+/// **unjoined** list — `resolveKey(rawFiles[i])`, `getRuleFiles`
+/// (`_original/lib/util/index.js:1435-1457`). Measured against whistle 2.10.8: a
+/// request for `/echo` under `127.0.0.1:P file://http://127.0.0.1:P/fixed`
+/// fetches `/fixed`, not `/fixed/echo`. Decided per `|` entry rather than per
+/// value, so `file:///srv/static|http://host/fallback` still extends the
+/// directory and still leaves the URL alone — the same split upstream gets for
+/// free by keeping the entries apart.
+///
+/// The destination rewrite and the write family are deliberately not covered: a
+/// destination's value is *always* a URL and joining it is the whole of "the
+/// path is concatenated by default", and a dump path is a path.
+fn names_a_remote_file(protocol: &str, value: &str) -> bool {
+    protocols::is_file_protocol(protocol) && super::url::has_web_protocol(value)
 }
 
 /// Add `op` to `resolved` under its protocol's arity rule, stamped with `order`
@@ -1052,6 +1076,33 @@ fn ignore_upstream_proxies(resolved: &mut Resolved) {
 mod tests {
     use super::*;
     use crate::rules::parse_text;
+
+    /// A file rule whose source is a URL keeps its own path; one that is a
+    /// directory still takes the request's.
+    ///
+    /// Upstream resolves a URL entry from its **unjoined** list (`rawFiles[i]`,
+    /// `getRuleFiles`, `_original/lib/util/index.js:1435-1457`). Without the
+    /// distinction, `file://http://host/data.json` on a request for `/echo`
+    /// fetched `/data.json/echo` — the rule looked broken and the source it
+    /// named looked fine.
+    #[test]
+    fn a_url_file_source_keeps_its_path_and_a_directory_takes_the_tail() {
+        let join = |value: &str| join_each_path("file", value, "/js/a.js");
+        assert_eq!(join("http://host/data.json"), "http://host/data.json");
+        assert_eq!(join("https://host/data.json"), "https://host/data.json");
+        assert_eq!(join("/srv/static"), "/srv/static/js/a.js");
+        // Decided per entry, so a mixed list gets both answers at once.
+        assert_eq!(
+            join("/srv/static|http://host/fallback"),
+            "/srv/static/js/a.js|http://host/fallback"
+        );
+        // A destination rewrite is always a URL and always joins — that is the
+        // whole of "the path is concatenated by default".
+        assert_eq!(
+            join_each_path(crate::rules::protocols::URL_REPLACE, "http://host/base", "/js/a.js"),
+            "http://host/base/js/a.js"
+        );
+    }
 
     fn req(url: &str) -> ReqInfo {
         // Minimal URL splitter for tests.

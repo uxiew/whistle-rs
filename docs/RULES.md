@@ -1465,13 +1465,32 @@ that is neither is read as a list of protocol names.
 |----------|-------|--------|
 | `redirect` / `location` | a URL | Respond `302 Found` with `Location: <url>` |
 | `statusCode` | a status number | Respond with that status and an empty body (mock) |
-| `file` / `rawfile` | a local path | Serve the file's bytes with a guessed `Content-Type` |
+| `file` / `rawfile` | a local path **or a URL** | Serve the file's bytes with a guessed `Content-Type` |
 
 ```
 old.example.com/legacy   redirect://https://new.example.com/
 /\/track\b/              statusCode://204
 example.com/app.js       file:///Users/me/dev/app.js
 ```
+
+**The source may be a URL**, and then it is fetched and its bytes are served as
+the mock — `pluginMgr.resolveKey` turns any entry `util.isUrl` accepts into an
+HTTP request rather than a path (`_original/lib/plugins/index.js:1521-1529`).
+
+```
+example.com/api/flags   file://http://mocks.internal/flags.json
+example.com/api         file:///srv/cache|http://mocks.internal/api    # local first
+```
+
+It is a **fetch, not a forward**: the request's own headers do not travel, the
+answer carries this family's `Server` header, and the request's leftover path is
+*not* appended to the URL — `file:///srv/static` extends into a directory,
+`file://http://host/x` does not. The entries of a `|` list are decided one at a
+time, so the second line above serves the local copy when it is there and fetches
+only when it is not. A source is capped at 256 KB (`MAX_URL_VAL_LEN`); one that
+answers `404` gives the family's own 404, and one that answers anything else
+non-`200` gives a `502` naming the status, because that is a broken mock server
+rather than a missing file. `<…>` names a path, never a URL.
 
 Note the first line has no `*`. A path prefix already matches everything below
 it at a segment boundary, and a `*` in the path of an ordinary pattern is a

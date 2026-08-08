@@ -1435,8 +1435,9 @@ pub fn short_circuit(
     info: &ReqInfo,
     resolved: &Resolved,
     env: super::template::ProxyEnv<'_>,
+    remote: Option<&RemoteFile>,
 ) -> Option<Response<DynBody>> {
-    let mut resp = short_circuit_inner(info, resolved, env)?;
+    let mut resp = short_circuit_inner(info, resolved, env, remote)?;
     mark_self_generated(resp.headers_mut());
     Some(resp)
 }
@@ -1457,6 +1458,7 @@ fn short_circuit_inner(
     info: &ReqInfo,
     resolved: &Resolved,
     env: super::template::ProxyEnv<'_>,
+    remote: Option<&RemoteFile>,
 ) -> Option<Response<DynBody>> {
     let op = resolved.slot()?;
     let proto = op.protocol.as_str();
@@ -1518,7 +1520,7 @@ fn short_circuit_inner(
                 write_auto_cors(resp.headers_mut(), info);
                 return Some(resp);
             }
-            let mut resp = serve_file_family(proto, op, info, env)?;
+            let mut resp = serve_file_family(proto, op, info, env, remote)?;
             if cors {
                 write_auto_cors(resp.headers_mut(), info);
             }
@@ -1712,6 +1714,7 @@ fn serve_file_family(
     op: &RuleOp,
     info: &ReqInfo,
     env: super::template::ProxyEnv<'_>,
+    remote: Option<&RemoteFile>,
 ) -> Option<Response<DynBody>> {
     let value = op.value.as_str();
     let raw = proto.contains("rawfile");
@@ -1732,8 +1735,13 @@ fn serve_file_family(
     // it was stored under — `rule.key` at `file-proxy.js:270-272` — because that
     // is the only place `mock.json`'s extension is written down. An inline
     // `(text)` has no such name and falls back to the request URL.
-    if op.value_is_content {
-        let bytes = value.as_bytes().to_vec();
+    let Some((value, sources)) = file_location(op) else {
+        // The value is content. Two ways to get one, and they differ only in
+        // the name the content type is guessed from.
+        let bytes = match op.value_is_content {
+            true => value.as_bytes().to_vec(),
+            false => crate::rules::url::fixed_value(value)?.1.into_bytes(),
+        };
         let named = op.value_key.as_deref().unwrap_or(&info.full_url);
         return Some(if raw {
             serve_raw_value(&bytes)
@@ -1742,24 +1750,10 @@ fn serve_file_family(
         } else {
             serve_file_range(&bytes, named, info)
         });
-    }
-    let value = match crate::rules::url::fixed_value(value) {
-        Some((crate::rules::url::Fixed::Inline, text)) => {
-            let bytes = text.into_bytes();
-            return Some(if raw {
-                serve_raw_value(&bytes)
-            } else if templated {
-                serve_template(&bytes, &info.full_url, info, env)
-            } else {
-                serve_file_range(&bytes, &info.full_url, info)
-            });
-        }
-        Some((crate::rules::url::Fixed::Verbatim, path)) => std::borrow::Cow::Owned(path),
-        None => std::borrow::Cow::Borrowed(value),
     };
 
-    let candidates = FileCandidates::of(proto, &value);
-    match candidates.read() {
+    let candidates = FileCandidates::of(proto, &value, sources);
+    match candidates.read(remote) {
         // The *matched* path drives the content type, not the rule value: with
         // `file:///tmp/mock/` it is `/tmp/mock/index.html` that was served.
         //
@@ -1777,6 +1771,28 @@ fn serve_file_family(
         // A cross (`x`/`xs`) rule falls through to the real server instead —
         // including when the path was refused (`file-proxy.js:298-303`).
         None if cross => None,
+        // A URL source that answered something other than `404` is the file
+        // server being broken rather than the file being absent, and upstream
+        // says so with a `502` instead of hiding it behind a not-found
+        // (`file-proxy.js:301-307`). Measured: a source answering `500` gets a
+        // `502` from whistle and used to get a `404` from here — the one status
+        // that tells a reader to go and look at their mock server.
+        None if let Some(r) = remote
+            && r.data.is_none()
+            && r.status != 0
+            && r.status != 404 =>
+        {
+            Some(
+                Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(body::full(Bytes::from(format!(
+                        "Error: response {}",
+                        r.status
+                    ))))
+                    .unwrap(),
+            )
+        }
         None => Some(
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -1788,6 +1804,52 @@ fn serve_file_family(
                 .unwrap(),
         ),
     }
+}
+
+/// Where a file rule points, or `None` when its value **is** the content and
+/// there is nothing to open.
+///
+/// Two value shapes are content: an inline `(text)`, and a `{name}` the values
+/// store answered — both are `readRuleValue`'s `if (rule.value)` arm upstream
+/// (`_original/lib/util/index.js:1178-1180`). `<path>` is the third bracket form
+/// and means the opposite: a location pinned in place, which the matcher has
+/// already honoured by not extending it.
+///
+/// Shared by the serving path and by [`prefetch_remote_file`], which have to
+/// agree about what the rule points at — one fetches the URL the other will ask
+/// for.
+fn file_location(op: &RuleOp) -> Option<(std::borrow::Cow<'_, str>, Sources)> {
+    if op.value_is_content {
+        return None;
+    }
+    match crate::rules::url::fixed_value(&op.value) {
+        Some((crate::rules::url::Fixed::Inline, _)) => None,
+        Some((crate::rules::url::Fixed::Verbatim, path)) => {
+            Some((std::borrow::Cow::Owned(path), Sources::PathsOnly))
+        }
+        None => Some((std::borrow::Cow::Borrowed(op.value.as_str()), Sources::PathsAndUrls)),
+    }
+}
+
+/// May this rule's entries name a URL, or are they all paths?
+///
+/// The `<…>` form is paths only, which is a measurement rather than a design:
+/// `file://http://host/x` is fetched by whistle and `file://<http://host/x>` is
+/// opened as a path and 404s. The brackets are documented as *do not append the
+/// request's path*, and nothing says they also mean *do not fetch* — but they
+/// do, and a port that fetched both would answer `200` where whistle answers
+/// `404`.
+///
+/// One shape is not covered: against a pattern that leaves no path to append —
+/// `^http://host/echo <http://host/x>` — upstream fetches after all. That is
+/// recorded in `tests/differential/cases.js` rather than reproduced, because no
+/// reading of `file-proxy.js` explained why the pattern's leftover should decide
+/// whether a value is a URL, and encoding an unexplained correlation is how a
+/// port acquires bugs it cannot maintain.
+#[derive(Clone, Copy, PartialEq)]
+enum Sources {
+    PathsOnly,
+    PathsAndUrls,
 }
 
 /// The marker whistle reports instead of a path it refused to resolve
@@ -1802,17 +1864,115 @@ const INVALID_PATH: &str = "(Path contains parent directory notation '..')";
 /// a file wins" rule (`readFiles`, `file-proxy.js:38-58`) a single loop, and
 /// keeps the 404 able to name what was actually tried.
 struct FileCandidates {
-    paths: Vec<String>,
+    paths: Vec<FileSource>,
     /// What a 404 should blame: the last path the user actually wrote, or
     /// [`INVALID_PATH`] when that entry was refused for containing `..`.
     blame: String,
 }
 
+/// Where one candidate's bytes come from.
+///
+/// A file rule may name a URL instead of a path, and then the bytes are fetched
+/// rather than opened — see [`names_a_remote_file`](crate::rules::matcher) for
+/// the upstream reader that does this and why such an entry keeps its own path.
+/// The two are kept in one ordered list because upstream tries them in the order
+/// written and stops at the first that answers: `file:///srv/cache|http://host/x`
+/// serves the local copy when it exists and fetches only when it does not.
+#[derive(Debug, Clone, PartialEq)]
+enum FileSource {
+    Path(String),
+    Url(String),
+}
+
+/// A file rule's URL source, already fetched.
+///
+/// The fetch happens before [`short_circuit`], not inside it: everything that
+/// answers a request without contacting the origin is synchronous, and the one
+/// piece of I/O here that is not the filesystem should not be the reason to make
+/// all of it async. [`prefetch_remote_file`] walks the same candidate list the
+/// serving code walks, so the URL it fetched is the URL that will be asked for.
+pub struct RemoteFile {
+    url: String,
+    /// The bytes, or `None` when the fetch did not produce any.
+    data: Option<Arc<Vec<u8>>>,
+    /// What the URL answered, or `0` when nothing did. It outlives a failed
+    /// fetch because upstream distinguishes two kinds: a `404` is *this file is
+    /// not there*, and anything else is the file server itself being broken,
+    /// which it reports as a `502` rather than hiding behind a not-found
+    /// (`is502 = err.code > 0 && err.code != 404`,
+    /// `_original/lib/handlers/file-proxy.js:302`). A transport failure has no
+    /// numeric code there, so it falls to the 404 — and to `0` here.
+    status: u16,
+}
+
+/// Fetch a file rule's URL source, if the rule has one that is reached.
+///
+/// "Reached" is what the walk is for: an entry only matters when no earlier
+/// candidate is a readable local file, which is upstream's `readFiles` order
+/// (`_original/lib/handlers/file-proxy.js:39-59`). Returns `None` for the
+/// overwhelmingly common case — a rule that is not a file rule, or one whose
+/// sources are all paths — and costs nothing there.
+///
+/// A remote source is capped at `MAX_URL_VAL_LEN`
+/// (`_original/lib/plugins/index.js:1496`), and a fetch that fails is not an
+/// answer: the rule falls through to its next candidate, then to the 404 — or,
+/// for an `x` variant, to the origin.
+pub async fn prefetch_remote_file(resolved: &Resolved) -> Option<RemoteFile> {
+    let op = resolved.slot()?;
+    let proto = op.protocol.as_str();
+    if !crate::rules::protocols::is_file_protocol(proto) {
+        return None;
+    }
+    let (value, sources) = file_location(op)?;
+    if sources != Sources::PathsAndUrls {
+        return None;
+    }
+    for source in FileCandidates::of(proto, &value, sources).paths {
+        match source {
+            FileSource::Path(p) if read_cached(Path::new(&p)).is_some() => return None,
+            FileSource::Path(_) => {}
+            FileSource::Url(url) => {
+                let answer = super::upstream::simple_get(&url).await;
+                let (status, body) = match answer {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        tracing::warn!("file://{url}: {err}");
+                        return Some(RemoteFile { url, data: None, status: 0 });
+                    }
+                };
+                // Over the cap is this port's own refusal, not a measurement of
+                // upstream's: whistle passes `maxLength` into its reader and
+                // what that does at the boundary was never put in front of it.
+                // Refusing loudly beats serving a body that is silently short.
+                if status != 200 || body.len() > MAX_URL_FILE {
+                    tracing::warn!("file://{url}: answered {status}, {} bytes", body.len());
+                    return Some(RemoteFile { url, data: None, status });
+                }
+                return Some(RemoteFile { url, data: Some(Arc::new(body.to_vec())), status });
+            }
+        }
+    }
+    None
+}
+
+/// How much of a URL-sourced file is served — `MAX_URL_VAL_LEN`
+/// (`_original/lib/plugins/index.js:1496`).
+const MAX_URL_FILE: usize = 1024 * 256;
+
 impl FileCandidates {
-    fn of(proto: &str, value: &str) -> FileCandidates {
+    fn of(proto: &str, value: &str, sources: Sources) -> FileCandidates {
         let mut paths = Vec::new();
         let mut blame = String::new();
         for entry in split_paths(proto, value) {
+            // A URL is not a path and none of what follows applies to it: there
+            // is no home directory to expand, no `index.html` to append and no
+            // leading slash to restore. It is also the one entry that can carry
+            // a `?query`, which `decode_path` would cut off.
+            if sources == Sources::PathsAndUrls && crate::rules::url::has_web_protocol(entry) {
+                blame = entry.to_string();
+                paths.push(FileSource::Url(entry.to_string()));
+                continue;
+            }
             let entry = expand_home(&decode_path(entry));
             if has_parent_ref(&entry) {
                 // `joinPath` refuses the path outright (`util/index.js:1847-1849`)
@@ -1829,19 +1989,27 @@ impl FileCandidates {
                 let rooted = format!("/{}", candidate.trim_start_matches('/'));
                 blame = candidate.clone();
                 if rooted != candidate {
-                    paths.push(candidate);
+                    paths.push(FileSource::Path(candidate));
                 }
-                paths.push(rooted);
+                paths.push(FileSource::Path(rooted));
             }
         }
         FileCandidates { paths, blame }
     }
 
-    /// The first candidate that is a readable regular file.
-    fn read(&self) -> Option<(String, Arc<Vec<u8>>)> {
-        self.paths
-            .iter()
-            .find_map(|p| read_cached(Path::new(p)).map(|data| (p.clone(), data)))
+    /// The first candidate that answers: a readable regular file, or the URL
+    /// source [`prefetch_remote_file`] already fetched.
+    fn read(&self, remote: Option<&RemoteFile>) -> Option<(String, Arc<Vec<u8>>)> {
+        self.paths.iter().find_map(|source| match source {
+            FileSource::Path(p) => read_cached(Path::new(p)).map(|data| (p.clone(), data)),
+            // Matched by URL rather than taken on trust: the prefetch walked
+            // this same list, but a `|` value can name two URLs and only the
+            // one that was fetched may answer.
+            FileSource::Url(url) => remote
+                .filter(|r| &r.url == url)
+                .and_then(|r| r.data.as_ref())
+                .map(|data| (url.clone(), Arc::clone(data))),
+        })
     }
 }
 
@@ -2633,8 +2801,17 @@ fn content_type_for(path: &str, full_url: &str) -> &'static str {
 /// mock tree holds. An extension outside it falls back to the request URL's, as
 /// it would for a file with no extension at all.
 fn content_type_of_ext(path: &str) -> Option<&'static str> {
-    let last = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let ext = last.rsplit_once('.')?.1.to_ascii_lowercase();
+    // The separator set is `mime`'s own: `lookup` strips everything up to the
+    // last `.`, `/` **or** `\` (`mime@1 lookup`, `path.replace(/.*[\.\/\\]/, '')`),
+    // so a final segment with no dot is taken as the extension whole. That is
+    // not a quirk without consequence — `file://http://host/json` is typed
+    // `application/json` upstream, and was `text/html` here, because this
+    // required a dot and gave up.
+    let ext = path
+        .rsplit(['.', '/', '\\'])
+        .next()
+        .filter(|ext| !ext.is_empty())?
+        .to_ascii_lowercase();
     Some(match ext.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "xhtml" => "application/xhtml+xml; charset=utf-8",
@@ -9510,7 +9687,7 @@ mod tests {
     #[test]
     fn a_local_file_answer_carries_cors_for_a_cross_origin_page() {
         let resolved = resolve("a.com/api file:///no/such/mock.json\n", "http://a.com/api");
-        let resp = short_circuit(&cross_origin("GET"), &resolved, test_env()).expect("file://");
+        let resp = short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("file://");
         let h = resp.headers();
         assert_eq!(h.get("access-control-allow-origin").unwrap(), "https://app.test");
         assert_eq!(h.get("access-control-allow-credentials").unwrap(), "true");
@@ -9522,7 +9699,7 @@ mod tests {
     fn a_same_origin_request_gets_no_cors_headers() {
         let info = build_req_info("GET", "http", "a.com", 80, "/api", &HeaderMap::new(), None);
         let resolved = resolve("a.com/api file:///no/such/mock.json\n", "http://a.com/api");
-        let resp = short_circuit(&info, &resolved, test_env()).expect("file://");
+        let resp = short_circuit(&info, &resolved, test_env(), None).expect("file://");
         assert!(resp.headers().get("access-control-allow-origin").is_none());
     }
 
@@ -9538,7 +9715,7 @@ mod tests {
         h.insert("access-control-request-headers", "x-token".parse().unwrap());
         let info = build_req_info("OPTIONS", "http", "a.com", 80, "/api", &h, None);
         let resolved = resolve("a.com/api file:///no/such/mock.json\n", "http://a.com/api");
-        let resp = short_circuit(&info, &resolved, test_env()).expect("file://");
+        let resp = short_circuit(&info, &resolved, test_env(), None).expect("file://");
         assert_eq!(resp.status(), StatusCode::OK, "not the file's 404");
         let hs = resp.headers();
         assert_eq!(hs.get("access-control-allow-origin").unwrap(), "https://app.test");
@@ -9555,13 +9732,13 @@ mod tests {
             "a.com/api file:///no/such/mock.json disable://autoCors",
         ] {
             let resolved = resolve(&format!("{rule}\n"), "http://a.com/api");
-            let resp = short_circuit(&cross_origin("GET"), &resolved, test_env()).expect("file://");
+            let resp = short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("file://");
             assert!(
                 resp.headers().get("access-control-allow-origin").is_none(),
                 "{rule} should have silenced it"
             );
             // …and with it off, the preflight is the file's own answer again.
-            let resp = short_circuit(&cross_origin("OPTIONS"), &resolved, test_env()).expect("f");
+            let resp = short_circuit(&cross_origin("OPTIONS"), &resolved, test_env(), None).expect("f");
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{rule}");
         }
     }
@@ -9593,7 +9770,7 @@ mod tests {
         let info = build_req_info("GET", "http", "a.com", 80, "/x", &HeaderMap::new(), None);
         for rule in ["statusCode://204", "redirect://http://b.com/", "file:///nope"] {
             let resolved = resolve(&format!("a.com/x {rule}\n"), "http://a.com/x");
-            let resp = short_circuit(&info, &resolved, test_env()).expect("an answer");
+            let resp = short_circuit(&info, &resolved, test_env(), None).expect("an answer");
             assert_eq!(
                 resp.headers().get("x-server").map(|v| v.to_str().unwrap()),
                 Some("whistle-rs"),
@@ -9622,7 +9799,7 @@ mod tests {
     fn location_href_answers_the_request_itself() {
         let body_of = |rule: &str, info: &ReqInfo| {
             let resolved = resolve(&format!("a.com/x {rule}\n"), "http://a.com/x");
-            let resp = short_circuit(info, &resolved, test_env())?;
+            let resp = short_circuit(info, &resolved, test_env(), None)?;
             let ctype = resp
                 .headers()
                 .get(hyper::header::CONTENT_TYPE)
@@ -9696,7 +9873,7 @@ mod tests {
             "http://a.com/x",
         );
         assert_eq!(second.slot().map(|op| op.protocol.as_str()), Some("file"));
-        assert_eq!(body_text(short_circuit(&info, &second, test_env()).unwrap()), "MOCK");
+        assert_eq!(body_text(short_circuit(&info, &second, test_env(), None).unwrap()), "MOCK");
     }
 
     /// Only the file family. `redirect://` and `statusCode://` are answered by
@@ -9705,7 +9882,7 @@ mod tests {
     fn redirect_and_status_code_carry_no_automatic_cors() {
         for rule in ["redirect://http://b.com/", "statusCode://204"] {
             let resolved = resolve(&format!("a.com/api {rule}\n"), "http://a.com/api");
-            let resp = short_circuit(&cross_origin("GET"), &resolved, test_env()).expect("answer");
+            let resp = short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("answer");
             assert!(resp.headers().get("access-control-allow-origin").is_none(), "{rule}");
         }
     }
@@ -9715,10 +9892,10 @@ mod tests {
         let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
         // xfile with a missing file → no short-circuit (proxy the real server).
         let x = resolve("a.com xfile:///no/such/file.txt\n", "http://a.com/");
-        assert!(short_circuit(&info, &x, test_env()).is_none());
+        assert!(short_circuit(&info, &x, test_env(), None).is_none());
         // plain file missing → a 404 short-circuit.
         let f = resolve("a.com file:///no/such/file.txt\n", "http://a.com/");
-        let r = short_circuit(&info, &f, test_env()).expect("file:// should short-circuit");
+        let r = short_circuit(&info, &f, test_env(), None).expect("file:// should short-circuit");
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 
@@ -9731,7 +9908,7 @@ mod tests {
             "a.com file:///definitely/missing/file resHeaders://x-mock=1 resType://json",
             "http://a.com/x",
         );
-        let resp = short_circuit(&info, &resolved, test_env()).expect("file:// short-circuits");
+        let resp = short_circuit(&info, &resolved, test_env(), None).expect("file:// short-circuits");
         let mut parts = resp.into_parts().0;
         apply_response(&mut parts, &resolved);
         assert_eq!(parts.headers.get("x-mock").map(|v| v.to_str().unwrap()), Some("1"));
@@ -10121,7 +10298,7 @@ mod tests {
             value: value.to_string(),
             ..Default::default()
         };
-        let resp = serve_file_family(proto, &op, &info, test_env())?;
+        let resp = serve_file_family(proto, &op, &info, test_env(), None)?;
         let status = resp.status().as_u16();
         let ctype = resp
             .headers()
@@ -10174,7 +10351,7 @@ mod tests {
                 None => (rest, "/"),
             };
             let info = build_req_info("GET", scheme, host, 80, path, &HeaderMap::new(), None);
-            let resp = short_circuit(&info, &mgr.resolve(&info), test_env())?;
+            let resp = short_circuit(&info, &mgr.resolve(&info), test_env(), None)?;
             let status = resp.status().as_u16();
             let body = rt()
                 .block_on(async { http_body_util::BodyExt::collect(resp.into_body()).await })
@@ -10254,7 +10431,7 @@ mod tests {
             &HeaderMap::new(),
             None,
         );
-        let resp = short_circuit(&info, &mgr.resolve(&info), test_env()).expect("served");
+        let resp = short_circuit(&info, &mgr.resolve(&info), test_env(), None).expect("served");
         assert_eq!(resp.status().as_u16(), 200);
         let body = rt()
             .block_on(async { http_body_util::BodyExt::collect(resp.into_body()).await })
@@ -10325,6 +10502,142 @@ mod tests {
         assert_eq!(expand_index("/a/b"), vec!["/a/b".to_string()]);
     }
 
+    /// A one-shot HTTP server that answers every request the same way.
+    ///
+    /// Hand-rolled rather than hyper: what is under test is the fetch, and a
+    /// fixed status line with a fixed body is the whole of what it needs to
+    /// answer with. Returns the `http://127.0.0.1:PORT` it is listening on.
+    async fn one_answer(status: u16, ctype: &str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let head = format!(
+            "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let head = head.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Serve a file rule whose source may be a URL, doing the prefetch the
+    /// request path does.
+    async fn serve_remote(proto: &str, value: &str, url: &str) -> (u16, String, String) {
+        let (scheme, rest) = url.split_once("://").expect("absolute url");
+        let (host, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let info = build_req_info("GET", scheme, host, 80, path, &HeaderMap::new(), None);
+        let op = RuleOp {
+            protocol: proto.to_string(),
+            value: value.to_string(),
+            ..Default::default()
+        };
+        let mut resolved = Resolved::default();
+        resolved.insert(op.clone());
+        let remote = prefetch_remote_file(&resolved).await;
+        let resp = serve_file_family(proto, &op, &info, test_env(), remote.as_ref())
+            .expect("the file family answers");
+        let status = resp.status().as_u16();
+        let ctype = resp
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        // Awaited rather than passed to `body_text`, which spins up a runtime
+        // of its own and cannot be called from inside one.
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        (status, ctype, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A file rule may name a URL, and then its bytes are fetched rather than
+    /// opened — upstream's `resolveKey`/`requestBin` path
+    /// (`_original/lib/plugins/index.js:1521-1529`).
+    ///
+    /// Measured against whistle 2.10.8 before it was written: the content type
+    /// comes from the **URL**, not from what the source answered with, which is
+    /// why a JSON body behind an extensionless path is served as `text/html`
+    /// by both.
+    #[tokio::test]
+    async fn a_file_rule_may_name_a_url_instead_of_a_path() {
+        let base = one_answer(200, "application/json", r#"{"remote":true}"#).await;
+
+        let (status, ctype, body) = serve_remote("file", &format!("{base}/data.json"), "http://x.com/echo").await;
+        assert_eq!((status, body.as_str()), (200, r#"{"remote":true}"#));
+        assert!(ctype.starts_with("application/json"), "type from the URL: {ctype}");
+
+        // No extension to guess from, and upstream falls back to the request's
+        // own default rather than to what the source said.
+        let (_, ctype, _) = serve_remote("file", &format!("{base}/noext"), "http://x.com/echo").await;
+        assert!(ctype.starts_with("text/html"), "{ctype}");
+
+        // A final segment that *is* an extension name counts as one, with no
+        // dot in sight — `mime.lookup` cuts at the last `.`, `/` or `\`.
+        let (_, ctype, _) = serve_remote("file", &format!("{base}/json"), "http://x.com/echo").await;
+        assert!(ctype.starts_with("application/json"), "{ctype}");
+
+        // `<…>` is paths only. Measured: whistle opens it as a path and 404s.
+        let (status, _, _) =
+            serve_remote("file", &format!("<{base}/data.json>"), "http://x.com/echo").await;
+        assert_eq!(status, 404, "angle brackets do not name a URL to fetch");
+    }
+
+    /// A source that answers something other than `404` is the file server
+    /// being broken, and says so with a `502` — `is502` at
+    /// `_original/lib/handlers/file-proxy.js:301-307`. Measured: whistle answers
+    /// `502 Error: response 500`, and this port answered `404` until it did.
+    #[tokio::test]
+    async fn a_broken_url_source_is_a_502_and_a_missing_one_is_a_404() {
+        let broken = one_answer(500, "text/plain", "boom").await;
+        let (status, _, body) = serve_remote("file", &format!("{broken}/x.json"), "http://x.com/echo").await;
+        assert_eq!((status, body.as_str()), (502, "Error: response 500"));
+
+        let missing = one_answer(404, "text/plain", "gone").await;
+        let (status, _, body) = serve_remote("file", &format!("{missing}/x.json"), "http://x.com/echo").await;
+        assert_eq!(status, 404);
+        assert!(body.contains("file not found"), "{body}");
+    }
+
+    /// A `|` value mixing a path and a URL tries them in the order written, and
+    /// only fetches when the local copy is not there.
+    #[tokio::test]
+    async fn a_local_path_is_preferred_to_a_url_written_after_it() {
+        let base = one_answer(200, "application/json", r#"{"remote":true}"#).await;
+        let fx = Fixtures::new("remote-file");
+        let local = fx.write("local.json", br#"{"local":true}"#);
+
+        let (_, _, body) = serve_remote(
+            "file",
+            &format!("{local}|{base}/data.json"),
+            "http://x.com/echo",
+        )
+        .await;
+        assert_eq!(body, r#"{"local":true}"#, "the local copy answers first");
+
+        let (_, _, body) = serve_remote(
+            "file",
+            &format!("/definitely/missing.json|{base}/data.json"),
+            "http://x.com/echo",
+        )
+        .await;
+        assert_eq!(body, r#"{"remote":true}"#, "and the URL when it is not there");
+    }
+
     #[test]
     fn home_prefix_expands_to_the_home_directory() {
         let home = dirs::home_dir().expect("a home directory");
@@ -10336,9 +10649,9 @@ mod tests {
         assert_eq!(expand_home("/tmp/~/x"), "/tmp/~/x");
 
         assert!(
-            FileCandidates::of("file", "~/mock.json")
+            FileCandidates::of("file", "~/mock.json", Sources::PathsAndUrls)
                 .paths
-                .contains(&format!("{home}/mock.json"))
+                .contains(&FileSource::Path(format!("{home}/mock.json")))
         );
     }
 
@@ -10425,7 +10738,7 @@ mod tests {
             value: path,
             ..Default::default()
         };
-        let resp = serve_file_family("rawfile", &op, &info, test_env()).expect("served");
+        let resp = serve_file_family("rawfile", &op, &info, test_env(), None).expect("served");
         assert_eq!(resp.status().as_u16(), 202);
         assert_eq!(
             resp.headers().get("x-sep").and_then(|v| v.to_str().ok()),
@@ -10460,7 +10773,7 @@ mod tests {
                 value: value.into(),
                 ..Default::default()
             };
-            let resp = serve_file_family(proto, &op, &info, test_env()).expect("served");
+            let resp = serve_file_family(proto, &op, &info, test_env(), None).expect("served");
             resp.headers()
                 .get("server")
                 .and_then(|v| v.to_str().ok())
@@ -10493,7 +10806,7 @@ mod tests {
                 value_key: key.map(str::to_string),
                 ..Default::default()
             };
-            let resp = serve_file_family("file", &op, &info, test_env()).expect("served");
+            let resp = serve_file_family("file", &op, &info, test_env(), None).expect("served");
             resp.headers()
                 .get(hyper::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
@@ -10547,7 +10860,7 @@ mod tests {
             value: value.into(),
             ..Default::default()
         };
-        let resp = serve_file_family(proto, &op, &info, test_env()).expect("served");
+        let resp = serve_file_family(proto, &op, &info, test_env(), None).expect("served");
         let status = resp.status().as_u16();
         let heads = resp
             .headers()
@@ -10635,7 +10948,7 @@ mod tests {
             value: "(no-blank-line)".into(),
             ..Default::default()
         };
-        let resp = serve_file_family("rawfile", &op, &info, test_env()).expect("served");
+        let resp = serve_file_family("rawfile", &op, &info, test_env(), None).expect("served");
         assert_eq!(resp.status().as_u16(), 200);
         assert!(resp.headers().get(hyper::header::CONTENT_TYPE).is_none());
     }
@@ -10650,7 +10963,7 @@ mod tests {
         let info = build_req_info("GET", "http", "x.com", 80, "/", &HeaderMap::new(), None);
         let head = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\nplain";
         let encoding_of = |op: &RuleOp| {
-            serve_file_family("rawfile", op, &info, test_env())
+            serve_file_family("rawfile", op, &info, test_env(), None)
                 .expect("served")
                 .headers()
                 .get(hyper::header::CONTENT_ENCODING)
@@ -11113,7 +11426,7 @@ mod tests {
         ] {
             let r = resolve(rules, "http://a.com/");
             assert!(
-                short_circuit(&info, &r, test_env()).is_none(),
+                short_circuit(&info, &r, test_env(), None).is_none(),
                 "the file rule should step aside: {rules}"
             );
         }
@@ -11132,7 +11445,7 @@ mod tests {
         ] {
             let r = resolve(rules, "http://a.com/");
             assert!(
-                short_circuit(&info, &r, test_env()).is_some(),
+                short_circuit(&info, &r, test_env(), None).is_some(),
                 "the file rule should answer: {rules}"
             );
         }
@@ -12996,7 +13309,7 @@ mod tests {
         let challenge = |rule: &str, header: &str| {
             let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
             let resolved = resolve(&format!("a.com {rule}\n"), "http://a.com/");
-            let resp = short_circuit(&info, &resolved, test_env()).expect("a status is answered");
+            let resp = short_circuit(&info, &resolved, test_env(), None).expect("a status is answered");
             (
                 resp.status().as_u16(),
                 resp.headers().get(header).map(|v| v.to_str().unwrap().to_string()),

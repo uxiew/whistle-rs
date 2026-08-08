@@ -47,14 +47,17 @@ says which port is which.
 It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0` — except for the corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
-`cases-delete.js` at `differing: 8`, `cases-values.js` at `differing: 11` and
-`cases-groups.js` at `differing: 4`.
+`cases-delete.js` at 8, `cases-values.js` at 11, `cases-compose.js` at 7,
+`cases-groups.js` at 4, `cases-file.js` at 2 and `cases-proxy.js` at 23.
+
+Every run also reports `inert` — the cases that would answer the same with no
+rules loaded at all, and therefore prove nothing. See [below](#inert-which-cases-prove-nothing).
 
 One corpus claims a fourth port. `cases-includes.js` is about `@` includes, and
 half of them name a **URL**, so it stands up a rules-serving HTTP server at
 `PORT_BASE+10`. It runs clean at `differing: 0`.
 
-Four corpora are not clean on a bare run, by design:
+Five corpora are not clean on a bare run, by design:
 
 * `cases-filters.js` asks about `env:`, which reads the **proxy's** environment.
   Both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle
@@ -67,11 +70,15 @@ Four corpora are not clean on a bare run, by design:
   when the bodies audit matched upstream: an operator written with *no value*
   now does nothing here either. That is a different question from
   `delete://body`, where this port still empties the body on purpose.
-* `cases-compose.js` ends at `differing: 8`, also named at the top of the file:
+* `cases-compose.js` ends at `differing: 7`, also named at the top of the file:
   six are `weinre://`, which appends whistle's own bundled debug agent and points
   it at a weinre server whistle runs — neither of which this port has; one is
   `intercept://`, which is not a protocol in either proxy and fails in each one's
   own words; and one is the OS byte of a gzip header.
+* `cases-file.js` ends at `differing: 2`, named at the top of the file: a URL
+  file source spelled `https://` against a plaintext origin, which whistle
+  answers anyway and this port refuses; and `<…>`, which names a path here and
+  is fetched by upstream when the pattern leaves nothing to append.
 * `cases-groups.js` ends at `differing: 4`, named at the top of the file: one is
   the two APIs' answer to adding a group twice, and three are one fact — a
   fenced ``` block is private to the rule group that declared it upstream and
@@ -149,6 +156,42 @@ the bug.
 No amount of reading the parser shows this; the layer above it has to be run.
 When a case is inert on both sides, the question to answer before believing it
 is *which* layer made it inert.
+
+## `inert`: which cases prove nothing
+
+`differing: 0` says the two proxies agree. It does not say the case was *about*
+anything. A case whose rule never matched, or whose operator has no effect the
+bench can see, agrees with upstream perfectly — and would go on agreeing if the
+operator were deleted from this port's source. In the output the two are
+indistinguishable, which is this bench's oldest blind spot and the reason the
+notes above already name eleven cases in `cases-file.js` that 404 on both sides.
+
+So every run also asks a third question: **would the answer change if the rules
+were not there?** Before the corpus starts, with nothing loaded, each distinct
+request shape is put through whistle-rs once and the answer kept. A case whose
+answer is byte-identical to that one is reported as `inert`.
+
+```
+ran 152  differing 0  inert 33
+```
+
+Inert is not the same as wrong. A case pinning that a filter correctly excludes
+a line, or that a malformed rule is ignored, *should* be inert; so should one
+about an effect this bench cannot see — `resWrite://` goes to disk, and
+`write-bench.js` is where that is measured. What the number is for is that each
+of those needs a reason, and until it existed none of them were even listed.
+
+It found four kinds of dead case on its first run, all in the oldest corpus:
+
+* **seven pinned to port `18800`**, which no `PORT_BASE` has produced for a long
+  time — including the only cases here for wildcard patterns, regexp submatches
+  and port-only patterns. They had been passing as misses;
+* **six the bench itself could not see**, because `user-agent` and `accept` were
+  on the ignore list while the rules under test were `ua://`, `disable://ua` and
+  both `headerReplace://` doc forms;
+* **three whose names described something they do not measure** — `127.0.0.1:P
+  http://…` reads as *pattern = the URL*, so the line does nothing at all;
+* **one that needed a `content-type`** to make the body it rewrote count as text.
 
 ## Adding cases
 

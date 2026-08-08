@@ -5,6 +5,11 @@
 // on load. Both proxies run as the same user and are given the same rules text,
 // so the paths below are absolute and shared.
 //
+// It ends at `differing: 2`, both named where they are written: a URL source
+// spelled `https://` against a plaintext origin, and `<…>`, which names a path
+// here and is fetched by upstream against a pattern that leaves nothing to
+// append.
+//
 // Note the two pattern shapes. `A` pins the pattern to the request's whole path
 // so the rule's value is used as written; `P` leaves the path unmatched so it is
 // concatenated onto the value. Getting this wrong is silent: the first draft of
@@ -271,4 +276,39 @@ module.exports = [
   { name: 'a range with a signed start', rules: `${A} file://${F('range.txt')}`, request: { headers: { range: 'bytes=+2-6' } } },
   { name: 'an empty range value', rules: `${A} file://${F('range.txt')}`, request: { headers: { range: 'bytes=' } } },
   { name: 'a range over a concatenated file', rules: `${P} file://${F('site')}`, request: { path: '/js/app.js', headers: { range: 'bytes=0-6' } } },
+
+  // ── a file source that is a URL ────────────────────────────────────────
+  // The file family does not only read the disk: an entry `util.isUrl` accepts
+  // is fetched over HTTP and its bytes are served as the mock
+  // (`pluginMgr.resolveKey`, `_original/lib/plugins/index.js:1521-1529`, reached
+  // from `readFiles`, `lib/handlers/file-proxy.js:39-59`). This port answered
+  // 404 to every line below until it was measured.
+  //
+  // The origin doubles as the source, so `/json` and friends are the fixtures.
+  // It is a *fetch*, not a forward: the client's own headers do not travel, and
+  // the answer carries the file family's `Server` header — which is how these
+  // were told apart from a destination rewrite in the first place.
+  { name: 'a url file source is fetched', rules: `${A} file://http://${P}/json` },
+  { name: 'a url file source keeps its own path', rules: `${P} file://http://${P}/json`, request: { path: '/echo/deep' } },
+  // Two deliberate deviations, both about `https://` and `<…>`:
+  //
+  // * the **https spelling** points TLS at a plaintext origin. whistle answers
+  //   `200` anyway; this port speaks the scheme it was given, fails the
+  //   handshake and 404s. Matching upstream here would mean ignoring the `s`.
+  // * `<…>` names a **path**, never a URL to fetch — measured, and reproduced.
+  //   Against a pattern that leaves nothing to append, upstream fetches it after
+  //   all (`^http://P/echo <http://P/x>` serves the URL's bytes). No reading of
+  //   `file-proxy.js` explains why the pattern's leftover should decide whether
+  //   a value is a URL, so the shape is recorded and not copied.
+  { name: 'a url file source, https spelling', rules: `${A} file://https://${P}/json` },
+  { name: 'angle brackets name a path, not a url', rules: `${A} file://<http://${P}/json>` },
+  { name: 'a url source for tpl', rules: `${A} tpl://http://${P}/json` },
+  { name: 'a url source for rawfile', rules: `${A} rawfile://http://${P}/rawres` },
+  { name: 'a url source that 404s', rules: `${A} file://http://${P}/status?code=404` },
+  { name: 'a url source that 500s is a 502', rules: `${A} file://http://${P}/status?code=500` },
+  { name: 'an x variant falls through when the url 404s', rules: `${A} xfile://http://${P}/status?code=404` },
+  { name: 'the type comes from the url, not the answer', rules: `${A} file://http://${P}/json?x=1` },
+  { name: 'a url source with no extension', rules: `${A} file://http://${P}/plain` },
+  { name: 'a local path is preferred to a url after it', rules: `${A} file://${F('mock.json')}|http://${P}/json` },
+  { name: 'a missing local path falls through to the url', rules: `${A} file://${F('nope.json')}|http://${P}/json` },
 ];

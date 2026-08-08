@@ -2,7 +2,8 @@
 //
 // `P` is the origin's authority; rules are written against it so the same text
 // can go to both proxies unchanged.
-const P = `127.0.0.1:${Number(process.env.PORT_BASE || 18700) + 2}`;
+const PORT = Number(process.env.PORT_BASE || 18700) + 2;
+const P = `127.0.0.1:${PORT}`;
 
 module.exports = [
   // ── request headers ────────────────────────────────────────────────────
@@ -36,7 +37,12 @@ module.exports = [
   { name: 'reqBody replaces', rules: `${P} reqBody://(INJECTED)`, request: { method: 'POST', body: 'original' } },
   { name: 'reqBody on GET is dropped', rules: `${P} reqBody://(INJECTED)` },
   { name: 'reqPrepend/reqAppend', rules: `${P} reqPrepend://(A) reqAppend://(Z)`, request: { method: 'POST', body: 'M' } },
-  { name: 'reqReplace', rules: `${P} reqReplace://old=new`, request: { method: 'POST', body: 'an old thing' } },
+  { name: 'reqReplace', rules: `${P} reqReplace://old=new`, request: { method: 'POST', body: 'an old thing', headers: { 'content-type': 'text/plain' } } },
+  // The same line without a type, which neither proxy rewrites: the text
+  // transforms run inside a charset decode keyed on the content type, and a
+  // body with no type is not text as far as either of them is concerned. The
+  // case above carried no type either, and so measured nothing for a year.
+  { name: 'reqReplace needs a content type', rules: `${P} reqReplace://old=new`, request: { method: 'POST', body: 'an old thing' } },
   { name: 'params into urlencoded body', rules: `${P} params://c=3`, request: { method: 'POST', body: 'a=1&b=2', headers: { 'content-type': 'application/x-www-form-urlencoded' } } },
   { name: 'params with no body goes to query', rules: `${P} params://c=3` },
   { name: 'delete reqBody key on json', rules: `${P} delete://reqBody.a`, request: { method: 'POST', body: '{"a":1,"b":2}', headers: { 'content-type': 'application/json' } } },
@@ -93,13 +99,26 @@ module.exports = [
   { name: 'first matching line wins a single-value operator', rules: `${P} ua://first\n${P} ua://second` },
   { name: 'important reverses that', rules: `${P} ua://first\n${P} ua://second lineProps://important` },
   { name: 'a pattern that does not match', rules: `other.test reqHeaders://x-a=1` },
-  { name: 'wildcard pattern', rules: `*.0.0.1:18800 reqHeaders://x-w=1` },
-  { name: 'regexp pattern with a group', rules: `/127\\.0\\.0\\.(\\d+):18800/ reqHeaders://x-g=$1` },
+  { name: 'wildcard pattern', rules: `*.0.0.1:${PORT} reqHeaders://x-w=1` },
+  { name: 'regexp pattern with a group', rules: `/127\\.0\\.0\\.(\\d+):${PORT}/ reqHeaders://x-g=$1` },
   { name: 'inline comment is not a rule', rules: `${P} reqHeaders://x-a=1 # a comment` },
   // ── forms taken from the documentation at wproxy.org ───────────────────
-  { name: 'doc: protocol inheritance, http:// destination', rules: `${P} http://${P}/moved` },
-  { name: 'doc: <> disables path concatenation', rules: `${P} <http://${P}/fixed>`, request: { path: '/echo/deep/path' } },
-  { name: 'doc: path is concatenated by default', rules: `${P} http://${P}/base`, request: { path: '/echo/deep' } },
+  // The three below all pin the **swap** described in the note under them, not
+  // what their names used to claim. `127.0.0.1:<port> http://…` reads as
+  // *pattern = the URL, operator = the host*, so a request for `/echo` matches
+  // nothing and the line does nothing — on both sides. Renamed rather than
+  // deleted, because "this documented-looking line is inert" is worth a case;
+  // the live pair after them asks the questions the old names promised, with a
+  // pattern that cannot be swapped away.
+  { name: 'doc: a bare host with an http:// URL swaps into pattern and host', rules: `${P} http://${P}/moved` },
+  { name: 'doc: a bare host with an <http://> URL swaps and turns into a file', rules: `${P} <http://${P}/fixed>`, request: { path: '/echo/deep/path' } },
+  { name: 'doc: the swap leaves a plain request unmatched', rules: `${P} http://${P}/base`, request: { path: '/echo/deep' } },
+  { name: 'doc: path is concatenated by default', rules: `^http://${P}/echo** http://${P}/base`, request: { path: '/echo/deep' } },
+  // The brackets go **inside** the scheme. `<http://…>` is not a destination
+  // that refuses the join — the whole token is wrapped, and `formatShorthand`
+  // reads a wrapped token as `file://`, so it names a file whose path happens to
+  // look like a URL. `http://<…>` is the form the documentation means.
+  { name: 'doc: <> disables path concatenation', rules: `^http://${P}/echo** http://<${P}/base>`, request: { path: '/echo/deep' } },
   // These two are inert on **both** sides, and not for the reason their names
   // used to suggest. `127.0.0.1:<port>` is a bare host, which `indexOfPattern`
   // does not accept as a pattern (`isPattern` has no host branch — it only
@@ -110,16 +129,16 @@ module.exports = [
   // pair below asks the ws question with a pattern that cannot be swapped away.
   { name: 'doc: a bare host with a ws:// URL swaps into pattern and host', rules: `${P} ws://${P}/other` },
   { name: 'doc: a bare host with a tunnel:// URL swaps the same way', rules: `${P} tunnel://${P}` },
-  { name: 'doc: submatch $1 from a wildcard', rules: `^http://127.0.0.1:18800/**  reqHeaders://x-sub=$1`, request: { path: '/echo/abc' } },
-  { name: 'doc: submatch $1 from a regexp', rules: `/127\\.0\\.0\\.1:18800\\/(\\w+)/ reqHeaders://x-sub=$1` },
+  { name: 'doc: submatch $1 from a wildcard', rules: `^http://${P}/**  reqHeaders://x-sub=$1`, request: { path: '/echo/abc' } },
+  { name: 'doc: submatch $1 from a regexp', rules: `/127\\.0\\.0\\.1:${PORT}\\/(\\w+)/ reqHeaders://x-sub=$1` },
   { name: 'doc: urlParams with an existing query', rules: `${P} urlParams://a=1&b=2`, request: { path: '/echo?c=3' } },
   { name: 'doc: method lowercase is upcased', rules: `${P} method://put` },
   { name: 'doc: reqCookies json', rules: `${P} reqCookies://{"a":"1","b":"2"}` },
   { name: 'doc: resCookies with attributes', rules: `${P} resCookies://{"sid":{"value":"x","httpOnly":true,"maxAge":600}}` },
   { name: 'doc: log tag', rules: `${P} log://mytag` },
   { name: 'doc: two operators on one line', rules: `${P} reqHeaders://x-a=1 resHeaders://x-b=2` },
-  { name: 'doc: pattern with a path prefix', rules: `127.0.0.1:18800/echo reqHeaders://x-p=1` },
-  { name: 'doc: pattern with a path that should not match', rules: `127.0.0.1:18800/nope reqHeaders://x-p=1` },
+  { name: 'doc: pattern with a path prefix', rules: `${P}/echo reqHeaders://x-p=1` },
+  { name: 'doc: pattern with a path that should not match', rules: `${P}/nope reqHeaders://x-p=1` },
   { name: 'doc: ignore silences an operator', rules: `${P} reqHeaders://x-a=1 ignore://reqHeaders` },
   { name: 'doc: skip is the same as ignore', rules: `${P} reqHeaders://x-a=1 skip://reqHeaders` },
   { name: 'doc: enable and disable on one line', rules: `${P} disable://cookie enable://abort`, request: { headers: { cookie: 'a=1' } } },
@@ -139,7 +158,7 @@ module.exports = [
   { name: 'doc pattern: scheme-relative //host/path', rules: `//${P}/echo reqHeaders://x-hit=1` },
   { name: 'doc pattern: ^ wildcard in a path', rules: `^http://${P}/ec*o reqHeaders://x-hit=1` },
   { name: 'doc pattern: ^ with a trailing $ boundary', rules: `^http://${P}/ec*o$ reqHeaders://x-hit=1`, request: { path: '/echo/deep' } },
-  { name: 'doc pattern: port-only', rules: `:18800 reqHeaders://x-hit=1` },
+  { name: 'doc pattern: port-only', rules: `:${PORT} reqHeaders://x-hit=1` },
   { name: 'doc pattern: port-only that misses', rules: `:9999 reqHeaders://x-hit=1` },
 
   // A pattern that carries a query changes how its *path* is matched: prefix

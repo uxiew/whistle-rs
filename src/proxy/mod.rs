@@ -3674,7 +3674,13 @@ async fn serve(
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
-    if let Some(resp) = apply::short_circuit(&info, &resolved, proxy_env) {
+    // A file rule may name a URL rather than a path, and then its bytes are
+    // fetched. Hoisted out of `short_circuit` because everything under there
+    // answers without waiting for anything but the filesystem, and one network
+    // read is not a reason to make all of it async. Costs nothing unless a file
+    // rule won the slot and named a URL.
+    let remote = apply::prefetch_remote_file(&resolved).await;
+    if let Some(resp) = apply::short_circuit(&info, &resolved, proxy_env, remote.as_ref()) {
         tracing::info!("{} {} -> short-circuit", info.method, info.full_url);
         // Response-side operators apply to a mocked response too: upstream runs
         // its response inspectors over `file`/`tpl`/`redirect` responses just as
