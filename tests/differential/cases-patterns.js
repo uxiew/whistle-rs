@@ -59,6 +59,16 @@ const p = (name, pattern, url = A, probe = HIT) =>
 /** A whole rules text, with the mapper prepended. */
 const raw = (name, rules, url = A) =>
   ({ name, rules: `${MAP}\n${rules}`, request: { url } });
+/**
+ * A rules text with **no** mapper, matched on the origin's own address.
+ *
+ * For the cases that say `ignore://*` or `skip://*`: those take the mapper with
+ * them, and a case whose hostname then stops resolving has both proxies
+ * answering 502 and agreeing on nothing.
+ */
+const bare = (name, rules) => ({ name, rules: `127.0.0.1:${ORIGIN} ${rules}` });
+/** A ``` fenced values block, appended to a rules text. */
+const values = (name, body) => '\n\n```' + name + '\n' + body + '\n```';
 
 module.exports = [
   // ── baseline ───────────────────────────────────────────────────────────
@@ -299,6 +309,61 @@ module.exports = [
   raw('a second bare host is an operator, not a pattern', 'a.example.test b.example.test statusCode://204'),
   raw('the same pattern written twice on one line', 'a.example.test a.example.test statusCode://204'),
   raw('a bare host after the operator', 'a.example.test statusCode://204 b.example.test'),
+  raw('locationHref then statusCode on one line', 'a.example.test locationHref://http://d.test/ statusCode://204'),
+  raw('statusCode then locationHref on one line', 'a.example.test statusCode://204 locationHref://http://d.test/'),
+
+  // ── silencing the shared slot ─────────────────────────────────────────
+  // The slot is where `ignore://` and `skip://` stop being two spellings of one
+  // thing, and it is the only place they can: on a protocol with a list of its
+  // own, deleting the winner and skipping every candidate leave the same
+  // nothing.
+  //
+  //   * `ignore://` runs *after* the list has been reduced to one winner
+  //     (`ignoreForwardRule`, `_original/lib/util/index.js:2047-2059`), so it
+  //     either takes that winner out or does nothing at all. A loser it names
+  //     is not there to be named, and a winner it takes out does not hand the
+  //     slot to the next line.
+  //   * `skip://` also fills `req._skipProps`, which `getRule` consults per
+  //     candidate as it walks (`checkSkip`, `:2004-2013`), so the slot **falls
+  //     through** to whatever was written next.
+  //
+  // The names each reaches by are the two a resolved rule carries: the list it
+  // was filed under — `rule` for every member here — and the protocol it was
+  // *written* with. The member's canonical name is neither, which is why an
+  // alias cannot be silenced: `status://204` left the text `status` behind, and
+  // `ignore://status` resolves to the name `statusCode`, so the two never meet.
+  raw('ignore the operator that won the slot', 'a.example.test statusCode://204 redirect://http://d.test/ ignore://statusCode'),
+  raw('ignore the winner when redirect is first', 'a.example.test redirect://http://d.test/ statusCode://204 ignore://redirect'),
+  raw('ignore an operator that lost the slot', 'a.example.test statusCode://204 redirect://http://d.test/ ignore://redirect'),
+  raw('ignore rule names the whole family', 'a.example.test statusCode://204 redirect://http://d.test/ ignore://rule'),
+  raw('ignore a bare destination by its scheme', `a.example.test http://127.0.0.1:${ORIGIN}/x statusCode://204 ignore://http`),
+  raw('ignore rule names a bare destination too', `a.example.test http://127.0.0.1:${ORIGIN}/x statusCode://204 ignore://rule`),
+  raw('ignore the only operator in the slot', 'a.example.test statusCode://204 ignore://statusCode'),
+  raw('ignore a winner from a line above', 'a.example.test statusCode://204\na.example.test redirect://http://d.test/\na.example.test ignore://statusCode'),
+  raw('ignore locationHref when statusCode won', 'a.example.test statusCode://204 locationHref://http://d.test/ ignore://locationHref'),
+  raw('ignore statusCode when locationHref won', 'a.example.test locationHref://http://d.test/ statusCode://204 ignore://locationHref'),
+  raw('an alias cannot be ignored by its own spelling', 'a.example.test status://204 redirect://http://d.test/ ignore://status'),
+  raw('an alias cannot be ignored by its canonical name', 'a.example.test status://204 redirect://http://d.test/ ignore://statusCode'),
+  raw('skip the winner and the next one answers', 'a.example.test statusCode://204 redirect://http://d.test/ skip://statusCode'),
+  raw('skip the winner when redirect is first', 'a.example.test redirect://http://d.test/ statusCode://204 skip://redirect'),
+  raw('skip an operator that lost the slot', 'a.example.test statusCode://204 redirect://http://d.test/ skip://redirect'),
+  raw('skip rule takes the whole family', 'a.example.test statusCode://204 redirect://http://d.test/ skip://rule'),
+  raw('skip both members by name', 'a.example.test statusCode://204 redirect://http://d.test/ skip://statusCode|redirect'),
+  raw('skip a winner from a line above', 'a.example.test statusCode://204\na.example.test redirect://http://d.test/\na.example.test skip://statusCode'),
+  // `ignore://*` and `skip://*` would take the mapper with them, so these carry
+  // the origin's own address as their pattern instead.
+  bare('skip everything', 'statusCode://204 redirect://http://d.test/ reqHeaders://x-hit=1 skip://*'),
+  bare('an exemption does not survive skip star', 'statusCode://204 redirect://http://d.test/ skip://*|-redirect'),
+  bare('nor when it names the winner', 'statusCode://204 redirect://http://d.test/ skip://*|-statusCode'),
+  bare('a named skip its own line exempts', 'statusCode://204 redirect://http://d.test/ skip://statusCode|-statusCode'),
+  bare('ignore everything', 'statusCode://204 redirect://http://d.test/ ignore://*'),
+  bare('ignore everything but a loser', 'statusCode://204 redirect://http://d.test/ ignore://*&-redirect'),
+  bare('ignore everything but the winner', 'statusCode://204 redirect://http://d.test/ ignore://*&-statusCode'),
+
+  // Rules merged in mid-request compete for the same slot: `mergeRule` returns
+  // the *new* rule for a single-value protocol, and `rule` is one.
+  raw('an included statusCode beats an outer destination', `a.example.test http://127.0.0.1:${ORIGIN}/x reqRules://{extra}` + values('extra', 'a.example.test statusCode://204')),
+  raw('an included destination beats an outer statusCode', 'a.example.test statusCode://204 reqRules://{extra}' + values('extra', `a.example.test http://127.0.0.1:${ORIGIN}/x`)),
 
   // operator-first lines
   raw('operator first, one pattern', 'statusCode://204 a.example.test'),

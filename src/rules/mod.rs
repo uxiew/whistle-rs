@@ -376,16 +376,23 @@ pub struct Rule {
     /// Precomputed: does this line write an operator the response phase decides
     /// ([`protocols::is_res_phase`]), or an `ignore://` that could drop one?
     pub res_phase_ops: bool,
-    /// Precomputed: does this line carry an `ignore://`/`skip://` naming a rule
-    /// *exactly* — `pattern=…`, `matcher=…`, `operator=…`, `operation=…`?
+    /// Precomputed: does this line carry an ignore that has to be applied
+    /// *before* the resolution walk rather than after it?
     ///
-    /// These cannot be applied where the name-based ignores are, because they
-    /// drop a rule by text the resolved operator no longer carries, and they can
-    /// be written on a line *below* the rule they silence. Both force a pre-scan
-    /// (upstream resolves the ignore list first, `rules.js:1118-1147`), and a
-    /// pre-scan over every rule on every request is not free — so the flag says
-    /// whether one is needed at all. Rule sets that use none pay nothing.
-    pub has_exact_skip: bool,
+    /// Two kinds do. An `ignore://`/`skip://` naming a rule **exactly** —
+    /// `pattern=…`, `matcher=…`, `operator=…`, `operation=…` — drops a rule by
+    /// text the resolved operator no longer carries. And **every** `skip://`,
+    /// whatever it names, because the walk is where upstream consults
+    /// `req._skipProps` (`checkSkip`, called per candidate from
+    /// `_original/lib/rules/rules.js:986-989`) and skipping a candidate is not
+    /// the same as deleting a winner — see [`matcher::PreWalkSkips`].
+    ///
+    /// Either can be written on a line *below* the rule it silences, so both
+    /// force a pre-scan (upstream resolves the ignore list first,
+    /// `rules.js:1118-1147`), and a pre-scan over every rule on every request is
+    /// not free — so the flag says whether one is needed at all. Rule sets that
+    /// use none pay nothing.
+    pub has_skip: bool,
     /// Precomputed: might one of its filters need the response head?
     pub res_dependent: bool,
     /// Precomputed: does one of its filters read the request body (`b:`)?
@@ -801,27 +808,91 @@ pub struct ResInfo {
 
 /// The winning operators for a request, keyed by protocol.
 ///
-/// A protocol lands in exactly one of the two maps, decided once by
-/// [`protocols::is_multi_match`]. The accessors below hide that split: upstream
-/// exposes a multi-match protocol *both* as its first match (`_rules[name]`,
-/// from `getRule`) and as the full list (`rule.list`, from `getRuleList`,
+/// A protocol lands in exactly one of the three fields, decided once by
+/// [`protocols::is_slot_protocol`] and [`protocols::is_multi_match`]. The
+/// accessors below hide that split: upstream exposes a multi-match protocol
+/// *both* as its first match (`_rules[name]`, from `getRule`) and as the full
+/// list (`rule.list`, from `getRuleList`,
 /// `_original/lib/rules/rules.js:2240-2258`), so [`Resolved::get`] and
-/// [`Resolved::all`] are each total over both maps rather than one map apiece.
+/// [`Resolved::all`] are each total over all three rather than one field apiece.
 #[derive(Debug, Default, Clone)]
 pub struct Resolved {
     /// First-match-wins single-value protocols.
     pub single: HashMap<String, RuleOp>,
     /// Accumulated values for multi-match protocols (top-to-bottom order).
     pub multi: HashMap<String, Vec<RuleOp>>,
+    /// The one operator that won the **shared slot** — see
+    /// [`protocols::SLOT_PROTOCOLS`].
+    ///
+    /// A dozen protocol names share a single list upstream, so at most one of
+    /// them can ever be in play; keeping a key each and reconciling afterwards
+    /// left every consumer free to read a *loser* out of the set, and several
+    /// did. There is one entry here for the same reason there is one list
+    /// there, and [`RuleOp::protocol`] on it says which member won —
+    /// which is `getProtocolName(rules.rule.url)`, upstream's own way of asking
+    /// (`_original/lib/util/index.js:2043-2045`).
+    pub slot: Option<RuleOp>,
 }
 
 impl Resolved {
     /// The operator that won `protocol` — for a multi-match protocol, the first
     /// entry of its list, which is upstream's `_rules[name]`.
+    ///
+    /// A [shared-slot](protocols::SLOT_PROTOCOLS) name answers only when it is
+    /// the member that *won* the slot, which is what makes reading one of them
+    /// by name safe: a `statusCode://` written below a `file://` is not in the
+    /// set at all, exactly as upstream's `_rules.rule` never holds it.
     pub fn get(&self, protocol: &str) -> Option<&RuleOp> {
+        if protocols::is_slot_protocol(protocol) {
+            return self.slot.as_ref().filter(|op| op.protocol == protocol);
+        }
         self.single
             .get(protocol)
             .or_else(|| self.multi.get(protocol).and_then(|list| list.first()))
+    }
+
+    /// The operator holding the shared slot, whatever member it is.
+    pub fn slot(&self) -> Option<&RuleOp> {
+        self.slot.as_ref()
+    }
+
+    /// Take `op` into the set under its protocol's arity rule.
+    ///
+    /// The shared slot is settled **here**, during resolution, which is where
+    /// `getRule` settles it: the walk visits operators in resolution order, so
+    /// the first slot member to arrive is the winner and every later one is
+    /// dropped on the floor. The explicit order comparison is for the merge
+    /// paths, which insert out of order.
+    pub fn insert(&mut self, op: RuleOp) {
+        if protocols::is_slot_protocol(&op.protocol) {
+            match &self.slot {
+                Some(cur) if cur.order <= op.order => {}
+                _ => self.slot = Some(op),
+            }
+            return;
+        }
+        if protocols::is_multi_match(&op.protocol) {
+            self.multi.entry(op.protocol.clone()).or_default().push(op);
+        } else {
+            // first-match-wins (importance handled by pass order)
+            self.single.entry(op.protocol.clone()).or_insert(op);
+        }
+    }
+
+    /// Every operator in the set, in no particular order.
+    pub fn ops(&self) -> impl Iterator<Item = &RuleOp> {
+        self.single
+            .values()
+            .chain(self.multi.values().flatten())
+            .chain(self.slot.iter())
+    }
+
+    /// Every operator in the set, mutably; see [`Resolved::ops`].
+    pub fn ops_mut(&mut self) -> impl Iterator<Item = &mut RuleOp> {
+        self.single
+            .values_mut()
+            .chain(self.multi.values_mut().flatten())
+            .chain(self.slot.iter_mut())
     }
 
     /// The winning operator's value; see [`Resolved::get`].
@@ -833,6 +904,9 @@ impl Resolved {
     /// lines first, source order within a pass. A single-match protocol yields
     /// its one winner, so callers that accumulate need no special case.
     pub fn all(&self, protocol: &str) -> &[RuleOp] {
+        if protocols::is_slot_protocol(protocol) {
+            return self.get(protocol).map(std::slice::from_ref).unwrap_or(&[]);
+        }
         match self.multi.get(protocol) {
             Some(list) => list,
             None => self
@@ -909,6 +983,14 @@ impl Resolved {
                 list.insert(at, op);
                 from = at + 1;
             }
+        }
+        // Empty in practice — no [`protocols::SLOT_PROTOCOLS`] member is a
+        // response-phase protocol, so the pass never resolves one — but taken
+        // through the same order comparison as everything else rather than
+        // dropped, so that a name added to `RES_PHASE_PROTOCOLS` cannot make an
+        // operator vanish here.
+        if let Some(op) = res.slot {
+            self.insert(op);
         }
         self.apply_response_ignores(&ignores);
     }
@@ -1765,9 +1847,10 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
     let has_capture_ref = ops
         .iter()
         .any(|op| replace::has_reference(&op.value) || names_a_value(&op.value));
-    let has_exact_skip = ops
-        .iter()
-        .any(|op| op.protocol == "ignore" && parse_exact_skip(&op.value, is_skip_token(&op.raw)).is_some());
+    let has_skip = ops.iter().any(|op| {
+        op.protocol == "ignore"
+            && (is_skip_token(&op.raw) || parse_exact_skip(&op.value, false).is_some())
+    });
 
     pattern_toks
         .into_iter()
@@ -1788,7 +1871,7 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
                 res_dependent,
                 has_body_filter,
                 has_capture_ref,
-                has_exact_skip,
+                has_skip,
             })
         })
         .collect()
@@ -2603,6 +2686,12 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
             // from `rules.js:2188-2196`). One mechanism, two spellings.
             if proto == "filter" {
                 return op("ignore", rest);
+            }
+            // `rule://<name>` is this port's values-store include, and an
+            // include is not a destination: it must not take the shared slot
+            // away from one (see [`protocols::RULE_INCLUDE`]).
+            if proto == protocols::URL_REPLACE {
+                return op(protocols::RULE_INCLUDE, rest);
             }
             // Normalise alias protocols (e.g. `hosts` → `host`) to canonical names.
             return op(protocols::canonical(proto).unwrap_or(proto), rest);

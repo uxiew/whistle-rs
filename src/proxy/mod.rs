@@ -1190,9 +1190,9 @@ fn log_labels(resolved: &Resolved) -> Vec<String> {
 /// `resHeaders://` withheld by an `includeFilter://s:404` as never having
 /// matched, on the requests where it did.
 ///
-/// **A request no rule matched pays nothing.** Both maps are empty, both loops
-/// run zero times, and `Vec::new` does not allocate — so the common case is two
-/// `HashMap::is_empty`-shaped walks and a null pointer, not a heap allocation
+/// **A request no rule matched pays nothing.** The set is empty, the walk runs
+/// zero times, and `Vec::new` does not allocate — so the common case is a couple
+/// of `HashMap::is_empty`-shaped walks and a null pointer, not a heap allocation
 /// holding nothing.
 ///
 /// Ties are broken by protocol name so the list is stable between two identical
@@ -1200,14 +1200,12 @@ fn log_labels(resolved: &Resolved) -> Vec<String> {
 /// Within one protocol the sort is stable, so several `reqHeaders://` written on
 /// one line keep the order they were written in — which is the order in which
 /// they are applied.
+///
+/// Only operators that **applied** are here, which is why the shared slot
+/// contributes at most one: a `statusCode://` that lost to a `file://` did
+/// nothing, and reporting it as a match would say the opposite.
 fn matched_ops(resolved: &Resolved) -> Vec<MatchedOp> {
-    let mut ops: Vec<(u64, &crate::rules::RuleOp)> = Vec::new();
-    for op in resolved.single.values() {
-        ops.push((op.order, op));
-    }
-    for list in resolved.multi.values() {
-        ops.extend(list.iter().map(|op| (op.order, op)));
-    }
+    let mut ops: Vec<(u64, &crate::rules::RuleOp)> = resolved.ops().map(|op| (op.order, op)).collect();
     ops.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.protocol.cmp(&y.protocol)));
     ops.into_iter()
         .map(|(_, op)| MatchedOp {

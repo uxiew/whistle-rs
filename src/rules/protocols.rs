@@ -116,7 +116,55 @@ pub const PROTOCOLS: &[&str] = &[
 /// destination. Upstream files that spelling here too, where it can only ever
 /// produce the unusable URL `rule://<name>`, so the divergence costs no rule
 /// that works upstream — and `ignore://rule` still drops both readings.
+///
+/// It resolves under [`RULE_INCLUDE`] rather than here, because an include is
+/// not a destination and must not take the shared slot away from one.
 pub const URL_REPLACE: &str = "rule";
+
+/// The protocol key this port's `rule://<name>` include resolves to.
+///
+/// It is deliberately *not* [`URL_REPLACE`]: the include names more rules, not
+/// somewhere to send the request, so it takes no part in the contest
+/// [`SLOT_PROTOCOLS`] describes. `ignore://rule` still drops it — see
+/// `matcher::apply_ignores` — because the two readings share one spelling and a
+/// rules file that silences the spelling means both.
+pub const RULE_INCLUDE: &str = "ruleInclude";
+
+/// The operators that share **one** resolved slot, and so can never coexist.
+///
+/// `parseRule` files a rule under `rules[protocol]`, and falls through to the
+/// single `rules.rule` list for every protocol that has no key of its own
+/// (`_original/lib/rules/rules.js:1310-1316`). `getRule` then returns the
+/// **first** entry of that one list, so whichever of these was written first
+/// answers the request outright and the rest do not apply at all.
+///
+/// The membership below was taken by running whistle 2.10.8's own parser over
+/// one matcher at a time and reading back which `_rules[…]` list each landed
+/// in, rather than by reading the `protocols` array — which is how the previous
+/// audit came to name `urlReplace://` as a member. It is not one: `urlReplace`
+/// *is* in the array, has a list of its own, and is a `multiMatchs` protocol
+/// besides. What is in the shared list:
+///
+/// * the local-file / template family and every `x` / `xs` fallback spelling —
+///   `file`, `rawfile`, `tpl`, `jsonp`, `dust` (see [`is_file_protocol`]);
+/// * `statusCode` (with its `status` alias) and `redirect`;
+/// * `location` and `locationHref`;
+/// * a bare **destination** — `http://`, `https://`, `ws://`, `wss://`,
+///   `tunnel://`, the schema-less `//host`, and a bare `host:port` that is not
+///   an IP address — all of which resolve to [`URL_REPLACE`];
+/// * a bare **path**, which `formatShorthand` rewrites to `file://` first;
+/// * **any protocol name whistle does not know at all**, which is the same
+///   fall-through and resolves to [`URL_REPLACE`] here too.
+///
+/// [`crate::rules::Resolved`] holds them in one place for the same reason:
+/// [`crate::rules::Resolved::slot`] is one operator, chosen once, during
+/// resolution.
+pub const SLOT_PROTOCOLS: &[&str] = &[URL_REPLACE, "statusCode", "redirect", "location", "locationHref"];
+
+/// Does this operator compete for the shared slot (see [`SLOT_PROTOCOLS`])?
+pub fn is_slot_protocol(name: &str) -> bool {
+    SLOT_PROTOCOLS.contains(&name) || is_file_protocol(name)
+}
 
 /// Every upstream-proxy operator, in the order this port prefers them.
 ///
@@ -418,6 +466,34 @@ mod tests {
         }
         // `xhost` keeps its own explicit arm — `host` is not a proxy.
         assert_eq!(canonical("xhost"), Some("host"));
+    }
+
+    /// Which protocols share the one `rules.rule` list, taken by running
+    /// whistle 2.10.8's own parser over one matcher at a time and reading back
+    /// the `_rules[…]` key each landed under.
+    ///
+    /// The negative half is the point. The audit that found the slot named
+    /// `urlReplace://` as a member from the four names in front of it; it is
+    /// not one, and reading `protocols.js` says so — `urlReplace` is in the
+    /// array, has a list of its own, and is a `multiMatchs` protocol besides.
+    /// Nor is anything else with a key: putting one in here would silently
+    /// reduce a whole accumulating family to a single winner.
+    #[test]
+    fn the_shared_slot_holds_the_family_upstream_files_under_rule() {
+        for name in ["file", "xfile", "xsfile", "rawfile", "xrawfile", "tpl", "xtpl", "jsonp",
+                     "xjsonp", "dust", "xdust", "statusCode", "redirect", "location",
+                     "locationHref", URL_REPLACE] {
+            assert!(is_slot_protocol(name), "{name} shares the rule list upstream");
+        }
+        // `statusCode` is reached by its alias too, and the alias resolves to
+        // the same member — one slot, whichever spelling wrote it.
+        assert_eq!(canonical("status"), Some("statusCode"));
+        // Everything with a key of its own, including the three the slot is
+        // most easily confused with.
+        for name in ["urlReplace", "pathReplace", "host", "proxy", "pac", "replaceStatus",
+                     "resBody", "reqHeaders", "plugin", "ignore", RULE_INCLUDE] {
+            assert!(!is_slot_protocol(name), "{name} has a list of its own");
+        }
     }
 
     /// The tool protocols are part of the response phase upstream

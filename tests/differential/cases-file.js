@@ -15,7 +15,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const P = `127.0.0.1:${Number(process.env.PORT_BASE || 18700) + 2}`;
+const ORIGIN = Number(process.env.PORT_BASE || 18700) + 2;
+const P = `127.0.0.1:${ORIGIN}`;
 const A = `${P}/echo`;
 
 /** The fixture tree, rebuilt on every run so a stale file cannot pass a case. */
@@ -222,6 +223,30 @@ module.exports = [
   { name: 'a file response carries auto cors when an origin is sent', rules: `${A} file://${F('plain.txt')}`, request: { headers: { origin: 'https://app.test' } } },
   { name: 'a file rule beats a host rule', rules: `${A} file://${F('plain.txt')} host://192.0.2.1` },
   { name: 'a 404 from a file rule still takes response operators', rules: `${A} file://${F('nope.txt')} resHeaders://x-mock=1` },
+
+  // ── the shared slot ────────────────────────────────────────────────────
+  // `file://` has no protocol key of its own upstream: it lands in `rules.rule`
+  // alongside `statusCode://`, `redirect://` and a bare destination, and
+  // `getRule` returns the **first** of them (`_original/lib/rules/rules.js:1310-1316`).
+  // So these do not combine — one answers and the others are not in the
+  // resolved set at all. Which is also what decides whether an `ignore://` can
+  // reach the file: it names the winner or it names nothing.
+  { name: 'a file then statusCode on one line', rules: `${A} file://${F('mock.json')} statusCode://204` },
+  { name: 'statusCode then a file on one line', rules: `${A} statusCode://204 file://${F('mock.json')}` },
+  { name: 'a file then a redirect', rules: `${A} file://${F('mock.json')} redirect://http://d.test/` },
+  { name: 'a redirect then a file', rules: `${A} redirect://http://d.test/ file://${F('mock.json')}` },
+  { name: 'a file then a destination', rules: `${A} file://${F('mock.json')} http://127.0.0.1:${ORIGIN}/x` },
+  { name: 'a destination then a file', rules: `${A} http://127.0.0.1:${ORIGIN}/x file://${F('mock.json')}` },
+  { name: 'a file line above a statusCode line', rules: `${A} file://${F('mock.json')}\n${A} statusCode://204` },
+  { name: 'a statusCode line above a file line', rules: `${A} statusCode://204\n${A} file://${F('mock.json')}` },
+  { name: 'ignore file when the file won the slot', rules: `${A} file://${F('mock.json')} statusCode://204 ignore://file` },
+  { name: 'ignore file when the file lost the slot', rules: `${A} statusCode://204 file://${F('mock.json')} ignore://file` },
+  { name: 'ignore rule when the file won the slot', rules: `${A} file://${F('mock.json')} statusCode://204 ignore://rule` },
+  // `skip://` is the spelling that falls through to the next member.
+  { name: 'skip file hands the slot to statusCode', rules: `${A} file://${F('mock.json')} statusCode://204 skip://file` },
+  { name: 'skip rule takes the whole family', rules: `${A} file://${F('mock.json')} statusCode://204 skip://rule` },
+  { name: 'ignore xfile does not name a file', rules: `${A} file://${F('mock.json')} statusCode://204 ignore://xfile` },
+  { name: 'ignore file does not name an xfile', rules: `${A} xfile://${F('nope.txt')} statusCode://204 ignore://file` },
 
   // ── range requests ─────────────────────────────────────────────────────
   { name: 'range over a file', rules: `${A} file://${F('range.txt')}`, request: { headers: { range: 'bytes=0-5' } } },

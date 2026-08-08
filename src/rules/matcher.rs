@@ -507,7 +507,7 @@ fn resolve_walk(
     defer_res_phase: bool,
 ) -> Resolved {
     let mut resolved = Resolved::default();
-    let exact = collect_exact_skips(rules, req, is_internal_req);
+    let exact = collect_skips(rules, req, is_internal_req);
 
     // Two passes so important rules win: first important, then normal. Within a
     // pass we keep first-match order. `is_important` folds `lineProps://important`
@@ -544,29 +544,83 @@ fn resolve_walk(
         }
     }
 
-    apply_ignores(&mut resolved);
+    apply_ignores(&mut resolved, &req.scheme);
     resolved
 }
 
-/// Rules silenced by name, gathered before anything is resolved.
+/// Rules silenced before anything is resolved — everything `skip://` says, and
+/// the exact forms of `ignore://`.
 ///
-/// `ignore://pattern=…` and `ignore://matcher=…` (with `skip://` and the
-/// `operator=`/`operation=` spellings folded in) drop a rule by the *text* it
-/// was written as. Two things follow, and both are why this cannot live in
-/// [`apply_ignores`] with the name-based ignores:
+/// `ignore://pattern=…` and `ignore://matcher=…` (with the `operator=` /
+/// `operation=` spellings folded in) drop a rule by the *text* it was written
+/// as. Two things follow, and both are why this cannot live in [`apply_ignores`]
+/// with the name-based ignores:
 ///
 /// * the text is gone by then — a resolved [`RuleOp`] no longer knows which
 ///   pattern brought it in;
 /// * the ignore may be written *below* the rule it silences, so nothing can be
 ///   taken until the whole set has been read (upstream resolves its ignore list
 ///   first for the same reason, `_original/lib/rules/rules.js:1118-1147`).
+///
+/// **`skip://<name>` is here too, and that is the difference between the two
+/// spellings.** They are one protocol and `skip://x` does everything
+/// `ignore://x` does, but it *also* fills `req._skipProps`, which `getRule`
+/// consults per candidate rule as it walks the list (`checkSkip`,
+/// `_original/lib/util/index.js:2004-2013`, called from `rules.js:986-989`). On
+/// a protocol with a list of its own the two are indistinguishable — dropping
+/// the winner and skipping every candidate leave the same nothing. On the
+/// [shared slot](protocols::SLOT_PROTOCOLS) they part company:
+/// `a.com statusCode://204 redirect://…` answered with `skip://statusCode`
+/// **falls through to the redirect**, and with `ignore://statusCode` answers
+/// from the origin, because the ignore deletes the winner after the list has
+/// already been reduced to it.
 #[derive(Debug, Default)]
-struct ExactSkips {
+struct PreWalkSkips {
     patterns: Vec<String>,
     matchers: Vec<String>,
+    /// `skip://<name>` — protocol names whose operators the walk passes over.
+    names: Vec<String>,
+    /// `skip://-<name>` / `skip://!<name>` — names exempted from the above.
+    keep: Vec<String>,
+    /// `skip://*` — pass over everything.
+    all: bool,
+    /// `skip://-*` — cancels the above, wherever the two were written.
+    cancel_all: bool,
+    /// The request's own scheme, for a destination written without one; see
+    /// [`named_by`].
+    scheme: String,
 }
 
-impl ExactSkips {
+impl PreWalkSkips {
+    /// Read one `skip://` value as a name list.
+    ///
+    /// `|` alone separates here, which is not the separator set the *ignore*
+    /// half of the same token reads: `resolveProps` splits a skip value with
+    /// `matcher.split('|')` (`_original/lib/rules/rules.js:1136`) while
+    /// `resolveIgnore` goes through `parseProps` and its `PROP_SEP_RE`. So
+    /// `skip://*&-redirect` contributes **one** name, `*&-redirect`, which
+    /// matches no operator — and the line still ignores everything, because the
+    /// ignore half read the same value as two.
+    fn take_names(&mut self, value: &str) {
+        for name in value.split('|') {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(rest) = name.strip_prefix('-').or_else(|| name.strip_prefix('!')) {
+                match rest {
+                    "*" => self.cancel_all = true,
+                    other => self.keep.push(other.to_string()),
+                }
+                continue;
+            }
+            match name {
+                "*" => self.all = true,
+                other => self.names.push(other.to_string()),
+            }
+        }
+    }
+
     /// Is every rule written with this pattern token silenced?
     fn silences_pattern(&self, raw_pattern: &str) -> bool {
         self.patterns.iter().any(|p| p == raw_pattern)
@@ -580,28 +634,86 @@ impl ExactSkips {
     /// /local/path` parses to `file:///local/path`, and a user silencing it will
     /// write whichever of the two they are looking at.
     fn silences_op(&self, op: &RuleOp) -> bool {
-        if self.matchers.is_empty() {
+        if !self.matchers.is_empty() {
+            let expanded = format!("{}://{}", op.protocol, op.value);
+            if self.matchers.iter().any(|m| m == &op.raw || m == &expanded) {
+                return true;
+            }
+        }
+        // `ignore://` itself is never skipped: upstream resolves the ignore list
+        // before `_skipProps` exists, so nothing it says can silence it.
+        let all = self.all && !self.cancel_all;
+        if op.protocol == "ignore" || (self.names.is_empty() && !all) {
             return false;
         }
-        let expanded = format!("{}://{}", op.protocol, op.value);
-        self.matchers
-            .iter()
-            .any(|m| m == &op.raw || m == &expanded)
+        // The star is tested first and on its own. `-name` spares a protocol
+        // from a *named* skip and never from `skip://*`, which only `-*` can
+        // cancel (`checkSkip`, `_original/lib/util/index.js:2005-2011`).
+        if all {
+            return true;
+        }
+        if self.keep.iter().any(|n| named_by(op, &self.scheme, n)) {
+            return false;
+        }
+        self.names.iter().any(|n| named_by(op, &self.scheme, n))
     }
 }
 
-/// Gather the exact-form ignores from every rule that applies to this request.
+/// May an `ignore://` / `skip://` naming `name` reach `op`?
 ///
-/// Skipped outright unless some rule carries one ([`Rule::has_exact_skip`]),
-/// because this is a second matching pass over the whole rule set and rule sets
-/// that never use the feature must not pay for it.
-fn collect_exact_skips(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> ExactSkips {
-    let mut skips = ExactSkips::default();
-    if !rules.iter().any(|r| r.has_exact_skip) {
+/// Upstream compares two names, and a resolved rule carries both: `rule.name` is
+/// the *list* it was filed under and `getProtocolName(rule.url || rule.matcher)`
+/// is the protocol it was *written* with (`checkSkip`,
+/// `_original/lib/util/index.js:2007-2011`; `ignoreForwardRule`, `:2047-2059`).
+///
+/// For most operators the two agree. For a [shared-slot](protocols::SLOT_PROTOCOLS)
+/// member they do not: `parseRule` overwrites the protocol with `rule` before it
+/// builds the rule object (`_original/lib/rules/rules.js:1312-1316`), so the
+/// list name is `rule` for every one of them and the member's own name survives
+/// **only** in the matcher text. `ignore://rule` therefore names the whole
+/// family, and `ignore://file` names a winner written `file://`.
+///
+/// One consequence is worth spelling out because it looks like a bug and is
+/// upstream's answer: an *alias* cannot be ignored. `ignore://status` and
+/// `ignore://statusCode` both resolve to the name `statusCode`, and a rule
+/// written `status://204` left the text `status` behind — so neither silences
+/// it, and only `ignore://rule` will. Measured on the differential bench, both
+/// ways round.
+fn named_by(op: &RuleOp, scheme: &str, name: &str) -> bool {
+    if protocols::is_slot_protocol(&op.protocol) {
+        return name == protocols::URL_REPLACE || name == written_protocol(op, scheme);
+    }
+    name == op.protocol || name == written_protocol(op, scheme)
+}
+
+/// The protocol `op` was written with, which is not always the one it resolved
+/// to: `status://204` resolves to `statusCode` and `pathReplace://` to
+/// `urlReplace`, and upstream's ignore machinery reads the text either way.
+fn written_protocol<'a>(op: &'a RuleOp, scheme: &'a str) -> &'a str {
+    match op.raw.split_once("://") {
+        Some((proto, _)) if !proto.is_empty() => proto,
+        // A destination written with no scheme of its own — `localhost:5173`,
+        // `//localhost:5173` — goes out with the request's, because `setProtocol`
+        // fills it in before `getProtocolName` reads it back
+        // (`_original/lib/rules/rules.js:958-966`).
+        _ if op.protocol == protocols::URL_REPLACE => scheme,
+        _ => op.protocol.as_str(),
+    }
+}
+
+/// Gather the pre-walk skips from every rule that applies to this request.
+///
+/// Skipped outright unless some rule carries one ([`Rule::has_skip`]), because
+/// this is a second matching pass over the whole rule set and rule sets that
+/// never use the feature must not pay for it.
+fn collect_skips(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> PreWalkSkips {
+    let mut skips = PreWalkSkips::default();
+    if !rules.iter().any(|r| r.has_skip) {
         return skips;
     }
+    skips.scheme = req.scheme.clone();
     for rule in rules {
-        if !rule.has_exact_skip || !rule.props.allows_scope(is_internal_req) {
+        if !rule.has_skip || !rule.props.allows_scope(is_internal_req) {
             continue;
         }
         if match_rule(rule, req).is_none() {
@@ -611,9 +723,14 @@ fn collect_exact_skips(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) ->
             if op.protocol != "ignore" {
                 continue;
             }
-            match super::parse_exact_skip(&op.value, super::is_skip_token(&op.raw)) {
+            let from_skip = super::is_skip_token(&op.raw);
+            match super::parse_exact_skip(&op.value, from_skip) {
                 Some((super::ExactSkip::Pattern, v)) => skips.patterns.push(v),
                 Some((super::ExactSkip::Matcher, v)) => skips.matchers.push(v),
+                // Only the `skip://` spelling contributes names — the
+                // `ignore://` half is applied after the walk, by
+                // [`apply_ignores`].
+                None if from_skip => skips.take_names(&op.value),
                 None => {}
             }
         }
@@ -722,16 +839,7 @@ fn take(resolved: &mut Resolved, op: &RuleOp, order: u64, matched: &Matched<'_>)
     if joins_tail(&op) && !matched.tail.is_empty() && !root_only {
         op.value = join_each_path(&op.protocol, &op.value, &matched.tail);
     }
-    if protocols::is_multi_match(&op.protocol) {
-        resolved
-            .multi
-            .entry(op.protocol.clone())
-            .or_default()
-            .push(op);
-    } else {
-        // first-match-wins (importance handled by pass order)
-        resolved.single.entry(op.protocol.clone()).or_insert(op);
-    }
+    resolved.insert(op);
 }
 
 /// Resolve the operators [`resolve_refs_scoped`] withheld, now that `req`
@@ -779,7 +887,16 @@ pub fn resolve_response_ops(
 
 /// `ignore://<proto>[,<proto>…]` removes those protocols from the resolved set;
 /// `ignore://all` clears everything. Ported from whistle's `ignore` handling.
-fn apply_ignores(resolved: &mut Resolved) {
+///
+/// The [shared slot](protocols::SLOT_PROTOCOLS) is reached through the member
+/// that **won** it and no other, which is `ignoreForwardRule`
+/// (`_original/lib/util/index.js:2047-2059`): the losers are not in the set to
+/// be named, and the winner does not step aside for one. `ignore://statusCode`
+/// on `a.com file:///mock statusCode://204` therefore silences nothing, and on
+/// `a.com statusCode://204 file:///mock` it silences the line — the mock does
+/// not take over. `skip://` is the spelling that falls through; see
+/// [`PreWalkSkips`].
+fn apply_ignores(resolved: &mut Resolved, scheme: &str) {
     let ignores = resolved.multi.remove("ignore").unwrap_or_default();
 
     // Upstream reads the whole ignore set before dropping anything
@@ -789,7 +906,7 @@ fn apply_ignores(resolved: &mut Resolved) {
     let (mut drop_all, mut cancel_all) = (false, false);
     for op in &ignores {
         // An exact form (`pattern=…`, `matcher=…`) has already been applied by
-        // [`collect_exact_skips`], and must not also be read as a name list:
+        // [`collect_skips`], and must not also be read as a name list:
         // `ignore://matcher=a|b` would split on the `|` and drop a protocol
         // called `b` that the user never mentioned.
         if super::parse_exact_skip(&op.value, super::is_skip_token(&op.raw)).is_some() {
@@ -826,6 +943,15 @@ fn apply_ignores(resolved: &mut Resolved) {
         }
     }
 
+    // Does an exemption name the operator holding the shared slot? Upstream asks
+    // this of the *winner* alone (`!exclude[pName]`), so an `ignore://*` that
+    // spares a member which lost spares nothing.
+    let slot_kept = |resolved: &Resolved| {
+        resolved
+            .slot()
+            .is_some_and(|op| keep.iter().any(|n| named_by(op, scheme, n)))
+    };
+
     if drop_all && !cancel_all {
         let kept: Vec<(String, RuleOp)> = keep
             .iter()
@@ -835,10 +961,12 @@ fn apply_ignores(resolved: &mut Resolved) {
             .iter()
             .filter_map(|name| resolved.multi.remove_entry(name))
             .collect();
+        let kept_slot = slot_kept(resolved).then(|| resolved.slot.take()).flatten();
         resolved.single.clear();
         resolved.multi.clear();
         resolved.single.extend(kept);
         resolved.multi.extend(kept_multi);
+        resolved.slot = kept_slot;
         return;
     }
 
@@ -849,6 +977,18 @@ fn apply_ignores(resolved: &mut Resolved) {
         if name == "proxy" {
             ignore_upstream_proxies(resolved);
             continue;
+        }
+        if resolved
+            .slot()
+            .is_some_and(|op| named_by(op, scheme, &name))
+            && !slot_kept(resolved)
+        {
+            resolved.slot = None;
+        }
+        // `ignore://rule` names both readings of the spelling — the destination
+        // that took the slot above, and this port's values-store include.
+        if name == protocols::URL_REPLACE {
+            resolved.single.remove(protocols::RULE_INCLUDE);
         }
         resolved.single.remove(&name);
         resolved.multi.remove(&name);
@@ -1268,6 +1408,128 @@ mod tests {
         // A named protocol still goes.
         assert_eq!(host_of(&format!("{BASE} ignore://host\n")), None);
         assert_eq!(host_of(&format!("{BASE} ignore://ua\n")).as_deref(), Some("1.1.1.1"));
+    }
+
+    /// An `ignore://` reaches the [shared slot](protocols::SLOT_PROTOCOLS)
+    /// through the member that **won** it, and through no other.
+    ///
+    /// `ignoreForwardRule` reads the protocol name off `rules.rule.url`
+    /// (`_original/lib/util/index.js:2047-2059`) — the one operator the list
+    /// resolved to. So naming a member that lost silences nothing, and naming
+    /// the winner silences the line rather than handing the slot to whatever
+    /// came next. This port kept a key per protocol and removed by key, which is
+    /// fall-through: `a.com statusCode://204 redirect://…  ignore://statusCode`
+    /// redirected here and reached the origin in whistle.
+    #[test]
+    fn an_ignore_reaches_the_slot_winner_and_no_one_else() {
+        let slot = |text: &str| {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(text);
+            m.resolve(&req("http://a.com/x"))
+                .slot()
+                .map(|op| format!("{}://{}", op.protocol, op.value))
+        };
+        const BOTH: &str = "a.com statusCode://204 redirect://http://d.test/";
+
+        assert_eq!(slot(BOTH).as_deref(), Some("statusCode://204"), "baseline");
+        // The winner, named: the whole line goes quiet.
+        assert_eq!(slot(&format!("{BOTH} ignore://statusCode\n")), None);
+        // A loser, named: nothing happens, because it is not in the set.
+        assert_eq!(
+            slot(&format!("{BOTH} ignore://redirect\n")).as_deref(),
+            Some("statusCode://204")
+        );
+        // The family name reaches whichever member won.
+        assert_eq!(slot(&format!("{BOTH} ignore://rule\n")), None);
+        assert_eq!(
+            slot("a.com http://dev.test/ statusCode://204 ignore://rule\n"),
+            None
+        );
+        // A bare destination is named by the scheme it was written with…
+        assert_eq!(
+            slot("a.com http://dev.test/ statusCode://204 ignore://http\n"),
+            None
+        );
+        // …and one written without a scheme takes the request's own.
+        assert_eq!(slot("a.com //dev.test/ statusCode://204 ignore://http\n"), None);
+        // An ignore written below the rule it silences still reaches it.
+        assert_eq!(
+            slot("a.com statusCode://204\na.com redirect://http://d.test/\na.com ignore://statusCode\n"),
+            None
+        );
+        // An alias cannot be silenced at all: `status://204` left the text
+        // `status` behind and the ignore name resolved to `statusCode`, so the
+        // two never meet. Upstream's answer, checked on the bench both ways.
+        for name in ["status", "statusCode"] {
+            assert_eq!(
+                slot(&format!("a.com status://204 redirect://http://d.test/ ignore://{name}\n"))
+                    .as_deref(),
+                Some("statusCode://204"),
+                "{name}"
+            );
+        }
+        // `ignore://*` spares the winner only when the exemption names *it*.
+        assert_eq!(slot(&format!("{BOTH} ignore://*&-redirect\n")), None);
+        assert_eq!(
+            slot(&format!("{BOTH} ignore://*&-statusCode\n")).as_deref(),
+            Some("statusCode://204")
+        );
+    }
+
+    /// `skip://<name>` is the spelling that makes the slot **fall through**.
+    ///
+    /// It does everything `ignore://` does and also fills `req._skipProps`,
+    /// which `getRule` consults per candidate as it walks the list (`checkSkip`,
+    /// `_original/lib/util/index.js:2004-2013`). Skipping a candidate and
+    /// deleting a winner are the same nothing on a protocol with a list of its
+    /// own; on the shared slot they are opposite answers.
+    #[test]
+    fn a_skip_hands_the_slot_to_the_next_member() {
+        let slot = |text: &str| {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(text);
+            m.resolve(&req("http://a.com/x"))
+                .slot()
+                .map(|op| format!("{}://{}", op.protocol, op.value))
+        };
+        const BOTH: &str = "a.com statusCode://204 redirect://http://d.test/";
+
+        assert_eq!(
+            slot(&format!("{BOTH} skip://statusCode\n")).as_deref(),
+            Some("redirect://http://d.test/")
+        );
+        // Both named, and there is nothing left to fall through to.
+        assert_eq!(slot(&format!("{BOTH} skip://statusCode|redirect\n")), None);
+        // The family name takes every member with it, because the list a
+        // slot rule is filed under *is* `rule`.
+        assert_eq!(slot(&format!("{BOTH} skip://rule\n")), None);
+        // A loser named changes nothing, as with `ignore://`.
+        assert_eq!(
+            slot(&format!("{BOTH} skip://redirect\n")).as_deref(),
+            Some("statusCode://204")
+        );
+        // `skip://*` is tested on its own: an exemption spares a protocol from a
+        // *named* skip and never from the star.
+        assert_eq!(slot(&format!("{BOTH} skip://*\n")), None);
+        assert_eq!(slot(&format!("{BOTH} skip://*|-redirect\n")), None);
+        assert_eq!(
+            slot(&format!("{BOTH} skip://statusCode|-statusCode\n")).as_deref(),
+            Some("statusCode://204")
+        );
+        // Only `|` separates a skip value — `resolveProps` splits it with
+        // `matcher.split('|')` (`_original/lib/rules/rules.js:1136`) while the
+        // ignore half goes through `parseProps` and its `PROP_SEP_RE`.
+        assert_eq!(
+            slot(&format!("{BOTH} skip://a|statusCode\n")).as_deref(),
+            Some("redirect://http://d.test/")
+        );
+        // The `&`-separated spelling is deliberately unasserted, here and on the
+        // bench. `&` is outside the protocol character set, so `NO_PROTO_RE`
+        // sends the whole value down the exact-*matcher* branch in both proxies
+        // and neither reads it as names — after which upstream's answer depends
+        // on which regexp last set `RegExp.$2` (`rules.js:1129-1131`), because
+        // the test that precedes it failed without clearing the groups. That is
+        // not a question about the slot, and it has no stable answer to pin.
     }
 
     #[test]
