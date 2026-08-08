@@ -974,7 +974,7 @@ fn apply_ignores(resolved: &mut Resolved, scheme: &str) {
         if keep.contains(&name) {
             continue;
         }
-        if name == "proxy" {
+        if name == "proxy" || names_the_winning_proxy(resolved, &name) {
             ignore_upstream_proxies(resolved);
             continue;
         }
@@ -993,6 +993,29 @@ fn apply_ignores(resolved: &mut Resolved, scheme: &str) {
         resolved.single.remove(&name);
         resolved.multi.remove(&name);
     }
+}
+
+/// Does `name` spell the upstream proxy that actually **won**?
+///
+/// The same fall-through the short-circuit slot had, one family over. All nine
+/// proxy spellings share a single key upstream, so `util.isIgnored` is asked
+/// about whichever one is in `rules.proxy` — and an `ignore://` naming that
+/// spelling takes the whole family with it, PAC fallback included. Removing the
+/// key alone, as this port did, promoted the next spelling instead: measured on
+/// `a.com socks://S proxy://H ignore://socks`, where whistle goes direct and
+/// this port used to reach the origin through `H`.
+///
+/// It has to be the **winner**, not merely a spelling that is present:
+/// `a.com proxy://H ignore://socks` keeps the hop in both proxies, because
+/// nothing named `socks` ever reached `rules.proxy`.
+fn names_the_winning_proxy(resolved: &Resolved, name: &str) -> bool {
+    if !protocols::UPSTREAM_PROXY_PROTOCOLS.contains(&name) {
+        return false;
+    }
+    protocols::UPSTREAM_PROXY_PROTOCOLS
+        .iter()
+        .find(|proto| resolved.get(proto).is_some())
+        .is_some_and(|winner| *winner == name)
 }
 
 /// `ignore://proxy` drops **every** upstream-proxy operator, not only the one
