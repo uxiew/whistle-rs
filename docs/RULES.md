@@ -501,6 +501,29 @@ example.com   resBody://https://cdn.test/mock.json      # fetched per request
 example.com   resBody://~/mock/a.html|~/mock/b.html     # both, CRLF-joined
 ```
 
+**The three spellings of a data value, and the two roads.** A value written on
+the rule line and a value loaded from a `{name}`, a file or a URL are not read
+the same way — `tryParseMatcher` sits ahead of `_parseJSON` and only looks at
+the former (`_original/lib/util/index.js:1165-1171,:1303`):
+
+| | a value written on the line | a value that was loaded |
+|---|---|---|
+| JSON | read as JSON | read as JSON |
+| `a=1&b=2` | read as a query, whitespace and all | read as a query, **only** if it has no whitespace |
+| `a: 1` per line | **nothing** — no `=`, no value | the line format |
+
+So `reqHeaders://x-a=${v}` with a two-line `v` keeps the newline inside the
+value and the header is thrown away, while the same two lines inside a
+`{value}` become two headers. And `reqHeaders://bare` sets nothing, while
+`bare` on a line of a `{value}` sets an empty header. Both measured against
+whistle 2.10.8.
+
+In the line format the separator is the first `": "`, else the first `:`, else
+the first `=`; a value wrapped in matching `"`, `'` or `` ` `` loses the quotes
+(and a backticked one turns `\n` into a real newline); and an unquoted safe
+integer becomes a number rather than a string. Only `reqMerge`/`resMerge` read
+a dotted name as a path into the object (`RESOLVE_KEY_RE`, `util/index.js:95`).
+
 **Which operators.** Two families, because upstream feeds them through two
 different readers:
 
