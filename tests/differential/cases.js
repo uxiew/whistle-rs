@@ -100,8 +100,16 @@ module.exports = [
   { name: 'doc: protocol inheritance, http:// destination', rules: `${P} http://${P}/moved` },
   { name: 'doc: <> disables path concatenation', rules: `${P} <http://${P}/fixed>`, request: { path: '/echo/deep/path' } },
   { name: 'doc: path is concatenated by default', rules: `${P} http://${P}/base`, request: { path: '/echo/deep' } },
-  { name: 'doc: ws:// against a plain HTTP request', rules: `${P} ws://${P}/other` },
-  { name: 'doc: tunnel:// against a plain HTTP request', rules: `${P} tunnel://${P}` },
+  // These two are inert on **both** sides, and not for the reason their names
+  // used to suggest. `127.0.0.1:<port>` is a bare host, which `indexOfPattern`
+  // does not accept as a pattern (`isPattern` has no host branch — it only
+  // records the index and keeps looking, `_original/lib/rules/rules.js:1449-1467`),
+  // while `ws://…` *is* one. So the line is read the other way round: the ws URL
+  // is the pattern and the host is a `host://` operator, and a plain HTTP request
+  // matches no such pattern. What they pin is the swap, not the ws rule — the
+  // pair below asks the ws question with a pattern that cannot be swapped away.
+  { name: 'doc: a bare host with a ws:// URL swaps into pattern and host', rules: `${P} ws://${P}/other` },
+  { name: 'doc: a bare host with a tunnel:// URL swaps the same way', rules: `${P} tunnel://${P}` },
   { name: 'doc: submatch $1 from a wildcard', rules: `^http://127.0.0.1:18800/**  reqHeaders://x-sub=$1`, request: { path: '/echo/abc' } },
   { name: 'doc: submatch $1 from a regexp', rules: `/127\\.0\\.0\\.1:18800\\/(\\w+)/ reqHeaders://x-sub=$1` },
   { name: 'doc: urlParams with an existing query', rules: `${P} urlParams://a=1&b=2`, request: { path: '/echo?c=3' } },
@@ -133,6 +141,70 @@ module.exports = [
   { name: 'doc pattern: ^ with a trailing $ boundary', rules: `^http://${P}/ec*o$ reqHeaders://x-hit=1`, request: { path: '/echo/deep' } },
   { name: 'doc pattern: port-only', rules: `:18800 reqHeaders://x-hit=1` },
   { name: 'doc pattern: port-only that misses', rules: `:9999 reqHeaders://x-hit=1` },
+
+  // A pattern that carries a query changes how its *path* is matched: prefix
+  // everywhere else, exact here ("路径必须完全相同，且查询字符串以 xxx 为前缀",
+  // https://wproxy.org/docs/rules/pattern.html §3.2). Asked three ways, because
+  // "the rule missed" and "the rule does not exist" look the same from one case.
+  { name: 'doc pattern: a query pattern matches its own path', rules: `${P}/echo?q= reqHeaders://x-hit=1`, request: { path: '/echo?q=1' } },
+  { name: 'doc pattern: a query pattern will not prefix-match the path', rules: `${P}/ec?q= reqHeaders://x-hit=1`, request: { path: '/echo?q=1' } },
+  { name: 'doc pattern: a query pattern rejects a longer path', rules: `${P}/echo?q= reqHeaders://x-hit=1`, request: { path: '/echo/sub?q=1' } },
+  // Query wildcards under `^`: `*` is `[^&]*` and stops at the separator, `**`
+  // is `.*` and eats the rest of the query string (same page, "查询参数通配符").
+  { name: 'doc pattern: ^ query * stops at the separator', rules: `^http://${P}/echo?q=a*b reqHeaders://x-hit=1`, request: { path: '/echo?q=a&r=b' } },
+  { name: 'doc pattern: ^ query ** crosses it', rules: `^http://${P}/echo?q=a**b reqHeaders://x-hit=1`, request: { path: '/echo?q=a&r=b' } },
+  { name: 'doc pattern: ^ query * within one value', rules: `^http://${P}/echo?q=a*b reqHeaders://x-hit=1`, request: { path: '/echo?q=axxb&r=1' } },
+
+  // ── more forms from the documentation ──────────────────────────────────
+  // A scheme-relative destination takes the same two bracket forms as a
+  // spelled-out one (https://wproxy.org/docs/rules/inherit.html, "禁用路径拼接").
+  // Read only for a `://` scheme, the brackets stayed in the value and the host
+  // became `<127.0.0.1` — a 502 on the page's own example.
+  { name: 'doc: //<> pins a scheme-relative destination', rules: `${P}/echo //<${P}/other>`, request: { path: '/echo/deep' } },
+  { name: 'doc: //() pins it too', rules: `${P}/echo //(${P}/other)`, request: { path: '/echo/deep' } },
+  { name: 'doc: //<> keeps its own query', rules: `${P}/echo //<${P}/other?k=1>`, request: { path: '/echo/deep' } },
+  // "普通 HTTP/HTTPS 请求：返回 502" (ws.html, wss.html, tunnel.html). Upstream
+  // hands node a `protocol: 'ws:'` its agent will not speak; this port used to
+  // forward the request as plain HTTP to wherever the rule pointed. Both answer
+  // 502 now, and `harness.js` excuses the two error pages by these case names.
+  { name: 'doc: ws:// is not a transport for a plain request', rules: `${P}/echo ws://${P}/other` },
+  { name: 'doc: wss:// is not a transport for a plain request', rules: `${P}/echo wss://${P}/other` },
+  { name: 'doc: tunnel:// is not a transport for a plain request', rules: `${P}/echo tunnel://${P}` },
+
+  // `no` is the documented short spelling of `no-cache`, and a negative age is
+  // the same thing (https://wproxy.org/docs/rules/cache.html).
+  { name: 'doc: cache://no is short for no-cache', rules: `${P} cache://no` },
+  { name: 'doc: cache with a negative age is no-cache', rules: `${P} cache://-5` },
+  // The object form of `auth://` has a `proxy` flag that moves the credentials
+  // to `Proxy-Authorization` (https://wproxy.org/docs/rules/auth.html).
+  { name: 'doc: auth with proxy true', rules: `${P} auth://{"proxy":true,"username":"admin","password":"secret"}` },
+  { name: 'doc: attachment names the download', rules: `${P} attachment://example.html` },
+  // `use-credentials` cannot answer `*`, so it echoes the request's own origin
+  // (https://wproxy.org/docs/rules/resCors.html, 方法二).
+  { name: 'doc: resCors use-credentials echoes the origin', rules: `${P} resCors://use-credentials`, request: { headers: { origin: 'http://foo.test' } } },
+  { name: 'doc: reqCharset with no content-type', rules: `${P} reqCharset://utf8`, request: { method: 'POST', body: 'x' } },
+  // `<script>` attributes for an injected script
+  // (https://wproxy.org/docs/rules/jsAppend.html, "为注入的脚本设置 <script> 标签属性").
+  { name: 'doc: jsAppend lineProps nomodule', rules: `${P} jsAppend://(Hello) file://(-test-) lineProps://nomodule` },
+  { name: 'doc: jsAppend lineProps async', rules: `${P} jsAppend://(Hello) file://(-test-) lineProps://async` },
+  { name: 'doc: jsAppend lineProps crossorigin', rules: `${P} jsAppend://(Hello) file://(-test-) lineProps://crossorigin` },
+  // The worked example on the lineProps page: three prepends onto one HTML
+  // body, which come out in the order css, html, js behind a `<!DOCTYPE html>`.
+  {
+    name: 'doc: three prepends onto one html body',
+    rules: `${P} file://(test) resType://html\n${P} htmlPrepend://(alert(1))\n${P} jsPrepend://(alert(1))\n${P} cssPrepend://(alert(1))`,
+  },
+  {
+    name: 'doc: lineProps strictHtml gates only its own line',
+    rules: `${P} file://(test) resType://html\n${P} htmlPrepend://(alert(1))\n${P} jsPrepend://(alert(1)) lineProps://strictHtml\n${P} cssPrepend://(alert(1))`,
+  },
+  {
+    name: 'doc: enable strictHtml gates every line',
+    rules: `${P} file://(test) resType://html\n${P} htmlPrepend://(alert(1))\n${P} jsPrepend://(alert(1)) enable://strictHtml\n${P} cssPrepend://(alert(1))`,
+  },
+  // The `line` block joins its own newlines into spaces
+  // (https://wproxy.org/docs/rules/rule.html, "换行配置").
+  { name: 'doc: a line block joins its lines', rules: `line\`\nreqHeaders://x-hit=1\n${P}\n\`` },
 
   { name: 'values reference', rules: '```v\nfrom-a-value\n```\n' + `${P} reqHeaders://x-v={v}` },
 ];

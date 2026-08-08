@@ -146,6 +146,14 @@ pub enum Fixed {
 pub fn fixed_value(value: &str) -> Option<(Fixed, String)> {
     let (scheme, rest) = match value.find("://") {
         Some(i) if has_protocol(value) => value.split_at(i + 3),
+        // A scheme-relative destination — `//host/path`, which inherits the
+        // request's own scheme (https://wproxy.org/docs/rules/inherit.html,
+        // "禁用路径拼接：使用 < > 或 ( ) 包裹路径"). Upstream cuts the protocol at
+        // `matcher.indexOf('://') + 3`, which is **2** on a matcher with no
+        // `://` at all, so `//<a.com/x>` splits into `//` and `<a.com/x>` and
+        // the brackets are read exactly as they are on `http://<a.com/x>`
+        // (`resolveValue`, `_original/lib/rules/rules.js:811-843`).
+        _ if value.starts_with("//") => value.split_at(2),
         _ => ("", value),
     };
     if rest.len() < 2 {
@@ -258,6 +266,23 @@ mod tests {
                 _ => assert_eq!(got, None, "{value:?}"),
             }
         }
+    }
+
+    /// `//host/path` is the destination that inherits the request's scheme, and
+    /// it takes the same two bracket forms as a spelled-out one. Read only for
+    /// a `://` scheme, the brackets stayed in the value: `//<a.com/x>` became
+    /// the host `<a.com` and answered 502, on a rule the documentation gives as
+    /// its example (https://wproxy.org/docs/rules/inherit.html).
+    #[test]
+    fn a_scheme_relative_destination_takes_the_bracket_forms() {
+        assert_eq!(fixed_value("//<a.com/x>"), Some((Fixed::Verbatim, "//a.com/x".into())));
+        assert_eq!(fixed_value("//(a.com/x)"), Some((Fixed::Inline, "//a.com/x".into())));
+        // Only *both* brackets count, and only around something.
+        assert_eq!(fixed_value("//a.com/x"), None);
+        assert_eq!(fixed_value("//<a.com/x"), None);
+        assert_eq!(fixed_value("//"), None);
+        // The spelled-out schemes are unchanged.
+        assert_eq!(fixed_value("http://<a.com/x>"), Some((Fixed::Verbatim, "http://a.com/x".into())));
     }
 
     #[test]

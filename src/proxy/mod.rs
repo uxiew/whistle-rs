@@ -3701,6 +3701,15 @@ async fn serve(
     // Resolved before the target because the target is *how* to reach it.
     let dest = dest::Destination::of(&info, &resolved);
 
+    // `ws://`, `wss://` and `tunnel://` name transports this request is not:
+    // each of the three says so — "普通 HTTP/HTTPS 请求：返回 502" — and upstream
+    // answers 502 because node refuses the protocol its own agent cannot speak.
+    // Forwarding it as plain HTTP instead sends the traffic somewhere the rule
+    // never asked for. See `dest::unroutable_scheme`.
+    if let Some(scheme) = dest::unroutable_scheme(&resolved) {
+        anyhow::bail!("unsupported protocol {scheme}:");
+    }
+
     // Fails the request rather than silently connecting direct when a proxy rule
     // matched but could not be honoured (unusable address, unreachable or
     // throwing PAC file) — see `apply::find_proxy`.
