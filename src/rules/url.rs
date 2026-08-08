@@ -44,6 +44,23 @@ pub fn set_protocol(target: &str, source_scheme: &str) -> String {
     format!("{source_scheme}:{separator}{target}")
 }
 
+/// The URL a pattern is matched against, assembled from its parts — the port's
+/// spelling of `getFullUrl` (`_original/lib/util/common.js:1231-1267`).
+///
+/// The port is elided when it is the scheme's default, because that is the form
+/// the client's own request line and `Host` header produce, and a pattern
+/// written without a port has to match it.
+pub fn full_url(scheme: &str, host: &str, port: u16, path: &str) -> String {
+    let default_port = match scheme {
+        "https" | "wss" => 443,
+        _ => 80,
+    };
+    match port == default_port {
+        true => format!("{scheme}://{host}{path}"),
+        false => format!("{scheme}://{host}:{port}{path}"),
+    }
+}
+
 /// Ensure a URL has a path (`formatUrl`, `_original/lib/util/common.js:513-523`):
 /// `http://a.com?q` → `http://a.com/?q`.
 pub fn format_url(url: &str) -> String {
@@ -283,6 +300,18 @@ mod tests {
         assert_eq!(fixed_value("//"), None);
         // The spelled-out schemes are unchanged.
         assert_eq!(fixed_value("http://<a.com/x>"), Some((Fixed::Verbatim, "http://a.com/x".into())));
+    }
+
+    /// A pattern is written against the URL the client's own request line
+    /// produces, so the default port must not appear in it.
+    #[test]
+    fn a_default_port_is_left_out_of_a_full_url() {
+        assert_eq!(full_url("http", "a.com", 80, "/x"), "http://a.com/x");
+        assert_eq!(full_url("https", "a.com", 443, "/x"), "https://a.com/x");
+        assert_eq!(full_url("wss", "a.com", 443, "/x"), "wss://a.com/x");
+        assert_eq!(full_url("http", "a.com", 443, "/x"), "http://a.com:443/x");
+        assert_eq!(full_url("https", "a.com", 80, "/x"), "https://a.com:80/x");
+        assert_eq!(full_url("http", "a.com", 8080, "/x?q=1"), "http://a.com:8080/x?q=1");
     }
 
     #[test]

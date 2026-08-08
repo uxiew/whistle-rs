@@ -115,6 +115,26 @@ impl Destination {
         Some(dest)
     }
 
+    /// The same request, asking for *this* destination — upstream's
+    /// `options.href`, and the URL the forwarding family is matched against.
+    ///
+    /// Everything but the URL is carried over unchanged, which is what upstream
+    /// does by re-using the same `req` object: the second pass sees the same
+    /// method, the same client address and the same headers, so a
+    /// `filter://m:POST` or an `includeFilter://h:x-a=1` guarding a `proxy://`
+    /// line answers the same way in both passes. Only the pattern's subject
+    /// moved. See [`protocols::forwarding_protocols`].
+    pub fn moved_req_info(&self, info: &ReqInfo) -> ReqInfo {
+        ReqInfo {
+            full_url: url::full_url(&self.scheme, &self.host, self.port, &self.path),
+            scheme: self.scheme.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            path: self.path.clone(),
+            ..info.clone()
+        }
+    }
+
     /// `host[:port]`, with the port elided when it is the scheme's default —
     /// the `Host` header the origin should see.
     pub fn authority(&self) -> String {
@@ -348,5 +368,21 @@ mod tests {
         assert_eq!(named("a.com b.com:8080\n"), None);
         assert_eq!(named("a.com host://1.2.3.4\n"), None);
         assert_eq!(named(""), None);
+    }
+
+    /// The URL the forwarding family is matched against is the destination's,
+    /// spelled the way a pattern expects: default ports elided, everything else
+    /// about the request carried over.
+    #[test]
+    fn the_moved_request_asks_for_the_destination() {
+        let info = req("https://a.com/y");
+        let d = dest("a.com/y http://b.com:8080/x\n", "https://a.com/y");
+        let moved = d.moved_req_info(&info);
+        assert_eq!(moved.full_url, "http://b.com:8080/x");
+        assert_eq!((moved.scheme.as_str(), moved.host.as_str(), moved.port), ("http", "b.com", 8080));
+        assert_eq!(moved.method, info.method);
+
+        let d = dest("a.com/y http://b.com/x\n", "https://a.com/y");
+        assert_eq!(d.moved_req_info(&info).full_url, "http://b.com/x");
     }
 }

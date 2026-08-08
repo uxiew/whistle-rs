@@ -230,14 +230,28 @@ pub enum Decision {
 
 /// Where a connection goes when it is relayed rather than intercepted.
 ///
-/// A connection we have promised not to read has no request to rewrite, so a
-/// URL-replacement rule has nothing to act on; the destination is the address
-/// asked for, and `host://` and the proxy family route it as usual. A proxy rule
-/// that cannot be honoured closes the connection rather than quietly putting the
-/// bytes on the wire it was told to divert.
-async fn relay_decision(info: &crate::rules::ReqInfo, resolved: &crate::rules::Resolved) -> Decision {
+/// A connection we have promised not to read has no *request* to rewrite, but a
+/// URL-replacement rule can still move the address it is relayed to — upstream's
+/// tunnel path rewrites `tunnelUrl` from the `rule` slot for exactly that
+/// (`_original/lib/tunnel.js:415-427`) and then hands the rewritten URL to
+/// `getProxy` (`:434`), so `host://` and the proxy family are matched against
+/// where the connection is going rather than where it said it was going. A proxy
+/// rule that cannot be honoured closes the connection rather than quietly
+/// putting the bytes on the wire it was told to divert.
+async fn relay_decision(
+    state: &Arc<AppState>,
+    info: &crate::rules::ReqInfo,
+    resolved: &crate::rules::Resolved,
+) -> Decision {
     let dest = super::dest::Destination::of(info, resolved);
-    match super::apply::resolve_target(info, &dest, resolved).await {
+    // No values pass here, because the connection's own resolution had none:
+    // `decide` matches against the live rule set and nothing else.
+    let forwarding = dest.replaced.then(|| {
+        let rules = state.rules.read().unwrap();
+        super::apply::reresolve_forwarding(resolved, &dest.moved_req_info(info), &rules, &[], false)
+    });
+    let forwarding = forwarding.as_ref().unwrap_or(resolved);
+    match super::apply::resolve_target(info, &dest, forwarding).await {
         Ok(target) => Decision::Bypass(Box::new(target)),
         Err(err) => Decision::Unroutable(format!("{err:#}")),
     }
@@ -278,7 +292,7 @@ pub async fn decide(
             let resolved = rules.resolve(&info);
             (info, resolved)
         };
-        return relay_decision(&info, &resolved).await;
+        return relay_decision(state, &info, &resolved).await;
     }
     // Scoped so the read guard cannot cross the `.await` below. `Resolved` owns
     // its contents, so it outlives the guard and is kept: a declined connection
@@ -310,7 +324,7 @@ pub async fn decide(
         (matched, info, resolved, relay)
     };
     if relay {
-        return relay_decision(&info, &resolved).await;
+        return relay_decision(state, &info, &resolved).await;
     }
     let Some((plugin, value)) = matched else {
         return Decision::Generated;
@@ -336,11 +350,7 @@ pub async fn decide(
         // `host://` and the proxy family through `rules.getProxy`.
         Ok(SniVerdict::Bypass) => {
             tracing::info!("sniCallback {plugin}: not intercepting {servername}");
-            // A connection we have promised not to read has no request to
-            // rewrite, so a URL-replacement rule has nothing to act on here;
-            // the destination is the request's own address, and `host://` and
-            // the proxy family route it as usual.
-            relay_decision(&info, &resolved).await
+            relay_decision(state, &info, &resolved).await
         }
         Ok(SniVerdict::Cert(cert)) => {
             match state.ca.set_plugin_cert(

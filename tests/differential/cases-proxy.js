@@ -76,19 +76,34 @@
 //      values-store include of more rules; upstream has no such spelling and
 //      reads it as the unusable URL `rule://<name>`, answering 502. Declared in
 //      `crate::rules::protocols::URL_REPLACE`.
-//   7. **Which URL the forwarding family is matched against**, once a URL
-//      replacement has moved the destination. whistle resolves `host://`, the
-//      proxy family and `pac://` a *second* time, against the URL the
-//      replacement produced: `getProxy` is handed `options.href` and assigns
-//      `req.curUrl = url` before resolving any of them
-//      (`_original/lib/rules/index.js:124-152`, `lib/rules/rules.js:2419-2420`,
-//      `lib/inspectors/res.js:208-212`). This port resolves every rule once,
-//      against the request's own URL. So a proxy or host line whose pattern
-//      matches only the *replacement* engages upstream and not here, and one
-//      that matches only the *original* engages here and not upstream — opposite
-//      routes for the same four-word rules file. **Found, not fixed**: matching
-//      it means a second resolution pass over exactly those four protocols and
-//      no others, which reaches well past the forwarding family.
+//   7. **What is left of the second resolution pass.** whistle resolves
+//      `host://`, the proxy family and `pac://` a *second* time, against the URL
+//      a replacement produced rather than the one the client asked for:
+//      `getProxy` is handed `options.href` and assigns `req.curUrl = url` before
+//      resolving any of them (`_original/lib/rules/index.js:125-152`,
+//      `lib/rules/rules.js:2419-2420`, `lib/inspectors/res.js:196,:207-210`).
+//      This port now does the same — `crate::proxy::apply::reresolve_forwarding`
+//      — and the nine `reresolve:` cases below, which used to be this
+//      divergence, agree. Two narrower ones remain, and each has a `residue:`
+//      case of its own:
+//
+//      a. **`urlReplace://` is not in the URL the second pass sees.** Upstream's
+//         `options.href` has already been through `urlReplace`, `params` and
+//         `delete://` by the time `getProxy` is called (`lib/inspectors/req.js:565-581`
+//         runs in the request inspector, ahead of `res.js`'s `req.request`).
+//         Here the path is rewritten *after* the target is chosen, because it
+//         has to be read after `method://` and `reqType://` have settled whether
+//         `params://` addresses the body or the query string. So the second pass
+//         matches the destination as the replacement rule wrote it.
+//      b. **`enable://proxyHost|proxyFirst|proxyTunnel` resolved against the
+//         replacement.** Those three, and only those three, are a *union* of the
+//         two passes upstream: `isProxyEnable` resolves `enable`/`disable` again
+//         when `curUrl !== fullUrl` and is asked for exactly those names
+//         (`lib/rules/index.js:87,:154,:229`, `lib/rules/rules.js:2332-2362`).
+//         Everything else those flags reach — `internalProxy`, `disable://proxyUA`,
+//         `disable://proxyConnection` — reads the first pass only, so folding the
+//         second pass's whole `enable` list in would trade three narrow
+//         divergences for a different one. Left as written.
 //   8. **`xhttps-proxy://` at an unreachable hop hangs upstream** (1 case).
 //      Measured against the same dead hop, written by name so no SNI objection
 //      is in play: `xproxy://` and `xsocks://` fall back and answer 200, plain
@@ -96,14 +111,17 @@
 //      nothing at all until the client gives up. This port falls back, which is
 //      what the `x` prefix documents and what its three siblings do.
 //
-// **How much of this corpus does anything.** 83 of the 94 cases change what
-// real whistle answers, measured against the same request with no rule at all.
-// The other eleven are the negative controls, and each is inert on purpose: the
-// empty baseline, the two `host://` spellings that must *keep* the request's own
-// address or port, the `xhost://` fallback whose whole point is landing back
-// where it started, a pattern written to miss, the two `ignore://` cases,
-// `proxyHostOnly` with no `host://` to attach to, PAC `DIRECT`, and the two PAC
-// cases where upstream's silence is itself the finding.
+// **How much of this corpus does anything.** 95 of the 107 cases change what
+// real whistle answers, measured against the same request with no rule at all —
+// including all eleven `reresolve:`/`residue:` cases. The other twelve are the
+// negative controls, and each is inert on purpose: the empty baseline, the two
+// `host://` spellings that must *keep* the request's own address or port, the
+// `xhost://` fallback whose whole point is landing back where it started, a
+// pattern written to miss, the two `ignore://` cases, `proxyHostOnly` with no
+// `host://` to attach to, PAC `DIRECT`, the two PAC cases where upstream's
+// silence is itself the finding, and `xsocks://` at a dead hop — a fallback to
+// a direct connection looks exactly like a rule that never fired, which is why
+// it is asked a second time at a live hop.
 //
 // One more difference is real but not shown, because it is hop-by-hop and
 // `harness.js` drops that class everywhere else: whistle's CONNECT always
@@ -295,10 +313,16 @@ module.exports = [
   { name: 'proxy: with statusCode, which answers first', rules: `${P} proxy://${HOP} statusCode://204` },
   { name: 'proxy: with a redirect, which answers first', rules: `${P} proxy://${HOP} redirect://http://elsewhere.test/x` },
   { name: 'proxy: with a URL replacement that moves the origin', rules: `${P}/ proxy://${HOP} http://${OTHER}/echo` },
-  // The four cases below isolate divergence 7 — which URL the forwarding family
-  // is matched against once a URL replacement has moved the destination. Each
-  // pair asks the same question from both sides: a pattern that matches only the
-  // *original* URL, and one that matches only the *replacement*.
+  // ── which URL the forwarding family is matched against ─────────────────
+  //
+  // Once a URL replacement has moved the destination, `host://`, the proxy
+  // family and `pac://` are resolved a **second** time — against the URL the
+  // replacement produced, not the one the client asked for. Nine of the eleven
+  // cases below were the evidence for that; they used to be divergence 7 and now
+  // agree. The two named `residue:` still differ, and the header says why.
+  //
+  // Each pair asks the same question from both sides: a pattern that matches
+  // only the *original* URL, and one that matches only the *replacement*.
   {
     name: 'reresolve: a proxy pattern matching only the original URL',
     rules: `${P}/ http://${OTHER}/echo\n${P} proxy://${HOP}`,
@@ -314,6 +338,60 @@ module.exports = [
   {
     name: 'reresolve: a host pattern matching only the replacement',
     rules: `${P}/ http://${OTHER}/echo\n${OTHER} host://${P}`,
+  },
+  {
+    name: 'reresolve: a pac file matching only the original URL',
+    rules: `${P}/ http://${OTHER}/echo\n${P} pac://${PAC}/proxy.pac`,
+  },
+  {
+    name: 'reresolve: a pac file matching only the replacement',
+    rules: `${P}/ http://${OTHER}/echo\n${OTHER} pac://${PAC}/proxy.pac`,
+  },
+  // Is the first pass's answer merged with the second, or replaced by it? These
+  // two say **replaced**: upstream deletes `proxy` and `pac` before it starts and
+  // drops a `host` the second pass did not find again
+  // (`_original/lib/rules/index.js:133-134`, `lib/rules/rules.js:2323-2325`). The
+  // first sends the request to the origin the pattern named; without the second
+  // pass it lands on the *other* one.
+  {
+    name: 'reresolve: the host the original URL matched is dropped',
+    rules: `${P}/ http://${OTHER}/echo\n${P} host://${P}`,
+  },
+  {
+    name: 'reresolve: the replacement\'s host beats the original\'s',
+    rules: `${P}/ http://${OTHER}/echo\n${OTHER} host://${P}\n${P} host://${CLOSED}`,
+  },
+  // A line filter is re-read too, because the second pass is a whole resolution
+  // walk and `matchExcludeFilters` takes `curUrl` from it
+  // (`_original/lib/rules/rules.js:983,:1967`). The pattern matches both origins
+  // so that only the filter decides, and the two cases are exact mirrors: the
+  // hop is engaged in the second and not in the first.
+  {
+    name: 'reresolve: a line filter only the replacement trips',
+    rules: `${P}/ http://${OTHER}/echo\n127.0.0.1 proxy://${HOP} excludeFilter:///${PORTS.originB}/`,
+  },
+  {
+    name: 'reresolve: a line filter only the original tripped',
+    rules: `${P}/ http://${OTHER}/echo\n127.0.0.1 proxy://${HOP} excludeFilter:///${PORTS.origin}/`,
+  },
+  // And so are the capture groups: `$1` is whatever the *replacement* URL put in
+  // the group, which here is the other origin's port.
+  {
+    name: 'reresolve: a regexp capture is taken from the replacement',
+    rules: `${P}/ http://${OTHER}/echo\n/^http:\\/\\/127\\.0\\.0\\.1:(\\d+)\\// host://127.0.0.1:$1`,
+  },
+  // Residue 1 (declared): the URL the second pass sees is the one the
+  // *replacement rule* wrote, before `urlReplace://` rewrote its path.
+  {
+    name: 'residue: urlReplace\'s rewrite is not in the second-pass URL',
+    rules: `${P}/echo http://${OTHER}/echo\n${OTHER}/moved proxy://${HOP}\n${P} urlReplace://echo=moved`,
+  },
+  // Residue 2 (declared): `enable://proxyHost` resolved against the replacement.
+  // Both the `host://` and the `proxy://` line here match the replacement, so
+  // the second pass finds them; only the flag that decides between them does not.
+  {
+    name: 'residue: enable://proxyHost written against the replacement',
+    rules: `${P}/ http://${OTHER}/echo\n${OTHER} host://${P} proxy://${HOP}\n${OTHER} enable://proxyHost`,
   },
   { name: 'proxy: on a pattern that carries its own port', rules: `127.0.0.1:${PORTS.origin}/echo proxy://${HOP}` },
   { name: 'proxy: on a POST with a body', rules: `${P} proxy://${HOP}`, request: { method: 'POST', body: 'payload', headers: { 'content-type': 'text/plain' } } },

@@ -2500,6 +2500,42 @@ fn tpl_ctx<'a>(host: &'a str, port: u16, info: &'a ReqInfo) -> apply::TplCtx<'a>
     }
 }
 
+/// The rules the forwarding family reads, when a URL replacement moved the
+/// request off its own URL.
+///
+/// `None` — the common case — means "use the request's own resolution": nothing
+/// moved, so the second pass would match the same URL with the same rules. See
+/// [`apply::reresolve_forwarding`] for what the pass covers and why.
+///
+/// The value store and the config variables are applied to the second pass as
+/// they were to the first, so a `host://${addr}` written against the destination
+/// resolves rather than reaching the connector as literal text. Nothing is
+/// loaded from disk or fetched: no forwarding operator's value is a location
+/// (`value_source`'s `LOADABLE_*` lists name none of them), so this stays
+/// synchronous.
+fn forwarding_resolution(
+    state: &AppState,
+    info: &ReqInfo,
+    dest: &dest::Destination,
+    resolved: &Resolved,
+    merged_rules: &[crate::rules::RuleManager],
+    is_internal_req: bool,
+) -> Option<Resolved> {
+    if !dest.replaced {
+        return None;
+    }
+    let moved = dest.moved_req_info(info);
+    let mut second = {
+        let rules = state.rules.read().unwrap();
+        apply::reresolve_forwarding(resolved, &moved, &rules, merged_rules, is_internal_req)
+    };
+    let host = bind_host(state);
+    let values = effective_values(state);
+    apply::substitute_values(&mut second, &values, tpl_ctx(&host, state.config.port, &moved));
+    apply::substitute_config_vars(&mut second, state.config.port, crate::config::VERSION);
+    Some(second)
+}
+
 /// The address the request actually went to.
 ///
 /// It comes from the socket: `TcpStream::connect` picks among the resolver's
@@ -3691,15 +3727,23 @@ async fn serve(
         return Ok(resp);
     }
 
-    // WebSocket / other protocol upgrades are tunnelled after a 101.
-    if is_upgrade(&req) {
-        return serve_upgrade(&state, req, &info, &resolved, client_ip, time_ms, started).await;
-    }
-
     // Where the request is addressed, which is its own URL unless a rule pointed
     // it somewhere else — `www.example.com http://localhost:5173` and friends.
-    // Resolved before the target because the target is *how* to reach it.
+    // Resolved before the target because the target is *how* to reach it, and
+    // because the forwarding family is matched against *this* URL rather than
+    // the client's — see `forwarding_resolution`.
     let dest = dest::Destination::of(&info, &resolved);
+    let forwarding =
+        forwarding_resolution(&state, &info, &dest, &resolved, &merged_rules, is_internal_req);
+    let forwarding = forwarding.as_ref().unwrap_or(&resolved);
+
+    // WebSocket / other protocol upgrades are tunnelled after a 101.
+    if is_upgrade(&req) {
+        return serve_upgrade(
+            &state, req, &info, &resolved, &dest, forwarding, client_ip, time_ms, started,
+        )
+        .await;
+    }
 
     // `ws://`, `wss://` and `tunnel://` name transports this request is not:
     // each of the three says so — "普通 HTTP/HTTPS 请求：返回 502" — and upstream
@@ -3713,7 +3757,7 @@ async fn serve(
     // Fails the request rather than silently connecting direct when a proxy rule
     // matched but could not be honoured (unusable address, unreachable or
     // throwing PAC file) — see `apply::find_proxy`.
-    let target = apply::resolve_target(&info, &dest, &resolved).await?;
+    let target = apply::resolve_target(&info, &dest, forwarding).await?;
 
     // A proxy rule that names this proxy would send the request back to us, be
     // matched by the same rule, and recurse until the sockets run out. whistle
@@ -4337,17 +4381,25 @@ fn is_websocket(req: &Request<DynBody>) -> bool {
 /// This is how WebSocket (`ws://`/`wss://`) traffic is proxied. WebSocket
 /// upgrades are tunnelled frame-by-frame so each frame is captured; any other
 /// `Upgrade:` protocol is tunnelled as an opaque byte stream.
+///
+/// `forwarding` is the forwarding family's own resolution and `resolved` the
+/// request's; the two differ only when a rule moved the request — see
+/// [`forwarding_resolution`]. Upstream splits them here too: its WebSocket path
+/// rewrites `fullUrl` from the `rule` slot and only then calls `getProxy` with
+/// it (`_original/lib/https/index.js:228-232,:292`).
+#[allow(clippy::too_many_arguments)]
 async fn serve_upgrade(
     state: &Arc<AppState>,
     mut req: Request<DynBody>,
     info: &ReqInfo,
     resolved: &Resolved,
+    dest: &dest::Destination,
+    forwarding: &Resolved,
     client_ip: Option<String>,
     time_ms: u128,
     started: Instant,
 ) -> Result<Response<DynBody>> {
-    let dest = dest::Destination::of(info, resolved);
-    let target = apply::resolve_target(info, &dest, resolved).await?;
+    let target = apply::resolve_target(info, dest, forwarding).await?;
     let frame_script = resolved.value("frameScript").and_then(script::load_script);
     let websocket = is_websocket(&req);
     // Which plugins may hook this session's frames. Resolving the plan contacts

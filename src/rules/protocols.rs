@@ -147,6 +147,32 @@ pub const UPSTREAM_PROXY_PROTOCOLS: &[&str] = &[
     "http2https-proxy",
 ];
 
+/// The operators whistle resolves a **second** time, against the URL a URL
+/// replacement produced rather than the one the client asked for.
+///
+/// `getProxy` is handed `options.href` — the request's URL after the
+/// [`URL_REPLACE`] slot moved it — and assigns `req.curUrl = url` before
+/// resolving anything (`_original/lib/rules/index.js:125-130`,
+/// `lib/inspectors/res.js:196,:207-210`). Every pattern below is therefore
+/// matched against the *destination*, and so is every `filter://` / `ignore://`
+/// and every per-line `includeFilter`/`excludeFilter` that guards one, since
+/// they are re-evaluated by the same walk (`resolveRuleList`'s `curUrl`,
+/// `lib/rules/rules.js:919-1090`).
+///
+/// The two passes are not merged: `proxy` and `pac` are deleted outright at the
+/// top of `getProxy` (`index.js:133-134`), and `host` is deleted by
+/// `resolveHost` when the second pass finds none (`rules.js:2323-2325`). So the
+/// second answer *replaces* the first, including when it is "nothing".
+///
+/// Nothing else re-resolves. The rest of the rule set — the response operators,
+/// the request-header family, the body operators, `plugin://` — keeps whatever
+/// the request's own URL matched.
+pub fn forwarding_protocols() -> impl Iterator<Item = &'static str> {
+    std::iter::once("host")
+        .chain(UPSTREAM_PROXY_PROTOCOLS.iter().copied())
+        .chain(std::iter::once("pac"))
+}
+
 /// whistle's "tool" protocols (`_original/lib/rules/protocols.js:73`).
 pub const TOOL_PROTOCOLS: &[&str] = &["log", "weinre"];
 
@@ -427,6 +453,30 @@ mod tests {
     fn tool_protocols_are_response_phase() {
         for name in TOOL_PROTOCOLS {
             assert!(is_res_phase(name), "{name} must be resolved in the res phase");
+        }
+    }
+
+    /// The second pass covers `getProxy`'s three questions and nothing else —
+    /// widening it would re-decide operators upstream settles once, against the
+    /// URL the client asked for.
+    #[test]
+    fn the_second_pass_covers_host_the_proxy_family_and_pac() {
+        let list: Vec<&str> = forwarding_protocols().collect();
+        assert_eq!(list.len(), UPSTREAM_PROXY_PROTOCOLS.len() + 2);
+        assert_eq!(list.first(), Some(&"host"));
+        assert_eq!(list.last(), Some(&"pac"));
+        for name in UPSTREAM_PROXY_PROTOCOLS {
+            assert!(list.contains(name), "{name} must be re-resolved");
+        }
+        // Every one is single-match, which is what lets the splice move exactly
+        // one operator per protocol.
+        for name in &list {
+            assert!(!is_multi_match(name), "{name} must be single-match");
+        }
+        // The families that must *not* move: the request operators, the body
+        // operators and the flag protocols all keep the first pass's answer.
+        for name in ["reqHeaders", "cipher", "enable", "disable", "filter", "rule", "plugin"] {
+            assert!(!list.contains(&name), "{name} must not be re-resolved");
         }
     }
 }
