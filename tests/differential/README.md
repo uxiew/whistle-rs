@@ -45,15 +45,16 @@ at the same recording proxy and their two recordings are compared. It needs
 says which port is which.
 
 It prints the cases it ran and every difference it could not explain. A clean
-run says `differing: 0` — except for the two corpora whose own header declares a
+run says `differing: 0` — except for the corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
-`cases-delete.js` at `differing: 8` and `cases-values.js` at `differing: 11`.
+`cases-delete.js` at `differing: 8`, `cases-values.js` at `differing: 11` and
+`cases-groups.js` at `differing: 4`.
 
 One corpus claims a fourth port. `cases-includes.js` is about `@` includes, and
 half of them name a **URL**, so it stands up a rules-serving HTTP server at
 `PORT_BASE+10`. It runs clean at `differing: 0`.
 
-Three corpora are not clean on a bare run, by design:
+Four corpora are not clean on a bare run, by design:
 
 * `cases-filters.js` asks about `env:`, which reads the **proxy's** environment.
   Both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle
@@ -71,6 +72,10 @@ Three corpora are not clean on a bare run, by design:
   it at a weinre server whistle runs — neither of which this port has; one is
   `intercept://`, which is not a protocol in either proxy and fails in each one's
   own words; and one is the OS byte of a gzip header.
+* `cases-groups.js` ends at `differing: 4`, named at the top of the file: one is
+  the two APIs' answer to adding a group twice, and three are one fact — a
+  fenced ``` block is private to the rule group that declared it upstream and
+  shared between them here.
 
 ## The HTTPS bench
 
@@ -158,3 +163,37 @@ That is how `cases-patterns.js` asks about a **hostname** and about the **defaul
 port**, neither of which the origin's own `127.0.0.1:<port>` address can express:
 it points every host at the origin with a `* host://…` line and then asks which
 patterns match `http://a.example.test/echo`.
+
+## Several rule groups at once
+
+`rules` is one text and it is the **Default** group. A case may say `groups`
+instead — or as well — and get several:
+
+```js
+{ name: 'a named group overrides Default',
+  rules: `${P} method://PUT`,
+  groups: [{ name: 'A', value: `${P} method://DELETE` }] }
+```
+
+Each entry is `{ name, value, selected? }`, in the order the console would list
+them, and `selected: false` adds the group without switching it on. `Default` is
+a name like any other here, except that both proxies resolve it **last**. A
+third key, `remove: ['A']`, deletes named groups again *after* they were
+installed, which is the only way to ask what a deletion mid-session does as
+opposed to what never adding the group would have done.
+
+Two things the harness does for this, and they matter for every corpus:
+
+* **It pins `allowMultipleChoice` on.** Upstream selects one rule file at a time
+  otherwise, so selecting the second group silently unselects the first
+  (`selectRulesFile`, `_original/lib/rules/util.js:148-161`).
+* **It clears named groups** before the corpus and after any case that installed
+  one, and puts Default's switch back on. Both proxies persist their groups, so
+  a corpus that did not do this would inherit whatever the last run left in the
+  same data directory — and a probe leaking group state between cases is how a
+  single divergence gets reported as five.
+
+A case that says only `rules` issues exactly the two calls it always issued.
+
+`cases-groups.js` is the corpus for all of this and ends at `differing: 4`, for
+the two reasons its header names.

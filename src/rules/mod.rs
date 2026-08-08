@@ -1425,7 +1425,20 @@ impl RuleManager {
     }
 
     /// Remove a group by name. Returns true if found and removed.
+    ///
+    /// **The default group cannot be removed.** Upstream's Default is not a
+    /// rules *file* at all — it is a property of its own, and asking its
+    /// console API to remove a file called `Default` deletes nothing
+    /// (`_original/biz/webui/cgi-bin/rules/remove.js` → `rulesStorage.removeFile`,
+    /// which only knows the named files). Here it used to delete it, taking the
+    /// rules text `GET`/`POST /api/rules` reads and writes with it — and
+    /// [`crate::rules::storage::save_groups`] then wrote that loss to disk. The
+    /// console guarded the case in the browser and the server did not, which is
+    /// no guard at all. Switching the default group off is what `toggle` is for.
     pub fn remove_group(&mut self, name: &str) -> bool {
+        if name == "default" {
+            return false;
+        }
         let before = self.groups.len();
         self.groups.retain(|g| g.name != name);
         let removed = self.groups.len() < before;
@@ -2935,6 +2948,40 @@ mod group_tests {
         assert!(mgr.remove_group("a"));
         assert!(!mgr.remove_group("a")); // already removed
         assert_eq!(mgr.groups().len(), 0);
+    }
+
+    /// Upstream's Default is a property and not a file, so its remove endpoint
+    /// cannot touch it. Here the delete used to succeed and take the text
+    /// `/api/rules` reads with it — persisted, and guarded only in the browser.
+    #[test]
+    fn the_default_group_cannot_be_removed() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com host://1.1.1.1");
+        mgr.add_group("extra", "other.com host://2.2.2.2", true);
+
+        assert!(!mgr.remove_group("default"));
+        assert_eq!(mgr.text(), "example.com host://1.1.1.1");
+        assert!(mgr.resolve(&req("http://example.com/")).single.contains_key("host"));
+
+        // A named group is still removable, and the refusal above is about the
+        // one name rather than about removal having stopped working.
+        assert!(mgr.remove_group("extra"));
+        assert_eq!(mgr.groups().len(), 1);
+    }
+
+    /// Switching the default group off is the thing a delete was reaching for,
+    /// and it leaves the text where the console can get it back.
+    #[test]
+    fn the_default_group_can_be_switched_off_instead() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com host://1.1.1.1");
+
+        assert_eq!(mgr.toggle_group("default"), Some(false));
+        assert!(mgr.resolve(&req("http://example.com/")).single.is_empty());
+        assert_eq!(mgr.text(), "example.com host://1.1.1.1");
+
+        assert_eq!(mgr.toggle_group("default"), Some(true));
+        assert!(mgr.resolve(&req("http://example.com/")).single.contains_key("host"));
     }
 
     #[test]
