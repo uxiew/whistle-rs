@@ -140,6 +140,38 @@ fn replacement_url(resolved: &Resolved) -> Option<&String> {
     (proto == protocols::URL_REPLACE).then_some(&op.value)
 }
 
+/// The scheme a URL-replacement rule named, when a plain HTTP request cannot be
+/// sent over it — `ws://`, `wss://` and `tunnel://`.
+///
+/// Each of the three documents this: "普通 HTTP/HTTPS 请求：返回 502"
+/// (https://wproxy.org/docs/rules/ws.html, `wss.html`, `tunnel.html`). Upstream
+/// gets there by handing `parseUrl`'s `protocol: 'ws:'` straight to
+/// `http.request`, which refuses it — `Unsupported protocol ws:` — and the throw
+/// is wrapped into the gateway error page. So the answer is a 502, not a
+/// silently retargeted request.
+///
+/// Measured, because reading the code says the opposite: `getOptions` only ever
+/// asks whether the protocol is `https:`, and this port used to conclude from
+/// that same reading that a `tunnel://` destination "stays HTTP". It does not —
+/// node's client validates the protocol against its agent's before anything is
+/// sent.
+///
+/// Scoped to the plain HTTP path on purpose. A **WebSocket** request is what
+/// `ws://`/`wss://` are for, and a **tunnel** is what `tunnel://` is for; those
+/// two paths resolve their own destination and are left alone.
+pub fn unroutable_scheme(resolved: &Resolved) -> Option<&'static str> {
+    let value = replacement_url(resolved)?;
+    // The brackets say "this exact URL"; the scheme is in front of them either
+    // way, but unwrapping keeps this reading the same value `parse` will.
+    let value = url::fixed_value(value).map_or_else(|| value.to_string(), |(_, v)| v);
+    match web_scheme(value.trim()) {
+        Some("ws") => Some("ws"),
+        Some("wss") => Some("wss"),
+        Some("tunnel") => Some("tunnel"),
+        _ => None,
+    }
+}
+
 /// Split an authority into host and port, unwrapping a bracketed IPv6 literal.
 fn split_host_port(authority: &str) -> Option<(&str, Option<u16>)> {
     if let Some(rest) = authority.strip_prefix('[') {
@@ -277,5 +309,44 @@ mod tests {
     #[test]
     fn the_rule_spelling_is_not_a_destination() {
         assert!(!dest("a.com rule://mocks\n", "http://a.com/x").replaced);
+    }
+
+    /// The bracket forms on a scheme-relative destination — the example
+    /// https://wproxy.org/docs/rules/inherit.html gives under "禁用路径拼接".
+    /// Both used to leave their brackets in the value, so the host became
+    /// `<b.com` and the request answered 502.
+    #[test]
+    fn a_scheme_relative_destination_takes_the_bracket_forms() {
+        for rules in ["a.com/y //<b.com/x>\n", "a.com/y //(b.com/x)\n"] {
+            let d = dest(rules, "https://a.com/y/deep?q=1");
+            assert_eq!(
+                (d.scheme.as_str(), d.host.as_str(), d.port, d.path.as_str()),
+                ("https", "b.com", 443, "/x"),
+                "{rules}"
+            );
+        }
+    }
+
+    /// Which replacement schemes a plain HTTP request cannot be sent over.
+    #[test]
+    fn ws_wss_and_tunnel_are_unroutable_for_a_plain_request() {
+        let named = |rules: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(rules);
+            let info = req("http://a.com/y");
+            unroutable_scheme(&mgr.resolve(&info))
+        };
+        assert_eq!(named("a.com ws://b.com/x\n"), Some("ws"));
+        assert_eq!(named("a.com wss://b.com/x\n"), Some("wss"));
+        assert_eq!(named("a.com tunnel://b.com:8080\n"), Some("tunnel"));
+        // The brackets do not hide the scheme.
+        assert_eq!(named("a.com ws://<b.com/x>\n"), Some("ws"));
+        // Everything a plain request *can* be sent over.
+        assert_eq!(named("a.com http://b.com/x\n"), None);
+        assert_eq!(named("a.com https://b.com/x\n"), None);
+        assert_eq!(named("a.com //b.com/x\n"), None);
+        assert_eq!(named("a.com b.com:8080\n"), None);
+        assert_eq!(named("a.com host://1.2.3.4\n"), None);
+        assert_eq!(named(""), None);
     }
 }

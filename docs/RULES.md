@@ -101,7 +101,8 @@ The operators worth knowing before the rest are
 - [Quick reference](#quick-reference)
 - [Operator coverage](#operator-coverage) — [applied at runtime](#applied-at-runtime) ·
   [parsed but not applied](#parsed-but-not-applied-2) ·
-  [simplified vs. upstream](#simplified-vs-upstream)
+  [simplified vs. upstream](#simplified-vs-upstream) ·
+  [where wproxy.org and whistle disagree](#where-wproxyorg-and-whistle-disagree)
 - [Origin certificate verification](#origin-certificate-verification)
 
 ---
@@ -2083,6 +2084,15 @@ the request's own `Access-Control-Request-Headers` is echoed back. `enable://cor
 is **not** an upstream flag — whistle-rs keeps it as an alias for
 `resCors://enable`.
 
+> The official page has that sentence **inverted** — it says "请求方法为 OPTIONS 时，
+> access-control-allow-headers -> access-control-expose-headers"
+> (<https://wproxy.org/docs/rules/resCors.html>), and its worked example lists
+> `access-control-allow-headers` for a plain `GET`. Both whistle and whistle-rs do
+> the opposite, which is also the only reading that makes sense: `allow` answers a
+> preflight, `expose` answers a real response. Upstream's own line is
+> `var operate = isOptions ? 'allow' : 'expose'`
+> (`_original/lib/util/index.js:2953`).
+
 ### Deleting
 
 | Operator | Value | Effect |
@@ -2750,6 +2760,35 @@ Known gaps in the operator layer, deliberately left:
   them. They are *skipped* rather than run as JavaScript — the script whistle-rs
   executes is the first entry not spelled `resRules://`, which is the one
   upstream executes too.
+- **Only two of the three documented data-object formats are read, and not
+  everywhere.** whistle's operation page gives three
+  (<https://wproxy.org/docs/rules/operation.html>, "数据对象"): JSON, the inline
+  query form `k1=v1&k2=v2`, and the **line format** — `key: value` one per line,
+  splitting on the first `: `, with a dotted key nesting (`a.b.c: 123`) and `\.`
+  escaping the dot. Upstream reads all three, for every JSON-valued operator, via
+  `_parseJSON` → `parsePureJSON || parsePlainText`
+  (`_original/lib/util/index.js:1122-1145`, `lib/util/common.js:1134-1230`).
+  Here the line format is read only as a lucky one-line special case, and
+  `resMerge`/`reqMerge` read **JSON alone**. Measured against whistle 2.10.8:
+
+  | rule | whistle | here |
+  |---|---|---|
+  | `resMerge://test=123 file://({"name":"a"})` | `{"name":"a","test":"123"}` | unchanged |
+  | `resMerge://{m}` with `m` = `a.b.c: 123` | `{"name":"a","a":{"b":{"c":123}}}` | unchanged |
+  | `urlParams://{u}` with `u` = `test1: 1` | `?test1=1` | no query added |
+  | `reqHeaders://{h}` with `h` = three `k: v` lines | three headers | none |
+
+  The first of those is the *leading example* on both
+  [`resMerge`](https://wproxy.org/docs/rules/resMerge.html) and
+  [`reqMerge`](https://wproxy.org/docs/rules/reqMerge.html). A single `k: v` line
+  does work on the header operators, and JSON and `k=v&…` work everywhere.
+- **`resCookies://k=v;path=/` percent-encodes the attributes.** The inline form's
+  documented spelling puts a cookie's attributes after a `;` inside the value
+  (<https://wproxy.org/docs/rules/resCookies.html>) — whistle sends
+  `set-cookie: k=v;path=/`, whistle-rs sends `k=v%3Bpath=/`, so the attributes are
+  part of the value instead of attributes. The JSON form
+  (`resCookies://{"k":{"value":"v","path":"/"}}`) is byte-identical on both and is
+  the spelling to use meanwhile.
 - **A response with no declared charset is not sniffed.** When a `charset=` is
   present the response operators honour it — the body is decoded before the text
   transforms and re-encoded after, and injected values are written in that
@@ -2788,6 +2827,25 @@ Known gaps in the operator layer, deliberately left:
 
 If a rule doesn't do what you expect, run with `-v` (debug logging) — each request
 logs its resolved destination or short-circuit decision.
+
+
+### Where wproxy.org and whistle disagree
+
+Places the official documentation states something whistle 2.10.8 does not do.
+Each was measured against the running program, and **the program wins** — this
+port follows whistle, not the prose. They are recorded because a reader who
+arrived from those pages would otherwise think whistle-rs had the bug.
+
+| The page says | whistle actually | Where |
+|---|---|---|
+| on an `OPTIONS` request `access-control-allow-headers` becomes `access-control-expose-headers` | exactly the inverse — `allow` on a preflight, `expose` otherwise | [`resCors`](#response-rewriting) above |
+| a line-format value with no `: ` "splits at the first colon" | a **space-free** value never reaches the line parser at all: `parseInlineJSON` claims it first and reads the whole line as one key with an empty value, so `x-a:1` sets a header literally named `x-a:1` and `urlParams://{u}` with `u` = `test1:1` produces `?test1%3A1=`. The documented colon split only happens once the value contains whitespace somewhere (`SPACE_RE`, `_original/lib/util/index.js:1127-1132`) | this port splits at the colon in both cases, which is what the page describes |
+| `ws://` / `wss://` / `tunnel://` "返回 502" for a plain HTTP request | it does, and the page is right — but only when the line is *read* as a destination. `127.0.0.1:8080 ws://host/x` is not: a bare host is no pattern to `indexOfPattern`, the `ws://` URL is, and the line swaps into "pattern `ws://host/x`, operator `host://127.0.0.1:8080`" (`_original/lib/rules/rules.js:1449-1467,:1774-1789`), which a plain request never matches | `cases.js`, the two "swaps into pattern and host" cases |
+| `delete://pathname` "删除请求路径（不包含请求参数）" | it deletes the path and then **doubles the query** | already recorded under [Deleting](#deleting) |
+
+The `ws://` row is the one worth remembering: the page is right, and the obvious
+way to test it is not — a bench case written as `<host:port> ws://…` is inert on
+both sides and proves nothing about the rule it names.
 
 
 ### `x-server` on a response the proxy made itself
