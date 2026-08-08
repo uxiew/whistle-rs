@@ -34,19 +34,20 @@
 //     `x-whistle-response-for: svc-a` from both. The cases stay because they
 //     still prove `responseFor://` does not disturb the request.
 //
-// **This corpus ends at `differing: 8`, and every one of the eight is named
-// here.** Six are `weinre://`, one is `intercept://`, and one is a gzip header.
+// **This corpus ends at `differing: 7`** — six `weinre://` and one
+// `intercept://`, each named below.
 //
-// The gzip one is `the response is re-encoded after injection`. Both proxies
-// inject into the compressed body and compress the result, and the deflate
-// stream they produce is **byte-identical**; what differs is byte 9 of the gzip
-// header, the OS field — `0x13` from Node's zlib on this machine against `0xff`,
-// RFC 1952's "unknown", from `flate2`. whistle's value is its build's, so it is
-// not stable across whistle installs either; 255 is the portable answer and is
-// kept. Measured:
+// It said eight until the eighth stopped differing on its own. That one was
+// `the response is re-encoded after injection`: both proxies inject into the
+// compressed body and recompress, the deflate stream was byte-identical, and
+// what differed was byte 9 of the gzip header — the OS field, `0x13` from the
+// Node zlib of the day against `0xff`, RFC 1952's "unknown", from `flate2`.
+// Node v26.4.0 emits `0xff` too, so the two now agree.
 //
-//   whistle    1f8b 0800 0000 0000 0013 b3c9 28c9 …
-//   whistle-rs 1f8b 0800 0000 0000 00ff b3c9 28c9 …
+// The case is kept rather than deleted, and this paragraph with it, because the
+// agreement is the toolchain's rather than either proxy's: whistle's byte is its
+// build's, so a different Node will part them again. If this corpus ever reports
+// eight, look at byte 9 before looking at the port.
 //
 // `weinre://` (`_original/lib/inspectors/weinre.js`) appends whistle's **own
 // bundled debug agent** — the whole of `assets/js/weinre.js`, inline, at the end
