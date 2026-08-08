@@ -162,6 +162,15 @@ pub struct RuleOp {
     pub value: String,
     /// The original token as written, for diagnostics.
     pub raw: String,
+    /// The pattern of the line this operator was written on, as written.
+    ///
+    /// Carried per operator because that is the only shape the reader needs:
+    /// `enable://responseWithMatchedRules` reports `rawPattern + ' ' +
+    /// rawMatcher` for each rule that matched (`getRulesText`,
+    /// `_original/lib/util/index.js:1867-1877`), and by then the resolved set
+    /// has mixed operators from many lines and no longer knows which line each
+    /// came from.
+    pub raw_pattern: String,
     /// Properties of the line this operator was written on. Copied per operator
     /// so that resolution — which mixes operators from many lines — keeps each
     /// one's line scope.

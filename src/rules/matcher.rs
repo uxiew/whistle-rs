@@ -539,7 +539,7 @@ fn resolve_walk(
                 if exact.silences_op(op) {
                     continue;
                 }
-                take(&mut resolved, op, super::token_order(line, at), &matched);
+                take(&mut resolved, rule, op, super::token_order(line, at), &matched);
             }
         }
     }
@@ -807,9 +807,10 @@ fn join_each_path(protocol: &str, value: &str, tail: &str) -> String {
 
 /// Add `op` to `resolved` under its protocol's arity rule, stamped with `order`
 /// and with the pattern's leftover URL joined on where that applies.
-fn take(resolved: &mut Resolved, op: &RuleOp, order: u64, matched: &Matched<'_>) {
+fn take(resolved: &mut Resolved, rule: &Rule, op: &RuleOp, order: u64, matched: &Matched<'_>) {
     let mut op = op.clone();
     op.order = order;
+    op.raw_pattern = rule.raw_pattern.clone();
     // Captures first, then the tail — upstream's order too (`resolveVar` and
     // `replaceSubMatcher` run before `getPathRule` joins anything).
     if let Some(groups) = &matched.groups {
@@ -878,7 +879,7 @@ pub fn resolve_response_ops(
         };
         for (at, op) in rule.ops.iter().enumerate() {
             if protocols::is_res_phase(&op.protocol) || op.protocol == "ignore" {
-                take(&mut resolved, op, super::token_order(*order, at), &matched);
+                take(&mut resolved, rule, op, super::token_order(*order, at), &matched);
             }
         }
     }

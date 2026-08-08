@@ -1952,12 +1952,15 @@ simplification: **`userLogin`** lets `enable` win over `disable`
 
 #### Two flag divergences, measured
 
-* **`enable://responseWithMatchedRules` is not implemented here.** whistle
-  writes the matched rule lines into `x-whistle-matched-rules` on the response
-  (`addMatchedRules`, `util/index.js:3879-3888`); this port writes nothing. Its
-  request-side twin `requestWithMatchedRules` is dead in **both**: upstream
-  calls it from the response inspector (`res.js:770`), after the request head
-  has already gone, so the origin never sees the header.
+* **`enable://responseWithMatchedRules`** writes the matched rule lines into
+  `x-whistle-matched-rules` on the response, `rawPattern + ' ' + rawMatcher` per
+  rule, joined with `\n` and URL-encoded whole (`addMatchedRules`,
+  `util/index.js:3879-3888`). The order is the **protocol table's**, not the
+  written one — whistle assigns `req.rules`' keys as it walks `protocols.js`, so
+  `enable://` is reported ahead of `resHeaders://` and a `file://` ahead of
+  both. Its request-side twin `requestWithMatchedRules` is dead in **both**
+  proxies: upstream calls it from the response inspector (`res.js:770`), after
+  the request head has already gone, so the origin never sees the header.
 * **`disable://trailers` still announces the trailer upstream.** Asked with
   `TE: trailers`, whistle emits `Trailer: x-t` and then sends no trailer section
   at all; whistle-rs drops the announcement along with the section. Announcing a

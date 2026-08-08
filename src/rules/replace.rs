@@ -105,7 +105,7 @@ fn emit_char(out: &mut String, value: &str, at: usize) -> usize {
 
 /// JavaScript's `encodeURIComponent`: everything outside the unreserved set
 /// `A-Za-z0-9-_.!~*'()` is percent-encoded.
-fn encode_uri_component(s: &str) -> String {
+pub fn encode_uri_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

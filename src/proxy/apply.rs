@@ -3603,6 +3603,56 @@ fn parse_leading_number(value: &str) -> Option<f64> {
     text[..end].parse().ok()
 }
 
+/// The rules that matched, as `enable://responseWithMatchedRules` reports them.
+///
+/// `getRulesText` walks `req.rules` and writes `rawPattern + ' ' + rawMatcher`
+/// per entry, joined with `\n` and `encodeURIComponent`d whole
+/// (`_original/lib/util/index.js:1867-1877`). The header is
+/// `x-whistle-matched-rules`.
+///
+/// **The order is the protocol table's**, which is what `Object.keys(req.rules)`
+/// yields: whistle assigns its keys as it walks `protocols.js`, so the report
+/// follows that array and not the order the operators were written. Measured
+/// three ways before it was believed — `resHeaders://x-r=1 enable://…` reports
+/// the `enable` first (index 24 against 57), and `file://(mocked) enable://…`
+/// reports the `file` first, because a local file is filed under `rule` at
+/// index 3. Operators sharing a protocol keep resolution order between them.
+///
+/// The request-side twin `requestWithMatchedRules` is deliberately absent:
+/// upstream calls `addMatchedRules(req)` from the response inspector
+/// (`res.js:770`), after the request head has gone, so the origin never sees
+/// that header. Measured; both proxies send nothing.
+fn matched_rules_text(resolved: &Resolved) -> Option<String> {
+    let mut ops: Vec<&RuleOp> = resolved
+        .single
+        .values()
+        .chain(resolved.multi.values().flatten())
+        .chain(resolved.slot())
+        .collect();
+    // The slot's members are all filed under `rule` upstream, whatever their own
+    // spelling — that is what puts `file://` ahead of `enable://`.
+    let key = |op: &RuleOp| -> (usize, u64) {
+        let name = match crate::rules::protocols::is_slot_protocol(&op.protocol) {
+            true => crate::rules::protocols::URL_REPLACE,
+            false => op.protocol.as_str(),
+        };
+        let at = crate::rules::protocols::PROTOCOLS
+            .iter()
+            .position(|p| *p == name)
+            .unwrap_or(usize::MAX);
+        (at, op.order)
+    };
+    ops.sort_by_key(|op| key(op));
+    let mut lines: Vec<String> = Vec::new();
+    for op in ops {
+        let line = format!("{} {}", op.raw_pattern, op.raw);
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    (!lines.is_empty()).then(|| crate::rules::replace::encode_uri_component(&lines.join("\n")))
+}
+
 /// Apply response-side operators (status replacement, headers) in place.
 ///
 /// The `resCors` negotiation and the `attachment` filename fallback both need
@@ -3626,6 +3676,12 @@ pub fn apply_response_for(
     resolved: &Resolved,
     info: Option<&ReqInfo>,
 ) {
+    if is_enabled(resolved, "responseWithMatchedRules")
+        && let Some(text) = matched_rules_text(resolved)
+        && let Ok(value) = hyper::header::HeaderValue::from_str(&text)
+    {
+        parts.headers.insert("x-whistle-matched-rules", value);
+    }
     // `statusCode` only speaks when it won the shared slot. Upstream reads it
     // off `rules.rule` (`getStatusCodeFromRule`,
     // `_original/lib/util/index.js:3566-3589`), which is the same single winner

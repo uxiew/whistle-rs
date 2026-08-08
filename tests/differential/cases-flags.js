@@ -22,22 +22,18 @@
 //
 // **Divergences this file declares rather than pins**, named here instead of in
 // `harness.js`'s `EXPECTED` so a wide matcher there cannot swallow news in
-// another corpus. A clean run of this file is `differing: 4`.
+// another corpus. A clean run of this file is `differing: 1`.
 //
-//   1. **`enable://responseWithMatchedRules` is not implemented** (3 cases).
-//      whistle writes the matched rules into `x-whistle-matched-rules` on the
-//      response (`addMatchedRules`, `_original/lib/util/index.js:3879-3888`);
-//      this port writes nothing. Implementing it needs each resolved operator
-//      to carry the pattern it came from, which `RuleOp` does not keep — a
-//      change in the resolver, deliberately deferred while that machinery is
-//      being restructured elsewhere. Recorded in `docs/RULES.md`.
+//   `enable://responseWithMatchedRules` used to be three of the four and is now
+//   implemented, byte for byte including the order. The order was the part worth
+//   measuring: whistle assigns `req.rules`' keys as it walks `protocols.js`, so
+//   the report follows that array rather than the written order — `enable://`
+//   ahead of `resHeaders://`, and a `file://` ahead of both because it is filed
+//   under `rule`. Its request-side twin `requestWithMatchedRules` agrees by both
+//   proxies doing nothing: upstream calls `addMatchedRules(req)` from the
+//   response inspector (`res.js:770`), after the request head has gone.
 //
-//      Its request-side twin `requestWithMatchedRules` **agrees**, and agrees
-//      by both proxies doing nothing: upstream calls `addMatchedRules(req)` from
-//      the response inspector (`res.js:770`), long after the request head went
-//      out, so the origin never sees the header. Measured, not assumed.
-//
-//   2. **`disable://trailers` still announces the trailer upstream** (1 case).
+//   1. **`disable://trailers` still announces the trailer upstream** (1 case).
 //      Measured with `TE: trailers` so both proxies would send a section if
 //      they meant to: whistle emits `Trailer: x-t` and then sends **no
 //      trailer section at all**, while this port drops the announcement with
