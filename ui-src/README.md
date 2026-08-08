@@ -3,17 +3,26 @@
 The web console served on the proxy port: a Vue 3 app that builds to **one
 self-contained HTML file**, `dist/index.html`.
 
-## The artifact is committed on purpose
+## Build it before you build the proxy
 
-`dist/index.html` is checked in. It is not a build product that happens to be in
-the tree by accident — the Rust build reads it with `include_str!`, and requiring
-Node to compile a Rust proxy would be a bad trade. Rebuild it and commit it in
-the same change as the source you edited.
+`dist/index.html` is **not** in the repository: it is a 445 KB bundle that is
+rewritten end to end by every build, which makes every console change an
+unreadable diff. Build it here, and the Rust build inlines it.
 
 ```sh
 npm install     # once
 npm run build   # writes dist/index.html
 ```
+
+Requiring Node to compile a Rust proxy would still be a bad trade, so it is not
+required. `build.rs` copies `dist/index.html` into `OUT_DIR` when it exists and
+writes a placeholder page there when it does not — `cargo build` succeeds either
+way, with a warning naming what is missing. A binary built without the console
+serves every API route as usual; only `/` is the placeholder, and it says so.
+
+The console is inlined at **compile** time, so building it after the proxy
+changes nothing until the proxy is rebuilt. `cargo build` notices the new file
+by itself (`rerun-if-changed`); it is the `cargo build` you have to remember.
 
 The output has no external references at all: no chunks, no CDN, no fonts, no
 images. It has to load with the network it is inspecting switched off, which is

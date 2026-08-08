@@ -77,6 +77,15 @@ cargo build --release
 # 二进制位于 ./target/release/whistle-rs
 ```
 
+代理本身不需要别的东西。**Web 控制台**是一份单独的 Vite 产物，只生成不入库；
+想要它就先构建，Rust 编译期会把它内联进来。没有构建时 `/` 会返回一个占位页，
+并在编译时打一条 warning 说清缺了什么：
+
+```bash
+cd ui-src && npm install && npm run build && cd ..
+cargo build --release
+```
+
 ## 快速开始
 
 ```bash

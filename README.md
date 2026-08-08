@@ -84,6 +84,16 @@ cargo build --release
 # binary at ./target/release/whistle-rs
 ```
 
+The proxy needs nothing else. The **web console** is a separate Vite bundle that
+is generated rather than committed, so build it first if you want it — the Rust
+build inlines it, and serves a placeholder page at `/` (with a build warning
+naming what is missing) when it has not been built:
+
+```bash
+cd ui-src && npm install && npm run build && cd ..
+cargo build --release
+```
+
 ## Quick start
 
 ```bash

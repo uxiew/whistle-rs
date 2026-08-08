@@ -1624,11 +1624,13 @@ fn html_ok(html: String) -> Response<DynBody> {
 
 /// The console: the Vue application from `ui-src/`, built to one file.
 ///
-/// `ui-src/dist/index.html` is a committed build artifact, and deliberately so.
-/// The console is a Vue 3 / Vite / TypeScript app — which needs node to build —
-/// but the *proxy* must not: `cargo build` on a machine with no node has to
-/// produce a working binary. So the artifact is checked in and `include_str!`'d,
-/// and `ui-src/README.md` says how to regenerate it.
+/// The bundle is **not** in the repository — it is a generated 445 KB artifact
+/// that changes wholesale on every UI build. `build.rs` copies
+/// `ui-src/dist/index.html` into `OUT_DIR` when it has been built and writes a
+/// placeholder page there when it has not, so `cargo build` still produces a
+/// working binary on a machine with no node; `ui-src/README.md` says how to
+/// build the real one. The choice is made before compilation because
+/// `include_str!` cannot express "this file, or that one".
 ///
 /// It is one file for a harder reason than convenience: the console is served by
 /// the proxy being debugged, and has to load with the network it is inspecting
@@ -1643,7 +1645,7 @@ fn index_html(state: &Arc<AppState>) -> String {
         .host
         .map(|h| h.to_string())
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    include_str!("../../ui-src/dist/index.html")
+    include_str!(concat!(env!("OUT_DIR"), "/console.html"))
         .replace("__VERSION__", crate::config::VERSION)
         .replace("__HOST__", &host)
         .replace("__PORT__", &state.config.port.to_string())

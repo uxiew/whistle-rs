@@ -42,7 +42,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
 | `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks |
 | `src/proxy/webui.rs` | `biz/webui` | The console's routes + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
-| `ui-src/` | `biz/webui/htdocs` | The console: a Vue 3 / Vite / TypeScript app built to one file, committed and inlined by `include_str!` |
+| `ui-src/` | `biz/webui/htdocs` | The console: a Vue 3 / Vite / TypeScript app built to one file and inlined at compile time; `build.rs` substitutes a placeholder when it has not been built, so no Node is needed to build the proxy |
 | `ui-src/src/editor/whistle-classify.js` | — | The rules classifier; shares `index_of_pattern` with the parser, and a Rust test holds the two together |
 | `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
 | `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`, `upper`, `ws-upper`, `gate`, `no-mitm`) |
@@ -357,4 +357,4 @@ whistle-rs/
 | add a plugin hook | `src/plugins/mod.rs` (manifest + trait), then the call site — but check first whether the existing dispatch already suffices, as `auth` did |
 | touch the request pipeline | `serve()` in `src/proxy/mod.rs` — the one place every request flows through |
 | add an endpoint | the route match at the top of `src/proxy/webui.rs` |
-| change the console | `ui-src/` — Vue 3 SFCs; `npm run build` regenerates the committed `dist/index.html` |
+| change the console | `ui-src/` — Vue 3 SFCs; `npm run build` writes `dist/index.html`, then `cargo build` inlines it |

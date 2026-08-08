@@ -1,5 +1,7 @@
 node_modules
 *.tsbuildinfo
 
-# dist/ is deliberately NOT ignored: the built console is committed so the Rust
-# build can `include_str!` it without needing Node. See README.md.
+# The Vite bundle is generated, not content. `build.rs` copies it into OUT_DIR
+# when it is there and writes a placeholder when it is not, so a checkout with
+# no Node still builds — see README.md.
+dist/
