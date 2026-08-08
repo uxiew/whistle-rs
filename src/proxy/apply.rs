@@ -3038,6 +3038,158 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, want: Head
     }
 }
 
+/// whistle's `_parseJSON` (`_original/lib/util/index.js:1135-1143`): the three
+/// spellings a data-valued operator accepts, tried in order.
+///
+/// 1. **JSON** — `parseRawJson`, a plain `JSON.parse` in a `try`.
+/// 2. **A query string** — `parseInlineJSON`, but *only* when the text contains
+///    no whitespace at all (`SPACE_RE.test(text)` returns early otherwise), so
+///    `a=1&b=2` is a pair list and `a=1 &b=2` is not.
+/// 3. **The line format** — [`parse_plain_text`], one `name: value` per line.
+///
+/// The third was missing here, everywhere, and the documentation leads with it:
+/// <https://wproxy.org/docs/rules/resMerge.html> opens with `resMerge://test=123`
+/// and the `行格式` section of every data-operator page shows the multi-line form
+/// through a `{value}` reference. Both did nothing in this port.
+///
+/// `resolve_keys` is `RESOLVE_KEY_RE` (`util/index.js:95`), which is exactly
+/// `^re[qs]Merge://` — only the merge pair reads a dotted name as a path into
+/// the object. Every other operator takes the name literally.
+fn parse_data_object(text: &str, resolve_keys: bool, is_content: bool) -> Option<serde_json::Value> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // `tryParseMatcher` comes **first**, and only for a value that is the rule's
+    // own matcher rather than text some loader produced — its guard is `!text`
+    // (`_original/lib/util/index.js:1165-1171`, ahead of `_parseJSON` at
+    // `:1303`). It asks one question: does the matcher contain an `=`? If so the
+    // whole thing is a query string, whitespace and newlines included.
+    //
+    // That is why `reqHeaders://x-a=${v}` with a two-line `v` sets **no** header
+    // upstream: the value stays whole, carries a newline, and `setHeader` throws
+    // on it. Splitting it into lines here instead produced a header whistle
+    // never sends. A value that came from the values store takes the other road.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return Some(value);
+    }
+    if !is_content {
+        // A written matcher is a query string when it has an `=`, and **nothing
+        // at all** when it does not. Measured, five shapes: `x-a=1` sets the
+        // header; `x-a=line1\nline2` keeps the newline in the value and is
+        // thrown away by the header layer; `bare` and a lone backtick set
+        // nothing. The same words inside loaded content *do* become headers with
+        // empty values, which is the line format doing its job — so the two
+        // roads really are different, not one road read twice.
+        let pairs = text.contains('=').then(|| ordered_pairs(text))??;
+        return Some(serde_json::Value::Object(pairs.into_iter().collect()));
+    }
+    if !text.contains(char::is_whitespace) {
+        let pairs = ordered_pairs(text)?;
+        return Some(serde_json::Value::Object(pairs.into_iter().collect()));
+    }
+    parse_plain_text(text, resolve_keys)
+}
+
+/// The line format: one `name: value` per line, folded into an object.
+///
+/// `common.parsePlainText` (`_original/lib/util/common.js:1178-1217`). Upstream
+/// starts the result as an array when the first key is numeric; this port always
+/// builds an object, because the array case only arises through `resolve_keys`
+/// and a numeric first segment, and every consumer here indexes by name.
+fn parse_plain_text(text: &str, resolve_keys: bool) -> Option<serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for line in text.split(['\n', '\r']) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = parse_data_line(line);
+        match resolve_keys {
+            true => insert_at_path(&mut out, &parse_json_path(&name), value),
+            false => {
+                out.insert(name, value);
+            }
+        }
+    }
+    (!out.is_empty()).then(|| serde_json::Value::Object(out))
+}
+
+/// One line of the line format (`parseLine`, `common.js:1134-1168`).
+///
+/// The separator is the first `": "`, else the first `':'`, else the first `'='`
+/// — in that order, so `x-a: b:c` splits at the space-colon and keeps `b:c`. A
+/// line with none of them is a name with an empty value.
+///
+/// A value wrapped in a matching pair of `"`, `'` or `` ` `` loses the quotes,
+/// and a backticked one also turns its literal `\n` and `\r` into the real
+/// characters. An unquoted value that is a safe integer becomes a number rather
+/// than a string.
+fn parse_data_line(line: &str) -> (String, serde_json::Value) {
+    let at = line
+        .find(": ")
+        .or_else(|| line.find(':'))
+        .or_else(|| line.find('='));
+    let Some(at) = at else {
+        return (line.to_string(), serde_json::Value::String(String::new()));
+    };
+    let name = line[..at].trim().to_string();
+    let value = line[at + 1..].trim();
+    let quote = value.chars().next().filter(|c| "\"'`".contains(*c));
+    if let Some(q) = quote
+        && value.len() >= 2
+        && value.ends_with(q)
+    {
+        let inner = &value[q.len_utf8()..value.len() - q.len_utf8()];
+        let inner = match q == '`' {
+            true => inner.replace("\\n", "\n").replace("\\r", "\r"),
+            false => inner.to_string(),
+        };
+        return (name, serde_json::Value::String(inner));
+    }
+    match safe_num(value) {
+        Some(n) => (name, serde_json::Value::Number(n.into())),
+        None => (name, serde_json::Value::String(value.to_string())),
+    }
+}
+
+/// `isSafeNumStr` (`_original/lib/util/common.js:1016-1029`): `0`, or an
+/// optionally-signed run of 1–16 digits with no leading zero, within JavaScript's
+/// safe-integer range.
+fn safe_num(value: &str) -> Option<i64> {
+    if value == "0" {
+        return Some(0);
+    }
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let ok = (1..=16).contains(&digits.len())
+        && digits.starts_with(|c: char| c.is_ascii_digit() && c != '0')
+        && digits.bytes().all(|b| b.is_ascii_digit());
+    ok.then(|| value.parse::<i64>().ok())
+        .flatten()
+        .filter(|n| n.unsigned_abs() <= 9_007_199_254_740_991)
+}
+
+/// Place `value` at a dotted path, creating the objects along the way.
+fn insert_at_path(out: &mut serde_json::Map<String, serde_json::Value>, path: &[String], value: serde_json::Value) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut node = out;
+    for key in parents {
+        node = node
+            .entry(key.clone())
+            .and_modify(|v| {
+                if !v.is_object() {
+                    *v = serde_json::Value::Object(serde_json::Map::new());
+                }
+            })
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .expect("just made it an object");
+    }
+    node.insert(last.clone(), value);
+}
+
 /// The entries of a `headerReplace://` value, in source order, in either
 /// spelling upstream accepts.
 ///
@@ -4814,9 +4966,12 @@ fn merge_json_patches(resolved: &Resolved, protocol: &str) -> Option<serde_json:
     let mut deep = false;
     let mut patches: Vec<serde_json::Value> = Vec::new();
     for op in resolved.all(protocol) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(op.value.trim()) else {
-            // Not JSON at all; upstream's `_parseJSON` yields null and the
-            // line is filtered out.
+        // All three spellings, not JSON alone. `resMerge://test=123` is the
+        // first example on <https://wproxy.org/docs/rules/resMerge.html> and it
+        // did nothing here; so did the line format, which is how a `{value}`
+        // reference carries a merge patch. `resMerge`/`reqMerge` are also the
+        // only operators whose dotted names are paths (`RESOLVE_KEY_RE`).
+        let Some(value) = parse_data_object(&op.value, true, op.value_is_content) else {
             continue;
         };
         match value {
@@ -6191,28 +6346,40 @@ fn merge_params_values(resolved: &Resolved, protocol: &str) -> Vec<(String, serd
         resolved
             .all(protocol)
             .iter()
-            .map(|op| parse_param_values(&op.value)),
+            .map(|op| parse_param_values(&op.value, op.value_is_content)),
     )
 }
 
 /// Parse `k=v&k2=v2` or `{json}` into `name` → JSON value pairs.
-fn parse_param_values(value: &str) -> Vec<(String, serde_json::Value)> {
+fn parse_param_values(value: &str, is_content: bool) -> Vec<(String, serde_json::Value)> {
     let value = value.trim();
     if value.starts_with('{')
         && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
     {
         return map.into_iter().collect();
     }
-    value
-        .split('&')
-        .filter_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            Some((
-                k.trim().to_string(),
-                serde_json::Value::String(v.trim().to_string()),
-            ))
-        })
-        .collect()
+    // The query-string spelling only when the value has no whitespace, then the
+    // line format — upstream's `_parseJSON` order, and the reason
+    // `urlParams://{u}` with a three-line `u` used to add no query at all.
+    if !is_content && !value.contains('=') {
+        return Vec::new();
+    }
+    if !is_content || !value.contains(char::is_whitespace) {
+        return value
+            .split('&')
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                Some((
+                    k.trim().to_string(),
+                    serde_json::Value::String(v.trim().to_string()),
+                ))
+            })
+            .collect();
+    }
+    match parse_plain_text(value, false) {
+        Some(serde_json::Value::Object(map)) => map.into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// A param value as it appears in a query string or a form body: a JSON string
@@ -6821,7 +6988,7 @@ fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, HeaderV
         resolved
             .all(protocol)
             .iter()
-            .map(|op| parse_header_pairs(&op.value)),
+            .map(|op| parse_header_pairs(&op.value, op.value_is_content)),
     )
 }
 
@@ -6833,7 +7000,7 @@ fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, HeaderV
 /// A value is a *list* because the JSON spelling may give one: upstream assigns
 /// the array straight onto the header map, and Node then writes one header line
 /// per element. Every other spelling produces a list of one.
-fn parse_header_pairs(value: &str) -> Vec<(String, HeaderValues)> {
+fn parse_header_pairs(value: &str, is_content: bool) -> Vec<(String, HeaderValues)> {
     let value = value.trim();
     if value.starts_with('{')
         && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
@@ -6850,19 +7017,21 @@ fn parse_header_pairs(value: &str) -> Vec<(String, HeaderValues)> {
             })
             .collect();
     }
-    if value.contains('=') {
+    // The query-string spelling, and **only** when the value has no whitespace
+    // in it: `parseInlineJSON` returns early on `SPACE_RE.test(text)`
+    // (`_original/lib/util/index.js:1128-1133`), which is what keeps `x-a: v=1`
+    // out of this branch. It used to reach it here and split at the `=`, giving
+    // a header named `x-a: v`.
+    if !is_content && !value.contains('=') {
+        return Vec::new();
+    }
+    if value.contains('=') && (!is_content || !value.contains(char::is_whitespace)) {
         // A name repeated in one value is a *list*, not a contest: Node's
         // `querystring.parse("a=1&a=2")` yields `{a: ["1","2"]}`, whistle
         // assigns that array onto the header map, and Node writes one header
         // line per element. Folding to the last value here sent one header
         // where whistle sends two, which for `set-cookie` or `accept` is the
         // difference between the rule working and half of it vanishing.
-        //
-        // Names are trimmed, deliberately unlike upstream: `qs.parse` leaves
-        // `x-t = v` with the name `"x-t "`, and a header name with a trailing
-        // space is not a valid token — hyper rejects it, so faithfully keeping
-        // the space would turn the operator into a silent no-op. Upstream's own
-        // `setHeader` throws on it.
         let mut out: Vec<(String, HeaderValues)> = Vec::new();
         for (name, val) in value.split('&').filter_map(|pair| pair.split_once('=')) {
             let (name, val) = (name.trim().to_string(), val.trim().to_string());
@@ -6873,13 +7042,25 @@ fn parse_header_pairs(value: &str) -> Vec<(String, HeaderValues)> {
         }
         return out;
     }
-    match value.split_once(':') {
-        Some((name, val)) => vec![(
-            name.trim().to_string(),
-            HeaderValues::One(val.trim().to_string()),
-        )],
-        None => Vec::new(),
-    }
+    // The line format, one `name: value` per line. This used to be a one-line
+    // special case that only ever produced a single pair, so a `{value}` holding
+    // three headers set none of them — the shape every data-operator page shows
+    // under 行格式. Names are trimmed here, deliberately unlike upstream: a
+    // header name with a trailing space is not a valid token and hyper rejects
+    // it, so keeping the space faithfully would turn the operator into a silent
+    // no-op. Upstream's own `setHeader` throws on it.
+    let Some(serde_json::Value::Object(map)) = parse_plain_text(value, false) else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .map(|(name, v)| {
+            let text = match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            (name.trim().to_string(), HeaderValues::One(text))
+        })
+        .collect()
 }
 
 /// One element of a JSON header array as it reaches the wire: a string as
@@ -8276,6 +8457,64 @@ mod tests {
         assert_eq!(res_speed_kbps(&of("a.com resSpeed://0.5\n")), Some(0.5));
     }
 
+    /// The three spellings a data-valued operator accepts, and the order.
+    ///
+    /// `_parseJSON` (`_original/lib/util/index.js:1135-1143`) tries JSON, then a
+    /// query string but **only** on a value with no whitespace, then the line
+    /// format. This port had the first two and read the third as a one-line
+    /// special case, so `resMerge://test=123` — the first example on that
+    /// operator's own documentation page — did nothing, and a `{value}` holding
+    /// three headers set none of them.
+    #[test]
+    fn a_data_value_is_json_then_a_query_then_lines() {
+        // `true` = the value is loaded content, which is the road that reaches
+        // the three layers; a written matcher containing `=` never gets past
+        // `tryParseMatcher`, and `a_written_matcher_with_an_equals_is_a_query`
+        // below covers that side.
+        let obj = |text: &str, keys: bool| parse_data_object(text, keys, true).unwrap().to_string();
+        assert_eq!(obj(r#"{"a":1}"#, false), r#"{"a":1}"#);
+        assert_eq!(obj("a=1&b=2", false), r#"{"a":"1","b":"2"}"#);
+        assert_eq!(obj("a: 1\nb: two", false), r#"{"a":1,"b":"two"}"#);
+        // A safe integer becomes a number; a quoted one stays text.
+        assert_eq!(obj("a: \"1\"", false), r#"{"a":"1"}"#);
+        assert_eq!(obj("a: 007", false), r#"{"a":"007"}"#);
+        assert_eq!(obj("a: 0", false), r#"{"a":0}"#);
+        // The separator is `": "`, then `:`, then `=` — so a value may hold both.
+        assert_eq!(obj("a: v=1", false), r#"{"a":"v=1"}"#);
+        assert_eq!(obj("a=v:1", false), r#"{"a":"v:1"}"#);
+        // Whitespace anywhere keeps the value out of the query branch entirely.
+        assert_eq!(obj("a=1 &b=2", false), r#"{"a":"1 &b=2"}"#);
+        // Only the merge pair reads a dotted name as a path.
+        assert_eq!(obj("n.a: x", true), r#"{"n":{"a":"x"}}"#);
+        assert_eq!(obj("n.a: x", false), r#"{"n.a":"x"}"#);
+        // A line with no separator at all is a name with an empty value.
+        assert_eq!(obj("bare", false), r#"{"bare":""}"#);
+    }
+
+    /// A written matcher containing `=` is a query string, whitespace and all.
+    ///
+    /// `tryParseMatcher` runs ahead of `_parseJSON` and only for the rule's own
+    /// matcher (`!text`, `_original/lib/util/index.js:1165-1171`). So
+    /// `reqHeaders://x-a=${v}` with a two-line `v` keeps the newline in the
+    /// value and `setHeader` throws it away — measured: whistle sends no header
+    /// at all, and sends the *other* pair when the line has one.
+    #[test]
+    fn a_written_matcher_with_an_equals_is_a_query() {
+        let written = |t: &str| parse_data_object(t, false, false).unwrap().to_string();
+        assert_eq!(written("x-a=1"), r#"{"x-a":"1"}"#);
+        assert_eq!(written("x-a=line1\nline2"), "{\"x-a\":\"line1\\nline2\"}");
+        assert_eq!(written("x-a=1&x-b=2"), r#"{"x-a":"1","x-b":"2"}"#);
+        // No `=` at all is nothing — not the line format, which only loaded
+        // content reaches. `reqHeaders://bare` and a lone backtick both set no
+        // header in whistle, while the same words inside a `{value}` do.
+        assert_eq!(parse_data_object("x-a: 1", false, false), None);
+        assert_eq!(parse_data_object("bare", false, false), None);
+        // JSON is still read first, with or without an `=` inside it.
+        assert_eq!(written(r#"{"x-a":"v=1"}"#), r#"{"x-a":"v=1"}"#);
+        assert_eq!(written(r#"{"x-a":"1"}"#), r#"{"x-a":"1"}"#);
+        assert_eq!(parse_data_object("   ", false, true), None);
+    }
+
     /// `enable://x disable://x` is nothing, and the flags that opt out.
     ///
     /// Upstream's `isEnable` is `enable[name] && !disable[name]`
@@ -9024,7 +9263,7 @@ mod tests {
     /// one header where whistle sends two.
     #[test]
     fn a_repeated_header_name_sends_every_value() {
-        let pairs = parse_header_pairs("x-a=1&x-b=2&x-a=3");
+        let pairs = parse_header_pairs("x-a=1&x-b=2&x-a=3", false);
         assert_eq!(pairs.len(), 2, "two distinct names");
         let x_a = &pairs.iter().find(|(n, _)| n == "x-a").expect("x-a").1;
         assert_eq!(x_a.iter().cloned().collect::<Vec<_>>(), ["1", "3"]);
@@ -9045,7 +9284,7 @@ mod tests {
 
         // Names are still trimmed — deliberately unlike upstream, whose
         // `qs.parse` would leave `"x-t "`, a name hyper rejects outright.
-        let pairs = parse_header_pairs("x-t = spaced");
+        let pairs = parse_header_pairs("x-t = spaced", false);
         assert_eq!(pairs[0].0, "x-t");
         assert_eq!(pairs[0].1.iter().next().map(String::as_str), Some("spaced"));
     }

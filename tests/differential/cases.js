@@ -207,4 +207,26 @@ module.exports = [
   { name: 'doc: a line block joins its lines', rules: `line\`\nreqHeaders://x-hit=1\n${P}\n\`` },
 
   { name: 'values reference', rules: '```v\nfrom-a-value\n```\n' + `${P} reqHeaders://x-v={v}` },
+
+  // ── the three spellings of a data value ────────────────────────────────
+  //
+  // `_parseJSON` tries JSON, then a query string on a value with no whitespace,
+  // then the line format (`_original/lib/util/index.js:1135-1143`). The third
+  // was missing here — including for `resMerge://test=123`, the first example
+  // on that operator's own documentation page.
+  { name: 'resMerge in its query spelling', rules: `${P} resMerge://test=123` },
+  { name: 'resMerge in its json spelling', rules: `${P} resMerge://{"test":123}` },
+  { name: 'resMerge in its line spelling', rules: '```m\ntest: 123\n```\n' + `${P} resMerge://{m}` },
+  { name: 'resMerge line spelling with a dotted path', rules: '```m\nnest.a: x\nnest.b: y\n```\n' + `${P} resMerge://{m}` },
+  { name: 'reqHeaders in its line spelling', rules: '```h\nx-a: 1\nx-b: two\n```\n' + `${P} reqHeaders://{h}` },
+  { name: 'resHeaders in its line spelling', rules: '```h\nx-r: 1\nx-s: two\n```\n' + `${P} resHeaders://{h}` },
+  { name: 'urlParams in its line spelling', rules: '```u\ntest1: 1\ntest2: 2\n```\n' + `${P} urlParams://{u}` },
+  // A value carrying both separators, which used to reach the query branch and
+  // split at the `=`, giving a header named `x-a: v`.
+  { name: 'a line value that contains an equals sign', rules: '```h\nx-a: v=1\n```\n' + `${P} reqHeaders://{h}` },
+  { name: 'a query value that contains a colon', rules: `${P} reqHeaders://x-a=v:1` },
+  // Quoting, and the number coercion the line format applies and the query
+  // spelling does not.
+  { name: 'a quoted line value stays text', rules: '```h\nx-a: "1"\n```\n' + `${P} reqHeaders://{h}` },
+  { name: 'a line value with a leading zero stays text', rules: '```h\nx-a: 007\n```\n' + `${P} reqHeaders://{h}` },
 ];
