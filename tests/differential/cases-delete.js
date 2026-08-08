@@ -304,6 +304,19 @@ module.exports = [
 
   // ── resCookies ─────────────────────────────────────────────────────────
   { name: 'resCookies adds one', rules: `${P} resCookies://sid=abc` },
+  // The string spelling is not escaped: `getCookieItem` returns
+  // `name + '=' + cookie` untouched for anything that is not an object
+  // (`_original/lib/util/index.js:3093-3096`), so a `;` really does set an
+  // attribute — which is how the operator's own documentation writes one. This
+  // port escaped it, turning `k=v;path=/` into a value of `v%3Bpath=/` with no
+  // attribute at all. Only the *object* spelling's `value` runs `escapeValue`.
+  { name: 'resCookies with an attribute after a semicolon', rules: `${P} resCookies://k=v;path=/` },
+  { name: 'resCookies with two attributes', rules: `${P} resCookies://k=v;path=/;httponly` },
+  { name: 'resCookies with a semicolon inside a json string value', rules: `${P} resCookies://{"k":"v;path=/"}` },
+  { name: 'resCookies object spelling still renders its attributes', rules: `${P} resCookies://{"k":{"value":"v","path":"/"}}` },
+  // A space ends the token, so this sets nothing in either proxy — the pair
+  // that keeps the three above from being read as "a semicolon always works".
+  { name: 'resCookies with a space after the semicolon', rules: `${P} resCookies://k=v; path=/` },
   { name: 'resCookies two pairs', rules: `${P} resCookies://sid=abc&t=2` },
   { name: 'resCookies json', rules: `${P} resCookies://{"sid":"abc"}` },
   { name: 'resCookies with an attribute object', rules: `${P} resCookies://{"sid":{"value":"x","httpOnly":true,"maxAge":600}}` },

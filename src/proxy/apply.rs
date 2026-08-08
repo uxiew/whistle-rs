@@ -6595,7 +6595,14 @@ const EXPIRED_MAX_AGE: i64 = -123456;
 /// `Max-Age`, `Secure`, `HttpOnly`, `Partitioned`, `Path`, `Domain`, `SameSite`.
 fn cookie_item(name: &str, value: &CookieValue) -> String {
     let map = match value {
-        CookieValue::Plain(v) => return format!("{name}={}", escape_cookie(v, false)),
+        // **Not escaped.** `getCookieItem` returns `name + '=' + cookie` for
+        // anything that is not an object — `escapeValue` is reached only down
+        // the attribute path, on `cookie.value`. So the string spelling passes
+        // a `;` through and `resCookies://k=v;path=/` really does set a cookie
+        // with a path, which is how the operator's documentation writes it.
+        // This port escaped here too, turning that rule into the value
+        // `v%3Bpath=/` — a cookie with a nonsense value and no path at all.
+        CookieValue::Plain(v) => return format!("{name}={v}"),
         CookieValue::Attrs(map) => map,
         // A nested array. [`cookie_lines`] flattens one level, so this is the
         // second — upstream reaches `getCookieItem` with the array itself, where
@@ -12494,11 +12501,17 @@ mod tests {
             .collect();
         assert_eq!(vals, ["sid=new", "other=1", "theme=dark"]);
 
-        // A `;` in a value would end the cookie early, so it is encoded.
+        // A `;` in the **string** spelling goes out as written, because that is
+        // the whole point of writing one: `resCookies://a=x;Secure` is how the
+        // operator's documentation sets an attribute. `getCookieItem` returns
+        // `name + '=' + cookie` untouched for a non-object
+        // (`_original/lib/util/index.js:3093-3096`) — `escapeValue` is reached
+        // only down the attribute path. This asserted the opposite, and the
+        // encoded form is a cookie with a nonsense value and no attribute at all.
         let resolved = resolve("example.com resCookies://a=x;Secure\n", "http://example.com/");
         let mut headers = HeaderMap::new();
         apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
-        assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x%3BSecure");
+        assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x;Secure");
     }
 
     /// One `Set-Cookie`, rendered from `resCookies`, for a given JSON spec.
