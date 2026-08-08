@@ -221,8 +221,11 @@ function oneSecondApart(problem) {
   const [a, b] = [at(m[2]), at(m[3])];
   if (a === null || b === null) return false;
   // The rest of the two values has to match, or a real change is hiding behind
-  // a date that happens to be close.
-  const strip = (quoted) => quoted.replace(/[A-Za-z]{3},[^;"]+GMT/i, '<date>');
+  // a date that happens to be close. Global, because the harness joins several
+  // `set-cookie` values into one string and each carries its own `Expires` —
+  // stripping only the first left the second in and the comparison failed, which
+  // is a difference of one second reported as news.
+  const strip = (quoted) => quoted.replace(/[A-Za-z]{3},[^;"]+GMT/gi, '<date>');
   return strip(m[2]) === strip(m[3]) && Math.abs(a - b) <= 1000;
 }
 
