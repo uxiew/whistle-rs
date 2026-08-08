@@ -665,11 +665,21 @@ What comes back is **content, not rules**: nothing in it is scanned again, so a
 `${…}`, a `{…}` or a fence inside a mock body is the text the mock meant to
 contain.
 
-> **One divergence.** When a fenced block and a [values store](#flags-includes--values)
-> entry carry the same name, upstream uses the block — `getValueFor` asks the
-> inline map first and falls back to the store (`rules.js:785-796`). whistle-rs
-> uses the store, so that a `--value` given on the command line, or an edit in
-> the console, overrides what a rules file brought.
+> **Two divergences.**
+>
+> When a fenced block and a [values store](#flags-includes--values) entry carry
+> the same name, upstream uses the block — `getValueFor` asks the inline map
+> first and falls back to the store (`rules.js:785-796`). whistle-rs uses the
+> store, so that a `--value` given on the command line, or an edit in the
+> console, overrides what a rules file brought.
+>
+> And a block declared in one **rule group** is visible to the others here,
+> where upstream keeps it private to the group that declared it: it files the
+> name under `key + '\n\r' + <file>` (`getInlineKey`, `util/index.js:205-209`)
+> and never looks in another group's map. So upstream's `{v}` renders literally
+> in a second group and expands here, and a second group declaring the same name
+> shadows the first here and does not there. Measured, not aligned —
+> `tests/differential/cases-groups.js` carries the three cases.
 
 ### Destination
 

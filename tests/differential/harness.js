@@ -344,22 +344,129 @@ function startOrigin() {
   });
 }
 
-const post = (port, path, body, type) =>
+/** One request with a body to a proxy's own API; resolves to the answer text. */
+const send = (port, method, path, body, type) =>
   new Promise((res, rej) => {
     const req = http.request(
-      { port, path, method: 'POST', headers: { 'content-type': type, 'content-length': Buffer.byteLength(body) } },
+      { port, path, method, headers: { 'content-type': type, 'content-length': Buffer.byteLength(body) } },
       (r) => { let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => res(b)); },
     );
     req.on('error', rej);
     req.end(body);
   });
 
-/** Load one rules text into both proxies. */
-async function setRules(text) {
+const post = (port, path, body, type) => send(port, 'POST', path, body, type);
+
+const getText = (port, path) =>
+  new Promise((res, rej) => {
+    http.get({ port, path, headers: { 'accept-encoding': 'identity' } }, (r) => {
+      let b = ''; r.on('data', (c) => (b += c)); r.on('end', () => res(b));
+    }).on('error', rej);
+  });
+
+const FORM = 'application/x-www-form-urlencoded';
+
+/**
+ * Named rule groups the previous case installed, so the next one starts clean.
+ *
+ * Kept rather than re-read because a corpus that never says `groups` must not
+ * pay two round trips a case for a list that is always empty. It starts full,
+ * in effect: [`wipeNamedGroups`] runs once before the corpus and clears
+ * whatever an earlier run — or an earlier corpus against the same oracle — left
+ * behind. Both proxies persist their rule groups, so this is not theoretical.
+ */
+let installed = [];
+
+/** Did the previous case switch the Default group off? Then switch it back on. */
+let defaultOff = false;
+
+/** The Default group's name on each side: upstream spells it with a capital. */
+const rsName = (name) => (name === 'Default' ? 'default' : name);
+
+/**
+ * Remove every named rule group from both proxies, whoever put it there, and
+ * put the Default group's switch back on.
+ *
+ * Upstream's `remove` unselects the file as it deletes it
+ * (`removeRulesFile`, `_original/lib/rules/util.js:213-222`), so nothing has to
+ * be unselected first. The **Default** group is not a file and cannot be
+ * removed on either side; it is overwritten by every case instead.
+ */
+async function wipeNamedGroups() {
+  const list = JSON.parse(await getText(W, '/cgi-bin/rules/list')).list || [];
+  for (const file of list) {
+    await post(W, '/cgi-bin/rules/remove', 'name=' + encodeURIComponent(file.name), FORM);
+  }
+  const rsGroups = JSON.parse(await getText(RS, '/api/rule-groups'));
+  for (const g of rsGroups) {
+    if (g.name === 'default') continue;
+    await send(RS, 'DELETE', '/api/rule-group', JSON.stringify({ name: g.name }), 'application/json');
+  }
+  installed = [];
+  await setDefaultEnabled(true);
+}
+
+/**
+ * Switch the Default group on or off on both sides.
+ *
+ * Upstream **sets** the flag — `enable-default` and `disable-default` are two
+ * endpoints — while this port **toggles**, so the toggle is aimed at the state
+ * the group is actually in rather than at the state it is assumed to be in.
+ * Costs a read, and only a case that says `selected` on `Default` pays it.
+ */
+async function setDefaultEnabled(on) {
+  await post(W, on ? '/cgi-bin/rules/enable-default' : '/cgi-bin/rules/disable-default', '', FORM);
+  const now = JSON.parse(await getText(RS, '/api/rule-groups')).find((g) => g.name === 'default');
+  if (now && now.enabled !== on) {
+    await send(RS, 'POST', '/api/rule-group/toggle', '{"name":"default"}', 'application/json');
+  }
+  defaultOff = !on;
+}
+
+/**
+ * Load one case's rules into both proxies.
+ *
+ * A case says `rules` — one text, which is the **Default** group, and the two
+ * calls that form issues are the two it has always issued — and/or `groups`,
+ * a list of `{ name, value, selected? }` naming rule groups in console order.
+ * Both may appear: Default is a group like any other, except that it is the
+ * one both proxies resolve **last** (`_original/lib/rules/util.js:94-101`).
+ *
+ * `remove` deletes named groups again after they were installed, which is the
+ * only way to ask what a deletion mid-session does as opposed to what never
+ * adding the group does.
+ */
+async function setRules(c) {
+  if (installed.length || defaultOff) await wipeNamedGroups();
+  const text = c.rules || '';
   await post(W, '/cgi-bin/rules/add',
-    'name=Default&selected=1&value=' + encodeURIComponent(text),
-    'application/x-www-form-urlencoded');
+    'name=Default&selected=1&value=' + encodeURIComponent(text), FORM);
   await post(RS, '/api/rules', text, 'text/plain');
+  for (const g of c.groups || []) {
+    // Upstream keys the Default group off the literal name, and so does this:
+    // a case may name it in `groups` to put its text beside the others.
+    if (g.name === 'Default') {
+      await post(W, '/cgi-bin/rules/add',
+        'name=Default&selected=1&value=' + encodeURIComponent(g.value || ''), FORM);
+      await post(RS, '/api/rules', g.value || '', 'text/plain');
+      if (g.selected === false) await setDefaultEnabled(false);
+      continue;
+    }
+    const selected = g.selected !== false;
+    await post(W, '/cgi-bin/rules/add',
+      'name=' + encodeURIComponent(g.name) + (selected ? '&selected=1' : '')
+      + '&value=' + encodeURIComponent(g.value || ''), FORM);
+    await send(RS, 'POST', '/api/rule-groups',
+      JSON.stringify({ name: g.name, text: g.value || '', enabled: selected }),
+      'application/json');
+    installed.push(g.name);
+  }
+  for (const name of c.remove || []) {
+    await post(W, '/cgi-bin/rules/remove', 'name=' + encodeURIComponent(name), FORM);
+    await send(RS, 'DELETE', '/api/rule-group',
+      JSON.stringify({ name: rsName(name) }), 'application/json');
+    installed = installed.filter((n) => n !== name);
+  }
   await new Promise((r) => setTimeout(r, 120));
 }
 
@@ -474,11 +581,22 @@ async function main() {
   let ran = 0, differing = 0;
   const report = [];
 
+  // Upstream selects **one** rule file at a time unless `allowMultipleChoice`
+  // is on: `selectRulesFile` starts from an empty list when it is off
+  // (`_original/lib/rules/util.js:148-161`), so selecting the second group
+  // silently unselects the first. Pinned rather than assumed, because it is a
+  // persisted property and an earlier run may have left it either way. Inert
+  // for a corpus that only ever sets Default: nothing reads it but `select`.
+  await post(W, '/cgi-bin/rules/allow-multiple-choice', 'allowMultipleChoice=1', FORM);
+  // Both proxies persist their rule groups, so a corpus starts by clearing
+  // whatever the last one left in the same data directory.
+  await wipeNamedGroups();
+
   for (const c of CASES) {
     // Progress on stderr, so a long corpus says where it is without touching
     // the JSON report on stdout.
     process.stderr.write(`… ${c.name}\n`);
-    await setRules(c.rules);
+    await setRules(c);
     const req = c.request || {};
     const [w, rs] = [await through(W, req), await through(RS, req)];
     ran++;
@@ -502,7 +620,7 @@ async function main() {
     const news = problems.filter((p) => !EXPECTED.some((e) => e.match(p, c)));
     if (news.length) {
       differing++;
-      report.push({ name: c.name, rules: c.rules, problems: news });
+      report.push({ name: c.name, rules: c.rules, groups: c.groups, problems: news });
     }
   }
 

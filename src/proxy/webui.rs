@@ -950,6 +950,12 @@ async fn rule_group_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Res
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    // Said here rather than left to "group not found", which would be a lie:
+    // the default group is there, and is the one group that may not go. See
+    // [`crate::rules::RuleManager::remove_group`] for why.
+    if name == "default" {
+        return json_error("the default group cannot be removed; switch it off instead");
+    }
     let ok = {
         let mut mgr = state.rules.write().unwrap();
         let ok = mgr.remove_group(name);

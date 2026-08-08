@@ -606,6 +606,13 @@ curl --noproxy '*' http://127.0.0.1:8899/api/rule-groups
 Groups persist to `<storage_dir>/rules/` and come back on restart. A disabled
 group contributes nothing — not even the values its fenced blocks declare.
 
+`DELETE /api/rule-group` removes a named group. It **refuses `default`**, which
+is the group `GET`/`POST /api/rules` reads and writes and the one the console
+opens on; switching it off is `POST /api/rule-group/toggle` with that name, and
+the text stays where you can get it back. `POST /api/rule-groups` likewise
+refuses a name that is already taken (`400 group already exists`) — changing a
+group's text is `POST /api/rule-group/update`.
+
 **Named groups outrank the default one.** Every enabled named group is resolved
 first, in list order, and the default group last — whistle's own order, and the
 reason its console lists Default at the bottom. So a `staging` group is the place
