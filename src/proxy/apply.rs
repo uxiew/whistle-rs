@@ -800,7 +800,7 @@ async fn find_proxy(
 fn proxy_tunnel(resolved: &Resolved, proxy_proto: &str) -> bool {
     resolved.props(proxy_proto).has("proxyTunnel")
         || resolved.props("host").has("proxyTunnel")
-        || enabled_flags(resolved).contains("proxyTunnel")
+        || is_enabled(resolved, "proxyTunnel")
 }
 
 /// `?proxyHost` / `&proxyHosts` written into an upstream proxy's own URL —
@@ -837,7 +837,7 @@ fn proxy_survives_host(resolved: &Resolved, proxy_proto: &str, host_matched: boo
         let host_props = resolved.props("host");
         resolved.props(proxy_proto).has("proxyFirst")
             || host_props.has("proxyFirst")
-            || enabled_flags(resolved).contains("proxyFirst")
+            || is_enabled(resolved, "proxyFirst")
     }
 }
 
@@ -866,7 +866,7 @@ fn host_travels_with_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
         || url_flag
         || proxy_props.has("proxyHost")
         || host_props.has("proxyHost")
-        || enabled_flags(resolved).contains("proxyHost")
+        || is_enabled(resolved, "proxyHost")
 }
 
 /// Compute the upstream target, honouring `host://` (and `:port`) overrides.
@@ -1005,7 +1005,7 @@ fn origin_tls(request_tls: bool, proxy_proto: Option<&str>, resolved: &Resolved)
 fn internal_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
     resolved.props(proxy_proto).has("internalProxy")
         || resolved.props("host").has("internalProxy")
-        || enabled_flags(resolved).contains("internalProxy")
+        || is_enabled(resolved, "internalProxy")
 }
 
 /// Parse a `cipher://` value into an upstream TLS version constraint.
@@ -1113,6 +1113,31 @@ pub fn enabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> {
 /// `disable://` flags for a request.
 pub fn disabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> {
     flag_set(resolved, "disable")
+}
+
+/// `enable://<flag>` — cancelled by a `disable://<flag>` on the same request.
+///
+/// Upstream's `isEnable` is `req.enable[name] && !req.disable[name]`
+/// (`_original/lib/util/index.js:678-680`), and its mirror `isDisable` is the
+/// same expression the other way round. This port had only the mirror: every
+/// flag was read as `enabled_flags(…).contains(…)`, so `enable://keepCSP
+/// disable://keepCSP` kept the CSP here and stripped it upstream — and the same
+/// omission applied to all sixteen reads, not just that one.
+///
+/// The two together mean a name written on both sides does **nothing**, which
+/// is the only reading under which `enable`/`disable` compose predictably: the
+/// answer does not depend on which was written first, or on which of the two
+/// the code happens to consult.
+/// **Not every flag is read this way**, and the three exceptions are upstream's,
+/// found by checking each name's reader rather than assuming they share one:
+/// `showHost` is a bare `req._filters.showHost || enable.showHost`
+/// (`_original/lib/inspectors/res.js:1193`), `userLogin` goes through a bespoke
+/// helper where `enable` wins over `disable` (`util/index.js:3557-3562`), and
+/// `cors` has no `enable` reader upstream at all. Those three keep the direct
+/// read. A blanket conversion broke the second of them and an existing test
+/// caught it — the test had the real semantics pinned.
+fn is_enabled(resolved: &Resolved, flag: &str) -> bool {
+    enabled_flags(resolved).contains(flag) && !disabled_flags(resolved).contains(flag)
 }
 
 /// `disable://<flag>` — with the escape hatch upstream gives it: an
@@ -1567,7 +1592,7 @@ fn strip_last_segment(url: &str) -> &str {
 /// to mean anything, so on its own it does not outrank the file.
 /// `enable://weakRule` says the same request-wide.
 fn weak_rule_yields(resolved: &Resolved, file_proto: &str) -> bool {
-    if !resolved.props(file_proto).has("weakRule") && !enabled_flags(resolved).contains("weakRule") {
+    if !resolved.props(file_proto).has("weakRule") && !is_enabled(resolved, "weakRule") {
         return false;
     }
     if resolved.value("host").is_some() {
@@ -3480,12 +3505,12 @@ pub fn apply_response_for(
         parts.status.as_u16(),
         info.map_or("GET", |i| i.method.as_str()),
     ) {
-        if !enabled_flags(resolved).contains("keepCSP")
-            && !enabled_flags(resolved).contains("keepAllCSP")
+        if !is_enabled(resolved, "keepCSP")
+            && !is_enabled(resolved, "keepAllCSP")
         {
             disable_csp(&mut parts.headers);
         }
-        if !custom_cache(resolved) && !enabled_flags(resolved).contains("keepCache") {
+        if !custom_cache(resolved) && !is_enabled(resolved, "keepCache") {
             disable_res_store(&mut parts.headers);
         }
     }
@@ -4088,7 +4113,7 @@ fn parse_leading_int(value: &str) -> Option<i64> {
 /// caching as deliberate, which stops the injection pass from overriding it
 /// (`req._customCache`, `_original/lib/inspectors/res.js:878-881`).
 fn custom_cache(resolved: &Resolved) -> bool {
-    if enabled_flags(resolved).contains("keepAllCache") {
+    if is_enabled(resolved, "keepAllCache") {
         return true;
     }
     match resolved.value("cache").map(str::trim) {
@@ -4347,7 +4372,7 @@ fn writer_file(file: &str, status: u16) -> String {
 /// (`_original/lib/inspectors/req.js:601`) and the response side
 /// (`res.js:1304`), despite the name.
 pub fn forces_write(resolved: &Resolved) -> bool {
-    enabled_flags(resolved).contains("forceReqWrite")
+    is_enabled(resolved, "forceReqWrite")
         && !disabled_flags(resolved).contains("forceReqWrite")
 }
 
@@ -4374,7 +4399,7 @@ pub fn req_body_limit(resolved: &Resolved) -> usize {
     // `params` is where `reqMerge://` lands here, as `reqRules.params` is where
     // it lands upstream (`req.js:461`).
     let on = resolved.props("params").has("enableBigData")
-        || (enabled_flags(resolved).contains("reqMergeBigData")
+        || (is_enabled(resolved, "reqMergeBigData")
             && !disabled_flags(resolved).contains("reqMergeBigData"));
     match on {
         true => BIG,
@@ -8250,6 +8275,42 @@ mod tests {
         assert_eq!(res_speed_kbps(&of("a.com resSpeed://0kb\n")), None);
         // A positive rate is still a rate.
         assert_eq!(res_speed_kbps(&of("a.com resSpeed://0.5\n")), Some(0.5));
+    }
+
+    /// `enable://x disable://x` is nothing, and the flags that opt out.
+    ///
+    /// Upstream's `isEnable` is `enable[name] && !disable[name]`
+    /// (`_original/lib/util/index.js:678-680`); this port read every flag as
+    /// bare set membership, so a name written on both sides was *enabled* here
+    /// and inert there. Measured on `cases-flags.js`, where
+    /// `enable://keepCSP disable://keepCSP` kept the CSP here and stripped it
+    /// upstream.
+    #[test]
+    fn a_flag_written_on_both_sides_does_nothing() {
+        let of = |text: &str| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            mgr.resolve(&info)
+        };
+        assert!(is_enabled(&of("a.com enable://keepCSP\n"), "keepCSP"));
+        assert!(!is_enabled(
+            &of("a.com enable://keepCSP disable://keepCSP\n"),
+            "keepCSP"
+        ));
+        // Order does not decide it, which is the point of reading both sides.
+        assert!(!is_enabled(
+            &of("a.com disable://keepCSP enable://keepCSP\n"),
+            "keepCSP"
+        ));
+        assert!(!is_disabled(
+            &of("a.com enable://keepCSP disable://keepCSP\n"),
+            "keepCSP"
+        ));
+        // `userLogin` is one of the three that keep the direct read, because
+        // upstream lets `enable` win there. This guards the revert.
+        let both = of("a.com replaceStatus://401 disable://userLogin enable://userLogin\n");
+        assert!(user_login_allowed(&both, "replaceStatus"));
     }
 
     /// `x-forwarded-for` — the header a client must not be able to dictate.

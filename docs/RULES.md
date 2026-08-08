@@ -1826,6 +1826,32 @@ then cut the client off" without changing what the origin sees.
 > Upstream also arms these from a `filter://abort` line; in whistle-rs `filter://`
 > is only a match condition, so `enable://` is the whole vocabulary here.
 
+#### A flag written on both sides does nothing
+
+`enable://x disable://x` cancels: upstream reads a flag as `enable[name] &&
+!disable[name]` (`isEnable`, `_original/lib/util/index.js:678-680`), and reads
+the opposite question the mirror way. The order the two were written in does not
+decide it. This port had only the mirror until it was measured, so a flag named
+on both sides used to be *on* here and inert upstream.
+
+Three names opt out, and the exceptions are upstream's rather than a
+simplification: **`userLogin`** lets `enable` win over `disable`
+(`util/index.js:3557-3562`), **`showHost`** is a bare read that never consults
+`disable` (`res.js:1193`), and **`cors`** has no `enable` reader upstream at all.
+
+#### Two flag divergences, measured
+
+* **`enable://responseWithMatchedRules` is not implemented here.** whistle
+  writes the matched rule lines into `x-whistle-matched-rules` on the response
+  (`addMatchedRules`, `util/index.js:3879-3888`); this port writes nothing. Its
+  request-side twin `requestWithMatchedRules` is dead in **both**: upstream
+  calls it from the response inspector (`res.js:770`), after the request head
+  has already gone, so the origin never sees the header.
+* **`disable://trailers` still announces the trailer upstream.** Asked with
+  `TE: trailers`, whistle emits `Trailer: x-t` and then sends no trailer section
+  at all; whistle-rs drops the announcement along with the section. Announcing a
+  field that never arrives is a protocol lie, and not one worth reproducing.
+
 #### Aborting a connection rather than a request
 
 A `CONNECT` tunnel and an inbound SOCKS connection have no response of their own
