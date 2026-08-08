@@ -1686,6 +1686,27 @@ script error leaves the response unchanged.
 example.com   resScript:///abs/path/patch.js
 ```
 
+**A script may instead *produce rules*.** This is upstream's original meaning
+for the family and it is now implemented: when the script's text is bracketed,
+carries no `#` comment or ``` `` ``` fence, and names `rules` or `values`
+(`isRulesContent`, `_original/lib/rules/index.js:41-43`), it runs with those two
+as globals and whatever it pushes into `rules` is parsed as more rules. A
+request-phase script sees `url`, `method`, `headers`, `body`, `ip` and
+`clientPort`; a `resScript` also sees `statusCode`, `serverIp` and `resHeaders`.
+A script that throws contributes nothing, not even lines pushed before it threw.
+
+```
+example.com   reqScript://(rules.push(url + ' reqHeaders://x-seen=1'))
+```
+
+Two narrow divergences, both measured: a `values` object the script writes does
+**not** resolve `{name}` references in the rules it pushed (upstream sends the
+literal `{name}` too), and the context omits `Buffer`, `decodeBuffer`,
+`encodeString`, `encodingExists`, `tpl`/`render` and `isLocalAddress` — a script
+calling one of those throws here and produces nothing, where upstream would run
+it. `pattern` is `''` because a resolved operator does not carry the pattern
+that matched it in this port.
+
 `frameScript` runs on each WebSocket text frame with
 `ctx = { direction: 'send'|'receive', frame: { data } }`; assign `ctx.frame.data`
 to rewrite the frame:
@@ -2879,12 +2900,6 @@ Known gaps in the operator layer, deliberately left:
   socket exists, so a source written before that is fetched with the variable
   still in it — and says so in the log rather than fetching port 0. In practice
   this is unreachable: the first fetch happens after the bind.
-- **`resRules://` entries of a `resScript` list are not applied.** Upstream folds
-  them into a rules text the response phase parses; whistle-rs's `resScript` is a
-  JavaScript hook that mutates the response directly, so it has nowhere to put
-  them. They are *skipped* rather than run as JavaScript — the script whistle-rs
-  executes is the first entry not spelled `resRules://`, which is the one
-  upstream executes too.
 - **A response with no declared charset is not sniffed.** When a `charset=` is
   present the response operators honour it — the body is decoded before the text
   transforms and re-encoded after, and injected values are written in that

@@ -588,6 +588,26 @@ pub fn merge_included_rules(
             true => Some(op.value.clone()),
             false => std::fs::read_to_string(&op.value).ok(),
         })
+        // A text that is JavaScript rather than rules is executed, and what it
+        // pushed into `rules` takes its place in the list — upstream's
+        // `handleDynamicRules` (`_original/lib/rules/index.js:459-476`), with
+        // `isRulesContent` deciding which is which. A script that errors
+        // contributes nothing, not even the lines it pushed before throwing.
+        .filter_map(|text| match crate::proxy::script::is_rules_content(&text) {
+            true => Some(text),
+            false => crate::proxy::script::run_rules_script(
+                &text,
+                &crate::proxy::script::RulesScriptCtx {
+                    method: &info.method,
+                    full_url: &info.full_url,
+                    headers: &info.headers,
+                    body: info.req_body.as_deref().unwrap_or(""),
+                    client_ip: info.client_ip.as_deref(),
+                    client_port: info.client_port,
+                    res: None,
+                },
+            ),
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if !joined.trim().is_empty() {
@@ -623,7 +643,15 @@ pub fn rules_file_ops(resolved: &Resolved) -> Vec<&RuleOp> {
 pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
     accumulated_script_ops(resolved, "resScript", "resRules")
         .into_iter()
-        .find(|op| raw_protocol(op) != Some("resRules"))
+        .filter(|op| raw_protocol(op) != Some("resRules"))
+        // A script that names `rules`/`values` is upstream's rules *producer*
+        // and is executed by [`merge_res_rules`]; the response hook — this
+        // port's own reading of `resScript` — keeps everything else. The two
+        // populations are disjoint under upstream's own classifier, because a
+        // hook script mutates `ctx.res.…` and never says either word.
+        .find(|op| {
+            !op.value_is_content || crate::proxy::script::is_rules_content(&op.value)
+        })
 }
 
 /// `resRules://` — a rules text that applies to the **response**, merged once
@@ -644,10 +672,36 @@ pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
 pub fn merge_res_rules(resolved: &mut Resolved, info: &ReqInfo, is_internal_req: bool) -> bool {
     let texts = accumulated_script_ops(resolved, "resScript", "resRules")
         .into_iter()
-        .filter(|op| raw_protocol(op) == Some("resRules"))
-        .filter_map(|op| match op.value_is_content {
-            true => Some(op.value.clone()),
-            false => std::fs::read_to_string(&op.value).ok(),
+        .filter_map(|op| {
+            let text = match op.value_is_content {
+                true => Some(op.value.clone()),
+                false => std::fs::read_to_string(&op.value).ok(),
+            }?;
+            // Upstream keeps both spellings in one list and asks the *text*
+            // which it is: script-shaped and it runs, with the response head in
+            // its context; rules-shaped and it is rules — but only when spelled
+            // `resRules://`, because a rules-shaped `resScript://` is this
+            // port's response hook and is consumed by `res_script_op` instead.
+            if !crate::proxy::script::is_rules_content(&text) {
+                let res = info.res.as_ref().map(|r| crate::proxy::script::RulesScriptRes {
+                    status: r.status,
+                    server_ip: r.server_ip.as_deref(),
+                    headers: &r.headers,
+                });
+                return crate::proxy::script::run_rules_script(
+                    &text,
+                    &crate::proxy::script::RulesScriptCtx {
+                        method: &info.method,
+                        full_url: &info.full_url,
+                        headers: &info.headers,
+                        body: "",
+                        client_ip: info.client_ip.as_deref(),
+                        client_port: info.client_port,
+                        res,
+                    },
+                );
+            }
+            (raw_protocol(op) == Some("resRules")).then_some(text)
         })
         .collect::<Vec<_>>();
     let mut merged = false;

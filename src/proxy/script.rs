@@ -115,6 +115,207 @@ pub fn run_res_script(
     })
 }
 
+/// Is this text a rules *text*, as opposed to JavaScript that produces one?
+///
+/// Upstream's `isRulesContent` (`_original/lib/rules/index.js:41-43`), term for
+/// term: rules text when it contains no `(` or `[` anywhere, **or** starts with
+/// a `#` comment, **or** any line starts with a ``` `` ``` fence, **or** never
+/// says the word `rules` or `values`. Only a bracketed, unfenced, uncommented
+/// text that names one of the two context arrays is executed.
+///
+/// The test is deliberately loose in upstream and reproduced loosely here: a
+/// rules file that happens to write `values` inside a `(...)` payload would be
+/// executed there too, and the honest move is to be wrong in the same place.
+pub fn is_rules_content(text: &str) -> bool {
+    let bracketed = text.contains('(') || text.contains('[');
+    if !bracketed {
+        return true;
+    }
+    if text.trim_start().starts_with('#') {
+        return true;
+    }
+    if text.lines().any(|l| l.trim_start().starts_with("``")) {
+        return true;
+    }
+    !has_script_word(text)
+}
+
+/// `/\b(?:rules|values)\b/` without pulling in a regex: the word with no
+/// `[A-Za-z0-9_]` on either side.
+fn has_script_word(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for word in ["rules", "values"] {
+        let mut from = 0;
+        while let Some(i) = text[from..].find(word) {
+            let at = from + i;
+            let before_ok = at == 0 || !word_byte(bytes[at - 1]);
+            let end = at + word.len();
+            let after_ok = end >= bytes.len() || !word_byte(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = at + 1;
+        }
+    }
+    false
+}
+
+/// What a rules-producing script gets to look at — upstream's
+/// `getScriptContext` (`_original/lib/rules/index.js:349-416`), the parts this
+/// port can honestly fill.
+pub struct RulesScriptCtx<'a> {
+    pub method: &'a str,
+    pub full_url: &'a str,
+    pub headers: &'a [(String, String)],
+    pub body: &'a str,
+    pub client_ip: Option<&'a str>,
+    pub client_port: Option<u16>,
+    /// `None` in the request pass; the response head once there is one.
+    pub res: Option<RulesScriptRes<'a>>,
+}
+
+/// The response third of the context, present only in the `resScript` pass.
+pub struct RulesScriptRes<'a> {
+    pub status: u16,
+    pub server_ip: Option<&'a str>,
+    pub headers: &'a [(String, String)],
+}
+
+/// Run a rules-producing script and return the rules text it pushed.
+///
+/// Upstream evaluates the source in a vm context holding `rules = []` and reads
+/// the array back joined with `\n` (`execRulesScript`,
+/// `_original/lib/rules/index.js:434-446`). Two behaviours are load-bearing and
+/// were measured before this was written, not assumed:
+///
+/// * **an error discards everything** — a script that pushes a rule and then
+///   throws produces no rules at all, because `execScriptSync` returns
+///   `undefined` from its catch and the caller turns that into `''`;
+/// * **`values` set by the script do not resolve `{name}` references in the
+///   rules it pushed** — whistle sends the literal `{name}` through. The
+///   `values` global exists here so a script writing to it does not throw, and
+///   is then ignored, which is the measured behaviour.
+///
+/// Omitted from the context, and what that costs: `Buffer`, `decodeBuffer`,
+/// `encodeString`, `encodingExists`, `tpl`/`render`, and `isLocalAddress`. A
+/// script calling one of those throws a `ReferenceError` here and produces
+/// nothing, where upstream would have run it — a real, narrow divergence,
+/// declared in `docs/RULES.md`. `pattern` is `''` because a resolved operator
+/// does not carry the pattern that matched it in this port.
+pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String> {
+    let mut ctx = Context::default();
+
+    let headers: serde_json::Map<String, serde_json::Value> = input
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    // Request side gets empty *strings* for the response fields, exactly as
+    // upstream writes them (`rules/index.js:406-414`) — a script comparing
+    // `statusCode == 200` in the request pass must see `'' == 200`, false.
+    let (status, server_ip, res_headers) = match &input.res {
+        Some(res) => (
+            json!(res.status),
+            json!(res.server_ip.unwrap_or("127.0.0.1")),
+            json!(
+                res.headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect::<serde_json::Map<_, _>>()
+            ),
+        ),
+        None => (json!(""), json!(""), json!("")),
+    };
+    let ip = input.client_ip.unwrap_or("127.0.0.1");
+    let globals = json!({
+        "url": input.full_url,
+        "fullUrl": input.full_url,
+        "method": if input.method.is_empty() { "GET" } else { input.method },
+        "httpVersion": "1.1",
+        "headers": headers,
+        "reqHeaders": headers,
+        "body": input.body,
+        "ip": ip,
+        "clientIp": ip,
+        "clientPort": input.client_port.unwrap_or(0),
+        "pattern": "",
+        "version": crate::config::VERSION,
+        "port": 0,
+        "uiPort": 0,
+        "uiHost": "local.wproxy.org",
+        "value": "",
+        "reqScriptData": {},
+        "statusCode": status,
+        "serverIp": server_ip,
+        "resHeaders": res_headers,
+        "rules": [],
+        "values": {},
+    });
+    let obj = JsValue::from_json(&globals, &mut ctx).ok()?;
+    let obj = obj.as_object()?.clone();
+    for key in obj.own_property_keys(&mut ctx).ok()? {
+        let val = obj.get(key.clone(), &mut ctx).ok()?;
+        ctx.global_object().set(key, val, false, &mut ctx).ok()?;
+    }
+    // The helpers a script may call, as JavaScript rather than native hooks:
+    // `getValue` answers from the values map the caller passed in via `values`
+    // upstream — this port resolves `{name}` references before the operator is
+    // read, so the map a script could usefully ask for is already folded into
+    // the source text; an unknown key answers `undefined` in both.
+    const PRELUDE: &str = r#"
+        var console = { log: function(){}, info: function(){}, warn: function(){},
+                        error: function(){}, debug: function(){}, fatal: function(){} };
+        function getValue() { return undefined; }
+        function parseQuery(s) {
+            var out = {};
+            String(s == null ? '' : s).replace(/^[?#]/, '').split('&').forEach(function (kv) {
+                if (!kv) return;
+                var i = kv.indexOf('=');
+                var k = i === -1 ? kv : kv.substring(0, i);
+                var v = i === -1 ? '' : kv.substring(i + 1);
+                try { k = decodeURIComponent(k); } catch (e) {}
+                try { v = decodeURIComponent(v); } catch (e) {}
+                out[k] = v;
+            });
+            return out;
+        }
+        function parseUrl(u) {
+            u = String(u == null ? '' : u);
+            var m = /^([a-z][\w.+-]*:)\/\/([^/?#]*)([^?#]*)(\??[^#]*)/i.exec(u) || [];
+            var host = m[2] || '';
+            var at = host.lastIndexOf(':');
+            var hostname = at === -1 ? host : host.substring(0, at);
+            var port = at === -1 ? null : host.substring(at + 1);
+            var search = m[4] || '';
+            return { protocol: (m[1] || '').toLowerCase(), host: host,
+                     hostname: hostname, port: port, path: (m[3] || '') + search,
+                     pathname: m[3] || '', search: search,
+                     query: search.replace(/^\?/, ''), href: u, hash: '' };
+        }
+        var render = function (s) { return s; };
+        var tpl = render;
+    "#;
+    ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).ok()?;
+
+    if let Err(err) = ctx.eval(Source::from_bytes(src.as_bytes())) {
+        tracing::debug!("rules script error: {err}");
+        return None;
+    }
+
+    let rules = ctx.global_object().get(js_string!("rules"), &mut ctx).ok()?;
+    let rules = rules.to_json(&mut ctx).ok()??;
+    let lines: Vec<String> = rules
+        .as_array()?
+        .iter()
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+    Some(lines.join("\n").trim().to_string())
+}
+
 /// Run a `frameScript` against one WebSocket text frame, returning the
 /// (possibly rewritten) payload. `direction` is `"send"` or `"receive"`.
 pub fn run_frame_script(src: &str, direction: &str, data: &str) -> Option<String> {

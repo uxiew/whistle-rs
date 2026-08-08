@@ -112,6 +112,17 @@ module.exports = [
   { name: 'the second rulesFile line is dropped', rules: `${P} rulesFile://${REQ_FILE}\n${P} rulesFile://${REQ_FILE_B}` },
   { name: 'a reqRules line survives next to a rulesFile one', rules: `${P} rulesFile://${REQ_FILE}\n${P} reqRules://${REQ_FILE_B}` },
 
+  // ── reqScript/resScript that hold JavaScript, not rules ─────────────────
+  //
+  // `isRulesContent` (`_original/lib/rules/index.js:41-43`) splits the family:
+  // a bracketed, unfenced, uncommented text that names `rules` or `values` is
+  // executed, and the array it pushes becomes the rules. This port used to run
+  // none of them.
+  { name: 'a reqScript pushes a rule', rules: `${P} reqScript://{s}` + V('s', `rules.push('${P} reqHeaders://x-s=1')`) },
+  { name: 'a resScript reads the status', rules: `${P} resScript://{s}` + V('s', `if (statusCode == 200) rules.push('${P} resHeaders://x-rs=ok')`) },
+  { name: 'a script that throws contributes nothing', rules: `${P} reqScript://{s}` + V('s', `rules.push('${P} reqHeaders://x-t=1'); throw new Error('x')`) },
+  { name: 'a script reading the request url', rules: `${P} reqScript://{s}` + V('s', `if (url.indexOf('q=1') !== -1) rules.push('${P} reqHeaders://x-u=1')`), request: { path: '/echo?q=1' } },
+
   // Depth: what a produced text produces is **not** followed. `resolveRulesFile`
   // parses the included text once and merges it; the merged set is never asked
   // for a `rulesFile` of its own.
