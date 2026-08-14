@@ -186,6 +186,21 @@ function assertVocabulary() {
   claim('filter://ua', 'filter');
   claim('host://1.1.1.1 includeFilter://m:GET', 'host');
 
+  // The two buckets this bench ignores because upstream resolves them
+  // elsewhere — checked by asking, not by trusting the comment: `pipe` is
+  // parsed into a list of its own and then skipped by `resolveRules`
+  // (`rules.js:2244`), and `sniCallback` never reaches `_rules` at all.
+  const req = makeReq('http://a.com/x');
+  const resolvedPipe = (() => {
+    const rules = new Rules({});
+    rules.parse('a.com pipe://name sniCallback://cert');
+    return rules.resolveRules(req);
+  })();
+  if (resolvedPipe.pipe) wrong.push('pipe is resolved by resolveRules after all');
+  if (resolvedPipe.sniCallback) {
+    wrong.push('sniCallback is resolved by resolveRules after all');
+  }
+
   if (wrong.length) {
     console.error('the bench\'s vocabulary disagrees with whistle:');
     for (const line of wrong) console.error(`  ${line}`);
