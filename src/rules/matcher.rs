@@ -810,6 +810,9 @@ fn collect_skips(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) -> PreWa
 /// * `(inline)` — the value *is* the content, not a location to extend;
 /// * `<verbatim>` — the documented way to say "this exact path, no matter what
 ///   the request asked for" (`docs/docs/rules/file.md`, "禁用路径拼接");
+/// * **JSON** — `{"a":1}`, `[1,2]`, `{}`: `getValue` hands it back as
+///   `rule.value`, so it is a mock body and a path appended to it is nonsense
+///   (see [`crate::rules::url::is_json_value`]);
 /// * `{key}` — a values-store reference, whose content is substituted whole
 ///   ([`crate::proxy::apply::substitute_values`]). Upstream skips the join only
 ///   when the key *resolves*; here the shape decides, so a `{key}` naming
@@ -826,6 +829,7 @@ fn joins_tail(op: &RuleOp) -> bool {
         && !op.value_is_content
         && super::url::fixed_value(&op.value).is_none()
         && !super::url::is_values_key(&op.value)
+        && !super::url::is_json_value(&op.value)
 }
 
 /// Join `tail` onto a value, once per `|`-separated path when it lists several.
@@ -1291,6 +1295,34 @@ mod tests {
         assert!(matched(re, "http://case.test/x"));
         assert!(!matched(re, "http://CASE.TEST/x"));
         assert!(matched(r"/^http:\/\/case\.test/i host://1.1.1.1", "http://CASE.TEST/x"));
+    }
+
+    /// A JSON value is a mock body, so nothing is appended to it.
+    ///
+    /// `getValue` hands any `isJson` value back as `rule.value`
+    /// (`_original/lib/rules/rules.js:277-285`), and a value is a location or it
+    /// is content — never both. Measured through whistle's resolver:
+    /// `example.com file://{}` on `/a` resolves to `{}` there and to `{}/a`
+    /// here, which is a path nobody wrote.
+    #[test]
+    fn a_json_value_takes_no_path() {
+        let value = |rules: &str| {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(rules);
+            m.resolve(&req("http://a.com/x")).slot().map(|op| op.value.clone())
+        };
+        for json in ["{}", "{\"a\":1}", "[1,2]", "[]"] {
+            assert_eq!(value(&format!("a.com file://{json}\n")).as_deref(), Some(json), "{json}");
+        }
+        // Neither of these is JSON — one has no colon, the other does not parse
+        // — but both are `{…}`, which this port reads as a values reference and
+        // therefore also leaves alone. Upstream extends the literal instead;
+        // that half is the declared divergence `joins_tail` already names.
+        assert_eq!(value("a.com file://{notjson}\n").as_deref(), Some("{notjson}"));
+        assert_eq!(value("a.com file://{a:1}\n").as_deref(), Some("{a:1}"));
+        // A path is still a path.
+        assert_eq!(value("a.com file:///srv/d\n").as_deref(), Some("/srv/d/x"));
+        assert_eq!(value("a.com file://[not-json\n").as_deref(), Some("[not-json/x"));
     }
 
     #[test]

@@ -235,6 +235,30 @@ pub fn is_values_key(value: &str) -> bool {
     rest.len() > 2 && rest.starts_with('{') && rest.ends_with('}')
 }
 
+/// Is this value **JSON**, and therefore content rather than a location?
+///
+/// whistle's `isJson` (`_original/lib/util/common.js:1681-1695`): `{}`, or a
+/// `{…}` with a colon in it, or a `[…]` — and then it has to parse. `getValue`
+/// asks it of every operator's value and hands the text back as `rule.value`
+/// when it says yes (`rules.js:277-285`), which is what keeps a mock body from
+/// being read as a path — and keeps the request's leftover path from being
+/// appended to it.
+///
+/// **Upstream caches the answer per line**, in `rule.lineProps`, so the first
+/// operator of a line to ask decides for the rest of it — `file:///srv/x.json
+/// resBody://{"a":1}` leaves the JSON *not* content. That correlation is not
+/// reproduced: it is a cache, not a rule, and this port already declares the
+/// wider divergence it feeds (`docs/RULES.md`, a bare value stays literal).
+pub fn is_json_value(value: &str) -> bool {
+    let value = value.trim();
+    if value == "{}" {
+        return true;
+    }
+    let shaped = (value.starts_with('{') && value.ends_with('}') && value.contains(':'))
+        || (value.starts_with('[') && value.ends_with(']'));
+    shaped && serde_json::from_str::<serde_json::Value>(value).is_ok()
+}
+
 /// `WEB_PROTOCOL_RE` (`_original/lib/rules/rules.js:22`) — the schemes a request
 /// can actually have, which is what makes a joined value a *URL* rather than a
 /// path.
