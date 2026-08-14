@@ -114,6 +114,10 @@ module.exports = [
   { name: 'pipe with every candidate missing', rules: `${A} file://${F('nope1')}|${F('nope2')}` },
   { name: 'a rejected .. candidate does not stop the rest', rules: `${A} file://${DIR}/../../escape|${F('plain.txt')}` },
   { name: 'xsfile does not split on pipe', rules: `${A} xsfile://${F('nope.txt')}|${F('plain.txt')}` },
+  // The other half of that pair, and the only case in the corpora that proves
+  // `xsfile://` does anything at all: the one above is inert by design, since an
+  // unsplit path that does not exist falls through to the origin.
+  { name: 'xsfile serves the file when present', rules: `${A} xsfile://${F('plain.txt')}` },
 
   // ── directories and index files ────────────────────────────────────────
   { name: 'trailing slash serves index.html', rules: `${A} file://${F('site')}/` },
