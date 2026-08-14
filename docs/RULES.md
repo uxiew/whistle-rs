@@ -1931,6 +1931,26 @@ connection — see
 A flag this port does not recognise is **inert** — it parses and does nothing,
 rather than failing the rule.
 
+#### The flags this port does not implement
+
+The official [`enable`](https://wproxy.org/docs/rules/enable.html) and
+[`disable`](https://wproxy.org/docs/rules/disable.html) pages list 55 and 65
+entries between them (a couple name two spellings of one flag). Every name was
+looked up in this port's source; these are the ones that appear nowhere, each
+with the reason. They parse and do nothing.
+
+| Flag | What it does upstream | Why not here |
+|---|---|---|
+| `interceptConsole`, `hideComposer`, `hideCaptureError`, `customParser`, `bigData` | shape what whistle's own console shows — the Log panel, which rows are hidden, who renders a capture, and a 2 MB → 16 MB display cap | this port has its own console; the capture cap is `--body-preview-limit` |
+| `clientId`, `multiClient`, `keepClientId` | whistle's `x-whistle-client-id` — a header it stamps so an upstream can tell clients apart | there is no client-id concept here, and inventing one to honour a flag is the wrong way round |
+| `useLocalHost`, `useSafePort` | rewrite `log://` and `weinre://` URLs to whistle's own built-in host and port | those two rules point at whistle's own servers, which this port does not run |
+| `authCapture`, `tunnelHeadersFirst`, `tunnelAuthHeader` | order a plugin's `auth` hook against the HTTPS upgrade, and decide whose headers win when a plugin passed some through a tunnel | all three are about whistle's plugin API; this port's is its own — see [`PLUGINS.md`](PLUGINS.md) |
+| `flushHeaders`, `secureOptions`, `keepH2Session`, `httpH2` | Node and HTTP/2 plumbing — `response.flushHeaders()`, the h2 `options`, session reuse, and h2 to the **origin** | this port speaks HTTP/2 to clients and HTTP/1.1 upstream, and has no Node to flush |
+| `dnsCache` | turn whistle's DNS cache off | there is no DNS cache here to turn off, so the flag's effect is already the default |
+| `clientCert`, `requestCert` | make the forged server ask the **client** for a certificate (mTLS) | not implemented. A client configured for mutual TLS fails against this port where it works against whistle; the missing half is a client-certificate store, not the flag |
+| `auto2http` | retry a `wss://` origin in **cleartext** after a TLS error, on by default when the address is local or a `host://` rule is in play | **declined, not missing.** Silently downgrading an encrypted upstream connection is the same class of thing as not verifying its certificate, and this port already refuses that one — see `--insecure-upstream` |
+| `forceResWrite` | nothing: only `forceReqWrite` is ever read, on **both** sides (`_original/lib/inspectors/req.js:604`, `res.js:1300`) | the flag exists in the documentation and not in the program |
+
 > **A response-body operator busts the request cache on its own.** Any of
 > `resBody`, `resPrepend`, `resAppend`, `resReplace`, `resMerge`, the
 > `html`/`js`/`css` variants, `attachment`, `resWrite` or `resWriteRaw` implies
@@ -3014,6 +3034,22 @@ Known gaps in the operator layer, deliberately left:
 - **A request body's charset is not undone.** whistle wraps `reqReplace://` in the
   same decode/encode pair it uses for responses; whistle-rs works on the bytes, so
   the operator is a no-op on a non-UTF-8 request body.
+- **An HTTP/2 request's `:authority` is forwarded as written.** Translating h2 to
+  HTTP/1.1 upstream, this port sends the `Host` the client asked for; whistle
+  sends the authority the tunnel was opened to instead, so a client that opens
+  `CONNECT host:80` and then asks for `:authority: host` sees `host` here and
+  `host:80` there. Both name the same server, and a rule matching on `Host` is
+  unaffected — patterns are matched against the request URL, which carries the
+  port either way.
+- **A body-less request with a body-permitting method is framed differently.**
+  When a client sends `POST` (or any method that may carry a body) with no
+  `Content-Length` and no `Transfer-Encoding` at all, whistle forwards
+  `content-length: 0` and whistle-rs forwards neither header. Both spell "no
+  body" and every origin reads them the same way; the difference is Node's HTTP
+  client against hyper's, not a rule. It is invisible on the ordinary proxy path,
+  where the client's own library has already chosen a framing — it shows only
+  inside a `CONNECT` tunnel carrying cleartext, where the bytes are whatever the
+  client wrote.
 - **A response trailer section only reaches clients that asked for one.** The
   origin's trailers and `trailers://` are both sent only when the client's request
   carried `TE: trailers` — hyper's HTTP/1 server drops the trailer section
@@ -3058,6 +3094,8 @@ arrived from those pages would otherwise think whistle-rs had the bug.
 | `ws://` / `wss://` / `tunnel://` "返回 502" for a plain HTTP request | it does, and the page is right — but only when the line is *read* as a destination. `127.0.0.1:8080 ws://host/x` is not: a bare host is no pattern to `indexOfPattern`, the `ws://` URL is, and the line swaps into "pattern `ws://host/x`, operator `host://127.0.0.1:8080`" (`_original/lib/rules/rules.js:1449-1467,:1774-1789`), which a plain request never matches | `cases.js`, the two "swaps into pattern and host" cases |
 | `delete://pathname` "删除请求路径（不包含请求参数）" | it deletes the path and then **doubles the query** | already recorded under [Deleting](#deleting) |
 | [`socks`](https://wproxy.org/docs/rules/socks.html) gives the default port as **443** | `1080`, from the one line that assigns all three — `isSocks ? 1080 : isHttpsProxy ? 443 : 80` (`_original/lib/inspectors/res.js:284`). The 443 looks copied from the `https-proxy` page | whistle-rs uses 1080; `src/proxy/upstream.rs` |
+| [`enable`](https://wproxy.org/docs/rules/enable.html) lists `forceResWrite` beside `forceReqWrite`, one per side | there is no `forceResWrite` in the program. `forceReqWrite` is read on **both** sides — the response dump obeys the request-shaped name (`_original/lib/inspectors/req.js:604`, `res.js:1300`) | the flag table under [Flags](#the-flags-this-port-does-not-implement) |
+| [`socks`](https://wproxy.org/docs/rules/socks.html), [`https-proxy`](https://wproxy.org/docs/rules/https-proxy.html) and others print `enable://captureIp` as the way to decrypt an HTTPS request to an IP | it is, but only once whistle is decrypting at all: `enable://captureIp` alone does not turn interception on, so on a default install the connection is relayed either way. `enable://capture` is the one that does both. Measured on both proxies with the console switch off and on | [Not decrypting a connection](#not-decrypting-a-connection) |
 | [`auth`](https://wproxy.org/docs/rules/auth.html) form 2: a ```` ``` ```` block holding `username: admin` / `password: …`, referenced as `auth://{custom-key}` | the block's content *is* the value by the time `getAuthByRules` sees it, and it has no slash, so the colon splits it: the username becomes the literal `username` and the password the rest of the file. A **file** in that same format works, because a path has a slash and takes the other road. Measured on both proxies; whistle-rs matches | [`auth://`](#auth-in-four-spellings) above; `cases-docs.js` |
 
 The `ws://` row is the one worth remembering: the page is right, and the obvious
@@ -3107,6 +3145,37 @@ connection nobody will forge one for is a question with no use for its answer,
 so the hook is not called.
 
 `--no-intercept-https` says the same thing for every connection at once.
+
+**Two narrower flags, one for each half of the connections.** The half is decided
+by whether the ClientHello named a server, which is a fact about the client and
+not about the rule:
+
+| Flag | Relays |
+|---|---|
+| `disable://captureSNI` | connections whose ClientHello **named** a server |
+| `disable://captureNoSNI` | connections whose ClientHello named **nothing** |
+
+**And one default nobody has to write.** A tunnel opened to a **bare IP address**
+whose ClientHello named nothing is *not* decrypted — `net.isIP(servername) &&
+!isCaptureIp()` (`_original/lib/https/index.js:1287`). TLS forbids an IP literal
+in SNI, so `https://10.0.0.5/` is exactly that shape and goes through untouched.
+Three spellings ask for it back, and one refuses even then:
+
+```
+10.0.0.5   enable://capture      # …or enable://captureIp, or enable://captureIP
+10.0.0.5   enable://capture disable://captureIp   # still relayed
+```
+
+`enable://capture` is the general one: it is also what turns interception on at
+all in whistle, whose global switch starts off. Here interception starts on, so
+the flag only ever matters for this row. All of it is measured against whistle
+2.10.8 — `tests/differential/https-bench.js` compares **who signed the
+certificate** for twelve shapes of connection, which is the only way to see the
+difference between a connection that was read and one that was passed through.
+
+> whistle intercepts a **local** hostname whatever the rules say, so
+> `disable://intercept` on `localhost` is ignored there and honoured here. See
+> [`CERTIFICATES.md`](CERTIFICATES.md#which-connections-are-read-at-all).
 
 
 ### Shaping the CONNECT to an upstream proxy

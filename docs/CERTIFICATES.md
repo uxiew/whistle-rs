@@ -164,6 +164,64 @@ that pins an IP does the same thing over `CONNECT`. When the client sends no SNI
 all — an old client, or a connection to a literal IP — the tunnel's own address is
 still the fallback, which is what it always was.
 
+### What the tunnel is carrying
+
+A tunnel is opened to an **address**, not to a protocol, and a client may put
+anything through it. Before step 2 the first bytes are sniffed, exactly as
+whistle sniffs them (`_original/lib/https/index.js:1176-1221`):
+
+| First bytes | What happens | Say otherwise with |
+|---|---|---|
+| a TLS record (`0x16`) | decrypted, as above | `enable://forHttp`, `disable://captureHttps` |
+| a cleartext `HTTP/1.x` request line | read as HTTP — rules apply to it in full | `enable://forHttps`, `disable://captureHttp` |
+| the cleartext HTTP/2 preface (`PRI * HTTP/2.0`) | read as HTTP/2 | as above |
+| **anything else** | **relayed untouched** | — |
+
+The last row is the one that matters most and it needs no flag: a tunnel
+carrying SSH, or a game protocol, or a binary nobody has named, is passed
+through. whistle-rs used to assume every tunnel was TLS and hand it to the
+acceptor, so those clients got a TLS alert where whistle gave them their
+connection.
+
+The method test is upstream's `/^(\w+)\s+(\S+)\s+HTTP\/1.\d$/im` — any method,
+not a list — so `PROPFIND`, `MKCOL` or something invented this morning is still
+read as HTTP.
+
+### Which connections are read at all
+
+Not every tunnel is opened. Before step 3, three questions are asked of the
+connection, and any one of them can send it through untouched — routed by its
+rules, but never decrypted:
+
+| The connection | Read? | Say otherwise with |
+|---|---|---|
+| a name, whether or not the ClientHello carried SNI | yes | `disable://intercept`, `disable://https`, `disable://capture` |
+| the ClientHello named a server | yes | `disable://captureSNI` |
+| the ClientHello named nothing | yes | `disable://captureNoSNI` |
+| **the authority is a bare IP and the ClientHello named nothing** | **no** | `enable://capture`, `enable://captureIp`, `enable://captureIP` — and `disable://captureIp` refuses even then |
+
+The last row is a default rather than a rule, and it is upstream's:
+`net.isIP(servername) && !isCaptureIp()`
+(`_original/lib/https/index.js:1287`). TLS forbids an IP literal in SNI, so
+`https://10.0.0.5/` produces exactly that shape — a tunnel to an address, with
+nothing named inside it — and neither proxy forges a certificate for it. A client
+that pins an IP therefore keeps its end-to-end connection without being asked.
+
+> **whistle-rs reads by default; whistle does not.** whistle's console has an
+> `Enable HTTPS` switch that starts **off**, and with it off `isEnableIntercept`
+> only touches hosts that already have a custom certificate
+> (`_original/lib/tunnel.js:187-199`). This port reads unless told not to, and
+> `--no-intercept-https` is the global opt-out. It is the one difference of
+> posture here, and everything in the table above is measured with whistle's
+> switch turned on — otherwise the comparison is between "whistle intercepts
+> nothing" and "this port intercepts", which says nothing about either rule.
+>
+> One more thing whistle does that this port does not: it intercepts a **local**
+> hostname whatever the rules say. `disable://intercept` on `localhost` is
+> ignored there and honoured here. Measured, and the reason
+> `tests/differential/https-bench.js` runs its certificate cases under
+> `probe.test` and a `host://` line rather than under `localhost`.
+
 ### Letting a plugin choose
 
 A `sniCallback://` rule hands step 3 to a plugin, which may supply its own

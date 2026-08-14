@@ -14,6 +14,7 @@
 const https = require('https');
 const http = require('http');
 const tls = require('tls');
+const http2 = require('http2');
 const fs = require('fs');
 const { execSync } = require('child_process');
 
@@ -122,6 +123,105 @@ function throughTunnel(port, ca, { method = 'GET', path = '/echo', headers = {} 
   });
 }
 
+/**
+ * **Who signed the certificate?** — the only way to see whether a proxy read a
+ * connection or passed it through.
+ *
+ * `throughTunnel` cannot answer it: it verifies against the proxy's own root, so
+ * an un-intercepted connection is a TLS error and every un-intercepted
+ * connection looks like every other failure. This one accepts any certificate
+ * and reports the issuer, so "forged" and "the origin's own" are two readable
+ * answers rather than one error.
+ */
+function issuerThroughTunnel(port, authority, servername) {
+  return new Promise((resolve) => {
+    const req = http.request({ port, host: '127.0.0.1', method: 'CONNECT', path: authority });
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) { socket.destroy(); return resolve(`CONNECT ${res.statusCode}`); }
+      const opts = { socket, rejectUnauthorized: false };
+      if (servername) opts.servername = servername;
+      const s = tls.connect(opts, () => {
+        const cert = s.getPeerCertificate();
+        const cn = (cert && cert.issuer && cert.issuer.CN) || '?';
+        s.destroy();
+        // Each proxy's root has its own name, so the answer is normalised to
+        // the only distinction that matters: did *this* proxy sign it.
+        resolve(cn === 'ipcap-origin' || cn === 'localhost' ? 'the origin\'s own' : 'forged by the proxy');
+      });
+      s.on('error', (e) => resolve('tls ' + e.code));
+    });
+    req.on('error', (e) => resolve('connect ' + e.code));
+    req.setTimeout(8000, () => { req.destroy(); resolve('timeout'); });
+    req.end();
+  });
+}
+
+/**
+ * A tunnel that is **not** TLS. Opens `CONNECT`, writes `payload` in the clear,
+ * and reports the first line and body of whatever comes back.
+ *
+ * A tunnel is opened to an address, not to a protocol: a client may put
+ * cleartext HTTP, an HTTP/2 preface, or somebody else's protocol entirely
+ * through it. Upstream sniffs the first chunk and branches three ways
+ * (`_original/lib/https/index.js:1176-1221`), and nothing else in this bench
+ * looks at the other two branches.
+ */
+function plainThroughTunnel(port, authority, payload) {
+  return new Promise((resolve) => {
+    const req = http.request({ port, host: '127.0.0.1', method: 'CONNECT', path: authority });
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) { socket.destroy(); return resolve(`CONNECT ${res.statusCode}`); }
+      let out = '';
+      socket.setTimeout(5000, () => { socket.destroy(); resolve(out ? 'partial: ' + out.slice(0, 80) : 'nothing came back'); });
+      socket.on('data', (d) => { out += d.toString(); });
+      socket.on('close', () => resolve(
+        out ? out.split('\r\n')[0] + ' | ' + (out.split('\r\n\r\n')[1] || '').slice(0, 120) : 'closed with nothing'));
+      socket.on('error', (e) => resolve('socket ' + e.code));
+      socket.write(payload);
+    });
+    req.on('error', (e) => resolve('connect ' + e.code));
+    req.setTimeout(8000, () => { req.destroy(); resolve('timeout'); });
+    req.end();
+  });
+}
+
+/**
+ * Cleartext **HTTP/2** inside a tunnel: the `PRI * HTTP/2.0` preface, which
+ * upstream hands to an h2 server of its own (`getHttp2Server`,
+ * `_original/lib/https/index.js:1274-1276`). Nothing else here reaches that
+ * branch, and this port used to answer it with a TLS alert.
+ */
+function h2ThroughTunnel(port, authority) {
+  return new Promise((resolve) => {
+    const req = http.request({ port, host: '127.0.0.1', method: 'CONNECT', path: authority });
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) { socket.destroy(); return resolve(`CONNECT ${res.statusCode}`); }
+      let done = false;
+      const fin = (v) => {
+        if (done) return;
+        done = true;
+        try { client.close(); } catch { /* already gone */ }
+        try { socket.destroy(); } catch { /* already gone */ }
+        resolve(v);
+      };
+      const client = http2.connect('http://probe.test', { createConnection: () => socket });
+      client.on('error', (e) => fin('h2 ' + e.code));
+      const st = client.request({ ':method': 'GET', ':path': '/echo' });
+      let body = '';
+      st.on('response', (h) => {
+        st.on('data', (d) => { body += d; });
+        st.on('end', () => fin(`${h[':status']} | ${body.slice(0, 120)}`));
+      });
+      st.on('error', (e) => fin('stream ' + e.code));
+      setTimeout(() => fin('timeout'), 6000);
+      st.end();
+    });
+    req.on('error', (e) => resolve('connect ' + e.code));
+    req.setTimeout(8000, () => { req.destroy(); resolve('timeout'); });
+    req.end();
+  });
+}
+
 const IGNORE = new Set([
   'date', 'connection', 'keep-alive', 'proxy-connection',
   'transfer-encoding', 'content-length', 'host', 'user-agent', 'accept',
@@ -179,12 +279,57 @@ function compare(w, rs) {
   return out;
 }
 
+/**
+ * Compare two tunnel answers the way `compare` does for the ordinary cases:
+ * status and body, with the hop-by-hop and framing headers dropped.
+ *
+ * The echo the origin returns contains the request headers it was given, so a
+ * raw string compare would fail on exactly the names `IGNORE` exists to
+ * excuse — `connection`, which whistle stamps on the forwarded request and
+ * hyper does not, and `host`, which whistle rewrites to the tunnel's authority
+ * while this port forwards the `:authority` the client sent.
+ */
+function sameTunnelAnswer(a, b) {
+  const strip = (s) => {
+    const cut = s.indexOf('{');
+    if (cut === -1) return s;
+    try {
+      const o = JSON.parse(s.slice(cut));
+      if (o && o.headers) {
+        o.headers = Object.fromEntries(
+          Object.entries(o.headers).filter(([k]) => !IGNORE.has(k.toLowerCase())),
+        );
+      }
+      return s.slice(0, cut) + JSON.stringify(o);
+    } catch {
+      return s;
+    }
+  };
+  return strip(a) === strip(b);
+}
+
 async function main() {
   ensureCert();
   const origin = await startOrigin();
   const O = `localhost:${ORIGIN}`;
   const wCa = await get(W, '/cgi-bin/rootca');
   const rsCa = await get(RS, '/rootCA.crt');
+
+  // **whistle does not decrypt HTTPS until it is told to.** `Enable HTTPS` in
+  // its console is off in a fresh data directory, and with it off
+  // `isEnableIntercept` only intercepts hosts that already have a custom
+  // certificate (`_original/lib/tunnel.js:187-199`). whistle-rs intercepts by
+  // default — a deliberate difference of posture, and `--no-intercept-https` is
+  // its opt-out — so without this line every case below would be comparing
+  // "whistle passed the connection through" against "this port read it".
+  //
+  // It went unnoticed because the origin here is `localhost`, which whistle
+  // intercepts anyway. Any other name and this whole file would have been
+  // measuring the switch rather than the rules. Measured, with a
+  // `probe.test host://127.0.0.1` origin: with the switch off whistle forges
+  // nothing at all; with it on, all ten certificate shapes below agree.
+  await post(W, '/cgi-bin/intercept-https-connects', 'interceptHttpsConnects=1',
+    'application/x-www-form-urlencoded');
 
   const CASES = [
     { name: 'baseline: no rule', rules: '' },
@@ -254,6 +399,109 @@ async function main() {
     const problems = compare(w, rs).filter((p) => !EXPECTED(p));
     if (problems.length) { differing++; report.push({ name: c.name, rules: c.rules, problems }); }
   }
+
+  // ── which connections get read at all ──────────────────────────────────
+  //
+  // Everything above asks what a rule did to a request *inside* a tunnel, which
+  // presupposes the tunnel was opened. Whether it is opened is a decision of its
+  // own, and upstream makes it from what the ClientHello named: a CONNECT to a
+  // **bare IP** whose ClientHello carried no server name is not decrypted
+  // (`net.isIP(servername) && !isCaptureIp()`,
+  // `_original/lib/https/index.js:1287`). TLS forbids an IP in SNI, so a client
+  // asking for `https://127.0.0.1/` produces exactly that shape — and this port
+  // used to read it.
+  //
+  // `localhost` and `127.0.0.1` are the same origin here, reached two ways, so
+  // the pair isolates the one variable.
+  // `probe.test`, not `localhost`. **whistle intercepts a local host whatever
+  // the rules say** — `disable://intercept` on `localhost` is ignored there, and
+  // measured to be: with the authority `probe.test` and a
+  // `host://127.0.0.1:<origin>` line to reach the same server, the same flag
+  // relays. Every named case below therefore travels under a name whistle has no
+  // opinion about, and reaches the origin by a rule rather than by DNS.
+  const N = 'probe.test';
+  const H = `${N} host://127.0.0.1:${ORIGIN}\n`;
+  const CERT_CASES = [
+    { name: 'cert: a name, with SNI, is read', rules: H, authority: `${N}:443`, servername: N },
+    { name: 'cert: a name, no SNI, is read too', rules: H, authority: `${N}:443` },
+    { name: 'cert: a bare IP with no SNI is not', rules: '', authority: `127.0.0.1:${ORIGIN}` },
+    { name: 'cert: enable://capture reads the bare IP', rules: `127.0.0.1:${ORIGIN} enable://capture`, authority: `127.0.0.1:${ORIGIN}` },
+    { name: 'cert: enable://captureIp reads it', rules: `127.0.0.1:${ORIGIN} enable://captureIp`, authority: `127.0.0.1:${ORIGIN}` },
+    { name: 'cert: enable://captureIP is the same flag', rules: `127.0.0.1:${ORIGIN} enable://captureIP`, authority: `127.0.0.1:${ORIGIN}` },
+    { name: 'cert: disable://captureIp refuses even then', rules: `127.0.0.1:${ORIGIN} enable://capture disable://captureIp`, authority: `127.0.0.1:${ORIGIN}` },
+    { name: 'cert: disable://captureSNI drops the named half', rules: `${H}${N} disable://captureSNI`, authority: `${N}:443`, servername: N },
+    { name: 'cert: disable://captureSNI spares the other half', rules: `${H}${N} disable://captureSNI`, authority: `${N}:443` },
+    { name: 'cert: disable://captureNoSNI drops the unnamed half', rules: `${H}${N} disable://captureNoSNI`, authority: `${N}:443` },
+    { name: 'cert: disable://captureNoSNI spares the named half', rules: `${H}${N} disable://captureNoSNI`, authority: `${N}:443`, servername: N },
+    { name: 'cert: disable://intercept relays whatever was named', rules: `${H}${N} disable://intercept`, authority: `${N}:443`, servername: N },
+  ];
+  for (const c of CERT_CASES) {
+    await setRules(c.rules);
+    const [w, rs] = [
+      await issuerThroughTunnel(W, c.authority, c.servername),
+      await issuerThroughTunnel(RS, c.authority, c.servername),
+    ];
+    ran++;
+    if (w !== rs) {
+      differing++;
+      report.push({ name: c.name, rules: c.rules, problems: [`certificate: whistle=${w} rs=${rs}`] });
+    }
+  }
+
+  // ── what the tunnel is carrying ────────────────────────────────────────
+  //
+  // A plain HTTP origin, reached through a `CONNECT` that never speaks TLS.
+  // This port used to hand every tunnel to its TLS acceptor, so a client that
+  // tunnelled anything else got a TLS alert where whistle gave it an answer.
+  const plain = http.createServer((q, r) => {
+    r.setHeader('content-type', 'application/json');
+    r.end(JSON.stringify({ url: q.url, headers: q.headers }));
+  });
+  await new Promise((r) => plain.listen(ORIGIN + 1, r));
+  const PH = `${N} host://127.0.0.1:${ORIGIN + 1}\n`;
+  const GET = 'GET /echo HTTP/1.1\r\nHost: probe.test\r\nConnection: close\r\n\r\n';
+  const PLAIN_CASES = [
+    { name: 'tunnel: cleartext HTTP is read', rules: PH, payload: GET },
+    { name: 'tunnel: cleartext HTTP takes its rules', rules: `${PH}${N} reqHeaders://x-a=1`, payload: GET },
+    { name: 'tunnel: enable://forHttps passes cleartext through', rules: `${PH}${N} enable://forHttps reqHeaders://x-a=1`, payload: GET },
+    { name: 'tunnel: disable://captureHttp passes it through too', rules: `${PH}${N} disable://captureHttp reqHeaders://x-a=1`, payload: GET },
+    { name: 'tunnel: neither HTTP nor TLS is relayed', rules: PH, payload: Buffer.from([0, 1, 2, 3, 4, 5, 6, 7]) },
+    // `\w+`, not a list of methods — the classifier accepts one nobody has
+    // registered. The explicit `Content-Length: 0` is not part of the question:
+    // without it the two proxies frame the body-less request differently (Node's
+    // client stamps `content-length: 0`, hyper omits it, and both mean "no
+    // body"), which would hide the classification behind a framing detail.
+    { name: 'tunnel: an unknown method is still HTTP', rules: `${PH}${N} reqHeaders://x-a=1`,
+      payload: 'PROPFIND /echo HTTP/1.1\r\nHost: probe.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' },
+  ];
+  for (const c of PLAIN_CASES) {
+    await setRules(c.rules);
+    const [w, rs] = [
+      await plainThroughTunnel(W, `${N}:80`, c.payload),
+      await plainThroughTunnel(RS, `${N}:80`, c.payload),
+    ];
+    ran++;
+    if (!sameTunnelAnswer(w, rs)) {
+      differing++;
+      report.push({ name: c.name, rules: c.rules, problems: [`answer: whistle=${w} rs=${rs}`] });
+    }
+  }
+  for (const c of [
+    { name: 'tunnel: cleartext HTTP/2 is read', rules: PH },
+    { name: 'tunnel: cleartext HTTP/2 takes its rules', rules: `${PH}${N} reqHeaders://x-a=1` },
+  ]) {
+    await setRules(c.rules);
+    const [w, rs] = [
+      await h2ThroughTunnel(W, `${N}:80`),
+      await h2ThroughTunnel(RS, `${N}:80`),
+    ];
+    ran++;
+    if (!sameTunnelAnswer(w, rs)) {
+      differing++;
+      report.push({ name: c.name, rules: c.rules, problems: [`answer: whistle=${w} rs=${rs}`] });
+    }
+  }
+  plain.close();
 
   origin.close();
   console.log(JSON.stringify({ ran, differing, report }, null, 2));

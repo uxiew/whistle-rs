@@ -747,12 +747,14 @@ async fn bench_accept(setup: Setup, state: &Arc<super::AppState>, stream: TcpStr
     let has_sni = hello.server_name.is_some();
     let name = hello.server_name.unwrap_or_else(|| BENCH_SNI.to_string());
     let stream = super::sni::Prefixed::new(hello.prefix, stream);
-    let acceptor = match super::sni::decide(state, &name, &name, 443, peer, has_sni).await {
+    let acceptor = match super::sni::decide(state, &name, &name, 443, peer, has_sni, super::sni::Carried::Tls).await {
         super::sni::Decision::Generated => state.ca.acceptor_for(&name).expect("acceptor"),
         super::sni::Decision::Plugin(a) => a,
         // Neither is reachable in this benchmark — its rules name no plugin —
         // and both mean "no handshake here", which is the same thing to it.
-        super::sni::Decision::Bypass(_) | super::sni::Decision::Unroutable(_) => return,
+        super::sni::Decision::Bypass(_)
+        | super::sni::Decision::Unroutable(_)
+        | super::sni::Decision::Cleartext(_) => return,
     };
     acceptor.accept(stream).await.ok();
 }

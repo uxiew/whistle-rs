@@ -109,6 +109,34 @@ the only place `cipher://` / `tlsOptions://` is observable at all: a version pin
 changes nothing the client can see. Without it, a case that pins a version and a
 case that pins nothing compare equal.
 
+**It turns whistle's `Enable HTTPS` switch on before it starts, and that is not a
+convenience.** whistle does not decrypt HTTPS in a fresh data directory; with the
+switch off it only intercepts hosts that already have a custom certificate
+(`_original/lib/tunnel.js:187-199`), while whistle-rs intercepts by default. For
+a long time this file did not know that, and passed anyway — because its origin
+is `localhost`, which whistle intercepts whatever the rules say. Under any other
+name every case here would have been comparing "whistle passed the connection
+through" against "this port read it", which is a fact about a switch and not
+about a rule.
+
+Two sections at the end look at the tunnel itself rather than at what travels
+inside it, and neither can be written with `throughTunnel`, which verifies
+against the proxy's own root and so turns every un-intercepted connection into
+the same TLS error:
+
+* **who signed the certificate** (12 cases) — the only way to see the difference
+  between a connection that was read and one that was passed through. It is
+  where the bare-IP default lives: a `CONNECT` to an address whose ClientHello
+  named nothing is not decrypted by either proxy. These run under `probe.test`
+  and a `host://` line rather than under `localhost`, for the reason above;
+* **what the tunnel is carrying** (8 cases) — cleartext HTTP, an unknown method,
+  cleartext HTTP/2, and bytes that are neither HTTP nor TLS, which both proxies
+  relay. These compare through `sameTunnelAnswer`, which drops the same
+  hop-by-hop and framing headers `compare` does: the origin echoes the request
+  headers it was given, so a raw compare would fail on `connection` (whistle
+  stamps it, hyper does not) and on `host` (whistle rewrites it to the tunnel's
+  authority, this port forwards the `:authority` the client sent).
+
 It refuses to run its cases until a plain request really works through both —
 because it once reported "18 cases, 0 differences" while **every tunnel was
 dying of `EPROTO`**. Two proxies that fail identically compare equal. The cause

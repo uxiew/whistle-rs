@@ -2296,12 +2296,47 @@ where
         // own hostname is only the fallback for a client that asked for nothing
         // (upstream's `useSNI || socket.tunnelHostname`).
         let servername = hello.server_name.unwrap_or_else(|| host.clone());
+        // A tunnel is opened to an address, not to a protocol. This port used to
+        // assume TLS and hand every one of them to the acceptor, which turns a
+        // tunnel carrying anything else into a TLS alert — see [`sni::Carried`].
+        let carried = sni::carried_protocol(&hello.prefix);
         let stream = sni::Prefixed::new(hello.prefix, stream);
         let acceptor =
-            match sni::decide(&state, &servername, &host, port, peer, has_sni).await {
+            match sni::decide(&state, &servername, &host, port, peer, has_sni, carried).await {
                 sni::Decision::Generated => state.ca.acceptor_for(&servername)?,
                 sni::Decision::Plugin(acceptor) => acceptor,
                 sni::Decision::Bypass(target) => return sni::relay(stream, &target).await,
+                // Cleartext inside the tunnel: no handshake to make, and the
+                // same two servers the SOCKS path already reaches for.
+                sni::Decision::Cleartext(sni::Carried::H2c) => {
+                    // `tls: false`: the connection genuinely is not encrypted, so
+                    // an `https://` pattern must not match it. Upstream reaches
+                    // its h2 server before it ever sets `socket.curUrl` to an
+                    // `https://` URL (`_original/lib/https/index.js:1280-1282`
+                    // returns above `:1297`), which is the same reading.
+                    return serve_intercepted_h2(
+                        state,
+                        TokioIo::new(stream),
+                        host,
+                        port,
+                        peer,
+                        false,
+                        false,
+                    )
+                    .await;
+                }
+                sni::Decision::Cleartext(_) => {
+                    return serve_intercepted(
+                        state,
+                        TokioIo::new(stream),
+                        host,
+                        port,
+                        peer,
+                        false,
+                        false,
+                    )
+                    .await;
+                }
                 // A proxy rule that cannot be honoured closes the connection
                 // rather than quietly sending the bytes direct — the same call
                 // the request path makes, where it answers 502.
@@ -2319,7 +2354,8 @@ where
         // completed, exactly as it did before the peek existed.
         let sni = conn.server_name().is_some();
         if is_h2 {
-            serve_intercepted_h2(state, TokioIo::new(tls_stream), host, port, peer, sni).await
+            serve_intercepted_h2(state, TokioIo::new(tls_stream), host, port, peer, true, sni)
+                .await
         } else {
             serve_intercepted(state, TokioIo::new(tls_stream), host, port, peer, true, sni).await
         }
@@ -2338,6 +2374,7 @@ async fn serve_intercepted_h2<I>(
     host: String,
     port: u16,
     peer: SocketAddr,
+    tls: bool,
     sni: bool,
 ) -> Result<()>
 where
@@ -2348,7 +2385,7 @@ where
         let origin = Origin::Mitm {
             host: host.clone(),
             port,
-            tls: true,
+            tls,
             sni,
         };
         async move { guard(serve(state, req, origin, peer).await) }

@@ -1207,18 +1207,51 @@ fn has_sni_callback(rules: &[Rule]) -> bool {
 
 /// Does any rule ask for a connection not to be intercepted?
 ///
-/// The three spellings are upstream's, read together as one question
+/// Two gates upstream, and both are a `disable` read. The first is the tunnel's
 /// (`disable.intercept || disable.https || disable.capture`,
-/// `_original/lib/tunnel.js:167-169`). Only the *presence* of the flag is
+/// `_original/lib/tunnel.js:167-169`); the second is at the ClientHello, where
+/// `disable.captureSNI` and `disable.captureNoSNI` each rule out one half of the
+/// connections by whether the client named a server
+/// (`lib/https/index.js:1285-1291`). Only the *presence* of a flag is
 /// precomputed; whether it matches this connection is decided per handshake.
+///
+/// A third pair sits earlier still, before the ClientHello is looked at:
+/// `enable://forHttp` / `disable://captureHttps` and their mirrors decide by
+/// what the tunnel turned out to be *carrying* (`lib/https/index.js:1204-1216`),
+/// so this scans `enable` as well as `disable`.
+///
+/// `captureIp` is deliberately not here. It appears in the same expression, but
+/// only ever to *cancel* an `enable://capture` — the bare-IP connection it
+/// governs already declines interception with no rule at all, so a handshake
+/// that has to ask about it is found by [`crate::proxy::sni::decide`] from the
+/// address, not from this flag.
 fn has_no_intercept(rules: &[Rule]) -> bool {
     rules.iter().any(|rule| {
         rule.ops.iter().any(|op| {
             op.protocol == "disable"
+                && op.value.split(['|', '&']).any(|f| {
+                    matches!(
+                        f.trim(),
+                        "intercept"
+                            | "https"
+                            | "capture"
+                            | "captureSNI"
+                            | "captureNoSNI"
+                            | "captureHttp"
+                            | "captureHttps"
+                    )
+                })
+        })
+    }) || rules.iter().any(|rule| {
+        // The two `enable://` spellings of the same question — "capture only
+        // HTTP" and "capture only HTTPS" — which turn interception *off* for
+        // whichever half the tunnel turns out to be carrying.
+        rule.ops.iter().any(|op| {
+            op.protocol == "enable"
                 && op
                     .value
                     .split(['|', '&'])
-                    .any(|f| matches!(f.trim(), "intercept" | "https" | "capture"))
+                    .any(|f| matches!(f.trim(), "forHttp" | "forHttps"))
         })
     })
 }

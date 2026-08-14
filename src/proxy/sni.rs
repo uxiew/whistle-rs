@@ -216,6 +216,11 @@ pub enum Decision {
     Generated,
     /// Intercept, presenting a certificate a plugin chose.
     Plugin(TlsAcceptor),
+    /// Read the tunnel, but there is no handshake to make: it is carrying
+    /// cleartext, and [`Carried`] says which kind. Upstream feeds a cleartext
+    /// `HTTP/1.x` tunnel back into its own HTTP server and a cleartext `h2`
+    /// preface into an HTTP/2 one (`_original/lib/https/index.js:1204-1221,:1274-1276`).
+    Cleartext(Carried),
     /// Do not intercept: relay the connection opaquely to the carried target,
     /// which is where this connection's `host://` and proxy rules have landed.
     ///
@@ -273,6 +278,150 @@ fn no_intercept(resolved: &crate::rules::Resolved) -> bool {
     ["intercept", "https", "capture"].iter().any(|f| disabled.contains(*f))
 }
 
+/// What is actually travelling inside a `CONNECT` tunnel.
+///
+/// A tunnel is opened to an address, not to a protocol, and the client may put
+/// anything through it. Upstream sniffs the first chunk and branches three ways
+/// (`_original/lib/https/index.js:1176-1221`); this port used to assume TLS and
+/// hand every tunnel to the TLS acceptor, which breaks the other two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carried {
+    /// A TLS record — `chunk[0] == 22`.
+    Tls,
+    /// A cleartext HTTP/1.x request line (`HTTP_RE`, `lib/https/index.js:1118`).
+    Http,
+    /// The cleartext HTTP/2 preface (`HTTP2_RE`, `:1119`).
+    H2c,
+    /// Anything else. Upstream passes it through untouched, which is the only
+    /// thing a proxy can do with a protocol it does not speak.
+    Opaque,
+}
+
+/// Classify the first bytes of a tunnel — upstream's two regexes and its one
+/// byte test, in upstream's order.
+///
+/// The HTTP test is deliberately upstream's `/^(\w+)\s+(\S+)\s+HTTP\/1.\d$/im`
+/// rather than a list of methods: it is multi-line and anchored per line, and it
+/// is what decides that a tunnel carrying `GET / HTTP/1.1` is a request and not
+/// a handshake. `\w+` accepts any method, including one nobody has registered.
+pub fn carried_protocol(prefix: &[u8]) -> Carried {
+    // Only the head is examined, as upstream examines only its first chunk.
+    let head = &prefix[..prefix.len().min(4096)];
+    let text = String::from_utf8_lossy(head);
+    if http_request_line(&text) {
+        return Carried::Http;
+    }
+    if text.lines().any(|line| line.trim_end() == "PRI * HTTP/2.0") {
+        return Carried::H2c;
+    }
+    match head.first() {
+        Some(22) => Carried::Tls,
+        _ => Carried::Opaque,
+    }
+}
+
+/// `HTTP_RE = /^(\w+)\s+(\S+)\s+HTTP\/1.\d$/im` — a request line on a line of
+/// its own, anywhere in the chunk.
+fn http_request_line(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_end_matches('\r');
+        let mut parts = line.split_ascii_whitespace();
+        let (Some(method), Some(target), Some(version), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        // `$` after the version, so nothing may follow it on the line — which is
+        // why the whole line is split and the fourth field must be absent.
+        method.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !target.is_empty()
+            && version.len() == "HTTP/1.x".len()
+            && version.starts_with("HTTP/1.")
+            && version.as_bytes()[7].is_ascii_digit()
+    })
+}
+
+/// Is this authority an IP literal — `net.isIP` (`_original/lib/https/index.js:1287`)?
+///
+/// A bracketed IPv6 authority is unwrapped first: whichever way the CONNECT line
+/// spelled it, `net.isIP` is given the address alone.
+fn is_ip_literal(host: &str) -> bool {
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    bare.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// The second gate: does this **ClientHello** decline interception, given what
+/// the client did or did not name?
+///
+/// Upstream is one expression (`lib/https/index.js:1285-1291`), and it asks a
+/// different question of each half of the connections:
+///
+/// ```text
+/// useSNI ? disable.captureSNI
+///        : (disable.captureNoSNI || (net.isIP(servername) && !isCaptureIp()))
+/// ```
+///
+/// The clause that matters without any rule at all is the last one. **A tunnel
+/// to a bare IP address, whose ClientHello named no server, is not decrypted** —
+/// `isCaptureIp()` is false unless something asks for it
+/// (`enable://capture`, `enable://captureIp`, `enable://captureIP`), and
+/// `disable://captureIp` / `disable://captureIP` refuse even then. So
+/// `https://10.0.0.5/` goes through whistle untouched while `https://api.test/`
+/// is read, and this port used to read both. Measured: whistle 2.10.8 answers a
+/// CONNECT to `127.0.0.1:<tls port>` with the **origin's own** certificate, and
+/// a CONNECT to `localhost:<same port>` with one it forged.
+///
+/// TLS forbids an IP literal in SNI, so "the authority is an IP" and "the client
+/// named nothing" almost always arrive together; they are still two conditions
+/// here because upstream writes them as two.
+///
+/// Upstream has a fourth way to say yes — a `user-agent` the console has marked
+/// for capture (`isCaptureUA`, `uaCache`, `lib/https/index.js:66-68`). There is
+/// no such list here, so that term is a constant `false`, which is also what it
+/// is upstream for every UA nobody has marked.
+///
+/// The flags are read straight off `enable`/`disable`, without the cancellation
+/// `isEnable` applies elsewhere — as upstream reads them here.
+fn declines_at_client_hello(
+    resolved: &crate::rules::Resolved,
+    has_sni: bool,
+    servername: &str,
+) -> bool {
+    let disabled = crate::proxy::apply::disabled_flags(resolved);
+    // Before the ClientHello is even looked at, upstream asks what the tunnel is
+    // carrying and lets four flags answer for a whole class of them
+    // (`lib/https/index.js:1204-1216`). `forHttps` means "capture only HTTPS",
+    // so a cleartext tunnel is passed through; `forHttp` is its mirror.
+    let enabled = crate::proxy::apply::enabled_flags(resolved);
+    if enabled.contains("forHttp") || disabled.contains("captureHttps") {
+        return true;
+    }
+    if has_sni {
+        return disabled.contains("captureSNI");
+    }
+    if disabled.contains("captureNoSNI") {
+        return true;
+    }
+    if !is_ip_literal(servername) {
+        return false;
+    }
+    if disabled.contains("captureIp") || disabled.contains("captureIP") {
+        return true;
+    }
+    !["capture", "captureIp", "captureIP"].iter().any(|f| enabled.contains(*f))
+}
+
+/// The same question for a tunnel that turned out to be carrying **cleartext**:
+/// `enable://forHttps` and `disable://captureHttp` each pass it through
+/// (`_original/lib/https/index.js:1205`).
+///
+/// The mirror flags — `forHttp` and `captureHttps` — belong to the TLS half and
+/// live in [`declines_at_client_hello`].
+fn declines_cleartext(resolved: &crate::rules::Resolved) -> bool {
+    crate::proxy::apply::enabled_flags(resolved).contains("forHttps")
+        || crate::proxy::apply::disabled_flags(resolved).contains("captureHttp")
+}
+
 pub async fn decide(
     state: &Arc<AppState>,
     servername: &str,
@@ -280,7 +429,23 @@ pub async fn decide(
     port: u16,
     peer: SocketAddr,
     has_sni: bool,
+    carried: Carried,
 ) -> Decision {
+    // A tunnel carrying something this proxy does not speak is passed through,
+    // whatever the rules say about certificates — upstream's
+    // `if (!isHttpH2 && chunk[0] != 22) return next(chunk)`
+    // (`_original/lib/https/index.js:1219-1221`). There is nothing to read, so
+    // there is nothing for a rule to read it *as*; the connection is still
+    // routed, which is all a relay ever was.
+    if carried == Carried::Opaque {
+        let (info, resolved) = {
+            let rules = state.rules.read().unwrap();
+            let info = connection_req_info(servername, port, peer, has_sni);
+            let resolved = rules.resolve(&info);
+            (info, resolved)
+        };
+        return relay_decision(state, &info, &resolved).await;
+    }
     // Interception switched off globally: every TLS connection is relayed, and
     // the answer is the same one a plugin's `false` produces — the connection is
     // still *routed* by its rules, it is simply not read. whistle spells this
@@ -297,13 +462,22 @@ pub async fn decide(
     // Scoped so the read guard cannot cross the `.await` below. `Resolved` owns
     // its contents, so it outlives the guard and is kept: a declined connection
     // still has to be routed, and re-resolving would mean matching twice.
+    // A tunnel to a bare IP whose ClientHello named nothing is the one shape
+    // that declines interception with **no rule written at all**, so it cannot
+    // take the fast path below — see [`declines_at_client_hello`]. Two string
+    // parses, and only for a connection addressed by address.
+    let bare_ip = !has_sni && is_ip_literal(servername);
+    let cleartext = carried != Carried::Tls;
     let (matched, info, resolved, relay) = {
         let rules = state.rules.read().unwrap();
         // Two questions, both answered from a `bool` per group: does anything
         // want to choose a certificate, and does anything want this connection
         // left alone? A rules file that asks neither costs exactly this much.
-        if !rules.has_sni_callback() && !rules.has_no_intercept() {
-            return Decision::Generated;
+        if !bare_ip && !rules.has_sni_callback() && !rules.has_no_intercept() {
+            return match cleartext {
+                true => Decision::Cleartext(carried),
+                false => Decision::Generated,
+            };
         }
         let info = connection_req_info(servername, port, peer, has_sni);
         let resolved = rules.resolve(&info);
@@ -315,16 +489,27 @@ pub async fn decide(
         // going to forge one for is a question with no use for its answer.
         //
         // Decided here and acted on below, because the relay is an `.await` and
-        // the read guard must not cross one.
-        let relay = no_intercept(&resolved);
-        let matched = match relay {
+        // the read guard must not cross one. The second half is the ClientHello's
+        // own gate, which upstream reaches only after the tunnel's — same order,
+        // same effect, and `sniCallback://` loses to either for the same reason.
+        let relay = no_intercept(&resolved)
+            || match cleartext {
+                true => declines_cleartext(&resolved),
+                false => declines_at_client_hello(&resolved, has_sni, servername),
+            };
+        let matched = match relay || cleartext {
             true => None,
+            // A cleartext tunnel has no handshake, so nothing to ask a
+            // certificate plugin about.
             false => resolved.value("sniCallback").and_then(parse_rule),
         };
         (matched, info, resolved, relay)
     };
     if relay {
         return relay_decision(state, &info, &resolved).await;
+    }
+    if cleartext {
+        return Decision::Cleartext(carried);
     }
     let Some((plugin, value)) = matched else {
         return Decision::Generated;
@@ -893,7 +1078,165 @@ mod tests {
     }
 
     async fn decide_for(state: &Arc<AppState>, servername: &str) -> Decision {
-        decide(state, servername, servername, 443, peer(), true).await
+        decide(state, servername, servername, 443, peer(), true, Carried::Tls).await
+    }
+
+    /// A CONNECT whose ClientHello named nothing, so the authority is all there
+    /// is to go on — the shape `declines_at_client_hello` is about.
+    async fn decide_without_sni(state: &Arc<AppState>, authority: &str) -> Decision {
+        decide(state, authority, authority, 443, peer(), false, Carried::Tls).await
+    }
+
+    /// **A tunnel to a bare IP that named no server is not decrypted**, and no
+    /// rule has to say so — `net.isIP(servername) && !isCaptureIp()`
+    /// (`_original/lib/https/index.js:1287`).
+    ///
+    /// Measured before it was written: whistle 2.10.8 answers a CONNECT to
+    /// `127.0.0.1:<tls port>` with the **origin's own** certificate and one to
+    /// `localhost:<the same port>` with one it forged. This port read both.
+    #[test]
+    fn a_bare_ip_with_no_sni_is_relayed_unless_asked_for() {
+        rt().block_on(async {
+            let bypass = |d: &Decision| matches!(d, Decision::Bypass(_));
+
+            // No rules at all: the address alone decides.
+            let plain = state_with("", None);
+            assert!(bypass(&decide_without_sni(&plain, "127.0.0.1").await));
+            assert!(bypass(&decide_without_sni(&plain, "::1").await));
+            assert!(bypass(&decide_without_sni(&plain, "[::1]").await));
+            // A name is read, with or without SNI…
+            assert!(matches!(
+                decide_without_sni(&plain, "example.com").await,
+                Decision::Generated
+            ));
+            assert!(matches!(decide_for(&plain, "example.com").await, Decision::Generated));
+            // …and so is an IP whose client *did* name a server, which TLS does
+            // not allow but the expression still distinguishes.
+            assert!(matches!(decide_for(&plain, "127.0.0.1").await, Decision::Generated));
+
+            // Three spellings ask for it back.
+            for rules in [
+                "127.0.0.1 enable://capture",
+                "127.0.0.1 enable://captureIp",
+                "127.0.0.1 enable://captureIP",
+            ] {
+                let state = state_with(rules, None);
+                assert!(
+                    matches!(decide_without_sni(&state, "127.0.0.1").await, Decision::Generated),
+                    "{rules}"
+                );
+            }
+            // …and `disable://` refuses even then, which is the only thing that
+            // flag is for.
+            for rules in [
+                "127.0.0.1 enable://capture disable://captureIp",
+                "127.0.0.1 enable://captureIp disable://captureIP",
+            ] {
+                let state = state_with(rules, None);
+                assert!(bypass(&decide_without_sni(&state, "127.0.0.1").await), "{rules}");
+            }
+        });
+    }
+
+    /// What a tunnel is carrying, by upstream's two regexes and its one byte
+    /// test (`_original/lib/https/index.js:1118-1119,:1178,:1218-1221`).
+    #[test]
+    fn a_tunnel_is_classified_by_its_first_bytes() {
+        let of = |bytes: &[u8]| carried_protocol(bytes);
+        // A TLS record: handshake, any version.
+        assert_eq!(of(&[0x16, 0x03, 0x01, 0x02, 0x00]), Carried::Tls);
+        // Cleartext HTTP/1.x, whatever the method — `\w+`, not a list.
+        for line in [
+            "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            "POST /x?y=1 HTTP/1.0\r\n\r\n",
+            "PROPFIND / HTTP/1.1\r\n",
+            "X9 /a HTTP/1.9\r\n",
+        ] {
+            assert_eq!(of(line.as_bytes()), Carried::Http, "{line:?}");
+        }
+        // The regexp is multi-line, so a request line further in still counts —
+        // which is how a chunk that opens with a blank line is read.
+        assert_eq!(of(b"\r\nGET / HTTP/1.1\r\n"), Carried::Http);
+        // The cleartext HTTP/2 preface.
+        assert_eq!(of(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), Carried::H2c);
+        // Anything else is somebody else's protocol.
+        for bytes in [
+            &b"SSH-2.0-OpenSSH_9.0\r\n"[..],
+            &[0x00, 0x01, 0x02, 0x03][..],
+            &b"GET / HTTP/3.0\r\n"[..],
+            // Three fields are required, and nothing may follow the version.
+            &b"GET /\r\n"[..],
+            &b"GET / HTTP/1.1 extra\r\n"[..],
+            &[][..],
+        ] {
+            assert_eq!(of(bytes), Carried::Opaque, "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    /// A tunnel carrying cleartext is read as cleartext, and one carrying
+    /// something else is passed through — neither is handed to a TLS acceptor.
+    #[test]
+    fn a_tunnel_that_is_not_tls_is_not_handshaken() {
+        rt().block_on(async {
+            let state = state_with("", None);
+            let at = |c| async move {
+                decide(&state_with("", None), "probe.test", "probe.test", 443, peer(), false, c)
+                    .await
+            };
+            assert!(matches!(at(Carried::Http).await, Decision::Cleartext(Carried::Http)));
+            assert!(matches!(at(Carried::H2c).await, Decision::Cleartext(Carried::H2c)));
+            assert!(matches!(at(Carried::Opaque).await, Decision::Bypass(_)));
+            assert!(matches!(at(Carried::Tls).await, Decision::Generated));
+
+            // The four flags that decide by what the tunnel carries. Each one
+            // rules out its own half and leaves the other alone.
+            let dec = |rules: &str, c| {
+                let s = state_with(rules, None);
+                async move { decide(&s, "probe.test", "probe.test", 443, peer(), false, c).await }
+            };
+            for (rules, half) in [
+                ("probe.test enable://forHttps", Carried::Http),
+                ("probe.test disable://captureHttp", Carried::Http),
+                ("probe.test enable://forHttp", Carried::Tls),
+                ("probe.test disable://captureHttps", Carried::Tls),
+            ] {
+                assert!(matches!(dec(rules, half).await, Decision::Bypass(_)), "{rules}");
+                let other = match half {
+                    Carried::Http => Carried::Tls,
+                    _ => Carried::Http,
+                };
+                assert!(
+                    !matches!(dec(rules, other).await, Decision::Bypass(_)),
+                    "{rules} must leave the other half alone"
+                );
+            }
+            // And `disable://intercept` still covers both, as the gate before
+            // the sniff does upstream.
+            let _ = state;
+            for c in [Carried::Http, Carried::Tls] {
+                assert!(matches!(dec("probe.test disable://intercept", c).await, Decision::Bypass(_)));
+            }
+        });
+    }
+
+    /// The other two clauses of the same expression: one for each half of the
+    /// connections, by whether the client named a server.
+    #[test]
+    fn capture_sni_and_capture_no_sni_each_rule_out_one_half() {
+        rt().block_on(async {
+            let bypass = |d: &Decision| matches!(d, Decision::Bypass(_));
+            let sni = state_with("example.com disable://captureSNI", None);
+            assert!(bypass(&decide_for(&sni, "example.com").await));
+            // It says nothing about a connection that named nothing.
+            assert!(matches!(
+                decide_without_sni(&sni, "example.com").await,
+                Decision::Generated
+            ));
+
+            let no_sni = state_with("example.com disable://captureNoSNI", None);
+            assert!(bypass(&decide_without_sni(&no_sni, "example.com").await));
+            assert!(matches!(decide_for(&no_sni, "example.com").await, Decision::Generated));
+        });
     }
 
     /// A self-signed certificate and key in PEM, as a plugin would supply them.
@@ -1332,10 +1675,10 @@ mod tests {
         rt().block_on(async {
             let state = state_with("pinned.example.com sniCallback://no-mitm", None);
             // Tunnel opened to an address, SNI naming the pinned host.
-            let d = decide(&state, "pinned.example.com", "93.184.216.34", 443, peer(), true).await;
+            let d = decide(&state, "pinned.example.com", "93.184.216.34", 443, peer(), true, Carried::Tls).await;
             assert!(matches!(d, Decision::Bypass(_)));
             // Same tunnel address, a different name asked for.
-            let d = decide(&state, "www.example.com", "93.184.216.34", 443, peer(), true).await;
+            let d = decide(&state, "www.example.com", "93.184.216.34", 443, peer(), true, Carried::Tls).await;
             assert!(matches!(d, Decision::Generated));
         });
     }
