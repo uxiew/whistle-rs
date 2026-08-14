@@ -237,8 +237,23 @@ fn pattern_accepts<'r>(
                 return None;
             }
             if path.is_empty() {
-                // A host-only pattern consumed no path, so all of it is tail.
-                return Some(Matched::with_tail(Tail::Borrowed(&req.path)));
+                // A host-only pattern consumed no path, so all of it is tail —
+                // except the root's own `/`, which upstream consumes with the
+                // pattern. It stores a domain pattern through `formatUrl`
+                // (`_original/lib/util/common.js:526-536`), which appends the
+                // slash a bare host lacks, so `www.example.com` is held as
+                // `http://www.example.com/` and the tail of a request for `/`
+                // is `''` rather than `/`.
+                //
+                // What it changes is a value that names a **file**:
+                // `www.example.com file:///srv/mock.json` answering `/` joined
+                // to `/srv/mock.json/`, which is a directory that does not
+                // exist. Measured against whistle 2.10.8, which resolves it to
+                // `/srv/mock.json`.
+                return Some(Matched::with_tail(match req.path == "/" {
+                    true => Tail::Borrowed(""),
+                    false => Tail::Borrowed(&req.path),
+                }));
             }
             if !req.path.starts_with(path.as_str()) || !path_match_ends_cleanly(path, &req.path) {
                 return None;
@@ -826,7 +841,7 @@ fn joins_tail(op: &RuleOp) -> bool {
 /// The `xs` spellings never split, which is upstream's own quirk (its split
 /// regexp admits a single `x`) and is reproduced in
 /// [`crate::proxy::apply`]'s reader too.
-fn join_each_path(protocol: &str, value: &str, tail: &str) -> String {
+pub(crate) fn join_each_path(protocol: &str, value: &str, tail: &str) -> String {
     let join = |path: &str| match names_a_remote_file(protocol, path) {
         true => path.to_string(),
         false => super::url::join_url(path, tail),
@@ -881,19 +896,15 @@ fn take(resolved: &mut Resolved, rule: &Rule, op: &RuleOp, order: u64, matched: 
             op.captures = Some(groups.to_vec());
         }
     }
-    // A tail of exactly `/` joins nothing onto a dump path. Upstream's own tail
-    // is *empty* for a domain pattern meeting a root request — `filePath` becomes
-    // `/` only under `lineProps://originUrl`
-    // (`_original/lib/rules/rules.js:1100-1106`) — so `resWrite://…/d` on a
-    // request for `/` writes `d`, where `/a/` writes `d/a/index.html`. Measured
-    // both ways on `tests/differential/write-bench.js`.
-    //
-    // Scoped to the dump operators rather than fixed in the tail itself: for the
-    // file family `/dir` and `/dir/` name the same thing once a directory is
-    // served, so the distinction is invisible there and not worth disturbing a
-    // family the bench has at 124/0.
-    let root_only = protocols::is_write_protocol(&op.protocol) && matched.tail == "/";
-    if joins_tail(&op) && !matched.tail.is_empty() && !root_only {
+    // A domain pattern meeting a root request leaves **no** tail, which is why
+    // `resWrite://…/d` on a request for `/` writes `d` and not `d/`. That used
+    // to be spelled here, as a rule scoped to the dump operators; it belongs to
+    // the tail itself (see `match_rule`), because it is a fact about what the
+    // pattern consumed and not about who reads it. Scoping it here also got the
+    // *other* root wrong: a pattern that carries a path (`a.com/api`) does not
+    // end in a slash upstream, so `/api/` leaves a tail of `/` and the dump path
+    // takes it.
+    if joins_tail(&op) && !matched.tail.is_empty() {
         op.value = join_each_path(&op.protocol, &op.value, &matched.tail);
     }
     resolved.insert(op);

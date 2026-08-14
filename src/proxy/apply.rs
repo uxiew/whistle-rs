@@ -10574,9 +10574,17 @@ mod tests {
             served(&rules, "http://static.test/js/app.js"),
             Some((200, b"console.log(1)".to_vec()))
         );
-        // A directory with nothing more to add falls back to its `index.html`.
+        // A domain pattern meeting a root request adds **nothing**, so the value
+        // stays the bare directory — and a directory is not a file. whistle
+        // answers `404 Not found file …/dir` here (measured, 2.10.8), because
+        // its `index.html` candidate comes from a *trailing slash* in the text
+        // (`getRuleFiles`, `_original/lib/util/index.js:1443-1450`) and the tail
+        // that would have supplied one is empty (`rules.js:1100-1101`). Writing
+        // the rule with the slash — `file:///srv/static/` — is what asks for the
+        // index, and then both proxies serve it.
+        assert_eq!(served(&rules, "http://static.test/").map(|(s, _)| s), Some(404));
         assert_eq!(
-            served(&rules, "http://static.test/"),
+            served(&format!("{}/\n", rules.trim_end()), "http://static.test/"),
             Some((200, b"<h1>root</h1>".to_vec()))
         );
         // The query string is not part of a filename.
