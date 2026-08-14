@@ -154,6 +154,17 @@ struct ExplainArgs {
     #[arg(long)]
     client_ip: Option<String>,
 
+    /// Answer the second question too: which rules apply once the origin has
+    /// replied with this status. Without it a condition about the response has
+    /// no answer and fails closed, which is the state a real request is in
+    /// until the head arrives.
+    #[arg(long)]
+    status: Option<u16>,
+
+    /// Response header as `name: value` (repeatable); needs `--status`.
+    #[arg(long = "res-header", value_name = "NAME: VALUE")]
+    res_headers: Vec<String>,
+
     /// Print the answer as JSON.
     #[arg(long)]
     json: bool,
@@ -394,13 +405,26 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
         return Ok(());
     }
 
-    let mut headers = std::collections::BTreeMap::new();
-    for header in &args.headers {
-        let (name, value) = header
-            .split_once(':')
-            .with_context(|| format!("invalid --header '{header}', expected 'name: value'"))?;
-        headers.insert(name.trim().to_string(), value.trim().to_string());
-    }
+    let split_headers = |given: &[String], flag: &str| -> Result<std::collections::BTreeMap<String, String>> {
+        let mut out = std::collections::BTreeMap::new();
+        for header in given {
+            let (name, value) = header
+                .split_once(':')
+                .with_context(|| format!("invalid {flag} '{header}', expected 'name: value'"))?;
+            out.insert(name.trim().to_string(), value.trim().to_string());
+        }
+        Ok(out)
+    };
+    let headers = split_headers(&args.headers, "--header")?;
+    let response = match args.status {
+        None => None,
+        Some(status) => Some(whistle_rs::explain::Response {
+            status,
+            headers: split_headers(&args.res_headers, "--res-header")?,
+            server_ip: None,
+            server_port: None,
+        }),
+    };
 
     let query = Query {
         rules,
@@ -410,6 +434,7 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
         headers,
         body: args.body.clone(),
         client_ip: args.client_ip.clone(),
+        response,
     };
     let explanation = explain::explain(&query).map_err(|e| anyhow::anyhow!(e))?;
     if args.json {

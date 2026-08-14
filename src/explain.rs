@@ -18,12 +18,12 @@
 //! * `@`-includes naming a file or a URL stay literal ([`RuleManager::new`]
 //!   rather than [`RuleManager::with_includes`]) — a rule tester that polls a
 //!   URL is a proxy with extra steps;
-//! * everything resolves in **one** pass. The proxy splits it in two so that a
-//!   response-phase operator guarded by a response condition (`statusCode:`,
-//!   `resH.`) can be decided once the head is in; here no head ever arrives, so
-//!   the operator is reported and the condition fails closed — the same answer
-//!   the request pass gives, and the same one whistle's own single-pass
-//!   `resolveRules` gives.
+//! * everything resolves in **one** pass unless the caller describes a
+//!   response. The proxy splits resolution in two so that an operator guarded
+//!   by a response condition (`statusCode:`, `resH.`) can be decided once the
+//!   head is in; with no head that operator is still reported and the condition
+//!   fails closed, and with a `response` in the query both passes run exactly
+//!   as they do on a real response.
 //!
 //! The batch shape ([`Query`] in, [`Explanation`] out, one JSON object per
 //! line) exists so that another program can ask thousands of these; that is
@@ -68,6 +68,28 @@ pub struct Query {
     /// The client address, for `clientIp:` / `i:`.
     #[serde(default)]
     pub client_ip: Option<String>,
+    /// The response head, when the question is about the **second** phase.
+    ///
+    /// Without one, a condition that asks about the response has no answer and
+    /// fails closed — which is the state a real request is in until the head
+    /// arrives. With one, the response-phase operators are resolved again
+    /// against it, exactly as [`crate::proxy::resolve_response_phase`] does.
+    #[serde(default)]
+    pub response: Option<Response>,
+}
+
+/// The response head a [`Query`] may carry.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Response {
+    pub status: u16,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// The address the origin answered from, for `serverIp:` / `enable://showHost`.
+    #[serde(default)]
+    pub server_ip: Option<String>,
+    #[serde(default)]
+    pub server_port: Option<u16>,
 }
 
 /// One operator that matched, and where it came from.
@@ -141,13 +163,35 @@ pub fn explain(query: &Query) -> Result<Explanation, String> {
     );
     info.req_body = query.body.clone();
 
-    // `resolve_once` rather than `resolve`: the two-pass split exists so that a
-    // response-phase operator guarded by a response condition can be decided
-    // when the head arrives, and here no head ever will. Withholding it would
-    // report nothing about the half of the rules file that is about responses —
-    // so it is resolved now, and a condition that needs the response fails
-    // closed exactly as it does in the request pass.
-    let mut resolved = manager.resolve_once(&info, false);
+    // With a response head in hand, the two passes the proxy runs: the request
+    // one withholds the operators a response condition guards, and the second
+    // decides them against the head (`resolve_response_phase`).
+    //
+    // Without one, everything resolves in a single pass. The split exists so
+    // that a response-phase operator can be decided once the head is in, and
+    // here no head will ever arrive; withholding would report nothing about the
+    // half of a rules file that is about responses. A condition that needs the
+    // response still fails closed — the same answer the request pass gives, and
+    // the same one whistle's own single-pass `resolveRules` gives.
+    let mut resolved = match &query.response {
+        None => manager.resolve_once(&info, false),
+        Some(_) => manager.resolve(&info),
+    };
+    if let Some(response) = &query.response {
+        let mut headers = hyper::HeaderMap::new();
+        for (name, value) in &response.headers {
+            insert_header(&mut headers, name, value);
+        }
+        info.res = Some(apply::build_res_info(
+            response.status,
+            &headers,
+            response.server_ip.clone(),
+            response.server_port,
+        ));
+        if let Some(extra) = manager.resolve_response(&info, false) {
+            resolved.merge_response_phase(extra);
+        }
+    }
 
     let mut values = manager.inline_values();
     values.extend(query.values.clone());
