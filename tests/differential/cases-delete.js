@@ -316,7 +316,9 @@ module.exports = [
   { name: 'resCookies object spelling still renders its attributes', rules: `${P} resCookies://{"k":{"value":"v","path":"/"}}` },
   // A space ends the token, so this sets nothing in either proxy — the pair
   // that keeps the three above from being read as "a semicolon always works".
-  { name: 'resCookies with a space after the semicolon', rules: `${P} resCookies://k=v; path=/` },
+  // The space is the subject, and a token cannot contain one — so the value
+  // arrives the way a rules file has to write it, through a fenced block.
+  { name: 'resCookies with a space after the semicolon', rules: `\`\`\`ck\nk=v; path=/\n\`\`\`\n${P} resCookies://{ck}` },
   { name: 'resCookies two pairs', rules: `${P} resCookies://sid=abc&t=2` },
   { name: 'resCookies json', rules: `${P} resCookies://{"sid":"abc"}` },
   { name: 'resCookies with an attribute object', rules: `${P} resCookies://{"sid":{"value":"x","httpOnly":true,"maxAge":600}}` },
@@ -324,7 +326,7 @@ module.exports = [
   { name: 'resCookies one name carrying several values', rules: `${P} resCookies://{"sid":[{"value":"a","path":"/x"},{"value":"b","path":"/y"}]}` },
   { name: 'resCookies a whole value with no equals', rules: `${P} resCookies://sid` },
   { name: 'resCookies a valueless pair inside a query', rules: `${P} resCookies://sid=abc&t` },
-  { name: 'resCookies with expires', rules: `${P} resCookies://{"sid":{"value":"x","expires":"Wed, 21 Oct 2099 07:28:00 GMT"}}` },
+  { name: 'resCookies with expires', rules: `\`\`\`ck\n{"sid":{"value":"x","expires":"Wed, 21 Oct 2099 07:28:00 GMT"}}\n\`\`\`\n${P} resCookies://{ck}` },
   { name: 'resCookies two lines merge', rules: `${P} resCookies://a=1\n${P} resCookies://b=2` },
   { name: 'resCookies two lines contest a name', rules: `${P} resCookies://a=first\n${P} resCookies://a=second` },
   { name: 'resCookies a Max-Age spelled Max-Age', rules: `${P} resCookies://{"sid":{"value":"x","Max-Age":60}}` },

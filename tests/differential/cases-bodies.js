@@ -45,7 +45,7 @@ module.exports = [
   { name: 'htmlAppend on a br page', rules: `${P} htmlAppend://(<i>hi</i>)`, request: { path: '/br' } },
   { name: 'htmlAppend on a deflate page', rules: `${P} htmlAppend://(<i>hi</i>)`, request: { path: '/deflate' } },
   { name: 'jsAppend on a gzip page', rules: `${P} jsAppend://(alert(1))`, request: { path: '/gz' } },
-  { name: 'resBody on a gzip page', rules: `${P} resBody://(NEW BODY)`, request: { path: '/gz' } },
+  { name: 'resBody on a gzip page', rules: `${P} resBody://(NEW-BODY)`, request: { path: '/gz' } },
   { name: 'resPrepend and resAppend on a br page', rules: `${P} resPrepend://(TOP) resAppend://(END)`, request: { path: '/br' } },
   { name: 'resMerge into a gzip json body', rules: `${P} resMerge://{"extra":1}`, request: { path: '/gzjson' } },
 
@@ -84,7 +84,7 @@ module.exports = [
   { name: 'resReplace on a gbk page', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/gbk' } },
   { name: 'htmlAppend on a gbk page', rules: `${P} htmlAppend://(<i>hi</i>)`, request: { path: '/gbk' } },
   { name: 'resAppend on a gbk page', rules: `${P} resAppend://(END)`, request: { path: '/gbk' } },
-  { name: 'resBody on a gbk page', rules: `${P} resBody://(NEW BODY)`, request: { path: '/gbk' } },
+  { name: 'resBody on a gbk page', rules: `${P} resBody://(NEW-BODY)`, request: { path: '/gbk' } },
   { name: 'resCharset over a gbk page', rules: `${P} resCharset://utf-8`, request: { path: '/gbk' } },
   // The cases that discriminate: a value the two charsets spell differently.
   { name: 'resReplace writes cjk into a gbk page', rules: `${P} resReplace://ORIGINAL=中文`, request: { path: '/gbk' } },
