@@ -235,6 +235,22 @@ pub struct RuleOp {
     /// body gets expanded and a body that opens and closes with a backtick loses
     /// one from each end to the backtick-template test.
     pub values_substituted: bool,
+    /// The part of the URL its pattern did not consume, held back because this
+    /// operator's value is a **backtick template**.
+    ///
+    /// Order matters and it is upstream's: `resolveVar` renders the template
+    /// while the rule is being resolved (`_original/lib/rules/rules.js:774-783`,
+    /// reached from every branch of `resolveRuleList`), and the tail is appended
+    /// to what came out (`rule.url` / `rule.files`, `getPathRule`,
+    /// `:936-948`). Joining first destroys the template: the value no longer
+    /// *ends* with a backtick, so nothing recognises it, and
+    /// ``www.dev http://`${method}.example` `` reached the origin as the literal
+    /// text of the rule with the request's path stuck on the end.
+    ///
+    /// This port renders in [`crate::proxy::apply::substitute_values`], which
+    /// runs after resolution, so the tail waits here until the render has
+    /// happened — including the response-phase render, which is later still.
+    pub pending_tail: Option<String>,
     /// Where this operator sits in the resolution order — important lines first,
     /// then source order (see [`order_key`]). Stamped when a rule resolves.
     ///

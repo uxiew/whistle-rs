@@ -916,7 +916,12 @@ fn take(resolved: &mut Resolved, rule: &Rule, op: &RuleOp, order: u64, matched: 
     // end in a slash upstream, so `/api/` leaves a tail of `/` and the dump path
     // takes it.
     if joins_tail(&op) && !matched.tail.is_empty() {
-        op.value = join_each_path(&op.protocol, &op.value, &matched.tail);
+        // A template is rendered before anything is appended to it — see
+        // [`RuleOp::pending_tail`], which is where the tail waits.
+        match super::url::is_backtick_template(&op.value) {
+            true => op.pending_tail = Some(matched.tail.to_string()),
+            false => op.value = join_each_path(&op.protocol, &op.value, &matched.tail),
+        }
     }
     resolved.insert(op);
 }

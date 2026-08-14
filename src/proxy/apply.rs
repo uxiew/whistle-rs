@@ -106,11 +106,18 @@ pub struct TplCtx<'a> {
 /// the request with `resolveTplVar` before anything else looks at it.
 ///
 /// Upstream matches `TPL_RE = /^((?:[\w.-]+:)?\/\/)?(`.*`)$/` against the rule's
-/// whole matcher, so the optional first group is the `proto://` prefix. Here the
-/// protocol has already been split off, which leaves exactly the second group:
-/// the value must open and close with a backtick and nothing may sit outside
-/// them. `.*` does not cross a newline upstream and a token cannot contain one
-/// here, so the two agree.
+/// whole matcher, so the optional first group is a `proto://` prefix that stays
+/// where it is and the second is the template. For most operators the protocol
+/// has already been split off here, which leaves exactly the second group; the
+/// value must open and close with a backtick and nothing may sit outside them.
+/// `.*` does not cross a newline upstream and a token cannot contain one here,
+/// so the two agree.
+///
+/// **The prefix still has to be handled**, because one family of values keeps
+/// its scheme: a destination is stored whole (`http://…`, `tunnel://…`, or a
+/// scheme this port does not know), and so ``www.dev http://`${method}.example` ``
+/// — the form upstream's own regexp is written for — went to the origin as the
+/// literal text of the rule.
 ///
 /// Returns `None` when the value is not a template, which is also the answer for
 /// the two protocols upstream opts out at parse time (`rule.isTpl = false` for
@@ -120,13 +127,14 @@ fn render_backticks(op: &crate::rules::RuleOp, tpl: TplCtx<'_>) -> Option<String
     if op.protocol == "log" || op.protocol == "weinre" {
         return None;
     }
+    let (prefix, rest) = crate::rules::url::tpl_prefix(&op.value);
     // A lone backtick is not a pair: `strip_suffix` on the empty remainder says
     // so, which is upstream's `(`.*`)` needing two characters.
-    let inner = op
-        .value
-        .strip_prefix('`')
-        .and_then(|rest| rest.strip_suffix('`'))?;
-    Some(super::template::render_vars(inner, tpl.info, tpl.env))
+    let inner = rest.strip_prefix('`').and_then(|r| r.strip_suffix('`'))?;
+    Some(format!(
+        "{prefix}{}",
+        super::template::render_vars(inner, tpl.info, tpl.env)
+    ))
 }
 
 /// What `{name}` means *to this operator* — upstream's `getValueFor`
@@ -268,6 +276,30 @@ pub fn substitute_values(
                     false => expand(stored),
                 })
             });
+        }
+        // `getValue` unwraps the bracket forms **after** `resolveVar` has
+        // rendered the template (`resolveValue`, `rules.js:810-822`, whose
+        // `matcher` is what the walk already rendered). Parsing unwrapped them
+        // first here, so a rendered `(…)` kept its parentheses — and
+        // ``resBody://`({"t":${now}})` ``, the form the documentation prints,
+        // put two of them in the body it mocked.
+        if is_tpl
+            && let Some((super::super::rules::url::Fixed::Inline, inner)) =
+                super::super::rules::url::fixed_value(&op.value)
+        {
+            op.value = inner;
+            op.value_is_content = true;
+        }
+        // The tail its pattern left over, held back until the template above had
+        // been rendered — see [`crate::rules::RuleOp::pending_tail`]. A template
+        // that turned out to be **content** takes no tail, which is the same
+        // rule `joins_tail` applies to a value written as `(…)` in the first
+        // place: upstream reads `rule.value` for those and never looks at the
+        // joined `rule.url` (`getRuleValue`, `lib/util/common.js:911-919`).
+        if let Some(tail) = op.pending_tail.take()
+            && !op.value_is_content
+        {
+            op.value = crate::rules::matcher::join_each_path(&op.protocol, &op.value, &tail);
         }
         true
     }
@@ -9309,6 +9341,66 @@ mod tests {
             of("a.com reqHeaders://`x=${nosuchvar}`\n", "reqHeaders").as_deref(),
             Some("x=${nosuchvar}")
         );
+    }
+
+    /// A template is rendered **before** the request's tail is appended, and the
+    /// scheme in front of it is not part of the template.
+    ///
+    /// Both halves are `TPL_RE`'s (`rules.js:72,:768`), and both were missing.
+    /// Joining first left a value that no longer ended with a backtick, so
+    /// nothing recognised it as a template — measured against whistle 2.10.8,
+    /// which answers `http://GET.dev/x` where this port sent
+    /// `` http://`${method}.dev`/x ``.
+    #[test]
+    fn a_template_destination_renders_before_it_takes_the_path() {
+        let none = HashMap::new();
+        let slot = |text: &str| {
+            let (info, mut resolved) = resolve_with_info(text, "http://b.com/x");
+            substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+            resolved.slot().map(|op| op.value.clone())
+        };
+
+        // Backticks around the whole destination, and around the part after the
+        // scheme — upstream's regexp accepts either.
+        assert_eq!(slot("b.com `http://${method}.dev`\n").as_deref(), Some("http://GET.dev/x"));
+        assert_eq!(slot("b.com http://`${method}.dev`\n").as_deref(), Some("http://GET.dev/x"));
+        // A scheme this port does not know keeps its place too.
+        assert_eq!(
+            slot("b.com tunnel://`${method}.dev:443`\n").as_deref(),
+            Some("tunnel://GET.dev:443/x")
+        );
+        // The file family joins the same way.
+        assert_eq!(
+            slot("b.com file://`/srv/${method}.json`\n").as_deref(),
+            Some("/srv/GET.json/x")
+        );
+        // A pattern that leaves no tail renders just the same.
+        let (info, mut resolved) = resolve_with_info("b.com/x `http://${method}.dev`\n", "http://b.com/x");
+        substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+        assert_eq!(resolved.slot().map(|op| op.value.as_str()), Some("http://GET.dev"));
+        // Not a template — a `//` that is not a scheme separator leaves the
+        // value alone, backtick or no backtick.
+        assert_eq!(
+            slot("b.com http://a`${method}`\n").as_deref(),
+            Some("http://a`${method}`/x")
+        );
+
+        // A rendered `(…)` is **content**, unwrapped after the render and never
+        // extended by the path — `getValue` runs on what `resolveVar` produced
+        // (`rules.js:810-822`). Measured: whistle answers `file://mock-GET`,
+        // and this port used to answer `(mock-GET)/x` — parentheses in the
+        // mock's own bytes, plus a path appended to a body.
+        let (info, mut resolved) =
+            resolve_with_info("b.com file://`(mock-${method})`\n", "http://b.com/x");
+        substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+        let op = resolved.slot().expect("a file rule");
+        assert_eq!(op.value, "mock-GET");
+        assert!(op.value_is_content);
+        // …and the same for an operator that never joins anything.
+        let (info, mut resolved) =
+            resolve_with_info("b.com reqHeaders://`(x-m=${method})`\n", "http://b.com/x");
+        substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+        assert_eq!(resolved.value("reqHeaders"), Some("x-m=GET"));
     }
 
     /// `resolveVar`'s subtlety (`rules.js:774-783`): when the value *was* a

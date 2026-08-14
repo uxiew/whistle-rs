@@ -136,6 +136,38 @@ pub fn join_url(base: &str, tail: &str) -> String {
     }
 }
 
+/// Split `TPL_RE`'s first group — `(?:[\w.-]+:)?//` — off the front of a value.
+///
+/// whistle tests a rule's **whole matcher** for a backtick template, and its
+/// regexp allows a scheme in front of the backticks: `TPL_RE =
+/// /^((?:[\w.-]+:)?\/\/)?(`.*`)$/` (`_original/lib/rules/rules.js:72,:768`).
+/// The prefix is put back untouched around the rendered body, so
+/// ``http://`${method}.example` `` is a template and this returns the two halves
+/// of it. Most operators have had their protocol split off long before this, and
+/// then there is no prefix to find; a **destination** keeps its scheme in the
+/// value, which is the case that needs asking.
+pub fn tpl_prefix(value: &str) -> (&str, &str) {
+    let Some(at) = value.find("//") else {
+        return ("", value);
+    };
+    let named = value[..at].strip_suffix(':').is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    });
+    match at == 0 || named {
+        true => value.split_at(at + 2),
+        false => ("", value),
+    }
+}
+
+/// Is the value a backtick template — [`tpl_prefix`] and then a `` `…` `` body?
+pub fn is_backtick_template(value: &str) -> bool {
+    let (_, rest) = tpl_prefix(value);
+    rest.len() > 1 && rest.starts_with('`') && rest.ends_with('`')
+}
+
 /// The bracket forms that pin an operator's value in place (`getValue`,
 /// `_original/lib/rules/rules.js:271-287`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
