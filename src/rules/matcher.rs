@@ -498,6 +498,35 @@ pub fn resolve_refs_once(rules: &[&Rule], req: &ReqInfo, is_internal_req: bool) 
     resolve_walk(rules, req, is_internal_req, false)
 }
 
+/// Can a local file answer this request at all?
+///
+/// Not on a WebSocket and not inside a tunnel: upstream skips every file-family
+/// candidate when the URL being resolved does not start with `h` — `notHttp &&
+/// protoMgr.isFileProxy(rule.matcher)` in `checkFilter`
+/// (`_original/lib/rules/rules.js:920,:977`). The test is only armed for the
+/// list that carries `isRuleProto`, which is the one shared list
+/// (`protocols.js:263`) — so it is exactly the [shared
+/// slot](protocols::SLOT_PROTOCOLS)'s file members that are passed over, and the
+/// slot then **falls through to the next candidate**: measured against whistle
+/// 2.10.8, `a.com file:///srv/x` and `a.com http://b.com` together answer a
+/// `ws://a.com/s` with the destination.
+///
+/// The reason it is skipped rather than applied is that there is nothing to
+/// apply it to. A file is a complete HTTP response; a WebSocket upgrade wants a
+/// 101 and a socket, and answering one with the contents of a directory is a
+/// handshake failure with a mock's status line on it. `statusCode://` and
+/// `redirect://` share the slot and are *not* skipped — both are answers a
+/// client can be given before it upgrades.
+fn serves_no_file(req: &ReqInfo) -> bool {
+    !matches!(req.scheme.as_str(), "http" | "https")
+}
+
+/// whistle's `isFileProxy` (`_original/lib/rules/protocols.js:281-283`): the
+/// local-file / template family, or `locationHref://`.
+fn is_file_proxy(protocol: &str) -> bool {
+    protocols::is_file_protocol(protocol) || protocol == "locationHref"
+}
+
 /// The resolution walk. `defer_res_phase` withholds the operators a second pass
 /// will resolve; see [`resolve_response_ops`].
 fn resolve_walk(
@@ -537,6 +566,9 @@ fn resolve_walk(
                     continue;
                 }
                 if exact.silences_op(op) {
+                    continue;
+                }
+                if serves_no_file(req) && is_file_proxy(&op.protocol) {
                     continue;
                 }
                 take(&mut resolved, rule, op, super::token_order(line, at), &matched);
@@ -1129,6 +1161,62 @@ mod tests {
             full_url: url.to_string(),
             ..Default::default()
         }
+    }
+
+    /// A WebSocket cannot be answered with a file, so whistle passes the file
+    /// family over and lets the slot fall through — see [`serves_no_file`].
+    #[test]
+    fn a_file_rule_does_not_answer_a_websocket_or_a_tunnel() {
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("a.com file:///srv/x\n");
+        assert_eq!(
+            m.resolve(&req("http://a.com/s")).slot().map(|op| op.protocol.as_str()),
+            Some("file")
+        );
+        for url in ["ws://a.com/s", "wss://a.com/s", "tunnel://a.com:443"] {
+            assert!(m.resolve(&req(url)).slot().is_none(), "{url}");
+        }
+
+        // The whole family, and `locationHref://` with it (`isFileProxy`).
+        for op in [
+            "file:///srv/x",
+            "xfile:///srv/x",
+            "xsfile:///srv/x",
+            "rawfile:///srv/x",
+            "tpl:///srv/x",
+            "jsonp:///srv/x",
+            "locationHref://http://x.com",
+        ] {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(&format!("a.com {op}\n"));
+            assert!(m.resolve(&req("ws://a.com/s")).slot().is_none(), "{op}");
+        }
+
+        // Not the rest of the slot: both of these answer a client that has not
+        // upgraded yet, and upstream keeps them (measured).
+        for op in ["statusCode://404", "redirect://http://x.com"] {
+            let mut m = crate::rules::RuleManager::new();
+            m.set_text(&format!("a.com {op}\n"));
+            assert!(m.resolve(&req("ws://a.com/s")).slot().is_some(), "{op}");
+        }
+
+        // The point of skipping rather than dropping: the next candidate wins.
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("a.com file:///srv/x\na.com http://b.com\n");
+        assert_eq!(
+            m.resolve(&req("ws://a.com/s")).slot().map(|op| op.value.as_str()),
+            Some("http://b.com/s")
+        );
+        assert_eq!(
+            m.resolve(&req("http://a.com/s")).slot().map(|op| op.protocol.as_str()),
+            Some("file")
+        );
+        // Only the slot is passed over — the rest of the line still applies.
+        let mut m = crate::rules::RuleManager::new();
+        m.set_text("a.com file:///srv/x reqHeaders://x-a=1\n");
+        let r = m.resolve(&req("ws://a.com/s"));
+        assert!(r.slot().is_none());
+        assert_eq!(r.value("reqHeaders"), Some("x-a=1"));
     }
 
     #[test]
