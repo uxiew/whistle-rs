@@ -469,8 +469,19 @@ token with a `scheme://` is never it, and a **bare IP address** is never it eith
 |-----------|----------------|
 | `127.0.0.1:8080` | `host://127.0.0.1:8080` |
 | `127.0.0.1` | `host://127.0.0.1` |
-| `/abs/path` · `~/f` · `./f` | `file:///abs/path` … |
-| any other URL | a destination — see below |
+| `/abs/path` · `C:\path` | `file:///abs/path` … |
+| `(text)` · `{name}` · `<path>` | `file://` and the bracket form — see below |
+| any other token | a destination — see below |
+
+**A path here is an absolute one.** `FILE_RE`
+(`_original/lib/rules/rules.js:36`) is a drive letter or a *single* leading
+slash, and nothing else: measured against whistle 2.10.8, `a.com ~/mock.json`
+resolves to the destination `http://~/mock.json/…`, not to a file. This port
+read `~/` and `./` as paths too until that was measured; the convenience was
+also a silent change of meaning, since `a.com .internal.example` became a local
+file that does not exist. Inside an operator's *value* `~/` is still a home
+path (`file://~/mock.json`), which is upstream's `convertSlash` →
+`getHomePath` (`lib/util/file-mgr.js:13-16`) and a different question.
 
 ### What an operator's value can be
 
@@ -649,6 +660,24 @@ Two differences from a `tpl://` file, both upstream's:
 - the whole value must be backticked. ``reqHeaders://x=`${method}` `` is not a
   template; the backticks are two literal characters.
 
+**A scheme may sit in front of the backticks**, because `TPL_RE` is
+`/^((?:[\w.-]+:)?\/\/)?(`.*`)$/` (`rules.js:72`) — the prefix stays where it is
+and the body is rendered. It only shows on a **destination**, whose scheme is
+part of its value, and both spellings mean the same thing:
+
+```
+www.example.com   `http://${method}.dev`
+www.example.com   http://`${method}.dev`      # same rule
+```
+
+**Rendered first, extended second.** The request's leftover path is appended to
+what came *out* of the template, never to the template
+(`resolveVar` runs in the resolution walk and `getPathRule` joins after it,
+`rules.js:936-948,:1010`), so ``example.com file://`/srv/${method}.json` `` on
+`/x` reads `/srv/GET.json/x`. And the bracket forms are read after the render
+too: ``resBody://`({"m":"${method}"})` `` mocks `{"m":"GET"}` — parentheses off,
+content, and no path appended.
+
 **The subtle one.** When the value *was* a backtick template, whatever the
 [values store](#flags-includes--values) returns for a `${name}` inside it is
 rendered too (`rule.isTpl && key ? resolveTplVar(key, req) : key`,
@@ -776,6 +805,18 @@ directory onto a URL prefix:
 | `example.com http://localhost:5173` | `/a/b?q=1` | `http://localhost:5173/a/b?q=1` |
 | `example.com/api http://dev/v2` | `/api/users?x=2` | `http://dev/v2/users?x=2` |
 | `example.com file:///srv/static` | `/js/app.js?v=2` | `/srv/static/js/app.js` |
+| `example.com file:///srv/mock.json` | `/` | `/srv/mock.json` — **nothing** is appended |
+
+That last row is the root, and it is a rule of its own: a **domain** pattern is
+stored with the trailing slash (`formatUrl`,
+`_original/lib/util/common.js:526-536`), so a request for `/` leaves no tail at
+all. It matters for a value that names a *file* — `/srv/mock.json/` is a
+directory that does not exist — and it is why `example.com file:///srv/static`
+answers `/` with **404** on both proxies: the `index.html` candidate comes from
+a trailing slash in the text you wrote (`getRuleFiles`,
+`lib/util/index.js:1443-1450`), so write `file:///srv/static/` when you want the
+index. A pattern that carries a path is not stored with the slash, so
+`example.com/api file:///srv/d` on `/api/` does take the `/`.
 
 Wrap the value in `< >` to turn that off, and in `( )` to give the value *as
 content* rather than as a location:
@@ -790,6 +831,12 @@ A file rule may list alternatives with `|`, and each one takes the path:
 ```
 static.example.com   file:///srv/a|/srv/b        # first one that exists wins
 ```
+
+Only the **file** family is a list. `getFiles` splits the matcher for
+`rule.files` and nothing else (`rules.js:290,:943-948`), so a `|` in a
+destination is an ordinary character — `example.com http://dev/api?f=a|b`
+forwards the filter it was given, where splitting would have handed the origin
+half of it.
 
 > `rule://<name>` is **not** a destination: it is this port's own spelling for
 > pulling a values-store entry in as more rules. Upstream files it in the same
@@ -1549,6 +1596,21 @@ it at a segment boundary, and a `*` in the path of an ordinary pattern is a
 **literal** — `old.example.com/legacy/*` matches a URL containing the character
 `*` and nothing else. Write `^http://old.example.com/legacy/**` when you need a
 path wildcard with a capture.
+
+**A file never answers a WebSocket or a tunnel.** When the URL being resolved is
+not an `http(s)://` one — `ws://`, `wss://`, `tunnel://` — every candidate in the
+file family, and `locationHref://` with it, is passed over and the slot falls
+through to the next rule (`notHttp && protoMgr.isFileProxy(rule.matcher)`,
+`_original/lib/rules/rules.js:920,:977`). A file is a complete HTTP response and
+an upgrade wants a `101`, so answering one with a directory listing is a
+handshake failure wearing a mock's status line. `statusCode://` and `redirect://`
+share the slot and are *not* passed over: both are answers a client can be given
+before it upgrades.
+
+```
+chat.example.com   file:///srv/mock.json       # ignored by the WebSocket…
+chat.example.com   127.0.0.1:9000              # …which this line still moves
+```
 
 **These share one slot with each other and with a bare destination URL.** None
 of `file`, `rawfile`, `tpl`, `jsonp`, `dust`, `redirect`, `location`,
