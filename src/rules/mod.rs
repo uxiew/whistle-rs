@@ -2858,12 +2858,20 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
     // upstream rewrites `{key}`, `(value)` and `<path>` to `file://…` before
     // parsing (`formatShorthand`, `_original/lib/rules/rules.js:222-240`), so a
     // line may name a mock without naming a protocol.
-    if tok.starts_with('/')
-        || tok.starts_with('~')
-        || tok.starts_with('.')
-        || url::fixed_value(tok).is_some()
-        || url::is_values_key(tok)
-    {
+    //
+    // **What counts as a path is `FILE_RE`'s answer, not a wider one.** This
+    // read `~/` and `./` as paths too, which upstream does not: `FILE_RE`
+    // (`rules.js:36`) is a drive letter or a *single* leading slash, and
+    // measured against whistle 2.10.8, `a.com ~/mock.json` resolves to the
+    // destination `http://~/mock.json/…` there. The extra prefixes were not a
+    // convenience but a silent change of meaning in both directions — a
+    // leading-dot hostname (`a.com .internal.example`) became a local file that
+    // does not exist, and a rules file written for whistle served a mock where
+    // whistle forwards. `~` is still expanded inside a *value*
+    // (`file://~/mock.json`), which is upstream's `convertSlash` →
+    // `getHomePath` (`lib/util/file-mgr.js:13-16`, `common.js:571-576`) and a
+    // different question from what an unprefixed token means.
+    if is_file_path(tok) || url::fixed_value(tok).is_some() || url::is_values_key(tok) {
         return op("file", tok);
     }
     // Anything else with no protocol at all is still a destination: upstream's
@@ -4672,6 +4680,22 @@ mod parse_text_tests {
         // A bare IP is still the address shorthand, not a destination.
         let rules = parse_text("example.com 1.2.3.4:8080");
         assert_eq!(rules[0].ops[0].protocol, "host");
+        // And so is a token that merely *looks* like a relative path. `FILE_RE`
+        // wants a drive letter or one leading slash; everything else is a
+        // destination, measured against whistle 2.10.8, which resolves
+        // `a.com ~/mock.json` to `http://~/mock.json/…`. Reading these as files
+        // turned a leading-dot hostname into a 404 and a whistle rules file
+        // into a different program.
+        for tok in ["~/mock.json", "./mock.json", "../mock.json", "...", ".internal.example"] {
+            let rules = parse_text(&format!("example.com {tok}"));
+            assert_eq!(rules[0].ops[0].protocol, protocols::URL_REPLACE, "{tok}");
+            assert_eq!(rules[0].ops[0].value, tok, "{tok}");
+        }
+        // The paths that are paths still are.
+        for tok in ["/srv/mock.json", "/"] {
+            let rules = parse_text(&format!("example.com {tok}"));
+            assert_eq!(rules[0].ops[0].protocol, "file", "{tok}");
+        }
         // …and so are the bracket forms, which name a mock rather than a place
         // (`formatShorthand`). The inline one is unwrapped on the way through,
         // which is what makes it *content* rather than a path.
