@@ -198,6 +198,42 @@ matcher narrow enough that it cannot excuse anything else, the same discipline
 matches `Host: EXAMPLE.COM` here and not upstream, which `docs/RULES.md` declares
 and the bench proves case by case by re-asking upstream with the host lowered.
 
+### Why a case proves nothing
+
+`inert` is a number; `triage-inert.js` is the reason behind it.
+
+```sh
+PORT_BASE=19500 CASES=./cases-bodies.js npm run bench \
+  | PORT_BASE=19500 node triage-inert.js ./cases-bodies.js
+```
+
+It takes the inert list out of the bench's own JSON and resolves each of those
+cases' rules against its own request — through the oracle's machinery, so the
+answer is the resolver's — and sorts them into four:
+
+* **baselines**, which carry no rules and whose whole claim is what the origin
+  does;
+* **matched and did nothing**, which is most of them and usually correct:
+  `jsAppend://` on a CSS response is *supposed* to do nothing, and the case
+  says so by being inert. It prints the operators, so a family that should have
+  had an effect stands out;
+* **never matched, and the line says why** — a filter, an `ignore://`, a
+  `skip://`, a negated pattern, an `@` source that is not one;
+* **never matched, with nothing to explain it.** That is the bug: the case has
+  been passing in the shape of a rule that fires and does nothing, which is the
+  shape a *missing feature* has too.
+
+A case that means to miss says so with `inert: true`, and the tool checks that
+claim both ways — a case that declares itself inert and turns out to
+discriminate is a stale marker, and is reported too.
+
+It found four cases that had fallen into the same trap: **a token cannot
+contain a space**, so `resBody://(NEW BODY)` parses as `resBody://(NEW` plus a
+second *pattern* `BODY)`, and the line then matches nothing at all. One case in
+the same corpus documents that trap on purpose; two others had walked into it,
+along with two `resCookies://` values carrying a `; ` and a date. All fourteen
+corpora now report zero unexplained.
+
 ## Reading a difference
 
 Two divergences are **deliberate** and declared in `EXPECTED` at the top of
