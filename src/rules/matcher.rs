@@ -1246,6 +1246,40 @@ mod tests {
         assert_eq!(r.value("reqHeaders"), Some("x-a=1"));
     }
 
+    /// A domain pattern is matched against the **host**, case folded; a regexp
+    /// pattern is matched against the URL as text, and is not.
+    ///
+    /// A declared divergence, and the direction matters: whistle compares the
+    /// pattern with `indexOf` over the URL (`rules.js:1078-1083`), so a client
+    /// sending `Host: EXAMPLE.COM` gets none of the rules written for
+    /// `example.com` — measured against 2.10.8, which forwarded the request to
+    /// the real origin instead. A rule that stops applying because somebody
+    /// shifted a key fails open, so this port folds the case of the thing that
+    /// is case-insensitive by definition and leaves the text comparison alone.
+    /// Recorded in `docs/RULES.md`.
+    #[test]
+    fn a_domain_pattern_ignores_the_hosts_case_and_a_regexp_does_not() {
+        let matched = |text: &str, url: &str| {
+            let mut mgr = crate::rules::RuleManager::new();
+            mgr.set_text(text);
+            let mut info = req(url);
+            // What `build_req_info` does: the host is folded, the URL is not.
+            info.full_url = url.to_string();
+            info.host = info.host.to_ascii_lowercase();
+            mgr.resolve(&info).value("host").is_some()
+        };
+        for pattern in ["case.test", "http://case.test", "case.test/x"] {
+            let text = format!("{pattern} host://1.1.1.1");
+            assert!(matched(&text, "http://case.test/x"), "{pattern}");
+            assert!(matched(&text, "http://CASE.TEST/x"), "{pattern}");
+        }
+        // The URL is text to a regexp, and text has a case.
+        let re = r"/^http:\/\/case\.test/ host://1.1.1.1";
+        assert!(matched(re, "http://case.test/x"));
+        assert!(!matched(re, "http://CASE.TEST/x"));
+        assert!(matched(r"/^http:\/\/case\.test/i host://1.1.1.1", "http://CASE.TEST/x"));
+    }
+
     #[test]
     fn hosts_shorthand_maps_host() {
         let mut m = crate::rules::RuleManager::new();
