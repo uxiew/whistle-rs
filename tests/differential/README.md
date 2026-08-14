@@ -234,6 +234,33 @@ the same corpus documents that trap on purpose; two others had walked into it,
 along with two `resCookies://` values carrying a `; ` and a date. All fourteen
 corpora now report zero unexplained.
 
+### Which operators the bench proves anything about
+
+`every_documented_rule_has_a_differential_case` (a Rust test) says every
+documented rule name appears in a corpus. It says so in the weakest possible
+terms, and admits it: a case exists, not that the case has any force.
+`coverage-ops.js` asks the stronger question.
+
+```sh
+PORT_BASE=19500 node coverage-ops.js     # runs all fourteen benches, a few minutes
+```
+
+For each operator: is there at least one case that resolves it **and** whose
+answer would change if the rule were removed? The universe is `operators.js` —
+one spelling of everything this port parses — so an operator nobody wrote a case
+for cannot hide by being absent from both the corpus and the list.
+
+It found two things on its first run. `xsfile://` had exactly one case and that
+case was inert by design (an unsplit path that does not exist falls through to
+the origin), so nothing had ever proved the operator does anything at all.
+And `location://`, which no case asked about, turned out not to be a protocol:
+it is in neither upstream's registry nor its alias table, so whistle answers
+`502 Unsupported protocol location:` where this port answered a `302`.
+
+What is left is eight operators the corpora here cannot reach — dumps, ciphers,
+delays, frames, plugins — each named with the bench or the test that does reach
+it.
+
 ## Reading a difference
 
 Two divergences are **deliberate** and declared in `EXPECTED` at the top of

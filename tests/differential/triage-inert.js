@@ -25,10 +25,11 @@ const path = require('path');
 const { portResolve } = require('./rules-oracle.js');
 
 function readBenchJson(text) {
-  // The bench prints progress lines and then one JSON object.
-  const start = text.indexOf('\n{');
+  // The bench prints progress lines and then one JSON object — and the progress
+  // goes to stderr, so with stdout alone the object is the whole input.
+  const start = text.search(/^\{/m);
   if (start === -1) throw new Error('no bench JSON on stdin');
-  return JSON.parse(text.slice(start + 1));
+  return JSON.parse(text.slice(start));
 }
 
 function main(text) {
