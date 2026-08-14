@@ -144,6 +144,60 @@ was in the bench: the tunnel's socket is already decrypted, so what travels
 inside it is plain HTTP, and using an HTTPS client on it negotiated TLS a second
 time.
 
+## The rules oracle
+
+`rules-oracle.js` asks a narrower question than everything above, and pays
+almost nothing for it: **which rules match this request, and what does each
+operator end up holding**. It needs no proxy, no origin and no port — whistle's
+own `Rules` (`lib/rules/rules.js`) is driven in-process, this port answers
+through `whistle-rs explain --batch`, and the two answers are compared.
+
+```sh
+cargo build                     # the bench runs target/debug/whistle-rs
+node rules-oracle.js            # which operators matched
+node rules-oracle.js --values   # …and what each one resolved to
+node rules-oracle.js --grep host --limit 5
+```
+
+Its corpus is `cases-rulelines.js`, written by `gen-rulelines.js` from a
+checkout of the docs: **every concrete rule line the whistle documentation
+prints**, kept verbatim — `docs/docs/**/*.md` from the upstream
+repository, the rule pages and the pages beside them. `cases-docs.js` had to
+repoint each pattern at a live origin and drop every line that would make a
+proxy dial a stranger; this one resolves rather than runs, so
+`/Users/john/mock.json`, `www.test.com` and `10.1.0.1:8080` all stay as written.
+Each line is asked about a fixed set of URLs plus URLs derived from its own
+pattern — 17k questions in under a second, which is cheap enough to run on every
+change.
+
+It has a second corpus: `--from-cases` reads the fourteen **hand-written**
+corpora as *rules* instead of running them as requests. Each of those cases
+already carries its own request — a method, a path, headers, sometimes a body —
+so it can be asked exactly, and they are the awkward lines somebody sat down and
+thought of rather than the ones a website prints (1842 questions, and they need
+`PORT_BASE` set to the same value the corpora were written against).
+
+It is the layer most of this port's bugs have lived in, and the first run found
+six: a bare `~/mock.json` read as a file where whistle reads a destination; a
+`file://` rule answering a WebSocket upgrade; a domain pattern appending `/` to
+its value at the root, so `file:///srv/mock.json` opened `/srv/mock.json/`; a `|`
+in a destination's query string split in half; a backtick template joined to the
+request's path *before* it was rendered, which left the template unrendered; and
+a ``` block's `\r\n` rewritten to `\n`, which is the framing of the raw HTTP
+response such a block is usually written to hold.
+
+**What it cannot see.** Resolution is not application: two proxies that resolve
+a rule identically can still apply it differently, and that is the live bench's
+subject. Neither does it see the response phase, plugins, or anything an
+`@`-include pulls in mid-request.
+
+A clean run is `differing: 0, value differences: 0`. It also reports
+**`declared`** — differences this port has declared, each with its reason and a
+matcher narrow enough that it cannot excuse anything else, the same discipline
+`EXPECTED` keeps below — and **`host-case folds`** — questions whose only difference is that a domain pattern
+matches `Host: EXAMPLE.COM` here and not upstream, which `docs/RULES.md` declares
+and the bench proves case by case by re-asking upstream with the host lowered.
+
 ## Reading a difference
 
 Two divergences are **deliberate** and declared in `EXPECTED` at the top of
