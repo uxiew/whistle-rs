@@ -198,7 +198,7 @@ module.exports = [
   },
   { name: 'host: two lines, the first wins', rules: `${P} host://${OTHER}\n${P} host://${CLOSED}` },
   { name: 'host: on a pattern that carries its own port', rules: `127.0.0.1:${PORTS.origin}/echo host://${OTHER}` },
-  { name: 'host: a pattern whose port does not match', rules: `127.0.0.1:${PORTS.originB}/echo host://${OTHER}` },
+  { name: 'host: a pattern whose port does not match', inert: true, rules: `127.0.0.1:${PORTS.originB}/echo host://${OTHER}` },
 
   // ── host:// meeting other rules ────────────────────────────────────────
   { name: 'host: with a request header rule', rules: `${P} host://${OTHER} reqHeaders://x-a=1` },

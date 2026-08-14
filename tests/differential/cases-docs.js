@@ -157,7 +157,12 @@ module.exports = [
   { name: 'htmlPrepend: www.example.com/path3 htmlPrepend://(test) file://([-test-])  enable://safeHtml', rules: `${P} htmlPrepend://(test) file://([-test-]) enable://safeHtml` },
   // ── https-proxy ─────────────────────────────────────────────────
   { name: 'https-proxy: www.example.com https-proxy://127.0.0.1:1234', rules: `${P} https-proxy://127.0.0.1:1234` },
-  { name: 'https-proxy: www.example.com/api www.example.com https-proxy://127.0.0.1:1234', rules: `${P} www.example.com https-proxy://127.0.0.1:1234` },
+  // Inert by construction, and kept for it: the documented line carries **two**
+  // patterns sharing one operator, and this corpus repoints the first at the
+  // bench's `ip:port` origin — which is the `host://` shorthand, not a pattern.
+  // What is left is `www.example.com`, which no request here matches. Both
+  // proxies read the line that way, which is what the case now proves.
+  { name: 'https-proxy: two patterns, the first repointed into a host override', inert: true, rules: `${P} www.example.com https-proxy://127.0.0.1:1234` },
   // ── jsAppend ────────────────────────────────────────────────────
   { name: 'jsAppend: www.example.com/path1 jsAppend://(Hello) file://(-test-)', rules: `${P} jsAppend://(Hello) file://(-test-)` },
   { name: 'jsAppend: www.example.com/path2 jsAppend://(Hello) file://(-test-) resType://js', rules: `${P} jsAppend://(Hello) file://(-test-) resType://js` },
@@ -194,7 +199,12 @@ module.exports = [
   { name: 'pipe: wss://test-ws.example.com/path pipe://test-pipe-ws', rules: `${P} pipe://test-pipe-ws` },
   // ── proxy ───────────────────────────────────────────────────────
   { name: 'proxy: www.example.com proxy://127.0.0.1:1234', rules: `${P} proxy://127.0.0.1:1234` },
-  { name: 'proxy: www.example.com/api www.example.com proxy://127.0.0.1:1234', rules: `${P} www.example.com proxy://127.0.0.1:1234` },
+  // Inert by construction, and kept for it: the documented line carries **two**
+  // patterns sharing one operator, and this corpus repoints the first at the
+  // bench's `ip:port` origin — which is the `host://` shorthand, not a pattern.
+  // What is left is `www.example.com`, which no request here matches. Both
+  // proxies read the line that way, which is what the case now proves.
+  { name: 'proxy: two patterns, the first repointed into a host override', inert: true, rules: `${P} www.example.com proxy://127.0.0.1:1234` },
   // ── redirect ────────────────────────────────────────────────────
   { name: 'redirect: www.example.com/path2 redirect://../abc/123', rules: `${P} redirect://../abc/123` },
   // ── replaceStatus ───────────────────────────────────────────────
@@ -249,7 +259,12 @@ module.exports = [
   { name: 'sniCallback: wwww.example.com sniCallback://test-sni(abc)', rules: `${P} sniCallback://test-sni(abc)` },
   // ── socks ───────────────────────────────────────────────────────
   { name: 'socks: www.example.com socks://127.0.0.1:1234', rules: `${P} socks://127.0.0.1:1234` },
-  { name: 'socks: www.example.com/api www.example.com socks://127.0.0.1:1234', rules: `${P} www.example.com socks://127.0.0.1:1234` },
+  // Inert by construction, and kept for it: the documented line carries **two**
+  // patterns sharing one operator, and this corpus repoints the first at the
+  // bench's `ip:port` origin — which is the `host://` shorthand, not a pattern.
+  // What is left is `www.example.com`, which no request here matches. Both
+  // proxies read the line that way, which is what the case now proves.
+  { name: 'socks: two patterns, the first repointed into a host override', inert: true, rules: `${P} www.example.com socks://127.0.0.1:1234` },
   // ── statusCode ──────────────────────────────────────────────────
   { name: 'statusCode: www.example.com/api/old-endpoint statusCode://410', rules: `${P} statusCode://410` },
   // ── style ───────────────────────────────────────────────────────

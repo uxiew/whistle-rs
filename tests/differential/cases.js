@@ -98,7 +98,7 @@ module.exports = [
   // ── precedence and shape ───────────────────────────────────────────────
   { name: 'first matching line wins a single-value operator', rules: `${P} ua://first\n${P} ua://second` },
   { name: 'important reverses that', rules: `${P} ua://first\n${P} ua://second lineProps://important` },
-  { name: 'a pattern that does not match', rules: `other.test reqHeaders://x-a=1` },
+  { name: 'a pattern that does not match', inert: true, rules: `other.test reqHeaders://x-a=1` },
   { name: 'wildcard pattern', rules: `*.0.0.1:${PORT} reqHeaders://x-w=1` },
   { name: 'regexp pattern with a group', rules: `/127\\.0\\.0\\.(\\d+):${PORT}/ reqHeaders://x-g=$1` },
   { name: 'inline comment is not a rule', rules: `${P} reqHeaders://x-a=1 # a comment` },
@@ -110,9 +110,9 @@ module.exports = [
   // deleted, because "this documented-looking line is inert" is worth a case;
   // the live pair after them asks the questions the old names promised, with a
   // pattern that cannot be swapped away.
-  { name: 'doc: a bare host with an http:// URL swaps into pattern and host', rules: `${P} http://${P}/moved` },
+  { name: 'doc: a bare host with an http:// URL swaps into pattern and host', inert: true, rules: `${P} http://${P}/moved` },
   { name: 'doc: a bare host with an <http://> URL swaps and turns into a file', rules: `${P} <http://${P}/fixed>`, request: { path: '/echo/deep/path' } },
-  { name: 'doc: the swap leaves a plain request unmatched', rules: `${P} http://${P}/base`, request: { path: '/echo/deep' } },
+  { name: 'doc: the swap leaves a plain request unmatched', inert: true, rules: `${P} http://${P}/base`, request: { path: '/echo/deep' } },
   { name: 'doc: path is concatenated by default', rules: `^http://${P}/echo** http://${P}/base`, request: { path: '/echo/deep' } },
   // The brackets go **inside** the scheme. `<http://…>` is not a destination
   // that refuses the join — the whole token is wrapped, and `formatShorthand`
@@ -127,8 +127,8 @@ module.exports = [
   // is the pattern and the host is a `host://` operator, and a plain HTTP request
   // matches no such pattern. What they pin is the swap, not the ws rule — the
   // pair below asks the ws question with a pattern that cannot be swapped away.
-  { name: 'doc: a bare host with a ws:// URL swaps into pattern and host', rules: `${P} ws://${P}/other` },
-  { name: 'doc: a bare host with a tunnel:// URL swaps the same way', rules: `${P} tunnel://${P}` },
+  { name: 'doc: a bare host with a ws:// URL swaps into pattern and host', inert: true, rules: `${P} ws://${P}/other` },
+  { name: 'doc: a bare host with a tunnel:// URL swaps the same way', inert: true, rules: `${P} tunnel://${P}` },
   { name: 'doc: submatch $1 from a wildcard', rules: `^http://${P}/**  reqHeaders://x-sub=$1`, request: { path: '/echo/abc' } },
   { name: 'doc: submatch $1 from a regexp', rules: `/127\\.0\\.0\\.1:${PORT}\\/(\\w+)/ reqHeaders://x-sub=$1` },
   { name: 'doc: urlParams with an existing query', rules: `${P} urlParams://a=1&b=2`, request: { path: '/echo?c=3' } },
@@ -138,7 +138,7 @@ module.exports = [
   { name: 'doc: log tag', rules: `${P} log://mytag` },
   { name: 'doc: two operators on one line', rules: `${P} reqHeaders://x-a=1 resHeaders://x-b=2` },
   { name: 'doc: pattern with a path prefix', rules: `${P}/echo reqHeaders://x-p=1` },
-  { name: 'doc: pattern with a path that should not match', rules: `${P}/nope reqHeaders://x-p=1` },
+  { name: 'doc: pattern with a path that should not match', inert: true, rules: `${P}/nope reqHeaders://x-p=1` },
   { name: 'doc: ignore silences an operator', rules: `${P} reqHeaders://x-a=1 ignore://reqHeaders` },
   { name: 'doc: skip is the same as ignore', rules: `${P} reqHeaders://x-a=1 skip://reqHeaders` },
   { name: 'doc: enable and disable on one line', rules: `${P} disable://cookie enable://abort`, request: { headers: { cookie: 'a=1' } } },
@@ -149,28 +149,28 @@ module.exports = [
   // `$example.test` applied to every URL on the host instead of its root.
   { name: 'doc pattern: $ exact matches its own path', rules: `$http://${P}/echo reqHeaders://x-hit=1` },
   { name: 'doc pattern: $ ignores the query when it has none', rules: `$http://${P}/echo reqHeaders://x-hit=1`, request: { path: '/echo?a=1' } },
-  { name: 'doc pattern: $ does not match a sub-path', rules: `$http://${P}/echo reqHeaders://x-hit=1`, request: { path: '/echo/sub' } },
+  { name: 'doc pattern: $ does not match a sub-path', inert: true, rules: `$http://${P}/echo reqHeaders://x-hit=1`, request: { path: '/echo/sub' } },
   { name: 'doc pattern: $ with a query is exact in both', rules: `$http://${P}/echo?a=1 reqHeaders://x-hit=1`, request: { path: '/echo?a=1' } },
-  { name: 'doc pattern: $ with a query rejects another', rules: `$http://${P}/echo?a=1 reqHeaders://x-hit=1`, request: { path: '/echo?b=2' } },
+  { name: 'doc pattern: $ with a query rejects another', inert: true, rules: `$http://${P}/echo?a=1 reqHeaders://x-hit=1`, request: { path: '/echo?b=2' } },
   { name: 'doc pattern: $ carries no precedence', rules: `${P}/echo reqHeaders://x-who=normal\n$http://${P}/echo reqHeaders://x-who=exact` },
   { name: 'doc pattern: !$ is a negated exact', rules: `!$http://${P}/echo reqHeaders://x-hit=1` },
   { name: 'doc pattern: !$ matches everything else', rules: `!$http://${P}/echo reqHeaders://x-hit=1`, request: { path: '/echo/sub' } },
   { name: 'doc pattern: scheme-relative //host/path', rules: `//${P}/echo reqHeaders://x-hit=1` },
   { name: 'doc pattern: ^ wildcard in a path', rules: `^http://${P}/ec*o reqHeaders://x-hit=1` },
-  { name: 'doc pattern: ^ with a trailing $ boundary', rules: `^http://${P}/ec*o$ reqHeaders://x-hit=1`, request: { path: '/echo/deep' } },
+  { name: 'doc pattern: ^ with a trailing $ boundary', inert: true, rules: `^http://${P}/ec*o$ reqHeaders://x-hit=1`, request: { path: '/echo/deep' } },
   { name: 'doc pattern: port-only', rules: `:${PORT} reqHeaders://x-hit=1` },
-  { name: 'doc pattern: port-only that misses', rules: `:9999 reqHeaders://x-hit=1` },
+  { name: 'doc pattern: port-only that misses', inert: true, rules: `:9999 reqHeaders://x-hit=1` },
 
   // A pattern that carries a query changes how its *path* is matched: prefix
   // everywhere else, exact here ("路径必须完全相同，且查询字符串以 xxx 为前缀",
   // https://wproxy.org/docs/rules/pattern.html §3.2). Asked three ways, because
   // "the rule missed" and "the rule does not exist" look the same from one case.
   { name: 'doc pattern: a query pattern matches its own path', rules: `${P}/echo?q= reqHeaders://x-hit=1`, request: { path: '/echo?q=1' } },
-  { name: 'doc pattern: a query pattern will not prefix-match the path', rules: `${P}/ec?q= reqHeaders://x-hit=1`, request: { path: '/echo?q=1' } },
-  { name: 'doc pattern: a query pattern rejects a longer path', rules: `${P}/echo?q= reqHeaders://x-hit=1`, request: { path: '/echo/sub?q=1' } },
+  { name: 'doc pattern: a query pattern will not prefix-match the path', inert: true, rules: `${P}/ec?q= reqHeaders://x-hit=1`, request: { path: '/echo?q=1' } },
+  { name: 'doc pattern: a query pattern rejects a longer path', inert: true, rules: `${P}/echo?q= reqHeaders://x-hit=1`, request: { path: '/echo/sub?q=1' } },
   // Query wildcards under `^`: `*` is `[^&]*` and stops at the separator, `**`
   // is `.*` and eats the rest of the query string (same page, "查询参数通配符").
-  { name: 'doc pattern: ^ query * stops at the separator', rules: `^http://${P}/echo?q=a*b reqHeaders://x-hit=1`, request: { path: '/echo?q=a&r=b' } },
+  { name: 'doc pattern: ^ query * stops at the separator', inert: true, rules: `^http://${P}/echo?q=a*b reqHeaders://x-hit=1`, request: { path: '/echo?q=a&r=b' } },
   { name: 'doc pattern: ^ query ** crosses it', rules: `^http://${P}/echo?q=a**b reqHeaders://x-hit=1`, request: { path: '/echo?q=a&r=b' } },
   { name: 'doc pattern: ^ query * within one value', rules: `^http://${P}/echo?q=a*b reqHeaders://x-hit=1`, request: { path: '/echo?q=axxb&r=1' } },
 

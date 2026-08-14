@@ -124,6 +124,6 @@ module.exports = [
   { name: 'several lineProps tokens merge', rules: `${P} method://PUT lineProps://internalOnly lineProps://important` },
   { name: 'an empty payload is a no-op', rules: `${P} method://PUT lineProps://` },
   { name: 'an unknown action is kept and ignored', rules: `${P} method://PUT lineProps://totallyMadeUp` },
-  { name: 'lineProps alone is not a rule', rules: `${P} lineProps://important` },
+  { name: 'lineProps alone is not a rule', inert: true, rules: `${P} lineProps://important` },
   { name: 'the properties land on every operator of the line', rules: `${P} file://(MOCKED) resHeaders://x-a=1 lineProps://disableAutoCors`, request: { headers: { origin: 'http://other.test' } } },
 ];

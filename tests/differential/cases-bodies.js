@@ -206,6 +206,6 @@ module.exports = [
   { name: 'jsPrepend on a gzip page', rules: `${P} jsPrepend://(TOP=1)`, request: { path: '/gz' } },
   // The space. Both proxies read two tokens and inject nothing — the second
   // token is not an operator, so it is a pattern nothing matches.
-  { name: 'an inline payload cannot contain a space', rules: `${P} jsAppend://(var TOP=1;)`, request: { path: '/html' } },
+  { name: 'an inline payload cannot contain a space', inert: true, rules: `${P} jsAppend://(var TOP=1;)`, request: { path: '/html' } },
   { name: 'the same payload without the space does inject', rules: `${P} jsAppend://(var_TOP=1;)`, request: { path: '/html' } },
 ];
