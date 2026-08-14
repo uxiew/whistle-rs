@@ -41,7 +41,7 @@ CONNECT 隧道 + HTTPS 中间人）以及**动态 CA 证书生成**。
 - **内建 SOCKS5 服务** —— 接受 SOCKS5 客户端（`--socks-port`）进入同一套拦截管线，
   自动识别 TLS 与明文 HTTP。
 - **规则引擎** —— whistle 规则语法：域名/前缀、前导点子域、域名通配符、`^` 前缀的
-  路径/查询通配符（含 `$1`…`$9` 子匹配传值）与正则模式；`$` 高优先级；多命中累加。
+  路径/查询通配符（含 `$1`…`$9` 子匹配传值）与正则模式；`lineProps://important` 高优先级；多命中累加。
 - **转发** —— 一个裸 URL 就把站点指向本地开发服务
   （`www.example.com http://localhost:5173`），未命中的路径会自动拼接过去。
 - **目标改写**（`host://`）—— 改写目标 IP/端口，同时保留原始 `Host` 头与 TLS SNI ——
@@ -250,6 +250,29 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `-v, --verbose` | 调试日志 —— 失败的**原因**，这是光看 `502` 得不到的 | 关闭 |
 | `-h, --help` / `-V, --version` | 帮助 / 版本 | —— |
 
+### `whistle-rs explain` —— 这个请求会命中哪些规则？
+
+原版控制台里的 *Test Rules*，这里是一个子命令，而且**什么都不启动** —— 不开服务、
+不建存储目录、不生成 CA。它回答的是规则文件最常见的那个问题：**一条不命中的规则什么
+也不报**，命中和落空在客户端那边长得一模一样。
+
+```console
+$ whistle-rs explain --rules rules.txt -X POST -H 'x-env: staging' \
+    'http://www.example.com/api/list?id=2'
+http://www.example.com/api/list?id=2
+  rule        http://localhost:5173/api/list?id=2   [slot]
+      on: www.example.com http://localhost:5173
+  reqHeaders  x-env=staging
+      on: www.example.com/api reqHeaders://x-env=staging
+```
+
+`[slot]` 标出赢下[共享槽位](docs/RULES.md#short-circuit-no-upstream-request-is-made)
+的那个算子 —— 输的那些**根本不在输出里**，这就是「我的 mock 为什么被忽略」的答案。
+另有 `--body`（喂 `b:` 条件）、`--client-ip`（喂 `clientIp:`）、
+`--value NAME=CONTENT`（取值）、`--json`，以及 `--batch`（stdin 一行一个 JSON 问题）。
+最后这个就是 `tests/differential/rules-oracle.js` 的接口：同样一万七千个问题，一边问
+本移植、一边问 whistle 自己的解析器，逐条比对。
+
 ## 文档
 - [`docs/UPSTREAM.md`](docs/UPSTREAM.md) —— 原版 whistle 的取回方式与提交号；源码里 513 处 `_original/…` 引用都指向它
 
@@ -277,7 +300,7 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 - HTTP/2 拦截（ALPN h2），失败回退 HTTP/1.1
 - WebSocket（`ws://`/`wss://`）升级隧道**并逐帧抓取**
 - 根 CA 生成、持久化与 `/rootCA.crt` 下载
-- 规则引擎：注释、hosts 简写、正则/通配/前缀/点模式、`$` 高优先级、多命中累加、
+- 规则引擎：注释、hosts 简写、正则/通配/前缀/点模式、`lineProps://important` 高优先级、多命中累加、
   `ignore://`、`filter`/`includeFilter`/`excludeFilter` 条件（方法/域名/头/客户端 IP/URL）
 - 上游路由：`proxy`/`http-proxy`/`https-proxy`/`internal-proxy`（HTTP 代理）与
   `socks`（SOCKS5）；`pac`（求值 PAC 选择代理）
@@ -365,11 +388,11 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 |------|------------|
 | 命中了你以为不该命中的 URL，或反过来 | 路径前缀只在 `/`、`\`、`?` 边界上匹配：`example.com/path/to` 命中 `/path/to/x`，但**不**命中 `/path/toxxx`。 |
 | 路径里的 `*` 什么都匹配不到 | `*` **只在域名部分**是通配符；在路径里它是字面量，因为 `*` 是合法的 URL 字符。要路径通配请写 `^http://example.com/old/**`。筛选器是例外 —— 它的 pattern 总按 `^` 解读。 |
-| mock / 重定向 / 转发被静默忽略 | `file`、`redirect`、`statusCode`、模板家族与裸目标 URL **共用一个槽位**，第一条填进去的完全获胜。写在转发下面的 mock 永远不会执行 —— 把它往上挪，或标 `$`。 |
+| mock / 重定向 / 转发被静默忽略 | `file`、`redirect`、`statusCode`、模板家族与裸目标 URL **共用一个槽位**，第一条填进去的完全获胜。写在转发下面的 mock 永远不会执行 —— 把它往上挪，或标 `lineProps://important`。 |
 | 算子取值被截断 | 里面有空格，而行是按空白切分的。`reqHeaders://authorization=Bearer secret` 设成 `Bearer`，然后把请求路由到一台叫 `secret` 的主机。百分号编码救不了；用命名 value 加 `${name}`。 |
 | 整行只对一部分请求生效 | 筛选器的作用域是**整行**，包括目标。`host://` 旁边写了 `includeFilter://from:composer`，这个改写就只对重放生效。 |
 | 两行设了同一个头，少了一个 | 同名争用由**首行**获胜，important 行在前。 |
-| 赢的是一条你没料到的规则 | `$` important 规则先于其余一切解析，与行序无关。 |
+| 赢的是一条你没料到的规则 | `lineProps://important` 的行先于其余一切解析，与行序无关。行首的 `$` **不是**它 —— 那是原版的精确匹配 pattern。 |
 
 ### 生效了，但结果不对
 
@@ -380,9 +403,9 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 | 请求挂一分多钟才失败 | 目标是**丢包**而不是拒绝连接，于是这段等待就是操作系统的 TCP 超时。`-t 3000` 给连接**建立**封顶（不影响已建立的连接，流式响应是安全的）。 |
 | `resDelay://1s` 瞬间就过去了 | 延迟单位是**毫秒**，单位后缀会被解析掉然后丢弃而不是换算，所以 `1s` 是 1 毫秒。写 `1000`。 |
 | 限速比预期快 8 倍 | `reqSpeed://` / `resSpeed://` 的单位是**千比特**每秒，不是千字节。本移植此前按千字节读，按旧行为写的数值乘以 8。 |
-| SSE / chunked 响应不再流式 | 作用在流式响应上的 body 算子会把**整条流**缓冲完才开始发送 —— 实测一条 600 毫秒的 SSE 流，不带 body 算子首字节 3 毫秒，带上是 621 毫秒。本移植的 body 层建立在整体缓冲之上，改成流式是重写该层，记录在 [`docs/ROADMAP.md`](docs/ROADMAP.md)。延迟与限速不受影响。 |
+| SSE / chunked 响应不再流式 | 不该发生：`resReplace://` 随流生效、只扣住一小段尾巴，prepend/append/`resBody` 一族根本不需要缓冲 —— 实测一个每 200 毫秒发一条事件的 SSE 源站，带规则首字节 204 毫秒、不带 206 毫秒。**确实**要等最后一个字节的是那些天然需要整段 body 的算子（`resMerge://`、往标记语言里注入）。 |
 | `statusCode://` 返回了空 body | 它就是这么设计的 —— 它**造**一个响应。要改一个本来就有 body 的响应的状态码，用 `replaceStatus://`。 |
-| 给了路径的算子把路径本身发了出去 | 本移植的算子取值不从文件或 URL 加载（上游的 `readRuleValue` 未移植），所以 `resBody:///tmp/mock.json` 发的就是这个字符串。要服务文件用 `file://`，或把内容作为 value 引进来。 |
+| 给了路径的算子发出来的东西不是你写的那串字 | 这正是它的语义：算子取值若命名了一个**位置**，会在算子生效前被**读出来**（上游的 `readRuleValue`），所以 `resBody:///tmp/mock.json` 发的是文件内容，`resBody://https://cdn.test/mock.json` 每请求抓一次。要发那串字本身就包起来：`resBody://(/tmp/mock.json)`。 |
 | 证书绑定的 App 一拦就崩 | 只放过这一个域名：`pinned.example.com sniCallback://no-mitm` 会逐字节中继它，同时仍按规则路由。`--no-intercept-https` 是对所有连接这么做。 |
 
 ### 抓包里没有它

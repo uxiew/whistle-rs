@@ -42,7 +42,7 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   interception pipeline, auto-detecting TLS vs. plain HTTP.
 - **Rules engine** — whistle's rule syntax: domain/prefix, leading-dot subdomain,
   host wildcards, `^`-prefixed path/query wildcards with `$1`…`$9` captures, and regex
-  patterns; `$`-important precedence; multi-match accumulation.
+  patterns; `lineProps://important` precedence; multi-match accumulation.
 - **Forwarding** — point a site at a dev server with a bare URL
   (`www.example.com http://localhost:5173`); the request's remaining path comes along.
 - **Destination override** (`host://`) that rewrites the target IP/port while keeping
@@ -276,6 +276,33 @@ CA.
 | `-v, --verbose` | Debug logging — the reason behind a failure, which the `502` alone will not tell you | off |
 | `-h, --help` / `-V, --version` | Help / version | — |
 
+### `whistle-rs explain` — which rules would this request hit?
+
+whistle's console has this as *Test Rules*; here it is a subcommand, and it
+starts nothing — no server, no storage directory, no CA. It answers the question
+a rules file poses most often, because **a rule that does not match reports
+nothing**: a working line and a silently inert one look identical from the
+client side.
+
+```console
+$ whistle-rs explain --rules rules.txt -X POST -H 'x-env: staging' \
+    'http://www.example.com/api/list?id=2'
+http://www.example.com/api/list?id=2
+  rule        http://localhost:5173/api/list?id=2   [slot]
+      on: www.example.com http://localhost:5173
+  reqHeaders  x-env=staging
+      on: www.example.com/api reqHeaders://x-env=staging
+```
+
+`[slot]` marks the operator that won the [shared
+slot](docs/RULES.md#short-circuit-no-upstream-request-is-made) — the losers are
+absent entirely, which is the answer to "why is my mock being ignored". Add
+`--body` for the `b:` filter conditions, `--client-ip` for `clientIp:`,
+`--value NAME=CONTENT` for the values store, `--json` for a machine, and
+`--batch` to answer one JSON query per line from stdin. That last one is how
+`tests/differential/rules-oracle.js` puts 17k questions through this port and
+through whistle's own parser and compares the answers.
+
 ## Documentation
 - [`docs/UPSTREAM.md`](docs/UPSTREAM.md) — where to fetch the upstream whistle tree the 513 `_original/…` citations point at, and at which commit
 
@@ -306,7 +333,7 @@ CA.
 - WebSocket (`ws://`/`wss://`) upgrade tunnelling
 - Root CA generation, persistence, and `/rootCA.crt` download
 - Rules engine: comments, hosts shorthand, regex/wildcard/prefix/dot patterns,
-  `$`-important precedence, multi-match accumulation, `ignore://`,
+  `lineProps://important` precedence, multi-match accumulation, `ignore://`,
   `filter`/`includeFilter`/`excludeFilter` conditions (method/host/header/clientIp/URL)
 - Upstream routing: `proxy`/`http-proxy`/`https-proxy`/`internal-proxy` (HTTP proxy)
   and `socks` (SOCKS5); `pac` (evaluate PAC to pick the proxy)
@@ -410,11 +437,11 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 |---------|-------------|
 | The rule matches a URL you expected it to miss, or the reverse | A path prefix only matches at a `/`, `\` or `?` boundary: `example.com/path/to` matches `/path/to/x` but **not** `/path/toxxx`. |
 | A `*` in the path matches nothing | `*` is a wildcard **in the host only**; in a path it is a literal, because `*` is a legal URL character. Write `^http://example.com/old/**` for a path wildcard. Filter patterns are the exception — they always read as if `^`-prefixed. |
-| A mock, redirect or forward is silently ignored | `file`, `redirect`, `statusCode`, the template family and a bare destination URL **share one slot**, and the first line to fill it wins outright. A mock written below a forward never runs — move it up, or mark it `$`. |
+| A mock, redirect or forward is silently ignored | `file`, `redirect`, `statusCode`, the template family and a bare destination URL **share one slot**, and the first line to fill it wins outright. A mock written below a forward never runs — move it up, or mark it `lineProps://important`. |
 | An operator value arrives truncated | It contained a space, and the line is split on whitespace. `reqHeaders://authorization=Bearer secret` sets `Bearer` and then routes the request to a host called `secret`. Percent-encoding does not help; use a named value and `${name}`. |
 | The whole line does nothing on some requests | A filter scopes the *entire* line, destination included — `includeFilter://from:composer` beside a `host://` means the override applies only to replays. |
 | Two lines set the same header and one is missing | A contested name is won by the **first** line, important lines first. |
-| A rule you did not expect is winning | `$`-important rules resolve before everything else, whatever the file order. |
+| A rule you did not expect is winning | `lineProps://important` rules resolve before everything else, whatever the file order. A leading `$` is **not** that — it is whistle's exact-match pattern. |
 
 ### It fires, but the result is wrong
 
@@ -425,9 +452,9 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 | A request hangs for a minute or more before failing | The destination is dropping packets rather than refusing, so the wait is the OS's TCP timeout. `-t 3000` caps connection *establishment* (never an established connection, so streams are safe). |
 | `resDelay://1s` is instantaneous | Delays are **milliseconds**, and a unit suffix is parsed off and discarded rather than converted, so `1s` is one millisecond. Write `1000`. |
 | A throttle is 8× faster than expected | `reqSpeed://` / `resSpeed://` are **kilobits** per second, not kilobytes. This port read them as kilobytes until recently; multiply values written against that by 8. |
-| An SSE or chunked response stops streaming | A body operator on a streaming response buffers the **whole stream** before anything is sent — measured at 3 ms to first byte without one and 621 ms with, on a 600 ms SSE stream. The body layer transforms whole buffers; making it streaming is a rewrite of that layer, recorded in [`docs/ROADMAP.md`](docs/ROADMAP.md). Delays and speed caps are unaffected. |
+| An SSE or chunked response stops streaming | It should not: `resReplace://` travels with the stream and holds back only a tail, and the prepend/append/`resBody` family needs no buffer at all — measured on an SSE origin emitting one event every 200 ms, first byte at 204 ms with a rule and 206 ms without. What *does* wait for the last byte is an operator that has to read the whole body (`resMerge://`, an injection into markup), which is in its nature. |
 | `statusCode://` returned an empty body | That is what it does — it manufactures a response. `replaceStatus://` is the one that changes the status of a response that has a body. |
-| An operator given a path sends the path itself | Operator values are not loaded from a file or a URL here (upstream's `readRuleValue` is not ported), so `resBody:///tmp/mock.json` sends that string. Serve a file with `file://`, or pull its content in as a value. |
+| An operator given a path sends something you did not write | That is the point: an operator value that names a location is **read** before the operator applies (upstream's `readRuleValue`), so `resBody:///tmp/mock.json` sends the file's contents and `resBody://https://cdn.test/mock.json` fetches per request. To send the text itself, wrap it: `resBody://(/tmp/mock.json)`. |
 | A certificate-pinned app breaks under interception | Stop intercepting that one host: `pinned.example.com sniCallback://no-mitm` relays it byte-for-byte while still routing it by its rules. `--no-intercept-https` does the same for everything. |
 
 ### It is not in the capture
