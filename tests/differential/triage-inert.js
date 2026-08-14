@@ -92,7 +92,15 @@ function main(text) {
         declared: cases[i].inert === true,
       });
     } else {
-      const key = ops.map((op) => op.protocol).sort().join('+');
+      // `enable://`, `disable://`, `delete://` and `ignore://` are one operator
+      // with many meanings, and the meaning is the value — a flag that proves
+      // nothing is worth naming, where a `resHeaders` that proves nothing is
+      // just a case about a header.
+      const named = new Set(['enable', 'disable', 'delete', 'ignore']);
+      const key = ops
+        .map((op) => (named.has(op.protocol) ? `${op.protocol}://${op.value}` : op.protocol))
+        .sort()
+        .join('+');
       alive.set(key, (alive.get(key) || 0) + 1);
     }
   });
