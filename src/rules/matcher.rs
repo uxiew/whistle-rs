@@ -987,7 +987,7 @@ fn apply_ignores(resolved: &mut Resolved, scheme: &str) {
     // (`resolveIgnore`, `_original/lib/util/index.js:1891-1932`), because an
     // exclusion can arrive after the `*` it exempts a protocol from.
     let (mut drop, mut keep) = (Vec::new(), Vec::new());
-    let (mut drop_all, mut cancel_all) = (false, false);
+    let mut drop_all = false;
     for op in &ignores {
         // An exact form (`pattern=…`, `matcher=…`) has already been applied by
         // [`collect_skips`], and must not also be read as a name list:
@@ -1004,12 +1004,25 @@ fn apply_ignores(resolved: &mut Resolved, scheme: &str) {
             if name.is_empty() {
                 continue;
             }
-            // `-name` / `!name` exempts a protocol from an `ignore://*`;
-            // `-*` cancels the `*` outright.
+            // `-name` / `!name` exempts a protocol from an `ignore://*`.
+            //
+            // **`-*` exempts nothing here.** It sets `disableIgnoreAll`, which
+            // stops `resolveIgnore` from writing a flag per protocol into the
+            // *filter* — and `ignoreRules`, which is what empties the resolved
+            // set, never looks at it: it walks `Object.keys(ignoreAll ? rules :
+            // ignore)` and drops each name that `exclude` does not hold
+            // (`_original/lib/util/index.js:1904-1953,:2083-2108`). Measured
+            // against whistle 2.10.8 through its own resolver:
+            // `ignore://* ignore://-*` leaves no operator at all, and so does
+            // the `skip://` spelling of it. This port used to keep everything.
+            //
+            // The flag it does set still matters upstream — `resolveProxy` and
+            // the plugin path re-read the *parsed* rules and consult the filter
+            // — but those live outside the resolved set, which this port has
+            // only one of.
             if let Some(rest) = name.strip_prefix('-').or_else(|| name.strip_prefix('!')) {
-                match rest {
-                    "*" => cancel_all = true,
-                    other => keep.push(protocols::canonical(other).unwrap_or(other).to_string()),
+                if rest != "*" {
+                    keep.push(protocols::canonical(rest).unwrap_or(rest).to_string());
                 }
                 continue;
             }
@@ -1036,7 +1049,7 @@ fn apply_ignores(resolved: &mut Resolved, scheme: &str) {
             .is_some_and(|op| keep.iter().any(|n| named_by(op, scheme, n)))
     };
 
-    if drop_all && !cancel_all {
+    if drop_all {
         let kept: Vec<(String, RuleOp)> = keep
             .iter()
             .filter_map(|name| resolved.single.remove_entry(name))
@@ -1619,9 +1632,18 @@ mod tests {
             host_of(&format!("{BASE} ignore://*&!host\n")).as_deref(),
             Some("1.1.1.1")
         );
-        // …and `-*` cancels the `*` itself.
+        // …but `-*` exempts nothing: it sets `disableIgnoreAll`, which stops
+        // `resolveIgnore` from writing a per-protocol flag into the *filter*,
+        // while `ignoreRules` — the half that empties the resolved set — walks
+        // every resolved name and consults `exclude` alone
+        // (`_original/lib/util/index.js:1904-1953,:2083-2108`). Measured
+        // through whistle 2.10.8's own resolver, in both spellings.
+        assert_eq!(host_of(&format!("{BASE} ignore://*|-*\n")), None);
+        assert_eq!(host_of(&format!("{BASE} ignore://* ignore://-*\n")), None);
+        assert_eq!(host_of(&format!("{BASE} skip://* skip://-*\n")), None);
+        // A `-*` with no `*` beside it has nothing to say either way.
         assert_eq!(
-            host_of(&format!("{BASE} ignore://*|-*\n")).as_deref(),
+            host_of(&format!("{BASE} ignore://-*\n")).as_deref(),
             Some("1.1.1.1")
         );
         // An exemption applies however the two are ordered on the line.
