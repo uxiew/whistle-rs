@@ -841,12 +841,23 @@ fn joins_tail(op: &RuleOp) -> bool {
 /// The `xs` spellings never split, which is upstream's own quirk (its split
 /// regexp admits a single `x`) and is reproduced in
 /// [`crate::proxy::apply`]'s reader too.
+///
+/// **Only the file family splits.** `getFiles` feeds `rule.files`, and the two
+/// other readers of a joined value — the URL-replacement rule and the dump
+/// operators — go to `rule.url`, which upstream joins as one string
+/// (`getPathRule`, `rules.js:936-943`). Splitting a destination on `|` broke a
+/// query string that contains one: `a.com http://dev.local/api?f=a|b` became
+/// two halves, and the first, which is the one that gets used, had lost its
+/// filter.
 pub(crate) fn join_each_path(protocol: &str, value: &str, tail: &str) -> String {
     let join = |path: &str| match names_a_remote_file(protocol, path) {
         true => path.to_string(),
         false => super::url::join_url(path, tail),
     };
-    if protocol.starts_with("xs") || !value.contains('|') {
+    if !protocols::is_file_protocol(protocol)
+        || protocol.starts_with("xs")
+        || !value.contains('|')
+    {
         return join(value);
     }
     value.split('|').map(join).collect::<Vec<_>>().join("|")
