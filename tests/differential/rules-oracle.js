@@ -96,10 +96,6 @@ const KNOWN = {
   'internal-https-proxy': 'proxy',
   'https2http-proxy': 'proxy',
   'http2https-proxy': 'proxy',
-  // `includeFilter` / `excludeFilter` are one protocol upstream
-  // (`aliasProtocols`, `lib/rules/protocols.js:1151-1173`).
-  includeFilter: 'filter',
-  excludeFilter: 'filter',
 };
 
 // Buckets neither side reports in a comparable way, so a difference in them is
@@ -111,6 +107,10 @@ const KNOWN = {
 //     during the TLS handshake;
 //   * `lineProps` is not an operator on either side — it is a property of the
 //     line, and this port carries it on each operator;
+//   * a per-line `includeFilter://` / `excludeFilter://` is not an operator on
+//     either side — upstream attaches it to the rule it guards and files
+//     nothing (checked by `assertVocabulary`), and this port keeps it as a
+//     condition on the line;
 //   * `ignore` and `filter` are **consumed** here: this port applies what they
 //     silence during resolution and the operator itself does not survive into
 //     the answer, where upstream keeps it in `_rules.ignore` for later phases
@@ -127,6 +127,70 @@ const IGNORED_BUCKETS = new Set([
 
 function bucketOf(protocol) {
   return KNOWN[protocol] || protocol;
+}
+
+// ── The translation table, checked against upstream ────────────────────────
+//
+// Every entry above is a claim about where whistle files a rule, and a *wrong*
+// claim hides exactly what this bench exists to find: `location://` was
+// translated as a slot member of its own, so both sides "agreed" while whistle
+// answered `502` and this port answered `302`. The claims are cheap to check —
+// the parser is right here — so they are checked before anything is compared,
+// and a false one stops the run rather than quietly excusing a difference.
+
+/** Which `_rules[…]` lists does whistle file this line under? */
+function upstreamKeysOf(line) {
+  const rules = new Rules({});
+  rules.parse(`a.com ${line}`);
+  return Object.keys(rules._rules).filter(
+    (key) => rules._rules[key] && rules._rules[key].length
+  );
+}
+
+function assertVocabulary() {
+  const wrong = [];
+  const claim = (line, key) => {
+    const got = upstreamKeysOf(line);
+    if (!got.includes(key)) {
+      wrong.push(`${line} lands in _rules.${got.join('/') || '(nothing)'}, not ${key}`);
+    }
+  };
+
+  // Every slot member shares the one `rule` list — that is what makes it a
+  // member. A name with a key of its own would be reduced to a single winner
+  // by this bench and by nothing else.
+  for (const member of SLOT_MEMBERS) {
+    if (member === 'rule') continue;
+    claim(`${member}:///srv/x`, 'rule');
+  }
+  // …and the names that are *not* members, for the same reason in reverse.
+  for (const [matcher, key] of [
+    ['urlReplace://a=b', 'urlReplace'],
+    ['host://1.1.1.1', 'host'],
+    ['replaceStatus://500', 'replaceStatus'],
+    ['resBody://(a)', 'resBody'],
+  ]) {
+    claim(matcher, key);
+  }
+  // The upstream-proxy family is one key, whatever the spelling.
+  for (const name of Object.keys(KNOWN)) {
+    if (KNOWN[name] !== 'proxy') continue;
+    claim(`${name}://127.0.0.1:8888`, 'proxy');
+  }
+  // …and both filter spellings are one protocol.
+  // `filter://` the *protocol* — the spelling that suppresses other operators —
+  // is a rule with a list of its own. The per-line `includeFilter://` /
+  // `excludeFilter://` conditions are not: they are attached to the rule they
+  // guard (`rule.filters`) and file nothing, which is why neither side reports
+  // them as operators.
+  claim('filter://ua', 'filter');
+  claim('host://1.1.1.1 includeFilter://m:GET', 'host');
+
+  if (wrong.length) {
+    console.error('the bench\'s vocabulary disagrees with whistle:');
+    for (const line of wrong) console.error(`  ${line}`);
+    process.exit(2);
+  }
 }
 
 // ── Upstream ───────────────────────────────────────────────────────────────
@@ -695,6 +759,7 @@ function parseArgs(argv) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
+  assertVocabulary();
   const corpus = args.generated
     ? require('./cases-generated.js')
     : args.fromCases
