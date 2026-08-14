@@ -189,6 +189,11 @@ module.exports = [
   { name: 'doc: ws:// is not a transport for a plain request', rules: `${P}/echo ws://${P}/other` },
   { name: 'doc: wss:// is not a transport for a plain request', rules: `${P}/echo wss://${P}/other` },
   { name: 'doc: tunnel:// is not a transport for a plain request', rules: `${P}/echo tunnel://${P}` },
+  // …and neither is `location://`, which is not a protocol at all: it is in
+  // neither upstream's registry nor its alias table, so the token is a
+  // destination whose scheme nothing can speak. This port answered a `302` for
+  // it until the operator-coverage sweep found that no case had ever asked.
+  { name: 'doc: location:// is not a transport for a plain request', rules: `${P}/echo location://http://d.test/x` },
 
   // `no` is the documented short spelling of `no-cache`, and a negative age is
   // the same thing (https://wproxy.org/docs/rules/cache.html).

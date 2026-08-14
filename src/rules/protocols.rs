@@ -84,7 +84,6 @@ pub const PROTOCOLS: &[&str] = &[
     "sniCallback",
     // Common aliases / additional operators handled by the core.
     "redirect",
-    "location",
     "locationHref",
     "statusCode",
     "socks",
@@ -148,7 +147,7 @@ pub const RULE_INCLUDE: &str = "ruleInclude";
 /// * the local-file / template family and every `x` / `xs` fallback spelling —
 ///   `file`, `rawfile`, `tpl`, `jsonp`, `dust` (see [`is_file_protocol`]);
 /// * `statusCode` (with its `status` alias) and `redirect`;
-/// * `location` and `locationHref`;
+/// * `locationHref`;
 /// * a bare **destination** — `http://`, `https://`, `ws://`, `wss://`,
 ///   `tunnel://`, the schema-less `//host`, and a bare `host:port` that is not
 ///   an IP address — all of which resolve to [`URL_REPLACE`];
@@ -159,7 +158,7 @@ pub const RULE_INCLUDE: &str = "ruleInclude";
 /// [`crate::rules::Resolved`] holds them in one place for the same reason:
 /// [`crate::rules::Resolved::slot`] is one operator, chosen once, during
 /// resolution.
-pub const SLOT_PROTOCOLS: &[&str] = &[URL_REPLACE, "statusCode", "redirect", "location", "locationHref"];
+pub const SLOT_PROTOCOLS: &[&str] = &[URL_REPLACE, "statusCode", "redirect", "locationHref"];
 
 /// Does this operator compete for the shared slot (see [`SLOT_PROTOCOLS`])?
 pub fn is_slot_protocol(name: &str) -> bool {
@@ -507,10 +506,20 @@ mod tests {
     #[test]
     fn the_shared_slot_holds_the_family_upstream_files_under_rule() {
         for name in ["file", "xfile", "xsfile", "rawfile", "xrawfile", "tpl", "xtpl", "jsonp",
-                     "xjsonp", "dust", "xdust", "statusCode", "redirect", "location",
+                     "xjsonp", "dust", "xdust", "statusCode", "redirect",
                      "locationHref", URL_REPLACE] {
             assert!(is_slot_protocol(name), "{name} shares the rule list upstream");
         }
+        // `location://` is **not** one of them, and not a protocol at all: it is
+        // absent from upstream's array and from its alias table, so
+        // `location://http://b.test/x` is a destination whose scheme nothing can
+        // speak. Measured against whistle 2.10.8, which answers `502 Unsupported
+        // protocol location:`; this port used to answer a `302`, having invented
+        // the name as a synonym for `redirect://`. An unknown protocol still
+        // reaches the slot — as a destination — which is why the assertion is
+        // about the *name*.
+        assert!(!PROTOCOLS.contains(&"location"));
+        assert_eq!(canonical("location"), None);
         // `statusCode` is reached by its alias too, and the alias resolves to
         // the same member — one slot, whichever spelling wrote it.
         assert_eq!(canonical("status"), Some("statusCode"));

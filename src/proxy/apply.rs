@@ -1552,7 +1552,7 @@ fn short_circuit_inner(
     let op = resolved.slot()?;
     let proto = op.protocol.as_str();
     match proto {
-        "redirect" | "location" => {
+        "redirect" => {
             let mut resp = Response::builder()
                 .status(StatusCode::FOUND)
                 .body(body::empty())

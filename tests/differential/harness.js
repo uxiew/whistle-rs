@@ -180,14 +180,16 @@ const EXPECTED = [
   },
   {
     // `ws://`, `wss://` and `tunnel://` name transports a plain HTTP request is
-    // not, and all three pages say so: "普通 HTTP/HTTPS 请求：返回 502". Both
-    // proxies answer 502; only the page differs — whistle's is HTML holding a
+    // not, and all three pages say so: "普通 HTTP/HTTPS 请求：返回 502".
+    // `location://` reaches the same 502 by a different road: it is not a
+    // protocol in either program, so the token is a destination whose scheme
+    // nothing can speak. Both proxies answer 502; only the page differs — whistle's is HTML holding a
     // Node stack trace (`wrapGatewayError`, `_original/lib/util/index.js:1096-1109`)
     // and this port's is the error chain as plain text, the same pair
     // `cases-proxy.js` declares for every other gateway error.
     //
     // Scoped by **case name**, so this cannot excuse a 502 anywhere else.
-    match: (p, c) => /^doc: (ws|wss|tunnel):\/\/ is not a transport/.test(c.name)
+    match: (p, c) => /^doc: (ws|wss|tunnel|location):\/\/ is not a transport/.test(c.name)
       && /^(res\.body|res\.header\.content-type):/.test(p),
     why: 'a 502 on both sides; only each proxy\'s error page differs',
   },

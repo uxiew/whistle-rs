@@ -842,6 +842,14 @@ half of it.
 > pulling a values-store entry in as more rules. Upstream files it in the same
 > place, where it can only ever produce the unusable URL `rule://<name>`.
 
+> **`location://` is not a protocol.** It is in neither upstream's registry nor
+> its alias table, so the token is a *destination* whose scheme nothing can
+> speak, and both proxies answer **502**. This port used to treat it as a
+> synonym for `redirect://` and answer a `302` — a name it invented, and one no
+> case had ever asked about until `coverage-ops.js` went looking for operators
+> with no case that proves anything. Write `redirect://` for the 302 and
+> `locationHref://` for the page that redirects itself.
+
 **A destination has to be `http` or `https`.** A plain request named at any
 other scheme answers **502 `unsupported protocol <scheme>:`** rather than being
 sent there — which is what `ws://`, `wss://` and `tunnel://` document about
@@ -1562,7 +1570,7 @@ that is neither is read as a list of protocol names.
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `redirect` / `location` | a URL | Respond `302 Found` with `Location: <url>` |
+| `redirect` | a URL | Respond `302 Found` with `Location: <url>` |
 | `statusCode` | a status number | Respond with that status and an empty body (mock) |
 | `file` / `rawfile` | a local path **or a URL** | Serve the file's bytes with a guessed `Content-Type` |
 
@@ -1613,7 +1621,7 @@ chat.example.com   127.0.0.1:9000              # …which this line still moves
 ```
 
 **These share one slot with each other and with a bare destination URL.** None
-of `file`, `rawfile`, `tpl`, `jsonp`, `dust`, `redirect`, `location`,
+of `file`, `rawfile`, `tpl`, `jsonp`, `dust`, `redirect`,
 `statusCode` or a forwarding URL is a name in upstream's `protocols` array, so
 `parseRule` files every one of them under the same `rule` list
 (`_original/lib/rules/rules.js:1313-1316`) and `getRule` returns the **first**
@@ -2757,7 +2765,7 @@ Two orderings sit either side of "file order" and are easy to be surprised by:
   console shows Default at the bottom.
 * **Tokens on one line.** Several operators share a **single slot**: a
   destination (`http://…`, `example.com`, a bare host), the local-file family,
-  `statusCode://`, `redirect://` and `location://`. Only one of them answers a
+  `statusCode://` and `redirect://`. Only one of them answers a
   request, and it is whichever was written first — on the earlier line, or
   earlier on the same line:
 
@@ -2848,7 +2856,7 @@ resolve (so mixed rule files load) but have no distinct effect.
 | Request rewrite | `reqHeaders`, `reqCookies`, `reqType`, `reqCharset`, `reqCors`, `ua`, `referer`, `method`, `auth`, `forwardedFor`, `urlReplace`, `params`, `urlParams`, `reqBody`, `reqPrepend`, `reqAppend`, `reqReplace`, `reqDelay`, `reqSpeed`, `reqWrite`, `reqWriteRaw` |
 | Response rewrite | `resHeaders`, `resCookies`, `resType`, `resCharset`, `resCors`, `replaceStatus`, `statusCode`, `attachment`, `cache`, `resBody`, `resMerge`, `resPrepend`, `resAppend`, `resReplace`, `resDelay`, `resSpeed`, `resWrite`, `resWriteRaw`, `trailers`, `headerReplace`, `responseFor` |
 | Content-type body | `cssBody`/`cssPrepend`/`cssAppend`, `htmlBody`/`htmlPrepend`/`htmlAppend`, `jsBody`/`jsPrepend`/`jsAppend` (the JS and CSS families reach HTML responses too, wrapped as markup) |
-| Short-circuit / flags | `redirect`, `location`, `locationHref`, `statusCode` mock, `enable`, `disable` |
+| Short-circuit / flags | `redirect`, `locationHref`, `statusCode` mock, `enable`, `disable` |
 | Local file / template | `file`, `rawfile`, `tpl`, `jsonp`, `dust`, and their `x`/`xs` fallback variants (`xfile`, `xrawfile`, …) |
 | Matching / control | `filter`, `includeFilter`, `excludeFilter`, `ignore`, `delete`, `log`, `rule`, `rulesFile` (`reqRules`), `resRules` |
 | TLS | `cipher` (upstream TLS version pin + OpenSSL cipher-string evaluation), `sniCallback` (plugin picks the MITM certificate, or declines to intercept) |

@@ -276,8 +276,10 @@ const SLOT_MEMBERS = new Set([
   'xstpl',
   'statusCode',
   'redirect',
-  'location',
   'locationHref',
+  // `location` is **not** here: it is in neither upstream's registry nor its
+  // alias table, so `location://x` is a destination whose scheme happens to be
+  // spelled `location` — the same fall-through any unknown protocol takes.
 ]);
 
 function upstreamKey(op) {
