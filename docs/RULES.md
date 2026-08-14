@@ -767,6 +767,30 @@ static.example.com   file:///srv/a|/srv/b        # first one that exists wins
 > pulling a values-store entry in as more rules. Upstream files it in the same
 > place, where it can only ever produce the unusable URL `rule://<name>`.
 
+**A destination has to be `http` or `https`.** A plain request named at any
+other scheme answers **502 `unsupported protocol <scheme>:`** rather than being
+sent there — which is what `ws://`, `wss://` and `tunnel://` document about
+themselves ("普通 HTTP/HTTPS 请求：返回 502"), and what whistle does for every
+other spelling on the same line of the same function: `isWebProtocol` is
+`protocol == 'http:' || protocol == 'https:'` and everything else is
+`next(new Error('Unsupported protocol …'))`
+(`_original/lib/rules/protocols.js:269-271`, `lib/handlers/http-proxy.js:5-11`).
+
+The rule that makes this matter is a typo:
+
+```
+example.com   socks5://127.0.0.1:1080     # 502 — the operator is socks://
+```
+
+`socks://` is an [upstream proxy](#upstream-proxy); `socks5://` is no operator at
+all, so the line falls through to this slot as a destination. Forwarding it would
+open a **cleartext HTTP** connection to a port that speaks SOCKS. A scheme-less
+destination is unaffected: it inherits the request's own, which is one of the two.
+
+*A **WebSocket** request and a **`CONNECT`** tunnel resolve their destination on
+their own paths, where `ws://`/`wss://`/`tunnel://` are exactly what they are
+for; this applies to plain HTTP requests.*
+
 #### Which URL the routing rules are matched against
 
 Once a bare-URL rule has moved the request, `host://`, the [proxy

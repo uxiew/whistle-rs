@@ -40,43 +40,54 @@
 // swallow news in another area's corpus. They show as differences in a run; that
 // is the honest report. In the order they appear:
 //
-//   1. **The gateway error's prose and type** (12 cases). whistle answers an
+//   1. **The gateway error's prose and type** (13 cases). whistle answers an
 //      unreachable upstream with a 502 whose body is an HTML `<pre>` holding a
 //      Node stack trace (`wrapGatewayError`,
 //      `_original/lib/util/index.js:1096-1109`); this port answers 502 with the
 //      error chain as plain text and says `text/plain`. Both now name themselves
 //      in `x-server`. Matching another program's error prose is not worth
 //      pinning.
-//   2. **`socks5://` is nobody's protocol**, and the two disagree about what to
-//      do with a scheme neither understands. whistle refuses it —
-//      `Unsupported protocol socks5:` (`lib/handlers/http-proxy.js:5-11`, gated
-//      on `protoMgr.isWebProtocol`) — while this port reads the line as a URL
-//      replacement and sends the request to that address **in cleartext HTTP**.
-//      Not fixed: refusing it means `Destination::parse` has to be able to fail,
-//      which reaches past the forwarding family into the plugin dispatch.
-//   3. **Falling back to a direct connection leaves whistle in absolute form.**
+//
+//      **This used to be 12, and the thirteenth is the interesting one.**
+//      `socks5://` is nobody's protocol, and the two used to disagree about far
+//      more than prose: whistle refused it — `Unsupported protocol socks5:`
+//      (`lib/handlers/http-proxy.js:5-11`, gated on `protoMgr.isWebProtocol`) —
+//      while this port read the line as a URL replacement and sent the request
+//      to that address **in cleartext HTTP**. Now it refuses every scheme that
+//      is not `http`/`https`, which is the only question `isWebProtocol` asks,
+//      and the case's whole remaining difference is what the 502 says. See
+//      `crate::proxy::dest::unroutable_scheme`.
+//   2. **Falling back to a direct connection leaves whistle in absolute form.**
 //      `xproxy://` at a dead hop, and a PAC answering `PROXY <dead>; DIRECT`,
 //      both retry direct — and whistle sends the origin
 //      `GET http://host/path` rather than `GET /path`, because `options.path`
 //      was rewritten for the proxy and `send()` only rewrites it once
 //      (`origPath = null`, `_original/lib/inspectors/res.js:604-612`). Servers
 //      must accept absolute-form, so it works; this port sends origin-form.
-//   4. **A PAC file's `SOCKS5`**, and the order of its entries. Upstream reads
+//   3. **A PAC file's `SOCKS5`**, and the order of its entries. Upstream reads
 //      the result with `/(PROXY|SOCKS)\s+([^;\s]+)/i` (`node-pac/lib/Pac.js:7`),
 //      so `SOCKS5 host` matches nothing and the request goes direct, and a
 //      `PROXY` anywhere in the list wins even when `DIRECT` came first. This
 //      port reads the list in order, as PAC defines it: `DIRECT; PROXY x` is
 //      direct, `SOCKS5 x` is a SOCKS hop. (A `DIRECT` *after* the chosen proxy
 //      is its fallback in both, which is what `dead-then-direct.pac` checks.)
-//   5. **A PAC file that cannot be fetched.** whistle logs and connects direct
+//   4. **A PAC file that cannot be fetched.** whistle logs and connects direct
 //      (`logger.error`, `_original/lib/rules/index.js:295`); this port refuses
 //      the request, because a rule that named a proxy ruled a direct connection
 //      out. Declared in `docs/RULES.md`.
-//   6. **`rule://` and `rules://`.** This port reads `rule://<name>` as a
-//      values-store include of more rules; upstream has no such spelling and
-//      reads it as the unusable URL `rule://<name>`, answering 502. Declared in
-//      `crate::rules::protocols::URL_REPLACE`.
-//   7. **What is left of the second resolution pass.** whistle resolves
+//   5. **`rule://`, and `rules://` beside it.** This port reads `rule://<name>`
+//      as a values-store include of more rules; upstream has no such spelling
+//      and reads it as the unusable URL `rule://<name>`, answering 502. Declared
+//      in `crate::rules::protocols::URL_REPLACE`. Two cases, and only two.
+//
+//      **`rules://` is not that spelling**, in either program, and the case
+//      below used to be named as if it were. Only the singular is this port's
+//      include (`URL_REPLACE = "rule"`); the plural is a scheme neither side
+//      implements, so both answer 502 and the case belongs to divergence 1. It
+//      is kept because a reader who assumes the plural works should find the
+//      answer measured rather than argued — and because for a while this port
+//      answered it by looking up a host called `more`.
+//   6. **What is left of the second resolution pass.** whistle resolves
 //      `host://`, the proxy family and `pac://` a *second* time, against the URL
 //      a replacement produced rather than the one the client asked for:
 //      `getProxy` is handed `options.href` and assigns `req.curUrl = url` before
@@ -104,7 +115,7 @@
 //         `disable://proxyConnection` — reads the first pass only, so folding the
 //         second pass's whole `enable` list in would trade three narrow
 //         divergences for a different one. Left as written.
-//   8. **`xhttps-proxy://` at an unreachable hop hangs upstream** (1 case).
+//   7. **`xhttps-proxy://` at an unreachable hop hangs upstream** (1 case).
 //      Measured against the same dead hop, written by name so no SNI objection
 //      is in play: `xproxy://` and `xsocks://` fall back and answer 200, plain
 //      `https-proxy://` answers 502 promptly, and `xhttps-proxy://` returns
@@ -208,8 +219,9 @@ module.exports = [
   // `socks5://` is a spelling nobody implements: upstream's proxy regex knows
   // `socks` only (`_original/lib/rules/protocols.js:81`), so the line falls
   // through to the URL-replacement slot. It is pointed at the *echo origin's
-  // twin* on purpose — whistle refuses the scheme outright, and this port sends
-  // the request there in cleartext HTTP, which the answer makes visible.
+  // twin* on purpose, and that is what makes the case worth keeping: the twin
+  // answers `x-origin: b`, so "sent there in cleartext HTTP" and "refused" are
+  // two visible answers rather than one. Both proxies now refuse.
   { name: 'proxy: socks5 is not a protocol name', rules: `${P} socks5://${OTHER}` },
   { name: 'proxy: https-proxy puts TLS on the hop', rules: `${P} https-proxy://${TLSHOP}` },
   { name: 'proxy: internal-https-proxy puts TLS on the hop', rules: `${P} internal-https-proxy://${TLSHOP}` },
@@ -306,7 +318,9 @@ module.exports = [
   // ── rule:// and rules:// ───────────────────────────────────────────────
   { name: 'rule: names a values entry holding more rules', rules: '```more\n' + `${P} proxy://${HOP}\n` + '```\n' + `${P} rule://more` },
   { name: 'rule: a values entry that does not exist', rules: `${P} rule://absent` },
-  { name: 'rule: rules:// is the same include', rules: '```more\n' + `${P} proxy://${HOP}\n` + '```\n' + `${P} rules://more` },
+  // The plural is nobody's include. The block is still declared so that a
+  // reading in which it *were* one would be visible as a hop through ${HOP}.
+  { name: 'rule: rules:// is not the include, in either', rules: '```more\n' + `${P} proxy://${HOP}\n` + '```\n' + `${P} rules://more` },
 
   // ── forwarding meeting the rest of the rule set ────────────────────────
   { name: 'proxy: with a request header rule', rules: `${P} proxy://${HOP} reqHeaders://x-a=1` },

@@ -160,14 +160,16 @@ fn replacement_url(resolved: &Resolved) -> Option<&String> {
 }
 
 /// The scheme a URL-replacement rule named, when a plain HTTP request cannot be
-/// sent over it — `ws://`, `wss://` and `tunnel://`.
+/// sent over it — anything that is not `http` or `https`.
 ///
-/// Each of the three documents this: "普通 HTTP/HTTPS 请求：返回 502"
-/// (https://wproxy.org/docs/rules/ws.html, `wss.html`, `tunnel.html`). Upstream
-/// gets there by handing `parseUrl`'s `protocol: 'ws:'` straight to
-/// `http.request`, which refuses it — `Unsupported protocol ws:` — and the throw
-/// is wrapped into the gateway error page. So the answer is a 502, not a
-/// silently retargeted request.
+/// Upstream asks exactly that question and no other: `isWebProtocol` is
+/// `protocol == 'http:' || protocol == 'https:'`
+/// (`_original/lib/rules/protocols.js:269-271`), and the request handler refuses
+/// everything else with `next(new Error('Unsupported protocol ' + protocol))`
+/// (`lib/handlers/http-proxy.js:5-11`), which the gateway wrapper turns into a
+/// 502. `ws://`, `wss://` and `tunnel://` are the three that document it — "普通
+/// HTTP/HTTPS 请求：返回 502" (https://wproxy.org/docs/rules/ws.html, `wss.html`,
+/// `tunnel.html`) — but they are not a list, they are three members of it.
 ///
 /// Measured, because reading the code says the opposite: `getOptions` only ever
 /// asks whether the protocol is `https:`, and this port used to conclude from
@@ -175,20 +177,36 @@ fn replacement_url(resolved: &Resolved) -> Option<&String> {
 /// node's client validates the protocol against its agent's before anything is
 /// sent.
 ///
+/// The scheme this port never knew was a scheme is the reason to generalise it.
+/// A line reading `example.com socks5://127.0.0.1:1080` named a transport, and
+/// answering it by opening a **cleartext HTTP** connection to that address sends
+/// the request somewhere the rule did not ask for — through a port that speaks
+/// something else entirely. Fail-open, and the more so because `socks://` right
+/// beside it *is* a protocol here, so the misspelling looks like it worked.
+///
+/// A plugin protocol is not in play. Upstream reaches its plugins by bare name
+/// (`pluginMgr.getPlugin(protocol)` on the same line that refuses the rest), so
+/// `vase://x` is a plugin call there; here a plugin is written `plugin://name`
+/// or `whistle.name://`, both of which parse to the `plugin` operator long
+/// before this — see [`crate::rules`]'s `plugin_package`. Nothing else that this
+/// port can route arrives without a scheme it knows.
+///
 /// Scoped to the plain HTTP path on purpose. A **WebSocket** request is what
 /// `ws://`/`wss://` are for, and a **tunnel** is what `tunnel://` is for; those
 /// two paths resolve their own destination and are left alone.
-pub fn unroutable_scheme(resolved: &Resolved) -> Option<&'static str> {
+pub fn unroutable_scheme(resolved: &Resolved) -> Option<String> {
     let value = replacement_url(resolved)?;
     // The brackets say "this exact URL"; the scheme is in front of them either
     // way, but unwrapping keeps this reading the same value `parse` will.
     let value = url::fixed_value(value).map_or_else(|| value.to_string(), |(_, v)| v);
-    match web_scheme(value.trim()) {
-        Some("ws") => Some("ws"),
-        Some("wss") => Some("wss"),
-        Some("tunnel") => Some("tunnel"),
-        _ => None,
-    }
+    let value = value.trim();
+    // A destination with no scheme of its own inherits the request's, which is
+    // `http` or `https` by construction — `set_protocol` is what `parse` does
+    // with it, and there is nothing to refuse.
+    let scheme = url::has_protocol(value)
+        .then(|| value.split_once("://").map(|(s, _)| s.to_ascii_lowercase()))
+        .flatten()?;
+    (scheme != "http" && scheme != "https").then_some(scheme)
 }
 
 /// Split an authority into host and port, unwrapping a bracketed IPv6 literal.
@@ -346,20 +364,32 @@ mod tests {
         }
     }
 
-    /// Which replacement schemes a plain HTTP request cannot be sent over.
+    /// Which replacement schemes a plain HTTP request cannot be sent over:
+    /// every one that is not `http` or `https`, which is the only question
+    /// upstream's `isWebProtocol` asks.
     #[test]
-    fn ws_wss_and_tunnel_are_unroutable_for_a_plain_request() {
+    fn only_http_and_https_are_routable_for_a_plain_request() {
         let named = |rules: &str| {
             let mut mgr = RuleManager::new();
             mgr.set_text(rules);
             let info = req("http://a.com/y");
             unroutable_scheme(&mgr.resolve(&info))
         };
-        assert_eq!(named("a.com ws://b.com/x\n"), Some("ws"));
-        assert_eq!(named("a.com wss://b.com/x\n"), Some("wss"));
-        assert_eq!(named("a.com tunnel://b.com:8080\n"), Some("tunnel"));
+        let some = |s: &str| Some(s.to_string());
+        // The three that document the 502 themselves.
+        assert_eq!(named("a.com ws://b.com/x\n"), some("ws"));
+        assert_eq!(named("a.com wss://b.com/x\n"), some("wss"));
+        assert_eq!(named("a.com tunnel://b.com:8080\n"), some("tunnel"));
         // The brackets do not hide the scheme.
-        assert_eq!(named("a.com ws://<b.com/x>\n"), Some("ws"));
+        assert_eq!(named("a.com ws://<b.com/x>\n"), some("ws"));
+        // A scheme nothing here implements is refused for the same reason, and
+        // this one is why it matters: `socks5` is a misspelling of the `socks://`
+        // operator right beside it, and forwarding it as cleartext HTTP would
+        // put the request on a port that speaks SOCKS.
+        assert_eq!(named("a.com socks5://127.0.0.1:1080\n"), some("socks5"));
+        assert_eq!(named("a.com ftp://b.com/x\n"), some("ftp"));
+        // Case is not part of the answer; `parseUrl` lowercases it too.
+        assert_eq!(named("a.com FTP://b.com/x\n"), some("ftp"));
         // Everything a plain request *can* be sent over.
         assert_eq!(named("a.com http://b.com/x\n"), None);
         assert_eq!(named("a.com https://b.com/x\n"), None);
@@ -367,6 +397,10 @@ mod tests {
         assert_eq!(named("a.com b.com:8080\n"), None);
         assert_eq!(named("a.com host://1.2.3.4\n"), None);
         assert_eq!(named(""), None);
+        // A plugin is never a bare scheme here, so neither spelling reaches this
+        // question at all — both parse to the `plugin` operator.
+        assert_eq!(named("a.com whistle.vase://x\n"), None);
+        assert_eq!(named("a.com plugin://vase\n"), None);
     }
 
     /// The URL the forwarding family is matched against is the destination's,

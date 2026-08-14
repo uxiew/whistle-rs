@@ -3749,11 +3749,13 @@ async fn serve(
         .await;
     }
 
-    // `ws://`, `wss://` and `tunnel://` name transports this request is not:
-    // each of the three says so — "普通 HTTP/HTTPS 请求：返回 502" — and upstream
-    // answers 502 because node refuses the protocol its own agent cannot speak.
-    // Forwarding it as plain HTTP instead sends the traffic somewhere the rule
-    // never asked for. See `dest::unroutable_scheme`.
+    // A destination whose scheme is neither `http` nor `https` names a transport
+    // this request is not — `ws://`, `wss://` and `tunnel://` say so themselves
+    // ("普通 HTTP/HTTPS 请求：返回 502"), and upstream refuses every other spelling
+    // on the same line of the same function, because node will not hand a
+    // protocol to an agent that cannot speak it. Forwarding it as plain HTTP
+    // instead sends the traffic somewhere the rule never asked for. See
+    // `dest::unroutable_scheme`.
     if let Some(scheme) = dest::unroutable_scheme(&resolved) {
         anyhow::bail!("unsupported protocol {scheme}:");
     }
