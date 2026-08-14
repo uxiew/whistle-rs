@@ -31,6 +31,7 @@
 pub mod ca;
 pub mod config;
 pub mod embed;
+pub mod explain;
 pub mod plugins;
 pub mod proxy;
 pub mod rules;

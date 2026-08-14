@@ -104,11 +104,79 @@ struct Cli {
     /// Verbose (debug) logging.
     #[arg(short = 'v', long)]
     verbose: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Say which rules a request would hit, without making one.
+    ///
+    /// whistle's console has this as *Test Rules*. It answers the question a
+    /// rules file poses most often — a line that never matches reports nothing,
+    /// so a working rule and a silently inert one look identical from the
+    /// client side.
+    Explain(ExplainArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ExplainArgs {
+    /// The request URL. Without a scheme it is read as `http://`.
+    #[arg(required_unless_present = "batch")]
+    url: Option<String>,
+
+    /// Rules file to test (defaults to the top-level `--rules`, if given).
+    #[arg(short = 'r', long)]
+    rules: Option<PathBuf>,
+
+    /// Inline rules text, applied after `--rules`.
+    #[arg(long)]
+    rule: Option<String>,
+
+    /// Define a named value as `name=content` (repeatable).
+    #[arg(long = "value", value_name = "NAME=CONTENT")]
+    values: Vec<String>,
+
+    /// Request method.
+    #[arg(short = 'X', long, default_value = "GET")]
+    method: String,
+
+    /// Request header as `name: value` (repeatable).
+    #[arg(short = 'H', long = "header", value_name = "NAME: VALUE")]
+    headers: Vec<String>,
+
+    /// Request body, for the `b:` filter conditions.
+    #[arg(long)]
+    body: Option<String>,
+
+    /// Client address, for the `clientIp:` / `i:` conditions.
+    #[arg(long)]
+    client_ip: Option<String>,
+
+    /// Print the answer as JSON.
+    #[arg(long)]
+    json: bool,
+
+    /// Read one JSON query per line from stdin and answer each on stdout.
+    ///
+    /// The batch shape is what lets another program ask thousands of these —
+    /// `tests/differential/rules-oracle.js` puts the same corpus through
+    /// whistle's own parser and compares.
+    #[arg(long)]
+    batch: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Answered before anything is initialised: explaining a rules file starts no
+    // server, writes no storage directory and creates no CA. A tool you reach
+    // for while a proxy is already running must not disturb the one running.
+    if let Some(Command::Explain(args)) = &cli.command {
+        return run_explain(args, cli.rules.as_deref());
+    }
 
     tracing_subscriber::fmt()
         .with_max_level(if cli.verbose {
@@ -274,6 +342,82 @@ async fn main() -> Result<()> {
     // Keep the spawned Node plugin processes alive for the server's lifetime.
     let _children = children;
     proxy::run(state).await
+}
+
+/// `whistle-rs explain` — see [`whistle_rs::explain`].
+///
+/// `fallback_rules` is the top-level `--rules`, so that the file a running
+/// proxy was started with can be tested by naming it once.
+fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> Result<()> {
+    use std::io::{BufRead, Write};
+    use whistle_rs::explain::{self, Query};
+
+    let mut rules = String::new();
+    if let Some(path) = args.rules.as_deref().or(fallback_rules) {
+        rules = std::fs::read_to_string(path)
+            .with_context(|| format!("reading rules file {}", path.display()))?;
+    }
+    if let Some(inline) = &args.rule {
+        rules.push('\n');
+        rules.push_str(inline);
+    }
+
+    let mut values = std::collections::HashMap::new();
+    for spec in &args.values {
+        let (name, content) = spec
+            .split_once('=')
+            .with_context(|| format!("invalid --value '{spec}', expected name=content"))?;
+        values.insert(name.trim().to_string(), content.to_string());
+    }
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    if args.batch {
+        // One JSON object in, one out, in order — a line that cannot be read
+        // answers `{"error": …}` rather than ending the run, because a corpus
+        // of thousands is worth more with one case missing than not at all.
+        for line in std::io::stdin().lock().lines() {
+            let line = line.context("reading a batch query")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let answer = serde_json::from_str::<Query>(&line)
+                .map_err(|e| format!("cannot read query: {e}"))
+                .and_then(|query| explain::explain(&query));
+            let json = match answer {
+                Ok(explanation) => serde_json::to_string(&explanation)?,
+                Err(message) => serde_json::json!({ "error": message }).to_string(),
+            };
+            writeln!(out, "{json}")?;
+        }
+        return Ok(());
+    }
+
+    let mut headers = std::collections::BTreeMap::new();
+    for header in &args.headers {
+        let (name, value) = header
+            .split_once(':')
+            .with_context(|| format!("invalid --header '{header}', expected 'name: value'"))?;
+        headers.insert(name.trim().to_string(), value.trim().to_string());
+    }
+
+    let query = Query {
+        rules,
+        values,
+        url: args.url.clone().unwrap_or_default(),
+        method: Some(args.method.clone()),
+        headers,
+        body: args.body.clone(),
+        client_ip: args.client_ip.clone(),
+    };
+    let explanation = explain::explain(&query).map_err(|e| anyhow::anyhow!(e))?;
+    if args.json {
+        writeln!(out, "{}", serde_json::to_string_pretty(&explanation)?)?;
+    } else {
+        write!(out, "{}", explain::to_text(&explanation))?;
+    }
+    Ok(())
 }
 
 /// Grab a free TCP port on localhost (for a spawned plugin to bind).
