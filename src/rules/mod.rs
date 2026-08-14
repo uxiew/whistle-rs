@@ -1863,10 +1863,32 @@ pub fn lift_inline_values(text: &str) -> (String, HashMap<String, String>) {
             kept.extend(body);
             continue;
         }
-        values.entry(name.to_string()).or_insert_with(|| body.join("\n"));
+        // The **raw** span, separators and all. Upstream captures the text
+        // between the two fences with one regexp group
+        // (`MULTI_LINE_VALUE_RE`'s `([\s\S]*?)`,
+        // `_original/lib/util/index.js:98-99`), so a block written with CRLFs
+        // keeps them — and a block is how a raw HTTP response is written
+        // inline, where `\r\n` is the framing rather than a formatting choice.
+        // Re-joining the lines with `\n` quietly rewrote that.
+        values
+            .entry(name.to_string())
+            .or_insert_with(|| raw_span(text, &body));
     }
 
     (kept.join("\n"), values)
+}
+
+/// The slice of `text` that `lines` came from, from the first to the last.
+///
+/// The lines are subslices of `text` — [`split_lines`] borrows rather than
+/// copies — so their addresses give back the original separators, which is the
+/// point: this is the one place a value's bytes are the user's own.
+fn raw_span<'a>(text: &'a str, lines: &[&'a str]) -> String {
+    let offset = |part: &str| part.as_ptr() as usize - text.as_ptr() as usize;
+    match (lines.first(), lines.last()) {
+        (Some(first), Some(last)) => text[offset(first)..offset(last) + last.len()].to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Does this operator value ask the values store for anything?
@@ -4546,6 +4568,25 @@ mod parse_text_tests {
         // And a text with no backticks at all is returned untouched.
         let plain = "a.com host://1.1.1.1\n";
         assert_eq!(lift_inline_values(plain).0, plain);
+
+        // **The separators are the user's.** A block is how a raw HTTP response
+        // is written inline, and there `\r\n` is the framing rather than a
+        // formatting choice — upstream captures the span between the fences
+        // with one regexp group and changes nothing in it. This re-joined the
+        // lines with `\n`, so `rawfile://{r.http}` served a message whose head
+        // ended in bare newlines.
+        let crlf = "``` r.http\r\nHTTP/1.1 418 Teapot\r\nX-F: yes\r\n\r\nteapot\r\n```\r\n";
+        assert_eq!(
+            lift_inline_values(crlf).1.get("r.http").map(String::as_str),
+            Some("HTTP/1.1 418 Teapot\r\nX-F: yes\r\n\r\nteapot")
+        );
+        // A block written with plain newlines still has plain newlines, and one
+        // written with both keeps both.
+        let mixed = "``` k\na\r\nb\nc\n```\n";
+        assert_eq!(
+            lift_inline_values(mixed).1.get("k").map(String::as_str),
+            Some("a\r\nb\nc")
+        );
     }
 
     /// The group exposes what its own text declared, under a key private to it,
