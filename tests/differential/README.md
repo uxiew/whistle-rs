@@ -48,7 +48,7 @@ It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0` — except for the corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
 `cases-delete.js` at 8, `cases-values.js` at 11, `cases-compose.js` at 7,
-`cases-groups.js` at 4, `cases-file.js` at 2 and `cases-proxy.js` at 23.
+`cases-groups.js` at 3, `cases-file.js` at 2 and `cases-proxy.js` at 23.
 
 Every run also reports `inert` — the cases that would answer the same with no
 rules loaded at all, and therefore prove nothing. See [below](#inert-which-cases-prove-nothing).
@@ -79,10 +79,11 @@ Five corpora are not clean on a bare run, by design:
   file source spelled `https://` against a plaintext origin, which whistle
   answers anyway and this port refuses; and `<…>`, which names a path here and
   is fetched by upstream when the pattern leaves nothing to append.
-* `cases-groups.js` ends at `differing: 4`, named at the top of the file: one is
-  the two APIs' answer to adding a group twice, and three are one fact — a
-  fenced ``` block is private to the rule group that declared it upstream and
-  shared between them here.
+* `cases-groups.js` ends at `differing: 3`, named at the top of the file: one is
+  the two APIs' answer to adding a group twice. A fenced ``` block is private to
+  the rule group that declared it in both proxies now; what is left in the other
+  two is the older "a bare value stays the literal" divergence, reached because
+  a reference that is out of scope is a reference nothing answers.
 
 ## The HTTPS bench
 
@@ -238,5 +239,5 @@ Two things the harness does for this, and they matter for every corpus:
 
 A case that says only `rules` issues exactly the two calls it always issued.
 
-`cases-groups.js` is the corpus for all of this and ends at `differing: 4`, for
+`cases-groups.js` is the corpus for all of this and ends at `differing: 3`, for
 the two reasons its header names.

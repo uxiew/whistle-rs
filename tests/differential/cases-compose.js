@@ -141,6 +141,30 @@ module.exports = [
   { name: 'a produced rule sees the request the line above rewrote', rules: `${P}/echo ${P}/rewritten\n${P} reqRules://{a}` + V('a', `${P}/rewritten reqHeaders://x-saw=rewritten\n${P}/echo reqHeaders://x-saw=original`) },
   { name: 'a produced condition reads a header an outer line set', rules: `${P} reqHeaders://x-set=1\n${P} reqRules://{a}` + V('a', `${P} reqHeaders://x-saw=yes includeFilter://reqH.x-set=1`) },
 
+  // …and what they are **not** given: the ``` blocks of the text that produced
+  // them. Upstream parses the produced text into a `Rules` of its own, seeded
+  // only with the values that text itself returned, re-keyed under the naming
+  // rule's file (`toPrivateValues`, `_original/lib/rules/index.js:520-530`) —
+  // the naming file's own inline map lives in a different instance and is never
+  // consulted. So `{mock}` inside a produced text is answered by nothing, even
+  // though the block sits three lines above the rule that named it.
+  //
+  // Measured rather than read: `toPrivateValues(vals, rule.file)` says the
+  // opposite at a glance, and this port used to serve the block.
+  //
+  // Written on `reqHeaders://` rather than on a body operator so that the two
+  // answers are *both* visible. An unanswered `{name}` on a body operator makes
+  // this port write the six characters `{mock}` — the declared "a bare value
+  // stays the literal" divergence in `docs/RULES.md` — which would hide this
+  // question behind that one. On a header operator an unanswered reference sets
+  // nothing in either proxy, so "did the block reach it" is the only thing left
+  // to see. The middle case is therefore inert on purpose, and the two around it
+  // are what give it meaning: the first proves a produced rule fires at all, the
+  // last proves the same block reaches the same operator when it is not produced.
+  { name: 'a produced rule needing no value fires', rules: `${P} reqRules://{a}` + V('a', `${P} reqHeaders://x-produced=1`) },
+  { name: 'a produced rule cannot see the block beside the line that named it', rules: `${P} reqRules://{a}` + V('mock', 'x-mock=1') + V('a', `${P} reqHeaders://{mock}`) },
+  { name: 'the same block on the same operator, not produced', rules: `${P} reqHeaders://{mock}` + V('mock', 'x-mock=1') },
+
   // Malformed and missing.
   { name: 'a produced text that is not rules', rules: `${P} reqRules://{a}` + V('a', 'this is not a rule at all !!!') },
   { name: 'a produced text that is empty', rules: `${P} reqRules://{a}` + V('a', '') },

@@ -129,6 +129,31 @@ fn render_backticks(op: &crate::rules::RuleOp, tpl: TplCtx<'_>) -> Option<String
     Some(super::template::render_vars(inner, tpl.info, tpl.env))
 }
 
+/// What `{name}` means *to this operator* — upstream's `getValueFor`
+/// (`_original/lib/rules/rules.js:785-796`).
+///
+/// A ``` block is private to the rules text that declared it, so the same name
+/// can mean two things in two rule groups and neither may answer the other's
+/// reference. The private key is [`crate::rules::inline_key`]; an operator that
+/// belongs to no text of its own reads the shared store alone.
+///
+/// **The two lookups are in this port's order, not upstream's.** There, an
+/// inline block shadows a stored entry of the same name; here the store is asked
+/// first, because `--value` and the console are run-scoped overrides that have to
+/// beat what a rules file brought with it. That divergence is older than this
+/// function and is recorded at [`crate::proxy::effective_values`] — the private
+/// key does not touch it. What it changes is only which *inline* block an
+/// operator can see: its own.
+pub fn value_for<'a>(
+    values: &'a HashMap<String, String>,
+    name: &str,
+    group: Option<&str>,
+) -> Option<&'a String> {
+    values
+        .get(name)
+        .or_else(|| values.get(&crate::rules::inline_key(name, group?)))
+}
+
 /// Replace operator values of the form `{name}` with the named value's content
 /// (whistle's Values store references), after rendering a backtick template.
 ///
@@ -176,11 +201,15 @@ pub fn substitute_values(
             }
             None => false,
         };
+        // Which rules text is asking — a ``` block only answers its own. Taken
+        // before the value is borrowed mutably below.
+        let group = op.group.clone();
+        let group = group.as_deref();
         let value = &mut op.value;
         // The whole value is a reference: it is replaced by the content, which
         // is how a mock body or a rules text gets in.
         if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
-            && let Some(content) = values.get(name)
+            && let Some(content) = value_for(values, name, group)
         {
             let name = name.to_string();
             // A backticked `{name}` renders what the store returned, captures
@@ -233,7 +262,7 @@ pub fn substitute_values(
         // the operator as what the pattern captured.
         if value.contains("${") {
             *value = substitute_braced(value, |name| {
-                let stored = values.get(name)?;
+                let stored = value_for(values, name, group)?;
                 Some(match is_tpl && !stored.is_empty() {
                     true => super::template::render_vars(&expand(stored), tpl.info, tpl.env),
                     false => expand(stored),
@@ -412,6 +441,11 @@ pub fn merge_rules_text(
 ) -> RuleManager {
     let mut mgr = RuleManager::new();
     mgr.set_text(text);
+    // A plugin's rules are no rules file of this proxy's, so they read the
+    // shared values store and no group's ``` blocks — see
+    // [`RuleManager::adopt_group`]. Upstream's `pRules` land in the same place,
+    // by having a file key under which nothing of the user's was filed.
+    mgr.adopt_group(None);
     merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
     mgr
 }
@@ -566,8 +600,8 @@ pub fn merge_included_rules(
     is_internal_req: bool,
 ) -> Vec<RuleManager> {
     let mut texts: Vec<String> = Vec::new();
-    if let Some(name) = resolved.value(crate::rules::protocols::RULE_INCLUDE)
-        && let Some(content) = values.get(name)
+    if let Some(op) = resolved.get(crate::rules::protocols::RULE_INCLUDE)
+        && let Some(content) = value_for(values, &op.value, op.group.as_deref())
     {
         texts.push(content.clone());
     }
@@ -618,6 +652,25 @@ pub fn merge_included_rules(
         .map(|text| {
             let mut mgr = RuleManager::new();
             mgr.set_text(&text);
+            // The operators this text produces belong to no group's ``` blocks —
+            // not the throwaway manager's own `default` (which is a different
+            // text sharing a name with the console's Default) and **not the
+            // group of the line that pulled them in**. Measured, because reading
+            // `toPrivateValues(vals, rule.file)` at `_original/lib/rules/index.js:525`
+            // suggests the opposite: upstream re-keys the produced text's *own*
+            // values under the including file, but the including file's inline
+            // map lives in a different `Rules` instance and the produced manager
+            // never sees it. A rules text that declares `{mock}` and produces a
+            // rule using it gets nothing there; this port used to serve it, from
+            // whichever group happened to declare that name.
+            //
+            // The `rule://<name>` lookup above is a different question and does
+            // use the group: the *name of the entry to pull in* is read from the
+            // including line's own text, which is where it was written.
+            //
+            // Done before either resolution, so the response pass over the same
+            // manager agrees. See [`RuleManager::adopt_group`].
+            mgr.adopt_group(None);
             merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
             mgr
         })
@@ -708,6 +761,10 @@ pub fn merge_res_rules(resolved: &mut Resolved, info: &ReqInfo, is_internal_req:
     for text in texts {
         let mut mgr = RuleManager::new();
         mgr.set_text(&text);
+        // Produced rules belong to no group's ``` blocks, as an included text
+        // does not — see [`merge_included_rules`] and
+        // [`RuleManager::adopt_group`].
+        mgr.adopt_group(None);
         // Both passes, as the top-level rules get: a `resHeaders://x=1
         // includeFilter://s:404` line inside the text is withheld by the first
         // and answered by the second.
@@ -9051,6 +9108,62 @@ mod tests {
             let line = format!("a.com resHeaders://{text}\n");
             assert_eq!(of(&line, "resHeaders").as_deref(), Some(text), "{text}");
         }
+    }
+
+    /// A ``` block belongs to the rules text that declared it: another group's
+    /// reference of the same name is not answered by it, and cannot shadow it.
+    ///
+    /// Upstream files an inline entry under `key + '\n\r' + file` and looks that
+    /// key up before falling back to the shared store — never to another file's
+    /// inline map (`getInlineKey` / `getValueFor`,
+    /// `_original/lib/util/index.js:205-209`, `lib/rules/rules.js:785-796`).
+    /// This port merged every enabled group's blocks into one flat map, so the
+    /// reference below answered whatever group happened to be resolved last.
+    #[test]
+    fn a_fenced_block_answers_only_its_own_group() {
+        let body_of = |mgr: &RuleManager| {
+            let values = {
+                let mut v = mgr.inline_values();
+                // What the console and `--value` hold, laid over the top exactly
+                // as `crate::proxy::effective_values` does.
+                v.extend(HashMap::from([("stored".to_string(), "FROM-STORE".to_string())]));
+                v
+            };
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            let mut resolved = mgr.resolve(&info);
+            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            resolved.value("resBody").map(str::to_string)
+        };
+
+        // A block and the reference in the same group: the shape that has to
+        // keep working.
+        let mut own = RuleManager::new();
+        own.set_text("```v\nFROM-DEFAULT\n```\na.com resBody://{v}\n");
+        assert_eq!(body_of(&own).as_deref(), Some("FROM-DEFAULT"));
+
+        // Declared in one group, referenced from another: not answered, so the
+        // reference is left as written — which is what a missed lookup does.
+        let mut across = RuleManager::new();
+        across.set_text("```v\nFROM-DEFAULT\n```\n");
+        across.add_group("A", "a.com resBody://{v}\n", true);
+        assert_eq!(body_of(&across).as_deref(), Some("{v}"));
+
+        // And the sharpest form: a group that declares *and* uses `v` keeps its
+        // own, whatever another group declares under that name. `A` resolves
+        // before `default`, so this is the case the flat map got backwards.
+        let mut shadowed = RuleManager::new();
+        shadowed.set_text("```v\nFROM-DEFAULT\n```\n");
+        shadowed.add_group("A", "```v\nFROM-A\n```\na.com resBody://{v}\n", true);
+        assert_eq!(body_of(&shadowed).as_deref(), Some("FROM-A"));
+
+        // The store is shared by all of them, and still beats a block of the
+        // same name — this port's own layering, unchanged by the private key.
+        let mut stored = RuleManager::new();
+        stored.set_text("```stored\nFROM-BLOCK\n```\na.com resBody://{stored}\n");
+        assert_eq!(body_of(&stored).as_deref(), Some("FROM-STORE"));
+        let mut other = RuleManager::new();
+        other.add_group("A", "a.com resBody://{stored}\n", true);
+        assert_eq!(body_of(&other).as_deref(), Some("FROM-STORE"));
     }
 
     /// Resolve `text` against a GET of `http://a.com/p?q=1`, substitute

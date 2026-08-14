@@ -604,7 +604,10 @@ curl --noproxy '*' http://127.0.0.1:8899/api/rule-groups
 ```
 
 Groups persist to `<storage_dir>/rules/` and come back on restart. A disabled
-group contributes nothing — not even the values its fenced blocks declare.
+group contributes nothing — not even the values its fenced blocks declare. And
+an *enabled* group's fenced blocks are its own: a `{name}` written in one group
+is answered by that group's block, never by another's, so two groups may each
+carry a mock called `mock.json` without either shadowing the other.
 
 `DELETE /api/rule-group` removes a named group. It **refuses `default`**, which
 is the group `GET`/`POST /api/rules` reads and writes and the one the console

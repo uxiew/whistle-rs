@@ -36,7 +36,7 @@
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// A clean run of this file is **`differing: 4`**, from two causes, both named
+// A clean run of this file is **`differing: 3`**, from two causes, both named
 // here.
 //
 //  1. `two groups with the same name` — upstream's `add` is a file write, so the
@@ -49,19 +49,26 @@
 //     other API can reach, this one can reach too — and the shape that refuses
 //     to overwrite silently is the better of them. Declared, not aligned.
 //
-//  2. The three `values block` cases — upstream files an inline ``` block under
-//     a key **private to the rules file that declared it** (`getInlineKey` =
-//     `key + '\n\r' + file`, `_original/lib/util/index.js:205-209`), and
-//     `getValueFor` looks that private key up before falling back to the
-//     **stored** values (`_original/lib/rules/rules.js:785-796`) — never to
-//     another file's inline map. So upstream's second group sees nothing and
-//     `resBody://{v}` never fires, in either direction, and a second block of
-//     the same name cannot shadow the first group's own. This port merges every
-//     enabled group's blocks into one flat map (`RuleManager::inline_values` →
-//     `effective_values`, `src/proxy/mod.rs:2810`), so all three fire.
-//     Reported, not fixed: scoping it means carrying the declaring group down
-//     into the resolved operator set, which is the values resolution path
-//     rather than this one.
+//  2. Two of the three `values block` cases, and **not for the reason they were
+//     written**. An inline ``` block is now private to the group that declared
+//     it here as it is upstream — filed under `getInlineKey` = `key + '\n\r' +
+//     file` (`_original/lib/util/index.js:205-209`) and looked up before the
+//     **stored** values fall back (`getValueFor`,
+//     `_original/lib/rules/rules.js:785-796`), never in another file's inline
+//     map. `another group cannot shadow the block a group declared` is clean on
+//     that alone; this port used to merge every enabled group's blocks into one
+//     flat map, so which of two same-named blocks won was decided by the order
+//     the groups sat in.
+//
+//     What is left in the other two is a **different, older divergence**: with
+//     the block out of scope the reference is unanswered, and an unanswered
+//     `{v}` stays the literal `{v}` here while upstream reads it as a path,
+//     finds nothing, and leaves the response alone. So whistle answers with the
+//     origin's page and this port answers `{v}` plus the cache headers that come
+//     with a body rewrite. That is the "a bare value stays the literal" choice
+//     `docs/RULES.md` declares under *Values read from a file or a URL*, reached
+//     from a new direction — not a group-scoping difference. It is why these two
+//     did not go clean when the third did.
 //
 // ── How much of this measures anything ─────────────────────────────────────
 //

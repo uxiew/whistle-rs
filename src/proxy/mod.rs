@@ -2828,7 +2828,9 @@ fn restore_content_encoding(
 }
 
 /// The values a request resolves against: what the rules files declared in
-/// their ``` blocks, with the configured values laid over the top.
+/// their ``` blocks, each under a key private to the group that declared it
+/// ([`crate::rules::inline_key`]), plus the configured values under their plain
+/// names. [`apply::value_for`] is what reads the two apart.
 ///
 /// Rebuilt per request rather than cached because either side can change while
 /// the proxy runs — the console edits values, and a rules edit can add or
@@ -2840,7 +2842,9 @@ fn restore_content_encoding(
 /// (`_original/lib/rules/rules.js:785-796`), so there a ``` block shadows a
 /// stored entry of the same name. Here `--value` is a run-scoped override that
 /// has to beat what a rules file brought — see `main.rs`. Recorded rather than
-/// aligned, and exercised in `tests/differential/cases-values.js`.
+/// aligned, and exercised in `tests/differential/cases-values.js`. The private
+/// key does not touch that order: it decides *which* block an operator may see,
+/// not whether a block beats the store.
 fn effective_values(state: &AppState) -> std::collections::HashMap<String, String> {
     let mut values = state.rules.read().unwrap().inline_values();
     if values.is_empty() {

@@ -24,6 +24,7 @@ pub mod wildcard;
 
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 /// Every line property whistle's editor offers
 /// (`LINE_PROPS_HINTS` in `_original/biz/webui/htdocs/src/js/rules-hint.js:69`),
@@ -229,6 +230,35 @@ pub struct RuleOp {
     /// which one wins. Operators merged in from another rules text sort last —
     /// see [`crate::proxy::apply::merge_rules_text`].
     pub order: u64,
+    /// The rules text this operator was written in — upstream's `rule.file`.
+    ///
+    /// It has one reader: a ``` block is private to the text that declared it,
+    /// so answering a `{name}` needs to know whose `{name}` it is. Upstream
+    /// files an inline block under `key + '\n\r' + file` (`getInlineKey`,
+    /// `_original/lib/util/index.js:205-209`) and looks that private key up
+    /// before it falls back to the shared store (`getValueFor`,
+    /// `lib/rules/rules.js:785-796`) — see [`inline_key`].
+    ///
+    /// `None` for an operator that belongs to no rules text of its own: the
+    /// ones this port builds directly (the plugin and console paths, and every
+    /// test), which have no ``` block to be private to and so read the shared
+    /// store alone.
+    ///
+    /// An [`Arc`] because it is copied onto every operator of every line and
+    /// cloned again on every match — a group name is one allocation per parse,
+    /// not one per resolved operator.
+    pub group: Option<Arc<str>>,
+}
+
+/// The key an inline ``` block's entry is filed under: private to the rules
+/// text that declared it.
+///
+/// Upstream's `getInlineKey` (`_original/lib/util/index.js:205-209`), separator
+/// and all. `\n\r` cannot occur in a fence's name — [`lift_inline_values`]
+/// rejects a name with any whitespace in it — so a private key can never
+/// collide with a plain one, and the two live in the same map.
+pub fn inline_key(name: &str, group: &str) -> String {
+    format!("{name}\n\r{group}")
 }
 
 /// The resolution-order key of the rule at `index`: important lines sort before
@@ -1115,6 +1145,14 @@ impl RuleGroup {
         let body = includes.expand(&body, &mut inline);
         self.inline_values = inline;
         self.rules = parse_text(&body);
+        // Every operator remembers which text it was written in, because a ```
+        // block belongs to one — see [`RuleOp::group`]. Stamped here rather than
+        // threaded through the parser: `parse_text` is given a body and knows
+        // nothing about groups, and the group is the same for all of them.
+        let name: Arc<str> = Arc::from(self.name.as_str());
+        for op in self.rules.iter_mut().flat_map(|rule| rule.ops.iter_mut()) {
+            op.group = Some(name.clone());
+        }
         self.res_candidates = res_candidates(&self.rules);
         self.body_candidates = body_candidates(&self.rules);
         self.has_sni_callback = has_sni_callback(&self.rules);
@@ -1221,6 +1259,35 @@ impl RuleManager {
 
     pub(crate) fn includes(&self) -> &include::Includes {
         &self.includes
+    }
+
+    /// Say whose rules text this one's operators belong to — see
+    /// [`RuleOp::group`].
+    ///
+    /// For the mid-request managers only. A `rule://`, a `rulesFile://` or a
+    /// plugin's rules are parsed into a manager of their own, whose one group is
+    /// called `default` because [`set_text`](Self::set_text) has no other name to
+    /// give it — and that is a *different* text that merely shares a name with
+    /// the console's Default. Left as parsed, an included text would answer its
+    /// `{name}` from Default's ``` blocks whichever group actually named it.
+    ///
+    /// `None` says the text belongs to no rules file of this proxy's, so it reads
+    /// the shared store alone. That is what a plugin's rules are here, and what
+    /// upstream's `pRules` amount to: a file key of their own, under which no
+    /// user's block was ever filed.
+    ///
+    /// Applied to what is already parsed rather than remembered, because these
+    /// managers are parsed once and thrown away when the request ends. A rule set
+    /// that reparses — every long-lived one — must not call it.
+    pub fn adopt_group(&mut self, group: Option<Arc<str>>) {
+        for op in self
+            .groups
+            .iter_mut()
+            .flat_map(|g| g.rules.iter_mut())
+            .flat_map(|rule| rule.ops.iter_mut())
+        {
+            op.group = group.clone();
+        }
     }
 
     /// Does this rule set resolve `@` lines? Answered before anything is spent
@@ -1487,16 +1554,27 @@ impl RuleManager {
     // ── Group management API ──
 
     /// Immutable access to all groups.
-    /// Every value declared in a ``` fenced block by any **enabled** group.
+    /// Every value declared in a ``` fenced block by any **enabled** group,
+    /// filed under [`inline_key`] — private to the group that declared it.
+    ///
+    /// The private key is upstream's, and it is what keeps two groups' blocks of
+    /// the same name apart: `getValueFor` asks `key + '\n\r' + file` and never
+    /// another file's inline map (`_original/lib/rules/rules.js:785-796`). This
+    /// used to be a flat merge under the plain names, so a block declared in one
+    /// group answered a `{name}` written in another — and which of two blocks of
+    /// the same name won was decided by the order the groups happened to sit in.
     ///
     /// The proxy lays these *under* the configured values, so a `--value` or a
-    /// console-edited value of the same name wins — an inline block travels with
-    /// the rules file, and an explicit setting should be able to override what
-    /// a file brought with it.
+    /// console-edited value of the same name still wins — an inline block travels
+    /// with the rules file, and an explicit setting should be able to override
+    /// what a file brought with it. That layering is this port's, and the private
+    /// key does not change it: see [`crate::proxy::apply::value_for`].
     pub fn inline_values(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for group in self.groups.iter().filter(|g| g.enabled) {
-            out.extend(group.inline_values.clone());
+            for (name, value) in &group.inline_values {
+                out.insert(inline_key(name, &group.name), value.clone());
+            }
         }
         out
     }
@@ -4399,18 +4477,58 @@ mod parse_text_tests {
         assert_eq!(lift_inline_values(plain).0, plain);
     }
 
-    /// The group exposes what its own text declared, and only while enabled.
+    /// The group exposes what its own text declared, under a key private to it,
+    /// and only while enabled.
     #[test]
     fn inline_values_come_from_enabled_groups() {
         let mut mgr = RuleManager::new();
         mgr.set_text("``` a\nfrom-default\n```\nexample.com file://{a}\n");
-        assert_eq!(mgr.inline_values().get("a").map(String::as_str), Some("from-default"));
+        let got = |mgr: &RuleManager, name: &str, group: &str| {
+            mgr.inline_values().get(&inline_key(name, group)).cloned()
+        };
+        assert_eq!(got(&mgr, "a", "default").as_deref(), Some("from-default"));
+        // The plain name is nobody's key: an entry is only ever asked for
+        // alongside the group asking, so there is nothing to answer here.
+        assert!(!mgr.inline_values().contains_key("a"));
 
         mgr.add_group("extra", "``` b\nfrom-extra\n```\n", true);
-        assert_eq!(mgr.inline_values().get("b").map(String::as_str), Some("from-extra"));
+        assert_eq!(got(&mgr, "b", "extra").as_deref(), Some("from-extra"));
+        // …and `b` is not the default group's, which is the whole point of the
+        // key: two groups may each declare a `b`, and neither answers the other.
+        assert_eq!(got(&mgr, "b", "default"), None);
 
         mgr.toggle_group("extra");
-        assert!(!mgr.inline_values().contains_key("b"), "a disabled group contributes nothing");
+        assert_eq!(got(&mgr, "b", "extra"), None, "a disabled group contributes nothing");
+    }
+
+    /// Every operator carries the group its line was written in, and a
+    /// mid-request text can be told to say otherwise.
+    #[test]
+    fn an_operator_knows_which_rules_text_wrote_it() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com host://1.1.1.1\n");
+        mgr.add_group("extra", "example.com resHeaders://x-a=1\n", true);
+        let group_of = |mgr: &RuleManager, proto: &str| {
+            let info = crate::proxy::apply::build_req_info(
+                "GET",
+                "http",
+                "example.com",
+                80,
+                "/",
+                &hyper::HeaderMap::new(),
+                None,
+            );
+            mgr.resolve(&info).get(proto).and_then(|op| op.group.clone())
+        };
+        assert_eq!(group_of(&mgr, "host").as_deref(), Some("default"));
+        assert_eq!(group_of(&mgr, "resHeaders").as_deref(), Some("extra"));
+
+        // What a `rule://` or a plugin produces is not the group it was parsed
+        // under — see `RuleManager::adopt_group`.
+        mgr.adopt_group(Some(Arc::from("borrowed")));
+        assert_eq!(group_of(&mgr, "host").as_deref(), Some("borrowed"));
+        mgr.adopt_group(None);
+        assert_eq!(group_of(&mgr, "host"), None);
     }
 
     /// `proto://(text)` means the value **is** `text`, for every operator and

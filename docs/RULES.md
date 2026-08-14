@@ -566,6 +566,17 @@ is a CORS rule, not a fetch. A *path* there is still read.
 > the path, gets nothing, and falls back to parsing the matcher as a query
 > string (`tryParseMatcher`, `util/index.js:1165-1171,:1303`). The difference
 > only shows for a file whose name contains an `=`.
+>
+> **A `{name}` the store cannot answer is a bare value like any other**, and so
+> it stays literal here: `resBody://{typo}` writes those six characters as the
+> body, where whistle writes nothing — it files the matcher under `rule.key`
+> (`getKey`, `rules.js:263-270`), hands the keyed rule an empty file list
+> (`getRuleFiles`, `util/index.js:1435-1437`), and leaves the response alone.
+> Measured, and left as it is on purpose: telling a failed reference from a
+> literal that happens to be brace-wrapped means deciding that `{typo}` is a
+> *name* and `{"a":1}` is not, which is a grammar neither program has. The
+> same choice is already made one paragraph up for `${name}`, where upstream
+> agrees: a lookup that misses shows as itself rather than as nothing.
 
 **Details that matter:**
 
@@ -689,21 +700,24 @@ What comes back is **content, not rules**: nothing in it is scanned again, so a
 `${…}`, a `{…}` or a fence inside a mock body is the text the mock meant to
 contain.
 
-> **Two divergences.**
->
-> When a fenced block and a [values store](#flags-includes--values) entry carry
-> the same name, upstream uses the block — `getValueFor` asks the inline map
-> first and falls back to the store (`rules.js:785-796`). whistle-rs uses the
-> store, so that a `--value` given on the command line, or an edit in the
-> console, overrides what a rules file brought.
->
-> And a block declared in one **rule group** is visible to the others here,
-> where upstream keeps it private to the group that declared it: it files the
-> name under `key + '\n\r' + <file>` (`getInlineKey`, `util/index.js:205-209`)
-> and never looks in another group's map. So upstream's `{v}` renders literally
-> in a second group and expands here, and a second group declaring the same name
-> shadows the first here and does not there. Measured, not aligned —
-> `tests/differential/cases-groups.js` carries the three cases.
+**A block belongs to the rule group that declared it.** Another group's `{v}` is
+not answered by it, and another group's block of the same name cannot shadow it —
+the name is filed under `key + '\n\r' + <group>` and looked up that way, which is
+upstream's `getInlineKey` / `getValueFor` (`util/index.js:205-209`,
+`rules.js:785-796`). Rules **produced** mid-request — by a `rule://`, a
+`rulesFile://`, a `resRules://` or a plugin — belong to no group at all and see
+the [values store](#flags-includes--values) alone, as they do upstream: the
+produced text is parsed into a rule set of its own, and the naming file's blocks
+live in a different one. So a block three lines above a `reqRules://` does not
+reach what that line produces. The *name* on the line itself is read where it was
+written, so `rule://more` beside a ```` ```more ```` block still finds it.
+
+> **One divergence.** When a fenced block and a values store entry carry the same
+> name, upstream uses the block — `getValueFor` asks the inline map first and
+> falls back to the store. whistle-rs asks the store first, so that a `--value`
+> given on the command line, or an edit in the console, overrides what a rules
+> file brought with it. That is about *which of the two* wins, not about which
+> block is visible; the group scoping above is upstream's either way.
 
 ### Destination
 

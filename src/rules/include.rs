@@ -770,7 +770,9 @@ mod tests {
         let mut mgr = RuleManager::with_includes();
         mgr.set_text("```v\n@/t/inc.rules\n```\na.com resBody://{v}\n");
         assert!(mgr.includes().targets().is_empty());
-        assert_eq!(mgr.inline_values().get("v").map(String::as_str), Some("@/t/inc.rules"));
+        // Keyed to the group that declared it — see `RuleManager::inline_values`.
+        let key = crate::rules::inline_key("v", "default");
+        assert_eq!(mgr.inline_values().get(&key).map(String::as_str), Some("@/t/inc.rules"));
     }
 
     #[test]
@@ -780,8 +782,9 @@ mod tests {
             "/t/inc.rules",
             "```v\nINNER\n```\n```w\nONLY-INNER\n```\na.com resBody://{v}\n",
         );
-        assert_eq!(mgr.inline_values().get("v").map(String::as_str), Some("OUTER"));
-        assert_eq!(mgr.inline_values().get("w").map(String::as_str), Some("ONLY-INNER"));
+        let key = |name| crate::rules::inline_key(name, "default");
+        assert_eq!(mgr.inline_values().get(&key("v")).map(String::as_str), Some("OUTER"));
+        assert_eq!(mgr.inline_values().get(&key("w")).map(String::as_str), Some("ONLY-INNER"));
     }
 
     #[test]
