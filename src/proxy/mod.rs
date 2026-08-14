@@ -3384,6 +3384,19 @@ async fn serve(
     // not the client's, so nothing downstream may see it.
     let from_composer = take_composer_marker(req.headers_mut());
 
+    // A request that asks to change protocol is matched as a `ws://` one, and
+    // that has to be known *before* the rules resolve. whistle stamps
+    // `req.isWs = true` on every upgrade it accepts and builds the URL from it —
+    // `(req.isWs ? 'ws' : 'http') + (req.isHttps ? 's' : '')`
+    // (`_original/lib/upgrade.js:121`, `lib/util/common.js:1267`) — so a
+    // `ws://` pattern matches a WebSocket and an `http://` one does not.
+    //
+    // The rules layer has read this scheme all along; nothing ever set it, so
+    // both halves were wrong in production: `ws://example.com` matched nothing a
+    // client could send, and `http://example.com` matched the WebSocket it
+    // excludes. It also decides whether a `file://` may answer at all
+    // (`matcher::serves_no_file`).
+    let upgrading = asks_to_upgrade(req.headers());
     // Derive scheme/host/port/path for matching.
     let (scheme, host, port, path) = match &origin {
         Origin::Forward => {
@@ -3393,11 +3406,21 @@ async fn serve(
             if was_https && scheme == "http" {
                 scheme = "https".to_string();
             }
+            if upgrading {
+                scheme = match scheme.as_str() {
+                    "https" | "wss" => "wss".to_string(),
+                    _ => "ws".to_string(),
+                };
+            }
             // Read after the marker, so a request restored to https and carrying
-            // no explicit port lands on 443 rather than 80.
+            // no explicit port lands on 443 rather than 80 — and after the
+            // upgrade rename, so a `wss://` one does too.
             let port = uri
                 .port_u16()
-                .unwrap_or(if scheme == "https" { 443 } else { 80 });
+                .unwrap_or(match scheme.as_str() {
+                    "https" | "wss" => 443,
+                    _ => 80,
+                });
             let path = uri
                 .path_and_query()
                 .map(|p| p.as_str().to_string())
@@ -3410,7 +3433,12 @@ async fn serve(
                 .path_and_query()
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string());
-            let scheme = if *tls { "https" } else { "http" };
+            let scheme = match (*tls, upgrading) {
+                (true, true) => "wss",
+                (true, false) => "https",
+                (false, true) => "ws",
+                (false, false) => "http",
+            };
             (scheme.to_string(), host.clone(), *port, path)
         }
     };
@@ -4405,7 +4433,13 @@ fn apply_plugin_res_result(
 
 /// True if the request asks to upgrade the protocol (e.g. a WebSocket handshake).
 fn is_upgrade(req: &Request<DynBody>) -> bool {
-    let headers = req.headers();
+    asks_to_upgrade(req.headers())
+}
+
+/// The same question of a header map alone, because it has to be answered
+/// before the request has been read — the scheme the rules match against
+/// depends on it (`ws://` rather than `http://`).
+fn asks_to_upgrade(headers: &hyper::HeaderMap) -> bool {
     let conn_upgrade = headers
         .get(hyper::header::CONNECTION)
         .and_then(|v| v.to_str().ok())
@@ -4708,6 +4742,41 @@ mod upgrade_abort_tests {
             got.starts_with(b"HTTP/1.1 502"),
             "expected a gateway error, got {:?}",
             String::from_utf8_lossy(&got)
+        );
+    }
+
+    /// An upgrade resolves under a `ws://` URL, not an `http://` one.
+    ///
+    /// whistle stamps `req.isWs` and builds the URL its patterns match from it
+    /// (`_original/lib/upgrade.js:121`, `common.js:1267`). The rules layer here
+    /// has always read that scheme; nothing ever *set* it, so a `ws://` pattern
+    /// matched no request a client could make and an `http://` pattern matched
+    /// the WebSocket it is written to exclude. `enable://abortRes` is the probe
+    /// — silence means the rule matched, a `101` means it did not.
+    #[tokio::test]
+    async fn an_upgrade_is_matched_as_a_websocket_url() {
+        let origin = upgrading_origin().await;
+
+        let (_state, addr) = proxy_with(&format!("ws://{origin} enable://abortRes")).await;
+        assert!(
+            handshake_through(addr, origin, "/ws").await.is_empty(),
+            "a ws:// pattern must reach a WebSocket"
+        );
+
+        let (_state, addr) = proxy_with(&format!("http://{origin} enable://abortRes")).await;
+        assert!(
+            handshake_through(addr, origin, "/ws").await.starts_with(b"HTTP/1.1 101"),
+            "an http:// pattern must not reach a WebSocket"
+        );
+
+        // And the consequence the scheme decides on its own: a file rule is
+        // passed over on an upgrade rather than answering it with a mock
+        // (`matcher::serves_no_file`). Measured against whistle 2.10.8, which
+        // relays the handshake; this port used to answer `404 Not found file`.
+        let (_state, addr) = proxy_with(&format!("{origin} file:///no/such/mock.json")).await;
+        assert!(
+            handshake_through(addr, origin, "/ws").await.starts_with(b"HTTP/1.1 101"),
+            "a file rule must not answer an upgrade"
         );
     }
 
