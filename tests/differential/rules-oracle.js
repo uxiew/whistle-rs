@@ -131,10 +131,28 @@ function bucketOf(protocol) {
 
 // ── Upstream ───────────────────────────────────────────────────────────────
 
-function upstreamResolve(rulesText, values, req) {
+// One question with no response head, or **two** with one — which is what a
+// real request asks. whistle resolves the request-phase protocols before it has
+// a head (`resolveReqRules`) and the `pureResProtocols` once it does
+// (`resolveResRules`, `_original/lib/rules/rules.js:2302-2308`), against a
+// request `lib/inspectors/res.js` has just stamped the status and headers onto.
+// Asking for everything in one call with the head already in hand would decide
+// the *request* half with an answer no request has yet, which is the one thing
+// this port is careful not to do.
+function upstreamResolve(rulesText, values, req, response) {
   const rules = new Rules(values || {});
   rules.parse(rulesText);
-  const resolved = rules.resolveRules(req);
+  let resolved;
+  if (response) {
+    resolved = rules.resolveReqRules(req);
+    req.statusCode = String(response.status);
+    req.resHeaders = response.headers || {};
+    req.hostIp = response.server_ip;
+    req.serverPort = response.server_port;
+    Object.assign(resolved, rules.resolveResRules(req));
+  } else {
+    resolved = rules.resolveRules(req);
+  }
   const ops = [];
   for (const key of Object.keys(resolved)) {
     const rule = resolved[key];
@@ -172,11 +190,24 @@ function upstreamResolve(rulesText, values, req) {
   return ops;
 }
 
-function makeReq(url, method, headers, body) {
+function makeReq(url, method, headers, body, clientIp) {
   const parsed = new URL(url);
   const head = Object.assign(
     { host: parsed.host },
     headers || {}
+  );
+  // The URL a pattern is matched against is the one `getFullUrl` builds, and it
+  // drops the port when the scheme implies it (`removeDefaultPort`,
+  // `_original/lib/util/common.js:1266`). Both proxies do; only this bench,
+  // which hands the resolver a URL rather than a socket, has to be told.
+  url = url.replace(
+    /^(https?|wss?|tunnel):\/\/([^/?#]+)/,
+    (all, scheme, authority) => {
+      const port = /^(wss|https)$/.test(scheme) ? ':443' : ':80';
+      return authority.endsWith(port)
+        ? `${scheme}://${authority.slice(0, -port.length)}`
+        : all;
+    }
   );
   return {
     fullUrl: url,
@@ -185,6 +216,9 @@ function makeReq(url, method, headers, body) {
     headers: head,
     isHttps: parsed.protocol === 'https:',
     _reqBody: typeof body === 'string' ? body : undefined,
+    // `matchFilter` reads it straight off the request (`rules.js:1876,:1882`);
+    // the socket it normally comes from does not exist here.
+    clientIp,
   };
 }
 
@@ -641,11 +675,15 @@ function derivedUrls(line) {
 // ── Run ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { limit: 3, values: false, grep: null, quiet: false, fromCases: false };
+  const args = {
+    limit: 3, values: false, grep: null, quiet: false,
+    fromCases: false, generated: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--values') args.values = true;
     else if (arg === '--from-cases') args.fromCases = true;
+    else if (arg === '--generated') args.generated = true;
     else if (arg === '--quiet') args.quiet = true;
     else if (arg === '--limit') args.limit = parseInt(argv[++i], 10);
     else if (arg === '--grep') args.grep = new RegExp(argv[++i], 'i');
@@ -655,7 +693,11 @@ function parseArgs(argv) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
-  const corpus = args.fromCases ? casesCorpus() : CORPUS;
+  const corpus = args.generated
+    ? require('./cases-generated.js')
+    : args.fromCases
+      ? casesCorpus()
+      : CORPUS;
   const cases = corpus.filter(
     (c) =>
       (!args.grep || args.grep.test(c.rules)) &&
@@ -682,12 +724,15 @@ function main() {
         headers: testCase.headers || {},
         body: testCase.body,
         values: testCase.values || {},
+        client_ip: testCase.clientIp,
+        response: testCase.response,
       });
     }
   }
 
   console.log(
-    `rules-oracle: ${cases.length} ${args.fromCases ? 'bench cases' : 'rule lines'}` +
+    `rules-oracle: ${cases.length} ` +
+      `${args.fromCases ? 'bench cases' : args.generated ? 'generated cases' : 'rule lines'}` +
       ` × urls = ${queries.length} questions`
   );
 
@@ -713,7 +758,8 @@ function main() {
       upstream = upstreamResolve(
         query.rules,
         query.values,
-        makeReq(query.url, query.method, query.headers, query.body)
+        makeReq(query.url, query.method, query.headers, query.body, query.client_ip),
+        query.response
       );
     } catch (e) {
       record(classes, 'whistle threw: ' + e.message, query, '', '');
@@ -878,7 +924,8 @@ function isHostCaseFolding(query, right) {
     ops = upstreamResolve(
       rules,
       query.values,
-      makeReq(lowered, query.method, query.headers, query.body)
+      makeReq(lowered, query.method, query.headers, query.body, query.client_ip),
+      query.response
     );
   } catch {
     return false;
