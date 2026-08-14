@@ -1901,7 +1901,7 @@ pub async fn accept_loop(
 /// Entry point for every request arriving on the main port.
 async fn top_level(
     state: Arc<AppState>,
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     peer: SocketAddr,
 ) -> Result<Response<DynBody>, Destroyed> {
     if req.method() == hyper::Method::CONNECT {
@@ -1911,7 +1911,37 @@ async fn top_level(
     if req.uri().authority().is_some() {
         return guard(serve(state, req, Origin::Forward, peer).await);
     }
+    // …unless the path opens with the escape hatch. Everything addressed to the
+    // proxy's own port is its console, and `/-/` (or `/_/`) is how upstream lets
+    // a client say "this one is an ordinary request, not an instruction to you"
+    // — it strips the prefix and lets the request fall through to the rules
+    // (`_original/biz/index.js:114-129`, and the FAQ's answer to "how do I reach
+    // the proxy port without being taken for an internal request").
+    //
+    // The request then names *this* proxy, so what happens next is a rule's to
+    // decide: `http://127.0.0.1:8899/x https://api.example.com/x` is the FAQ's
+    // own example. With no rule it meets the self-loop guard and answers 302,
+    // which is what upstream does with it too.
+    if let Some(uri) = bypass_console(&req) {
+        *req.uri_mut() = uri;
+        return guard(serve(state, req, Origin::Forward, peer).await);
+    }
     Ok(webui::handle(&state, req).await)
+}
+
+/// `/-/…` and `/_/…` on the proxy's own port: the absolute-form URI the request
+/// would have had if the client had gone through the proxy properly.
+///
+/// Returns `None` when the path carries neither prefix, or when there is no
+/// `Host` header to build an authority from — a request with neither is not one
+/// this proxy can forward anywhere.
+fn bypass_console(req: &Request<Incoming>) -> Option<hyper::Uri> {
+    let path_and_query = req.uri().path_and_query()?.as_str();
+    let rest = path_and_query
+        .strip_prefix("/-/")
+        .or_else(|| path_and_query.strip_prefix("/_/"))?;
+    let host = req.headers().get(hyper::header::HOST)?.to_str().ok()?;
+    format!("http://{host}/{rest}").parse().ok()
 }
 
 /// Handle a CONNECT: acknowledge, then intercept the tunnel with MITM.
@@ -2163,6 +2193,62 @@ pub(crate) mod tunnel_abort_tests {
             accept_loop(serving, listener, None).await.ok();
         });
         (state, addr)
+    }
+
+    /// `/-/` and `/_/` on the proxy's own port say "this is an ordinary request".
+    ///
+    /// Everything addressed to that port origin-form is the console, so a client
+    /// with no proxy configured cannot otherwise reach a rule at all. Upstream
+    /// strips the prefix and lets the request fall through
+    /// (`_original/biz/index.js:114-129`); measured against whistle 2.10.8 with
+    /// the FAQ's own example, both proxies land the request on the origin the
+    /// rule names, and both answer the console's 404 without the prefix.
+    #[tokio::test]
+    async fn the_console_port_has_an_escape_hatch() {
+        // A one-line origin, so the test can see *where* the request landed.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin");
+        let origin = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = head.split_whitespace().nth(1).unwrap_or("?").to_string();
+                    let body = format!("LANDED {path}");
+                    let res = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    sock.write_all(res.as_bytes()).await.ok();
+                });
+            }
+        });
+
+        // The pattern names the proxy's own port, which the test does not know
+        // yet — so it is written as the regexp that any of them matches.
+        let (_state, addr) = proxy_with(&format!(
+            r"/^http:\/\/127\.0\.0\.1:\d+\/hop$/ http://{origin}/landed"
+        ))
+        .await;
+
+        let get = |path: String| async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+            client.write_all(req.as_bytes()).await.unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.ok();
+            String::from_utf8_lossy(&got).to_string()
+        };
+
+        for prefix in ["/-/", "/_/"] {
+            let answer = get(format!("{prefix}hop")).await;
+            assert!(answer.starts_with("HTTP/1.1 200"), "{prefix}: {answer}");
+            assert!(answer.contains("LANDED /landed"), "{prefix}: {answer}");
+        }
+        // Without the prefix the same path is the console's to answer.
+        let answer = get("/hop".to_string()).await;
+        assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
     }
 
     /// End to end: the client's CONNECT is never answered. Upstream destroys the

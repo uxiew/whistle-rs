@@ -2734,6 +2734,30 @@ api.test/data  resMerge://true            # …unless this asks for a deep fold
 
 ---
 
+### Reaching a rule without a proxy configured
+
+Everything addressed to the proxy's own port **origin-form** — a request with a
+path rather than a whole URL — is the console. That is what makes
+`http://127.0.0.1:8899/api` fetch a page of this program rather than anything a
+rule could touch.
+
+`/-/` (or `/_/`) in front of the path says the opposite: strip the prefix and
+treat what is left as an ordinary request (`_original/biz/index.js:114-129`,
+and the FAQ's answer to the same question). The request then names *this*
+proxy, so where it goes is a rule's to decide:
+
+```
+http://127.0.0.1:8899/hop   https://api.example.com/hop
+```
+
+```console
+$ curl http://127.0.0.1:8899/-/hop        # → api.example.com/hop
+$ curl http://127.0.0.1:8899/hop          # → the console's 404
+```
+
+With no rule matching, the request is addressed to the proxy itself and meets
+the self-loop guard, which answers `302` — as it does upstream.
+
 ## Precedence
 
 For each request whistle-rs walks the rules and builds a resolved set:
