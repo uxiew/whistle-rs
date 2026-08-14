@@ -88,7 +88,7 @@ The operators worth knowing before the rest are
     [origin markers](#origin-markers)
   - [Disabling operators](#disabling-operators) ·
     [Short-circuit](#short-circuit-no-upstream-request-is-made)
-  - [Request rewriting](#request-rewriting) — [`auth://`](#auth-in-three-spellings)
+  - [Request rewriting](#request-rewriting) — [`auth://`](#auth-in-four-spellings)
   - [Plugins](#plugins) · [Choosing the MITM certificate](#choosing-the-mitm-certificate) ·
     [Scripting](#scripting) · [weinre](#weinre-html-debug-injection)
   - [Flags, includes & values](#flags-includes--values) — [trailers](#trailers) ·
@@ -544,6 +544,20 @@ which is the documented one — and never fetches for those six.
 **What counts as a location.** An `http://` or `https://` URL, or a path that
 starts at the root (`/tmp/x`), the home directory (`~/x`, also the full-width
 `～/x`), a Windows drive (`C:\x`), or an explicit `./` / `../`.
+
+> **`temp/…` is not one here, and it is upstream.** whistle's console lets you
+> Cmd-click a `protocol://temp.json` in the rules editor, type the content into a
+> dialog, and save — it rewrites the line to
+> `protocol://temp/<64 hex>.json` and resolves that under its own `temp_files`
+> directory (`TEMP_PATH_RE`, `_original/lib/util/common.js:167`;
+> `getTempFilePath`, `util/index.js:1180-1187`, which drops the extension and
+> keeps it only to guess a type). This port has neither directory nor editor, so
+> the value stays the bare literal it looks like and a text operator writes it:
+> measured, `resBody://temp/blank.json` returns the origin's page in whistle and
+> the six characters `temp/blank.json` here. Recorded rather than half-built —
+> the path without the editor is a filename nobody can produce, since it is a
+> hash. `auth://temp/…` is unaffected: a slash makes it a location either way,
+> and neither proxy sends credentials for it.
 
 One exception, and it is upstream's: a URL on `reqCors://` / `resCors://` is the
 allowed **origin**, folded into `{"origin":…}` before anything would be read
@@ -1618,7 +1632,7 @@ api.test      forwardedFor://203.0.113.7
 sends an empty header. `disable://ua` and `disable://referer` are the rules that
 remove one.
 
-#### `auth://` in three spellings
+#### `auth://` in four spellings
 
 | Value | Sends |
 |-------|-------|
@@ -1626,6 +1640,7 @@ remove one.
 | `username=admin&password=secret` | the same |
 | `{"username":"admin","password":"secret"}` | the same |
 | `{"username":"admin","password":"secret","proxy":true}` | **`Proxy-Authorization`** instead |
+| a **location** — `/etc/whistle/auth.json`, a URL | what it holds, read as `username` / `password` / `proxy` |
 
 Only the first colon splits, so a password may contain one. Naming one half is
 allowed and the two halves are not symmetric (`getAuthBasic`,
@@ -1638,9 +1653,38 @@ read as `!!value`, so `proxy=false` is **true** — write the JSON form when the
 answer is no; and query values are taken raw, so a `%2F` in a password reaches
 the server as `%2F`.
 
-> whistle additionally reads a value containing a slash as a **file reference**
-> and sends nothing when it cannot load one. whistle-rs has no rule-value loader,
-> so it keeps splitting on the colon — which is what `auth://user:pa/ss` needs.
+**A value with a slash in it is a location, never credentials.** `SLASH_RE`
+(`util/index.js:102,:3653`) tests the whole value, so `auth://admin:se/cret`
+sends **no** header — a password may not contain a slash, in either program,
+however much it looks as though it should. The two spellings that *do* survive a
+slash are the ones tested before it: `{"password":"p/q"}` and
+`username=u&password=p/q`.
+
+The last row is the road a slash sends the value down, and it is the one the
+[official page](https://wproxy.org/docs/rules/auth.html) leads with for anything
+shared. What comes back is read as a data object — the line format included, so
+the documented file
+
+```
+username: admin
+password: my secret password
+```
+
+is two fields and not one long username. A location that cannot be read sends
+nothing.
+
+> **This port used to send the path.** `auth:///Users/john/config/auth.json`
+> reached the origin as `Authorization: Basic base64("/Users/john/config/auth.json")`
+> whenever the file was missing, because the slash test was skipped on the
+> reasoning that a password might contain one, and the line-format file was sent
+> whole as a username. Both were found by putting the documentation's own
+> examples in front of whistle — `tests/differential/cases-docs.js`.
+>
+> One spelling on that page does not work in **either** program, and the row
+> below records it: an inline ```` ``` ```` block in the line format,
+> `auth://{custom-key}`, is read as `user:pass` because the block's content
+> reaches `getAuthByRules` as the value itself. Both proxies send `username` as
+> the username. Use a file, or the `{"username":…}` JSON form, inside a block.
 
 ### Plugins
 
@@ -3014,6 +3058,7 @@ arrived from those pages would otherwise think whistle-rs had the bug.
 | `ws://` / `wss://` / `tunnel://` "返回 502" for a plain HTTP request | it does, and the page is right — but only when the line is *read* as a destination. `127.0.0.1:8080 ws://host/x` is not: a bare host is no pattern to `indexOfPattern`, the `ws://` URL is, and the line swaps into "pattern `ws://host/x`, operator `host://127.0.0.1:8080`" (`_original/lib/rules/rules.js:1449-1467,:1774-1789`), which a plain request never matches | `cases.js`, the two "swaps into pattern and host" cases |
 | `delete://pathname` "删除请求路径（不包含请求参数）" | it deletes the path and then **doubles the query** | already recorded under [Deleting](#deleting) |
 | [`socks`](https://wproxy.org/docs/rules/socks.html) gives the default port as **443** | `1080`, from the one line that assigns all three — `isSocks ? 1080 : isHttpsProxy ? 443 : 80` (`_original/lib/inspectors/res.js:284`). The 443 looks copied from the `https-proxy` page | whistle-rs uses 1080; `src/proxy/upstream.rs` |
+| [`auth`](https://wproxy.org/docs/rules/auth.html) form 2: a ```` ``` ```` block holding `username: admin` / `password: …`, referenced as `auth://{custom-key}` | the block's content *is* the value by the time `getAuthByRules` sees it, and it has no slash, so the colon splits it: the username becomes the literal `username` and the password the rest of the file. A **file** in that same format works, because a path has a slash and takes the other road. Measured on both proxies; whistle-rs matches | [`auth://`](#auth-in-four-spellings) above; `cases-docs.js` |
 
 The `ws://` row is the one worth remembering: the page is right, and the obvious
 way to test it is not — a bench case written as `<host:port> ws://…` is inert on

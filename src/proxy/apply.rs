@@ -2555,6 +2555,7 @@ pub async fn load_rule_values(resolved: &mut Resolved, at: &ReqInfo) {
             Some(content) => {
                 op.value = content.clone();
                 op.value_is_content = true;
+                op.value_loaded = true;
             }
             // See the failure note above: the JSON operators keep their text so
             // upstream's `tryParseMatcher` fallback still holds, the text ones
@@ -2941,7 +2942,7 @@ pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
     if let Some(ct) = resolved.value("reqType") {
         set_content_type(&mut parts.headers, ct, req_type_alias);
     }
-    if let Some(auth) = resolved.value("auth").map(parse_auth)
+    if let Some(auth) = resolved.get("auth").map(auth_of)
         && let Some(basic) = auth.basic()
     {
         // `"proxy":true` addresses the *proxy* rather than the origin
@@ -3017,32 +3018,66 @@ impl Auth {
     }
 }
 
-/// Parse an `auth://` value in all three shapes upstream accepts.
+/// What an `auth://` operator asks for, by whichever of upstream's two roads it
+/// travels.
 ///
-/// This port understood only `user:pass`, so the other two — the JSON object
-/// and the `username=…&password=…` query — were base64-encoded whole and sent
-/// as the credentials themselves. `auth://{"username":"u","password":"p"}`
+/// `getAuthByRules` reads the value **inline** — as JSON, as a
+/// `username=…&password=…` query, or as `user:pass`. When it declines, `req.js`
+/// hands the same rule to `parseRuleJson` instead (`authObj ? null :
+/// reqRules.auth`, `_original/lib/inspectors/req.js:461,:467`), which reads a
+/// data object out of it and keeps only `username` / `password` / `proxy`.
+///
+/// Which road a value takes is decided on the value **as written**, which is why
+/// [`RuleOp::value_loaded`] exists: a location has already been replaced by what
+/// it held.
+fn auth_of(op: &RuleOp) -> Auth {
+    // A value read out of a location never had the inline reading offered to it:
+    // `getAuthByRules` refused it for the slash, and this is the road it was
+    // sent down. The documented file — `username: admin` on one line,
+    // `password: …` on the next — is the line format, and it only arrives here.
+    if op.value_loaded {
+        return format_auth(parse_data_object(&op.value, false, true).as_ref());
+    }
+    match auth_by_rules(&op.value) {
+        Some(auth) => auth,
+        // Declined inline: upstream reads the matcher itself as a data object,
+        // and a value with a slash but no `=` yields nothing at all.
+        None => format_auth(parse_data_object(&op.value, false, op.value_is_content).as_ref()),
+    }
+}
+
+/// `getAuthByRules` (`_original/lib/util/index.js:3644-3661`) — the inline
+/// reading of an `auth://` value, or `None` when it declines.
+///
+/// This port understood only `user:pass`, so the other two shapes — the JSON
+/// object and the `username=…&password=…` query — were base64-encoded whole and
+/// sent as the credentials themselves. `auth://{"username":"u","password":"p"}`
 /// authenticated as the user *`{"username"`* with the password
 /// *`"u","password":"p"}`*, which a server answers with a 401 that looks like
 /// the rule never ran.
 ///
-/// The one shape not honoured here is upstream's fourth: a value containing a
-/// slash is a **file reference**, read through `readRuleValue`
-/// (`getAuthByRules` returns nothing for it, `util/index.js:3654-3656`, and
-/// `req.js:464` then feeds the rule to `parseRuleJson` instead). This port has
-/// no rule-value loader, so rather than answer such a rule with silence it
-/// keeps splitting on the first colon — which is what `auth://u:pa/ss`, a
-/// password with a slash in it, needs anyway.
-fn parse_auth(value: &str) -> Auth {
+/// **A value with a slash in it is not credentials.** `SLASH_RE = /[\\/]/`
+/// (`util/index.js:102`) tests the whole value, and when it matches upstream
+/// returns nothing — the value is a *location*, and only the other road may read
+/// it. This port used to split it on the first colon anyway, on the reading that
+/// a password may contain a slash. It may not: measured against whistle 2.10.8,
+/// `auth://admin:se/cret` sends **no** `Authorization` header there, and so do
+/// the block and `(inline)` spellings of the same text. What the old behaviour
+/// did instead was send the local filesystem path — the documented
+/// `auth:///Users/john/config/auth.json` reached the origin as
+/// `Authorization: Basic base64("/Users/john/config/auth.json")` whenever the
+/// file could not be read.
+fn auth_by_rules(value: &str) -> Option<Auth> {
     let value = value.trim();
     // `auth[0] === '{' && auth[auth.length - 1] === '}'`: a JSON object.
     if value.starts_with('{') && value.ends_with('}') {
         // A JSON object upstream cannot parse becomes `{}` — an auth naming
         // neither half, which produces no header rather than a bad one.
         let parsed = serde_json::from_str::<serde_json::Value>(value).ok();
-        return format_auth(parsed.as_ref());
+        return Some(format_auth(parsed.as_ref()));
     }
-    // `AUTH_RE = /^(?:username|password)=/` — anchored, and case-sensitive.
+    // `AUTH_RE = /^(?:username|password)=/` — anchored, and case-sensitive. It
+    // is tested *before* the slash, so a password may contain one here.
     if value.starts_with("username=") || value.starts_with("password=") {
         // `parseQuery(auth, null, null, true)`: the raw decoder, so a `%2F` or a
         // `+` in a password reaches the server as written.
@@ -3051,9 +3086,12 @@ fn parse_auth(value: &str) -> Auth {
             .filter_map(|kv| kv.split_once('='))
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
-        return format_auth(Some(&serde_json::Value::Object(obj)));
+        return Some(format_auth(Some(&serde_json::Value::Object(obj))));
     }
-    match value.split_once(':') {
+    if value.contains('/') || value.contains('\\') {
+        return None;
+    }
+    Some(match value.split_once(':') {
         Some((u, p)) => Auth {
             username: Some(u.to_string()),
             password: Some(p.to_string()),
@@ -3064,7 +3102,7 @@ fn parse_auth(value: &str) -> Auth {
             password: None,
             proxy: false,
         },
-    }
+    })
 }
 
 /// `formatAuth` (`_original/lib/util/index.js:3632-3643`): read the three
@@ -8051,11 +8089,68 @@ mod tests {
             auth("Basic VXNlcm5hbWU9dSZwYXNzd29yZD1w")
         );
 
-        // Deliberate divergence: upstream reads a value containing a slash as a
-        // *file reference* and sends nothing when it cannot (`SLASH_RE`,
-        // `util/index.js:3654-3656`). With no rule-value loader here, splitting
-        // on the colon is what a password with a slash in it needs.
-        assert_eq!(sent("u:pa/ss"), auth("Basic dTpwYS9zcw=="));
+        // ── a slash makes it a location, not credentials ──
+        //
+        // `SLASH_RE` (`util/index.js:102,:3653`) tests the whole value, so a
+        // password with a slash in it is not one. Measured against whistle
+        // 2.10.8: each of these sends **no** `Authorization` header there. This
+        // port used to split on the colon anyway, on the reading that a slash in
+        // a password should still work — which meant the documented
+        // `auth:///Users/john/config/auth.json` reached the origin with the
+        // local filesystem path as its credentials whenever the file was
+        // missing.
+        assert_eq!(sent("u:pa/ss"), None);
+        assert_eq!(sent("/no/such/auth.json"), None);
+        assert_eq!(sent("temp/blank.json"), None);
+        assert_eq!(sent("dom\\user:secret"), None);
+        // The JSON and query forms are tested first, so a slash inside either
+        // is a password character after all.
+        assert_eq!(sent(r#"{"username":"u","password":"p/q"}"#), auth("Basic dTpwL3E="));
+        assert_eq!(sent("username=u&password=p/q"), auth("Basic dTpwL3E="));
+    }
+
+    /// A value read out of the location the rule named takes upstream's *other*
+    /// road — `parseRuleJson`, not `getAuthByRules` — so the documented file is
+    /// the line format and never `user:pass`.
+    ///
+    /// Measured, both halves. `auth://<file holding "username: admin\npassword:
+    /// my secret password">` sends `admin:my secret password` in whistle; this
+    /// port sent the file's whole text as the credentials, because it applied
+    /// the inline reading to content the inline reading was never offered.
+    #[test]
+    fn a_loaded_auth_value_is_read_as_pairs() {
+        let loaded = |text: &str| {
+            let op = RuleOp {
+                protocol: "auth".to_string(),
+                value: text.to_string(),
+                value_is_content: true,
+                value_loaded: true,
+                ..Default::default()
+            };
+            auth_of(&op).basic()
+        };
+        // The docs' own file: `username:` on one line, `password:` on the next.
+        assert_eq!(
+            loaded("username: admin\npassword: my secret password\n"),
+            Some("Basic YWRtaW46bXkgc2VjcmV0IHBhc3N3b3Jk".to_string()),
+        );
+        // JSON in a file is the same object by the other spelling.
+        assert_eq!(
+            loaded(r#"{"username":"admin","password":"secret"}"#),
+            Some("Basic YWRtaW46c2VjcmV0".to_string()),
+        );
+        // A file holding `user:pass` names no `username` key, so it is not
+        // credentials — the inline spelling is where that form belongs.
+        assert_eq!(loaded("admin:secret"), None);
+        // `proxy` travels with them.
+        let op = RuleOp {
+            protocol: "auth".to_string(),
+            value: "username: u\npassword: p\nproxy: true\n".to_string(),
+            value_is_content: true,
+            value_loaded: true,
+            ..Default::default()
+        };
+        assert!(auth_of(&op).proxy);
     }
 
     #[test]

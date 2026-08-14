@@ -187,6 +187,20 @@ pub struct RuleOp {
     /// opened as a *path* — so the console reported "file not found" naming the
     /// JSON it was supposed to serve.
     pub value_is_content: bool,
+    /// Did [`crate::proxy::apply::load_rule_values`] read this value out of the
+    /// **location** the rule named — a path or a URL?
+    ///
+    /// Narrower than [`value_is_content`](RuleOp::value_is_content), which an
+    /// `(inline)` payload and an answered `{name}` also set. One operator needs
+    /// the difference, and needs it because upstream decides on the value **as
+    /// written**: `auth://` reads an inline value as `user:pass`, but refuses
+    /// that reading for anything with a slash in it and hands the rule to
+    /// `parseRuleJson` instead (`getAuthByRules`,
+    /// `_original/lib/util/index.js:3644-3661`, and `lib/inspectors/req.js:461,:467`).
+    /// A location always has a slash; what comes back from it usually does not,
+    /// so by the time the value is applied the written form is gone and this
+    /// flag is what remembers which road it took.
+    pub value_loaded: bool,
     /// The values-store name [`value`](RuleOp::value) came from, when it came
     /// from one.
     ///

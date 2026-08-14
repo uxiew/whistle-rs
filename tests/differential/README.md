@@ -48,7 +48,8 @@ It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0` — except for the corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
 `cases-delete.js` at 8, `cases-values.js` at 11, `cases-compose.js` at 7,
-`cases-groups.js` at 3, `cases-file.js` at 2 and `cases-proxy.js` at 23.
+`cases-docs.js` at 5, `cases-groups.js` at 3, `cases-file.js` at 2 and
+`cases-proxy.js` at 23.
 
 Every run also reports `inert` — the cases that would answer the same with no
 rules loaded at all, and therefore prove nothing. See [below](#inert-which-cases-prove-nothing).
@@ -57,7 +58,7 @@ One corpus claims a fourth port. `cases-includes.js` is about `@` includes, and
 half of them name a **URL**, so it stands up a rules-serving HTTP server at
 `PORT_BASE+10`. It runs clean at `differing: 0`.
 
-Five corpora are not clean on a bare run, by design:
+Six corpora are not clean on a bare run, by design:
 
 * `cases-filters.js` asks about `env:`, which reads the **proxy's** environment.
   Both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle
@@ -79,6 +80,11 @@ Five corpora are not clean on a bare run, by design:
   file source spelled `https://` against a plaintext origin, which whistle
   answers anyway and this port refuses; and `<…>`, which names a path here and
   is fetched by upstream when the pattern leaves nothing to append.
+* `cases-docs.js` ends at `differing: 5`, named at the top of the file: three
+  are the gateway error's prose, one is this port's deliberate cache-busting
+  showing through the only body operator that leaves the origin's echo intact,
+  and one is `temp/…`, whistle's console-editable temp file, which this port has
+  no directory or editor for.
 * `cases-groups.js` ends at `differing: 3`, named at the top of the file: one is
   the two APIs' answer to adding a group twice. A fenced ``` block is private to
   the rule group that declared it in both proxies now; what is left in the other
