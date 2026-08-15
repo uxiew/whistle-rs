@@ -49,7 +49,7 @@ run says `differing: 0` — except for the corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
 `cases-delete.js` at 8, `cases-values.js` at 11, `cases-compose.js` at 7,
 `cases-docs.js` at 5, `cases-groups.js` at 3, `cases-file.js` at 2 and
-`cases-proxy.js` at 23.
+`cases-proxy.js` at 25.
 
 Every run also reports `inert` — the cases that would answer the same with no
 rules loaded at all, and therefore prove nothing. See [below](#inert-which-cases-prove-nothing).

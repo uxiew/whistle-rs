@@ -5597,6 +5597,7 @@ mod internal_req_tests {
             proxy: None,
             tls_versions: upstream::TlsVersions::Default,
             host_fallback_direct: false,
+            auto2http: false,
         };
 
         let mut h = hyper::HeaderMap::new();

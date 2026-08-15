@@ -40,7 +40,7 @@
 // swallow news in another area's corpus. They show as differences in a run; that
 // is the honest report. In the order they appear:
 //
-//   1. **The gateway error's prose and type** (13 cases). whistle answers an
+//   1. **The gateway error's prose and type** (15 cases). whistle answers an
 //      unreachable upstream with a 502 whose body is an HTML `<pre>` holding a
 //      Node stack trace (`wrapGatewayError`,
 //      `_original/lib/util/index.js:1096-1109`); this port answers 502 with the
@@ -145,6 +145,10 @@ const { PORTS } = require('./forward-servers');
 
 /** The harness's own echo origin — every pattern is written against it. */
 const P = `127.0.0.1:${PORTS.origin}`;
+/** Points every hostname at the plain-HTTP echo origin — for `auto2http`. */
+const MAP = `* host://127.0.0.1:${PORTS.origin}`;
+/** The same origin, asked for over https: the handshake cannot come up. */
+const HTTPS = { url: 'https://a.example.test/echo' };
 const HOP = `127.0.0.1:${PORTS.proxy}`;
 const OTHER = `127.0.0.1:${PORTS.originB}`;
 const AUTH407 = `127.0.0.1:${PORTS.auth}`;
@@ -430,6 +434,21 @@ module.exports = [
   // three siblings do.
   { name: 'fail: xhttps-proxy falls back to a direct connection', rules: `${P} xhttps-proxy://localhost:${PORTS.closed}` },
   { name: 'proxy: xhttps-proxy at a hop that works is still used', rules: `${P} xhttps-proxy://${TLSHOP}` },
+
+  // ── auto2http ────────────────────────────────────────────────────────────
+  //
+  // `host.md`'s convenience: an https request pointed at a local address that
+  // turns out to speak plain HTTP is sent again without TLS
+  // (`checkAuto2Http`, `_original/lib/util/index.js:3191-3198`, taken in
+  // `res.js:585-600`). The origin here is an ordinary HTTP server, so the
+  // handshake cannot come up and the only way to a 200 is the retry.
+  //
+  // The two negative cases end in a gateway error on both sides, and that is
+  // divergence 1 above — the same 502, each in its own prose.
+  { name: 'auto2http: an https request to a plain-http local origin', rules: MAP, request: HTTPS },
+  { name: 'auto2http: disabled, the handshake is the answer', rules: `${MAP}\na.example.test disable://auto2http`, request: HTTPS },
+  { name: 'auto2http: enabled says the same thing out loud', rules: `${MAP}\na.example.test enable://auto2http`, request: HTTPS },
+  { name: 'auto2http: no host rule and a non-local address', rules: 'a.example.test reqHeaders://x-hit=1', request: HTTPS },
 
   // ── ignore:// naming one spelling of the family ──────────────────────────
   //

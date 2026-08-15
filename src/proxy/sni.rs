@@ -1448,6 +1448,7 @@ mod tests {
                 proxy: None,
                 tls_versions: upstream::TlsVersions::Default,
                 host_fallback_direct: false,
+                auto2http: false,
             };
             let relaying = tokio::spawn(async move { relay(prefixed, &target).await });
 

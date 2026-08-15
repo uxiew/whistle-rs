@@ -1131,7 +1131,26 @@ pub async fn resolve_target(
         Err(e) => bail!("cipher://: {e}"),
     };
     let disabled = disabled_flags(resolved);
+    // `checkAuto2Http` (`_original/lib/util/index.js:3191-3198`): a `host://`
+    // rule, a local address, or the flag said so out loud — and `disable://`
+    // beats all three. The address is read as written rather than as resolved:
+    // whistle asks the question of the IP it has just looked up, so a *name*
+    // that happens to resolve to a loopback address is local there and not
+    // here. Both agree on the shapes the page is about — an IP written into a
+    // `host://` rule, and `127.0.0.1` written as a destination.
+    let auto2http = !disabled.contains("auto2http")
+        && (enabled_flags(resolved).contains("auto2http")
+            || host_rule.is_some()
+            || if proxy.is_some() {
+                connect_host != dest.host || connect_port != dest.port
+            } else {
+                connect_host == "localhost"
+                    || connect_host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(super::upstream::is_local_ip)
+            });
     Ok(Target {
+        auto2http,
         tls_ciphers,
         // Read straight off `disable`, as upstream reads them.
         no_proxy_ua: disabled.contains("proxyUA"),
@@ -11647,6 +11666,32 @@ mod tests {
     /// The upstream target `rules` produce for `url`.
     fn target(rules: &str, url: &str) -> Target {
         try_target(rules, url).unwrap_or_else(|e| panic!("resolve_target: {e:#}"))
+    }
+
+    /// `auto2http` — `host.md`'s convenience, and the three ways to reach it.
+    ///
+    /// `checkAuto2Http` (`_original/lib/util/index.js:3191-3198`): a `host://`
+    /// rule on the request, a local address, or `enable://auto2http`; and
+    /// `disable://auto2http` over all three.
+    #[test]
+    fn an_https_leg_falls_back_to_cleartext_only_when_it_was_asked_to() {
+        let https = "https://example.com/";
+        // A public address with nothing to say about it: no retry.
+        assert!(!target("example.com reqHeaders://x=1", https).auto2http);
+        // A `host://` rule is enough on its own, wherever it points.
+        assert!(target("example.com host://1.2.3.4", https).auto2http);
+        // So is a local destination.
+        assert!(target("example.com host://127.0.0.1:5173", https).auto2http);
+        assert!(target("example.com https://localhost:5173", https).auto2http);
+        // And so is saying it.
+        assert!(target("example.com enable://auto2http", https).auto2http);
+        // `disable://` beats every one of them.
+        assert!(!target("example.com host://127.0.0.1:5173\nexample.com disable://auto2http", https).auto2http);
+        assert!(!target("example.com enable://auto2http\nexample.com disable://auto2http", https).auto2http);
+        // An http request has no leg to downgrade — the flag is read, the
+        // retry is not reachable.
+        let plain = target("example.com host://127.0.0.1:5173", "http://example.com/");
+        assert!(plain.auto2http && !plain.tls);
     }
 
     const HOST_AND_PROXY: &str = "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\n";

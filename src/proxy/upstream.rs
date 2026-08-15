@@ -170,6 +170,14 @@ pub struct Target {
     /// connection that cannot be *established* to it is retried against the
     /// requested host (`retryXHost`, `_original/lib/inspectors/res.js:571-600`).
     pub host_fallback_direct: bool,
+    /// May an https leg that will not come up be retried in cleartext?
+    ///
+    /// whistle's `auto2http` (`checkAuto2Http`,
+    /// `_original/lib/util/index.js:3191-3198`), which `host.md` documents as
+    /// the convenience that lets `www.example.com 127.0.0.1:5173` reach a local
+    /// dev server over https: the origin leg's handshake fails against a server
+    /// that speaks plain HTTP, and the request is sent again without TLS.
+    pub auto2http: bool,
 }
 
 impl Target {
@@ -236,6 +244,30 @@ impl Target {
             connect_host: self.sni.clone(),
             connect_port: self.request_port,
             host_fallback_direct: false,
+            ..self.clone()
+        })
+    }
+
+    /// The same hop in cleartext — `auto2http`'s retry, or `None` when this
+    /// request did not ask for one.
+    ///
+    /// whistle reaches it as the third rung of one ladder: an `x`-prefixed
+    /// proxy rule is tried first, then `xhost://`, and `auto2http` is their
+    /// `else if` (`_original/lib/inspectors/res.js:541-600`) — so a request
+    /// carrying a [`Self::fallback_target`] never gets here on the same
+    /// failure, and this port keeps that order.
+    ///
+    /// It is also **later** there than here. whistle downgrades on the first
+    /// failure only when the error looks like TLS (`checkTlsError` — a hang-up
+    /// inside `TLSSocket`, a 502, or anything OpenSSL said) and otherwise
+    /// retries https once more before downgrading anyway. Here any failure to
+    /// bring the leg up takes the retry immediately: the second https attempt
+    /// upstream makes exists to survive a flaky socket, and a port that has
+    /// already established the connection once knows the answer without it.
+    fn cleartext_target(&self) -> Option<Target> {
+        (self.tls && self.auto2http).then(|| Target {
+            tls: false,
+            auto2http: false,
             ..self.clone()
         })
     }
@@ -340,7 +372,7 @@ pub fn primary_local_ip() -> Option<IpAddr> {
 }
 
 /// Does `ip` name this machine? (whistle's `isLocalAddress`.)
-fn is_local_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_local_ip(ip: IpAddr) -> bool {
     // `0.0.0.0` is how a proxy value spells "everything local"; whistle treats
     // it as local too, via `isLocalIp`.
     if ip.is_loopback() || ip.is_unspecified() {
@@ -720,6 +752,20 @@ pub async fn forward_with_addr(
             );
             // The retry overwrites the phases of the attempt that failed, which
             // is right: they belong to a connection that was never used.
+            forward_once(&next, err.into_request(), timings)
+                .await
+                .map_err(RetryableError::into_inner)
+        }
+        // `auto2http`: an https leg that will not come up, to an address this
+        // request has reason to think speaks plain HTTP — see
+        // [`Target::cleartext_target`].
+        Err(RetryableError::Connect(err)) if target.cleartext_target().is_some() => {
+            let next = target.cleartext_target().expect("checked");
+            tracing::debug!(
+                "https to {}:{} failed ({err:#}); retrying in cleartext (auto2http)",
+                target.connect_host,
+                target.connect_port
+            );
             forward_once(&next, err.into_request(), timings)
                 .await
                 .map_err(RetryableError::into_inner)
@@ -1323,6 +1369,7 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
         proxy: None,
         tls_versions: TlsVersions::Default,
         host_fallback_direct: false,
+        auto2http: false,
     };
     Ok((target, path.to_string()))
 }
@@ -1586,6 +1633,7 @@ mod tests {
             proxy,
             tls_versions: TlsVersions::Default,
             host_fallback_direct: false,
+            auto2http: false,
         }
     }
 

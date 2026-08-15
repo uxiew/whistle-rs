@@ -76,7 +76,7 @@
 | `cases-compose.js`（规则组合与脚本注入） | 98 | 7 项，同上 | 14 |
 | `cases-values.js`（取值与模板） | 109 | 11 项，同上 | 7 |
 | `cases-includes.js`（`@` 引入） | 35 | 0 差异（其中 24 项在真 whistle 一侧确有改变） | 11 |
-| `cases-proxy.js`（转发族） | 111 | 23 项，同上 | 18 |
+| `cases-proxy.js`（转发族） | 115 | 25 项，同上 | 19 |
 | `https-bench.js`（MITM 隧道内，**含证书与隧道载荷**） | 49 | 0 差异 | — |
 | `timing-bench.js`（延时与限速） | 33 | 0 差异 | — |
 | `write-bench.js`（落盘族，比对磁盘） | 34 | 1 项，具名 | — |
@@ -820,8 +820,12 @@ socket —— 上游的 `Rules`（`lib/rules/rules.js`，真代理跑的同一�
 上游插件加载器的机制，本移植的插件是讲自研协议的外部 HTTP server。
 `requestWithMatchedRules`/`responseWithMatchedRules` —— 把命中规则回传给插件的开关，
 本移植的插件协议里规则是**始终**随钩子送达的。
-`keepH2Session`/`auto2http`/`lacalhostCompatible`（上游自己的拼写错误）—— 上游连接池与
+`keepH2Session`/`lacalhostCompatible`（上游自己的拼写错误）—— 上游连接池与
 兼容性开关，本移植不做上游连接池。
+`auto2http` —— **已实现**（本轮）：https 源站腿握不上手时改用明文重发，条件与
+`checkAuto2Http` 一致（`host://` 规则、本机地址、或显式 `enable://`；`disable://` 一票否决）。
+`host.md` 讲的 `www.example.com 127.0.0.1:5173` 之所以能用，靠的就是它；不做它，
+最常写的那条规则在这里 502、在 whistle 里 200。细节见 `docs/RULES.md`。
 `clientCert`/`requestCert`/`secureOptions` —— 向**客户端**索要证书（mTLS 的服务端一侧），
 本移植的 MITM 不做客户端证书请求。
 `wsDecompress` —— 关掉 WebSocket 的 `permessage-deflate` 解压；本移植不做该扩展的解压，

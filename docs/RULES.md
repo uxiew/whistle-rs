@@ -2001,6 +2001,43 @@ connection — see
 A flag this port does not recognise is **inert** — it parses and does nothing,
 rather than failing the rule.
 
+#### `auto2http` — an https leg that falls back to cleartext
+
+`https://www.example.com` pointed at a dev server that speaks plain HTTP is the
+first thing anyone does with a debug proxy, and on its own it cannot work: the
+origin leg is https, the server is not, and the handshake fails. whistle sends
+the request again without TLS, and [`host.md`](https://wproxy.org/docs/rules/host.html)
+documents that as the reason `www.example.com 127.0.0.1:5173` works at all.
+
+It is not unconditional. `checkAuto2Http`
+(`_original/lib/util/index.js:3191-3198`) asks for one of three things, and
+`disable://auto2http` overrides all of them:
+
+* `enable://auto2http` — said out loud;
+* a `host://` rule matched this request, wherever it points;
+* the address reached is **local** (loopback, this machine's own, or a proxy
+  hop with a host override).
+
+Two differences here, both narrowings of when the retry can happen rather than
+of what it does:
+
+* **The address is read as written, not as resolved.** whistle asks the
+  question of the IP it has just looked up, so `dev.local` resolving to
+  `127.0.0.1` is local there and not here. An IP written into a `host://` rule,
+  or `localhost`, or any request carrying a `host://` rule at all — the shapes
+  the page is about — reach the retry on both sides.
+* **The retry comes sooner.** whistle downgrades on the first failure only when
+  the error looks like TLS (`checkTlsError`) and otherwise retries https once
+  more first. Here any failure to bring the leg up takes it immediately.
+
+An earlier version of this document declined the flag, on the grounds that a
+silent downgrade of an encrypted connection is the same class of thing as not
+verifying a certificate. The reasoning still holds for what it described — but
+what it described was narrower than the flag: this is the ordinary request path,
+not a `wss://` corner, and refusing it means the most common rule anyone writes
+answers 502 here and 200 in whistle. It is implemented as whistle implements it,
+and `disable://auto2http` is how a request opts out.
+
 #### The flags this port does not implement
 
 The official [`enable`](https://wproxy.org/docs/rules/enable.html) and
@@ -2018,7 +2055,6 @@ with the reason. They parse and do nothing.
 | `flushHeaders`, `secureOptions`, `keepH2Session`, `httpH2` | Node and HTTP/2 plumbing — `response.flushHeaders()`, the h2 `options`, session reuse, and h2 to the **origin** | this port speaks HTTP/2 to clients and HTTP/1.1 upstream, and has no Node to flush |
 | `dnsCache` | turn whistle's DNS cache off | there is no DNS cache here to turn off, so the flag's effect is already the default |
 | `clientCert`, `requestCert` | make the forged server ask the **client** for a certificate (mTLS) | not implemented. A client configured for mutual TLS fails against this port where it works against whistle; the missing half is a client-certificate store, not the flag |
-| `auto2http` | retry a `wss://` origin in **cleartext** after a TLS error, on by default when the address is local or a `host://` rule is in play | **declined, not missing.** Silently downgrading an encrypted upstream connection is the same class of thing as not verifying its certificate, and this port already refuses that one — see `--insecure-upstream` |
 | `forceResWrite` | nothing: only `forceReqWrite` is ever read, on **both** sides (`_original/lib/inspectors/req.js:604`, `res.js:1300`) | the flag exists in the documentation and not in the program |
 
 > **A response-body operator busts the request cache on its own.** Any of
