@@ -362,6 +362,13 @@ async function main() {
     { name: 'tlsOptions in its JSON form', rules: `${O} tlsOptions://{"maxVersion":"TLSv1.2"}` },
     { name: 'tlsOptions minVersion', rules: `${O} tlsOptions://{"minVersion":"TLSv1.3"}` },
     { name: 'a cipher list pins no version', rules: `${O} tlsOptions://{"ciphers":"ECDHE-RSA-AES128-GCM-SHA256"}` },
+    // The query spelling `cipher.md` leads with, and the merge it documents:
+    // `getTlsOptions` walks `cipher.list` and hands the lot to `parseRuleJson`
+    // (`_original/lib/rules/index.js:684-691`), so several lines combine.
+    { name: 'tlsOptions in its query form', rules: `${O} tlsOptions://maxVersion=TLSv1.2` },
+    { name: 'tlsOptions query form, two keys', rules: `${O} tlsOptions://minVersion=TLSv1.3&maxVersion=TLSv1.3` },
+    { name: 'two tlsOptions lines merge', rules: `${O} tlsOptions://maxVersion=TLSv1.2\n${O} tlsOptions://ciphers=ECDHE-RSA-AES128-GCM-SHA256` },
+    { name: 'a bare cipher string on its own line', rules: `${O} tlsOptions://ECDHE-RSA-AES128-GCM-SHA256` },
     { name: 'tlsOptions with nonsense in it', rules: `${O} tlsOptions://not-a-version` },
     // `sniCallback://` asks a *plugin* which certificate to present, or whether
     // to intercept at all (`_original/lib/https/load-cert.js:8-17`). Naming a

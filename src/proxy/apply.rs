@@ -1130,11 +1130,11 @@ pub async fn resolve_target(
 
     let request_tls = super::dest::is_tls(&dest.scheme);
     let tls = origin_tls(request_tls, proxy_proto, resolved);
-    let cipher = resolved.value("cipher");
+    let cipher = cipher_options(resolved);
     // A cipher string that names nothing this build has fails the request, as
     // it fails at context creation in Node. See `parse_cipher_suites`.
-    let tls_ciphers = match cipher.map(parse_cipher_suites).transpose() {
-        Ok(policy) => policy.flatten(),
+    let tls_ciphers = match parse_cipher_suites(&cipher) {
+        Ok(policy) => policy,
         Err(e) => bail!("cipher://: {e}"),
     };
     let disabled = disabled_flags(resolved);
@@ -1171,7 +1171,7 @@ pub async fn resolve_target(
         sni: dest.host.clone(),
         request_port: dest.port,
         proxy,
-        tls_versions: cipher.map(parse_cipher_versions).unwrap_or_default(),
+        tls_versions: parse_cipher_versions(&cipher),
         host_fallback_direct,
     })
 }
@@ -1230,6 +1230,59 @@ fn internal_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
         || is_enabled(resolved, "internalProxy")
 }
 
+/// Every `cipher://` line on the request, merged into one options object.
+///
+/// `getTlsOptions` walks `cipher.list` and hands the lot to `parseRuleJson`
+/// (`_original/lib/rules/index.js:684-691`), so several lines **combine** —
+/// which is what `cipher.md` means by "根据从上到下的顺序自动合并" — and the
+/// first line to name a key keeps it, as it does for `resHeaders://`.
+///
+/// A value made only of `[a-z0-9:!-]` is a bare cipher string and becomes
+/// `{ciphers: …}` (`SEP_CIPHER_RE`, `rules/index.js:38,:686-688`). Anything else
+/// is a data object, so the `minVersion=TLSv1.2&maxVersion=TLSv1.3` form the
+/// page leads with parses here as it does there — this port read only JSON and
+/// silently ignored the documented spelling.
+fn cipher_options(resolved: &Resolved) -> serde_json::Map<String, serde_json::Value> {
+    let mut merged = serde_json::Map::new();
+    for value in collect_values(resolved, "cipher") {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let object = match is_bare_cipher_list(value) {
+            true => Some(serde_json::json!({ "ciphers": value })),
+            // A bare version token — `cipher://TLSv1.2`, which the dot keeps out
+            // of the cipher-string road — is not an object either, and upstream
+            // makes nothing of it. Here it pins the version, which is the
+            // declared improvement `docs/RULES.md` and `https-bench.js` record:
+            // whistle's options never reach a handshake that works, so a pin
+            // that means what it says is strictly more useful than one that
+            // does nothing.
+            false => parse_data_object(value, false, false).or_else(|| {
+                (cipher_is_12(value) || cipher_is_13(value))
+                    .then(|| serde_json::json!({ "minVersion": value, "maxVersion": value }))
+            }),
+        };
+        let Some(serde_json::Value::Object(map)) = object else {
+            continue;
+        };
+        for (key, val) in map {
+            merged.entry(key).or_insert(val);
+        }
+    }
+    merged
+}
+
+/// `SEP_CIPHER_RE = /[^a-z\d:!-]/i` (`_original/lib/rules/index.js:38`), read
+/// the way it is used: a value with **no** character outside that set is a
+/// cipher string rather than an options object. A version token fails it on the
+/// dot, which is why `cipher://TLSv1.2` is not a cipher list in either program.
+fn is_bare_cipher_list(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '!' | '-'))
+}
+
 /// Parse a `cipher://` value into an upstream TLS version constraint.
 ///
 /// Whistle's `cipher` operator carries Node TLS options as JSON (`minVersion`,
@@ -1237,29 +1290,16 @@ fn internal_proxy(resolved: &Resolved, proxy_proto: &str) -> bool {
 /// only and cannot take OpenSSL cipher strings, so we honour the portable part:
 /// the min/max protocol version. Accepts either a JSON object or a bare version
 /// token (`cipher://TLSv1.2`). Older pins clamp to the nearest supported version.
-fn parse_cipher_versions(value: &str) -> super::upstream::TlsVersions {
+fn parse_cipher_versions(options: &serde_json::Map<String, serde_json::Value>) -> super::upstream::TlsVersions {
     use super::upstream::TlsVersions;
-    let value = value.trim();
-    let (mut min, mut max) = (None, None);
-    if value.starts_with('{') {
-        if let Some(map) = crate::rules::url::parse_json(value).and_then(|v| match v {
-            serde_json::Value::Object(map) => Some(map),
-            _ => None,
-        }) {
-            let get = |k: &str| map.get(k).and_then(|v| v.as_str()).map(str::to_string);
-            min = get("minVersion");
-            max = get("maxVersion");
-            // secureProtocol pins a single version (e.g. "TLSv1_2_method").
-            if let Some(sp) = get("secureProtocol") {
-                min = Some(sp.clone());
-                max = Some(sp);
-            }
-        }
-    } else if !value.is_empty() {
-        // A bare token pins exactly that version.
-        min = Some(value.to_string());
-        max = Some(value.to_string());
+    let get = |k: &str| options.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let (mut min, mut max) = (get("minVersion"), get("maxVersion"));
+    // secureProtocol pins a single version (e.g. "TLSv1_2_method").
+    if let Some(sp) = get("secureProtocol") {
+        min = Some(sp.clone());
+        max = Some(sp);
     }
+
     let is13 = |s: &Option<String>| s.as_deref().map(cipher_is_13).unwrap_or(false);
     let is12 = |s: &Option<String>| s.as_deref().map(cipher_is_12).unwrap_or(false);
     if is13(&min) {
@@ -1283,20 +1323,12 @@ fn parse_cipher_versions(value: &str) -> super::upstream::TlsVersions {
 /// throws `no cipher match` at context creation, so the request fails rather
 /// than quietly going out under a policy nobody asked for.
 fn parse_cipher_suites(
-    value: &str,
+    options: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Option<std::sync::Arc<super::ciphers::CipherPolicy>>, super::ciphers::NoCipherMatch> {
-    let value = value.trim();
-    // A bare token is a version pin, not a cipher list — see
-    // `parse_cipher_versions`. Only the JSON form carries Node's `ciphers`.
-    if !value.starts_with('{') {
-        return Ok(None);
-    }
-    let spec = crate::rules::url::parse_json(value)
-        .and_then(|v| match v {
-            serde_json::Value::Object(map) => Some(map),
-            _ => None,
-        })
-        .and_then(|m| m.get("ciphers").and_then(|v| v.as_str()).map(str::to_string));
+    let spec = options
+        .get("ciphers")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let Some(spec) = spec.filter(|s| !s.trim().is_empty()) else {
         return Ok(None);
     };
@@ -10752,28 +10784,57 @@ mod tests {
         assert_eq!(p3.port, 3128);
     }
 
+    /// The version pin, in every spelling `cipher.md` prints — and across
+    /// several lines, which is what the page means by "自动合并".
     #[test]
     fn cipher_maps_to_tls_versions() {
         use super::super::upstream::TlsVersions;
-        assert_eq!(parse_cipher_versions("TLSv1.2"), TlsVersions::Only12);
-        assert_eq!(parse_cipher_versions("TLSv1.3"), TlsVersions::Only13);
+        let versions = |rules: &str| {
+            parse_cipher_versions(&cipher_options(&resolve(rules, "https://a.com/")))
+        };
+        let one = |value: &str| versions(&format!("a.com cipher://{value}\n"));
+        assert_eq!(one("TLSv1.2"), TlsVersions::Only12);
+        assert_eq!(one("TLSv1.3"), TlsVersions::Only13);
+        assert_eq!(one(r#"{"maxVersion":"TLSv1.2"}"#), TlsVersions::Only12);
+        assert_eq!(one(r#"{"minVersion":"TLSv1.3"}"#), TlsVersions::Only13);
+        assert_eq!(one(r#"{"secureProtocol":"TLSv1_2_method"}"#), TlsVersions::Only12);
+        // An OpenSSL cipher string carries no version pin → default (1.2+1.3).
+        assert_eq!(one(r#"{"ciphers":"ECDHE-RSA-AES128-GCM-SHA256"}"#), TlsVersions::Default);
+        // The query spelling the page leads with, which this port used to
+        // ignore outright.
+        assert_eq!(one("maxVersion=TLSv1.2"), TlsVersions::Only12);
+        assert_eq!(one("minVersion=TLSv1.3&maxVersion=TLSv1.3"), TlsVersions::Only13);
+        // Several lines merge, and the first to name a key keeps it.
         assert_eq!(
-            parse_cipher_versions("{\"maxVersion\":\"TLSv1.2\"}"),
-            TlsVersions::Only12
-        );
-        assert_eq!(
-            parse_cipher_versions("{\"minVersion\":\"TLSv1.3\"}"),
+            versions("a.com cipher://minVersion=TLSv1.3\na.com cipher://ciphers=ECDHE-RSA-AES128-GCM-SHA256\n"),
             TlsVersions::Only13
         );
         assert_eq!(
-            parse_cipher_versions("{\"secureProtocol\":\"TLSv1_2_method\"}"),
+            versions("a.com cipher://maxVersion=TLSv1.2\na.com cipher://maxVersion=TLSv1.3\n"),
             TlsVersions::Only12
         );
-        // An OpenSSL cipher string carries no version pin → default (1.2+1.3).
+    }
+
+    /// A value made only of `[a-z0-9:!-]` is a cipher string; anything else is
+    /// an options object (`SEP_CIPHER_RE`, `_original/lib/rules/index.js:38`).
+    #[test]
+    fn a_bare_cipher_list_is_told_from_an_options_object() {
+        let ciphers = |rules: &str| {
+            cipher_options(&resolve(rules, "https://a.com/"))
+                .get("ciphers")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
         assert_eq!(
-            parse_cipher_versions("{\"ciphers\":\"ECDHE-RSA-AES128-GCM-SHA256\"}"),
-            TlsVersions::Default
+            ciphers("a.com cipher://ECDHE-ECDSA-AES256-GCM-SHA384:DH-RSA-AES256-GCM-SHA384\n").as_deref(),
+            Some("ECDHE-ECDSA-AES256-GCM-SHA384:DH-RSA-AES256-GCM-SHA384")
         );
+        assert_eq!(
+            ciphers("a.com cipher://ciphers=ECDHE-RSA-AES128-GCM-SHA256\n").as_deref(),
+            Some("ECDHE-RSA-AES128-GCM-SHA256")
+        );
+        // A version token is not a cipher list — the dot is outside the set.
+        assert_eq!(ciphers("a.com cipher://TLSv1.2\n"), None);
     }
 
     // -- the file family -----------------------------------------------------

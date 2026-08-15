@@ -3183,6 +3183,16 @@ what rustls can express — see [What `cipher://` can pin](#what-cipher-can-pin)
 token) pin the **upstream** TLS protocol version. rustls offers TLS 1.2 and 1.3
 only, so a pin older than 1.2 clamps up to 1.2.
 
+The value takes every road a data value takes, which is what
+[`cipher.md`](https://wproxy.org/docs/rules/cipher.html) leads with: JSON,
+`minVersion=TLSv1.2&maxVersion=TLSv1.3`, the line format, a file, a `{name}`.
+The one exception is upstream's: a value made only of `[a-z0-9:!-]` is a **cipher
+string** rather than an object (`SEP_CIPHER_RE`,
+`_original/lib/rules/index.js:38`), so `cipher://ECDHE-RSA-AES128-GCM-SHA256`
+needs no `ciphers=`. And several `cipher://` lines **merge**, first line winning
+a contested key — `getTlsOptions` walks the whole list (`:684-691`). This port
+read only the JSON form, off the first line, and quietly ignored the rest.
+
 > **This is one of the places the port does more than whistle, deliberately.**
 > Measured with `tests/differential/https-bench.js`, which now reports the TLS
 > version the origin negotiated: a version pin is **inert upstream on a

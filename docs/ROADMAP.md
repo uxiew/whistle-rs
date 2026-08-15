@@ -77,7 +77,7 @@
 | `cases-values.js`（取值与模板） | 132 | 13 项，同上 | 10 |
 | `cases-includes.js`（`@` 引入） | 35 | 0 差异（其中 24 项在真 whistle 一侧确有改变） | 11 |
 | `cases-proxy.js`（转发族） | 115 | 25 项，同上 | 19 |
-| `https-bench.js`（MITM 隧道内，**含证书与隧道载荷**） | 49 | 0 差异 | — |
+| `https-bench.js`（MITM 隧道内，**含证书与隧道载荷**） | 53 | 0 差异 | — |
 | `timing-bench.js`（延时与限速） | 33 | 0 差异 | — |
 | `write-bench.js`（落盘族，比对磁盘） | 39 | 1 项，具名 | — |
 | `cases-flags.js`（`enable`/`disable` 标志矩阵） | 65 | 1 项，具名 | 21 |
