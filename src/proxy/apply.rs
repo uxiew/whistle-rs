@@ -1412,6 +1412,31 @@ pub fn disabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> 
     flag_set(resolved, "disable")
 }
 
+/// Is this transaction hidden from the capture?
+///
+/// `checkHideProp` (`_original/lib/util/index.js:3982-3987`) reads four flags,
+/// not one: `enable://hide` and `disable://show` hide, and `enable://show` and
+/// `disable://hide` un-hide, with the un-hiding half winning. The pair exists
+/// because the flags usually arrive from different lines — a broad
+/// `enable://hide` over a domain, an `enable://show` on the one request being
+/// looked at.
+///
+/// Taken as two sets rather than as a `Resolved`, because the same question is
+/// asked of a recorded session, whose flags have already been flattened.
+pub fn hides_capture(
+    enabled: &std::collections::HashSet<String>,
+    disabled: &std::collections::HashSet<String>,
+) -> bool {
+    (enabled.contains("hide") || disabled.contains("show"))
+        && !enabled.contains("show")
+        && !disabled.contains("hide")
+}
+
+/// [`hides_capture`], asked of a request's resolved rules.
+pub fn hidden_from_capture(resolved: &Resolved) -> bool {
+    hides_capture(&enabled_flags(resolved), &disabled_flags(resolved))
+}
+
 /// `enable://<flag>` — cancelled by a `disable://<flag>` on the same request.
 ///
 /// Upstream's `isEnable` is `req.enable[name] && !req.disable[name]`
@@ -1440,7 +1465,7 @@ pub(crate) fn is_enabled(resolved: &Resolved, flag: &str) -> bool {
 /// `disable://<flag>` — with the escape hatch upstream gives it: an
 /// `enable://<flag>` on the same request wins (`isDisable`,
 /// `_original/lib/util/index.js:681-683`).
-fn is_disabled(resolved: &Resolved, flag: &str) -> bool {
+pub(crate) fn is_disabled(resolved: &Resolved, flag: &str) -> bool {
     disabled_flags(resolved).contains(flag) && !enabled_flags(resolved).contains(flag)
 }
 

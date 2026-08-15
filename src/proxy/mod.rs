@@ -288,8 +288,21 @@ impl AppState {
 
     /// Record a transaction, assigning it an id which is returned so callers
     /// (e.g. WebSocket tunnels) can correlate later frames with it.
+    /// Take the next session id without recording anything yet.
+    ///
+    /// A transaction's frames are cut out of its **bodies**, and the request
+    /// body streams long before the response head arrives — so the id has to
+    /// exist before the session does. [`Self::record`] keeps an id that was
+    /// reserved this way rather than allocating a second one.
+    fn reserve_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn record(&self, mut session: Session) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = match session.id {
+            0 => self.next_id.fetch_add(1, Ordering::Relaxed),
+            reserved => reserved,
+        };
         session.id = id;
         // `enable://hide` — the request happens, and the console never hears
         // about it. Upstream gates its own data server on the same question
@@ -355,11 +368,7 @@ fn is_hidden(session: &Session) -> bool {
             .map(|f| f.trim().to_string())
             .collect()
     };
-    let enabled = flags("enable");
-    let disabled = flags("disable");
-    (enabled.contains("hide") || disabled.contains("show"))
-        && !enabled.contains("show")
-        && !disabled.contains("hide")
+    apply::hides_capture(&flags("enable"), &flags("disable"))
 }
 
 /// A callback told about each completed transaction — see [`AppState::observe`].
@@ -1201,6 +1210,17 @@ pub struct WsFrame {
 
 impl WsFrame {
     /// Build a frame record, deriving the opcode name and a bounded preview.
+    /// A frame cut out of an ordinary **body** — an SSE event, or a piece of a
+    /// stream a `x-whistle-custom-frame-separator` named.
+    ///
+    /// It is filed as a `text` frame, which is what it is: whistle shows these
+    /// in the same Frames panel as a WebSocket's, and the direction is the only
+    /// thing that tells them apart there (`emitFrame`,
+    /// `_original/lib/inspectors/data.js:67-75`).
+    fn body_frame(session: u64, dir: &'static str, payload: &[u8]) -> Self {
+        WsFrame::new(session, dir, 0x1, payload)
+    }
+
     fn new(session: u64, dir: &'static str, opcode: u8, payload: &[u8]) -> Self {
         let name = match opcode {
             0x0 => "continuation",
@@ -3091,6 +3111,47 @@ fn must_collect_body(
     ops.needs_body() || plugin_wants_body
 }
 
+/// The frame splitter a **response** asks for, or `None` for a body the console
+/// shows whole.
+///
+/// whistle's Frames panel gets a body cut into pieces in two cases
+/// (`handleResBody`, `_original/lib/inspectors/data.js:323-345`):
+///
+/// * the response **is** an event stream — `content-type: text/event-stream`,
+///   compared whole, which is a narrower test than the one deciding whether the
+///   body may be buffered;
+/// * a `x-whistle-custom-frame-separator` header names a separator, which works
+///   for any content type and is how the FAQ turns a chunked JSON stream into
+///   frames.
+///
+/// `disable://captureStream` turns both off, and a **compressed** body is never
+/// framed — upstream checks `getZipType(info)` first, and a separator search in
+/// a deflate stream would find nothing anyway.
+///
+/// The header is removed from the response either way, so the client never sees
+/// it (`parseFrameSep` deletes before it decides, `:83`).
+fn response_frames(
+    resolved: &Resolved,
+    headers: &mut hyper::HeaderMap,
+    res_enc: Option<&str>,
+) -> Option<restream::FrameSplitter> {
+    let custom = restream::take_frame_separator(headers);
+    if apply::is_disabled(resolved, "captureStream") {
+        return None;
+    }
+    if res_enc.is_some_and(|enc| !enc.trim().eq_ignore_ascii_case("identity")) {
+        return None;
+    }
+    if custom.is_some() {
+        return custom;
+    }
+    let is_sse = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.trim() == "text/event-stream");
+    is_sse.then(restream::FrameSplitter::sse)
+}
+
 /// The substitution to run on a response body that is **still arriving**, or
 /// `None` to stream it through untouched.
 ///
@@ -4335,6 +4396,26 @@ async fn serve(
     let new_path = apply::rewrite_path(&dest.path, &resolved, body_ctx);
     parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
     let req_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
+    // The id every body frame of this transaction is filed under. Reserved
+    // here, because the request body streams long before the session is
+    // recorded — a frame cut out of it has to know where it belongs.
+    let frame_session = state.reserve_id();
+    // `enable://hide` keeps the whole transaction out of the capture, frames
+    // included, so the watchers are not installed at all.
+    let hidden = apply::hidden_from_capture(&resolved);
+    // Frames a **buffered** body produced, each with its direction, held until
+    // the session has an id.
+    let mut buffered_frames: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    // The separator a request asked for, read off the outgoing headers before
+    // the body is built — and removed from them either way, so the origin never
+    // sees it (`parseFrameSep`, `_original/lib/inspectors/data.js:77-96`).
+    let mut req_frames = {
+        let asked = restream::take_frame_separator(&mut parts.headers);
+        match hidden || apply::is_disabled(&resolved, "captureStream") {
+            true => None,
+            false => asked,
+        }
+    };
     let mut req_body_cap: Option<Capture> = None;
     let req_body: DynBody = if apply::wants_req_body(&resolved, body_ctx)
         || req_speed.is_some()
@@ -4406,6 +4487,18 @@ async fn serve(
                         state.config.body_preview_cap,
                     ));
                 }
+                // A request body the console shows as frames, cut out of the
+                // bytes that go upstream — the response's twin, and gated the
+                // same way (`cseSep`, `data.js:63,:249`).
+                if let Some(mut splitter) = req_frames.take() {
+                    buffered_frames.extend(
+                        splitter
+                            .push(&new)
+                            .into_iter()
+                            .chain(splitter.finish())
+                            .map(|payload| ("send", payload)),
+                    );
+                }
                 apply::strip_length_headers(&mut parts.headers);
                 match req_speed {
                     Some(kbps) => body::throttled(new, kbps),
@@ -4417,7 +4510,13 @@ async fn serve(
         // No transform: stream through, copying a bounded preview for inspection.
         let cap = Capture::new(req_ct.clone(), req_enc.as_deref(), state.config.body_preview_cap);
         req_body_cap = Some(cap.clone());
-        body::tee(incoming, cap)
+        let teed = body::tee(incoming, cap);
+        match req_frames.take() {
+            Some(splitter) => {
+                body::frames(teed, state.clone(), frame_session, splitter, "send")
+            }
+            None => teed,
+        }
     } else {
         incoming
     };
@@ -4704,6 +4803,20 @@ async fn serve(
                     state.config.body_preview_cap,
                 ));
             }
+            // A buffered body is framed too, out of the bytes the client will
+            // receive — the same rule and the same separator, applied at once
+            // rather than as they arrive.
+            if let Some(mut splitter) =
+                response_frames(&resolved, &mut parts.headers, now.as_deref()).filter(|_| !hidden)
+            {
+                buffered_frames.extend(
+                    splitter
+                        .push(&new)
+                        .into_iter()
+                        .chain(splitter.finish())
+                        .map(|payload| ("receive", payload)),
+                );
+            }
             finish_res_body(&mut parts, new, ops, origin_trailers)
         } else {
             let body = streamed.expect("collected or streamed, never neither");
@@ -4753,9 +4866,20 @@ async fn serve(
             let cap = Capture::new(res_ct.clone(), res_enc.as_deref(), state.config.body_preview_cap);
             res_body_cap = Some(cap.clone());
             let teed = body::tee(body, cap);
+            // …and, for a stream the console shows as frames, one more watcher.
+            // It sits after the capture for the reason the capture sits after
+            // the substitution: a frame is what the client received.
+            let framed = match response_frames(&resolved, &mut parts.headers, res_enc.as_deref())
+                .filter(|_| !hidden)
+            {
+                Some(splitter) => {
+                    body::frames(teed, state.clone(), frame_session, splitter, "receive")
+                }
+                None => teed,
+            };
             match ops.no_trailers {
-                true => retrailer(teed, None),
-                false => teed,
+                true => retrailer(framed, None),
+                false => framed,
             }
         };
     // `receive` runs from the response head to the last byte, so it is stamped
@@ -4767,8 +4891,8 @@ async fn serve(
     if target.proxy.is_some() {
         target_desc.push_str(" (via proxy)");
     }
-    state.record(Session {
-        id: 0,
+    let recorded = state.record(Session {
+        id: frame_session,
         time_ms,
         method: info.method.clone(),
         url: info.full_url.clone(),
@@ -4784,6 +4908,9 @@ async fn serve(
         res_body: res_body_cap,
         timings: Some(timings.clone()),
     });
+    for (dir, payload) in buffered_frames {
+        state.record_frame(WsFrame::body_frame(recorded, dir, &payload));
+    }
 
     Ok(Response::from_parts(parts, res_body))
 }

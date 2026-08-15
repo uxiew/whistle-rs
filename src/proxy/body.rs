@@ -81,6 +81,102 @@ pub fn tee(body: DynBody, capture: super::Capture) -> DynBody {
     .boxed()
 }
 
+/// Box a body while splitting it into **frames** for the console, the way
+/// whistle's Frames panel shows an event stream.
+///
+/// The bytes travel on untouched and immediately — this only watches them. The
+/// session id is *reserved* before either body is built (`AppState::reserve_id`),
+/// because a request body streams long before the session it belongs to is
+/// recorded.
+pub fn frames(
+    body: DynBody,
+    state: std::sync::Arc<super::AppState>,
+    session: u64,
+    splitter: super::restream::FrameSplitter,
+    dir: &'static str,
+) -> DynBody {
+    FrameBody {
+        inner: Box::pin(body),
+        state,
+        session,
+        splitter: Some(splitter),
+        dir,
+    }
+    .boxed()
+}
+
+/// Body wrapper for [`frames`].
+struct FrameBody {
+    inner: Pin<Box<DynBody>>,
+    state: std::sync::Arc<super::AppState>,
+    session: u64,
+    /// Taken when the inner body ends, so the last frame is emitted once.
+    splitter: Option<super::restream::FrameSplitter>,
+    /// `"send"` for a request body, `"receive"` for a response's — the only
+    /// thing that tells the two apart in the Frames panel.
+    dir: &'static str,
+}
+
+impl FrameBody {
+    /// File one frame under the session this body belongs to.
+    fn emit(&self, payload: &[u8]) {
+        self.state
+            .record_frame(super::WsFrame::body_frame(self.session, self.dir, payload));
+    }
+}
+
+impl Body for FrameBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref()
+                    && let Some(splitter) = this.splitter.as_mut()
+                {
+                    for payload in splitter.push(data) {
+                        this.emit(&payload);
+                    }
+                }
+                // A body whose length was known ends here rather than at a
+                // `None`: hyper stops polling once `is_end_stream` is true, so
+                // waiting for the end would lose the last piece — the one after
+                // the final separator, which for a request body is usually the
+                // whole point.
+                if this.inner.is_end_stream()
+                    && let Some(mut splitter) = this.splitter.take()
+                    && let Some(tail) = splitter.finish()
+                {
+                    this.emit(&tail);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => {
+                if let Some(mut splitter) = this.splitter.take()
+                    && let Some(tail) = splitter.finish()
+                {
+                    this.emit(&tail);
+                }
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Body wrapper for [`tee`]: passes frames through, recording data bytes.
 struct TeeBody {
     inner: Pin<Box<DynBody>>,

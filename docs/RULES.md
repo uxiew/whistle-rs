@@ -2056,6 +2056,30 @@ read it as WebSocket anyway — upstream's test is
 `socket.enable.websocket || util.isWebSocket(headers)`
 (`_original/lib/https/index.js:81`), and this port's is the same expression.
 
+#### A body shown as frames
+
+whistle's Frames panel is not only for WebSockets: an ordinary body is cut into
+frames when it is an event stream, and when a header names a separator
+(`handleResBody` / `parseFrame`,
+`_original/lib/inspectors/data.js:67-135,:323-345`). This port showed such a
+body only as one preview, which for a stream that never ends is nothing at all.
+
+* **`content-type: text/event-stream`** — compared whole, so
+  `text/event-stream; charset=utf-8` is *not* framed by default — is cut at
+  every blank line, one frame per SSE event.
+* **`x-whistle-custom-frame-separator`** names any separator, on the request or
+  the response, and works for any content type: `resHeaders://(x-whistle-custom-frame-separator=%0A)`
+  turns a newline-delimited JSON stream into one frame per line. The value is
+  percent-decoded; a leading `/` keeps the separator on the frame it ends.
+  The header is removed before the other end sees it, whether or not it was
+  usable.
+* **`disable://captureStream`** turns both off, and a compressed body is never
+  framed — searching a deflate stream for a separator finds nothing.
+
+Frames from a request body are marked `send` and from a response `receive`,
+which is the only thing that distinguishes them from a WebSocket's in the
+panel. A hidden request (`enable://hide`) produces none.
+
 #### `hide` — a request the console never hears about
 
 `enable://hide` lets a request happen and keeps it out of the capture. Four

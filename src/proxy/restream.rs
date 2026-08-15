@@ -769,3 +769,222 @@ mod tests {
         assert_eq!(split_regexp("plain"), None);
     }
 }
+
+// ── body frames ────────────────────────────────────────────────────────────
+
+/// Split a body into **frames** as it streams past, the way whistle's Frames
+/// panel shows an event stream.
+///
+/// `emitFrame` / `parseFrame` (`_original/lib/inspectors/data.js:67-135`): the
+/// buffer is cut at every separator, each piece is a frame, and what is left
+/// over waits for the next chunk. The default separator is `\n\n` — an SSE
+/// event — and `x-whistle-custom-frame-separator` names another. A separator
+/// written with a leading `/` is **kept** on the frame that ends with it
+/// (`keepSep`, `:87-90`), which is how a stream whose separator carries meaning
+/// stays readable.
+///
+/// The cap is upstream's too: a run of bytes longer than `MAX_FRAME_PAYLOAD`
+/// with no separator in it is emitted anyway, one byte short, so a stream that
+/// never separates cannot grow without bound (`:130-133`,
+/// `util/index.js:4002`).
+pub struct FrameSplitter {
+    sep: Vec<u8>,
+    keep_sep: bool,
+    buf: Vec<u8>,
+}
+
+/// Upstream's `MAX_FRAME_PAYLOAD` (`_original/lib/util/index.js:4002`).
+const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
+
+impl FrameSplitter {
+    /// A splitter for `sep`, or `None` when the separator is empty — upstream
+    /// returns no `sep` for that and falls back to treating the body as one
+    /// piece (`parseFrameSep`, `data.js:91-94`).
+    pub fn new(sep: &[u8], keep_sep: bool) -> Option<Self> {
+        (!sep.is_empty()).then(|| FrameSplitter {
+            sep: sep.to_vec(),
+            keep_sep,
+            buf: Vec::new(),
+        })
+    }
+
+    /// The SSE default: an empty line between events.
+    pub fn sse() -> Self {
+        FrameSplitter {
+            sep: b"\n\n".to_vec(),
+            keep_sep: false,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Feed a chunk; returns the frames it completed.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(at) = find(&self.buf, &self.sep) {
+            let end = match self.keep_sep {
+                true => at + self.sep.len(),
+                false => at,
+            };
+            if end > 0 {
+                out.push(self.buf[..end].to_vec());
+            }
+            self.buf.drain(..at + self.sep.len());
+        }
+        // A stream that never separates still has to be shown, and must not be
+        // held for ever: upstream emits all but the last byte and keeps that
+        // one, so the next separator can still be found across the cut.
+        if self.buf.len() > MAX_FRAME_PAYLOAD {
+            let keep = self.buf.split_off(self.buf.len() - 1);
+            out.push(std::mem::replace(&mut self.buf, keep));
+        }
+        out
+    }
+
+    /// The last frame, if the body ended with bytes after the final separator.
+    pub fn finish(&mut self) -> Option<Vec<u8>> {
+        (!self.buf.is_empty()).then(|| std::mem::take(&mut self.buf))
+    }
+}
+
+/// The header that names a frame separator, on a request or a response
+/// (`FRAME_SEP_KEY`, `_original/lib/inspectors/data.js:15`).
+pub const FRAME_SEP_HEADER: &str = "x-whistle-custom-frame-separator";
+
+/// Read the separator header out of `headers` and **remove** it.
+///
+/// `parseFrameSep` (`data.js:77-96`) deletes the header whether or not the
+/// value is usable, so it never reaches the other end. The value is
+/// percent-decoded — `%0A` for a newline — and a leading `/` asks for the
+/// separator to stay on the frame it ends.
+pub fn take_frame_separator(headers: &mut hyper::HeaderMap) -> Option<FrameSplitter> {
+    let raw = headers.remove(FRAME_SEP_HEADER)?;
+    let text = raw.to_str().ok()?;
+    let decoded = percent_decode(text);
+    let (keep_sep, sep) = match decoded.strip_prefix('/') {
+        Some(rest) => (true, rest.to_string()),
+        None => (false, decoded),
+    };
+    FrameSplitter::new(sep.as_bytes(), keep_sep)
+}
+
+/// `decodeURIComponent`, byte-wise: a `%xx` that is not two hex digits is left
+/// alone, and a run that is not UTF-8 comes back lossily — upstream's
+/// `try { decodeURIComponent(sep) } catch (e) {}` keeps the raw text on a throw,
+/// which is the same shape of answer.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = (bytes[i] == b'%' && i + 2 < bytes.len())
+            .then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok())
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(b) => {
+                out.push(b);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The first index of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    fn text(frames: Vec<Vec<u8>>) -> Vec<String> {
+        frames
+            .into_iter()
+            .map(|f| String::from_utf8_lossy(&f).into_owned())
+            .collect()
+    }
+
+    /// The SSE default, one event per frame, with a partial event held back
+    /// until its separator arrives.
+    #[test]
+    fn an_event_stream_is_one_frame_per_event() {
+        let mut s = FrameSplitter::sse();
+        assert_eq!(text(s.push(b"data: a\n\ndata: b\n\n")), ["data: a", "data: b"]);
+        assert_eq!(text(s.push(b"data: c")), Vec::<String>::new());
+        assert_eq!(text(s.push(b"\n\n")), ["data: c"]);
+        assert_eq!(s.finish(), None);
+        // A tail with no separator is the last frame.
+        assert_eq!(text(s.push(b"data: d")), Vec::<String>::new());
+        assert_eq!(s.finish().map(|f| String::from_utf8_lossy(&f).into_owned()).as_deref(), Some("data: d"));
+    }
+
+    /// A custom separator, and the `/` that keeps it — `keepSep`
+    /// (`_original/lib/inspectors/data.js:87-90,:117-119`).
+    #[test]
+    fn a_custom_separator_may_be_kept() {
+        let mut dropped = FrameSplitter::new(b"\n", false).expect("separator");
+        assert_eq!(text(dropped.push(b"one\ntwo\n")), ["one", "two"]);
+        let mut kept = FrameSplitter::new(b"\n", true).expect("separator");
+        assert_eq!(text(kept.push(b"one\ntwo\n")), ["one\n", "two\n"]);
+        // An empty separator is not a separator.
+        assert!(FrameSplitter::new(b"", false).is_none());
+    }
+
+    /// The header is read, percent-decoded and **removed** — it must not reach
+    /// the other end (`parseFrameSep`, `data.js:77-96`).
+    #[test]
+    fn the_separator_header_is_consumed() {
+        let with = |value: &str| {
+            let mut h = hyper::HeaderMap::new();
+            h.insert(
+                hyper::header::HeaderName::from_static(FRAME_SEP_HEADER),
+                value.parse().unwrap(),
+            );
+            let split = take_frame_separator(&mut h);
+            (split, h.get(FRAME_SEP_HEADER).is_some())
+        };
+        let (split, left) = with("%0A");
+        assert!(!left, "the header must not survive");
+        let mut split = split.expect("a separator");
+        assert_eq!(
+            split.push(b"one\ntwo\n").into_iter().map(|f| String::from_utf8_lossy(&f).into_owned()).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        // A leading slash keeps the separator on the frame.
+        let mut kept = with("/%0A").0.expect("a separator");
+        assert_eq!(
+            kept.push(b"one\n").into_iter().map(|f| String::from_utf8_lossy(&f).into_owned()).collect::<Vec<_>>(),
+            ["one\n"]
+        );
+        // An empty value yields no splitter, and still loses the header.
+        let (none, left) = with("");
+        assert!(none.is_none() && !left);
+        // A `%` that is not an escape is text.
+        let mut literal = with("%zz").0.expect("a separator");
+        assert_eq!(
+            literal.push(b"a%zzb%zz").into_iter().map(|f| String::from_utf8_lossy(&f).into_owned()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    /// A separator that spans two chunks is still found.
+    #[test]
+    fn a_separator_split_across_chunks_is_found() {
+        let mut s = FrameSplitter::new(b"--END--", false).expect("separator");
+        assert_eq!(text(s.push(b"first--")), Vec::<String>::new());
+        assert_eq!(text(s.push(b"END--second")), ["first"]);
+        assert_eq!(s.finish().map(|f| String::from_utf8_lossy(&f).into_owned()).as_deref(), Some("second"));
+    }
+}
