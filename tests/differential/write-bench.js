@@ -216,6 +216,19 @@ const CASES = [
   // `getRuleValue` (`lib/util/common.js:911-919`).
   { name: 'a verbatim path refuses the join', rules: `${P} resWrite://<${F('d')}>`, request: { path: '/echo' } },
 
+  // ── a target that ends in a separator ────────────────────────────────────
+  //
+  // `reqWrite.md` says a directory target takes `index.html` when the request
+  // asks for a directory: "目标路径为 `/User/xxx/test/`，结尾为 `/` 或 `\` 自动
+  // 追加 `index.html`". `joinPath` is where that happens
+  // (`_original/lib/util/index.js:1855-1871`) — it puts the slash back when the
+  // *root* had one and the joined path does not.
+  { name: 'a directory target and a file request', rules: `${P} resWrite://${F('dir1')}/`, request: { path: '/a/b.html' } },
+  { name: 'a directory target and a directory request', rules: `${P} resWrite://${F('dir2')}/`, request: { path: '/a/' } },
+  { name: 'a directory target and the root', rules: `${P} resWrite://${F('dir3')}/`, request: { path: '/' } },
+  { name: 'a directory target the pattern consumes', rules: `${P}/a/ resWrite://${F('dir4')}/`, request: { path: '/a/' } },
+  { name: 'a file target and a directory request', rules: `${P} resWrite://${F('file1')}`, request: { path: '/a/' } },
+
   // ── shape of the value ───────────────────────────────────────────────────
   { name: 'a write path that is a directory', rules: `${P} resWrite://${DIR}` },
   { name: 'a write path under a directory that does not exist', rules: `${P} resWrite://${F('no/such/dir/rs')}` },

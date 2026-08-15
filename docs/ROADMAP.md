@@ -79,7 +79,7 @@
 | `cases-proxy.js`（转发族） | 115 | 25 项，同上 | 19 |
 | `https-bench.js`（MITM 隧道内，**含证书与隧道载荷**） | 49 | 0 差异 | — |
 | `timing-bench.js`（延时与限速） | 33 | 0 差异 | — |
-| `write-bench.js`（落盘族，比对磁盘） | 34 | 1 项，具名 | — |
+| `write-bench.js`（落盘族，比对磁盘） | 39 | 1 项，具名 | — |
 | `cases-flags.js`（`enable`/`disable` 标志矩阵） | 65 | 1 项，具名 | 21 |
 | `cases-groups.js`（规则分组与 API） | 51 | 3 项，具名 | 8 |
 | `cases-docs.js`（**官网文档里的写法**） | 111 | 5 项，具名 | 34 |
