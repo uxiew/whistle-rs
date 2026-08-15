@@ -4626,13 +4626,27 @@ fn write_res_cors(
 fn merge_cors_ops(resolved: &Resolved, protocol: &str) -> HashMap<String, String> {
     let mut spec: HashMap<String, String> = HashMap::new();
     for op in resolved.all(protocol).iter().rev() {
-        spec.extend(parse_cors(&op.value));
+        spec.extend(parse_cors(&op.value, op.value_is_content));
     }
     spec
 }
 
 /// Parse one `resCors` value into whistle's lower-cased option map.
-fn parse_cors(value: &str) -> HashMap<String, String> {
+///
+/// After the four shortcut spellings the value is an ordinary data object, so
+/// it takes the same three roads as any other ([`parse_data_object`]) — the
+/// third of which is the **line format**, which is how `resCors.md` spells out
+/// a full CORS object:
+///
+/// ```txt
+/// ``` cors.json
+/// origin: *
+/// methods: POST
+/// ```
+/// ```
+///
+/// That did nothing here: this had JSON and a query string and stopped.
+fn parse_cors(value: &str, is_content: bool) -> HashMap<String, String> {
     let trimmed = value.trim();
     let one = |k: &str, v: &str| HashMap::from([(k.to_string(), v.to_string())]);
     if GEN_URL_RE.is_match(trimmed) {
@@ -4646,29 +4660,18 @@ fn parse_cors(value: &str) -> HashMap<String, String> {
     {
         return one("enable", "true");
     }
-    if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed) {
-        return map
-            .into_iter()
-            .map(|(k, v)| {
-                let v = match v {
-                    serde_json::Value::String(s) => s,
-                    other => other.to_string(),
-                };
-                (k.to_ascii_lowercase(), v)
-            })
-            .collect();
-    }
-    // `parseInlineJSON`: a `key=…` value with no whitespace is a query string.
-    let inline = trimmed.split('=').next().unwrap_or("");
-    if trimmed.contains('=') && !inline.is_empty() && !inline.contains(['\\', '/']) && !trimmed.contains(char::is_whitespace)
-    {
-        return trimmed
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.to_string()))
-            .collect();
-    }
-    HashMap::new()
+    let Some(serde_json::Value::Object(map)) = parse_data_object(trimmed, false, is_content) else {
+        return HashMap::new();
+    };
+    map.into_iter()
+        .map(|(k, v)| {
+            let v = match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            (k.trim().to_ascii_lowercase(), v)
+        })
+        .collect()
 }
 
 /// One request header, if the request is known. Names in [`ReqInfo`] are
@@ -6985,7 +6988,7 @@ fn merge_cookie_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, CookieV
         resolved
             .all(protocol)
             .iter()
-            .map(|op| parse_cookie_ops(&op.value)),
+            .map(|op| parse_cookie_ops(&op.value, op.value_is_content)),
     )
 }
 
@@ -7048,27 +7051,26 @@ impl CookieValue {
 /// and sets no cookie (`tryParseMatcher` bails on `indexOf('=') === -1`,
 /// `_original/lib/util/index.js:1165-1171`). Same gate as
 /// [`parse_header_pairs`].
-fn parse_cookie_ops(value: &str) -> Vec<(String, CookieValue)> {
-    let value = value.trim();
-    if value.starts_with('{')
-        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
-    {
-        return map
-            .into_iter()
-            .map(|(k, v)| (k, CookieValue::of_json(v)))
-            .collect();
-    }
-    if !value.contains('=') {
+fn parse_cookie_ops(value: &str, is_content: bool) -> Vec<(String, CookieValue)> {
+    // The three roads every data value takes ([`parse_data_object`]). The line
+    // format is the third, and `resCookies.md` prints it as the way to write
+    // several cookies:
+    //
+    // ```txt
+    // ``` cookies.json
+    // key1: value1
+    // key2: value2
+    // ```
+    // ```
+    //
+    // It set no cookie at all here.
+    let Some(serde_json::Value::Object(map)) = parse_data_object(value.trim(), false, is_content)
+    else {
         return Vec::new();
-    }
-    value
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (k.trim().to_string(), CookieValue::Plain(v.to_string())),
-            None => (pair.trim().to_string(), CookieValue::Plain(String::new())),
-        })
-        .filter(|(name, _)| !name.is_empty())
+    };
+    map.into_iter()
+        .filter(|(name, _)| !name.trim().is_empty())
+        .map(|(k, v)| (k.trim().to_string(), CookieValue::of_json(v)))
         .collect()
 }
 

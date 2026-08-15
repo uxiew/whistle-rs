@@ -327,6 +327,10 @@ module.exports = [
   { name: 'resCookies a whole value with no equals', rules: `${P} resCookies://sid` },
   { name: 'resCookies a valueless pair inside a query', rules: `${P} resCookies://sid=abc&t` },
   { name: 'resCookies with expires', rules: `\`\`\`ck\n{"sid":{"value":"x","expires":"Wed, 21 Oct 2099 07:28:00 GMT"}}\n\`\`\`\n${P} resCookies://{ck}` },
+  // The line format, which `resCookies.md` prints as the way to write several
+  // cookies at once — it set none here until the campaign that read the page.
+  { name: 'resCookies from a fenced block', rules: `\`\`\`ck\nkey1: value1\nkey2: value2\n\`\`\`\n${P} resCookies://{ck}` },
+  { name: 'resCookies from a fenced block with attributes', rules: `\`\`\`ck\n{"key1":"value1","key2":{"value":"value2","path":"/","secure":true,"domain":"example.com"}}\n\`\`\`\n${P} resCookies://{ck}` },
   { name: 'resCookies two lines merge', rules: `${P} resCookies://a=1\n${P} resCookies://b=2` },
   { name: 'resCookies two lines contest a name', rules: `${P} resCookies://a=first\n${P} resCookies://a=second` },
   { name: 'resCookies a Max-Age spelled Max-Age', rules: `${P} resCookies://{"sid":{"value":"x","Max-Age":60}}` },
@@ -334,6 +338,9 @@ module.exports = [
   { name: 'resCookies a null value', rules: `${P} resCookies://{"sid":null}` },
 
   // ── CORS ───────────────────────────────────────────────────────────────
+  // The detailed spelling `resCors.md` prints: one field per line, in a block.
+  { name: 'resCors from a fenced block', rules: `\`\`\`c\norigin: *\nmethods: POST\nheaders: x-test\ncredentials: true\nmaxAge: 300000\n\`\`\`\n${P} resCors://{c}`, request: { headers: { origin: 'https://app.test' } } },
+  { name: 'resCors from a fenced block on a preflight', rules: `\`\`\`c\norigin: *\nheaders: x-test\n\`\`\`\n${P} resCors://{c}`, request: { method: 'OPTIONS', headers: { origin: 'https://app.test', 'access-control-request-headers': 'x-a' } } },
   { name: 'resCors star', rules: `${P} resCors://*` },
   { name: 'resCors enable echoes the origin', rules: `${P} resCors://enable`, request: { headers: { origin: 'https://app.test' } } },
   { name: 'resCors enable with no origin header', rules: `${P} resCors://enable` },
