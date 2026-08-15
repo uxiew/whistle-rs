@@ -1481,6 +1481,16 @@ H2 会话复用）。
 - **`G` / `style` 算子的「流量效果」** —— `G` 是全局插件变量基础设施、`style` 是规则列表
   配色，二者都不是逐请求的流量算子；保持「解析但不产生效果」。
 
+- **上游的 `/cgi-bin/*` 控制台 API（`extensions/api.md` 的 Local Agent API）** ——
+  那一页给的是一个 Node 模块（`w2 root bin/api`），它包着 whistle 自己控制台的
+  二十来个 `/cgi-bin/` 端点：`rules/add`、`rules/select2`、`values/add`、`sessions`、
+  `frames`、`composer`、`rootca` …… 其中一半的返回体就是上游控制台的内部数据模型
+  （`reqData`/`resData`/`frames` 那一套），复刻它等于把本移植的 Session 模型改造成
+  上游的形状。本移植有自己的一套 HTTP API，README 里逐个列了，形状是本移植的
+  Session 模型 —— 要给 Agent 用，用那一套。这是**接口非目标**，不是能力缺口：
+  规则增删改、Values、抓包读取、证书下载、HTTPS 开关这些能力都在，只是路径和 JSON
+  形状不同。
+
 - **`{{whistlePluginName}}` / `{{whistlePluginPackage.x}}` 插件包变量** —— 上游把它们替换进
   **已安装 npm 包目录**里的 `rules.txt` / `_rules.txt` / `resRules.txt` / `_values.txt`，
   取值源是该包自己的 `package.json`（`renderPluginRules`，
