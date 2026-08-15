@@ -63,6 +63,26 @@ const FIXTURES = {
   'tpl-dollar-only.txt': 'a runtime var and nothing else: ${method}',
   'jsonp.js': '{callback}({"ok":1})',
   'range.txt': 'ranged-0123456789-end',
+  // The content-type table, which is `mime@1.6.0`'s and not a guess. These are
+  // the entries a subset table gets wrong by reasoning about the name: a `.ts`
+  // is a transport stream, a `.rs` is an XML service description, and the
+  // office formats carry a charset because `isText` looks for `xml` as a
+  // substring and finds it inside `openxmlformats`.
+  'types/a.ts': 'not typescript\n',
+  'types/a.rs': 'fn main() {}\n',
+  'types/a.scss': '$c: red;\n',
+  'types/a.jsx': '<div/>\n',
+  'types/a.less': '@c: red;\n',
+  'types/a.md': '# title\n',
+  'types/a.csv': 'a,b\n',
+  'types/a.php': '<?php ?>\n',
+  'types/a.sh': 'echo hi\n',
+  'types/a.pem': '-----BEGIN-----\n',
+  'types/a.m3u8': '#EXTM3U\n',
+  'types/a.docx': 'not really a document\n',
+  'types/a.webmanifest': '{"name":"x"}\n',
+  'types/a.ics': 'BEGIN:VCALENDAR\n',
+  'types/a.zzz': 'an extension nobody knows\n',
 };
 
 for (const [name, content] of Object.entries(FIXTURES)) {
@@ -76,7 +96,21 @@ fs.writeFileSync(F('pixel.png'), Buffer.from(
   'base64'));
 fs.mkdirSync(F('emptydir'), { recursive: true });
 
+/** One fixture under `types/`, served by its own path. */
+const typed = (name) => ({
+  name: `content type: ${name}`,
+  rules: `${A} file://${F('types/' + name)}`,
+});
+
 module.exports = [
+  // ── the content-type table ─────────────────────────────────────────────
+  typed('a.ts'), typed('a.rs'), typed('a.scss'), typed('a.jsx'), typed('a.less'),
+  typed('a.md'), typed('a.csv'), typed('a.php'), typed('a.sh'), typed('a.pem'),
+  typed('a.m3u8'), typed('a.docx'), typed('a.webmanifest'), typed('a.ics'),
+  // An extension neither table knows falls back to the request URL's, and the
+  // request here asks for `/echo` — so both answer `text/html`.
+  typed('a.zzz'),
+
   // ── serving one file ───────────────────────────────────────────────────
   { name: 'baseline: no rule at all', rules: '' },
   { name: 'baseline: a rule that does nothing to the response', rules: `${A} reqHeaders://x-a=1` },

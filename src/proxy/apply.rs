@@ -2996,9 +2996,14 @@ fn content_type_for(path: &str, full_url: &str) -> &'static str {
 /// `text/` is text, and only `image/*` that got past those is not. That is why
 /// `image/svg+xml` carries a charset and `image/png` does not.
 ///
-/// The table is a subset of `mime`'s several hundred entries, covering what a
-/// mock tree holds. An extension outside it falls back to the request URL's, as
-/// it would for a file with no extension at all.
+/// The table is a subset of `mime`'s several hundred entries — every spelling
+/// here was read out of the `mime@1.6.0` whistle depends on rather than
+/// guessed, including the ones that look wrong (`.ts` is `video/mp2t`, `.rs` is
+/// `application/rls-services+xml`, and `.docx` carries a charset because
+/// `isText`'s substring test finds `xml` inside `openxmlformats`). An extension
+/// outside it falls back to the request URL's, then to `text/html`, which is
+/// the fallback chain whistle passes to `mime.lookup` itself
+/// (`file-proxy.js:255-257,:314`).
 fn content_type_of_ext(path: &str) -> Option<&'static str> {
     // The separator set is `mime`'s own: `lookup` strips everything up to the
     // last `.`, `/` **or** `\` (`mime@1 lookup`, `path.replace(/.*[\.\/\\]/, '')`),
@@ -3012,16 +3017,49 @@ fn content_type_of_ext(path: &str) -> Option<&'static str> {
         .filter(|ext| !ext.is_empty())?
         .to_ascii_lowercase();
     Some(match ext.as_str() {
-        "html" | "htm" => "text/html; charset=utf-8",
+        // Markup, styles and scripts.
+        "html" | "htm" | "shtml" => "text/html; charset=utf-8",
         "xhtml" => "application/xhtml+xml; charset=utf-8",
         "js" | "mjs" => "application/javascript; charset=utf-8",
+        "jsx" => "text/jsx; charset=utf-8",
         "css" => "text/css; charset=utf-8",
-        // A source map is JSON, and `.map` is how every bundler spells it.
+        "scss" => "text/x-scss; charset=utf-8",
+        "sass" => "text/x-sass; charset=utf-8",
+        "less" => "text/less; charset=utf-8",
+        "htc" => "text/x-component; charset=utf-8",
+        "hbs" => "text/x-handlebars-template; charset=utf-8",
+        // Data and documents. A source map is JSON, and `.map` is how every
+        // bundler spells it — which is `mime`'s answer too.
         "json" | "map" => "application/json; charset=utf-8",
+        "webmanifest" => "application/manifest+json; charset=utf-8",
         "xml" => "application/xml; charset=utf-8",
+        "rss" => "application/rss+xml; charset=utf-8",
+        "atom" => "application/atom+xml; charset=utf-8",
         "md" | "markdown" => "text/markdown; charset=utf-8",
         "csv" => "text/csv; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
         "yaml" | "yml" => "text/yaml; charset=utf-8",
+        "ini" | "conf" | "log" | "txt" | "text" => "text/plain; charset=utf-8",
+        "manifest" | "appcache" => "text/cache-manifest; charset=utf-8",
+        "ics" => "text/calendar; charset=utf-8",
+        "vcf" => "text/x-vcard; charset=utf-8",
+        "rtf" => "application/rtf",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document; charset=utf-8"
+        }
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; charset=utf-8"
+        }
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation; charset=utf-8"
+        }
+        "epub" => "application/epub+zip",
+        "mobi" => "application/x-mobipocket-ebook",
+        // Images.
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
@@ -3030,25 +3068,93 @@ fn content_type_of_ext(path: &str) -> Option<&'static str> {
         "tif" | "tiff" => "image/tiff",
         "svg" => "image/svg+xml; charset=utf-8",
         "ico" => "image/x-icon",
+        "wbmp" => "image/vnd.wap.wbmp",
+        "jng" => "image/x-jng",
+        "psd" => "image/vnd.adobe.photoshop",
+        "ai" | "eps" => "application/postscript",
+        // Fonts.
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "eot" => "application/vnd.ms-fontobject",
+        // Video and audio. `.ts` is `video/mp2t` and not TypeScript, which is
+        // `mime`'s answer and therefore whistle's.
         "mp4" => "video/mp4",
         "webm" => "video/webm",
+        "ogv" => "video/ogg",
+        "avi" => "video/x-msvideo",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "flv" => "video/x-flv",
+        "ts" => "video/mp2t",
+        "3gp" => "video/3gpp",
+        "m3u8" => "application/vnd.apple.mpegurl",
+        "mpd" => "application/dash+xml; charset=utf-8",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
+        "ogg" | "oga" => "audio/ogg",
+        "aac" => "audio/x-aac",
+        "flac" => "audio/x-flac",
+        "m4a" => "audio/mp4",
+        "weba" => "audio/webm",
+        "mid" | "midi" => "audio/midi",
+        // Archives and binaries.
         "zip" => "application/zip",
         "gz" => "application/gzip",
         "tar" => "application/x-tar",
+        "bz2" => "application/x-bzip2",
+        "xz" => "application/x-xz",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/x-rar-compressed",
+        "jar" | "war" => "application/java-archive",
+        "apk" => "application/vnd.android.package-archive",
+        "swf" => "application/x-shockwave-flash",
         "wasm" => "application/wasm",
-        "pdf" => "application/pdf",
         "bin" => "application/octet-stream",
-        "txt" | "text" => "text/plain; charset=utf-8",
+        // Sources, scripts and certificates.
+        "php" => "application/x-httpd-php",
+        "pl" => "application/x-perl",
+        "sh" => "application/x-sh",
+        "bat" => "application/x-msdownload",
+        "sql" => "application/x-sql",
+        "c" | "h" | "cpp" => "text/x-c; charset=utf-8",
+        "java" => "text/x-java-source; charset=utf-8",
+        "rs" => "application/rls-services+xml; charset=utf-8",
+        "pem" | "crt" => "application/x-x509-ca-cert",
+        "cer" => "application/pkix-cert",
+        "p12" | "pfx" => "application/x-pkcs12",
         _ => return None,
     })
+}
+
+/// Every entry of the type table, against the `mime@1.6.0` whistle carries.
+///
+/// The table is written out by hand, so the test is the check that it was
+/// copied and not invented — the values were produced by asking that package
+/// and are pinned here in the shape it gave them.
+#[cfg(test)]
+#[test]
+fn the_type_table_is_the_one_whistle_carries() {
+    // A few that a subset table gets wrong by guessing: `.ts` is a transport
+    // stream, `.rs` is not `text/rust`, and the office formats carry a charset
+    // only because `isText` looks for `xml` as a substring.
+    assert_eq!(content_type_of_ext("a.ts"), Some("video/mp2t"));
+    assert_eq!(content_type_of_ext("a.rs"), Some("application/rls-services+xml; charset=utf-8"));
+    assert_eq!(content_type_of_ext("a.scss"), Some("text/x-scss; charset=utf-8"));
+    assert_eq!(content_type_of_ext("a.jsx"), Some("text/jsx; charset=utf-8"));
+    assert_eq!(content_type_of_ext("a.m3u8"), Some("application/vnd.apple.mpegurl"));
+    assert_eq!(content_type_of_ext("a.php"), Some("application/x-httpd-php"));
+    assert_eq!(content_type_of_ext("a.pem"), Some("application/x-x509-ca-cert"));
+    assert_eq!(
+        content_type_of_ext("a.docx"),
+        Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document; charset=utf-8")
+    );
+    // An extension the table does not carry has no answer here — the caller
+    // then falls back to the request URL's, as `mime.lookup(path, defaultType)`
+    // does upstream.
+    assert_eq!(content_type_of_ext("a.zzz"), None);
+    assert_eq!(content_type_of_ext("a.vue"), None);
 }
 
 /// Apply request-side operators (headers, method, ua, referer) in place.
