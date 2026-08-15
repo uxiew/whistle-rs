@@ -255,4 +255,29 @@ module.exports = [
   { name: 'an @ include of a relative path is not an include', rules: '@inc.rules' },
   { name: 'an @ include of a file that does not exist', rules: `@${F('nope.rules')}` },
   { name: 'an @ line with a pattern in front is not an include', rules: `${A} @${F('inc.rules')}` },
+
+  // ── the line format, one `name: value` per line ──────────────────────────
+  //
+  // The third road a loaded value takes, after JSON and the query string
+  // (`_parseJSON`, `_original/lib/util/index.js:1135-1143`). What a *value*
+  // becomes there is `parseLine`'s answer, and its shape is not the obvious
+  // one: upstream asks whether the first and last characters match **before**
+  // it asks whether the text is a number, so the numeric branch is the `else`
+  // of that and unreachable for `1`, `11`, `121` or `0`
+  // (`common.js:1145-1157`). All of these were measured against whistle 2.10.8
+  // one at a time.
+  { name: 'line format: a two-character number stays text', rules: `\`\`\`v\na: 11\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'line format: ends that differ make a number', rules: `\`\`\`v\na: 123\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'line format: a single digit stays text', rules: `\`\`\`v\na: 1\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'line format: zero stays text', rules: `\`\`\`v\na: 0\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'line format: a negative number', rules: `\`\`\`v\na: -12\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'line format: a quoted value loses its quotes', rules: `\`\`\`v\na: "1"\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'line format: a bare name has an empty value', rules: `\`\`\`v\nsolo\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'line format: a name ending in a colon', rules: `\`\`\`v\nsolo:\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'line format: two lines', rules: `\`\`\`v\nx-a: 1\nx-b: two\n\`\`\`\n${A} reqHeaders://{v}` },
+  // The same three roads for the operators that replace rather than set: the
+  // line format is how `pathReplace.md` spells "several substitutions", and it
+  // did nothing here.
+  { name: 'line format: pathReplace pairs', rules: `\`\`\`v\necho: replaced\n\`\`\`\n${A} pathReplace://{v}` },
+  { name: 'line format: resReplace pairs', rules: `\`\`\`v\norigin: REPLACED\n\`\`\`\n${A} resReplace://{v}` },
 ];

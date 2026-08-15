@@ -3501,17 +3501,32 @@ fn parse_data_line(line: &str) -> (String, serde_json::Value) {
     };
     let name = line[..at].trim().to_string();
     let value = line[at + 1..].trim();
-    let quote = value.chars().next().filter(|c| "\"'`".contains(*c));
-    if let Some(q) = quote
-        && value.len() >= 2
-        && value.ends_with(q)
-    {
-        let inner = &value[q.len_utf8()..value.len() - q.len_utf8()];
-        let inner = match q == '`' {
-            true => inner.replace("\\n", "\n").replace("\\r", "\r"),
-            false => inner.to_string(),
-        };
-        return (name, serde_json::Value::String(inner));
+    // Upstream asks one question first — **do the first and last characters
+    // match?** — and only then which of the two branches to take:
+    //
+    // ```js
+    // if (fv === lv) { …unquote…} else if (isSafeNumStr(value)) { value = parseInt(value, 10); }
+    // ```
+    //
+    // (`parseLine`, `_original/lib/util/common.js:1145-1157`.) So the numeric
+    // conversion is *unreachable* for a value whose ends match, and that is not
+    // a quirk of quoting alone: `1`, `11` and `121` all stay strings while `123`
+    // and `-12` become numbers. Measured against whistle 2.10.8 for each.
+    let mut ends = value.chars();
+    let first = ends.next();
+    let last = ends.next_back().or(first);
+    if first == last {
+        if let Some(q) = first.filter(|c| "\"'`".contains(*c))
+            && value.chars().count() >= 2
+        {
+            let inner = &value[q.len_utf8()..value.len() - q.len_utf8()];
+            let inner = match q == '`' {
+                true => inner.replace("\\n", "\n").replace("\\r", "\r"),
+                false => inner.to_string(),
+            };
+            return (name, serde_json::Value::String(inner));
+        }
+        return (name, serde_json::Value::String(value.to_string()));
     }
     match safe_num(value) {
         Some(n) => (name, serde_json::Value::Number(n.into())),
@@ -3536,24 +3551,104 @@ fn safe_num(value: &str) -> Option<i64> {
 }
 
 /// Place `value` at a dotted path, creating the objects along the way.
-fn insert_at_path(out: &mut serde_json::Map<String, serde_json::Value>, path: &[String], value: serde_json::Value) {
-    let Some((last, parents)) = path.split_last() else {
+/// A path segment, and whether it arrived as a bracket index.
+///
+/// The distinction is upstream's and it is the only thing that decides between
+/// an array and an object: `parseKey` turns `a[0]` into the pair `['a', 0]` with
+/// a **number** for the index (`+result[1]`, `_original/lib/util/common.js:1064`),
+/// while a dotted `a.0` stays two strings. `parsePlainText` then opens an array
+/// exactly when the next key is a number (`:1209-1212`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PathSegment {
+    name: String,
+    is_index: bool,
+}
+
+impl PathSegment {
+    fn key(name: impl Into<String>) -> Self {
+        PathSegment { name: name.into(), is_index: false }
+    }
+    fn index(name: impl Into<String>) -> Self {
+        PathSegment { name: name.into(), is_index: true }
+    }
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Write `value` at `path`, opening the containers the path implies.
+fn insert_at_path(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[PathSegment],
+    value: serde_json::Value,
+) {
+    let Some((first, rest)) = path.split_first() else {
         return;
     };
-    let mut node = out;
-    for key in parents {
-        node = node
-            .entry(key.clone())
-            .and_modify(|v| {
-                if !v.is_object() {
-                    *v = serde_json::Value::Object(serde_json::Map::new());
-                }
-            })
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-            .as_object_mut()
-            .expect("just made it an object");
+    if rest.is_empty() {
+        out.insert(first.name.clone(), value);
+        return;
     }
-    node.insert(last.clone(), value);
+    let slot = open_slot(out, &first.name, rest[0].is_index);
+    insert_into(slot, rest, value);
+}
+
+/// The container under `name`, made if it is not there and replaced if what is
+/// there cannot hold a path.
+fn open_slot<'a>(
+    map: &'a mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    wants_array: bool,
+) -> &'a mut serde_json::Value {
+    map.entry(name.to_string())
+        .and_modify(|v| {
+            if !v.is_object() && !v.is_array() {
+                *v = empty_container(wants_array);
+            }
+        })
+        .or_insert_with(|| empty_container(wants_array))
+}
+
+fn insert_into(node: &mut serde_json::Value, path: &[PathSegment], value: serde_json::Value) {
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
+    match node {
+        serde_json::Value::Array(items) => {
+            let at: usize = first.name.parse().unwrap_or(0);
+            while items.len() <= at {
+                items.push(serde_json::Value::Null);
+            }
+            if rest.is_empty() {
+                items[at] = value;
+                return;
+            }
+            if !items[at].is_object() && !items[at].is_array() {
+                items[at] = empty_container(rest[0].is_index);
+            }
+            insert_into(&mut items[at], rest, value);
+        }
+        serde_json::Value::Object(map) => {
+            if rest.is_empty() {
+                map.insert(first.name.clone(), value);
+                return;
+            }
+            let slot = open_slot(map, &first.name, rest[0].is_index);
+            insert_into(slot, rest, value);
+        }
+        // A scalar cannot hold a path; the caller replaced one before
+        // descending, so this is only reachable for a root that is neither.
+        _ => {}
+    }
+}
+
+/// The container a path segment opens: an array when the segment below it is a
+/// bracket index, an object otherwise.
+fn empty_container(wants_array: bool) -> serde_json::Value {
+    match wants_array {
+        true => serde_json::Value::Array(Vec::new()),
+        false => serde_json::Value::Object(serde_json::Map::new()),
+    }
 }
 
 /// The entries of a `headerReplace://` value, in source order, in either
@@ -5397,7 +5492,8 @@ fn merge_json_patches(resolved: &Resolved, protocol: &str) -> Option<serde_json:
         // did nothing here; so did the line format, which is how a `{value}`
         // reference carries a merge patch. `resMerge`/`reqMerge` are also the
         // only operators whose dotted names are paths (`RESOLVE_KEY_RE`).
-        let Some(value) = parse_data_object(&op.value, true, op.value_is_content) else {
+        let Some(value) = parse_data_object(&op.value, resolves_dotted_keys(op), op.value_is_content)
+        else {
             continue;
         };
         match value {
@@ -6128,10 +6224,10 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
             if keys.peek().is_none() {
                 match node {
                     serde_json::Value::Object(map) => {
-                        map.remove(key);
+                        map.remove(key.name());
                     }
                     serde_json::Value::Array(list) => {
-                        if let Some(i) = array_index(key).filter(|i| *i < list.len()) {
+                        if let Some(i) = array_index(key.name()).filter(|i| *i < list.len()) {
                             list.remove(i);
                         }
                     }
@@ -6140,9 +6236,9 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
                 break;
             }
             let next = match node {
-                serde_json::Value::Object(map) => map.get_mut(key),
+                serde_json::Value::Object(map) => map.get_mut(key.name()),
                 serde_json::Value::Array(list) => {
-                    array_index(key).and_then(|i| list.get_mut(i))
+                    array_index(key.name()).and_then(|i| list.get_mut(i))
                 }
                 _ => None,
             };
@@ -6166,7 +6262,7 @@ fn delete_json_props(value: &mut serde_json::Value, paths: &[String]) {
 ///   itself ends in brackets is named;
 /// * `a[0][1]` — trailing bracket indices become segments of their own, so the
 ///   bracket form and `a.0.1` address the same element.
-fn parse_json_path(path: &str) -> Vec<String> {
+fn parse_json_path(path: &str) -> Vec<PathSegment> {
     let mut segments: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut chars = path.trim().chars().peekable();
@@ -6200,22 +6296,22 @@ fn parse_json_path(path: &str) -> Vec<String> {
 
 /// One segment of a path, with its quotes stripped and its trailing `[n]`
 /// indices split off (`parseKey`, `_original/lib/util/common.js:1051-1075`).
-fn parse_json_key(key: &str) -> Vec<String> {
+fn parse_json_key(key: &str) -> Vec<PathSegment> {
     if key.len() >= 2 && key.starts_with('"') && key.ends_with('"') {
-        return vec![key[1..key.len() - 1].to_string()];
+        return vec![PathSegment::key(&key[1..key.len() - 1])];
     }
     let mut head = key;
-    let mut indices: Vec<String> = Vec::new();
+    let mut indices: Vec<PathSegment> = Vec::new();
     while let Some((rest, index)) = strip_trailing_index(head) {
-        indices.insert(0, index.to_string());
+        indices.insert(0, PathSegment::index(index));
         head = rest;
     }
     if indices.is_empty() {
-        return vec![key.to_string()];
+        return vec![PathSegment::key(key)];
     }
     // `if (key)` — a bare `[0]` has no name in front of it and contributes none.
     if !head.is_empty() {
-        indices.insert(0, head.to_string());
+        indices.insert(0, PathSegment::key(head));
     }
     indices
 }
@@ -6386,7 +6482,7 @@ fn merge_rule_maps(resolved: &Resolved, protocol: &str) -> Vec<(String, String)>
         resolved
             .all(protocol)
             .iter()
-            .map(|op| parse_replace_pairs(&op.value)),
+            .map(|op| parse_replace_pairs(&op.value, op.value_is_content)),
     )
 }
 
@@ -6415,27 +6511,24 @@ fn merge_line_maps<V>(
 /// `parseQuery` (via `tryParseMatcher`) splits on `&` then on the first `=`, so
 /// `resReplace://a=1&b=2` is two substitutions, not one that inserts `1&b=2`.
 /// A `{json}` value is an object of the same shape.
-fn parse_replace_pairs(spec: &str) -> Vec<(String, String)> {
-    let spec = spec.trim();
-    if spec.starts_with('{')
-        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(spec)
-    {
-        return map
-            .into_iter()
-            .map(|(k, v)| {
-                let val = match v {
-                    serde_json::Value::String(s) => s,
-                    serde_json::Value::Null => String::new(),
-                    other => other.to_string(),
-                };
-                (k, val)
-            })
-            .collect();
-    }
-    spec.split('&')
-        .filter_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
-            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
+fn parse_replace_pairs(spec: &str, is_content: bool) -> Vec<(String, String)> {
+    // The same three roads every data value takes — JSON, then a query string,
+    // then the line format ([`parse_data_object`]). The line format was missing
+    // here, and `pathReplace.md` leads with it: a `{value}` holding
+    // `test: name` per line is how the page spells "several substitutions", and
+    // it did nothing at all in this port.
+    let Some(serde_json::Value::Object(map)) = parse_data_object(spec, false, is_content) else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .filter(|(k, _)| !k.is_empty())
+        .map(|(k, v)| {
+            let val = match v {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            (k, val)
         })
         .collect()
 }
@@ -6772,53 +6865,59 @@ fn merge_params_values(resolved: &Resolved, protocol: &str) -> Vec<(String, serd
         resolved
             .all(protocol)
             .iter()
-            .map(|op| parse_param_values(&op.value, op.value_is_content)),
+            .map(|op| parse_param_values(&op.value, op.value_is_content, resolves_dotted_keys(op))),
     )
 }
 
-/// Parse `k=v&k2=v2` or `{json}` into `name` → JSON value pairs.
-fn parse_param_values(value: &str, is_content: bool) -> Vec<(String, serde_json::Value)> {
-    let value = value.trim();
-    if value.starts_with('{')
-        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
-    {
-        return map.into_iter().collect();
-    }
-    // The query-string spelling only when the value has no whitespace, then the
-    // line format — upstream's `_parseJSON` order, and the reason
-    // `urlParams://{u}` with a three-line `u` used to add no query at all.
-    if !is_content && !value.contains('=') {
-        return Vec::new();
-    }
-    if !is_content || !value.contains(char::is_whitespace) {
-        return value
-            .split('&')
-            .filter_map(|kv| {
-                let (k, v) = kv.split_once('=')?;
-                Some((
-                    k.trim().to_string(),
-                    serde_json::Value::String(v.trim().to_string()),
-                ))
-            })
-            .collect();
-    }
-    match parse_plain_text(value, false) {
+/// Parse `k=v&k2=v2`, `{json}` or the line format into `name` → value pairs.
+///
+/// The three roads and their order are [`parse_data_object`]'s — this had its
+/// own copy of them, and the copy differed twice: a key written with no `=`
+/// was dropped where `parseQuery` keeps it with an empty value (`solo` and
+/// `solo:` both merged nothing here and `{"solo":""}` upstream), and the line
+/// format never resolved a dotted name.
+fn parse_param_values(
+    value: &str,
+    is_content: bool,
+    resolve_keys: bool,
+) -> Vec<(String, serde_json::Value)> {
+    match parse_data_object(value, resolve_keys, is_content) {
         Some(serde_json::Value::Object(map)) => map.into_iter().collect(),
         _ => Vec::new(),
     }
 }
 
-/// A param value as it appears in a query string or a form body: a JSON string
-/// unquoted, anything else serialised.
+/// Does this operator read a dotted name as a **path** into the object?
 ///
-/// Upstream reaches the same place by a different road — `qs.stringify` would
-/// spell a nested object `a[b]=1` — so a `params://{"a":{"b":1}}` written
-/// against a *form* body differs. Against a JSON body, which is where a nested
-/// value belongs, both implementations merge the structure.
+/// `RESOLVE_KEY_RE` is `/^re[qs]Merge:\/\//` (`_original/lib/util/index.js:95`)
+/// and it is tested against the matcher **as written**, so the question is about
+/// the spelling and not about the protocol it resolves to: measured against
+/// whistle 2.10.8, a block holding `a.b: 1` merges as `{"a":{"b":"1"}}` under
+/// `reqMerge://{v}` and as `{"a.b":"1"}` under `params://{v}` — the same
+/// operator, the same value, two answers.
+fn resolves_dotted_keys(op: &RuleOp) -> bool {
+    let written = op.raw.split_once("://").map(|(proto, _)| proto);
+    matches!(written, Some("reqMerge" | "resMerge"))
+}
+
+/// A param value as it appears in a query string or a form body: a string
+/// unquoted, a number or a boolean written out, **a structure written as
+/// nothing**.
+///
+/// The last one is Node's `querystring.stringify`, which upstream hands the
+/// whole patch to before merging it into a form body (`replaceQueryString`,
+/// `_original/lib/util/index.js:1753-1756`): it writes primitives and drops
+/// anything else, so `{a:{b:'1'}}` becomes `a=`. Measured against whistle
+/// 2.10.8; this port used to write the JSON text of the structure, which is a
+/// value the form's reader never sees from whistle.
+///
+/// A nested patch belongs on a JSON body, where both implementations merge the
+/// structure itself.
 fn json_to_param_string(value: serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s,
         serde_json::Value::Null => String::new(),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => String::new(),
         other => other.to_string(),
     }
 }
@@ -7458,7 +7557,16 @@ fn parse_header_pairs(value: &str, is_content: bool) -> Vec<(String, HeaderValue
     if !is_content && !value.contains('=') {
         return Vec::new();
     }
-    if value.contains('=') && (!is_content || !value.contains(char::is_whitespace)) {
+    // Loaded content takes the query road on **whitespace alone** — an `=` is
+    // not required, because `parseInlineJSON` only asks `SPACE_RE.test(text)`
+    // (`_original/lib/util/index.js:1128-1133`) and `querystring.parse` reads a
+    // bare entry as a key with an empty value. That is the difference between
+    // a block holding `solo:` naming the header `solo:` — which is not a token,
+    // so both proxies send nothing — and splitting it at the colon into a
+    // header named `solo`, which is what this port used to send.
+    if (is_content && !value.contains(char::is_whitespace))
+        || (value.contains('=') && !is_content)
+    {
         // A name repeated in one value is a *list*, not a contest: Node's
         // `querystring.parse("a=1&a=2")` yields `{a: ["1","2"]}`, whistle
         // assigns that array onto the header map, and Node writes one header
@@ -7466,7 +7574,11 @@ fn parse_header_pairs(value: &str, is_content: bool) -> Vec<(String, HeaderValue
         // where whistle sends two, which for `set-cookie` or `accept` is the
         // difference between the rule working and half of it vanishing.
         let mut out: Vec<(String, HeaderValues)> = Vec::new();
-        for (name, val) in value.split('&').filter_map(|pair| pair.split_once('=')) {
+        // An entry with no `=` is a name with an empty value, which is what
+        // `querystring.parse` gives it — dropping it here meant a block holding
+        // one bare name set no header where whistle sets an empty one.
+        for pair in value.split('&').filter(|pair| !pair.is_empty()) {
+            let (name, val) = pair.split_once('=').unwrap_or((pair, ""));
             let (name, val) = (name.trim().to_string(), val.trim().to_string());
             match out.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, values)) => values.push(val),
@@ -8427,7 +8539,14 @@ mod tests {
     /// write but a body rarely carries.
     #[test]
     fn a_json_delete_path_splits_the_way_parse_keys_does() {
-        let path = |s: &str| parse_json_path(s);
+        // The names alone; `a_bracket_index_opens_an_array` covers the other
+        // half of a segment, which is whether it came from brackets.
+        let path = |s: &str| {
+            parse_json_path(s)
+                .into_iter()
+                .map(|seg| seg.name().to_string())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(path("a.b.c"), ["a", "b", "c"]);
         assert_eq!(path(" a . b "), ["a", "b"]);
         assert_eq!(path(r"a\.b"), ["a.b"]);
@@ -8443,6 +8562,29 @@ mod tests {
         assert_eq!(path("a[01]"), ["a[01]"]);
         assert_eq!(path("a[x]"), ["a[x]"]);
         assert_eq!(path(r#""k[0]""#), ["k[0]"]);
+    }
+
+    /// A bracket index opens an **array**; a dotted number does not.
+    ///
+    /// Upstream's `parseKey` turns `a[0]` into `['a', 0]` with a number for the
+    /// index, and `parsePlainText` opens an array exactly when the next key is
+    /// one (`_original/lib/util/common.js:1064,:1209-1212`). A dotted `a.0`
+    /// stays two strings and therefore two objects. Measured against whistle
+    /// 2.10.8 through `reqMerge://{block}`: `a[0]: 1` merges as `{"a":["1"]}`,
+    /// which this port used to spell `{"a":{"0":"1"}}`.
+    #[test]
+    fn a_bracket_index_opens_an_array() {
+        let merged = |line: &str| {
+            parse_data_object(line, true, true).map(|v| v.to_string()).unwrap_or_default()
+        };
+        assert_eq!(merged("a[0]: 1"), r#"{"a":["1"]}"#);
+        assert_eq!(merged("a[1]: x"), r#"{"a":[null,"x"]}"#);
+        assert_eq!(merged("a[0][1]: x"), r#"{"a":[[null,"x"]]}"#);
+        assert_eq!(merged("a.0: 1"), r#"{"a":{"0":"1"}}"#);
+        assert_eq!(merged("a.b[0]: 1"), r#"{"a":{"b":["1"]}}"#);
+        // Two lines into the same array, and one that overwrites.
+        assert_eq!(merged("a[0]: x\na[1]: y"), r#"{"a":["x","y"]}"#);
+        assert_eq!(merged("a[0]: x\na[0]: y"), r#"{"a":["y"]}"#);
     }
 
     /// A multipart body: a part named by a param is replaced whole, one named
@@ -8964,11 +9106,19 @@ mod tests {
         let obj = |text: &str, keys: bool| parse_data_object(text, keys, true).unwrap().to_string();
         assert_eq!(obj(r#"{"a":1}"#, false), r#"{"a":1}"#);
         assert_eq!(obj("a=1&b=2", false), r#"{"a":"1","b":"2"}"#);
-        assert_eq!(obj("a: 1\nb: two", false), r#"{"a":1,"b":"two"}"#);
-        // A safe integer becomes a number; a quoted one stays text.
+        assert_eq!(obj("a: 1\nb: two", false), r#"{"a":"1","b":"two"}"#);
+        // A quoted value loses its quotes. A safe integer becomes a number —
+        // but **only** when its first and last characters differ, because
+        // upstream asks that first and the numeric branch is the `else` of it
+        // (`parseLine`, `common.js:1145-1157`). Measured against whistle 2.10.8:
+        // `1`, `11`, `121` and `0` stay strings; `123` and `-12` are numbers.
         assert_eq!(obj("a: \"1\"", false), r#"{"a":"1"}"#);
         assert_eq!(obj("a: 007", false), r#"{"a":"007"}"#);
-        assert_eq!(obj("a: 0", false), r#"{"a":0}"#);
+        assert_eq!(obj("a: 0", false), r#"{"a":"0"}"#);
+        assert_eq!(obj("a: 11", false), r#"{"a":"11"}"#);
+        assert_eq!(obj("a: 121", false), r#"{"a":"121"}"#);
+        assert_eq!(obj("a: 123", false), r#"{"a":123}"#);
+        assert_eq!(obj("a: -12", false), r#"{"a":-12}"#);
         // The separator is `": "`, then `:`, then `=` — so a value may hold both.
         assert_eq!(obj("a: v=1", false), r#"{"a":"v=1"}"#);
         assert_eq!(obj("a=v:1", false), r#"{"a":"v:1"}"#);
