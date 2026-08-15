@@ -14,9 +14,9 @@
 > **算子取值可以指向文件或 URL**（`readRuleValue`），**反引号整值按请求渲染**（`renderTpl`）。
 > **⚠️ 「已应用」不等于「与上游逐位一致」** —— 四路审计确认了 45 项行为差异，
 > **失败开放已清空**；不再维护一个精确的「已修 N 项」整数，下一节的清单才是准的。
-> 单元测试 **862** 项全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
+> 单元测试 **889** 项全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
 > 与 `cargo test --doc` 均 **0 警告 / 0 失败**（clippy 由 `Cargo.toml` 的
-> `[lints.clippy]` 把住）。此外还有 **1966 条差分用例**对着真 whistle 2.10.8 实测，
+> `[lints.clippy]` 把住）。此外还有 **2066 条差分用例**对着真 whistle 2.10.8 实测，
 > 见下一节——本轮的 bug 绝大多数出自那里，通读源码一个都没找到。
 > **本轮新增第二种 oracle**：把上游的解析器直接跑在进程里，同一份规则、同一个 URL
 > 问它「哪些规则命中、每个算子拿到什么」，与本移植的 `explain --batch` 逐条比对 ——
@@ -66,13 +66,13 @@
 
 | 语料 | 用例 | 结果 | inert |
 | --- | --- | --- | --- |
-| `cases.js`（通用） | 143 | 0 差异 | 23 |
+| `cases.js`（通用） | 155 | 0 差异 | 28 |
 | `cases-lineprops.js`（行级属性） | 55 | 0 差异 | 9 |
 | `cases-file.js`（本地文件家族） | 168 | 2 项**有意偏离**，逐条具名 | 13 |
 | `cases-filters.js`（筛选器条件） | 262 | 0 差异 | 116 |
-| `cases-patterns.js`（模式与优先级） | 258 | 0 差异 | 10 |
-| `cases-bodies.js`（body 改写与编码） | 180 | 0 差异 | 87 |
-| `cases-delete.js`（`delete://` 与类型算子） | 220 | 8 项，同上 | 41 |
+| `cases-patterns.js`（模式与优先级） | 262 | 0 差异 | 10 |
+| `cases-bodies.js`（body 改写与编码） | 180 | 0 差异 | 85 |
+| `cases-delete.js`（`delete://` 与类型算子） | 229 | 8 项，同上 | 39 |
 | `cases-compose.js`（规则组合与脚本注入） | 121 | 9 项，同上 | 14 |
 | `cases-values.js`（取值与模板） | 132 | 13 项，同上 | 10 |
 | `cases-includes.js`（`@` 引入） | 35 | 0 差异（其中 24 项在真 whistle 一侧确有改变） | 11 |
