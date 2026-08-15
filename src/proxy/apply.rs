@@ -2228,7 +2228,8 @@ impl FileCandidates {
                 paths.push(FileSource::Url(entry.to_string()));
                 continue;
             }
-            let entry = expand_home(&decode_path(entry));
+            // Home first, then the separators — `convertSlash`'s own order.
+            let entry = convert_slash(&expand_home(&decode_path(entry)));
             if has_parent_ref(&entry) {
                 // `joinPath` refuses the path outright (`util/index.js:1847-1849`)
                 // and `readFiles` reports it with a fixed marker; it contributes
@@ -2334,6 +2335,30 @@ fn expand_home(path: &str) -> String {
         // directory; leaving the path untouched has the same effect.
         Some(home) => format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/')),
         None => path.to_string(),
+    }
+}
+
+/// A backslash is a path separator **everywhere except on Windows**, which is
+/// the opposite of how it reads.
+///
+/// `convertSlash` is `isWin32 ? filePath : formatPathSep(filePath)`
+/// (`_original/lib/util/file-mgr.js:13-16`), and `formatPathSep` replaces every
+/// `\` with `/` (`util/common.js:178-180`). So a rule written on Windows —
+/// `file://D:\mock.json`, or a path pasted out of Explorer — keeps working when
+/// the same rules file is opened on a Mac, which is the point: rules travel
+/// between machines and paths in them are written in the local dialect.
+///
+/// On Windows itself nothing is converted, because the OS takes either
+/// separator and a `/` in a path is already a `/`.
+///
+/// The cost is a file whose **name** contains a backslash, which is legal here
+/// and unreachable through a rule. It is unreachable in upstream too, and a
+/// path that cannot be written on the platform the rule was written for is the
+/// cheaper thing to give up.
+pub(crate) fn convert_slash(path: &str) -> String {
+    match cfg!(windows) {
+        true => path.to_string(),
+        false => path.replace('\\', "/"),
     }
 }
 
@@ -2661,7 +2686,7 @@ async fn read_value_source(source: &ValueSource) -> Option<String> {
         ValueSource::File(spec) => {
             let mut parts: Vec<String> = Vec::new();
             for entry in spec.split('|') {
-                let path = expand_home(&decode_path(entry.trim()));
+                let path = convert_slash(&expand_home(&decode_path(entry.trim())));
                 if has_parent_ref(&path) {
                     tracing::warn!("rule value {path}: refused, path contains '..'");
                     continue;
@@ -7104,6 +7129,91 @@ fn delete_query(path: &str, names: &[String], clear: bool) -> String {
     }
 }
 
+/// `encodeURI`: the characters a URL may not carry raw, percent-encoded as
+/// UTF-8, and every other character left exactly as it is.
+///
+/// The set is the one JavaScript's `encodeURI` escapes — space, `"`, `<`, `>`,
+/// `\`, `^`, `` ` ``, `{`, `|`, `}`, `%`, and everything above ASCII — and it
+/// was arrived at by measurement rather than by reading: `auth-bench`-style
+/// probes put each character through a `params://` value and read what reached
+/// the origin. `é`→`%C3%A9`, `中`→`%E4%B8%AD`, `🚀`→`%F0%9F%9A%80`, `{`→`%7B`,
+/// `%`→`%25`, and `#`, `&`, `=`, `+`, `/`, `?`, `:` untouched.
+///
+/// `%`→`%25` means a value that was **already** escaped is escaped again —
+/// `%41` becomes `%2541`. That is upstream's answer and it is the consistent
+/// one: what a rule writes into a parameter arrives at the origin as those
+/// characters, whatever they look like.
+fn encode_uri(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        let raw = byte.is_ascii()
+            && !matches!(
+                byte,
+                b' ' | b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}' | b'%'
+            )
+            && !byte.is_ascii_control();
+        match raw {
+            true => out.push(byte as char),
+            false => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The request target to put on the wire: **every non-ASCII byte percent-encoded
+/// as UTF-8**, and every ASCII byte left exactly as it is.
+///
+/// A request target is ASCII, and a rule may name anything. A destination
+/// spelled `http://host/中文` or a `params://` value carrying one is an ordinary
+/// thing to write, and forwarding those bytes raw is not a request line: the
+/// bench's origin answers `400` and closes the connection, so the rule did not
+/// merely fail to apply — it took the request down with it.
+///
+/// Upstream escapes the same range on the rule's own URL —
+/// `ruleUrl = util.encodeNonLatin1Char(ruleUrl)`
+/// (`_original/lib/inspectors/rules.js:42`) — and the bench agrees with it
+/// character by character.
+///
+/// **Only non-ASCII.** The wider `encodeURI` set belongs to a `params://`
+/// *value* (see [`merge_query`]) and not here: a `%` escaped at this level would
+/// re-escape what the client wrote, turning a request for `/a%20b` into
+/// `/a%2520b`, and `urlReplace://` — which writes URL syntax on purpose — would
+/// have its `{`, `|` and `^` escaped where upstream leaves them alone. All three
+/// were measured separately.
+///
+/// **A target hyper still refuses gets the full [`encode_uri`] as a last
+/// resort.** `urlReplace://echo=ec` + a backtick produces a path the URI parser
+/// will not take, and the caller's fallback then keeps the *original* URI — so
+/// the rule silently does not happen, which is the one outcome worse than
+/// applying it differently. whistle puts the backtick on the wire raw; this
+/// sends `%60`, which every server decodes back to it. Declared in
+/// `cases-paths.js`.
+///
+/// `None` only when even that is not a URI, and the caller keeps the request's
+/// original URI.
+///
+/// The encoding is for the wire only: what is recorded and shown keeps the path
+/// as the rule wrote it, which is the readable form and the one to search a
+/// capture for.
+pub fn request_target(path: &str) -> Option<hyper::Uri> {
+    let ascii = match path.is_ascii() {
+        true => path.to_string(),
+        false => {
+            let mut out = String::with_capacity(path.len());
+            for byte in path.bytes() {
+                match byte.is_ascii() {
+                    true => out.push(byte as char),
+                    false => out.push_str(&format!("%{byte:02X}")),
+                }
+            }
+            out
+        }
+    };
+    hyper::Uri::try_from(ascii.as_str())
+        .ok()
+        .or_else(|| hyper::Uri::try_from(encode_uri(&ascii).as_str()).ok())
+}
+
 /// Rewrite the request path+query per `urlReplace`, `params`, `urlParams`, and
 /// the `delete://` keys that name a query parameter or a path segment.
 pub fn rewrite_path(path: &str, resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> String {
@@ -7228,12 +7338,28 @@ fn json_to_param_string(value: serde_json::Value) -> String {
 }
 
 /// Merge `params` into the query string of `path`, overriding same-named keys.
+///
+/// **The merged-in values are percent-encoded and the query's existing ones are
+/// not**, which is not a symmetry worth fixing: what was already in the URL is
+/// whatever the client wrote and re-encoding it would turn its `%20` into
+/// `%2520`, while what a rule adds is text somebody typed into a rules file and
+/// has to survive the trip. Measured on both sides character by character —
+/// `params://q=a{b` reaches the origin as `q=a%7Bb` from whistle and used to
+/// reach it as `q=a{b` from here. See [`encode_uri`].
+///
+/// `urlReplace://` is deliberately *not* encoded, and that asymmetry is
+/// upstream's too: it rewrites a URL, so what it writes is URL syntax rather
+/// than a value inside one.
 fn merge_query(path: &str, params: &[(String, String)]) -> String {
     let (base, query) = match path.split_once('?') {
         Some((b, q)) => (b, q),
         None => (path, ""),
     };
-    let merged = merge_query_string(query, params, &[]);
+    let params: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (k.clone(), encode_uri(v)))
+        .collect();
+    let merged = merge_query_string(query, &params, &[]);
     if merged.is_empty() {
         return base.to_string();
     }
@@ -11543,6 +11669,61 @@ mod tests {
             FileCandidates::of("file", "~/mock.json", Sources::PathsAndUrls)
                 .paths
                 .contains(&FileSource::Path(format!("{home}/mock.json")))
+        );
+    }
+
+    /// A rules file written on Windows opens on a Mac. `convertSlash` converts
+    /// on every platform *except* Windows (`util/file-mgr.js:13-16`), which is
+    /// the opposite of how it reads, and the reason is that the OS being served
+    /// is not the OS the rule was typed on.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_windows_path_is_read_as_a_path() {
+        let home = dirs::home_dir().expect("a home directory");
+        let home = home.to_string_lossy();
+        assert_eq!(convert_slash("D:\\dir\\mock.json"), "D:/dir/mock.json");
+        assert_eq!(convert_slash("/tmp/a\\b.txt"), "/tmp/a/b.txt");
+        assert_eq!(convert_slash("/tmp/plain.txt"), "/tmp/plain.txt");
+        // Home expansion runs first, so a `~\x` reaches the home directory too.
+        assert_eq!(
+            convert_slash(&expand_home("~/dir\\mock.json")),
+            format!("{home}/dir/mock.json")
+        );
+        assert!(
+            FileCandidates::of("file", "/tmp/wrs\\mock.json", Sources::PathsAndUrls)
+                .paths
+                .contains(&FileSource::Path("/tmp/wrs/mock.json".to_string()))
+        );
+    }
+
+    /// The three encodings a rewritten URL gets, each measured on its own in
+    /// `cases-paths.js`: the target keeps ASCII exactly and escapes the rest, a
+    /// `params://` value takes the whole `encodeURI` set, and `urlReplace://`
+    /// takes neither.
+    #[test]
+    fn a_rewritten_target_is_encoded_for_the_wire() {
+        let target = |p: &str| request_target(p).map(|u| u.to_string());
+        // ASCII is untouched, including what a client already escaped.
+        assert_eq!(target("/a%20b%25c"), Some("/a%20b%25c".to_string()));
+        assert_eq!(target("/echo?q=a{b|c"), Some("/echo?q=a{b|c".to_string()));
+        // Non-ASCII becomes UTF-8 escapes, or the target is not a request line
+        // at all and the origin answers 400.
+        assert_eq!(target("/echo?q=中"), Some("/echo?q=%E4%B8%AD".to_string()));
+        assert_eq!(target("/echo?q=é"), Some("/echo?q=%C3%A9".to_string()));
+        assert_eq!(target("/echo?q=🚀"), Some("/echo?q=%F0%9F%9A%80".to_string()));
+        // A backtick is not a URI character, so the last resort escapes the
+        // rest rather than letting the whole rewrite vanish.
+        assert_eq!(target("/ec`ho"), Some("/ec%60ho".to_string()));
+
+        // A `params://` value takes the wider set — and the query it merges
+        // into keeps its own escapes as the client wrote them.
+        assert_eq!(encode_uri("a{b|c^d"), "a%7Bb%7Cc%5Ed");
+        assert_eq!(encode_uri("a%41b"), "a%2541b");
+        assert_eq!(encode_uri("a b\"c"), "a%20b%22c");
+        assert_eq!(encode_uri("a&b=c/d?e:f"), "a&b=c/d?e:f");
+        assert_eq!(
+            merge_query("/echo?keep=a%20b", &[("q".into(), "a{b".into())]),
+            "/echo?keep=a%20b&q=a%7Bb"
         );
     }
 

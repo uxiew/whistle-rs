@@ -525,13 +525,24 @@ async fn fetch_file(target: &str) -> Option<String> {
 
 /// Where a non-URL source lives. Only absolute forms get here — a relative path
 /// is not an include at all, so there is no base directory to resolve against.
+///
+/// An include may name a **drive letter** — `is_source` admits `[a-z]:[\\/]`
+/// because upstream's `REMOTE_RULES_RE` does — and upstream reads it through
+/// `fileMgr.convertSlash` (`http-mgr.js:274`), the same conversion a `file://`
+/// value gets. So `@D:\team\rules.txt` written on Windows names
+/// `D:/team/rules.txt` when the file travels to a Mac, which is where it will
+/// not be found either; what matters is that it is looked for in the same place
+/// both proxies look.
 fn local_path(target: &str) -> PathBuf {
-    match target.strip_prefix("~/") {
+    let target = match target.strip_prefix("~/") {
         Some(rest) => dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(rest),
-        None => PathBuf::from(target),
-    }
+            .join(rest)
+            .to_string_lossy()
+            .into_owned(),
+        None => target.to_string(),
+    };
+    PathBuf::from(crate::proxy::apply::convert_slash(&target))
 }
 
 /// Fetch every source that has never loaded, and re-parse if any landed.

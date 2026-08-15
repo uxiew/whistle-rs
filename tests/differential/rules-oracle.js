@@ -644,6 +644,15 @@ const CASE_FILES = [
   'cases-flags.js',
   'cases-groups.js',
   'cases-docs.js',
+  // The resolver is the right instrument for these two, and for opposite
+  // reasons. `cases-paths.js` is mostly about lines nothing on this machine can
+  // open — a drive letter, a UNC share — and resolving one costs no filesystem
+  // at all, so the question "which operator did this token land in" can be asked
+  // of every spelling. `cases-frames.js` is the other way round: its subject is
+  // invisible to a resolver, and it is here so that its rules are at least
+  // parsed the same on both sides.
+  'cases-paths.js',
+  'cases-frames.js',
 ];
 
 function casesCorpus() {

@@ -104,9 +104,10 @@ fn login_required<B>(
         return None;
     }
     let offered = offered_credentials(req);
-    let matches = |name: Option<&str>, pass: Option<&str>| match &offered {
-        Some((u, p)) => u.as_str() == name.unwrap_or("") && p.as_str() == pass.unwrap_or(""),
-        None => false,
+    let matches = |name: Option<&str>, pass: Option<&str>| {
+        offered
+            .iter()
+            .any(|(u, p)| u.as_str() == name.unwrap_or("") && p.as_str() == pass.unwrap_or(""))
     };
     if matches(account.0, account.1) {
         return None;
@@ -135,9 +136,20 @@ fn login_required<B>(
     Some(resp)
 }
 
-/// The username and password this request offers, from whichever of the three
-/// places carries them.
-fn offered_credentials<B>(req: &Request<B>) -> Option<(String, String)> {
+/// Every username and password this request offers.
+///
+/// **Two candidates, not one.** Upstream reads a header *and* a query parameter
+/// and lets either satisfy the login — `equalAuth(headerAuth, auth) ||
+/// equalAuth(queryAuth, auth)` (`verifyLogin`,
+/// `_original/biz/webui/lib/index.js:171-177`). This used to take the first
+/// source that carried anything, which meant a browser holding a stale
+/// `Authorization` from an earlier password masked the `?authorization=…` the
+/// user had just pasted into the address bar, and no reload could get past it.
+///
+/// The header slot is itself one candidate: `Authorization` when it is there and
+/// `Proxy-Authorization` only when it is not, which is upstream's `||` and not a
+/// third try.
+fn offered_credentials<B>(req: &Request<B>) -> Vec<(String, String)> {
     let from_header = |name: hyper::header::HeaderName| {
         req.headers()
             .get(name)
@@ -150,24 +162,41 @@ fn offered_credentials<B>(req: &Request<B>) -> Option<(String, String)> {
             .find(|(k, _)| *k == "authorization")
             .map(|(_, v)| percent_decode(v))
     });
-    let raw = from_header(hyper::header::AUTHORIZATION)
-        .or_else(|| from_header(hyper::header::PROXY_AUTHORIZATION))
-        .or(from_query)?;
-    let encoded = raw.trim().strip_prefix("Basic ").or_else(|| {
-        // Case-insensitive, as every server reads it.
-        raw.trim()
-            .split_once(' ')
-            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
-            .map(|(_, rest)| rest)
-    })?;
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        encoded.trim(),
-    )
-    .ok()?;
+    let header = from_header(hyper::header::AUTHORIZATION)
+        .or_else(|| from_header(hyper::header::PROXY_AUTHORIZATION));
+    [header, from_query]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| parse_basic(&raw))
+        .collect()
+}
+
+/// One `Basic` credential, read the way upstream's `parseAuth` reads it.
+fn parse_basic(raw: &str) -> Option<(String, String)> {
+    let raw = raw.trim();
+    // `Basic ` comes off when it is there, and **the whole value is decoded when
+    // it is not** — `parseAuth` is `AUTH_RE.test(auth) ? auth.substring(6) : auth`
+    // (`_original/lib/util/common.js:911-928`). The scheme-less spelling is not
+    // idiomatic in a header, but the same function reads the `?authorization=`
+    // parameter, where writing `Basic%20…` into a URL is the awkward one.
+    // `auth-bench.js` measures all three places.
+    let encoded = raw
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+        .map_or(raw, |(_, rest)| rest);
+    // Padding optional: `Buffer.from(s, 'base64')` accepts a value whose `=` was
+    // trimmed, and a client that trims it is offering the right credentials.
+    let engine = base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
+    let decoded = base64::Engine::decode(&engine, encoded.trim()).ok()?;
     let text = String::from_utf8(decoded).ok()?;
-    // The **first** colon splits, so a password may contain one.
-    let (user, pass) = text.split_once(':')?;
+    // The **first** colon splits, so a password may contain one; with no colon
+    // the whole value is the name and the password is empty, which is upstream's
+    // `indexOf(':') === -1` branch and the only way an empty `-w` is satisfied.
+    let (user, pass) = text.split_once(':').unwrap_or((text.as_str(), ""));
     Some((user.to_string(), pass.to_string()))
 }
 
@@ -2583,6 +2612,76 @@ mod login_tests {
         assert!(login_required(&s, &query, "/sessions.json").is_none());
         // A lower-case scheme is still Basic.
         assert!(allowed(&s, "GET", "/", Some(&creds.replace("Basic", "basic"))));
+    }
+
+    /// A header and a query parameter are **two candidates**, and either one
+    /// satisfies the login on its own: upstream's `equalAuth(headerAuth, auth)
+    /// || equalAuth(queryAuth, auth)` (`verifyLogin`, `:171-177`).
+    ///
+    /// Taking the first source that carried anything — which this did — meant a
+    /// browser still holding an `Authorization` from an old password masked the
+    /// `?authorization=…` in the address bar, and no reload could get past it.
+    /// `auth-bench.js` is where the difference was measured.
+    #[test]
+    fn a_wrong_header_does_not_mask_a_right_query_parameter() {
+        let s = state((Some("admin"), Some("s3cret"), None, None));
+        let right = basic("admin", "s3cret").replace(' ', "%20");
+        let with = |header: &str| {
+            let r = Request::builder()
+                .method("GET")
+                .uri(format!("/sessions.json?authorization={right}"))
+                .header(hyper::header::AUTHORIZATION, header)
+                .body(())
+                .expect("request");
+            login_required(&s, &r, "/sessions.json").is_none()
+        };
+        assert!(with(&basic("admin", "wrong")));
+        assert!(with(&basic("root", "s3cret")));
+        assert!(with("Bearer nonsense"));
+        // And the other way round: a right header beside a wrong parameter.
+        let r = Request::builder()
+            .method("GET")
+            .uri(format!("/sessions.json?authorization={}", basic("admin", "wrong").replace(' ', "%20")))
+            .header(hyper::header::AUTHORIZATION, basic("admin", "s3cret"))
+            .body(())
+            .expect("request");
+        assert!(login_required(&s, &r, "/sessions.json").is_none());
+    }
+
+    /// `parseAuth` strips `Basic ` only when it is there and base64-decodes the
+    /// whole value when it is not (`_original/lib/util/common.js:911-928`), and
+    /// `Buffer.from(s, 'base64')` does not insist on the padding. The
+    /// scheme-less spelling is the natural one in a URL, which is the other
+    /// place the same function reads.
+    #[test]
+    fn a_credential_needs_neither_its_scheme_nor_its_padding() {
+        use base64::Engine;
+        let s = state((Some("admin"), Some("look"), None, None));
+        let raw = base64::engine::general_purpose::STANDARD.encode("admin:look");
+        assert!(raw.ends_with('='), "the fixture has to carry padding to prove anything");
+        assert!(allowed(&s, "GET", "/", Some(&raw)));
+        assert!(allowed(&s, "GET", "/", Some(raw.trim_end_matches('='))));
+        assert!(allowed(&s, "GET", "/", Some(&format!("Basic {}", raw.trim_end_matches('=')))));
+        // Still no: the wrong credentials are wrong however they are spelled.
+        let wrong = base64::engine::general_purpose::STANDARD.encode("admin:wrong");
+        assert!(!allowed(&s, "GET", "/", Some(&wrong)));
+        // A scheme that is not Basic is not stripped, so what is decoded is the
+        // whole value — which is not a credential, and does not become one.
+        assert!(!allowed(&s, "GET", "/", Some(&format!("Bearer {raw}"))));
+    }
+
+    /// No colon at all: the whole value is the name and the password is empty,
+    /// upstream's `indexOf(':') === -1` branch. It is the only way an account
+    /// configured with an empty password can be satisfied.
+    #[test]
+    fn a_value_with_no_colon_is_a_name_and_an_empty_password() {
+        use base64::Engine;
+        let name_only = base64::engine::general_purpose::STANDARD.encode("admin");
+        let s = state((Some("admin"), None, None, None));
+        assert!(allowed(&s, "GET", "/", Some(&format!("Basic {name_only}"))));
+        // And it does not open an account that has a password.
+        let s2 = state((Some("admin"), Some("s3cret"), None, None));
+        assert!(!allowed(&s2, "GET", "/", Some(&format!("Basic {name_only}"))));
     }
 }
 

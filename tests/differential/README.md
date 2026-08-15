@@ -48,8 +48,8 @@ It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0` — except for the corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
 `cases-delete.js` at 8, `cases-values.js` at 13, `cases-compose.js` at 9,
-`cases-docs.js` at 5, `cases-groups.js` at 3, `cases-file.js` at 2 and
-`cases-proxy.js` at 25.
+`cases-docs.js` at 5, `cases-groups.js` at 3, `cases-file.js` at 2,
+`cases-proxy.js` at 25, `cases-frames.js` at 6 and `cases-paths.js` at 9.
 
 Every run also reports `inert` — the cases that would answer the same with no
 rules loaded at all, and therefore prove nothing. See [below](#inert-which-cases-prove-nothing).
@@ -58,7 +58,7 @@ One corpus claims a fourth port. `cases-includes.js` is about `@` includes, and
 half of them name a **URL**, so it stands up a rules-serving HTTP server at
 `PORT_BASE+10`. It runs clean at `differing: 0`.
 
-Six corpora are not clean on a bare run, by design:
+Eight corpora are not clean on a bare run, by design:
 
 * `cases-filters.js` asks about `env:`, which reads the **proxy's** environment.
   Both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle
@@ -90,6 +90,58 @@ Six corpora are not clean on a bare run, by design:
   the rule group that declared it in both proxies now; what is left in the other
   two is the older "a bare value stays the literal" divergence, reached because
   a reference that is out of scope is a reference nothing answers.
+* `cases-frames.js` ends at `differing: 6`, and all six are one fact:
+  `parseFrameSep` deletes the `x-whistle-custom-frame-separator` header from
+  inside itself, so every branch that skips the call leaks the proxy's own
+  control header to the origin or the client — a gzipped body,
+  `disable://captureStream`, `enable://hide`, and an empty value. This port
+  removes it first and decides afterwards.
+* `cases-paths.js` ends at `differing: 9`, named at the top of the file: two are
+  a UNC path failing in each proxy's own words, one is a filename containing a
+  `%`, four are a header value above ASCII (which Node cannot write and whistle
+  therefore drops — for a *response* header it loses the whole response), and
+  two are `urlReplace://` values whistle declines to apply at all.
+
+## The login bench
+
+`auth-bench.js` is the one bench that never installs a rule, because its subject
+is the gate in front of the console every *other* bench installs its rules
+through. `-n`/`-w` name the account that may do anything and `-N`/`-W` one that
+may only read; a corpus that locked itself out would have nothing left to say,
+so this stands alone and both proxies are launched with the credentials.
+
+```sh
+W2_USER=admin W2_PASS=s3cret W2_GUEST=guest W2_GUEST_PASS=look \
+  PORT_BASE=19800 node oracle.js &
+cargo run -- --port 19801 --no-persist --dir /tmp/rs-auth \
+  -n admin -w s3cret -N guest -W look &
+PORT_BASE=19800 node auth-bench.js
+```
+
+The two consoles are different programs with different route tables, so what it
+compares is not what a path *answers* but whether the request got past the gate:
+the status, and whether a `WWW-Authenticate` came back. A path that exists in
+neither (`/no-such-route`) isolates that exactly — 401 when the credentials are
+wrong and 404 when they are right, and the difference between those two is the
+gate and nothing else. The prose and content type of the 401 body are each
+proxy's own words and are not compared.
+
+46 cases: every spelling of a credential (`Basic`, `basic`, no scheme at all,
+padding trimmed, no colon, a password containing one), each of the three places
+upstream reads them from, the read-only account against five methods, the
+`.js`/`.css`/`.ico`/`.png` exemption, the root certificate answering before the
+login does, and — the case that would matter most if it ever broke — that a
+console login **does not gate proxied traffic**. A clean run is `differing: 0,
+declared: 6`, the six being upstream's static-suffix exemption, which a console
+that is one self-contained page has nothing to use and would only be a hole.
+
+It found two things this port had wrong, both now fixed and both pinned in
+`login_tests`: `parseAuth` decodes a value with **no scheme** and does not
+insist on the padding, and a header and a query parameter are **two
+candidates** — either satisfies the login on its own, where this port took the
+first source that carried anything, so a browser holding a stale `Authorization`
+masked the `?authorization=…` the user had just pasted and no reload could get
+past it.
 
 ## The HTTPS bench
 
@@ -260,6 +312,55 @@ it is in neither upstream's registry nor its alias table, so whistle answers
 What is left is eight operators the corpora here cannot reach — dumps, ciphers,
 delays, frames, plugins — each named with the bench or the test that does reach
 it.
+
+## Which whistle, though
+
+Every number here is measured against whistle **2.10.8**, and "agrees with
+2.10.8" is not the same claim as "agrees with whistle". Some alignment somewhere
+is bound to be with behaviour a single release happened to have, and a corpus
+cannot ask that question about itself.
+
+`bench-versions.js` asks it. Two runs of every corpus against two releases, and
+a diff **by case name** — two runs that both report three differences are not
+thereby the same three, and a corpus that gained one and lost one would show as
+unchanged under a count.
+
+```sh
+WHISTLE_DIFF_ENV=Alpha cargo run -- --port 19401 --no-persist \
+  --insecure-upstream --dir /tmp/rs-versions &        # once; it does not change
+
+WHISTLE_DIFF_ENV=Alpha PORT_BASE=19400 node oracle.js &
+PORT_BASE=19400 node bench-versions.js > /tmp/v2.10.8.json
+kill %2
+
+mkdir -p /tmp/w29 && (cd /tmp/w29 && npm i whistle@2.9.109)
+WHISTLE_PKG=/tmp/w29/node_modules/whistle \
+  WHISTLE_DIFF_ENV=Alpha PORT_BASE=19400 node oracle.js &
+WHISTLE_PKG=/tmp/w29/node_modules/whistle PORT_BASE=19400 \
+  node bench-versions.js > /tmp/v2.9.109.json
+
+node bench-versions.js --diff /tmp/v2.10.8.json /tmp/v2.9.109.json
+```
+
+`oracle.js` takes `WHISTLE_PKG` for this, and keys its storage directory on the
+version as well as the port — two releases sharing one directory would each read
+the other's state, and the answer to "did this change between versions" would be
+partly an answer about a file the other one wrote.
+
+**The first run of it, 2.10.8 against 2.9.109: 60 differences, and every one of
+them additive.** Not a single case that differs against 2.10.8 agrees with
+2.9.109 — so nothing here is an alignment with one release's quirk. What the 60
+are is whistle's own feature set moving: 2.9.109 has no header filter conditions
+at all (`reqH.`, `resH.`, `h:` — 30 cases), no `*://` scheme wildcards (2), no
+`parseFrameSep` and so no body framing (14), no `resCors` preflight and no
+escaped separators in `delete://` keys (7), and — worth naming on its own — **no
+refusal of a `..` path segment**, which 2.10 added and this port has.
+
+Eight corpora are byte-identical between the two releases, which is its own
+finding: the pattern layer, the body layer, the value loader, the proxy family
+and the groups API did not move at all.
+
+The specialty benches are not run from here; each wants its own launch.
 
 ## Reading a difference
 

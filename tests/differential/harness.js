@@ -316,6 +316,31 @@ const FIXED = {
   // can tell "injected nothing" from "injected an empty string".
   '/cached': ['text/html', HTML,
     { 'cache-control': 'max-age=600', 'content-security-policy': "default-src 'self'" }],
+
+  // ── bodies the console cuts into frames ────────────────────────────────
+  // For `cases-frames.js`. A finite event stream, so the bench can read it to
+  // the end: what is under test is whether the bytes arrive unchanged and what
+  // becomes of the separator header, neither of which needs a stream that runs
+  // forever. The blank lines are the frame boundaries.
+  '/sse': ['text/event-stream', 'data: one\n\ndata: two\n\ndata: three\n\n', {}],
+  // The type with a parameter on it: upstream compares `content-type` **whole**
+  // for this decision (`headers['content-type'] === 'text/event-stream'`), which
+  // is narrower than the test deciding whether a body may be buffered.
+  '/sse-charset': ['text/event-stream; charset=utf-8', 'data: one\n\ndata: two\n\n', {}],
+  '/sse-gz': ['text/event-stream', zlib.gzipSync('data: one\n\ndata: two\n\n'),
+    { 'content-encoding': 'gzip' }],
+  // A response that names its own separator, which is how the FAQ turns a
+  // chunked JSON stream into frames. Whether the client ever sees the header is
+  // the question.
+  '/sep': ['application/json', '{"a":1}|{"b":2}|{"c":3}',
+    { 'x-whistle-custom-frame-separator': '|' }],
+  '/sep-slash': ['application/json', '{"a":1}|{"b":2}',
+    { 'x-whistle-custom-frame-separator': '/|' }],
+  '/sep-encoded': ['text/plain', 'one\ntwo\nthree',
+    { 'x-whistle-custom-frame-separator': '%0A' }],
+  '/sep-empty': ['text/plain', 'one\ntwo', { 'x-whistle-custom-frame-separator': '' }],
+  '/sep-gz': ['application/json', zlib.gzipSync('{"a":1}|{"b":2}'),
+    { 'content-encoding': 'gzip', 'x-whistle-custom-frame-separator': '|' }],
 };
 
 /**

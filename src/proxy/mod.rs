@@ -4415,7 +4415,7 @@ async fn serve(
     // rewrite *that* — the same order as upstream, where `req.options` is built
     // before the request inspectors run.
     let new_path = apply::rewrite_path(&dest.path, &resolved, body_ctx);
-    parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
+    parts.uri = apply::request_target(&new_path).unwrap_or(parts.uri);
     let req_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     // The id every body frame of this transaction is filed under. Reserved
     // here, because the request body streams long before the session is
@@ -5078,7 +5078,7 @@ async fn serve_upgrade(
     // `params://` can only address the query string here).
     let (mut parts, _body) = req.into_parts();
     let new_path = apply::rewrite_path(&dest.path, resolved, apply::ReqBodyCtx::default());
-    parts.uri = Uri::try_from(new_path.as_str()).unwrap_or(parts.uri);
+    parts.uri = apply::request_target(&new_path).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, &dest.host, dest.port, &dest.scheme);
     parts.headers.remove("proxy-connection");
     mark_stripped_tls(&mut parts.headers, &target);

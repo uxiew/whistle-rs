@@ -27,7 +27,7 @@ const CORPORA = [
   'cases.js', 'cases-lineprops.js', 'cases-file.js', 'cases-filters.js',
   'cases-patterns.js', 'cases-bodies.js', 'cases-delete.js', 'cases-compose.js',
   'cases-values.js', 'cases-includes.js', 'cases-flags.js', 'cases-groups.js',
-  'cases-docs.js', 'cases-proxy.js',
+  'cases-docs.js', 'cases-proxy.js', 'cases-frames.js', 'cases-paths.js',
 ];
 
 // Operators these corpora cannot prove anything about, each with where it is
