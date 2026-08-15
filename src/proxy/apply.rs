@@ -1291,14 +1291,83 @@ fn cipher_is_12(s: &str) -> bool {
 fn flag_set(resolved: &Resolved, protocol: &str) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for v in collect_values(resolved, protocol) {
-        for f in v.split(['|', '&']) {
-            let f = f.trim();
+        for f in parse_props(v) {
+            let f = f.trim().to_string();
             if !f.is_empty() {
-                set.insert(f.to_string());
+                set.insert(f);
             }
         }
     }
     set
+}
+
+/// Split a prop list on `|` and `&`, honouring the escapes upstream honours.
+///
+/// `parseProps` (`_original/lib/util/common.js:73,:111-127`) is a single
+/// regexp — `/(\\*)([|&]|\\[stnrfv])/g` — over the whole value, and it does two
+/// things at once:
+///
+/// * a separator preceded by an **odd** number of backslashes is a literal
+///   `|` or `&` rather than a split, and the run is halved;
+/// * `\s`, `\t`, `\n`, `\r`, `\f` and `\v` become the characters they name —
+///   which is how `delete://reqBody.a\nb` addresses a key with a newline in it.
+///
+/// `delete://` and the two flag families take this road; `lineProps://` takes
+/// the plain `SEP_RE` split with no escapes at all (`index.js:1898`), which is
+/// a difference `docs/LINE_PROPS.md` already records.
+fn parse_props(value: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            match c {
+                '|' | '&' => out.push(String::new()),
+                _ => out.last_mut().expect("never empty").push(c),
+            }
+            continue;
+        }
+        // The run of backslashes, and then what it applies to.
+        let mut run = 1;
+        while chars.next_if_eq(&'\\').is_some() {
+            run += 1;
+        }
+        let kept = "\\".repeat(run / 2);
+        let tail = out.last_mut().expect("never empty");
+        match chars.peek() {
+            // `\<sep>`: odd keeps the separator as text, even splits.
+            Some('|' | '&') => {
+                let sep = chars.next().expect("peeked");
+                tail.push_str(&kept);
+                match run % 2 {
+                    1 => tail.push(sep),
+                    _ => out.push(String::new()),
+                }
+            }
+            // `\s` and friends: the run is counted **with** the escape's own
+            // backslash, so an even run leaves the letter and an odd one
+            // replaces it with the character it names.
+            Some(&letter) if matches!(letter, 's' | 't' | 'n' | 'r' | 'f' | 'v') => {
+                chars.next();
+                let kept = "\\".repeat(run.div_ceil(2) - usize::from(run % 2 == 1));
+                tail.push_str(&kept);
+                match run % 2 {
+                    1 => tail.push(match letter {
+                        's' => ' ',
+                        't' => '\t',
+                        'n' => '\n',
+                        'r' => '\r',
+                        'f' => '\u{c}',
+                        _ => '\u{b}',
+                    }),
+                    _ => tail.push(letter),
+                }
+            }
+            // Anything else: the backslashes are text, untouched — the regexp
+            // did not match, so nothing was halved.
+            _ => tail.push_str(&"\\".repeat(run)),
+        }
+    }
+    out
 }
 
 /// `enable://` flags for a request.
@@ -3229,8 +3298,10 @@ impl Deletions {
         let mut del = Deletions::default();
         let side = if request_side { "req" } else { "res" };
         for value in collect_values(resolved, "delete") {
-            // `parseProps` splits on `|` and `&` only (`common.js:72,98`).
-            for key in value.split(['|', '&']) {
+            // `parseProps` — the split honours `\|`, `\&` and the `\s`/`\t`/
+            // `\n`/`\r`/`\f`/`\v` escapes, which is how `delete.md`'s own
+            // example addresses a body key holding a newline and a pipe.
+            for key in parse_props(value) {
                 let key = key.trim();
                 if key.is_empty() {
                     continue;
@@ -8564,6 +8635,40 @@ mod tests {
         assert_eq!(path("a[01]"), ["a[01]"]);
         assert_eq!(path("a[x]"), ["a[x]"]);
         assert_eq!(path(r#""k[0]""#), ["k[0]"]);
+    }
+
+    /// `parseProps` — the split that honours escapes.
+    ///
+    /// Upstream runs one regexp over the whole value
+    /// (`_original/lib/util/common.js:73,:111-127`), so a separator behind an
+    /// odd number of backslashes is text and `\s`/`\t`/`\n`/`\r`/`\f`/`\v`
+    /// become the characters they name. Measured against whistle 2.10.8 through
+    /// `delete://reqBody.…`, which is where `delete.md` documents the table.
+    #[test]
+    fn a_prop_list_splits_on_unescaped_separators() {
+        let props = |value: &str| parse_props(value);
+        assert_eq!(props("a|b"), ["a", "b"]);
+        assert_eq!(props("a&b"), ["a", "b"]);
+        // An odd run keeps the separator as text and halves the backslashes.
+        assert_eq!(props(r"a\|b"), ["a|b"]);
+        assert_eq!(props(r"a\&b"), ["a&b"]);
+        assert_eq!(props(r"a\\|b"), [r"a\", "b"]);
+        assert_eq!(props(r"a\\\|b"), [r"a\|b"]);
+        // The named characters.
+        assert_eq!(props(r"a\nb"), ["a\nb"]);
+        assert_eq!(props(r"a\tb"), ["a\tb"]);
+        assert_eq!(props(r"a\sb"), ["a b"]);
+        assert_eq!(props(r"a\rb\fc\vd"), ["a\rb\u{c}c\u{b}d"]);
+        // An even run leaves the letter alone.
+        assert_eq!(props(r"a\\nb"), [r"a\nb"]);
+        // A backslash before anything else is text.
+        assert_eq!(props(r"a\.b"), [r"a\.b"]);
+        assert_eq!(props(r"a\zb"), [r"a\zb"]);
+        // `delete.md`'s own example, both keys at once.
+        assert_eq!(
+            props(r"reqBody.a\nb|reqBody.test\|\&test"),
+            ["reqBody.a\nb", "reqBody.test|&test"]
+        );
     }
 
     /// A bracket index opens an **array**; a dotted number does not.

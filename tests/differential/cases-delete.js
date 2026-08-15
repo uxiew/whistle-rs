@@ -142,6 +142,20 @@ module.exports = [
   { name: 'delete query runs after urlParams wrote it', rules: `${P} urlParams://z=9 delete://query.z` },
   { name: 'delete query.a with params adding it back', rules: `${P} delete://query.a urlParams://a=new`, request: rich },
 
+  // ── delete: the escape table `delete.md` prints ────────────────────────
+  //
+  // `parseProps` is one regexp over the whole value
+  // (`_original/lib/util/common.js:73,:111-127`): a separator behind an odd
+  // number of backslashes is text rather than a split, and `\s`/`\t`/`\n`/
+  // `\r`/`\f`/`\v` become the characters they name. This port split on `|`
+  // and `&` and stopped, so `delete.md`'s own example — a body key holding a
+  // newline and a pipe — deleted nothing.
+  { name: 'delete an escaped pipe and amp in a key', rules: `${P} delete://reqBody.test\\|\\&test`, request: { method: 'POST', body: '{"test|&test":1,"keep":2}', headers: { 'content-type': 'application/json' } } },
+  { name: 'delete an escaped newline in a key', rules: `${P} delete://reqBody.a\\nb`, request: { method: 'POST', body: '{"a\\nb":1,"keep":2}', headers: { 'content-type': 'application/json' } } },
+  { name: 'delete an escaped tab in a key', rules: `${P} delete://reqBody.a\\tb`, request: { method: 'POST', body: '{"a\\tb":1,"keep":2}', headers: { 'content-type': 'application/json' } } },
+  { name: 'delete an escaped space in a key', rules: `${P} delete://reqBody.a\\sb`, request: { method: 'POST', body: '{"a b":1,"keep":2}', headers: { 'content-type': 'application/json' } } },
+  { name: 'delete two keys separated by an unescaped pipe', rules: `${P} delete://reqBody.a|reqBody.b`, request: { method: 'POST', body: '{"a":1,"b":2,"keep":3}', headers: { 'content-type': 'application/json' } } },
+
   // ── delete: pathname ───────────────────────────────────────────────────
   { name: 'delete bare pathname', rules: `${P} delete://pathname`, request: { path: '/one/two/three' } },
   { name: 'delete bare pathname keeps the query', rules: `${P} delete://pathname`, request: { path: '/one/two?a=1' } },

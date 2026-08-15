@@ -2770,6 +2770,26 @@ structure itself.
 > `{"0":…,"name":"x"}` there and `{"name":"x","0":…}` here. Reordering a user's
 > JSON to imitate a language's property order is worse than the difference.
 
+### Escapes in a prop list
+
+`delete://`, `enable://` and `disable://` split their value on `|` and `&`
+through `parseProps` (`_original/lib/util/common.js:73,:111-127`), which is one
+regexp over the whole value and does two things: a separator behind an **odd**
+number of backslashes is text rather than a split, and `\s`, `\t`, `\n`, `\r`,
+`\f` and `\v` become the characters they name. So `delete.md`'s own example —
+
+```
+https://www.example.com/path delete://reqBody.\n\ \.p.test\|\&test
+```
+
+— addresses a key holding a newline, a space and a dot, and another holding a
+pipe and an ampersand. `lineProps://` is the exception and takes the plain
+split with no escapes at all (`index.js:1898`), which
+[`LINE_PROPS.md`](LINE_PROPS.md) records.
+
+> The page's table writes the space as `\ `; the code reads `\s`. A `\ ` is
+> left as written by both proxies, so the difference is in the page.
+
 ### A status value that is not a status
 
 `statusCode://` and `replaceStatus://` take a number. Given anything else —
