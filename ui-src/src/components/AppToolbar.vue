@@ -11,6 +11,7 @@ const PANES: { key: Pane; label: string }[] = [
   { key: 'composer', label: 'Composer' },
   { key: 'rules', label: 'Rules' },
   { key: 'values', label: 'Values' },
+  { key: 'test', label: 'Test Rules' },
   { key: 'status', label: 'Status' },
 ];
 

@@ -12,6 +12,7 @@ import ValueKeys from './sidebar/ValueKeys.vue';
 import ComposerPane from './panes/ComposerPane.vue';
 import RequestsPane from './panes/RequestsPane.vue';
 import RulesPane from './panes/RulesPane.vue';
+import TestRulesPane from './panes/TestRulesPane.vue';
 import StatusPane from './panes/StatusPane.vue';
 import ValuesPane from './panes/ValuesPane.vue';
 import {
@@ -107,6 +108,7 @@ onBeforeUnmount(() => {
       <ComposerPane v-if="visited.has('composer')" v-show="state.pane === 'composer'" />
       <RulesPane v-if="visited.has('rules')" v-show="state.pane === 'rules'" />
       <ValuesPane v-if="visited.has('values')" v-show="state.pane === 'values'" />
+      <TestRulesPane v-if="visited.has('test')" v-show="state.pane === 'test'" />
       <StatusPane v-if="visited.has('status')" v-show="state.pane === 'status'" />
     </div>
   </div>

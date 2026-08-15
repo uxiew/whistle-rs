@@ -45,6 +45,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("DELETE", "/api/value") => value_delete(state, req).await,
         ("POST", "/api/replay") => replay_session(state, req).await,
         ("POST", "/api/composer") => compose_request(state, req).await,
+        ("POST", "/api/explain") => explain_rules(state, req).await,
         ("GET", "/api/export") => bundle_export(state),
         ("POST", "/api/import") => bundle_import(state, req).await,
         ("GET", "/api/rule-groups") => rule_groups_get(state),
@@ -1663,6 +1664,41 @@ async fn compose_request(state: &Arc<AppState>, req: Request<Incoming>) -> Respo
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(answer.to_string())))
         .unwrap()
+}
+
+/// **Test Rules**: which rules a request *would* hit, without making one.
+///
+/// whistle's console has the same panel (`gui/test-rules.md`), and this port
+/// has had the same answer on the command line since `explain` — this is that
+/// function, over HTTP, so the console can ask it too.
+///
+/// The body is an [`crate::explain::Query`]: the rules text, a URL, and
+/// whatever else the question needs (method, headers, body, a response head).
+/// The values store is filled in from the proxy's own when the caller sends
+/// none, so a `{name}` in the rules under test means what it means at runtime.
+async fn explain_rules(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let body = match req.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return refused("could not read body"),
+    };
+    let mut query: crate::explain::Query = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return refused(&format!("invalid JSON: {e}")),
+    };
+    if query.values.is_empty() {
+        query.values = state.values.read().unwrap().clone();
+    }
+    match crate::explain::explain(&query) {
+        Ok(answer) => {
+            let json = serde_json::to_string(&answer).unwrap_or_else(|_| "{}".into());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(body::full(Bytes::from(json)))
+                .unwrap()
+        }
+        Err(e) => refused(&e),
+    }
 }
 
 /// A `400` the console can read: everything it posts, it reads back as JSON.

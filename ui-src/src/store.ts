@@ -11,6 +11,8 @@ import { computed, reactive, watch } from 'vue';
 import { api } from './api';
 import type {
   Composition,
+  ExplainQuery,
+  Explanation,
   ProxyStatus,
   ReplayedSession,
   RuleGroup,
@@ -22,7 +24,7 @@ import type {
 import { COLUMNS } from './columns';
 import { clientOf, fmtBytes } from './format';
 
-export type Pane = 'requests' | 'composer' | 'rules' | 'values' | 'status';
+export type Pane = 'requests' | 'composer' | 'rules' | 'values' | 'test' | 'status';
 export type DetailTab =
   | 'general'
   | 'rules'
@@ -48,6 +50,7 @@ export const DETAIL_TABS: { key: DetailTab; label: string }[] = [
 
 const THEME_KEY = 'whistle-rs-theme';
 const COMPOSE_KEY = 'whistle-rs-composer';
+const TEST_KEY = 'whistle-rs-test-rules';
 const COMPOSE_HISTORY_KEY = 'whistle-rs-composer-history';
 
 /** How many sent compositions the source list keeps. Upstream keeps 100. */
@@ -104,6 +107,27 @@ interface State {
   composeHistory: Composition[];
 
   status: ProxyStatus | null;
+
+  /** Test Rules: the question, and the last answer. */
+  test: TestQuery;
+  testResult: Explanation | null;
+  testStatus: string;
+}
+
+/** What the Test Rules pane holds between visits. */
+export interface TestQuery {
+  rules: string;
+  url: string;
+  method: string;
+  headers: string;
+  body: string;
+  /** Empty for "ask about the request phase only". */
+  status: string;
+}
+
+/** What Test Rules opens on. */
+function blankTest(): TestQuery {
+  return { rules: '', url: '', method: 'GET', headers: '', body: '', status: '' };
 }
 
 /** What the Composer opens on, and what "New request" goes back to. */
@@ -170,6 +194,9 @@ export const state = reactive<State>({
   // by the proxy you are reconfiguring, so the page is reloaded far more often
   // here than in an application you would merely be using.
   compose: readStored(COMPOSE_KEY, blankComposition()),
+  test: readStored(TEST_KEY, blankTest()),
+  testResult: null,
+  testStatus: '',
   composeStatus: '',
   composeHistory: readStored<Composition[]>(COMPOSE_HISTORY_KEY, []),
 
@@ -177,6 +204,7 @@ export const state = reactive<State>({
 });
 
 watch(() => state.compose, (c) => writeStored(COMPOSE_KEY, c), { deep: true });
+watch(() => state.test, (t) => writeStored(TEST_KEY, t), { deep: true });
 
 // ── derived ────────────────────────────────────────────────────────────────
 
@@ -433,6 +461,56 @@ export function toggleSort(key: string): void {
     state.sort.key === key
       ? { key, dir: state.sort.dir === 'asc' ? 'desc' : 'asc' }
       : { key, dir: key === 'id' || key === 'time_ms' ? 'desc' : 'asc' };
+}
+
+/**
+ * Ask the proxy which rules a request would hit — whistle's **Test Rules**.
+ *
+ * The rules under test are whatever is in the editor, not what the proxy is
+ * running: that is the point of the panel. Everything else is optional, and the
+ * status field turns the question into one about the *response* phase, where a
+ * `resHeaders://` guarded by `includeFilter://s:404` finally has an answer.
+ */
+export async function runTest(): Promise<void> {
+  const t = state.test;
+  if (!t.url.trim()) {
+    state.testStatus = 'a URL to test against';
+    return;
+  }
+  const headers: Record<string, string> = {};
+  for (const line of t.headers.split('\n')) {
+    const at = line.indexOf(':');
+    if (at > 0) headers[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+  }
+  const status = parseInt(t.status, 10);
+  const query: ExplainQuery = {
+    rules: t.rules,
+    url: t.url.trim(),
+    method: t.method.trim() || 'GET',
+    headers,
+    body: t.body || undefined,
+    response: status > 0 ? { status, headers: {} } : undefined,
+  };
+  state.testStatus = 'testing…';
+  const answer = await reach(() => api.explain(query));
+  if (!answer) {
+    state.testStatus = 'the proxy did not answer';
+    return;
+  }
+  if (answer.error) {
+    state.testResult = null;
+    state.testStatus = answer.error;
+    return;
+  }
+  state.testResult = answer;
+  const n = answer.ops.length;
+  state.testStatus = n ? `${n} operator${n === 1 ? '' : 's'}` : 'no rule matched';
+}
+
+/** Fill the editor with the rules the proxy is running. */
+export async function testCurrentRules(): Promise<void> {
+  const text = await reach(() => api.rules());
+  if (typeof text === 'string') state.test.rules = text;
 }
 
 export async function loadFrames(id: number): Promise<void> {

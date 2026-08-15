@@ -54,7 +54,11 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   list, a sortable request table, and the selected request's headers and bodies in a
   detail panel below it. Arrow keys walk the capture, `Copy as cURL` reproduces a
   request as the origin saw it, and a JSON body can be re-indented in place. A Status
-  pane reports ports, TLS posture, the root CA path and the registered plugins.
+  pane reports ports, TLS posture, the root CA path and the registered plugins. A
+  **Test Rules** pane answers the question a rules file poses most often — which
+  operators a request *would* hit — without sending anything, the same answer
+  `whistle-rs explain` gives on the command line and whistle's own Test Rules
+  dialog gives there.
 - **Rules editor with syntax highlighting** — CodeMirror 6 with a whistle-specific mode
   that marks *which token the proxy will match on*, which is the one thing a rules
   file gets wrong silently. The mode runs the parser's own line split, and a test

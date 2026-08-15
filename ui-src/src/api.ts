@@ -180,6 +180,39 @@ export interface ProxyStatus {
   plugins: PluginInfo[];
 }
 
+/** A question for Test Rules. */
+export interface ExplainQuery {
+  rules: string;
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  /** The response head, when the question is about the response phase. */
+  response?: { status: number; headers?: Record<string, string> };
+}
+
+/** One operator a rules text produced for a request. */
+export interface ExplainOp {
+  protocol: string;
+  value: string;
+  raw: string;
+  pattern: string;
+  /** True when the value *is* content rather than a location. */
+  content: boolean;
+  /** True when this operator won the shared destination slot. */
+  slot: boolean;
+  order: number;
+}
+
+/** What Test Rules answers with. */
+export interface Explanation {
+  /** The URL as the proxy normalised it — what every pattern was matched on. */
+  url: string;
+  ops: ExplainOp[];
+  /** Set when the question could not be read at all. */
+  error?: string;
+}
+
 /** What the write endpoints answer with. */
 export interface OkResult {
   ok: boolean;
@@ -306,6 +339,9 @@ export const api = {
   // Sent through the proxy's own port, exactly as a replay is, so the rules
   // apply to it and it is captured — see `send_through_self` in `webui.rs`.
   compose: (c: Composition) => postJson<ComposeResult>('/api/composer', c),
+
+  /** Test Rules: which operators a request *would* hit, without making one. */
+  explain: (q: ExplainQuery) => postJson<Explanation>('/api/explain', q),
 
   rules: async () => (await fetch('/api/rules')).text(),
   saveRules: (text: string) => postText<{ ok: boolean; rules: number }>('/api/rules', text),
