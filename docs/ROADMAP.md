@@ -188,7 +188,46 @@
 
 ---
 
-## 已完成（本轮：把问题交叉相乘，以及问「这条用例到底证明了什么」）
+## 已完成（本轮：一页一页读官网文档，逐条拿去两边实跑）
+
+这一轮的方法是笨办法：把 wproxy.org 的每一页读完，把页面上的**每一句主张**写成差分用例
+或 oracle 问题，两边跑，不一致就查源码。找出来的东西比通读源码多得多：
+
+- **`parseProps` 的转义**（`delete://`/`enable://`/`disable://`）—— 上游是一条正则
+  一次扫完（`common.js:73,:111-127`）：`\|`、`\&` 是字面量，`\s\t\n\r\f\v` 变成它们
+  命名的那个字符。本移植只按 `|`/`&` 切，于是 `delete.md` 自己印的例子（键里带换行和
+  竖线）一个都删不掉。
+- **`auto2http`** —— https 源站腿握不上手时改用明文重发。`host.md` 讲的
+  `www.example.com 127.0.0.1:5173` 能用，靠的就是它；不做它，最常写的那条规则在这里 502。
+  条件与 `checkAuto2Http` 一致。文档里原本把它列在「不实现」，那条理由描述的是
+  `wss://` 的一个角落，而它其实是普通请求路径。
+- **`reqScript` 的上下文**：`body` 一直是空字符串（没人在脚本跑之前缓冲请求体）、
+  `render`/`tpl` 是恒等函数（上游是 `<% %>` 微模板）、`getValue` 永远 `undefined`、
+  `isLocalAddress` 根本不存在（脚本一调就抛，整段作废）。四个都补上了。
+- **取值的第一条路是 JSON5，不是 JSON** —— `parseRawJson` 就是 `json5.parse`
+  （`common.js:1673`），而它是每一条「值→对象」的路径最先试的那个：`_parseJSON`、
+  `isJson`（决定一个值是内容还是路径）、鉴权、以及**请求/响应体**的两处合并。
+  于是 `reqCookies.md` 印的 `{ key1: 'value1' }` 在这里被读成一行文本，设出一个
+  叫 `{` 的 cookie。
+- **Content-Type 表**是 `mime@1.6.0` 的，不是猜的：`.ts` 是 `video/mp2t`、`.rs` 是
+  `application/rls-services+xml`、`.docx` 带 charset（因为 `isText` 在
+  `openxmlformats` 里搜到了 `xml`）。原本 40 条的手写表之外的扩展名全都回落成
+  `text/html`。
+- **规则头不再流到源站**：`x-whistle-rule-value` 等四个头上游**无条件删除**
+  （读不读它们才受 `enableRequestHeaderRules` 控制），本移植原样转发 —— 客户端写的规则
+  文本能一路送到源站，链路上游的 whistle 还会照做。另外三个连接标记
+  （`client-port`/`alpn-protocol`/`client-id`）同理。
+- **Body 也能是帧**：SSE 与 `x-whistle-custom-frame-separator`（上游
+  `data.js:67-135`）。抓包界面原本只把这种响应显示成一段预览，而对一条不会结束的流来说
+  那等于什么都没有。
+- **命令行**：`-R`/`-F`（抓包条数与帧数，含上游那两道下限）、`-P/--uiport`（控制台单独
+  端口）、`-n`/`-w`/`-N`/`-W`（控制台登录与只读账号）。
+- **标志**：`enable://hide`（连同 `show` 那三个对手）、`enable://websocket`（把不叫
+  `websocket` 的 Upgrade 当 WebSocket 读）、`enable://keepClientId`。
+- 还有两处只值一句话的：`pattern.md` 说 `^` 模式仍有 `/` 边界（没有，`$` 才是），
+  `disable://timeout` 这个名字在 whistle 2.10.8 的源码里根本不存在。
+
+## 已完成（上一轮：把问题交叉相乘，以及问「这条用例到底证明了什么」）
 
 上一节那台 oracle 便宜到可以随便问，于是这一轮不再只问「别人想到的问题」：
 
