@@ -119,6 +119,35 @@ fn take_https_marker(headers: &mut hyper::HeaderMap) -> bool {
 /// a stable one is what lets a client exercise the condition deliberately.
 pub const COMPOSER_REQ_HEADER: &str = "x-whistle-composer";
 
+/// The headers whistle reads rules out of, and removes either way.
+///
+/// `x-whistle-rule-value` carries a rules text, `x-whistle-rule-host` a line
+/// appended to it, `x-whistle-rule-key` the name of a values entry to prepend,
+/// and `x-whistle-key-value` a JSON object of values for them
+/// (`_original/lib/rules/index.js:25-29,:586-591`).
+///
+/// **`x-whistle-rule-name` is deliberately not here.** It is read only in
+/// `multiEnv` mode, and `getValue` — which is what deletes a header — is never
+/// called for it otherwise, so upstream forwards that one to the origin.
+/// Measured against whistle 2.10.8, which strips the four and passes the fifth.
+pub const HEADER_RULE_HEADERS: [&str; 4] = [
+    "x-whistle-rule-value",
+    "x-whistle-rule-host",
+    "x-whistle-rule-key",
+    "x-whistle-key-value",
+];
+
+/// Remove [`HEADER_RULE_HEADERS`] from a request on its way in.
+///
+/// The values are dropped rather than used: reading them is what upstream gates
+/// behind `enableRequestHeaderRules`, and this port has no such mode — so the
+/// headers do nothing here, and now they do nothing *at the origin* too.
+fn take_header_rules(headers: &mut hyper::HeaderMap) {
+    for name in HEADER_RULE_HEADERS {
+        headers.remove(name);
+    }
+}
+
 /// Strip the composer marker, reporting whether it was present.
 fn take_composer_marker(headers: &mut hyper::HeaderMap) -> bool {
     match headers.remove(COMPOSER_REQ_HEADER) {
@@ -3749,6 +3778,13 @@ async fn serve(
     // Consumed here too, and for the same reason: it is this proxy's own marker,
     // not the client's, so nothing downstream may see it.
     let from_composer = take_composer_marker(req.headers_mut());
+    // The rules-carrying headers, which whistle removes from **every** request
+    // whether or not it reads them (`getValue`,
+    // `_original/lib/rules/index.js:558-572`: the `delete` is unconditional and
+    // only the *reading* is gated on `enableRequestHeaderRules`/`multiEnv`).
+    // Leaving them on meant a rules text written by a client reached the origin
+    // — and would be honoured by any whistle further up the chain.
+    take_header_rules(req.headers_mut());
 
     // A request that asks to change protocol is matched as a `ws://` one, and
     // that has to be known *before* the rules resolve. whistle stamps
@@ -6353,6 +6389,33 @@ mod local_response_tests {
 #[cfg(test)]
 mod req_origin_tests {
     use super::*;
+
+    /// The rules-carrying headers never reach the origin.
+    ///
+    /// whistle deletes them whether or not it is configured to read them
+    /// (`getValue`, `_original/lib/rules/index.js:558-572`), and this port had
+    /// been forwarding them — so a client could hand the origin a rules text,
+    /// and an upstream whistle would have obeyed it. `x-whistle-rule-name` is
+    /// the one that travels on, because upstream only ever looks at it in
+    /// `multiEnv` mode and therefore never deletes it. Measured on both.
+    #[test]
+    fn the_rules_headers_are_consumed() {
+        let mut h = hyper::HeaderMap::new();
+        for name in HEADER_RULE_HEADERS {
+            h.insert(
+                hyper::header::HeaderName::from_static(name),
+                "a.com file://(x)".parse().unwrap(),
+            );
+        }
+        h.insert("x-whistle-rule-name", "n".parse().unwrap());
+        h.insert("x-other", "kept".parse().unwrap());
+        take_header_rules(&mut h);
+        for name in HEADER_RULE_HEADERS {
+            assert!(h.get(name).is_none(), "{name} must not survive");
+        }
+        assert_eq!(h.get("x-whistle-rule-name").unwrap(), "n");
+        assert_eq!(h.get("x-other").unwrap(), "kept");
+    }
 
     /// The composer marker is consumed exactly like the internal one: the rules'
     /// header conditions, the plugins, the capture and the origin must never see

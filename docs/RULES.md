@@ -2023,6 +2023,21 @@ connection — see
 A flag this port does not recognise is **inert** — it parses and does nothing,
 rather than failing the rule.
 
+#### Rules in a request header
+
+whistle reads a rules text out of `x-whistle-rule-value`, a line to append out
+of `x-whistle-rule-host`, a values-store key out of `x-whistle-rule-key` and a
+JSON object of values out of `x-whistle-key-value`
+(`_original/lib/rules/index.js:25-29,:586-591`). Reading them is off unless it
+was started with `enableRequestHeaderRules` or `-M multiEnv`; **deleting** them
+is not — `getValue`'s `delete req.headers[key]` runs either way (`:558-572`).
+
+This port does not read them, and now does not forward them either. It used to:
+a client could hand the origin the rules text it had written, and a whistle
+further up the chain would have obeyed it. Measured against whistle 2.10.8,
+which strips those four and forwards `x-whistle-rule-name` — that one is read
+only in `multiEnv`, so `getValue` is never called for it and it survives.
+
 #### `websocket` — an upgrade that does not say `websocket`
 
 Some clients speak WebSocket under a name of their own: `Upgrade: ws`, a vendor
