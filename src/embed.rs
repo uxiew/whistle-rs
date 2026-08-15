@@ -224,6 +224,10 @@ impl Builder {
         let mut config = Config {
             port: self.port.unwrap_or(0),
             host: self.host,
+            ui_username: None,
+            ui_password: None,
+            guest_username: None,
+            guest_password: None,
             ui_port: None,
             socks_port: self.socks_port,
             persist_sessions: self.persist,

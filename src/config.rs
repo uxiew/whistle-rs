@@ -31,6 +31,18 @@ pub struct Config {
     /// Inline rules text loaded at startup (`-r`/`--rules`), whistle's
     /// `config.rules`.
     pub rules: Option<String>,
+    /// Console login — whistle's `-n/--username` and `-w/--password`.
+    ///
+    /// With neither set the console is open, which is upstream's default and
+    /// its own test: `if (!username && !password) return true`
+    /// (`_original/biz/webui/lib/index.js:161-163`).
+    pub ui_username: Option<String>,
+    pub ui_password: Option<String>,
+    /// The read-only account — `-N/--guestName` and `-W/--guestPassword`. It
+    /// may `GET`; anything that writes needs the full login
+    /// (`GET_METHOD_RE`, `biz/webui/lib/index.js:520-525`).
+    pub guest_username: Option<String>,
+    pub guest_password: Option<String>,
     /// Optional separate port for the console — whistle's `-P/--uiport`.
     ///
     /// `None` (or the proxy's own port) means the console is served on the
@@ -96,6 +108,10 @@ impl Default for Config {
             storage_dir: base.join(DATA_DIRNAME),
             intercept_https: true,
             rules: None,
+            ui_username: None,
+            ui_password: None,
+            guest_username: None,
+            guest_password: None,
             ui_port: None,
             socks_port: None,
             plugins: HashMap::new(),

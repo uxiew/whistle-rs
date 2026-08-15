@@ -17,6 +17,11 @@ use super::{AppState, Capture, ReplayBody, Session, WsFrame};
 /// Route a direct (non-proxied) request to the UI / API.
 pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let path = req.uri().path().to_string();
+    // The login, when one is configured. Before the route table, and before the
+    // plugin subtree: a plugin's own pages are part of the console.
+    if let Some(denied) = login_required(state, &req, &path) {
+        return denied;
+    }
     // `/plugin/<name>/…` belongs to a plugin, not to us. Checked before the
     // route table because the tail is arbitrary — it is the plugin's own URL
     // space, and nothing here may reserve a path inside it.
@@ -57,6 +62,144 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => not_found(),
     }
+}
+
+/// Paths that answer before the login does.
+///
+/// A device that cannot reach the root certificate cannot trust the proxy, and
+/// a client that cannot read the PAC file cannot use it — so both stay open,
+/// which is upstream's arrangement too (`/cgi-bin/rootca` is in its
+/// `DONT_CHECK_PATHS`, `_original/biz/webui/lib/index.js:39-40`).
+fn open_without_login(path: &str) -> bool {
+    matches!(path, "/rootCA.crt" | "/rootca.crt" | "/proxy.pac" | "/pac")
+}
+
+/// `None` when the request may proceed; the 401 to send when it may not.
+///
+/// whistle's model, minus its cookie. `-n`/`-w` name the account that may do
+/// anything; `-N`/`-W` name one that may only **read**, which upstream spells
+/// as "the guest login passes, and then the method has to be `GET`"
+/// (`GET_METHOD_RE`, `biz/webui/lib/index.js:520-525`). Credentials come from
+/// `Authorization`, from `Proxy-Authorization` — a browser pointed at a proxy
+/// port may send either — or from an `authorization` query parameter, all three
+/// of which upstream reads (`verifyLogin`, `:171-173`).
+///
+/// **Narrowed on purpose:** upstream also sets a login cookie keyed on the
+/// client's IP so the prompt appears once. Here every request carries its own
+/// credentials, which a browser does by itself after the first prompt, and
+/// nothing has to be stored.
+fn login_required<B>(
+    state: &Arc<AppState>,
+    req: &Request<B>,
+    path: &str,
+) -> Option<Response<DynBody>> {
+    let config = &state.config;
+    let account = (config.ui_username.as_deref(), config.ui_password.as_deref());
+    if account == (None, None) {
+        return None;
+    }
+    if open_without_login(path) {
+        return None;
+    }
+    let offered = offered_credentials(req);
+    let matches = |name: Option<&str>, pass: Option<&str>| match &offered {
+        Some((u, p)) => u.as_str() == name.unwrap_or("") && p.as_str() == pass.unwrap_or(""),
+        None => false,
+    };
+    if matches(account.0, account.1) {
+        return None;
+    }
+    let guest = (
+        config.guest_username.as_deref(),
+        config.guest_password.as_deref(),
+    );
+    if guest != (None, None) && matches(guest.0, guest.1) && req.method() == hyper::Method::GET {
+        return None;
+    }
+    let mut resp = Response::builder()
+        .status(hyper::StatusCode::UNAUTHORIZED)
+        .body(crate::proxy::body::full(bytes::Bytes::from_static(
+            b"Access denied",
+        )))
+        .expect("static response");
+    resp.headers_mut().insert(
+        hyper::header::WWW_AUTHENTICATE,
+        hyper::header::HeaderValue::from_static("Basic realm=User Login"),
+    );
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Some(resp)
+}
+
+/// The username and password this request offers, from whichever of the three
+/// places carries them.
+fn offered_credentials<B>(req: &Request<B>) -> Option<(String, String)> {
+    let from_header = |name: hyper::header::HeaderName| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let from_query = req.uri().query().and_then(|q| {
+        q.split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| *k == "authorization")
+            .map(|(_, v)| percent_decode(v))
+    });
+    let raw = from_header(hyper::header::AUTHORIZATION)
+        .or_else(|| from_header(hyper::header::PROXY_AUTHORIZATION))
+        .or(from_query)?;
+    let encoded = raw.trim().strip_prefix("Basic ").or_else(|| {
+        // Case-insensitive, as every server reads it.
+        raw.trim()
+            .split_once(' ')
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+            .map(|(_, rest)| rest)
+    })?;
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        encoded.trim(),
+    )
+    .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    // The **first** colon splits, so a password may contain one.
+    let (user, pass) = text.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
+}
+
+/// `%xx` decoding for the query-parameter spelling.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Serve `/plugin/<name>/…` from the named plugin's own UI hook.
@@ -2230,6 +2373,127 @@ mod composer_tests {
                 .as_deref(),
             Some("not an HTTP method: G ET")
         );
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn state(users: (Option<&str>, Option<&str>, Option<&str>, Option<&str>)) -> Arc<AppState> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let config = crate::config::Config {
+            storage_dir: std::env::temp_dir().join(format!(
+                "whistle-rs-login-tests-{}-{unique}",
+                std::process::id()
+            )),
+            persist_sessions: false,
+            ui_username: users.0.map(str::to_string),
+            ui_password: users.1.map(str::to_string),
+            guest_username: users.2.map(str::to_string),
+            guest_password: users.3.map(str::to_string),
+            ..crate::config::Config::default()
+        };
+        let ca = crate::ca::CertAuthority::load_or_create(&config).expect("ca");
+        Arc::new(AppState::new(config, crate::rules::RuleManager::new(), ca))
+    }
+
+    fn basic(user: &str, pass: &str) -> String {
+        use base64::Engine;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+        )
+    }
+
+    /// Build a request with an optional `Authorization` header.
+    fn req(method: &str, path: &str, auth: Option<&str>) -> Request<()> {
+        let mut b = Request::builder().method(method).uri(path);
+        if let Some(a) = auth {
+            b = b.header(hyper::header::AUTHORIZATION, a);
+        }
+        b.body(()).expect("request")
+    }
+
+    /// Allowed if `login_required` says nothing.
+    fn allowed(state: &Arc<AppState>, method: &str, path: &str, auth: Option<&str>) -> bool {
+        let r = req(method, path, auth);
+        let p = r.uri().path().to_string();
+        login_required(state, &r, &p).is_none()
+    }
+
+    /// With no account configured the console is open — upstream's own first
+    /// test, `if (!username && !password) return true`
+    /// (`_original/biz/webui/lib/index.js:161-163`).
+    #[test]
+    fn no_account_means_no_login() {
+        let s = state((None, None, None, None));
+        assert!(allowed(&s, "GET", "/", None));
+        assert!(allowed(&s, "POST", "/api/rules", None));
+    }
+
+    /// The full account may do anything; a wrong password may do nothing.
+    #[test]
+    fn the_account_opens_everything_and_a_wrong_one_opens_nothing() {
+        let s = state((Some("admin"), Some("s3cret"), None, None));
+        assert!(!allowed(&s, "GET", "/", None));
+        assert!(!allowed(&s, "GET", "/", Some(&basic("admin", "wrong"))));
+        assert!(!allowed(&s, "GET", "/", Some(&basic("root", "s3cret"))));
+        assert!(allowed(&s, "GET", "/", Some(&basic("admin", "s3cret"))));
+        assert!(allowed(&s, "POST", "/api/rules", Some(&basic("admin", "s3cret"))));
+        // A password may contain a colon: only the first one splits.
+        let s2 = state((Some("admin"), Some("a:b"), None, None));
+        assert!(allowed(&s2, "GET", "/", Some(&basic("admin", "a:b"))));
+    }
+
+    /// The guest may read and may not write — upstream gates it on the method
+    /// being `GET` (`GET_METHOD_RE`, `biz/webui/lib/index.js:520-525`).
+    #[test]
+    fn the_guest_account_may_only_read() {
+        let s = state((Some("admin"), Some("s3cret"), Some("guest"), Some("look")));
+        let guest = basic("guest", "look");
+        assert!(allowed(&s, "GET", "/sessions.json", Some(&guest)));
+        assert!(!allowed(&s, "POST", "/api/rules", Some(&guest)));
+        assert!(!allowed(&s, "DELETE", "/api/value", Some(&guest)));
+        // And a guest that is not configured is nobody.
+        let s2 = state((Some("admin"), Some("s3cret"), None, None));
+        assert!(!allowed(&s2, "GET", "/sessions.json", Some(&guest)));
+    }
+
+    /// The certificate and the PAC file answer before the login does: a device
+    /// that cannot fetch them cannot be configured to use the proxy at all.
+    #[test]
+    fn the_certificate_and_the_pac_stay_open() {
+        let s = state((Some("admin"), Some("s3cret"), None, None));
+        assert!(allowed(&s, "GET", "/rootCA.crt", None));
+        assert!(allowed(&s, "GET", "/proxy.pac", None));
+        assert!(!allowed(&s, "GET", "/sessions.json", None));
+    }
+
+    /// The three places credentials may travel — `Proxy-Authorization` because
+    /// a browser pointed at a proxy port may send that one instead, and the
+    /// query parameter because upstream reads it (`verifyLogin`, `:171-173`).
+    #[test]
+    fn credentials_travel_three_ways() {
+        let s = state((Some("admin"), Some("s3cret"), None, None));
+        let creds = basic("admin", "s3cret");
+        let proxy_auth = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header(hyper::header::PROXY_AUTHORIZATION, &creds)
+            .body(())
+            .expect("request");
+        assert!(login_required(&s, &proxy_auth, "/").is_none());
+        let query = Request::builder()
+            .method("GET")
+            .uri(format!("/sessions.json?authorization={}", creds.replace(' ', "%20")))
+            .body(())
+            .expect("request");
+        assert!(login_required(&s, &query, "/sessions.json").is_none());
+        // A lower-case scheme is still Basic.
+        assert!(allowed(&s, "GET", "/", Some(&creds.replace("Basic", "basic"))));
     }
 }
 

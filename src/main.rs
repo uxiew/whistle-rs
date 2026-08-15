@@ -24,6 +24,25 @@ struct Cli {
     #[arg(short = 'H', long)]
     host: Option<IpAddr>,
 
+    /// Console login name (whistle's `-n/--username`).
+    ///
+    /// With no name and no password the console is open, as it is there.
+    #[arg(short = 'n', long)]
+    username: Option<String>,
+
+    /// Console login password (whistle's `-w/--password`).
+    #[arg(short = 'w', long)]
+    password: Option<String>,
+
+    /// Read-only console account (whistle's `-N/--guestName`): it may look at
+    /// the capture and the rules, and may not change them.
+    #[arg(short = 'N', long)]
+    guest_name: Option<String>,
+
+    /// Password for the read-only account (whistle's `-W/--guestPassword`).
+    #[arg(short = 'W', long)]
+    guest_password: Option<String>,
+
     /// Serve the console on its own port (whistle's `-P/--uiport`).
     ///
     /// Without it the console lives on the proxy port, which is where whistle
@@ -260,6 +279,10 @@ async fn main() -> Result<()> {
         port: cli.port,
         host: cli.host,
         storage_dir,
+        ui_username: cli.username,
+        ui_password: cli.password,
+        guest_username: cli.guest_name,
+        guest_password: cli.guest_password,
         ui_port: cli.ui_port,
         socks_port: cli.socks_port,
         plugins,
