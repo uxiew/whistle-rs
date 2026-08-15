@@ -1131,11 +1131,20 @@ pub async fn resolve_target(
     let request_tls = super::dest::is_tls(&dest.scheme);
     let tls = origin_tls(request_tls, proxy_proto, resolved);
     let cipher = cipher_options(resolved);
-    // A cipher string that names nothing this build has fails the request, as
-    // it fails at context creation in Node. See `parse_cipher_suites`.
+    // A cipher string that names nothing this build has takes the **pin** down,
+    // not the request. See `parse_cipher_suites` for why the two are not the
+    // same fact here that they are in OpenSSL.
     let tls_ciphers = match parse_cipher_suites(&cipher) {
         Ok(policy) => policy,
-        Err(e) => bail!("cipher://: {e}"),
+        Err(e) => {
+            tracing::warn!(
+                "{} {}: cipher://: {e} — the connection is made without the pin, \
+                 so the suite is not the one the rule asked for",
+                info.method,
+                info.full_url
+            );
+            None
+        }
     };
     let disabled = disabled_flags(resolved);
     // `checkAuto2Http` (`_original/lib/util/index.js:3191-3198`): a `host://`
@@ -1315,13 +1324,15 @@ fn parse_cipher_versions(options: &serde_json::Map<String, serde_json::Value>) -
 
 /// Read the `ciphers` half of a `cipher://` value.
 ///
-/// The other half — `minVersion`/`maxVersion` — is [`parse_cipher_versions`].
-/// This one is the OpenSSL cipher string, which [`super::ciphers`] evaluates
-/// over the suites this build has.
+/// The other half — `minVersion`/`maxVersion` — is [`parse_cipher_versions`],
+/// and the two are read independently on purpose: a value whose cipher string
+/// is unusable may still carry a version that is not, and there is no reason for
+/// one to take the other with it.
 ///
-/// `Err` is upstream's own answer to a string that selects nothing: OpenSSL
-/// throws `no cipher match` at context creation, so the request fails rather
-/// than quietly going out under a policy nobody asked for.
+/// `Err` means the string selected no suite. **The caller drops the pin and
+/// makes the connection anyway**, which is a deliberate departure from both
+/// OpenSSL and from what this port used to do — see [`super::ciphers`]'s
+/// "When the answer is nothing".
 fn parse_cipher_suites(
     options: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Option<std::sync::Arc<super::ciphers::CipherPolicy>>, super::ciphers::NoCipherMatch> {
@@ -12087,6 +12098,53 @@ mod tests {
         let info = build_req_info("GET", "https", "example.com", 443, "/", &HeaderMap::new(), None);
         let target = resolved_target(&info, &resolved);
         assert_eq!(target.tls_versions, TlsVersions::Only12);
+    }
+
+    /// **A cipher string that selects nothing takes the pin down, not the
+    /// request.** It used to `bail!`, which meant one unusable value in a rules
+    /// file removed every HTTPS site behind that pattern.
+    ///
+    /// The deciding reason is in [`super::super::ciphers`]: "selects nothing"
+    /// here is a fact about rustls's nine suites, not about the string —
+    /// `cipher://3DES` is a good string everywhere OpenSSL was built with 3DES.
+    /// Failing the request would put a limitation of this build into somebody
+    /// else's traffic, under a message about their rule. `https-bench.js`
+    /// measures the family against real whistle, which applies none of it.
+    #[test]
+    fn an_unusable_cipher_string_drops_the_pin_and_keeps_the_request() {
+        use super::super::upstream::TlsVersions;
+        for spec in [
+            "example.com cipher://NOTACIPHER\n",
+            "example.com tlsOptions://not-a-version\n",
+            "example.com cipher://3DES\n",
+            "example.com cipher://{\"ciphers\":\"!ALL\"}\n",
+        ] {
+            let target = try_target(spec, "https://example.com/")
+                .unwrap_or_else(|e| panic!("{spec:?} must not fail the request: {e:#}"));
+            assert!(
+                target.tls_ciphers.is_none(),
+                "{spec:?} selected nothing, so nothing is pinned"
+            );
+        }
+
+        // The two halves of a `cipher://` value are read independently: an
+        // unusable cipher string does not take a usable version with it.
+        let target = try_target(
+            "example.com cipher://{\"ciphers\":\"NOTACIPHER\",\"maxVersion\":\"TLSv1.2\"}\n",
+            "https://example.com/",
+        )
+        .expect("the version half is still usable");
+        assert!(target.tls_ciphers.is_none());
+        assert_eq!(target.tls_versions, TlsVersions::Only12);
+
+        // And a string that does select something still pins it, or none of the
+        // above would be saying anything.
+        let target = try_target(
+            "example.com cipher://{\"ciphers\":\"ECDHE-RSA-AES128-GCM-SHA256\"}\n",
+            "https://example.com/",
+        )
+        .expect("a usable cipher string");
+        assert!(target.tls_ciphers.is_some(), "a matchable string still pins");
     }
 
     // ── host / proxy precedence (proxyFirst, proxyHost, proxyHostOnly) ──

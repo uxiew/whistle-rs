@@ -156,10 +156,23 @@ cargo run -- --port 19601 --no-persist --insecure-upstream --dir /tmp/rs-tls &
 PORT_BASE=19600 node https-bench.js
 ```
 
-Its origin also echoes the **TLS version it negotiated with the proxy**, which is
-the only place `cipher://` / `tlsOptions://` is observable at all: a version pin
-changes nothing the client can see. Without it, a case that pins a version and a
-case that pins nothing compare equal.
+Its origin also echoes the **TLS version and the cipher suite it negotiated with
+the proxy**, which is the only place `cipher://` / `tlsOptions://` is observable
+at all: nothing about a pin reaches the client. Without the version, a case that
+pins a version and a case that pins nothing compare equal — and the suite was
+missing for just as long, so a rule naming one suite and a rule naming another
+negotiated the same version and compared equal too. Every `ciphers` case here was
+inert until the origin started reporting `getCipher().name`.
+
+Three cases at the end are **one-sided**, and have to be. `cipher://` turns out to
+do nothing at all in whistle 2.10.8 — it builds the options and then merges them
+into the socket only while *retrying a ciphers error*, so the first, successful
+handshake never sees them — which means a two-proxy comparison can only ever say
+"whistle-rs pinned something and whistle did not". Those three ask the question
+that matters instead: name a suite, and read back what the origin actually
+negotiated. Four more ask that a string selecting **nothing** leaves the
+connection unpinned and alive rather than failing it, which is what it used to
+do; see `src/proxy/ciphers.rs` for why that changed.
 
 **It turns whistle's `Enable HTTPS` switch on before it starts, and that is not a
 convenience.** whistle does not decrypt HTTPS in a fresh data directory; with the

@@ -49,6 +49,12 @@ function startOrigin() {
           r.end(JSON.stringify({
             method: q.method, url: q.url, headers: q.headers, body,
             tls: q.socket.getProtocol(),
+            // And the **suite**, without which the `ciphers` half of
+            // `cipher://` is not observable at all: a version pin shows in
+            // `tls`, but a rule that names one suite and a rule that names
+            // another negotiate the same version and compared equal. Every
+            // `ciphers` case here was inert until this line existed.
+            suite: q.socket.getCipher && q.socket.getCipher().name,
           }));
         });
       },
@@ -249,10 +255,21 @@ const norm = (h) => Object.fromEntries(
  *    dot, so it is not read as a cipher string, and it is not JSON either.
  *    whistle-rs applies the pin on the first attempt, which is what the rule
  *    says it does. Declared in `docs/RULES.md`.
+ * 3. The **suite** half is inert upstream for the same reason, and it only
+ *    became visible when the origin started echoing `getCipher().name` — before
+ *    that, a rule naming one suite and a rule naming another negotiated the same
+ *    version and compared equal, so every `ciphers` case here was proving
+ *    nothing. Measured across the family: whistle stays on the origin's default
+ *    `TLS_AES_256_GCM_SHA384` whatever the rule says, and whistle-rs negotiates
+ *    the suite that was asked for.
+ *
+ *    Narrow on purpose — it excuses a difference only where whistle sat on the
+ *    default. Two proxies that both pin, and pin differently, is news.
  */
 const EXPECTED = (p) =>
   /req\.header\.(pragma|cache-control): whistle=undefined rs="no-cache"/.test(p)
-  || /req\.tls: whistle="TLSv1\.3" rs="TLSv1\.2"/.test(p);
+  || /req\.tls: whistle="TLSv1\.3" rs="TLSv1\.2"/.test(p)
+  || /req\.suite: whistle="TLS_AES_256_GCM_SHA384" rs="[\w-]+"/.test(p);
 
 const show = (v) => JSON.stringify(v);
 
@@ -269,6 +286,7 @@ function compare(w, rs) {
     if (wb.url !== rb.url) out.push(`req.url: whistle=${wb.url} rs=${rb.url}`);
     if (wb.body !== rb.body) out.push(`req.body: whistle=${show(wb.body)} rs=${show(rb.body)}`);
     if (wb.tls !== rb.tls) out.push(`req.tls: whistle=${show(wb.tls)} rs=${show(rb.tls)}`);
+    if (wb.suite !== rb.suite) out.push(`req.suite: whistle=${show(wb.suite)} rs=${show(rb.suite)}`);
     const [whh, rhh] = [norm(wb.headers), norm(rb.headers)];
     for (const k of new Set([...Object.keys(whh), ...Object.keys(rhh)])) {
       if (show(whh[k]) !== show(rhh[k])) out.push(`req.header.${k}: whistle=${show(whh[k])} rs=${show(rhh[k])}`);
@@ -369,7 +387,26 @@ async function main() {
     { name: 'tlsOptions query form, two keys', rules: `${O} tlsOptions://minVersion=TLSv1.3&maxVersion=TLSv1.3` },
     { name: 'two tlsOptions lines merge', rules: `${O} tlsOptions://maxVersion=TLSv1.2\n${O} tlsOptions://ciphers=ECDHE-RSA-AES128-GCM-SHA256` },
     { name: 'a bare cipher string on its own line', rules: `${O} tlsOptions://ECDHE-RSA-AES128-GCM-SHA256` },
+    // Two suites, asked for one at a time. This is the pair that says the
+    // `ciphers` half does anything at all: same version, different suite, and
+    // before the origin echoed `suite` they were the same case twice.
+    { name: 'a cipher list picks the suite it names', rules: `${O} tlsOptions://{"ciphers":"ECDHE-RSA-AES128-GCM-SHA256","maxVersion":"TLSv1.2"}` },
+    { name: 'and a different one names a different suite', rules: `${O} tlsOptions://{"ciphers":"ECDHE-RSA-AES256-GCM-SHA384","maxVersion":"TLSv1.2"}` },
+    // ── a value that selects no suite ──────────────────────────────────
+    //
+    // These used to **502** here while whistle answered: the pin failing took
+    // the request with it. It takes only the pin now — see the note in
+    // `src/proxy/ciphers.rs`, which is where the reasoning lives. `3DES` is the
+    // case that decides it: a perfectly good OpenSSL string that this build
+    // cannot honour because rustls has no 3DES, so failing the request would be
+    // putting a limitation of the build into somebody's traffic.
     { name: 'tlsOptions with nonsense in it', rules: `${O} tlsOptions://not-a-version` },
+    { name: 'a cipher string this build cannot honour', rules: `${O} tlsOptions://{"ciphers":"3DES"}` },
+    { name: 'a cipher string that selects nothing', rules: `${O} tlsOptions://{"ciphers":"NOTACIPHER"}` },
+    { name: 'a cipher string that excludes everything', rules: `${O} tlsOptions://{"ciphers":"!ALL"}` },
+    // The two halves are read independently, so an unusable cipher string does
+    // not take a usable version with it. Upstream applies neither.
+    { name: 'an unusable cipher string beside a usable version', rules: `${O} tlsOptions://{"ciphers":"NOTACIPHER","maxVersion":"TLSv1.2"}` },
     // `sniCallback://` asks a *plugin* which certificate to present, or whether
     // to intercept at all (`_original/lib/https/load-cert.js:8-17`). Naming a
     // plugin that is not installed leaves the connection exactly as it was.
@@ -509,6 +546,49 @@ async function main() {
     }
   }
   plain.close();
+
+  // ── which suite a pin actually produces ────────────────────────────────
+  //
+  // **One-sided, and it has to be.** Everything above compares two proxies, and
+  // upstream applies none of this — so a `ciphers` case can only ever report
+  // "whistle-rs pinned something and whistle did not", which is excused and
+  // says nothing about whether the suite was the *right* one. These ask that
+  // directly: name a suite, read back what the origin negotiated.
+  //
+  // It is the only claim in this file that would survive whistle disappearing,
+  // and it is the one the `ciphers` evaluator is actually for.
+  for (const suite of ['ECDHE-RSA-AES128-GCM-SHA256', 'ECDHE-RSA-AES256-GCM-SHA384',
+    'ECDHE-RSA-CHACHA20-POLY1305']) {
+    await setRules(`${O} tlsOptions://{"ciphers":"${suite}","maxVersion":"TLSv1.2"}`);
+    const got = await throughTunnel(RS, rsCa);
+    ran++;
+    let negotiated;
+    try { negotiated = JSON.parse(got.body).suite; } catch (e) { negotiated = got.note || 'unparseable'; }
+    if (negotiated !== suite) {
+      differing++;
+      report.push({
+        name: `whistle-rs negotiates the suite it was told to`,
+        rules: `${O} tlsOptions://{"ciphers":"${suite}",…}`,
+        problems: [`suite: asked for ${suite}, got ${negotiated}`],
+      });
+    }
+  }
+  // And the other half of the claim: a string that selects nothing leaves the
+  // connection **unpinned and alive**, rather than failing it. This is the case
+  // that used to 502.
+  for (const spec of ['NOTACIPHER', '3DES', '!ALL', 'not-a-version']) {
+    await setRules(`${O} tlsOptions://{"ciphers":"${spec}"}`);
+    const got = await throughTunnel(RS, rsCa);
+    ran++;
+    if (got.status !== 200) {
+      differing++;
+      report.push({
+        name: 'a cipher string that selects nothing keeps the request',
+        rules: `${O} tlsOptions://{"ciphers":"${spec}"}`,
+        problems: [`status: ${got.status} ${got.note || ''} — the pin should fall, not the request`],
+      });
+    }
+  }
 
   origin.close();
   console.log(JSON.stringify({ ran, differing, report }, null, 2));

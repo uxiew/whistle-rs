@@ -34,11 +34,44 @@
 //! # When the answer is nothing
 //!
 //! A string that selects no suite at all is an error in OpenSSL — it throws at
-//! context creation, before any connection (`no cipher match`, measured). It is
-//! an error here too, and the message names the tokens that came up empty. This
-//! is the one place the smaller universe shows: `ciphers: "3DES"` works against
-//! an OpenSSL that has 3DES and fails here, because this build does not have it,
-//! and no evaluation can conjure an algorithm that is not compiled in.
+//! context creation, before any connection. Measured, on Node 26 / OpenSSL 3.6:
+//! `not-a-version`, `NOTREAL`, `!ALL`, `-ALL` and `ZZZ:YYY` all throw
+//! `ERR_SSL_NO_CIPHER_MATCH`, while `TLS_AES_128_GCM_SHA256` and `aNULL` do not.
+//!
+//! [`evaluate`] returns that answer, and it names the tokens that came up empty.
+//! **What the caller does with it is not what OpenSSL does**: the pin is
+//! dropped, the connection is made without it, and the reason is logged. This
+//! port used to fail the request instead. Three things changed the answer, and
+//! the first is the one that decides it:
+//!
+//! * **"no match" here is not the same fact as "no match" there.** OpenSSL fails
+//!   when a string selects nothing out of its own large universe; this fails when
+//!   it selects nothing out of rustls's nine suites. `ciphers: "3DES"` is a
+//!   perfectly good string that works against an OpenSSL built with 3DES — and
+//!   no evaluation can conjure an algorithm that is not compiled in. Failing the
+//!   request would import a limitation of *this build* into somebody's traffic,
+//!   under a message about their rule.
+//! * **`cipher://` does nothing at all in whistle 2.10.8** — measured across
+//!   every spelling, bare token and JSON alike: the connection stays at TLS 1.3
+//!   with the default suite. It builds the options and then only ever merges
+//!   them into the socket options *while retrying a ciphers error*
+//!   (`_original/lib/inspectors/res.js:495-497`,
+//!   `lib/util/common.js:1769-1771`), so the first, successful handshake never
+//!   sees them. There is therefore no upstream behaviour to be faithful to here,
+//!   only the question of what a proxy that *does* implement it should do — and
+//!   where this port does more than upstream, doing more must not mean breaking
+//!   what upstream serves.
+//! * **This port already has an answer for an unusable rule value, and it is not
+//!   this one.** `statusCode://abc`, `replaceStatus://1`, `method://GET;` — every
+//!   one of them leaves the operator inert, and each has a differential case
+//!   saying so. One operator that takes the request down instead is a surprise,
+//!   not a safeguard.
+//!
+//! The argument for failing was that a pin nobody noticed had failed is worse
+//! than an outage. It does not survive: a 502 does not say the pin failed
+//! either — it says the site is down, and the log line is what actually tells
+//! you, in both designs. So the log line does the work and the request lives.
+//! `https-bench.js` measures the whole family.
 
 use rustls::SupportedCipherSuite;
 use rustls::crypto::ring::cipher_suite as ring;

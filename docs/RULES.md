@@ -3269,19 +3269,36 @@ OpenSSL 3.6**, not inferred:
   pins it; the alias `CHACHA20` does not, even though it describes a TLS 1.3
   suite too.
 
-A string that selects **nothing at all** fails the request with a message naming
-the tokens that came up empty. That is OpenSSL's own behaviour — it throws `no
-cipher match` at context creation, before any connection — and it is the honest
-answer for the one case evaluation cannot rescue: this build does not have the
-algorithm.
+A string that selects **nothing at all** drops the **pin** and leaves the request
+alone: the connection is made without it and the log says so, naming the tokens
+that came up empty. It does *not* fail the request, and the reason is that "no
+match" here is not the same fact it is in OpenSSL. OpenSSL throws `no cipher
+match` when a string selects nothing out of its own large universe; this selects
+nothing out of nine suites, so `cipher://3DES` — a perfectly good string against
+an OpenSSL built with 3DES — would fail here for a reason that is about *this
+build* rather than about the rule. Failing the request would put that limitation
+into somebody else's traffic, under a message about their rules file.
+
+Two more things settle it. `cipher://` is **inert in whistle 2.10.8** — measured
+across every spelling, so there is no upstream behaviour to be faithful to, only
+the question of what a proxy that does implement it should do; and this port
+already answers that question everywhere else, since `statusCode://abc`,
+`replaceStatus://1` and `method://GET;` all leave the operator inert rather than
+failing anything.
+
+The two halves of the value are read independently, so an unusable cipher string
+does not take a usable `maxVersion` with it.
 
 ```
 # evaluated; the origin really negotiates from this set
 example.com cipher://{"ciphers":"ECDHE+AESGCM:!AES128"}
 # TLS 1.3 pinned by name; the TLS 1.2 list is emptied, as OpenSSL empties it
 example.com cipher://{"ciphers":"TLS_AES_128_GCM_SHA256"}
-# 502: `no cipher match: 3DES names no cipher suite this build has`
+# connects, unpinned, and logs `no cipher match: 3DES names no cipher suite
+# this build has` — rustls has no 3DES and cannot be argued into one
 example.com cipher://{"ciphers":"3DES"}
+# the ciphers half is dropped; the version half still holds
+example.com cipher://{"ciphers":"3DES","maxVersion":"TLSv1.2"}
 ```
 
 The nine suites are the three TLS 1.3 ones (AES-GCM ×2, ChaCha20-Poly1305) and
