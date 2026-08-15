@@ -2770,6 +2770,15 @@ structure itself.
 > `{"0":…,"name":"x"}` there and `{"name":"x","0":…}` here. Reordering a user's
 > JSON to imitate a language's property order is worse than the difference.
 
+### A `^` pattern has no path boundary
+
+`pattern.md`'s wildcard section prints `^wss://*.example.com/path/to` as a miss
+for `wss://a.example.com/path/toxxx`, "路径缺少 `/` 边界". It matches. A `^`
+pattern is compiled to a prefix regexp with no `/` boundary anywhere in it —
+the boundary belongs to the plain URL-fragment form — and the way to forbid the
+tail is the trailing `$` the same section documents. Measured on whistle 2.10.8
+and matched here; `cases-patterns.js` carries both halves.
+
 ### Escapes in a prop list
 
 `delete://`, `enable://` and `disable://` split their value on `|` and `&`

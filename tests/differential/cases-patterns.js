@@ -264,6 +264,14 @@ module.exports = [
   p('a caret with ** in the path', '^http://a.example.test/**', 'http://a.example.test/a/b'),
   p('a caret with * in the path stops at a slash', '^http://a.example.test/*', 'http://a.example.test/a/b'),
   p('a caret with *** crosses the query', '^http://a.example.test/***', 'http://a.example.test/a?b=c'),
+  // `pattern.md` says a `^` pattern keeps the URL-fragment form's `/`
+  // boundary — its own example calls `^wss://*.example.com/path/to` a miss for
+  // `…/path/toxxx`. It is not: a `^` pattern is a prefix regexp and matches
+  // there, in whistle 2.10.8 and here. `docs/RULES.md` records it.
+  p('a caret path prefix needs no slash boundary', '^http://a.example.test/ec'),
+  p('a caret path prefix with the end anchored', '^http://a.example.test/ec$'),
+  p('a caret with a query ** crosses the amp', '^http://a.example.test/echo?q=a**b', 'http://a.example.test/echo?q=a&r=b'),
+  p('a caret with a query * does not', '^http://a.example.test/echo?q=a*b', 'http://a.example.test/echo?q=a&r=b'),
   p('a caret with a query star', '^http://a.example.test/echo?q=*', 'http://a.example.test/echo?q=1&r=2'),
   p('a caret with a query star that misses', '^http://a.example.test/echo?q=*b', 'http://a.example.test/echo?q=1&r=2'),
   p('*/path is a host wildcard', '*/echo'),
