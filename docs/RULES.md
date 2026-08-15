@@ -1978,7 +1978,7 @@ example.com/old    locationHref://replace:/new
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `pauseSend`/`pauseReceive` (hold one direction until the console releases it), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection) |
+| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `pauseSend`/`pauseReceive` (hold one direction until the console releases it), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection), `hide`/`show` (keep a request out of the capture, or put it back — see below) |
 | `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Add HTTP response trailer headers (forces chunked) — see below |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
@@ -2022,6 +2022,22 @@ connection — see
 
 A flag this port does not recognise is **inert** — it parses and does nothing,
 rather than failing the rule.
+
+#### `hide` — a request the console never hears about
+
+`enable://hide` lets a request happen and keeps it out of the capture. Four
+flags decide, not one (`checkHideProp`,
+`_original/lib/util/index.js:3982-3987`): `enable://hide` and `disable://show`
+hide; `enable://show` and `disable://hide` un-hide, and the un-hiding half
+wins. The pair exists because the two halves usually come from different lines —
+a broad `enable://hide` over a whole domain, and an `enable://show` on the one
+request being looked at.
+
+A hidden request is not shown, not stored and not replayable, here as there —
+upstream gates its data server on the same question (`inspectors/data.js:59`).
+Its Composer-only pair (`enable://hideComposer`) and its server-wide capture
+switch are not implemented: a session here does not record whether the Composer
+sent it.
 
 #### `auto2http` — an https leg that falls back to cleartext
 

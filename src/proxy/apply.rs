@@ -1347,7 +1347,7 @@ fn flag_set(resolved: &Resolved, protocol: &str) -> std::collections::HashSet<St
 /// `delete://` and the two flag families take this road; `lineProps://` takes
 /// the plain `SEP_RE` split with no escapes at all (`index.js:1898`), which is
 /// a difference `docs/LINE_PROPS.md` already records.
-fn parse_props(value: &str) -> Vec<String> {
+pub(crate) fn parse_props(value: &str) -> Vec<String> {
     let mut out = vec![String::new()];
     let mut chars = value.chars().peekable();
     while let Some(c) = chars.next() {

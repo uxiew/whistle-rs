@@ -247,6 +247,14 @@ impl AppState {
     fn record(&self, mut session: Session) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         session.id = id;
+        // `enable://hide` — the request happens, and the console never hears
+        // about it. Upstream gates its own data server on the same question
+        // (`isHide`, `_original/lib/util/index.js:3990-3996`, read by
+        // `inspectors/data.js:59`), so a hidden request is not shown, not
+        // stored and not replayable there either.
+        if is_hidden(&session) {
+            return id;
+        }
         if let Some(observe) = self.observer.get() {
             observe(&session);
         }
@@ -278,6 +286,36 @@ impl AppState {
         }
         q.push_back(frame);
     }
+}
+
+/// Is this transaction hidden from the capture — `enable://hide`?
+///
+/// Upstream's `checkHideProp` (`_original/lib/util/index.js:3982-3987`) reads
+/// four flags, not one: `enable://hide` and `disable://show` hide, and
+/// `enable://show` and `disable://hide` un-hide, with the un-hiding half
+/// winning. The pair exists because the flags can arrive from different rule
+/// lines — a broad `enable://hide` over a whole domain, and a narrow
+/// `enable://show` on the one request being looked at.
+///
+/// Upstream also has a Composer-only pair (`enable://hideComposer`) and a
+/// server-wide capture switch; neither is here — this port has no
+/// `captureData` mode, and a session does not record whether the Composer sent
+/// it.
+fn is_hidden(session: &Session) -> bool {
+    let flags = |protocol: &str| -> std::collections::HashSet<String> {
+        session
+            .rules
+            .iter()
+            .filter(|op| op.protocol == protocol)
+            .flat_map(|op| crate::proxy::apply::parse_props(&op.value))
+            .map(|f| f.trim().to_string())
+            .collect()
+    };
+    let enabled = flags("enable");
+    let disabled = flags("disable");
+    (enabled.contains("hide") || disabled.contains("show"))
+        && !enabled.contains("show")
+        && !disabled.contains("hide")
 }
 
 /// A callback told about each completed transaction — see [`AppState::observe`].
@@ -1954,6 +1992,58 @@ async fn run_console(state: Arc<AppState>, port: u16) -> Result<()> {
                 tracing::debug!("console connection from {peer} closed: {err}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod hide_tests {
+    use super::*;
+
+    fn session(rules: &[(&str, &str)]) -> Session {
+        let mut s = Session {
+            id: 0,
+            time_ms: 0,
+            method: "GET".into(),
+            url: "http://a.com/".into(),
+            status: 200,
+            client_ip: None,
+            target: String::new(),
+            duration_ms: 0,
+            log: Vec::new(),
+            rules: Vec::new(),
+            req_headers: Vec::new(),
+            res_headers: Vec::new(),
+            req_body: None,
+            res_body: None,
+            timings: None,
+        };
+        s.rules = rules
+            .iter()
+            .map(|(protocol, value)| MatchedOp {
+                protocol: (*protocol).to_string(),
+                value: (*value).to_string(),
+                raw: format!("{protocol}://{value}"),
+            })
+            .collect();
+        s
+    }
+
+    /// `checkHideProp` (`_original/lib/util/index.js:3982-3987`) is four flags:
+    /// two that hide and two that un-hide, with un-hiding winning.
+    #[test]
+    fn hide_and_the_three_flags_that_argue_with_it() {
+        assert!(!is_hidden(&session(&[])));
+        assert!(is_hidden(&session(&[("enable", "hide")])));
+        assert!(is_hidden(&session(&[("disable", "show")])));
+        // Un-hiding wins, from either side.
+        assert!(!is_hidden(&session(&[("enable", "hide"), ("enable", "show")])));
+        assert!(!is_hidden(&session(&[("enable", "hide"), ("disable", "hide")])));
+        assert!(!is_hidden(&session(&[("disable", "show"), ("enable", "show")])));
+        // The value is a prop list, so one line may carry several flags.
+        assert!(is_hidden(&session(&[("enable", "gzip|hide")])));
+        assert!(!is_hidden(&session(&[("enable", "gzip|hide|show")])));
+        // A flag that merely contains the word is not the word.
+        assert!(!is_hidden(&session(&[("enable", "hideComposer")])));
     }
 }
 
