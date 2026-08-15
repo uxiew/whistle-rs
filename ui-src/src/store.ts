@@ -254,7 +254,7 @@ export function tabEnabled(key: DetailTab): boolean {
     case 'res-head': return !!d?.res_headers?.length;
     case 'req-body': return !!d?.req_body?.len;
     case 'res-body': return !!d?.res_body?.len;
-    case 'frames': return s.status === 101;
+    case 'frames': return s.status === 101 || !!s.has_frames;
     default: return true;
   }
 }

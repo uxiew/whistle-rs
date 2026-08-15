@@ -21,15 +21,16 @@ const holds = computed(() => {
     .map(([dir, d]) => ({ dir, held: d.held }));
 });
 
-// What a held connection is holding grows while you watch it, so the tab stops
-// being a snapshot for as long as that is true — and goes back to being one the
-// moment it is released. Nothing polls a conversation that is merely finished.
+// A frame list is not a snapshot: a held connection grows while you watch it,
+// and so does an event stream — a body cut into frames arrives for as long as
+// the server keeps writing, which for SSE is often minutes. So this polls for
+// as long as the tab is open, and stops the moment it is not. The cost is one
+// small request every two seconds while somebody is looking at exactly this.
 let timer: number | undefined;
 watch(
-  () => holds.value.length > 0,
-  (holding) => {
+  () => state.selected,
+  () => {
     clearInterval(timer);
-    if (!holding) return;
     timer = setInterval(() => {
       if (state.selected !== null) void loadFrames(state.selected);
     }, 2000) as unknown as number;

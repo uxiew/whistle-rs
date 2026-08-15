@@ -329,6 +329,14 @@ fn pac(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
 /// Lightweight session list for the polled Network view (no headers/bodies —
 /// those are fetched on demand via [`session_detail_json`]).
 fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
+    // Which sessions have frames to show. Read once and looked up per row: a
+    // body cut into frames (an event stream, or a separator a rule named) is
+    // not a WebSocket, so the status cannot answer this on its own — and the
+    // console hides the Frames tab for a session with nothing in it.
+    let framed: std::collections::HashSet<u64> = {
+        let frames = state.ws_frames.lock().unwrap();
+        frames.iter().map(|f| f.session).collect()
+    };
     let list: Vec<serde_json::Value> = {
         let q = state.sessions.lock().unwrap();
         q.iter()
@@ -360,6 +368,7 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
                     "down": s.res_body.as_ref().map(|c| c.total()).unwrap_or(0),
                     "has_req_body": s.req_body.as_ref().map(|c| c.total() > 0).unwrap_or(false),
                     "has_res_body": s.res_body.as_ref().map(|c| c.total() > 0).unwrap_or(false),
+                    "has_frames": s.status == 101 || framed.contains(&s.id),
                 })
             })
             .collect()

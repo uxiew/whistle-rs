@@ -43,6 +43,12 @@ export interface SessionSummary {
   down: number;
   has_req_body: boolean;
   has_res_body: boolean;
+  /**
+   * Does this session have frames? A WebSocket always does; an ordinary body
+   * does when it was cut into frames — an event stream, or a separator named
+   * by `x-whistle-custom-frame-separator`.
+   */
+  has_frames?: boolean;
 }
 
 /** A captured body preview: `len` is the whole body, `text` only the prefix. */
