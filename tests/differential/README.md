@@ -47,7 +47,7 @@ says which port is which.
 It prints the cases it ran and every difference it could not explain. A clean
 run says `differing: 0` — except for the corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
-`cases-delete.js` at 8, `cases-values.js` at 11, `cases-compose.js` at 9,
+`cases-delete.js` at 8, `cases-values.js` at 13, `cases-compose.js` at 9,
 `cases-docs.js` at 5, `cases-groups.js` at 3, `cases-file.js` at 2 and
 `cases-proxy.js` at 25.
 

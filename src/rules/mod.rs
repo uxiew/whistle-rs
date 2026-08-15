@@ -1760,10 +1760,18 @@ fn remove_comment(line: &str) -> &str {
 /// becomes `proxy://127.0.0.1:8080 www.example.com api.example.com`
 /// (`MULTI_TO_ONE_RE` + `toLine`, `_original/lib/rules/rules.js:21,:369-375`).
 ///
-/// One deviation: upstream's replacement keeps the `` line` `` opener and the
-/// closing backtick in the collapsed text, where they survive as extra pattern
-/// tokens that can never match. We drop them instead — same effective rules,
-/// without the dead entries.
+/// The opener and the closing backtick are dropped: `MULTI_TO_ONE_RE` matches
+/// both of them and `toLine` returns the captured middle alone, so the block
+/// leaves nothing of itself behind. Whitespace *inside* the block collapses the
+/// same way — `toLine` is one `/\s+/g` over the capture, so a line broken over
+/// three spaces and a line broken over one produce the same rule.
+///
+/// A block with no closing backtick is **not** a block: the regexp does not
+/// match, the text is left exactly as written, and the three lines that were
+/// going to be one rule are read as three — a pattern with no operator, an
+/// operator with no pattern, and another pattern with no operator, which
+/// together resolve to nothing. This port used to join them anyway and produce
+/// the rule the user was in the middle of writing.
 ///
 /// Comments are stripped *before* this runs, matching `mergeLines`; the other
 /// order would change what a `#` inside a block does.
@@ -1787,34 +1795,47 @@ fn split_lines(text: &str) -> impl Iterator<Item = &str> {
 
 fn merge_lines(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
-    let mut block: Option<Vec<String>> = None;
+    /// The lines of a block that has not closed yet, and the text they were
+    /// written as — one of the two is kept, and which one is not known until
+    /// the closing backtick arrives or the text runs out.
+    struct Block {
+        parts: Vec<String>,
+        raw: Vec<String>,
+    }
+    let mut block: Option<Block> = None;
     for raw in split_lines(text) {
         let trimmed = raw.trim();
         match &mut block {
             None => {
                 if trimmed == "line`" {
-                    block = Some(Vec::new());
+                    block = Some(Block { parts: Vec::new(), raw: vec![raw.to_string()] });
                 } else {
                     out.push(raw.to_string());
                 }
             }
-            Some(parts) => {
+            Some(open) => {
+                open.raw.push(raw.to_string());
                 if trimmed == "`" {
-                    out.push(parts.join(" "));
+                    // `toLine` is one `/\s+/g` over everything between the
+                    // backticks, so runs of spaces inside a line collapse too.
+                    out.push(open.parts.join(" "));
                     block = None;
                 } else if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
+                    parts_push(&mut open.parts, trimmed);
                 }
             }
         }
     }
-    // An unterminated block still yields its rule rather than vanishing.
-    if let Some(parts) = block
-        && !parts.is_empty()
-    {
-        out.push(parts.join(" "));
+    // A block that never closed is not a block — see the note above.
+    if let Some(open) = block {
+        out.extend(open.raw);
     }
     out.join("\n")
+}
+
+/// One line of a `` line` `` block, with its internal whitespace collapsed.
+fn parts_push(parts: &mut Vec<String>, line: &str) {
+    parts.push(line.split_whitespace().collect::<Vec<_>>().join(" "));
 }
 
 /// Lift ``` fenced blocks out of a rules text and into named values.
@@ -4895,11 +4916,23 @@ mod parse_text_tests {
         assert_eq!(host_for(text, "http://skipped.com/"), None);
     }
 
-    /// An unterminated block still yields its rule rather than vanishing.
+    /// A block with no closing backtick is not a block. `MULTI_TO_ONE_RE`
+    /// (`_original/lib/rules/rules.js:21`) needs the closer, so the text is
+    /// left as written and its lines are read one at a time — none of which is
+    /// a rule. Measured against whistle 2.10.8, which resolves nothing here;
+    /// this port used to join them and serve the half-written rule.
     #[test]
-    fn unterminated_block_is_salvaged() {
+    fn an_unterminated_block_is_not_a_block() {
+        assert_eq!(host_for("line`\nhost://5.5.5.5\nlonely.com", "http://lonely.com/"), None);
+        // The closing backtick is all it takes.
         assert_eq!(
-            host_for("line`\nhost://5.5.5.5\nlonely.com", "http://lonely.com/").as_deref(),
+            host_for("line`\nhost://5.5.5.5\nlonely.com\n`", "http://lonely.com/").as_deref(),
+            Some("5.5.5.5")
+        );
+        // Whitespace inside a block collapses: `toLine` is one `/\s+/g` over
+        // everything between the backticks.
+        assert_eq!(
+            host_for("line`\n  host://5.5.5.5   \n  lonely.com\n`", "http://lonely.com/").as_deref(),
             Some("5.5.5.5")
         );
     }

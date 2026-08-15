@@ -2792,13 +2792,40 @@ api.test/data  resMerge://true            # …unless this asks for a deep fold
 
 ---
 
+### The first road is JSON5
+
+"Read as JSON" is read as **JSON5**: `parseRawJson` is `json5.parse`
+(`evalJson`, `_original/lib/util/common.js:1673-1679`), and it is the first
+thing every road to an object tries — `_parseJSON` before the query and line
+formats, `isJson` deciding whether a value is content rather than a path, the
+credentials reader, and both body merges, which parse the **body** with it too.
+
+So all of these are objects:
+
+```
+{a: 'one', b: 'two'}      unquoted keys, single quotes
+{a: 'one',}               a trailing comma
+{ /* or a comment */ }    comments, both kinds
+{a: 0x1f, b: .5, c: +1}   hex, leading-dot and signed numbers
+```
+
+which is why [`reqCookies.md`](https://wproxy.org/docs/rules/reqCookies.html)
+can print `{ key1: 'value1', key2: 'value2' }` as a cookie object. This port
+read it as text and set a cookie called `{`.
+
+One shape looks as though it should work and does not, in either program: a
+**dashed** key cannot be unquoted, because `-` ends a JavaScript identifier.
+`{x-a: 'b'}` falls through to the line format, which yields a header named
+`{x-a`; Node writes that onto the wire and hyper refuses to build it, so
+whistle sends a broken header and this port sends none. Quote the key.
+
 ### The line format, exactly
 
 A value that was **loaded** — from a ``` block, a file, a URL or the values
-store — is read as JSON, then as a query string if it holds no whitespace, then
-line by line (`_parseJSON`, `_original/lib/util/index.js:1135-1143`). The third
-road has details that are not the obvious ones, and each was measured against
-whistle 2.10.8 rather than read:
+store — is read as JSON5, then as a query string if it holds no whitespace,
+then line by line (`_parseJSON`, `_original/lib/util/index.js:1135-1143`). The
+third road has details that are not the obvious ones, and each was measured
+against whistle 2.10.8 rather than read:
 
 | You write | It becomes | Why |
 |---|---|---|

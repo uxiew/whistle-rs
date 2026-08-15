@@ -256,7 +256,29 @@ pub fn is_json_value(value: &str) -> bool {
     }
     let shaped = (value.starts_with('{') && value.ends_with('}') && value.contains(':'))
         || (value.starts_with('[') && value.ends_with(']'));
-    shaped && serde_json::from_str::<serde_json::Value>(value).is_ok()
+    shaped && parse_json(value).is_some()
+}
+
+/// Parse a JSON value the way whistle parses one — **JSON5**.
+///
+/// `parseRawJson` is `json5.parse` (`evalJson`,
+/// `_original/lib/util/common.js:1673-1679`), and every road a rule's value
+/// takes to an object goes through it: `_parseJSON` tries it before the query
+/// and line formats (`util/index.js:1142,:1149-1151`), `isJson` asks it whether
+/// a value is content at all, `getAuthByRules` reads credentials with it, and
+/// both body merges parse the **body** with it (`req.js:196`, `res.js:1035`).
+///
+/// So the documented `reqCookies://{key1: 'value1'}` — unquoted keys, single
+/// quotes, a trailing comma — is an object upstream and was a line of text
+/// here, where it produced a cookie called `{` and one called `}`.
+///
+/// Strict JSON is tried first. JSON5 is a superset, so the answer is the same
+/// either way; it is a fast path for the shape almost every value has, and it
+/// keeps a large response body off the JSON5 parser.
+pub fn parse_json(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(text)
+        .ok()
+        .or_else(|| json5::from_str(text).ok())
 }
 
 /// `WEB_PROTOCOL_RE` (`_original/lib/rules/rules.js:22`) — the schemes a request
@@ -274,6 +296,27 @@ pub fn web_scheme(url: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    /// `parseRawJson` is `json5.parse`, so the shapes the documentation prints
+    /// — unquoted keys, single quotes, trailing commas, comments — are objects.
+    #[test]
+    fn a_rule_value_is_read_as_json5() {
+        let obj = |s: &str| super::parse_json(s).map(|v| v.to_string());
+        assert_eq!(obj("{\"a\":1}").as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(obj("{a: 'one', b: 'two'}").as_deref(), Some(r#"{"a":"one","b":"two"}"#));
+        assert_eq!(obj("{a: 'one',}").as_deref(), Some(r#"{"a":"one"}"#));
+        assert_eq!(obj("{\n // a comment\n a: 1\n}").as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(obj("{a: 0x1f}").as_deref(), Some(r#"{"a":31}"#));
+        assert_eq!(obj("{a: .5}").as_deref(), Some(r#"{"a":0.5}"#));
+        // A dashed key cannot be unquoted: `-` ends the identifier, in the
+        // `json5` module as much as in the crate. Quoted, it is a key.
+        assert_eq!(obj("{x-a: 'b'}"), None);
+        assert_eq!(obj("{'x-a': 'b'}").as_deref(), Some(r#"{"x-a":"b"}"#));
+        // And a value that is not an object at all is still not one.
+        assert_eq!(obj("plain text"), None);
+        assert!(super::is_json_value("{a: 'one'}"));
+        assert!(!super::is_json_value("{x-a: 'b'}"));
+    }
+
     use super::*;
 
     /// The table from upstream's own pattern documentation

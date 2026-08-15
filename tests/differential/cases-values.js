@@ -25,13 +25,13 @@
 // because it cannot contain any — the line is split on whitespace before `(` is
 // looked at, so `resBody://(a b)` is two tokens and neither is a payload.
 //
-// 90 of the 109 cases change something on the real-whistle side. Of the 19 that
-// do not, 13 are the point: "upstream does nothing here" is the fact, and
+// Most of these cases change something on the real-whistle side; of the ones
+// that do not, the majority are the point: "upstream does nothing here" is the fact, and
 // whistle-rs doing something is the difference.
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// A clean run of this file is **`differing: 11`**. They are not in `harness.js`'s
+// A clean run of this file is **`differing: 13`**. They are not in `harness.js`'s
 // `EXPECTED` because a matcher wide enough to catch them would hide real news in
 // another corpus; what makes them expected is the rule, which a matcher on the
 // output cannot see. Two deliberate divergences, already declared in the code:
@@ -280,4 +280,34 @@ module.exports = [
   // did nothing here.
   { name: 'line format: pathReplace pairs', rules: `\`\`\`v\necho: replaced\n\`\`\`\n${A} pathReplace://{v}` },
   { name: 'line format: resReplace pairs', rules: `\`\`\`v\norigin: REPLACED\n\`\`\`\n${A} resReplace://{v}` },
+
+  // ── the first road is JSON5, not JSON ──────────────────────────────────
+  //
+  // `parseRawJson` is `json5.parse` (`evalJson`,
+  // `_original/lib/util/common.js:1673-1679`), and it is the first thing every
+  // value-to-object road tries — `_parseJSON` before the query and line
+  // formats, `isJson` deciding whether a value is content at all, the auth
+  // reader, and both body merges. So unquoted keys, single quotes, trailing
+  // commas, comments and hex numbers are all an object upstream; here they were
+  // a line of text, and `reqCookies://{key1: 'value1'}` — which is what
+  // `reqCookies.md` prints — set a cookie called `{`.
+  { name: 'json5: unquoted keys and single quotes', rules: `\`\`\`v\n{a: 'one', b: 'two'}\n\`\`\`\n${A} urlParams://{v}` },
+  { name: 'json5: a trailing comma', rules: `\`\`\`v\n{a: 'one',}\n\`\`\`\n${A} urlParams://{v}` },
+  { name: 'json5: a comment inside the object', rules: `\`\`\`v\n{\n  // the one parameter\n  a: 'one'\n}\n\`\`\`\n${A} urlParams://{v}` },
+  { name: 'json5: a hex number', rules: `\`\`\`v\n{a: 0x1f}\n\`\`\`\n${A} urlParams://{v}` },
+  { name: 'json5: a leading-dot number', rules: `\`\`\`v\n{a: .5}\n\`\`\`\n${A} urlParams://{v}` },
+  { name: 'json5: the cookie object the page prints', rules: `\`\`\`v\n{\n  key1: 'value1',\n  key2: 'value2'\n}\n\`\`\`\n${A} reqCookies://{v}` },
+  { name: 'json5: a quoted dashed key is a header', rules: `\`\`\`v\n{'x-a': 'b'}\n\`\`\`\n${A} reqHeaders://{v}` },
+  { name: 'json5: auth credentials', rules: `\`\`\`v\n{username: 'admin', password: 'secret'}\n\`\`\`\n${A} auth://{v}` },
+  { name: 'json5: a single-quoted body is still merged', rules: `\`\`\`v\n{extra: 1}\n\`\`\`\n${A} reqMerge://{v}`, request: { method: 'POST', body: "{'a':1}", headers: { 'content-type': 'application/json' } } },
+  { name: 'json5: an inline value with single quotes', rules: `${A} resHeaders://({'x-a':'b'})` },
+  // Divergences 12 and 13. A **dashed** key cannot be unquoted — `-` ends the
+  // identifier, in `json5` the module as much as in the crate — so both proxies
+  // fall to the line format and both end up with a header named `{x-a`. Node
+  // writes that name onto the wire (and loses the rest of the response's
+  // headers doing it, on the `resHeaders` road); hyper will not build it, so
+  // this port drops the header and answers normally. Neither is copying the
+  // other here: the value is not a header name in either program.
+  { name: 'json5: an unquoted dashed key on resHeaders', rules: `\`\`\`v\n{x-a: 'b'}\n\`\`\`\n${A} resHeaders://{v}` },
+  { name: 'json5: an unquoted dashed key on trailers', rules: `\`\`\`v\n{x-t: 'v'}\n\`\`\`\n${A} trailers://{v}`, request: { headers: { te: 'trailers' } } },
 ];

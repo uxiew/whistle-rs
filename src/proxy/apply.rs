@@ -1242,7 +1242,10 @@ fn parse_cipher_versions(value: &str) -> super::upstream::TlsVersions {
     let value = value.trim();
     let (mut min, mut max) = (None, None);
     if value.starts_with('{') {
-        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value) {
+        if let Some(map) = crate::rules::url::parse_json(value).and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        }) {
             let get = |k: &str| map.get(k).and_then(|v| v.as_str()).map(str::to_string);
             min = get("minVersion");
             max = get("maxVersion");
@@ -1288,8 +1291,11 @@ fn parse_cipher_suites(
     if !value.starts_with('{') {
         return Ok(None);
     }
-    let spec = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
-        .ok()
+    let spec = crate::rules::url::parse_json(value)
+        .and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
         .and_then(|m| m.get("ciphers").and_then(|v| v.as_str()).map(str::to_string));
     let Some(spec) = spec.filter(|s| !s.trim().is_empty()) else {
         return Ok(None);
@@ -3208,7 +3214,7 @@ fn auth_by_rules(value: &str) -> Option<Auth> {
     if value.starts_with('{') && value.ends_with('}') {
         // A JSON object upstream cannot parse becomes `{}` — an auth naming
         // neither half, which produces no header rather than a bad one.
-        let parsed = serde_json::from_str::<serde_json::Value>(value).ok();
+        let parsed = crate::rules::url::parse_json(value);
         return Some(format_auth(parsed.as_ref()));
     }
     // `AUTH_RE = /^(?:username|password)=/` — anchored, and case-sensitive. It
@@ -3533,7 +3539,7 @@ fn parse_data_object(text: &str, resolve_keys: bool, is_content: bool) -> Option
     // upstream: the value stays whole, carries a newline, and `setHeader` throws
     // on it. Splitting it into lines here instead produced a header whistle
     // never sends. A value that came from the values store takes the other road.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+    if let Some(value) = crate::rules::url::parse_json(text) {
         return Some(value);
     }
     if !is_content {
@@ -5853,7 +5859,7 @@ fn merge_params_into_body(
             let Some((start, end)) = json_span(&text) else {
                 return text.into_bytes();
             };
-            let Ok(mut base) = serde_json::from_str::<serde_json::Value>(&text[start..end]) else {
+            let Some(mut base) = crate::rules::url::parse_json(&text[start..end]) else {
                 return text.into_bytes();
             };
             // `extend(true, obj, params)` — deep, unlike the fold that built it.
@@ -6299,7 +6305,7 @@ fn apply_res_merge(
     let Some((start, end)) = json_span(&text) else {
         return text.into_bytes();
     };
-    let Ok(mut base) = serde_json::from_str::<serde_json::Value>(&text[start..end]) else {
+    let Some(mut base) = crate::rules::url::parse_json(&text[start..end]) else {
         return text.into_bytes();
     };
     if let Some(patch) = &patch {
@@ -7634,7 +7640,10 @@ fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(String, HeaderV
 fn parse_header_pairs(value: &str, is_content: bool) -> Vec<(String, HeaderValues)> {
     let value = value.trim();
     if value.starts_with('{')
-        && let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value)
+        && let Some(map) = crate::rules::url::parse_json(value).and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
     {
         return map
             .into_iter()
