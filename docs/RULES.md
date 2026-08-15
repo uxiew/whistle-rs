@@ -2734,6 +2734,22 @@ api.test/data  resMerge://true            # …unless this asks for a deep fold
 
 ---
 
+### A status value that is not a status
+
+`statusCode://` and `replaceStatus://` take a number. Given anything else —
+`abc`, `20x`, `099`, `0`, `2000`, a file path — upstream hands it to Node's
+`res.writeHead`, which throws, and the client gets a **connection reset**.
+Measured against whistle 2.10.8 for every one of those.
+
+There is nothing there to copy, so this port keeps the answer an **empty**
+value gets, which upstream does define (`var code = rule || 200`,
+`getStatusCodeFromRule`, `_original/lib/util/index.js:3580`): a mock answers
+`200`, and `replaceStatus://` leaves the response alone. A typo is not a reason
+to drop a response that arrived.
+
+The values that *are* statuses agree, including the two outside the registered
+range — `999` and `600` are written as asked, by both.
+
 ### Reaching a rule without a proxy configured
 
 Everything addressed to the proxy's own port **origin-form** — a request with a

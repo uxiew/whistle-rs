@@ -189,6 +189,19 @@ module.exports = [
   { name: 'doc: ws:// is not a transport for a plain request', rules: `${P}/echo ws://${P}/other` },
   { name: 'doc: wss:// is not a transport for a plain request', rules: `${P}/echo wss://${P}/other` },
   { name: 'doc: tunnel:// is not a transport for a plain request', rules: `${P}/echo tunnel://${P}` },
+  // A status value that is not a status. Upstream hands it to Node's
+  // `res.writeHead`, which throws, and the client gets a **connection reset** —
+  // measured for `abc`, `20x`, `099`, `0`, `2000` and a file path. This port
+  // keeps the answer an empty value gets (`200`, which is upstream's own
+  // `rule || 200`) and leaves a replaced status alone. Declared in `harness.js`.
+  { name: 'unusable status value: statusCode text', rules: `${P} statusCode://abc` },
+  { name: 'unusable status value: statusCode out of range', rules: `${P} statusCode://2000` },
+  { name: 'unusable status value: replaceStatus text', rules: `${P} replaceStatus://abc` },
+  { name: 'unusable status value: replaceStatus below 100', rules: `${P} replaceStatus://1` },
+  // The two either side of it, which do agree.
+  { name: 'statusCode with an empty value is 200', rules: `${P} statusCode://` },
+  { name: 'replaceStatus with an empty value changes nothing', rules: `${P} replaceStatus://` },
+  { name: 'statusCode 999 is passed through', rules: `${P} statusCode://999` },
   // …and neither is `location://`, which is not a protocol at all: it is in
   // neither upstream's registry nor its alias table, so the token is a
   // destination whose scheme nothing can speak. This port answered a `302` for

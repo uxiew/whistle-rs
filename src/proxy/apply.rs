@@ -1563,6 +1563,14 @@ fn short_circuit_inner(
             Some(resp)
         }
         "statusCode" => {
+            // An empty value is `200` upstream too — `var code = rule || 200`
+            // (`getStatusCodeFromRule`, `_original/lib/util/index.js:3580`) —
+            // and a value that is not a status at all has no upstream answer to
+            // copy: `res.writeHead('abc')` throws inside Node and the client
+            // gets a **connection reset**. Measured against whistle 2.10.8 for
+            // `abc`, `20x`, `099`, `0`, `2000` and a file path; this port keeps
+            // the empty-value answer for all of them rather than dropping a
+            // socket over a typo.
             let status = op
                 .value
                 .trim()
@@ -3998,6 +4006,10 @@ pub fn apply_response_for(
     if let Some((proto, code)) = ["replaceStatus", "statusCode"]
         .into_iter()
         .find_map(|p| resolved.value(p).map(|v| (p, v)))
+        // A value that is not a status leaves the response alone. Upstream
+        // hands it to `res.writeHead` and the client gets a connection reset
+        // (measured, same list as `statusCode://` above); an operator that
+        // cannot be honoured is not a reason to drop a response that arrived.
         && let Some(status) = code
             .trim()
             .parse::<u16>()
@@ -10060,6 +10072,33 @@ mod tests {
         assert!(bust("weinre://myid"));
         assert!(bust("resBody://(x)"), "the body operators, as before");
         assert!(!bust("reqHeaders://x-a=1"), "and nothing else");
+    }
+
+    /// A status value that is not a status: this port answers, upstream does not.
+    ///
+    /// `res.writeHead('abc')` throws inside Node and takes the connection with
+    /// it, so whistle 2.10.8 answers a **reset** — measured for `abc`, `20x`,
+    /// `099`, `0`, `2000` and a file path. There is nothing there to copy, so
+    /// the mock keeps the answer an *empty* value gets, which upstream does
+    /// define: `var code = rule || 200` (`getStatusCodeFromRule`,
+    /// `_original/lib/util/index.js:3580`). Declared in `harness.js` and
+    /// measured by four cases in `cases.js`.
+    #[test]
+    fn a_status_that_is_not_a_status_still_answers() {
+        let info = build_req_info("GET", "http", "a.com", 80, "/x", &HeaderMap::new(), None);
+        for value in ["abc", "20x", "099", "0", "2000", "/tmp/code.txt", ""] {
+            let resolved = resolve(&format!("a.com/x statusCode://{value}\n"), "http://a.com/x");
+            let resp = short_circuit(&info, &resolved, test_env(), None)
+                .unwrap_or_else(|| panic!("statusCode://{value} answers"));
+            assert_eq!(resp.status(), StatusCode::OK, "statusCode://{value}");
+        }
+        // …and the ones that *are* statuses are still themselves, including the
+        // two outside the registered range that whistle also accepts.
+        for (value, want) in [("204", 204u16), ("999", 999), ("600", 600)] {
+            let resolved = resolve(&format!("a.com/x statusCode://{value}\n"), "http://a.com/x");
+            let resp = short_circuit(&info, &resolved, test_env(), None).expect("an answer");
+            assert_eq!(resp.status().as_u16(), want, "statusCode://{value}");
+        }
     }
 
     /// Every response the proxy makes itself says so — upstream's `x-server`

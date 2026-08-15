@@ -194,6 +194,19 @@ const EXPECTED = [
     why: 'a 502 on both sides; only each proxy\'s error page differs',
   },
   {
+    // A status value that is not a status: upstream hands it to Node's
+    // `res.writeHead`, which throws `ERR_HTTP_INVALID_STATUS_CODE` and takes
+    // the connection with it, so the client sees a reset rather than an
+    // answer. This port keeps the answer an *empty* value gets — `200` for a
+    // mock, no replacement for `replaceStatus://` — which is upstream's own
+    // `rule || 200` applied to a case upstream never reaches.
+    //
+    // Scoped by **case name**, so it excuses nothing else: a reset anywhere
+    // else is still news.
+    match: (p, c) => /^unusable status value:/.test(c.name),
+    why: 'whistle drops the connection on a status it cannot write; this port answers',
+  },
+  {
     // Not a divergence at all: the bench straddling a second.
     //
     // Several rules render an HTTP date from the clock — an injection strips
