@@ -234,6 +234,7 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 |------|------|--------|
 | `-p, --port <PORT>` | 代理端口 | `8899` |
 | `-H, --host <IP>` | 绑定地址 | 所有网卡（`0.0.0.0`） |
+| `-P, --uiport <PORT>` | 把控制台单独放到一个端口（上游的 `-P`）。不设则跟上游一样，控制台就在代理端口上 | 代理端口 |
 | `--socks-port <PORT>` | 额外启动内建 SOCKS5 服务 | 关闭 |
 | `--plugin <NAME=HOST:PORT>` | 注册一个远程（Node/HTTP）插件（可重复） | —— |
 | `--node-plugin <NAME=PATH>` | 从脚本拉起一个 Node 插件（可重复） | —— |

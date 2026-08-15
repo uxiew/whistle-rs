@@ -31,6 +31,13 @@ pub struct Config {
     /// Inline rules text loaded at startup (`-r`/`--rules`), whistle's
     /// `config.rules`.
     pub rules: Option<String>,
+    /// Optional separate port for the console — whistle's `-P/--uiport`.
+    ///
+    /// `None` (or the proxy's own port) means the console is served on the
+    /// proxy port, which is upstream's default: `config.uiport = config.port`
+    /// unless the flag moved it, and only a *different* value starts a second
+    /// server (`customUIPort`, `_original/biz/init.js:8-19`).
+    pub ui_port: Option<u16>,
     /// Optional inbound SOCKS5 port (whistle's `socksPort`).
     pub socks_port: Option<u16>,
     /// Registered plugin servers: name → `host:port` (whistle plugin servers).
@@ -89,6 +96,7 @@ impl Default for Config {
             storage_dir: base.join(DATA_DIRNAME),
             intercept_https: true,
             rules: None,
+            ui_port: None,
             socks_port: None,
             plugins: HashMap::new(),
             values: HashMap::new(),

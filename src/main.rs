@@ -24,6 +24,16 @@ struct Cli {
     #[arg(short = 'H', long)]
     host: Option<IpAddr>,
 
+    /// Serve the console on its own port (whistle's `-P/--uiport`).
+    ///
+    /// Without it the console lives on the proxy port, which is where whistle
+    /// keeps it too — `config.uiport = config.port`, and only a different value
+    /// starts a second server (`_original/biz/init.js:8-19`). A separate port
+    /// is what lets a client reach the console without going through the proxy,
+    /// and what keeps `http://<proxy>/` free for the rules to answer.
+    #[arg(short = 'P', long = "uiport")]
+    ui_port: Option<u16>,
+
     /// Also run an inbound SOCKS5 server on this port.
     #[arg(long)]
     socks_port: Option<u16>,
@@ -250,6 +260,7 @@ async fn main() -> Result<()> {
         port: cli.port,
         host: cli.host,
         storage_dir,
+        ui_port: cli.ui_port,
         socks_port: cli.socks_port,
         plugins,
         values,

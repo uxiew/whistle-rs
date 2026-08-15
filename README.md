@@ -260,6 +260,7 @@ CA.
 |------|---------|---------|
 | `-p, --port <PORT>` | Proxy port | `8899` |
 | `-H, --host <IP>` | Bind address | all interfaces (`0.0.0.0`) |
+| `-P, --uiport <PORT>` | Serve the console on its own port (whistle's `-P`). Without it the console lives on the proxy port, as it does there | proxy port |
 | `--socks-port <PORT>` | Also run an inbound SOCKS5 server | off |
 | `--plugin <NAME=HOST:PORT>` | Register a remote (Node/HTTP) plugin (repeatable) | — |
 | `--node-plugin <NAME=PATH>` | Spawn a Node plugin from a script (repeatable) | — |

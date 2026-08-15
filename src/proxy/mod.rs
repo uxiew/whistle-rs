@@ -1807,6 +1807,7 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
     // The *bound* port, not the requested one, or port 0 would register nothing.
     let mut own_ports = vec![addr.port()];
     own_ports.extend(state.config.socks_port);
+    own_ports.extend(state.config.ui_port);
     upstream::register_listen(state.config.host, &own_ports);
 
     // The same fact the include layer needs for a `${port}` in a backticked
@@ -1831,6 +1832,20 @@ pub async fn accept_loop(
     listener: TcpListener,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
+    // The console on its own port, when `-P/--uiport` named one. Upstream
+    // starts a second plain HTTP server for exactly this case and serves the UI
+    // and nothing else on it (`customUIPort`, `_original/biz/init.js:8-19`);
+    // this is that server. A port equal to the proxy's is not a second server
+    // in either program — there the console already answers.
+    if let Some(ui_port) = state.config.ui_port.filter(|p| *p != state.config.port) {
+        let ui_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_console(ui_state, ui_port).await {
+                tracing::error!("console server error: {e}");
+            }
+        });
+    }
+
     // Optional inbound SOCKS5 server.
     if let Some(socks_port) = state.config.socks_port {
         let socks_state = state.clone();
@@ -1895,6 +1910,131 @@ pub async fn accept_loop(
                 tracing::debug!("connection from {peer} closed: {err}");
             }
         });
+    }
+}
+
+/// Serve the console, and only the console, on its own port.
+///
+/// Every request here is the UI's: there is no proxying, no CONNECT and no
+/// rules — a client that wants those has the proxy port. That is upstream's
+/// arrangement too, whose UI server is a bare `http.createServer()` with the
+/// web UI's own handler on it and nothing of the proxy attached
+/// (`_original/biz/init.js:8-19`).
+async fn run_console(state: Arc<AppState>, port: u16) -> Result<()> {
+    let addr = SocketAddr::new(
+        state
+            .config
+            .host
+            .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
+        port,
+    );
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("console listening on http://{}", listener.local_addr()?);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("console accept error: {e}");
+                continue;
+            }
+        };
+        stream.set_nodelay(true).ok();
+        let state = state.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: Request<Incoming>| {
+                let state = state.clone();
+                async move { Ok::<_, std::convert::Infallible>(webui::handle(&state, req).await) }
+            });
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await
+            {
+                tracing::debug!("console connection from {peer} closed: {err}");
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod console_port_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A state with its own storage directory, so two tests never race over one
+    /// root CA.
+    fn state(ui_port: Option<u16>) -> Arc<AppState> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let config = Config {
+            storage_dir: std::env::temp_dir().join(format!(
+                "whistle-rs-console-tests-{}-{unique}",
+                std::process::id()
+            )),
+            persist_sessions: false,
+            ui_port,
+            ..Config::default()
+        };
+        let ca = crate::ca::CertAuthority::load_or_create(&config).expect("ca");
+        Arc::new(AppState::new(config, RuleManager::new(), ca))
+    }
+
+    /// `-P/--uiport` serves the console, and only the console: the page and the
+    /// capture API answer, and a request that would be a *proxy* request on the
+    /// other port is not one here.
+    #[tokio::test]
+    async fn the_console_answers_on_its_own_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let state = state(Some(port));
+        let server = state.clone();
+        tokio::spawn(async move { run_console(server, port).await });
+
+        // The port is bound asynchronously; give the spawn a moment to land.
+        let url = format!("http://127.0.0.1:{port}");
+        let mut page = None;
+        for _ in 0..50 {
+            match reqwest_get(&format!("{url}/")).await {
+                Ok(body) => {
+                    page = Some(body);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        let page = page.expect("the console never came up");
+        assert!(page.starts_with("HTTP/1.1 200"), "index: {}", &page[..40.min(page.len())]);
+        assert!(page.contains("<!doctype html>") || page.contains("<!DOCTYPE html>"));
+
+        let api = reqwest_get(&format!("{url}/sessions.json")).await.expect("sessions");
+        assert!(api.starts_with("HTTP/1.1 200"), "sessions: {}", &api[..40.min(api.len())]);
+
+        // Nothing here proxies: an unknown path is a 404 from the UI, not a
+        // gateway error from a forward that was never attempted.
+        let missing = reqwest_get(&format!("{url}/nope")).await.expect("404");
+        assert!(missing.starts_with("HTTP/1.1 404"), "unknown: {}", &missing[..40.min(missing.len())]);
+    }
+
+    /// One raw GET, so the test needs no HTTP client dependency.
+    async fn reqwest_get(url: &str) -> std::io::Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rest = url.strip_prefix("http://").unwrap_or(url);
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let mut stream = tokio::net::TcpStream::connect(authority).await?;
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 }
 
