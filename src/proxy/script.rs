@@ -386,24 +386,148 @@ pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String>
     Some(lines.join("\n").trim().to_string())
 }
 
-/// Run a `frameScript` against one WebSocket text frame, returning the
-/// (possibly rewritten) payload. `direction` is `"send"` or `"receive"`.
-pub fn run_frame_script(src: &str, direction: &str, data: &str) -> Option<String> {
+/// What a `frameScript` decided about one frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameAction {
+    /// Deliver it as it came — the script said nothing about it.
+    Keep,
+    /// Deliver this instead.
+    Replace(String),
+    /// Deliver nothing: upstream's handler returned a falsy value, and
+    /// `cb(null, chunk || null)` then writes nothing
+    /// (`_original/lib/socket-mgr.js:198-206`).
+    Drop,
+}
+
+/// The two shapes a `frameScript` may be written in, as JavaScript.
+///
+/// **Upstream's** is a pair of handlers installed on `ctx`
+/// (`frameScript.md`, and `execHandleFrame`,
+/// `_original/lib/socket-mgr.js:303-323`): `handleSendToServerFrame` for the
+/// client's frames and `handleSendToClientFrame` for the server's, each
+/// receiving `(data, opts)` and returning the frame to deliver — or a falsy
+/// value to deliver nothing. `ctx.sendToServer` / `ctx.sendToClient` inject a
+/// frame of their own; see [`frame_script_injections`].
+///
+/// **This port's** is `ctx.frame.data`, assigned in place. Both are supported:
+/// a script that installs a handler is read as upstream reads it, and one that
+/// assigns `ctx.frame.data` is read as this port's own documentation describes.
+/// A script doing both gets the handler's answer, because that is the one the
+/// other program would honour.
+const FRAME_CTX: &str = r#"
+    var __injected = [];
+    var ctx = {
+        direction: __direction,
+        frame: { data: __data },
+        sendToServer: function (d) { __injected.push(['send', String(d)]); },
+        sendToClient: function (d) { __injected.push(['receive', String(d)]); },
+        handleSendToServerFrame: null,
+        handleSendToClientFrame: null
+    };
+"#;
+
+/// Run a `frameScript` against one WebSocket text frame.
+///
+/// `direction` is `"send"` (client → server) or `"receive"`.
+pub fn run_frame_script(src: &str, direction: &str, data: &str) -> FrameAction {
     let mut ctx = Context::default();
-    let ctx_json = json!({ "direction": direction, "frame": { "data": data } });
-    let jsval = boa_engine::JsValue::from_json(&ctx_json, &mut ctx).ok()?;
-    ctx.global_object()
-        .set(js_string!("ctx"), jsval, false, &mut ctx)
-        .ok()?;
-    if ctx.eval(Source::from_bytes(src.as_bytes())).is_err() {
-        return None;
+    let set = |ctx: &mut Context, name: &str, value: &str| {
+        let v = boa_engine::JsValue::from_json(&json!(value), ctx).ok()?;
+        ctx.global_object()
+            .set(js_string!(name), v, false, ctx)
+            .ok()
+    };
+    if set(&mut ctx, "__direction", direction).is_none() || set(&mut ctx, "__data", data).is_none()
+    {
+        return FrameAction::Keep;
     }
-    let ctx_val = ctx.global_object().get(js_string!("ctx"), &mut ctx).ok()?;
-    let out = ctx_val.to_json(&mut ctx).ok()??;
-    out.get("frame")?
-        .get("data")?
-        .as_str()
-        .map(|s| s.to_string())
+    if ctx.eval(Source::from_bytes(FRAME_CTX.as_bytes())).is_err() {
+        return FrameAction::Keep;
+    }
+    if ctx.eval(Source::from_bytes(src.as_bytes())).is_err() {
+        return FrameAction::Keep;
+    }
+    // The handler shape first: it is the one a script copied from the whistle
+    // documentation uses, and the one whose falsy answer means "drop".
+    let handler = match direction {
+        "send" => "handleSendToServerFrame",
+        _ => "handleSendToClientFrame",
+    };
+    let call = format!(
+        "(function () {{
+            var f = ctx.{handler};
+            if (typeof f !== 'function') return null;
+            var out = f(ctx.frame.data, {{}});
+            return out ? String(out) : '';
+        }})()"
+    );
+    if let Ok(value) = ctx.eval(Source::from_bytes(call.as_bytes()))
+        && !value.is_null()
+        && let Ok(text) = value.to_string(&mut ctx)
+    {
+        let text = text.to_std_string_escaped();
+        return match text.is_empty() {
+            true => FrameAction::Drop,
+            false => FrameAction::Replace(text),
+        };
+    }
+    // …and otherwise this port's own shape. Read by evaluating the path rather
+    // than by serialising `ctx`: it now carries functions, and an object with a
+    // function in it is not JSON.
+    let Ok(value) = ctx.eval(Source::from_bytes(b"ctx.frame.data")) else {
+        return FrameAction::Keep;
+    };
+    let Ok(text) = value.to_string(&mut ctx) else {
+        return FrameAction::Keep;
+    };
+    let text = text.to_std_string_escaped();
+    match text != data {
+        true => FrameAction::Replace(text),
+        false => FrameAction::Keep,
+    }
+}
+
+/// The frames a `frameScript` injects on its own, evaluated **once** when the
+/// connection opens.
+///
+/// `ctx.sendToServer(data)` / `ctx.sendToClient(data)` at the top of a script
+/// send a frame nobody asked for, which is how `frameScript.md`'s own example
+/// opens. Returned as `(direction, payload)` pairs in the order they were
+/// called, for the leg that writes each one.
+pub fn frame_script_injections(src: &str) -> Vec<(String, String)> {
+    let mut ctx = Context::default();
+    let set = |ctx: &mut Context, name: &str, value: &str| {
+        let v = boa_engine::JsValue::from_json(&json!(value), ctx).ok()?;
+        ctx.global_object().set(js_string!(name), v, false, ctx).ok()
+    };
+    // The connection has no frame yet, and a script that reads `ctx.frame.data`
+    // here sees an empty one rather than failing.
+    if set(&mut ctx, "__direction", "").is_none() || set(&mut ctx, "__data", "").is_none() {
+        return Vec::new();
+    }
+    if ctx.eval(Source::from_bytes(FRAME_CTX.as_bytes())).is_err()
+        || ctx.eval(Source::from_bytes(src.as_bytes())).is_err()
+    {
+        return Vec::new();
+    }
+    let Ok(value) = ctx.global_object().get(js_string!("__injected"), &mut ctx) else {
+        return Vec::new();
+    };
+    let Ok(Some(json)) = value.to_json(&mut ctx) else {
+        return Vec::new();
+    };
+    json.as_array()
+        .map(|pairs| {
+            pairs
+                .iter()
+                .filter_map(|pair| {
+                    let dir = pair.get(0)?.as_str()?.to_string();
+                    let data = pair.get(1)?.as_str()?.to_string();
+                    Some((dir, data))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ── PAC ────────────────────────────────────────────────────────────────────

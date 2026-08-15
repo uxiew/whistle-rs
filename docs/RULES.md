@@ -1900,9 +1900,23 @@ machine's primary address, where whistle also consults a cache of every name it
 has resolved; and `pattern` is `''` because a resolved operator does not carry
 the pattern that matched it in this port.
 
-`frameScript` runs on each WebSocket text frame with
-`ctx = { direction: 'send'|'receive', frame: { data } }`; assign `ctx.frame.data`
-to rewrite the frame:
+`frameScript` may be written in either of two shapes, and both work.
+
+**Upstream's**, which is what [`frameScript.md`](https://wproxy.org/docs/rules/frameScript.html)
+prints: install a handler per direction on `ctx`, and send frames of your own.
+
+```js
+ctx.sendToServer('hello');                       // sent when the connection opens
+ctx.handleSendToServerFrame = (buf, opts) => String(buf).replace(/1/g, '***');
+ctx.handleSendToClientFrame = (buf, opts) => String(buf).replace(/1/g, '+++');
+```
+
+A handler's return value is the frame to deliver; a falsy one delivers
+**nothing**, which is upstream's `cb(null, chunk || null)`
+(`_original/lib/socket-mgr.js:198-206,:303-323`).
+
+**This port's**, which is shorter for a one-liner: `ctx.frame.data`, assigned in
+place, with `ctx.direction` naming the direction.
 
 ```js
 if (ctx.direction === 'send') ctx.frame.data = ctx.frame.data.toUpperCase();
@@ -1911,6 +1925,13 @@ if (ctx.direction === 'send') ctx.frame.data = ctx.frame.data.toUpperCase();
 ```
 chat.example.com   frameScript:///abs/path/frame.js
 ```
+
+A script that does both gets the handler's answer, because that is the one the
+other program would honour. One narrowing: the script is evaluated **per frame**
+here and once per connection there, so state kept in a closure between frames
+does not survive — `ctx.sendToServer` and `ctx.sendToClient` are collected from
+a single evaluation when the connection opens, so they fire once, as they do
+upstream.
 
 ### weinre (HTML debug injection)
 

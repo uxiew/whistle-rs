@@ -248,6 +248,22 @@ pub async fn capturing_tunnel<A, B>(
         state.ws_pause.lock().unwrap().insert(session, gate.clone());
         gate
     });
+    // Frames the script sends on its own, before either side has said anything
+    // — `ctx.sendToServer` / `ctx.sendToClient`, which is how
+    // `frameScript.md`'s example opens. Evaluated once here rather than per
+    // frame, as upstream evaluates the script once per connection.
+    let injections = script
+        .as_deref()
+        .map(crate::proxy::script::frame_script_injections)
+        .unwrap_or_default();
+    let mut inject_send: Vec<String> = Vec::new();
+    let mut inject_receive: Vec<String> = Vec::new();
+    for (dir, data) in injections {
+        match dir.as_str() {
+            "send" => inject_send.push(data),
+            _ => inject_receive.push(data),
+        }
+    }
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
     let up = tokio::spawn(pump(
@@ -261,6 +277,7 @@ pub async fn capturing_tunnel<A, B>(
             pause: pause.clone(),
             // This leg writes toward the server, so its keep-alive is the pong.
             keepalive: !flow.no_pong,
+            inject: inject_send,
         },
         state.clone(),
         session,
@@ -276,6 +293,7 @@ pub async fn capturing_tunnel<A, B>(
             pause: pause.clone(),
             // …and this one writes toward the client, so it is the ping.
             keepalive: !flow.no_ping,
+            inject: inject_receive,
         },
         state.clone(),
         session,
@@ -506,6 +524,9 @@ struct Leg {
     /// False when `disable://ping` / `disable://pong` asked for no keep-alive on
     /// this leg — see [`crate::proxy::apply::ws_keepalive_disabled`].
     keepalive: bool,
+    /// Text frames the `frameScript` asked to send on this leg the moment the
+    /// connection opened, before anything was read.
+    inject: Vec<String>,
 }
 
 async fn pump<R, W>(r: R, w: W, leg: Leg, state: Arc<AppState>, session: u64)
@@ -520,6 +541,7 @@ where
         mode,
         pause,
         keepalive,
+        inject,
     } = leg;
     let ctx = FrameCtx {
         direction: dir.label(),
@@ -531,10 +553,27 @@ where
         session,
     };
     match (mode, pause) {
-        (DirMode::Pause, Some(gate)) => pump_held(r, w, ctx, gate, dir, keepalive).await,
+        (DirMode::Pause, Some(gate)) => {
+            pump_held(r, w, ctx, gate, dir, keepalive, inject).await
+        }
         // Everything else, which is very nearly every session: read, decide,
         // write, with no companion task and no channel between the two.
-        _ => pump_direct(r, w, ctx).await,
+        _ => pump_direct(r, w, ctx, inject).await,
+    }
+}
+
+/// Write the frames a `frameScript` asked to send on this leg, and record them.
+///
+/// They are the script's own, not the peer's, so they are not filtered by it —
+/// upstream's `sendToServer` writes straight to the sender
+/// (`_original/lib/socket-mgr.js`, the `ctx` a frame script is handed).
+async fn write_injections<W: AsyncWrite + Unpin>(w: &mut W, ctx: &FrameCtx, inject: &[String]) {
+    for data in inject {
+        if deliver(w, true, OPCODE_TEXT, data.as_bytes(), ctx.to_server).await != Sent::Ok {
+            return;
+        }
+        ctx.state
+            .record_frame(WsFrame::new(ctx.session, ctx.direction, OPCODE_TEXT, data.as_bytes()));
     }
 }
 
@@ -560,13 +599,19 @@ impl FrameCtx {
     async fn process(&mut self, frame: Frame, held: bool) -> Option<Bytes> {
         let mut payload = Bytes::from(frame.payload);
         if frame.opcode == OPCODE_TEXT {
-            // Text frame: allow the script to rewrite it.
+            // Text frame: the script may rewrite it, or refuse it. A handler
+            // that answers with nothing drops the frame, which is what
+            // upstream's `cb(null, chunk || null)` does with a falsy return
+            // (`_original/lib/socket-mgr.js:198-206`).
+            use crate::proxy::script::FrameAction;
             if let Some(script) = &self.script
-                && let Some(new) = std::str::from_utf8(&payload).ok().and_then(|text| {
-                    crate::proxy::script::run_frame_script(script, self.direction, text)
-                })
+                && let Ok(text) = std::str::from_utf8(&payload)
             {
-                payload = Bytes::from(new);
+                match crate::proxy::script::run_frame_script(script, self.direction, text) {
+                    FrameAction::Keep => {}
+                    FrameAction::Replace(new) => payload = Bytes::from(new),
+                    FrameAction::Drop => return None,
+                }
             }
         }
         if !self.hooks.is_empty() && is_data_frame(frame.opcode) {
@@ -639,11 +684,12 @@ async fn deliver<W: AsyncWrite + Unpin>(
 }
 
 /// The ordinary leg: read a frame, decide about it, write it.
-async fn pump_direct<R, W>(mut r: R, mut w: W, mut ctx: FrameCtx)
+async fn pump_direct<R, W>(mut r: R, mut w: W, mut ctx: FrameCtx, inject: Vec<String>)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    write_injections(&mut w, &ctx, &inject).await;
     loop {
         let frame = match read_frame(&mut r).await {
             Ok(Some(f)) => f,
@@ -676,10 +722,14 @@ async fn pump_held<R, W>(
     pause: Arc<SessionPause>,
     dir: Dir,
     keepalive: bool,
+    inject: Vec<String>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
+    // The script's own frames go out before the hold begins: they are not the
+    // peer's traffic, and holding them would hold something nobody sent.
+    write_injections(&mut w, &ctx, &inject).await;
     let gate = pause.of(dir);
     let (tx, mut rx) = mpsc::channel::<Frame>(1);
     let reader = tokio::spawn(async move {
@@ -1789,6 +1839,66 @@ mod tests {
                 .expect("client write");
             let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
             assert_eq!(got.payload, b"HI VIA SEND");
+            finish(wire).await;
+        });
+    }
+
+    /// A `frameScript` written the way `frameScript.md` writes one: two
+    /// handlers installed on `ctx`, each returning the frame to deliver.
+    #[test]
+    fn a_frame_script_may_install_handlers() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://websocket\n");
+            let script = "ctx.handleSendToServerFrame = function (buf) { \
+                              return (buf + '').replace(/1/g, '***'); \
+                          };"
+                .to_string();
+            let mut wire = spawn_tunnel(&state, plan, Some(script));
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"1 and 1", true)
+                .await
+                .expect("client write");
+            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            assert_eq!(got.payload, b"*** and ***");
+            finish(wire).await;
+        });
+    }
+
+    /// A handler that answers with nothing delivers nothing —
+    /// `cb(null, chunk || null)` (`_original/lib/socket-mgr.js:198-206`).
+    #[test]
+    fn a_handler_that_returns_nothing_drops_the_frame() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://websocket\n");
+            let script = "ctx.handleSendToServerFrame = function (buf) { \
+                              return (buf + '') === 'drop' ? '' : buf; \
+                          };"
+                .to_string();
+            let mut wire = spawn_tunnel(&state, plan, Some(script));
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"drop", true)
+                .await
+                .expect("client write");
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"keep", true)
+                .await
+                .expect("client write");
+            // The dropped frame never arrives, so the next one is what reads.
+            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            assert_eq!(got.payload, b"keep");
+            finish(wire).await;
+        });
+    }
+
+    /// `ctx.sendToServer` sends a frame the moment the connection opens.
+    #[test]
+    fn a_frame_script_may_send_a_frame_of_its_own() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://websocket\n");
+            let script = "ctx.sendToServer('hello server');".to_string();
+            let mut wire = spawn_tunnel(&state, plan, Some(script));
+            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            assert_eq!(got.payload, b"hello server");
             finish(wire).await;
         });
     }
