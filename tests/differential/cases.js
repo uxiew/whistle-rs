@@ -202,6 +202,17 @@ module.exports = [
   { name: 'statusCode with an empty value is 200', rules: `${P} statusCode://` },
   { name: 'replaceStatus with an empty value changes nothing', rules: `${P} replaceStatus://` },
   { name: 'statusCode 999 is passed through', rules: `${P} statusCode://999` },
+  // A method value that is not an HTTP token. Node refuses to build the
+  // request and whistle answers its `502` page; this port leaves the method
+  // alone, for the same reason it keeps answering an unusable status — an
+  // operator that cannot be honoured is not a reason to fail a request that
+  // otherwise works. Measured for `GET;`, a JSON object and a block of lines.
+  { name: 'unusable method value: a separator', rules: `${P} method://GET;` },
+  { name: 'unusable method value: a json object', rules: `${P} method://{"method":"PUT"}` },
+  // …and the ones that are tokens, which agree: an unknown verb is sent as
+  // written, and digits are a token too.
+  { name: 'method: an unknown verb is sent as written', rules: `${P} method://FROBNICATE` },
+  { name: 'method: digits are a token', rules: `${P} method://42` },
   // …and neither is `location://`, which is not a protocol at all: it is in
   // neither upstream's registry nor its alias table, so the token is a
   // destination whose scheme nothing can speak. This port answered a `302` for

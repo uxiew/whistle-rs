@@ -2786,6 +2786,14 @@ to drop a response that arrived.
 The values that *are* statuses agree, including the two outside the registered
 range — `999` and `600` are written as asked, by both.
 
+### A method value that is not a token
+
+Same shape, one operator over. `method://GET;`, `method://{"method":"PUT"}` and
+a block of lines all reach Node's `http.request`, which throws
+`ERR_INVALID_HTTP_TOKEN`, and whistle answers its `502` page. This port leaves
+the method alone. A value that *is* a token agrees, including an unknown verb
+(`FROBNICATE` is sent as written) and digits.
+
 ### Reaching a rule without a proxy configured
 
 Everything addressed to the proxy's own port **origin-form** — a request with a

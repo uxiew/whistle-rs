@@ -207,6 +207,15 @@ const EXPECTED = [
     why: 'whistle drops the connection on a status it cannot write; this port answers',
   },
   {
+    // The same shape one operator over: a `method://` value that is not an
+    // HTTP token. Node's `http.request` throws `ERR_INVALID_HTTP_TOKEN` and
+    // whistle answers its `502` page; this port leaves the method alone.
+    // Measured for `GET;`, a JSON object and a block of lines; a value that
+    // *is* a token — including an unknown verb and digits — agrees.
+    match: (p, c) => /^unusable method value:/.test(c.name),
+    why: 'whistle fails the request on a method it cannot send; this port ignores the value',
+  },
+  {
     // Not a divergence at all: the bench straddling a second.
     //
     // Several rules render an HTTP date from the clock — an injection strips
