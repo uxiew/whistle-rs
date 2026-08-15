@@ -671,6 +671,7 @@ pub fn merge_included_rules(
                     client_ip: info.client_ip.as_deref(),
                     client_port: info.client_port,
                     res: None,
+                    values,
                 },
             ),
         })
@@ -754,7 +755,12 @@ pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
 /// `{name}` and inline forms and a path otherwise, exactly as
 /// [`merge_included_rules`] reads its own. Nothing here was applied before —
 /// `resRules://` parsed, resolved, and then went nowhere.
-pub fn merge_res_rules(resolved: &mut Resolved, info: &ReqInfo, is_internal_req: bool) -> bool {
+pub fn merge_res_rules(
+    resolved: &mut Resolved,
+    info: &ReqInfo,
+    values: &HashMap<String, String>,
+    is_internal_req: bool,
+) -> bool {
     let texts = accumulated_script_ops(resolved, "resScript", "resRules")
         .into_iter()
         .filter_map(|op| {
@@ -783,6 +789,7 @@ pub fn merge_res_rules(resolved: &mut Resolved, info: &ReqInfo, is_internal_req:
                         client_ip: info.client_ip.as_deref(),
                         client_port: info.client_port,
                         res,
+                        values,
                     },
                 );
             }
@@ -4728,12 +4735,12 @@ fn merge_cors_ops(resolved: &Resolved, protocol: &str) -> HashMap<String, String
 /// third of which is the **line format**, which is how `resCors.md` spells out
 /// a full CORS object:
 ///
-/// ```txt
+/// ````txt
 /// ``` cors.json
 /// origin: *
 /// methods: POST
 /// ```
-/// ```
+/// ````
 ///
 /// That did nothing here: this had JSON and a query string and stopped.
 fn parse_cors(value: &str, is_content: bool) -> HashMap<String, String> {
@@ -10864,7 +10871,7 @@ mod tests {
             let (mut info, mut resolved) = resolve_with_info(rules, "http://example.com/");
             substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
             info.res = Some(build_res_info(status, &HeaderMap::new(), None, None));
-            merge_res_rules(&mut resolved, &info, false);
+            merge_res_rules(&mut resolved, &info, &HashMap::new(), false);
             let mut h = HeaderMap::new();
             apply_header_ops(&mut h, &resolved, "resHeaders");
             (h, resolved)

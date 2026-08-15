@@ -34,8 +34,8 @@
 //     `x-whistle-response-for: svc-a` from both. The cases stay because they
 //     still prove `responseFor://` does not disturb the request.
 //
-// **This corpus ends at `differing: 7`** — six `weinre://` and one
-// `intercept://`, each named below.
+// **This corpus ends at `differing: 9`** — six `weinre://`, one `intercept://`,
+// and two about the script context, each named below or beside its case.
 //
 // It said eight until the eighth stopped differing on its own. That one was
 // `the response is re-encoded after injection`: both proxies inject into the
@@ -122,6 +122,53 @@ module.exports = [
   { name: 'a resScript reads the status', rules: `${P} resScript://{s}` + V('s', `if (statusCode == 200) rules.push('${P} resHeaders://x-rs=ok')`) },
   { name: 'a script that throws contributes nothing', rules: `${P} reqScript://{s}` + V('s', `rules.push('${P} reqHeaders://x-t=1'); throw new Error('x')`) },
   { name: 'a script reading the request url', rules: `${P} reqScript://{s}` + V('s', `if (url.indexOf('q=1') !== -1) rules.push('${P} reqHeaders://x-u=1')`), request: { path: '/echo?q=1' } },
+
+  // ── the context `reqScript.md` prints ──────────────────────────────────
+  //
+  // The page lists what a script may look at, and every name here was put
+  // through both proxies (`getScriptContext`,
+  // `_original/lib/rules/index.js:349-416`). Two of them found gaps in this
+  // port and are the reason the rest are pinned: `body` was the empty string
+  // because nothing had buffered the request body before the script ran, and
+  // `render`/`tpl` was the identity function rather than whistle's `<% … %>`
+  // template.
+  { name: 'script ctx: method', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-m=' + method)`) },
+  { name: 'script ctx: ip and clientIp are one address', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-ip=' + (ip === clientIp))`) },
+  { name: 'script ctx: headers', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-h=' + (headers['x-probe'] || 'none'))`), request: { headers: { 'x-probe': 'yes' } } },
+  { name: 'script ctx: body', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-b=' + body.length)`), request: { method: 'POST', body: 'hello' } },
+  { name: 'script ctx: a GET has no body', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-b=' + body.length)`) },
+  { name: 'script ctx: parseUrl', rules: `${P} reqScript://{s}` + V('s', `var u = parseUrl(url); rules.push(url + ' reqHeaders://x-p=' + u.pathname + '|' + u.port)`) },
+  { name: 'script ctx: parseQuery', rules: `${P} reqScript://{s}` + V('s', `var q = parseQuery(parseUrl(url).query); rules.push(url + ' reqHeaders://x-q=' + q.a)`), request: { path: '/echo?a=42' } },
+  { name: 'script ctx: render interpolates', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-t=' + render('<%=a%>-<%=b%>', {a:1,b:2}))`) },
+  { name: 'script ctx: render runs code', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-t=' + render('<% if (a) { %>yes<% } else { %>no<% } %>', {a:1}))`) },
+  { name: 'script ctx: render leaves a plain string alone', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-t=' + render('plain'))`) },
+  { name: 'script ctx: tpl is render', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-t=' + (tpl === render))`) },
+  { name: 'script ctx: getValue reads the Values pane', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-v=' + getValue('mock'))`), values: { mock: 'from-store' } },
+  { name: 'script ctx: getValue of a name nobody defined', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-v=' + getValue('nope'))`) },
+  { name: 'script ctx: isLocalAddress', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-l=' + isLocalAddress('127.0.0.1') + '-' + isLocalAddress('8.8.8.8'))`) },
+  { name: 'script ctx: httpVersion', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-hv=' + httpVersion)`) },
+  { name: 'script ctx: statusCode is empty in the request pass', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-s=[' + statusCode + ']')`) },
+  { name: 'script ctx: reqScriptData', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-d=' + (typeof reqScriptData))`) },
+  { name: 'script ctx: a values object the script writes', rules: `${P} reqScript://{s}` + V('s', `values.a = 'b'; rules.push(url + ' reqHeaders://x-v=' + Object.keys(values).length)`) },
+  { name: 'script ctx: resScript sees the status', rules: `${P} resScript://{s}` + V('s', `rules.push(url + ' resHeaders://x-s=' + statusCode)`) },
+  { name: 'script ctx: resScript sees serverIp', rules: `${P} resScript://{s}` + V('s', `rules.push(url + ' resHeaders://x-si=' + (serverIp ? 'set' : 'empty'))`) },
+  { name: 'script ctx: resScript sees the response headers', rules: `${P} resScript://{s}` + V('s', `rules.push(url + ' resHeaders://x-ct=' + (resHeaders['content-type'] ? 'yes' : 'no'))`) },
+  // Divergence 8: `getValue` and a ``` block declared in the same text. The
+  // inline map is the first place upstream's own `getValue` looks
+  // (`rules/index.js:398-401`), and in a running whistle it answers
+  // `undefined` there while answering the Values pane correctly — the map on
+  // the request is whichever `Rules` instance resolved last, and by script
+  // time that is not the one holding the block. This port serves the block,
+  // which is what the code says. The Values-pane case above pins the half the
+  // two agree on.
+  { name: 'script ctx: getValue reads a fenced block', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-v=' + getValue('mock.txt'))`) + V('mock.txt', 'from-fence') },
+  // Divergence 9: how much body a script sees. whistle's reader stops at the
+  // first chunk that crosses 16 KB (`PAYLOAD_SIZE`, `pipestream/lib/index.js:5`,
+  // and `handleData` at `:249`), so what its script gets depends on how the
+  // client chunked the upload — 20 KB arrives whole and 70 KB arrives as
+  // 65 409 bytes here. This port hands the script the body it buffered, up to
+  // `apply::REQ_BODY_LIMIT`.
+  { name: 'script ctx: a body over whistle\'s chunk cap', rules: `${P} reqScript://{s}` + V('s', `rules.push(url + ' reqHeaders://x-b=' + body.length)`), request: { method: 'POST', body: 'x'.repeat(70000) } },
 
   // Depth: what a produced text produces is **not** followed. `resolveRulesFile`
   // parses the included text once and merges it; the merged set is never asked

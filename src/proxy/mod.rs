@@ -2589,7 +2589,7 @@ async fn resolve_response_phase(
     // It substitutes against `values`, the same map every other pass here uses.
     // Reading `state.values` directly is what made a response-phase operator the
     // one place a ``` block in the rules text was invisible.
-    if apply::merge_res_rules(resolved, info, is_internal_req) {
+    if apply::merge_res_rules(resolved, info, &values, is_internal_req) {
         apply::substitute_values(resolved, &values, tpl_ctx(&host, state.config.port, info));
         apply::substitute_config_vars(resolved, state.config.port, crate::config::VERSION);
         added = true;

@@ -73,7 +73,7 @@
 | `cases-patterns.js`（模式与优先级） | 258 | 0 差异 | 10 |
 | `cases-bodies.js`（body 改写与编码） | 180 | 0 差异 | 87 |
 | `cases-delete.js`（`delete://` 与类型算子） | 220 | 8 项，同上 | 41 |
-| `cases-compose.js`（规则组合与脚本注入） | 98 | 7 项，同上 | 14 |
+| `cases-compose.js`（规则组合与脚本注入） | 121 | 9 项，同上 | 14 |
 | `cases-values.js`（取值与模板） | 109 | 11 项，同上 | 7 |
 | `cases-includes.js`（`@` 引入） | 35 | 0 差异（其中 24 项在真 whistle 一侧确有改变） | 11 |
 | `cases-proxy.js`（转发族） | 115 | 25 项，同上 | 19 |

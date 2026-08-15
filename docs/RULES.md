@@ -1866,17 +1866,39 @@ request-phase script sees `url`, `method`, `headers`, `body`, `ip` and
 `clientPort`; a `resScript` also sees `statusCode`, `serverIp` and `resHeaders`.
 A script that throws contributes nothing, not even lines pushed before it threw.
 
-```
-example.com   reqScript://(rules.push(url + ' reqHeaders://x-seen=1'))
-```
+A script of any size goes in a ``` fenced block and the line names it — a rule
+line is split on whitespace by both proxies, so an inline `(…)` script ends at
+its first space and is never a whole program. (This document used to print
+`reqScript://(rules.push(url + ' reqHeaders://x-seen=1'))` as an example. It
+resolves to `rulesFile://(rules.push(url` and two more operators, in whistle
+2.10.8 as much as here.)
 
-Two narrow divergences, both measured: a `values` object the script writes does
-**not** resolve `{name}` references in the rules it pushed (upstream sends the
-literal `{name}` too), and the context omits `Buffer`, `decodeBuffer`,
-`encodeString`, `encodingExists`, `tpl`/`render` and `isLocalAddress` — a script
-calling one of those throws here and produces nothing, where upstream would run
-it. `pattern` is `''` because a resolved operator does not carry the pattern
-that matched it in this port.
+````
+```probe.js
+rules.push(url + ' reqHeaders://x-seen=1');
+```
+example.com   reqScript://{probe.js}
+````
+
+The context is upstream's `getScriptContext`
+(`_original/lib/rules/index.js:349-416`): `url`/`fullUrl`, `method`,
+`httpVersion`, `headers`/`reqHeaders`, `body`, `ip`/`clientIp`, `clientPort`,
+`rules`, `values`, `value`, `reqScriptData`, `version`, `uiHost`,
+`getValue(name)`, `parseUrl`, `parseQuery`, `tpl`/`render`, `isLocalAddress`,
+and — in a `resScript` — `statusCode`, `serverIp` and `resHeaders`, which are
+empty strings in the request pass. `render` is whistle's own `<% … %>` /
+`<%= … %>` micro-template (`rules/index.js:304-347`), ported as the same source
+transformation.
+
+Divergences, all measured: a `values` object the script writes does **not**
+resolve `{name}` references in the rules it pushed (upstream sends the literal
+`{name}` too); the context omits `Buffer`, `decodeBuffer`, `encodeString` and
+`encodingExists`, the four that move bytes between encodings, so a script
+calling one throws here and produces nothing where upstream would have run it;
+`isLocalAddress` knows the loopback range, the unspecified addresses and this
+machine's primary address, where whistle also consults a cache of every name it
+has resolved; and `pattern` is `''` because a resolved operator does not carry
+the pattern that matched it in this port.
 
 `frameScript` runs on each WebSocket text frame with
 `ctx = { direction: 'send'|'receive', frame: { data } }`; assign `ctx.frame.data`

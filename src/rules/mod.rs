@@ -469,6 +469,19 @@ pub struct Rule {
     /// (`_original/lib/rules/rules.js:1390-1392`), for the same reason: the body
     /// has to be buffered before resolution, and only these lines can ask.
     pub has_body_filter: bool,
+    /// Precomputed: does this line carry a **rules-producing script** —
+    /// `reqScript://` and the rest of the `rulesFile` family?
+    ///
+    /// Such a script reads the request body as its `body` global
+    /// (`getReqPayload`, `_original/lib/rules/index.js:417-432`), so the body
+    /// has to be in hand before the script runs, which here means before
+    /// resolution. whistle can decide later than this: its value loader is
+    /// async, so it reads the text first and asks for the body only when the
+    /// text turns out to be a script. A line whose value is rules rather than
+    /// JavaScript therefore buffers a body here that upstream would have left
+    /// streaming — the same over-reading a `b:` filter does, and bounded the
+    /// same way.
+    pub has_rules_script: bool,
     /// Precomputed: does any operator on this line write `$0`…`$9`?
     ///
     /// Only then does a match have to collect what the pattern captured, which
@@ -1116,10 +1129,12 @@ pub struct RuleGroup {
     /// lines cost and not what the whole group costs: a rules file with a
     /// thousand lines and one `includeFilter://s:` walks one rule.
     res_candidates: Vec<u32>,
-    /// Indices into `rules` of the lines carrying a `b:` filter — upstream's
-    /// `_bodyFilters` (`_original/lib/rules/rules.js:1390-1392`). Empty for
-    /// every rules file that never mentions the body, which is what lets the
-    /// request path skip buffering entirely.
+    /// Indices into `rules` of the lines that need the request body before
+    /// resolution: a `b:` filter — upstream's `_bodyFilters`
+    /// (`_original/lib/rules/rules.js:1390-1392`) — or a rules-producing
+    /// script, which reads the body as a global
+    /// ([`Rule::has_rules_script`]). Empty for every rules file that mentions
+    /// neither, which is what lets the request path skip buffering entirely.
     body_candidates: Vec<u32>,
     /// Does any line here carry an `sniCallback://` operator?
     ///
@@ -1277,7 +1292,7 @@ fn body_candidates(rules: &[Rule]) -> Vec<u32> {
     rules
         .iter()
         .enumerate()
-        .filter(|(_, rule)| rule.has_body_filter)
+        .filter(|(_, rule)| rule.has_body_filter || rule.has_rules_script)
         .map(|(i, _)| i as u32)
         .collect()
 }
@@ -2025,6 +2040,9 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
         .any(|op| protocols::is_res_phase(&op.protocol) || op.protocol == "ignore");
     let res_dependent = filters.iter().any(|f| f.cond.may_need_response());
     let has_body_filter = filters.iter().any(|f| matches!(f.cond, Cond::Body(_)));
+    let has_rules_script = ops
+        .iter()
+        .any(|op| op.protocol == "rulesFile" || op.protocol == protocols::RULE_INCLUDE);
     // A line that names a values-store entry needs the groups too: the store's
     // content can carry its own `$1`, and upstream expands captures *after* the
     // store has answered — see [`RuleOp::captures`]. `has_reference` cannot see
@@ -2055,6 +2073,7 @@ fn parse_line(tokens: &[&str], raw_line: &str) -> Vec<Rule> {
                 res_phase_ops,
                 res_dependent,
                 has_body_filter,
+                has_rules_script,
                 has_capture_ref,
                 has_skip,
             })

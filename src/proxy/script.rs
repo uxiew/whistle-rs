@@ -173,6 +173,10 @@ pub struct RulesScriptCtx<'a> {
     pub client_port: Option<u16>,
     /// `None` in the request pass; the response head once there is one.
     pub res: Option<RulesScriptRes<'a>>,
+    /// The values store, for `getValue(name)` — inline blocks and the console's
+    /// Values pane both, which is the pair upstream's own `getValue` asks
+    /// (`_original/lib/rules/index.js:398-401`).
+    pub values: &'a std::collections::HashMap<String, String>,
 }
 
 /// The response third of the context, present only in the `resScript` pass.
@@ -198,11 +202,12 @@ pub struct RulesScriptRes<'a> {
 ///   is then ignored, which is the measured behaviour.
 ///
 /// Omitted from the context, and what that costs: `Buffer`, `decodeBuffer`,
-/// `encodeString`, `encodingExists`, `tpl`/`render`, and `isLocalAddress`. A
-/// script calling one of those throws a `ReferenceError` here and produces
-/// nothing, where upstream would have run it — a real, narrow divergence,
-/// declared in `docs/RULES.md`. `pattern` is `''` because a resolved operator
-/// does not carry the pattern that matched it in this port.
+/// `encodeString` and `encodingExists` — the four that exist to move bytes
+/// between encodings, which need an `iconv` this port does not carry. A script
+/// calling one of them throws a `ReferenceError` here and produces nothing,
+/// where upstream would have run it — a real, narrow divergence, declared in
+/// `docs/RULES.md`. `pattern` is `''` because a resolved operator does not
+/// carry the pattern that matched it in this port.
 pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String> {
     let mut ctx = Context::default();
 
@@ -252,6 +257,27 @@ pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String>
         "rules": [],
         "values": {},
     });
+    let mut globals = globals;
+    // `getValue` reads them by name. An inline block's key carries the group it
+    // was declared in (`crate::rules::inline_key`), and a script asks by the
+    // plain name, so the mangled half is offered under both spellings — the
+    // plain one only where the store has no entry of its own for it, which is
+    // the precedence `value_for` uses everywhere else.
+    let mut store = serde_json::Map::new();
+    for (name, content) in input.values {
+        if !name.contains('\n') {
+            store.insert(name.clone(), serde_json::Value::String(content.clone()));
+        }
+    }
+    for (name, content) in input.values {
+        if let Some((plain, _group)) = name.split_once("\n\r")
+            && !store.contains_key(plain)
+        {
+            store.insert(plain.to_string(), serde_json::Value::String(content.clone()));
+        }
+    }
+    globals["__values"] = serde_json::Value::Object(store);
+    globals["__localIp"] = json!(crate::proxy::upstream::primary_local_ip().map(|ip| ip.to_string()));
     let obj = JsValue::from_json(&globals, &mut ctx).ok()?;
     let obj = obj.as_object()?.clone();
     for key in obj.own_property_keys(&mut ctx).ok()? {
@@ -266,7 +292,17 @@ pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String>
     const PRELUDE: &str = r#"
         var console = { log: function(){}, info: function(){}, warn: function(){},
                         error: function(){}, debug: function(){}, fatal: function(){} };
-        function getValue() { return undefined; }
+        function getValue(key) {
+            var v = __values[key];
+            return typeof v === 'string' ? v : undefined;
+        }
+        function isLocalAddress(addr) {
+            addr = String(addr == null ? ip : addr).toLowerCase();
+            if (addr[0] === '[') addr = addr.slice(1, -1);
+            return addr === '127.0.0.1' || addr === '0.0.0.0' || addr === 'localhost'
+                || addr === '::1' || addr === '0:0:0:0:0:0:0:1' || addr === '::'
+                || /^127\./.test(addr) || (!!__localIp && addr === __localIp);
+        }
         function parseQuery(s) {
             var out = {};
             String(s == null ? '' : s).replace(/^[?#]/, '').split('&').forEach(function (kv) {
@@ -293,8 +329,42 @@ pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String>
                      pathname: m[3] || '', search: search,
                      query: search.replace(/^\?/, ''), href: u, hash: '' };
         }
-        var render = function (s) { return s; };
-        var tpl = render;
+        // whistle's `tpl` (`_original/lib/rules/index.js:304-347`), the same
+        // source transformation: `<% … %>` is code, `<%= … %>` interpolates,
+        // and a string with no `<%` and `%>` in it is returned as it came. The
+        // newline dance is upstream's — lines become tabs so the generated
+        // function is one line, and the tabs come back at the end.
+        var __tplCache = {};
+        function tpl(str, data) {
+            if (typeof str !== 'string' || str.indexOf('<%') === -1 || str.indexOf('%>') === -1) {
+                return str + '';
+            }
+            var fn = __tplCache[str];
+            if (!fn) {
+                var body = str
+                    .replace(/[\u2028\u2029]/g, '')
+                    .replace(/\t/g, ' ')
+                    .replace(/\r?\n|\r/g, '\t')
+                    .split('<%')
+                    .join('\u2028')
+                    .replace(/((^|%>)[^\u2028]*)'/g, '$1\r')
+                    .replace(/\u2028=(.*?)%>/g, '\',$1,\'')
+                    .split('\u2028')
+                    .join('\');')
+                    .split('%>')
+                    .join('p.push(\'')
+                    .split('\r')
+                    .join('\\\'');
+                fn = new Function(
+                    'obj',
+                    'var p=[],print=function(){p.push.apply(p,arguments);};'
+                        + 'with(obj){p.push(\'' + body + '\');}return p.join(\'\');'
+                );
+                __tplCache[str] = fn;
+            }
+            return fn(data || {}).replace(/\t/g, '\n');
+        }
+        var render = tpl;
     "#;
     ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).ok()?;
 
@@ -747,6 +817,10 @@ mod tests {
         assert!(is_rules_content("rulesfoo = (1)"));
     }
 
+    /// No values store, for the cases that are not about one.
+    static NO_VALUES: std::sync::LazyLock<std::collections::HashMap<String, String>> =
+        std::sync::LazyLock::new(std::collections::HashMap::new);
+
     /// A rules script pushes lines; an error discards them; `values` set by the
     /// script does not resolve a `{name}` reference. All measured against
     /// whistle 2.10.8 first.
@@ -761,6 +835,7 @@ mod tests {
                 client_ip: None,
                 client_port: None,
                 res: None,
+                values: &NO_VALUES,
             }
         }
         assert_eq!(
@@ -794,6 +869,47 @@ mod tests {
         assert_eq!(run_rules_script("var unused = 1;", &ctx("")).as_deref(), Some(""));
     }
 
+    /// The context `reqScript.md` prints, in the three pieces this port had to
+    /// build: `render`/`tpl`, `getValue`, and `isLocalAddress`.
+    #[test]
+    fn a_script_renders_a_template_and_reads_a_value() {
+        let mut store = std::collections::HashMap::new();
+        store.insert("mock".to_string(), "from-store".to_string());
+        store.insert(
+            crate::rules::inline_key("block.txt", "Default"),
+            "from-fence".to_string(),
+        );
+        let ctx = RulesScriptCtx {
+            method: "GET",
+            full_url: "http://a.com/",
+            headers: &[],
+            body: "",
+            client_ip: None,
+            client_port: None,
+            res: None,
+            values: &store,
+        };
+        let push = |expr: &str| {
+            run_rules_script(&format!("rules.push('a.com reqHeaders://x=' + ({expr}))"), &ctx)
+        };
+        // `tpl` is whistle's own micro-template: `<%= … %>` interpolates and
+        // `<% … %>` is code, and a string carrying neither comes back as it was.
+        assert_eq!(push("render('<%=a%>-<%=b%>', {a:1,b:2})").as_deref(), Some("a.com reqHeaders://x=1-2"));
+        assert_eq!(push("render('<% if (a) { %>yes<% } else { %>no<% } %>', {a:0})").as_deref(), Some("a.com reqHeaders://x=no"));
+        assert_eq!(push("render('plain')").as_deref(), Some("a.com reqHeaders://x=plain"));
+        assert_eq!(push("tpl === render").as_deref(), Some("a.com reqHeaders://x=true"));
+        // `getValue` answers from the store, by the plain name for an inline
+        // block as well as for a Values entry.
+        assert_eq!(push("getValue('mock')").as_deref(), Some("a.com reqHeaders://x=from-store"));
+        assert_eq!(push("getValue('block.txt')").as_deref(), Some("a.com reqHeaders://x=from-fence"));
+        assert_eq!(push("getValue('nope')").as_deref(), Some("a.com reqHeaders://x=undefined"));
+        // `isLocalAddress` knows the loopback range and the two spellings of
+        // the unspecified address; a public address is not local.
+        assert_eq!(push("isLocalAddress('127.0.0.1')").as_deref(), Some("a.com reqHeaders://x=true"));
+        assert_eq!(push("isLocalAddress('[::1]')").as_deref(), Some("a.com reqHeaders://x=true"));
+        assert_eq!(push("isLocalAddress('8.8.8.8')").as_deref(), Some("a.com reqHeaders://x=false"));
+    }
+
     /// A `resScript` sees the response head; a request script sees empty strings
     /// there, so `statusCode == 200` is false in the request pass.
     #[test]
@@ -807,6 +923,7 @@ mod tests {
             client_ip: None,
             client_port: None,
             res: Some(res),
+            values: &NO_VALUES,
         };
         assert_eq!(
             run_rules_script(
@@ -824,6 +941,7 @@ mod tests {
             client_ip: None,
             client_port: None,
             res: None,
+            values: &NO_VALUES,
         };
         assert_eq!(
             run_rules_script(
