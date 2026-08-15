@@ -1978,7 +1978,7 @@ example.com/old    locationHref://replace:/new
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `pauseSend`/`pauseReceive` (hold one direction until the console releases it), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection), `hide`/`show` (keep a request out of the capture, or put it back — see below) |
+| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `pauseSend`/`pauseReceive` (hold one direction until the console releases it), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection), `hide`/`show` (keep a request out of the capture, or put it back — see below), `websocket` (read an upgrade as WebSocket whatever it calls itself) |
 | `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Add HTTP response trailer headers (forces chunked) — see below |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
@@ -2022,6 +2022,15 @@ connection — see
 
 A flag this port does not recognise is **inert** — it parses and does nothing,
 rather than failing the rule.
+
+#### `websocket` — an upgrade that does not say `websocket`
+
+Some clients speak WebSocket under a name of their own: `Upgrade: ws`, a vendor
+string, a typo. Both proxies tunnel such a connection as opaque bytes and
+surface no frames, and both take `enable://websocket` as the instruction to
+read it as WebSocket anyway — upstream's test is
+`socket.enable.websocket || util.isWebSocket(headers)`
+(`_original/lib/https/index.js:81`), and this port's is the same expression.
 
 #### `hide` — a request the console never hears about
 

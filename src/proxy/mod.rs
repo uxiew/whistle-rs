@@ -1996,6 +1996,56 @@ async fn run_console(state: Arc<AppState>, port: u16) -> Result<()> {
 }
 
 #[cfg(test)]
+mod websocket_flag_tests {
+    use super::*;
+
+    fn req(upgrade: Option<&str>) -> Request<DynBody> {
+        let mut b = Request::builder().method("GET").uri("http://a.com/ws");
+        if let Some(u) = upgrade {
+            b = b.header(hyper::header::UPGRADE, u);
+        }
+        b.body(body::empty()).expect("request")
+    }
+
+    fn resolved(rules: &str) -> Resolved {
+        let mut m = RuleManager::new();
+        m.set_text(rules);
+        let info = apply::build_req_info(
+            "GET",
+            "http",
+            "a.com",
+            80,
+            "/ws",
+            &hyper::HeaderMap::new(),
+            None,
+        );
+        m.resolve(&info)
+    }
+
+    /// `enable://websocket` is the flag for a client that speaks WebSocket
+    /// under a name of its own: upstream reads
+    /// `socket.enable.websocket || util.isWebSocket(headers)`
+    /// (`_original/lib/https/index.js:81`), so the header decides unless the
+    /// flag overrules it.
+    #[test]
+    fn a_nonstandard_upgrade_is_a_websocket_when_the_flag_says_so() {
+        let none = resolved("");
+        assert!(is_websocket(&req(Some("websocket")), &none));
+        assert!(is_websocket(&req(Some("WebSocket")), &none));
+        assert!(!is_websocket(&req(Some("ws-custom")), &none));
+        assert!(!is_websocket(&req(None), &none));
+
+        let on = resolved("a.com enable://websocket");
+        assert!(is_websocket(&req(Some("ws-custom")), &on));
+        assert!(is_websocket(&req(None), &on));
+        // `disable://` beats it, as it beats every flag (`isEnable`,
+        // `_original/lib/util/index.js:678-680`).
+        let off = resolved("a.com enable://websocket\na.com disable://websocket");
+        assert!(!is_websocket(&req(Some("ws-custom")), &off));
+    }
+}
+
+#[cfg(test)]
 mod hide_tests {
     use super::*;
 
@@ -4766,7 +4816,17 @@ fn asks_to_upgrade(headers: &hyper::HeaderMap) -> bool {
 
 /// True if the upgrade handshake targets the WebSocket protocol (as opposed to
 /// some other `Upgrade:` protocol we should tunnel opaquely).
-fn is_websocket(req: &Request<DynBody>) -> bool {
+///
+/// `enable://websocket` says yes whatever the header says. Some clients speak
+/// WebSocket under a name of their own — `Upgrade: ws`, a vendor string — and
+/// upstream's read of the flag is exactly this one:
+/// `socket.enable.websocket || util.isWebSocket(headers)`
+/// (`_original/lib/https/index.js:81`). Without it such a connection is a byte
+/// stream in both proxies, and its frames are never surfaced.
+fn is_websocket(req: &Request<DynBody>, resolved: &Resolved) -> bool {
+    if apply::is_enabled(resolved, "websocket") {
+        return true;
+    }
     req.headers()
         .get(hyper::header::UPGRADE)
         .and_then(|v| v.to_str().ok())
@@ -4798,7 +4858,7 @@ async fn serve_upgrade(
 ) -> Result<Response<DynBody>> {
     let target = apply::resolve_target(info, dest, forwarding).await?;
     let frame_script = resolved.value("frameScript").and_then(script::load_script);
-    let websocket = is_websocket(&req);
+    let websocket = is_websocket(&req, resolved);
     // Which plugins may hook this session's frames. Resolving the plan contacts
     // nothing and allocates nothing unless a rule named a registered plugin;
     // the plugins themselves are dialled later, from inside the tunnel.

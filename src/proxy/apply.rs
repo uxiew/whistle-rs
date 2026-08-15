@@ -1433,7 +1433,7 @@ pub fn disabled_flags(resolved: &Resolved) -> std::collections::HashSet<String> 
 /// `cors` has no `enable` reader upstream at all. Those three keep the direct
 /// read. A blanket conversion broke the second of them and an existing test
 /// caught it — the test had the real semantics pinned.
-fn is_enabled(resolved: &Resolved, flag: &str) -> bool {
+pub(crate) fn is_enabled(resolved: &Resolved, flag: &str) -> bool {
     enabled_flags(resolved).contains(flag) && !disabled_flags(resolved).contains(flag)
 }
 
