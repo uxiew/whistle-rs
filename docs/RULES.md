@@ -2103,6 +2103,7 @@ with the reason. They parse and do nothing.
 | `dnsCache` | turn whistle's DNS cache off | there is no DNS cache here to turn off, so the flag's effect is already the default |
 | `clientCert`, `requestCert` | make the forged server ask the **client** for a certificate (mTLS) | not implemented. A client configured for mutual TLS fails against this port where it works against whistle; the missing half is a client-certificate store, not the flag |
 | `forceResWrite` | nothing: only `forceReqWrite` is ever read, on **both** sides (`_original/lib/inspectors/req.js:604`, `res.js:1300`) | the flag exists in the documentation and not in the program |
+| `timeout` (as `disable://timeout`) | nothing: the name appears in no source file of whistle 2.10.8 | the same — a documented flag the program never reads |
 
 > **A response-body operator busts the request cache on its own.** Any of
 > `resBody`, `resPrepend`, `resAppend`, `resReplace`, `resMerge`, the
