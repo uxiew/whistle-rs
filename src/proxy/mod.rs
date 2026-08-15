@@ -4718,7 +4718,8 @@ async fn serve(
             // they are already in memory and were never read from a socket.
             Some(new) => collected = Some((Bytes::from(new.clone()), None)),
             None => {
-                match collect_capped_body(body, state.config.body_rewrite_cap).await? {
+                let cap = apply::res_body_limit(&resolved, state.config.body_rewrite_cap);
+                match collect_capped_body(body, cap).await? {
                     body::Capped::Whole { bytes, trailers } => {
                         collected = Some((bytes, trailers));
                     }
@@ -4735,7 +4736,7 @@ async fn serve(
                              not apply. Raise --body-rewrite-limit to allow it",
                             info.method,
                             info.full_url,
-                            state.config.body_rewrite_cap,
+                            cap,
                         );
                         streamed = Some(body);
                     }

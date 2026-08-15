@@ -2959,6 +2959,28 @@ the boundary belongs to the plain URL-fragment form — and the way to forbid th
 tail is the trailing `$` the same section documents. Measured on whistle 2.10.8
 and matched here; `cases-patterns.js` carries both halves.
 
+### How big a body a merge may read
+
+`resMerge://` is skipped over a response larger than 2 MB upstream, and
+`enable://resMergeBigData` or `lineProps://enableBigData` on the line raises
+that to 16 MB (`MAX_RES_SIZE` / `BIG_MAX_RES_SIZE`,
+`_original/lib/inspectors/res.js:21-22,:1013`). The request side is the same
+shape with `reqMergeBigData` (`req.js:19-20,:163`).
+
+Here the bound is one knob for every response operator —
+`--body-rewrite-limit`, 16 MB by default, which is already upstream's raised
+ceiling — so by default this port merges bodies whistle would have skipped.
+The two flags still mean something: they raise **this request's** ceiling to
+16 MB, which is what a user who lowered the knob is asking for.
+
+### `socks://` with no port is 1080
+
+[`socks.md`](https://wproxy.org/docs/rules/socks.html) says the default port is
+443, twice. It is 1080: `proxyPort = isSocks ? 1080 : isHttpsProxy ? 443 : 80`
+(`_original/lib/inspectors/res.js:284`), which is also the SOCKS default
+everywhere else. The page appears to have copied the `https-proxy` row. This
+port uses 1080, as whistle does.
+
 ### Escapes in a prop list
 
 `delete://`, `enable://` and `disable://` split their value on `|` and `&`

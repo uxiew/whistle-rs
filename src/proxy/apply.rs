@@ -5342,6 +5342,31 @@ pub fn forces_write(resolved: &Resolved) -> bool {
 /// and nothing else (`req.js:564`). Measured against the differential bench, a
 /// 3 MB JSON body with `reqMerge://{"added":1} lineProps://enableBigData` was
 /// merged by whistle and forwarded unchanged here.
+/// How much of a **response** body this request may hold in order to rewrite it.
+///
+/// Upstream has a limit per merge rather than per response: `resMerge://` is
+/// skipped over a body larger than `MAX_RES_SIZE` (2 MB), and
+/// `enable://resMergeBigData` or `lineProps://enableBigData` on the line raises
+/// it to `BIG_MAX_RES_SIZE` (16 MB) — `res.js:21-22,:1013`.
+///
+/// Here the bound is one knob for every response operator
+/// (`--body-rewrite-limit`, 16 MB by default), so the flags cannot make a
+/// smaller default bigger for the merge alone. What they do instead is raise
+/// **this request's** ceiling to upstream's big one, which matters exactly when
+/// a user has lowered the knob: the two documented ways of saying "this body is
+/// worth reading" then say it here too.
+pub fn res_body_limit(resolved: &Resolved, configured: usize) -> usize {
+    /// `BIG_MAX_RES_SIZE` (`_original/lib/inspectors/res.js:22`).
+    const BIG: usize = 16 * 1024 * 1024;
+    let on = resolved.props("resMerge").has("enableBigData")
+        || (is_enabled(resolved, "resMergeBigData")
+            && !disabled_flags(resolved).contains("resMergeBigData"));
+    match on {
+        true => configured.max(BIG),
+        false => configured,
+    }
+}
+
 pub fn req_body_limit(resolved: &Resolved) -> usize {
     /// `BIG_MAX_REQ_SIZE` (`req.js:20`).
     const BIG: usize = 16 * 1024 * 1024;
@@ -8630,6 +8655,30 @@ mod tests {
 
     /// How much of a request body the merging operators are allowed to hold.
     ///
+    /// The response twin: `enable://resMergeBigData` and
+    /// `lineProps://enableBigData` on the `resMerge://` line raise this
+    /// request's ceiling to upstream's big one (`res.js:21-22,:1013`), which
+    /// matters when the configured knob is smaller.
+    #[test]
+    fn the_response_merge_flags_raise_this_requests_ceiling() {
+        const BIG: usize = 16 * 1024 * 1024;
+        let limit = |rules: &str, configured: usize| {
+            res_body_limit(&resolve(rules, "http://example.com/"), configured)
+        };
+        assert_eq!(limit("example.com resMerge://{\"a\":1}\n", 1024), 1024);
+        assert_eq!(
+            limit("example.com resMerge://{\"a\":1} lineProps://enableBigData\n", 1024),
+            BIG
+        );
+        assert_eq!(limit("example.com enable://resMergeBigData\n", 1024), BIG);
+        assert_eq!(
+            limit("example.com enable://resMergeBigData\nexample.com disable://resMergeBigData\n", 1024),
+            1024
+        );
+        // A ceiling already higher than upstream's stays where it is.
+        assert_eq!(limit("example.com enable://resMergeBigData\n", BIG * 2), BIG * 2);
+    }
+
     /// `lineProps://enableBigData` on the `reqMerge://` line raises it, exactly
     /// as `enable://reqMergeBigData` does — upstream passes the one straight
     /// into the place it reads the other (`handleParams`,
