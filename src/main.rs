@@ -82,6 +82,23 @@ struct Cli {
     #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_DAYS)]
     persist_days: u32,
 
+    /// How many captured requests to keep (whistle's `-R/--reqCacheSize`).
+    ///
+    /// Values below the default are ignored, as they are upstream — its own
+    /// floor is `if (!(size > 0) || size < 600) size = 600`
+    /// (`_original/lib/util/data-server.js:10-12`).
+    #[arg(short = 'R', long, default_value_t = whistle_rs::config::DEFAULT_REQ_CACHE_SIZE)]
+    req_cache_size: usize,
+
+    /// How many captured WebSocket frames to keep (whistle's
+    /// `-F/--frameCacheSize`).
+    ///
+    /// Upstream compares against **720** and falls back to 600, so a value
+    /// between 1 and 719 buys nothing there and nothing here
+    /// (`data-server.js:14-16`).
+    #[arg(short = 'F', long, default_value_t = whistle_rs::config::DEFAULT_FRAME_CACHE_SIZE)]
+    frame_cache_size: usize,
+
     /// Do not decrypt HTTPS: relay every TLS connection untouched.
     ///
     /// The connection is still *routed* by its rules — `host://` and the proxy
@@ -240,6 +257,8 @@ async fn main() -> Result<()> {
         body_rewrite_cap: cli.body_rewrite_limit,
         persist_sessions: !cli.no_persist,
         persist_days: cli.persist_days,
+        req_cache_size: whistle_rs::config::clamp_req_cache_size(cli.req_cache_size),
+        frame_cache_size: whistle_rs::config::clamp_frame_cache_size(cli.frame_cache_size),
         timeout_ms: cli.timeout,
         intercept_https: !cli.no_intercept_https,
         ..Config::default()
@@ -330,7 +349,7 @@ async fn main() -> Result<()> {
         let sessions_dir = state.config.sessions_dir();
         let loaded = whistle_rs::proxy::persist::SessionStore::load(
             &sessions_dir,
-            whistle_rs::proxy::MAX_SESSIONS,
+            state.config.req_cache_size,
         );
         if !loaded.is_empty() {
             let max_id = loaded.iter().map(|s| s.id).max().unwrap_or(0);

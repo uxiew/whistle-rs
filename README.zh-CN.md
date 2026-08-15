@@ -244,6 +244,8 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `--body-preview-limit <BYTES>` | 每条事务保留的 Body 预览上限字节数 | `16384` |
 | `--no-persist` | 关闭流量落盘（仅存内存） | 开启落盘 |
 | `--persist-days <N>` | 磁盘上保留多少天的历史 | `7` |
+| `-R, --req-cache-size <N>` | 内存里保留多少条抓包（上游的 `-R`）。小于默认值的会被忽略，上游也是这么做的 | `600` |
+| `-F, --frame-cache-size <N>` | 内存里保留多少个 WebSocket 帧（上游的 `-F`）。上游那道下限是拿 720 去比、落回 600，中间这一段等于没设 | `600` |
 | `--insecure-upstream` | **不**校验源站 TLS 证书。与上游不同，whistle-rs 默认校验 —— 见 [源站证书校验](docs/RULES.md#origin-certificate-verification) | 校验开启 |
 | `--no-intercept-https` | 不解密 HTTPS：每条 TLS 连接原样中继，但仍按规则路由（上游写作 `-M pureProxy`） | 拦截开启 |
 | `-t, --timeout <MS>` | 到源站 / 上游代理的连接**建立**超时。已建立的连接不会被切断，流式响应不受影响。它只会**收紧**：底下还有 16 秒硬上限，所以默认值实际是 16 秒，只有设到它以下才起作用 | `360000` |

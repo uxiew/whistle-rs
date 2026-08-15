@@ -41,8 +41,10 @@ use crate::config::Config;
 use crate::rules::{ReqInfo, Resolved, RuleManager};
 use body::DynBody;
 
-/// Maximum number of captured transactions kept in memory.
-pub const MAX_SESSIONS: usize = 500;
+/// Maximum number of captured transactions kept in memory, when nothing says
+/// otherwise — [`crate::config::Config::req_cache_size`] is what the running
+/// proxy reads, and `-R/--req-cache-size` is how a user changes it.
+pub const MAX_SESSIONS: usize = crate::config::DEFAULT_REQ_CACHE_SIZE;
 
 /// Request header that marks a request as *whistle-internal*: issued by the
 /// proxy (or its tooling) rather than by a client being debugged. It is what
@@ -124,10 +126,6 @@ fn take_composer_marker(headers: &mut hyper::HeaderMap) -> bool {
         None => false,
     }
 }
-
-/// Maximum number of captured WebSocket frames kept in memory (across all
-/// connections). Whistle surfaces every frame; we keep a bounded ring buffer.
-const MAX_FRAMES: usize = 2000;
 
 /// Collect a whole [`DynBody`] into memory. Its boxed error type is unsized, so
 /// it needs flattening before `?` can carry it into `anyhow`.
@@ -257,7 +255,8 @@ impl AppState {
             store.persist(&session);
         }
         let mut q = self.sessions.lock().unwrap();
-        if q.len() >= MAX_SESSIONS {
+        let cap = self.config.req_cache_size.max(1);
+        while q.len() >= cap {
             q.pop_front();
         }
         q.push_back(session);
@@ -273,7 +272,8 @@ impl AppState {
     /// Record one captured WebSocket frame in the bounded ring buffer.
     pub fn record_frame(&self, frame: WsFrame) {
         let mut q = self.ws_frames.lock().unwrap();
-        if q.len() >= MAX_FRAMES {
+        let cap = self.config.frame_cache_size.max(1);
+        while q.len() >= cap {
             q.pop_front();
         }
         q.push_back(frame);

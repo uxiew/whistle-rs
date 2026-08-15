@@ -270,6 +270,8 @@ CA.
 | `--body-preview-limit <BYTES>` | Max captured body bytes kept per transaction | `16384` |
 | `--no-persist` | Disable session persistence (in-memory only) | persist on |
 | `--persist-days <N>` | Days of session history to retain on disk | `7` |
+| `-R, --req-cache-size <N>` | Captured requests kept in memory (whistle's `-R`). Values under the default are ignored, as upstream ignores them | `600` |
+| `-F, --frame-cache-size <N>` | Captured WebSocket frames kept in memory (whistle's `-F`). Upstream's floor is written against 720 and lands on 600, so anything between is the default | `600` |
 | `--insecure-upstream` | Do **not** verify the origin's TLS certificate. whistle-rs verifies by default, unlike upstream — see [Origin certificate verification](docs/RULES.md#origin-certificate-verification) | verify on |
 | `--no-intercept-https` | Do not decrypt HTTPS: relay every TLS connection untouched, still routing it by its rules (whistle's `-M pureProxy`) | intercept on |
 | `-t, --timeout <MS>` | How long a connection to an origin or upstream proxy may take to *establish*. Never cuts short a connection that did establish, so streams are unaffected. It only ever **tightens**: a hard 16s ceiling sits underneath, so the default means 16s and this matters only below that | `360000` |

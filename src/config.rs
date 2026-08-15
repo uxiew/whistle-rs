@@ -47,6 +47,15 @@ pub struct Config {
     pub persist_sessions: bool,
     /// Number of days of session JSONL files to retain.
     pub persist_days: u32,
+    /// How many captured transactions to keep in memory — whistle's
+    /// `-R/--reqCacheSize`. Floored at 600 there and here
+    /// (`_original/lib/util/data-server.js:10-12`).
+    pub req_cache_size: usize,
+    /// How many captured WebSocket frames to keep in memory — whistle's
+    /// `-F/--frameCacheSize`. Upstream's floor is the odd one: anything under
+    /// **720** becomes 600 (`data-server.js:14-16`), so the flag can only ever
+    /// raise the number.
+    pub frame_cache_size: usize,
 }
 
 impl Config {
@@ -87,6 +96,8 @@ impl Default for Config {
             body_rewrite_cap: DEFAULT_BODY_REWRITE_CAP,
             persist_sessions: true,
             persist_days: DEFAULT_PERSIST_DAYS,
+            req_cache_size: DEFAULT_REQ_CACHE_SIZE,
+            frame_cache_size: DEFAULT_FRAME_CACHE_SIZE,
         }
     }
 }
@@ -114,3 +125,54 @@ pub const DEFAULT_BODY_REWRITE_CAP: usize = 16 * 1024 * 1024;
 
 /// Default number of days to retain persisted session files.
 pub const DEFAULT_PERSIST_DAYS: u32 = 7;
+
+/// Captured transactions kept in memory, and whistle's own default and floor
+/// (`-R/--reqCacheSize`, `_original/lib/util/data-server.js:10-12`). This port
+/// used to keep 500, so the console showed a shorter history than whistle's for
+/// the same traffic.
+pub const DEFAULT_REQ_CACHE_SIZE: usize = 600;
+
+/// Captured WebSocket frames kept in memory (`-F/--frameCacheSize`,
+/// `data-server.js:14-16`). 600 is upstream's default; its floor is written
+/// against **720**, so a smaller flag value lands back on 600 rather than on
+/// itself — see [`Config::frame_cache_size`].
+pub const DEFAULT_FRAME_CACHE_SIZE: usize = 600;
+
+/// Apply whistle's floor to a `-R` value: under its default, the default wins.
+pub fn clamp_req_cache_size(n: usize) -> usize {
+    n.max(DEFAULT_REQ_CACHE_SIZE)
+}
+
+/// Apply whistle's floor to a `-F` value. The comparison is against 720 and the
+/// result is 600 — upstream's own asymmetry, kept because a user who copies a
+/// `-F 700` from one proxy to the other should get the same buffer.
+pub fn clamp_frame_cache_size(n: usize) -> usize {
+    match n >= 720 {
+        true => n,
+        false => DEFAULT_FRAME_CACHE_SIZE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two capture caps, and the floors whistle applies to them
+    /// (`_original/lib/util/data-server.js:10-16`). The `-F` floor is written
+    /// against 720 and answers 600, which is upstream's own asymmetry rather
+    /// than a transcription slip.
+    #[test]
+    fn a_capture_cap_cannot_be_set_below_its_floor() {
+        assert_eq!(clamp_req_cache_size(0), 600);
+        assert_eq!(clamp_req_cache_size(1), 600);
+        assert_eq!(clamp_req_cache_size(599), 600);
+        assert_eq!(clamp_req_cache_size(600), 600);
+        assert_eq!(clamp_req_cache_size(5000), 5000);
+
+        assert_eq!(clamp_frame_cache_size(0), 600);
+        assert_eq!(clamp_frame_cache_size(600), 600);
+        assert_eq!(clamp_frame_cache_size(719), 600);
+        assert_eq!(clamp_frame_cache_size(720), 720);
+        assert_eq!(clamp_frame_cache_size(5000), 5000);
+    }
+}
