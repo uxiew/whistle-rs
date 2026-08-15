@@ -109,6 +109,9 @@ interface State {
   status: ProxyStatus | null;
 
   /** Test Rules: the question, and the last answer. */
+  /** The frame the Frames panel's composer is holding. */
+  wsCompose: string;
+
   test: TestQuery;
   testResult: Explanation | null;
   testStatus: string;
@@ -194,6 +197,7 @@ export const state = reactive<State>({
   // by the proxy you are reconfiguring, so the page is reloaded far more often
   // here than in an application you would merely be using.
   compose: readStored(COMPOSE_KEY, blankComposition()),
+  wsCompose: '',
   test: readStored(TEST_KEY, blankTest()),
   testResult: null,
   testStatus: '',
@@ -461,6 +465,23 @@ export function toggleSort(key: string): void {
     state.sort.key === key
       ? { key, dir: state.sort.dir === 'asc' ? 'desc' : 'asc' }
       : { key, dir: key === 'id' || key === 'time_ms' ? 'desc' : 'asc' };
+}
+
+/**
+ * Send a frame into the selected live WebSocket session.
+ *
+ * `send` puts it on its way to the server, as if the client had sent it;
+ * `receive` on its way to the client. It is recorded like any other frame,
+ * because it is one — the peer cannot tell it from traffic.
+ */
+export async function sendWsFrame(dir: 'send' | 'receive', data: string): Promise<void> {
+  const id = state.selected;
+  if (id === null || !data) return;
+  const answer = await reach(() => api.wsSend(id, dir, data));
+  if (answer?.ok) {
+    state.wsCompose = '';
+    await loadFrames(id);
+  }
 }
 
 /**

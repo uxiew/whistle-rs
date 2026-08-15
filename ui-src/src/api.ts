@@ -340,6 +340,10 @@ export const api = {
   // apply to it and it is captured — see `send_through_self` in `webui.rs`.
   compose: (c: Composition) => postJson<ComposeResult>('/api/composer', c),
 
+  /** Send a frame into a live WebSocket session, from the console. */
+  wsSend: (id: number, dir: 'send' | 'receive', data: string) =>
+    postJson<OkResult>('/api/ws/send', { id, dir, data }),
+
   /** Test Rules: which operators a request *would* hit, without making one. */
   explain: (q: ExplainQuery) => postJson<Explanation>('/api/explain', q),
 

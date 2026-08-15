@@ -266,6 +266,14 @@ pub async fn capturing_tunnel<A, B>(
     }
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
+    // The two writers, shared with the console so it can send a frame into a
+    // live connection — the Frames panel's own Composer (`gui/network.md`).
+    // A `Mutex` rather than a channel: a frame is written whole while the lock
+    // is held, so an injected one can never interleave with a relayed one, and
+    // the ordinary path pays one uncontended lock per frame.
+    let writers = Arc::new(SessionWriters::new(uw, cw));
+    state.ws_write.lock().unwrap().insert(session, writers.clone());
+    let (uw, cw) = (writers.to_server(), writers.to_client());
     let up = tokio::spawn(pump(
         cr,
         uw,
@@ -301,6 +309,107 @@ pub async fn capturing_tunnel<A, B>(
     let _ = tokio::join!(up, down);
     if pause.is_some() {
         state.ws_pause.lock().unwrap().remove(&session);
+    }
+    // The connection is over; nothing may be written into it any more.
+    state.ws_write.lock().unwrap().remove(&session);
+}
+
+/// The two write halves of a live WebSocket session, shared with the console.
+///
+/// whistle's Frames panel can send a frame to either end of a connection that
+/// is still open (`gui/network.md`), which is the one thing a capture cannot
+/// answer on its own: what the other side *does* with a message. The writers
+/// live here for as long as the tunnel does.
+///
+/// Each half is behind its own mutex, and a frame is written whole while it is
+/// held — so an injected frame can never land inside a relayed one, and the
+/// ordinary path pays one uncontended lock per frame.
+pub struct SessionWriters {
+    to_server: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    to_client: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+}
+
+impl SessionWriters {
+    fn new<S, C>(to_server: S, to_client: C) -> Self
+    where
+        S: AsyncWrite + Unpin + Send + 'static,
+        C: AsyncWrite + Unpin + Send + 'static,
+    {
+        SessionWriters {
+            to_server: Arc::new(tokio::sync::Mutex::new(Box::new(to_server))),
+            to_client: Arc::new(tokio::sync::Mutex::new(Box::new(to_client))),
+        }
+    }
+
+    fn to_server(&self) -> SharedWriter {
+        SharedWriter { inner: self.to_server.clone() }
+    }
+
+    fn to_client(&self) -> SharedWriter {
+        SharedWriter { inner: self.to_client.clone() }
+    }
+
+    /// Write one text frame into the live connection, from the console.
+    ///
+    /// `dir` is the capture's own spelling: `"send"` puts the frame on its way
+    /// to the **server** (as if the client had sent it) and `"receive"` on its
+    /// way to the client. The frame is masked exactly as a real one from that
+    /// side would be, so neither end can tell it apart from traffic.
+    pub async fn send(&self, dir: &str, data: &[u8]) -> bool {
+        let (half, to_server) = match dir {
+            "send" => (&self.to_server, true),
+            "receive" => (&self.to_client, false),
+            _ => return false,
+        };
+        let mut w = half.lock().await;
+        write_frame(&mut *w, true, OPCODE_TEXT, data, to_server)
+            .await
+            .is_ok()
+    }
+}
+
+/// One half of a [`SessionWriters`], as the leg that owns it sees it: an
+/// ordinary `AsyncWrite` that happens to be shared.
+struct SharedWriter {
+    inner: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+}
+
+impl AsyncWrite for SharedWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let mut guard = match Box::pin(this.inner.lock()).as_mut().poll(cx) {
+            std::task::Poll::Ready(g) => g,
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        };
+        std::pin::Pin::new(&mut **guard).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let mut guard = match Box::pin(this.inner.lock()).as_mut().poll(cx) {
+            std::task::Poll::Ready(g) => g,
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        };
+        std::pin::Pin::new(&mut **guard).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let mut guard = match Box::pin(this.inner.lock()).as_mut().poll(cx) {
+            std::task::Poll::Ready(g) => g,
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        };
+        std::pin::Pin::new(&mut **guard).poll_shutdown(cx)
     }
 }
 
@@ -1901,6 +2010,47 @@ mod tests {
             assert_eq!(got.payload, b"hello server");
             finish(wire).await;
         });
+    }
+
+    /// The console's own frame: written into a live connection, masked the way
+    /// a real frame from that side would be.
+    #[tokio::test]
+    async fn the_console_can_write_into_a_live_session() {
+        let (to_server, mut server) = tokio::io::duplex(4096);
+        let (to_client, mut client) = tokio::io::duplex(4096);
+        let writers = SessionWriters::new(to_server, to_client);
+
+        assert!(writers.send("send", b"to the server").await);
+        let frame = read_frame(&mut server).await.expect("read").expect("frame");
+        assert_eq!(frame.opcode, OPCODE_TEXT);
+        assert_eq!(frame.payload, b"to the server");
+
+        assert!(writers.send("receive", b"to the client").await);
+        let frame = read_frame(&mut client).await.expect("read").expect("frame");
+        assert_eq!(frame.payload, b"to the client");
+
+        // A direction nobody has is not a direction.
+        assert!(!writers.send("sideways", b"nowhere").await);
+    }
+
+    /// A frame from the client is **masked** and one from the server is not
+    /// (RFC 6455 §5.3), and the console's frames have to look the same or the
+    /// peer would know where they came from.
+    #[tokio::test]
+    async fn a_console_frame_is_masked_like_a_real_one() {
+        let (to_server, mut server) = tokio::io::duplex(4096);
+        let (to_client, mut client) = tokio::io::duplex(4096);
+        let writers = SessionWriters::new(to_server, to_client);
+
+        writers.send("send", b"abc").await;
+        let mut head = [0u8; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut head).await.expect("head");
+        assert_eq!(head[1] & 0x80, 0x80, "a client frame is masked");
+
+        writers.send("receive", b"abc").await;
+        let mut head = [0u8; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut head).await.expect("head");
+        assert_eq!(head[1] & 0x80, 0, "a server frame is not masked");
     }
 
     /// Only whole messages can be dropped outright.

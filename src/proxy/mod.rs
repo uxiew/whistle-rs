@@ -216,6 +216,14 @@ pub struct AppState {
     /// here, and the tunnel removes its own when it ends, so this holds exactly
     /// the connections someone is waiting on — see [`ws::SessionPause`].
     pub ws_pause: Mutex<HashMap<u64, Arc<ws::SessionPause>>>,
+    /// The live WebSocket sessions the console can write into — one entry per
+    /// intercepted connection, removed when it ends.
+    ///
+    /// whistle's Frames panel has a Composer that sends a frame to either end
+    /// of a live connection (`gui/network.md`), which is the one thing a
+    /// capture cannot tell you: what the *other* side does with a message you
+    /// have not seen it receive. See [`ws::SessionWriters`].
+    pub ws_write: Mutex<HashMap<u64, Arc<ws::SessionWriters>>>,
     next_id: AtomicU64,
     /// Optional session persistence (JSONL on disk).
     session_store: Option<persist::SessionStore>,
@@ -254,6 +262,7 @@ impl AppState {
             sessions: Mutex::new(VecDeque::new()),
             ws_frames: Mutex::new(VecDeque::new()),
             ws_pause: Mutex::new(HashMap::new()),
+            ws_write: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             session_store: None,
             observer: std::sync::OnceLock::new(),
@@ -1217,6 +1226,18 @@ impl WsFrame {
     /// in the same Frames panel as a WebSocket's, and the direction is the only
     /// thing that tells them apart there (`emitFrame`,
     /// `_original/lib/inspectors/data.js:67-75`).
+    /// A frame the **console** sent into a live connection.
+    ///
+    /// Recorded like any other, because it is one: it went out on the wire and
+    /// the peer cannot tell it from traffic. The direction says which way.
+    pub(crate) fn console_frame(session: u64, dir: &str, payload: &[u8]) -> Self {
+        let dir = match dir {
+            "send" => "send",
+            _ => "receive",
+        };
+        WsFrame::new(session, dir, 0x1, payload)
+    }
+
     fn body_frame(session: u64, dir: &'static str, payload: &[u8]) -> Self {
         WsFrame::new(session, dir, 0x1, payload)
     }

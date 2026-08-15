@@ -8,9 +8,12 @@
 
 import { computed, onUnmounted, watch } from 'vue';
 import type { WsFrame } from '../api';
-import { loadFrames, releaseWsDir, state } from '../store';
+import { loadFrames, releaseWsDir, sendWsFrame, state } from '../store';
 
 defineProps<{ frames: WsFrame[] | null }>();
+
+/** Is the connection still open? Only then can a frame be sent into it. */
+const live = computed(() => !!state.wsPause?.live);
 
 /** The directions this connection is currently holding, if it is still live. */
 const holds = computed(() => {
@@ -41,6 +44,26 @@ onUnmounted(() => clearInterval(timer));
 </script>
 
 <template>
+  <!-- The Frames composer: a message to either end of a connection that is
+       still open. It is the one thing a capture cannot answer on its own —
+       what the *other* side does with something it has not been sent yet. -->
+  <div v-if="live" class="ws-compose">
+    <input
+      v-model="state.wsCompose"
+      class="ws-input"
+      spellcheck="false"
+      placeholder="a frame to send…"
+      aria-label="Frame to send"
+      @keydown.enter="sendWsFrame('send', state.wsCompose)"
+    />
+    <button class="btn tiny" :disabled="!state.wsCompose" @click="sendWsFrame('send', state.wsCompose)">
+      ▲ To server
+    </button>
+    <button class="btn tiny" :disabled="!state.wsCompose" @click="sendWsFrame('receive', state.wsCompose)">
+      ▼ To client
+    </button>
+  </div>
+
   <div v-if="holds.length" class="holds">
     <div v-for="h in holds" :key="h.dir" class="hold">
       <span class="dir" :class="h.dir">{{ h.dir === 'send' ? '▲ send' : '▼ recv' }}</span>
@@ -68,3 +91,19 @@ onUnmounted(() => clearInterval(timer));
     </div>
   </div>
 </template>
+
+<style scoped>
+.ws-compose {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+}
+.ws-input {
+  flex: 1;
+  min-width: 6rem;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+</style>

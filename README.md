@@ -58,7 +58,8 @@ module-for-module onto it (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
   **Test Rules** pane answers the question a rules file poses most often — which
   operators a request *would* hit — without sending anything, the same answer
   `whistle-rs explain` gives on the command line and whistle's own Test Rules
-  dialog gives there.
+  dialog gives there. The Frames tab can **send a frame** into a connection that
+  is still open, to either end.
 - **Rules editor with syntax highlighting** — CodeMirror 6 with a whistle-specific mode
   that marks *which token the proxy will match on*, which is the one thing a rules
   file gets wrong silently. The mode runs the parser's own line split, and a test

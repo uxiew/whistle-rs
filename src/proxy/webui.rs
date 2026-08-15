@@ -56,6 +56,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
         ("GET", "/api/ws/status") => ws_status(state, &req),
         ("POST", "/api/ws/release") => ws_release(state, req).await,
+        ("POST", "/api/ws/send") => ws_send(state, req).await,
         // Takes a body now: the console can forget just the rows it selected.
         ("POST", "/api/sessions/clear") => sessions_clear(state, req).await,
         ("GET", "/api/status") => status_json(state).await,
@@ -706,8 +707,13 @@ fn ws_status(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody
         Some(d) => serde_json::json!({ "paused": d.paused(), "held": d.held() }),
         None => serde_json::json!({ "paused": false, "held": 0 }),
     };
+    // `live` used to mean "somebody is holding this one", because a pause was
+    // the only reason to register a session. It now means what it says: the
+    // connection is open, which is also what decides whether a frame can be
+    // sent into it.
+    let open = want.is_some_and(|id| state.ws_write.lock().unwrap().contains_key(&id));
     let body = serde_json::json!({
-        "live": found.is_some(),
+        "live": open || found.is_some(),
         "send": dir(found.as_ref().map(|p| &p.send)),
         "receive": dir(found.as_ref().map(|p| &p.receive)),
     });
@@ -741,6 +747,44 @@ async fn ws_release(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
     let released = gate.release();
     tracing::info!("released {released} held {name} frame(s) of session {id}");
     json_value(&serde_json::json!({ "ok": true, "released": released }))
+}
+
+/// Send a frame into a **live** WebSocket session, from the console.
+///
+/// whistle's Frames panel has the same control (`gui/network.md`): a message to
+/// either end of a connection that is still open, which is the one thing a
+/// capture cannot answer on its own — what the other side *does* with a message
+/// it has not been sent yet.
+///
+/// `dir` is the capture's own spelling, so it reads the same as the frame list:
+/// `send` puts the frame on its way to the **server**, as if the client had
+/// sent it, and `receive` on its way to the client. The frame is masked the way
+/// a real one from that side would be, so neither end can tell it apart.
+async fn ws_send(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(id) = payload.get("id").and_then(|v| v.as_u64()) else {
+        return json_error("id is required");
+    };
+    let dir = payload.get("dir").and_then(|v| v.as_str()).unwrap_or("");
+    if dir != "send" && dir != "receive" {
+        return json_error("dir must be \"send\" or \"receive\"");
+    }
+    let data = payload.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    let found = state.ws_write.lock().unwrap().get(&id).cloned();
+    let Some(writers) = found else {
+        return json_error("no live WebSocket session with that id");
+    };
+    if !writers.send(dir, data.as_bytes()).await {
+        return json_error("the connection would not take it");
+    }
+    // Recorded like any other frame, because it is one — the direction says
+    // where it went, and the console shows it in the same list.
+    state.record_frame(crate::proxy::WsFrame::console_frame(id, dir, data.as_bytes()));
+    tracing::info!("console sent {} bytes into session {id} ({dir})", data.len());
+    json_value(&serde_json::json!({ "ok": true, "sent": data.len() }))
 }
 
 /// The `?id=<n>` a per-session endpoint takes.
