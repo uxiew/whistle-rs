@@ -2038,6 +2038,15 @@ further up the chain would have obeyed it. Measured against whistle 2.10.8,
 which strips those four and forwards `x-whistle-rule-name` — that one is read
 only in `multiEnv`, so `getValue` is never called for it and it survives.
 
+Three more markers go the same way, and for the same reason — they name facts
+about the *connection*, which the connection already answers:
+
+| Header | Where whistle drops it |
+|---|---|
+| `x-whistle-client-port` | `_original/lib/init.js:181`, and again on the upgrade and tunnel paths |
+| `x-whistle-alpn-protocol` | `init.js:224`, where it is consumed |
+| `x-whistle-client-id` | `res.js:717-723` — **unless** `enable://keepClientId`, which this port honours for exactly this purpose and nothing else |
+
 #### `websocket` — an upgrade that does not say `websocket`
 
 Some clients speak WebSocket under a name of their own: `Upgrade: ws`, a vendor
@@ -2111,7 +2120,7 @@ with the reason. They parse and do nothing.
 | Flag | What it does upstream | Why not here |
 |---|---|---|
 | `interceptConsole`, `hideComposer`, `hideCaptureError`, `customParser`, `bigData` | shape what whistle's own console shows — the Log panel, which rows are hidden, who renders a capture, and a 2 MB → 16 MB display cap | this port has its own console; the capture cap is `--body-preview-limit` |
-| `clientId`, `multiClient`, `keepClientId` | whistle's `x-whistle-client-id` — a header it stamps so an upstream can tell clients apart | there is no client-id concept here, and inventing one to honour a flag is the wrong way round |
+| `clientId`, `multiClient` | whistle's `x-whistle-client-id` — a header it stamps so an upstream can tell clients apart | there is no client-id concept here, and inventing one to honour a flag is the wrong way round. `keepClientId` **is** implemented, for the one thing it can mean here: keeping a client-id the *client* sent — see [Rules in a request header](#rules-in-a-request-header) |
 | `useLocalHost`, `useSafePort` | rewrite `log://` and `weinre://` URLs to whistle's own built-in host and port | those two rules point at whistle's own servers, which this port does not run |
 | `authCapture`, `tunnelHeadersFirst`, `tunnelAuthHeader` | order a plugin's `auth` hook against the HTTPS upgrade, and decide whose headers win when a plugin passed some through a tunnel | all three are about whistle's plugin API; this port's is its own — see [`PLUGINS.md`](PLUGINS.md) |
 | `flushHeaders`, `secureOptions`, `keepH2Session`, `httpH2` | Node and HTTP/2 plumbing — `response.flushHeaders()`, the h2 `options`, session reuse, and h2 to the **origin** | this port speaks HTTP/2 to clients and HTTP/1.1 upstream, and has no Node to flush |

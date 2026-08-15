@@ -3159,6 +3159,17 @@ fn the_type_table_is_the_one_whistle_carries() {
 
 /// Apply request-side operators (headers, method, ua, referer) in place.
 pub fn apply_request(parts: &mut request::Parts, resolved: &Resolved) {
+    // The client-id a client sent is not the client-id an upstream should read.
+    // whistle drops it unless the request asked to keep it — `if (clientId) { if
+    // (!options.isPlugin && !req._customClientId && !isKeepClientId(req, …))
+    // removeClientId(optHeaders) }` (`_original/lib/inspectors/res.js:717-723`).
+    // This port has no client-id of its own to put in its place (see
+    // `docs/RULES.md`, the flags it does not implement), so the header simply
+    // goes — and `enable://keepClientId`, which does nothing else here, is
+    // honoured for this one purpose.
+    if !is_enabled(resolved, "keepClientId") {
+        parts.headers.remove("x-whistle-client-id");
+    }
     apply_header_ops(&mut parts.headers, resolved, "reqHeaders");
 
     // Both go through the same `setHeader` assignment upstream
@@ -11788,6 +11799,35 @@ mod tests {
     /// The upstream target `rules` produce for `url`.
     fn target(rules: &str, url: &str) -> Target {
         try_target(rules, url).unwrap_or_else(|e| panic!("resolve_target: {e:#}"))
+    }
+
+    /// A client-id a client sent is dropped, unless the request asked to keep
+    /// it (`removeClientId`, `_original/lib/inspectors/res.js:717-723`).
+    /// Measured on both proxies, with and without the flag.
+    #[test]
+    fn a_client_id_from_the_client_does_not_travel_on() {
+        let sent = |rules: &str| {
+            let resolved = resolve(rules, "http://example.com/a");
+            let req = hyper::Request::builder()
+                .method("GET")
+                .uri("http://example.com/a")
+                .header("x-whistle-client-id", "cid")
+                .body(())
+                .expect("request");
+            let (mut parts, ()) = req.into_parts();
+            apply_request(&mut parts, &resolved);
+            parts
+                .headers
+                .get("x-whistle-client-id")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(sent("example.com reqHeaders://x-a=1"), None);
+        assert_eq!(sent("example.com enable://keepClientId").as_deref(), Some("cid"));
+        // `disable://` beats it, as it beats every flag.
+        assert_eq!(
+            sent("example.com enable://keepClientId\nexample.com disable://keepClientId"),
+            None
+        );
     }
 
     /// `auto2http` — `host.md`'s convenience, and the three ways to reach it.

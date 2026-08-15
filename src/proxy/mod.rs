@@ -137,14 +137,29 @@ pub const HEADER_RULE_HEADERS: [&str; 4] = [
     "x-whistle-key-value",
 ];
 
+/// Proxy-internal markers a client may not forge.
+///
+/// `x-whistle-client-port` is deleted the moment a request is read
+/// (`_original/lib/init.js:181`, and again on the upgrade and tunnel paths);
+/// `x-whistle-alpn-protocol` is deleted where it is consumed (`init.js:224`).
+/// Both name facts about the *connection*, which the connection already
+/// answers — a client sending them is either an upstream whistle (whose values
+/// this port does not read) or someone spoofing them at the origin.
+///
+/// `x-whistle-client-id` is not here because it survives
+/// `enable://keepClientId`, and that is decided from the rules — see
+/// [`apply::apply_request`].
+pub const CONNECTION_MARKER_HEADERS: [&str; 2] =
+    ["x-whistle-client-port", "x-whistle-alpn-protocol"];
+
 /// Remove [`HEADER_RULE_HEADERS`] from a request on its way in.
 ///
 /// The values are dropped rather than used: reading them is what upstream gates
 /// behind `enableRequestHeaderRules`, and this port has no such mode — so the
 /// headers do nothing here, and now they do nothing *at the origin* too.
 fn take_header_rules(headers: &mut hyper::HeaderMap) {
-    for name in HEADER_RULE_HEADERS {
-        headers.remove(name);
+    for name in HEADER_RULE_HEADERS.iter().chain(&CONNECTION_MARKER_HEADERS) {
+        headers.remove(*name);
     }
 }
 
@@ -6407,11 +6422,17 @@ mod req_origin_tests {
                 "a.com file://(x)".parse().unwrap(),
             );
         }
+        for name in CONNECTION_MARKER_HEADERS {
+            h.insert(
+                hyper::header::HeaderName::from_static(name),
+                "1234".parse().unwrap(),
+            );
+        }
         h.insert("x-whistle-rule-name", "n".parse().unwrap());
         h.insert("x-other", "kept".parse().unwrap());
         take_header_rules(&mut h);
-        for name in HEADER_RULE_HEADERS {
-            assert!(h.get(name).is_none(), "{name} must not survive");
+        for name in HEADER_RULE_HEADERS.iter().chain(&CONNECTION_MARKER_HEADERS) {
+            assert!(h.get(*name).is_none(), "{name} must not survive");
         }
         assert_eq!(h.get("x-whistle-rule-name").unwrap(), "n");
         assert_eq!(h.get("x-other").unwrap(), "kept");
