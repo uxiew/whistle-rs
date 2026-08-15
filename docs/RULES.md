@@ -2734,6 +2734,42 @@ api.test/data  resMerge://true            # …unless this asks for a deep fold
 
 ---
 
+### The line format, exactly
+
+A value that was **loaded** — from a ``` block, a file, a URL or the values
+store — is read as JSON, then as a query string if it holds no whitespace, then
+line by line (`_parseJSON`, `_original/lib/util/index.js:1135-1143`). The third
+road has details that are not the obvious ones, and each was measured against
+whistle 2.10.8 rather than read:
+
+| You write | It becomes | Why |
+|---|---|---|
+| `a: 123` | `{"a":123}` | a number: the first and last characters differ |
+| `a: 1`, `a: 11`, `a: 121`, `a: 0` | `{"a":"1"}` … | **text**: upstream asks `fv === lv` first, and the numeric branch is the `else` of it (`parseLine`, `common.js:1145-1157`) |
+| `a: "1"` | `{"a":"1"}` | a quoted value loses its quotes |
+| `solo` (no separator) | `{"solo":""}` | a name with an empty value |
+| `solo:` | `{"solo:":""}` | **no whitespace**, so it never reaches the line format at all — the query road reads the whole token as a name, and a header called `solo:` is not a token, so nothing is sent |
+
+Two more are seen only by `reqMerge://` / `resMerge://`, because
+`RESOLVE_KEY_RE` is tested against the matcher *as written* — the same value
+under `params://` keeps its dots:
+
+| You write | It becomes |
+|---|---|
+| `a.b.c: 1` | `{"a":{"b":{"c":"1"}}}` |
+| `c\.d: 1` | `{"c.d":"1"}` — an escaped dot is part of the name |
+| `a[0]: 1` | `{"a":["1"]}` — a **bracket** index opens an array; a dotted `a.0` opens an object |
+
+A structure merged into a **form** body is written as nothing (`a=`), because
+that is what Node's `querystring.stringify` does with it; a JSON body gets the
+structure itself.
+
+> **One difference remains, and it is JavaScript's.** A merged JSON object is
+> re-serialised by whistle through a JS object, and JS enumerates integer-like
+> keys first: a patch adding `0` to `{"name":"x"}` comes back
+> `{"0":…,"name":"x"}` there and `{"name":"x","0":…}` here. Reordering a user's
+> JSON to imitate a language's property order is worse than the difference.
+
 ### A status value that is not a status
 
 `statusCode://` and `replaceStatus://` take a number. Given anything else —
