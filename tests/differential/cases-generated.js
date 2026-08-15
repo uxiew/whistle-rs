@@ -312,6 +312,47 @@ for (const [rules, values] of VALUE_LINES) {
   add(rules, 'http://example.com/a', { values });
 }
 
+// ── JSON5 shapes ───────────────────────────────────────────────────────────
+//
+// `isJson` decides whether a value is **content** or a path, and it parses with
+// `json5` rather than `JSON` (`evalJson`,
+// `_original/lib/util/common.js:1673-1695`). So the answer to "is this a mock
+// body or a filename" turns on JSON5's grammar, and every operator that reads a
+// data object turns on it twice. Each shape below is asked of both parsers.
+
+const JSON5_SHAPES = [
+  '{"a":1}',
+  "{a:1}",
+  "{a: 'one'}",
+  "{'a': 'one'}",
+  '{a:1,}',
+  '{a:1,b:[1,2,]}',
+  '{}',
+  '{ }',
+  '[1,2]',
+  '[1,2,]',
+  '{a:0x1f}',
+  '{a:.5}',
+  '{a:+1}',
+  '{a:Infinity}',
+  '{a:NaN}',
+  '{a:null}',
+  '{x-a:1}',
+  "{'x-a':1}",
+  '{a:1}extra',
+  '{a:1',
+  'a:1}',
+  '{a}',
+  '{a:}',
+  '{//c\na:1}',
+  '{/*c*/a:1}',
+];
+for (const shape of JSON5_SHAPES) {
+  for (const op of ['resBody', 'file', 'reqHeaders', 'urlParams', 'resCors', 'auth', 'reqMerge']) {
+    add(`example.com ${op}://${shape.replace(/\n/g, '\\n')}`, 'http://example.com/a');
+  }
+}
+
 // ── the response phase ─────────────────────────────────────────────────────
 //
 // The half a request cannot answer on its own. Each line carries one operator
