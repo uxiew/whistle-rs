@@ -2089,11 +2089,25 @@ body only as one preview, which for a stream that never ends is nothing at all.
   `text/event-stream; charset=utf-8` is *not* framed by default — is cut at
   every blank line, one frame per SSE event.
 * **`x-whistle-custom-frame-separator`** names any separator, on the request or
-  the response, and works for any content type: `resHeaders://(x-whistle-custom-frame-separator=%0A)`
+  the response, and works for any content type — **together with
+  `enable://captureStream`**, which is not optional:
+
+  ```
+  api.example.com enable://captureStream resHeaders://(x-whistle-custom-frame-separator=%0A)
+  ```
+
   turns a newline-delimited JSON stream into one frame per line. The value is
-  percent-decoded; a leading `/` keeps the separator on the frame it ends.
-  The header is removed before the other end sees it, whether or not it was
-  usable.
+  percent-decoded (`%0A` is a newline; the FAQ prints `%A0`, which is a
+  different byte and frames nothing); a leading `/` keeps the separator on the
+  frame it ends. The header is removed before the other end sees it, whether or
+  not it was usable.
+
+  The flag is required because the header need not have come from you: it can
+  arrive from the origin, or from a whistle further up the chain, and a header
+  somebody else sent should not decide what this proxy holds on to. Upstream
+  wants the same pair — measured through its own frames API, a separator with no
+  flag frames nothing there either, on the request side as well as the response.
+  An event stream is the exception and turns the flag on by itself.
 * **`disable://captureStream`** turns both off, and a compressed body is never
   framed — searching a deflate stream for a separator finds nothing.
 

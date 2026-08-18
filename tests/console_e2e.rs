@@ -8,10 +8,16 @@
 //! console work lives (a body shown as frames, the Test Rules pane), and it had
 //! no test that crossed a socket.
 //!
-//! The differential bench cannot cover this: whistle's console and this one are
-//! different programs with different data models, and there is nothing to
-//! compare. `cases-frames.js` covers the half that *is* comparable — what the
-//! framing does to the wire. This covers the half that is not.
+//! `cases-frames.js` covers what the framing does to the **wire**, and
+//! `frames-bench.js` covers the frames themselves — the two consoles have
+//! different data models but the question "how many frames, carrying what" is
+//! the same question, and both answer it over HTTP. (An earlier note here said
+//! that comparison was impossible. It is not, and believing it was is how a real
+//! divergence went unmeasured: a named separator framed here without the
+//! `enable://captureStream` upstream requires.)
+//!
+//! What is left for this file is what has no counterpart at all: the session id
+//! reserved before the body is built, the Test Rules API, and the refusals.
 //!
 //! Everything binds port 0 and cleans up after itself, so this runs under
 //! `cargo test` like anything else.
@@ -199,20 +205,24 @@ async fn capture_stream_can_be_turned_off() {
 /// also not reach the client: `cases-frames.js` measures that on the wire, and
 /// this measures it from the other side, where the frames exist at all.
 ///
-/// The control is the same body with no header: JSON split at `|` is not
-/// something to guess at, so a build that framed on the separator without being
-/// asked would fail here rather than pass both.
+/// **`enable://captureStream` is part of the recipe, not decoration.** Measured
+/// through whistle's own frames API: a separator header with no flag produces no
+/// frames there, on either side of the exchange, and it produces none here. The
+/// FAQ's example carries the flag for that reason — and a header that arrives
+/// from the origin, or from a whistle further up the chain, should not by itself
+/// turn on body capture in this proxy.
 #[tokio::test]
 async fn a_named_separator_cuts_any_body_into_frames() {
     const BODY: &str = "{\"a\":1}|{\"b\":2}|{\"c\":3}";
     const NAMED: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
 x-whistle-custom-frame-separator: |\r\ncontent-length: 23\r\nConnection: close\r\n\r\n\
 {\"a\":1}|{\"b\":2}|{\"c\":3}";
-    const PLAIN: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 23\r\n\
-Connection: close\r\n\r\n{\"a\":1}|{\"b\":2}|{\"c\":3}";
 
     let named = origin(NAMED).await;
-    let proxy = proxy_with(&format!("origin.test host://{named}\n")).await;
+    let proxy = proxy_with(&format!(
+        "origin.test host://{named}\norigin.test enable://captureStream\n"
+    ))
+    .await;
     let answer = through_proxy(proxy.addr(), "http://origin.test/x", "").await;
     assert!(answer.contains(BODY), "the body is forwarded whole: {answer}");
     assert!(
@@ -231,9 +241,12 @@ Connection: close\r\n\r\n{\"a\":1}|{\"b\":2}|{\"c\":3}";
     );
     proxy.shutdown().await;
 
-    // The control: the same body, nobody asking.
-    let plain = origin(PLAIN).await;
-    let proxy = proxy_with(&format!("origin.test host://{plain}\n")).await;
+    // The control, and the gate: the **same** response, the same separator, and
+    // no `enable://captureStream`. Upstream frames nothing here and neither does
+    // this — otherwise a header sent by somebody else would be deciding what
+    // this proxy holds on to.
+    let named = origin(NAMED).await;
+    let proxy = proxy_with(&format!("origin.test host://{named}\n")).await;
     let answer = through_proxy(proxy.addr(), "http://origin.test/x", "").await;
     assert!(answer.contains(BODY), "{answer}");
     let state = proxy.state().clone();

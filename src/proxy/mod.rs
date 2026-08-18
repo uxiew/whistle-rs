@@ -3163,13 +3163,25 @@ fn response_frames(
     if res_enc.is_some_and(|enc| !enc.trim().eq_ignore_ascii_case("identity")) {
         return None;
     }
-    if custom.is_some() {
-        return custom;
-    }
     let is_sse = headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.trim() == "text/event-stream");
+    // **A named separator frames only when `enable://captureStream` says so.**
+    // An event stream turns it on by itself — `captureStream = captureStream ||
+    // isSse`, and only then does a separator decide anything
+    // (`_original/lib/inspectors/data.js:329-340`). Measured through upstream's
+    // own frames API: with the header alone and no flag, whistle reports **no
+    // frames at all**, on the request side as well as the response side.
+    //
+    // Worth following rather than simplifying away, and not only for alignment:
+    // the header can arrive from the *origin*, or from a whistle further up the
+    // chain, and a header somebody else sent should not by itself turn on body
+    // capture here. That is the same call this port already made about the
+    // rules-carrying headers.
+    if custom.is_some() && (is_sse || apply::is_enabled(resolved, "captureStream")) {
+        return custom;
+    }
     is_sse.then(restream::FrameSplitter::sse)
 }
 
@@ -4451,7 +4463,14 @@ async fn serve(
     // sees it (`parseFrameSep`, `_original/lib/inspectors/data.js:77-96`).
     let mut req_frames = {
         let asked = restream::take_frame_separator(&mut parts.headers);
-        match hidden || apply::is_disabled(&resolved, "captureStream") {
+        // As on the response side, the separator only frames when
+        // `enable://captureStream` asked for it — measured, upstream reports no
+        // frames for a request separator without the flag. There is no `isSse`
+        // half here: a request body is not an event stream.
+        match hidden
+            || apply::is_disabled(&resolved, "captureStream")
+            || !apply::is_enabled(&resolved, "captureStream")
+        {
             true => None,
             false => asked,
         }

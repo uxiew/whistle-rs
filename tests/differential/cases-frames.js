@@ -6,10 +6,13 @@
 // on the request as well as the response (`parseFrameSep` / `handleResBody`,
 // `_original/lib/inspectors/data.js:67-96,:323-345`).
 //
-// **What this corpus can see, and what it cannot.** The frames themselves live
-// in each console's own data model, and those two models are not the same
-// program — nothing here can compare them. What is on the wire is comparable,
-// and it is where the risk actually is:
+// **What this corpus can see, and what it cannot.** This one is about the
+// **wire**; `frames-bench.js` is about the frames, which turned out to be
+// comparable after all — the two consoles have different data models but both
+// answer "how many frames, carrying what" over HTTP, and the note that used to
+// be here saying otherwise is how a real divergence went unmeasured for a while.
+//
+// What is on the wire is still where a particular kind of risk lives:
 //
 //   * **the separator header must not reach the other end.** Upstream deletes
 //     it inside `parseFrameSep`, which is called from a branch — so *when* it

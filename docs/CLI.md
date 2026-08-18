@@ -144,6 +144,21 @@ whistle-rs -p 8899 -n admin -w "$PASSWORD" -N guest -W look
 The login gates the console and **not** the traffic — proxying keeps working for
 clients that know nothing about it. The guest account may `GET` and nothing else.
 
+**Watching a streamed body arrive** (an LLM's tokens, a chunked JSON feed):
+
+```
+api.example.com enable://captureStream resHeaders://(x-whistle-custom-frame-separator=%0A)
+```
+
+Each line becomes a frame in the Frames panel. An event stream
+(`content-type: text/event-stream`) needs neither the flag nor the header. The
+flag is not optional for the header form — whistle wants the same pair, and a
+separator header can arrive from the origin rather than from you.
+
+> whistle's FAQ prints this example with `%A0`, which is a different byte from
+> the newline it means (`%0A`) and frames the whole body as one. Both proxies do
+> the same thing with it, so the recipe fails the same way in each.
+
 **Behind another proxy, keeping the real client address.**
 
 ```sh

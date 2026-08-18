@@ -343,6 +343,35 @@ What is left is eight operators the corpora here cannot reach — dumps, ciphers
 delays, frames, plugins — each named with the bench or the test that does reach
 it.
 
+## The frames bench
+
+`frames-bench.js` compares **the frames themselves** — how many a request
+produced, carrying what, in which direction.
+
+```sh
+PORT_BASE=19300 node oracle.js &
+cargo run -- --port 19301 --no-persist --dir /tmp/rs-frames &
+PORT_BASE=19300 node frames-bench.js
+```
+
+For a long time this file did not exist, on the reasoning that the two consoles
+are different programs with different data models and there is nothing to
+compare. The models do differ. The *question* does not, and both answer it over
+HTTP — `POST /cgi-bin/sessions` then `POST /cgi-bin/frames` there, `/sessions.json`
+then `/frames.json?id=` here. Believing otherwise cost a real divergence: this
+port framed a body on a separator header alone, where upstream also wants
+`enable://captureStream`, and nothing on the wire could tell.
+
+It compares the payloads in order, each tagged with its direction, and nothing
+else: ids, timestamps and lengths are each console's own bookkeeping. 14 cases —
+the event stream, the flag on both sides of the exchange, the leading slash that
+keeps the separator, a separator that appears nowhere, and the FAQ's own example
+including its typo (`%A0` where it means `%0A`, which frames the whole body as
+one). A clean run is `differing: 0`.
+
+`cases-frames.js` is the other half: what the framing does to the wire, where
+the risk is a splitter that eats a boundary or holds the tail.
+
 ## The mode bench
 
 `mode-bench.js` asks a different shape of question from everything else here:
