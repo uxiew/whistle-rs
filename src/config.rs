@@ -50,6 +50,22 @@ pub struct Config {
     /// unless the flag moved it, and only a *different* value starts a second
     /// server (`customUIPort`, `_original/biz/init.js:8-19`).
     pub ui_port: Option<u16>,
+    /// Whether the console answers at all — `-M headless` (and
+    /// `shadowRulesOnly`) turn it off. The root certificate and the PAC file
+    /// still answer, because a client that cannot fetch them cannot be
+    /// configured to use the proxy: upstream keeps `/cgi-bin/rootca` and
+    /// `/cgi-bin/status` answering under `headless` too, measured.
+    pub console: bool,
+    /// Whether the hostnames in [`crate::proxy::webui::BUILTIN_UI_HOSTS`] open
+    /// the console — `-M pureProxy` (and `proxyOnly`, `httpProxy`) turn it off,
+    /// which is upstream's own `if (config.pureProxy) return false` inside
+    /// `isWebUIHost`. Without a way to say no there is no way to run this as a
+    /// plain proxy that forwards those names like any other.
+    pub console_hostnames: bool,
+    /// Whether a client's own `x-forwarded-for` survives to the origin —
+    /// `-M keepXFF`. Off by default in both proxies, so a client cannot hand
+    /// the origin an address the proxy appears to vouch for.
+    pub keep_client_xff: bool,
     /// Extra hostnames that **are** the console rather than somewhere to
     /// forward to — whistle's `-l/--localUIHost`, which appends to a built-in
     /// list rather than replacing it (`uiHostList`,
@@ -119,6 +135,9 @@ impl Default for Config {
             guest_username: None,
             guest_password: None,
             ui_port: None,
+            console: true,
+            console_hostnames: true,
+            keep_client_xff: false,
             local_ui_hosts: Vec::new(),
             socks_port: None,
             plugins: HashMap::new(),
@@ -134,6 +153,151 @@ impl Default for Config {
 }
 
 /// Default preview cap: 16 KB of each body kept for inspection.
+/// What a `-M/--mode` list did, so the launch can say so out loud.
+///
+/// A whistle command line that names a mode this port cannot honour should not
+/// look like it worked. Upstream's parser silently ignores anything it does not
+/// recognise (its `forEach` has no `else`), which is fine for a program where
+/// every token means something; here the same silence would hide the difference
+/// between "applied" and "there is no such thing here".
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ModeReport {
+    /// Tokens that changed something.
+    pub honoured: Vec<String>,
+    /// Tokens upstream has and this port has nothing to apply them to.
+    pub inert: Vec<String>,
+    /// Tokens neither program knows — almost certainly a typo.
+    pub unknown: Vec<String>,
+}
+
+/// Upstream's composite modes, expanded before anything else looks at the list
+/// (`_original/lib/config.js:766-773`). `admin`'s expansion differs under
+/// `debug`, and this takes the non-debug one; the extra tokens it adds are all
+/// inert here, so the difference is not reachable.
+fn expand_mode(token: &str) -> Option<&'static [&'static str]> {
+    match token {
+        "multiple" => Some(&["multiEnv", "disableUpdateTips", "keepXFF", "x-forwarded-proto"]),
+        "admin" => Some(&[
+            "proxyServer", "master", "x-forwarded-proto", "strict", "rules",
+            "disableUpdateTips", "proxifier", "notAllowedDisablePlugins",
+        ]),
+        _ => None,
+    }
+}
+
+/// Every mode token upstream recognises and this port has nothing to do with.
+///
+/// Written out rather than left to fall through to `unknown`, because the two
+/// answers are different advice: "whistle has this and whistle-rs does not" is
+/// something to look up, and "no such mode" is a typo to fix. Grouped by why.
+const INERT_MODES: &[&str] = &[
+    // Reading rules out of request headers — a real feature, not done here.
+    // `nohost`/`multiEnv` deployments serve many environments from one proxy by
+    // letting each request carry its own rules; measured, upstream honours
+    // `x-whistle-rule-value` under any of these three.
+    "multiEnv", "multienv", "nohost", "enableRequestHeaderRules",
+    // Trusting a front proxy's forwarded headers. Measured: with these on,
+    // upstream *consumes* `x-forwarded-proto` / `x-forwarded-host` and lets them
+    // decide the scheme and the destination. Off — which is the default in both
+    // — the headers travel on untouched, which is what this port does.
+    "x-forwarded-proto", "x-forwarded-host",
+    // Console options: which switches the web UI offers, and how it looks.
+    "disableAuthUI", "disableUIAuth", "keepProxyUI", "hideLeftBar", "hideLeftMenu",
+    "allowMultipleChoice", "useMultipleRules", "enableMultipleRules",
+    "disableMultipleRules", "notAllowDisableRules", "notAllowedDisableRules",
+    "disableBackOption", "disabledBackOption", "disableMultipleOption",
+    "disabledMultipleOption", "disableRulesOptions", "disabledRulesOptions",
+    "notAllowDisablePlugins", "notAllowedDisablePlugins",
+    "notAllowEnableHTTPS", "notAllowedEnableHTTPS", "disableUpdateTips",
+    "disableCustomCerts", "showPluginReq",
+    // Which subsystem the instance is for. This port has one shape.
+    "rules", "rulesOnly", "plugins", "pluginsOnly", "network", "shadowRules",
+    "socks", "master", "client", "agent", "proxyServer", "proxifier",
+    "proxifier2", "diagnose", "encrypted", "captureData", "strict", "noGzip",
+    "INADDR_ANY", "buildIn", "build-in",
+    // DNS resolution order — `gui/online.md`'s three radio buttons.
+    "ipv6Only", "ipv6only", "ipv4First", "ipv4first", "ipv6first", "verbatim",
+    "dnsResolve", "dnsResolve4", "dnsResolve6",
+    // Node's own inspector and process shape.
+    "debug", "safe", "rejectUnauthorized",
+];
+
+impl Config {
+    /// Apply a `-M/--mode` list: `|`, `,` or `&` separated, as upstream splits
+    /// it (`newConf.mode.trim().split(/\s*[|,&]\s*/)`, `config.js:763`).
+    ///
+    /// Only the tokens a *proxy client* can tell apart are honoured, and that
+    /// set was measured rather than chosen: `tests/differential/mode-probe.js`
+    /// runs one whistle per token and reports which ones move any of nine
+    /// probes. Fifteen of the fifty-six do; they collapse into six behaviours,
+    /// four of which this port has something to apply them to.
+    pub fn apply_modes(&mut self, list: &str) -> ModeReport {
+        let mut report = ModeReport::default();
+        let mut tokens: Vec<String> = Vec::new();
+        for raw in list.split(['|', ',', '&']) {
+            let token = raw.trim();
+            if token.is_empty() {
+                continue;
+            }
+            // A composite is fully represented by what it expands to, so the
+            // name itself is not carried forward — reporting `multiple` as a
+            // thing that did nothing would be less true than reporting the four
+            // tokens it actually stands for.
+            match expand_mode(token) {
+                Some(parts) => tokens.extend(parts.iter().map(|p| p.to_string())),
+                None => tokens.push(token.to_string()),
+            }
+        }
+        for token in tokens {
+            let honoured = match token.as_str() {
+                // A plain proxy: the console stays on its own port and the three
+                // hostnames go back to being ordinary names to forward.
+                "pureProxy" | "proxyOnly" | "httpProxy" => {
+                    self.console_hostnames = false;
+                    true
+                }
+                // No console at all. The certificate and the PAC still answer.
+                "headless" | "shadowRulesOnly" => {
+                    self.console = false;
+                    true
+                }
+                // The HTTPS switch, at launch. This port intercepts by default,
+                // so the `on` spellings are the default and say so; the `off`
+                // ones are `--no-intercept-https` under whistle's name.
+                "capture" | "intercept" | "enable-capture" | "enableCapture"
+                | "enableHttps" | "enableHTTPS" | "persistentCapture" => {
+                    self.intercept_https = true;
+                    true
+                }
+                "disable-capture" | "disableCapture" => {
+                    self.intercept_https = false;
+                    true
+                }
+                // Keep the client's own `x-forwarded-for` instead of dropping
+                // it. Both proxies drop it by default so a client cannot claim
+                // an address; this is how upstream opts back in globally, and
+                // it is `enable://clientIp` for every request.
+                "keepXFF" | "forwardedFor" | "x-forwarded-for" => {
+                    self.keep_client_xff = true;
+                    true
+                }
+                _ => false,
+            };
+            let bucket = if honoured {
+                &mut report.honoured
+            } else if INERT_MODES.contains(&token.as_str()) {
+                &mut report.inert
+            } else {
+                &mut report.unknown
+            };
+            if !bucket.contains(&token) {
+                bucket.push(token);
+            }
+        }
+        report
+    }
+}
+
 pub const DEFAULT_BODY_PREVIEW_CAP: usize = 16 * 1024;
 
 /// Default ceiling on a response body held in memory to rewrite it: 16 MiB.
@@ -205,5 +369,95 @@ mod tests {
         assert_eq!(clamp_frame_cache_size(719), 600);
         assert_eq!(clamp_frame_cache_size(720), 720);
         assert_eq!(clamp_frame_cache_size(5000), 5000);
+    }
+
+    /// The four modes this port honours, and that each is honoured for every
+    /// spelling upstream gives it.
+    #[test]
+    fn the_modes_that_change_something_do() {
+        let with = |list: &str| {
+            let mut c = Config::default();
+            let r = c.apply_modes(list);
+            (c, r)
+        };
+        for token in ["pureProxy", "proxyOnly", "httpProxy"] {
+            let (c, r) = with(token);
+            assert!(!c.console_hostnames, "{token}");
+            assert!(c.console, "{token}: only the hostnames go");
+            assert_eq!(r.honoured, [token]);
+        }
+        for token in ["headless", "shadowRulesOnly"] {
+            let (c, r) = with(token);
+            assert!(!c.console, "{token}");
+            // Not the hostnames: upstream still routes them and answers 404.
+            assert!(c.console_hostnames, "{token}");
+            assert_eq!(r.honoured, [token]);
+        }
+        for token in ["capture", "intercept", "enableCapture", "enableHttps", "persistentCapture"] {
+            let (c, _) = with(token);
+            assert!(c.intercept_https, "{token}");
+        }
+        for token in ["disableCapture", "disable-capture"] {
+            let (c, _) = with(token);
+            assert!(!c.intercept_https, "{token}");
+        }
+        for token in ["keepXFF", "forwardedFor"] {
+            let (c, _) = with(token);
+            assert!(c.keep_client_xff, "{token}");
+        }
+    }
+
+    /// A list is split on any of the three separators upstream splits on, and a
+    /// token it has that this port cannot apply is reported rather than
+    /// swallowed — the whole point of the report is that a copied command line
+    /// says what happened to it.
+    #[test]
+    fn a_mode_list_is_split_and_triaged() {
+        let mut c = Config::default();
+        let r = c.apply_modes(" pureProxy , nohost | notAThing & keepXFF ");
+        assert_eq!(r.honoured, ["pureProxy", "keepXFF"]);
+        assert_eq!(r.inert, ["nohost"]);
+        assert_eq!(r.unknown, ["notAThing"]);
+        assert!(!c.console_hostnames && c.keep_client_xff);
+
+        // An empty list changes nothing and reports nothing.
+        let mut c = Config::default();
+        assert_eq!(c.apply_modes(""), ModeReport::default());
+        assert_eq!(c.apply_modes("  |  , "), ModeReport::default());
+    }
+
+    /// `multiple` and `admin` are composites upstream expands before reading
+    /// (`config.js:766-773`), so the parts have to be honoured too — `multiple`
+    /// carries `keepXFF`, and a port that only matched the composite name would
+    /// silently drop it.
+    #[test]
+    fn a_composite_mode_expands_to_its_parts() {
+        let mut c = Config::default();
+        let r = c.apply_modes("multiple");
+        assert!(c.keep_client_xff, "multiple carries keepXFF");
+        assert!(r.honoured.contains(&"keepXFF".to_string()));
+        // The rest of the expansion is real vocabulary, so it is inert and not
+        // unknown — the distinction is the advice the report gives.
+        assert!(r.inert.contains(&"multiEnv".to_string()));
+        // The composite's own name is not reported: it stands for its parts and
+        // they are what happened.
+        assert!(!r.inert.contains(&"multiple".to_string()));
+        assert!(r.unknown.is_empty(), "{r:?}");
+
+        let mut c = Config::default();
+        let r = c.apply_modes("admin");
+        assert!(r.unknown.is_empty(), "admin expands to known tokens: {r:?}");
+    }
+
+    /// The last word wins when two tokens in one list disagree, which is what
+    /// reading them left to right means.
+    #[test]
+    fn a_later_mode_overrides_an_earlier_one() {
+        let mut c = Config::default();
+        c.apply_modes("capture|disableCapture");
+        assert!(!c.intercept_https);
+        let mut c = Config::default();
+        c.apply_modes("disableCapture|capture");
+        assert!(c.intercept_https);
     }
 }

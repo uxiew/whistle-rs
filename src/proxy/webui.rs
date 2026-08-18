@@ -17,6 +17,15 @@ use super::{AppState, Capture, ReplayBody, Session, WsFrame};
 /// Route a direct (non-proxied) request to the UI / API.
 pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let path = req.uri().path().to_string();
+    // `-M headless`: no console. The root certificate and the PAC file answer
+    // anyway — a client that cannot fetch them cannot be configured to use the
+    // proxy at all, and upstream keeps its own two open under `headless` for the
+    // same reason (measured: `/cgi-bin/rootca` and `/cgi-bin/status` answer, the
+    // rest is 404).
+    if !state.config.console && !open_without_login(&path) && !ALIVE_WHEN_HEADLESS.contains(&path.as_str())
+    {
+        return not_found();
+    }
     // The login, when one is configured. Before the route table, and before the
     // plugin subtree: a plugin's own pages are part of the console.
     if let Some(denied) = login_required(state, &req, &path) {
@@ -89,6 +98,18 @@ pub(super) const ROOT_CA_HOST: &str = "rootca.pro";
 /// still serves the console — so the question is asked before a rule is
 /// resolved, and it is asked here for the same reason.
 pub(super) fn console_host(state: &Arc<AppState>, host: &str) -> bool {
+    // `-M pureProxy` puts these names back to being ordinary ones to forward,
+    // which is upstream's own `if (config.pureProxy) return false` inside
+    // `isWebUIHost` (`_original/lib/config.js:1068-1073`).
+    //
+    // `-M headless` deliberately does **not** stop the routing: upstream still
+    // sends the name to the console and lets the console answer `404`, so the
+    // name says "there is a console here and it is off" rather than "no such
+    // host". Measured — under `headless` upstream's console hostname is a 404
+    // and `rootca.pro` still hands out the certificate.
+    if !state.config.console_hostnames {
+        return false;
+    }
     let host = host.trim_start_matches('[').trim_end_matches(']');
     BUILTIN_UI_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
         || host.eq_ignore_ascii_case(ROOT_CA_HOST)
@@ -131,6 +152,18 @@ pub(super) async fn handle_proxied(
 /// a client that cannot read the PAC file cannot use it — so both stay open,
 /// which is upstream's arrangement too (`/cgi-bin/rootca` is in its
 /// `DONT_CHECK_PATHS`, `_original/biz/webui/lib/index.js:39-40`).
+/// What still answers when `-M headless` has turned the console off.
+///
+/// The status endpoint, because a console that is off is not a proxy that is
+/// gone and something has to be able to say the difference. Upstream keeps
+/// `/cgi-bin/status` answering under `headless` for the same reason — measured,
+/// along with `/cgi-bin/rootca`, while everything else is a 404.
+///
+/// Deliberately **not** the same list as [`open_without_login`]: "the console is
+/// switched off" and "you have not logged in" are different questions, and the
+/// certificate is on both lists for its own reason.
+const ALIVE_WHEN_HEADLESS: [&str; 1] = ["/api/status"];
+
 fn open_without_login(path: &str) -> bool {
     matches!(path, "/rootCA.crt" | "/rootca.crt" | "/proxy.pac" | "/pac")
 }

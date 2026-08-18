@@ -4573,6 +4573,9 @@ fn apply_show_host(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&R
 fn apply_forwarded_for(headers: &mut HeaderMap, resolved: &Resolved) {
     const XFF: &str = "x-forwarded-for";
     let dis = disabled_flags(resolved);
+    // `-M keepXFF` is `enable://clientIp` for every request — still beaten by an
+    // explicit `disable://clientIp` below, as the flag is.
+    let keep_all = KEEP_CLIENT_XFF.load(std::sync::atomic::Ordering::Relaxed);
     if dis.contains("clientIp") || dis.contains("clientIP") {
         headers.remove(XFF);
         return;
@@ -4585,9 +4588,22 @@ fn apply_forwarded_for(headers: &mut HeaderMap, resolved: &Resolved) {
         }
     }
     let en = enabled_flags(resolved);
-    if !en.contains("clientIp") && !en.contains("clientIP") {
+    if !keep_all && !en.contains("clientIp") && !en.contains("clientIP") {
         headers.remove(XFF);
     }
+}
+
+/// Set by the launch when `-M keepXFF` (or `forwardedFor`) named it.
+///
+/// A process-wide switch rather than a threaded parameter, for the same reason
+/// [`super::upstream::set_insecure_upstream`] is one: it is decided once, at
+/// startup, and every request reads the same answer.
+static KEEP_CLIENT_XFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once by the launch; see [`KEEP_CLIENT_XFF`].
+pub fn set_keep_client_xff(keep: bool) {
+    KEEP_CLIENT_XFF.store(keep, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `responseFor://` — annotate the response with who answered it, as

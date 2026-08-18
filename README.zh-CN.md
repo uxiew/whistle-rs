@@ -116,8 +116,21 @@ export http_proxy=http://127.0.0.1:8899 https_proxy=http://127.0.0.1:8899
 **浏览器 / 系统：** 将系统或浏览器的 HTTP+HTTPS 代理设为同一 host/port。
 局域网内的设备请改用本机 IP（而非 `127.0.0.1`），并确保端口可达。
 
-直接访问 <http://127.0.0.1:8899/>（**不经过**代理）可查看状态页，列出近期抓取的流量。
-`GET /sessions.json` 返回同样的数据（JSON），`GET /proxy.pac` 提供可自动配置客户端的 PAC 文件。
+### 打开控制台
+
+两条路，第二条是 whistle 官方文档教的那条：
+
+```
+http://127.0.0.1:8899/        # 直接访问，不经过代理
+http://local.whistlejs.com/   # 经过代理 —— 这个域名本身就是控制台
+```
+
+`local.whistlejs.com`、`local.wproxy.org` 和 **`rootca.pro`** 由代理自己应答、不转发出去，
+跟 whistle 一样。前两个开控制台；`rootca.pro` **在任何路径下**都直接给出根证书 —— 这就是
+手机那套流程：设好代理、打开 `rootca.pro`、装它给你的东西。用 `-l/--local-ui-host`
+可以再加域名，用 `-M pureProxy` 可以让它们变回普通域名照常转发。
+
+`GET /sessions.json` 返回抓包数据（JSON），`GET /proxy.pac` 提供可自动配置客户端的 PAC 文件。
 
 ## 拦截 HTTPS
 
@@ -125,7 +138,8 @@ HTTPS 流量是加密的，要读取/改写它，whistle-rs 会出示一份自�
 客户端必须先信任根 CA：
 
 1. 启动 whistle-rs，从 <http://127.0.0.1:8899/rootCA.crt> 下载 CA
-   （或复制 `~/.whistle-rs/certs/root.crt`）。
+   （或复制 `~/.whistle-rs/certs/root.crt`）。**手机或另一台机器**上更省事：先把代理设好，
+   然后打开 <http://rootca.pro/> —— 这个域名由代理应答并直接下发证书，不用记地址。
 2. 在操作系统/浏览器中安装并信任它 —— **各平台分步说明见
    [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md)**。
 3. 验证：
@@ -240,6 +254,7 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `-P, --uiport <PORT>` | 把控制台单独放到一个端口（上游的 `-P`）。不设则跟上游一样，控制台就在代理端口上 | 代理端口 |
 | `-n, --username <NAME>` / `-w, --password <PASS>` | 控制台登录（上游的 `-n`/`-w`）。都不设则控制台不设防 | 不设防 |
 | `-N, --guest-name <NAME>` / `-W, --guest-password <PASS>` | 只读账号（上游的 `-N`/`-W`）：只放行 `GET`，能看抓包、改不了任何东西 | —— |
+| `-M, --mode <LIST>` | 启动模式（上游的 `-M`），用 `\|`/`,`/`&` 分隔。已生效：`pureProxy`（不再应答控制台域名）、`headless`（关掉控制台，只留证书与 PAC）、`capture`/`disableCapture`（HTTPS 解密开关）、`keepXFF`（放行客户端自带的 `x-forwarded-for`）。其余上游认识的 token 会在启动时报「此处无对应行为」 | — |
 | `-l, --local-ui-host <HOSTS>` | 追加能打开控制台的域名（上游的 `-l`），用 `\|`、`,` 或 `&` 分隔。不设时 `local.whistlejs.com`、`local.wproxy.org`、`rootca.pro` 也已生效 | 内建三个 |
 | `--socks-port <PORT>` | 额外启动内建 SOCKS5 服务（上游拼作 `--socksPort`，同样接受） | 关闭 |
 | `--plugin <NAME=HOST:PORT>` | 注册一个远程（Node/HTTP）插件（可重复） | —— |
@@ -290,6 +305,7 @@ http://www.example.com/api/list?id=2
 |------|------|
 | [`docs/COOKBOOK.zh-CN.md`](docs/COOKBOOK.zh-CN.md) | 按任务组织的实操手册：开发服务、mock、改写、限速、手机、HAR、嵌入 —— 从这里开始 |
 | [`docs/RULES.md`](docs/RULES.md) | 完整规则语法：模式、算子、优先级、速查、兼容性、算子覆盖表 |
+| [`docs/CLI.md`](docs/CLI.md) | 命令行逐项对照：每个上游参数在这里是什么行为、`-M/--mode` 认哪些、以及 `w2 start` 这类子命令该怎么替代 |
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | 在各平台下载、安装并信任根 CA |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 模块地图、请求生命周期、如何扩展代理 |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md) | 编写插件（Rust 进程内 + Node 子进程）与 JSON 协议 |

@@ -129,9 +129,24 @@ export http_proxy=http://127.0.0.1:8899 https_proxy=http://127.0.0.1:8899
 For a device on your LAN, use your machine's IP instead of `127.0.0.1` and make sure
 the port is reachable.
 
-Open <http://127.0.0.1:8899/> directly (not through the proxy) to see the status page,
-which lists recent captured traffic. `GET /sessions.json` returns the same data as JSON,
-and `GET /proxy.pac` serves a PAC file that auto-configures a client to use this proxy.
+### Opening the console
+
+Two ways in, and the second is the one whistle's own docs tell you about:
+
+```
+http://127.0.0.1:8899/        # directly, not through the proxy
+http://local.whistlejs.com/   # through the proxy — the name is the console
+```
+
+`local.whistlejs.com`, `local.wproxy.org` and **`rootca.pro`** are answered by the
+proxy itself rather than forwarded, as they are in whistle. The first two open the
+console; `rootca.pro` hands over the root certificate at any path, which is the
+whole phone workflow — set the proxy, open `rootca.pro`, install what it gives you.
+Add more names with `-l/--local-ui-host`, or stop answering for them at all with
+`-M pureProxy`.
+
+`GET /sessions.json` returns the captured traffic as JSON, and `GET /proxy.pac`
+serves a PAC file that auto-configures a client to use this proxy.
 
 ## Intercepting HTTPS
 
@@ -139,7 +154,9 @@ HTTPS traffic is encrypted, so to read/rewrite it whistle-rs presents a certific
 signs itself. Your client must trust the root CA first:
 
 1. Start whistle-rs and download the CA from <http://127.0.0.1:8899/rootCA.crt>
-   (or copy `~/.whistle-rs/certs/root.crt`).
+   (or copy `~/.whistle-rs/certs/root.crt`). **On a phone or another machine**, set
+   the proxy first and then open <http://rootca.pro/> — the proxy answers for that
+   name and hands over the certificate, so there is no address to type.
 2. Install & trust it in your OS/browser — **step-by-step per platform in
    [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md)**.
 3. Verify:
@@ -268,6 +285,7 @@ CA.
 | `-P, --uiport <PORT>` | Serve the console on its own port (whistle's `-P`). Without it the console lives on the proxy port, as it does there | proxy port |
 | `-n, --username <NAME>` / `-w, --password <PASS>` | Console login (whistle's `-n`/`-w`). With neither, the console is open | open |
 | `-N, --guest-name <NAME>` / `-W, --guest-password <PASS>` | Read-only console account (whistle's `-N`/`-W`): `GET` only, so it can watch the capture and change nothing | — |
+| `-M, --mode <LIST>` | Startup modes (whistle's `-M`), `\|`/`,`/`&` separated. Honoured: `pureProxy` (stop answering for the console hostnames), `headless` (no console at all, bar the CA and the PAC), `capture`/`disableCapture` (the HTTPS switch), `keepXFF` (let the client's `x-forwarded-for` through). Anything else whistle knows is reported as having no effect here | — |
 | `-l, --local-ui-host <HOSTS>` | More hostnames that open the console (whistle's `-l`), separated by `\|`, `,` or `&`. `local.whistlejs.com`, `local.wproxy.org` and `rootca.pro` answer without it | the built-in three |
 | `--socks-port <PORT>` | Also run an inbound SOCKS5 server (whistle spells it `--socksPort`, which is accepted too) | off |
 | `--plugin <NAME=HOST:PORT>` | Register a remote (Node/HTTP) plugin (repeatable) | — |
@@ -322,6 +340,7 @@ through whistle's own parser and compares the answers.
 |-----|----------|
 | [`docs/COOKBOOK.md`](docs/COOKBOOK.md) | Task-oriented recipes: dev server, mocks, rewriting, throttling, phones, HAR, embedding — start here |
 | [`docs/RULES.md`](docs/RULES.md) | Complete rule syntax: patterns, operators, precedence, quick reference, compatibility |
+| [`docs/CLI.md`](docs/CLI.md) | The command line, flag by flag, and how it maps to whistle's — including `-M/--mode` and what to do instead of `w2 start` |
 | [`docs/CERTIFICATES.md`](docs/CERTIFICATES.md) | Downloading, installing & trusting the root CA on every platform |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module map, request lifecycle, and how to extend the proxy |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md) | Writing plugins (Rust in-process + Node subprocess), the JSON protocol |

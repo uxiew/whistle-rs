@@ -53,6 +53,29 @@ struct Cli {
     #[arg(short = 'P', long = "uiport")]
     ui_port: Option<u16>,
 
+    /// Startup modes (whistle's `-M/--mode`), separated by `|`, `,` or `&`.
+    ///
+    /// whistle's vocabulary is fifty-six tokens, of which fifteen change
+    /// anything a proxy client can see — measured, one whistle per token, by
+    /// `tests/differential/mode-probe.js`. This honours the four that mean
+    /// something here:
+    ///
+    /// * `pureProxy` (`proxyOnly`, `httpProxy`) — stop answering for the console
+    ///   hostnames and forward them like any other name;
+    /// * `headless` (`shadowRulesOnly`) — no console at all, except the root
+    ///   certificate and the PAC file;
+    /// * `capture` (`intercept`, `enableCapture`, `enableHttps`,
+    ///   `persistentCapture`) — intercept HTTPS, which is already the default
+    ///   here; `disableCapture` is the off switch and is `--no-intercept-https`
+    ///   under whistle's name;
+    /// * `keepXFF` (`forwardedFor`) — let a client's own `x-forwarded-for` reach
+    ///   the origin, which both proxies otherwise drop.
+    ///
+    /// A token whistle has and this port cannot apply is reported at startup,
+    /// and so is one neither program knows. See `docs/ROADMAP.md` for the rest.
+    #[arg(short = 'M', long = "mode")]
+    mode: Option<String>,
+
     /// More hostnames that open the console (whistle's `-l/--localUIHost`),
     /// separated by `|`, `,` or `&`.
     ///
@@ -325,6 +348,34 @@ async fn main() -> Result<()> {
         intercept_https: !cli.no_intercept_https,
         ..Config::default()
     };
+
+    // `-M/--mode`, applied over the flags so that a mode and a flag naming the
+    // same thing agree rather than race — `--no-intercept-https -M capture` is a
+    // contradiction and the mode, being the more specific instruction, wins.
+    //
+    // The report is printed rather than swallowed: a whistle command line that
+    // names modes this port has nothing to do with should say so, or it looks
+    // like it worked.
+    if let Some(list) = &cli.mode {
+        let report = config.apply_modes(list);
+        if !report.honoured.is_empty() {
+            tracing::info!("mode: {}", report.honoured.join(", "));
+        }
+        if !report.inert.is_empty() {
+            tracing::info!(
+                "mode: {} — whistle has these and this port has nothing to apply \
+                 them to; see docs/ROADMAP.md",
+                report.inert.join(", ")
+            );
+        }
+        if !report.unknown.is_empty() {
+            tracing::warn!(
+                "mode: {} — no such mode in whistle either, so probably a typo",
+                report.unknown.join(", ")
+            );
+        }
+    }
+    whistle_rs::proxy::apply::set_keep_client_xff(config.keep_client_xff);
 
     // Load rules. An `@` line naming a file or a URL is *registered* here and
     // fetched by `rules::include` before the first connection is accepted — the

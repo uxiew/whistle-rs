@@ -343,6 +343,47 @@ What is left is eight operators the corpora here cannot reach — dumps, ciphers
 delays, frames, plugins — each named with the bench or the test that does reach
 it.
 
+## The mode bench
+
+`mode-bench.js` asks a different shape of question from everything else here:
+not "what does this rule do" but "**which of these fifty-six words mean
+anything**". whistle's `-M/--mode` takes a list out of a large vocabulary, of
+which its own documentation prints nine. So this starts one proxy per token —
+whistle and whistle-rs, in turn — and runs the same nine probes through each.
+
+```sh
+PORT_BASE=20100 node mode-bench.js                          # every token
+PORT_BASE=20100 MODES=pureProxy,headless node mode-bench.js  # a few
+```
+
+It needs no oracle left running: it starts and kills every proxy itself, which is
+also why it is slow (two process starts per token, a few minutes for the lot) and
+not part of a normal bench run. Reach for it when the vocabulary changes.
+
+**Fifteen of the fifty-six move anything a client can see**, and they collapse
+into six behaviours — turn the console hostnames off, turn the console off,
+intercept HTTPS from startup, keep the client's `x-forwarded-for`, read rules out
+of a request header, trust a front proxy's forwarded headers. This port honours
+the first four; the last two are declared, with the reason, in the bench itself.
+
+Three things about how it compares, each of which it got wrong first:
+
+* **each console is asked for its own path.** `/cgi-bin/rules/list` and
+  `/api/rules` are the same question to two different route tables, and asking
+  both proxies the first one was asking one of them for a page it has never had.
+* **console answers are compared on status alone.** The two consoles return
+  different content types for the same question, so comparing those was comparing
+  the tables.
+* **the answers are compared, not the change from each baseline.** The two
+  baselines differ on purpose — whistle does not decrypt HTTPS in a fresh data
+  directory and this port does — so a delta compare reported `disableCapture` as
+  a difference while both proxies were ending in the same state. The default
+  difference is declared once instead, against the exact list of tokens that
+  touch the switch. A substring test there is not good enough: `captureData`
+  contains "capture" and touches nothing.
+
+A clean run is `differing: 0`.
+
 ## Which whistle, though
 
 Every number here is measured against whistle **2.10.8**, and "agrees with

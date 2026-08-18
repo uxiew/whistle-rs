@@ -42,6 +42,12 @@ http://127.0.0.1:8899/           # status page with a download link
 http://127.0.0.1:8899/rootCA.crt # the certificate itself
 ```
 
+**Or, from a device that already has the proxy set:** open <http://rootca.pro/>.
+The proxy answers for that name itself instead of forwarding it, and hands over
+the certificate whatever the path is — so there is no address and no port to type
+on a phone keyboard. It is whistle's own arrangement, kept here. `-M pureProxy`
+turns it off, if you would rather that name were forwarded like any other.
+
 Or copy it straight from disk: `~/.whistle-rs/certs/root.crt`.
 
 ```bash
@@ -91,7 +97,8 @@ sudo update-ca-trust
 ### iOS
 
 1. Set the device's Wi-Fi HTTP proxy to your machine's IP and port `8899`.
-2. Visit `http://<your-ip>:8899/rootCA.crt` in Safari and allow the profile download.
+2. Visit **<http://rootca.pro/>** in Safari (or `http://<your-ip>:8899/rootCA.crt`)
+   and allow the profile download.
 3. **Settings → General → VPN & Device Management** → install the profile.
 4. **Settings → General → About → Certificate Trust Settings** → enable full trust
    for **whistle-rs Root CA**. (This last step is required on iOS.)
@@ -99,7 +106,8 @@ sudo update-ca-trust
 ### Android
 
 1. Set the Wi-Fi proxy to your machine's IP and port `8899`.
-2. Download `root.crt` and install it under **Settings → Security → Encryption &
+2. Download the certificate from **<http://rootca.pro/>** (or
+   `http://<your-ip>:8899/rootCA.crt`) and install it under **Settings → Security → Encryption &
    credentials → Install a certificate → CA certificate**.
 3. Note: since Android 7, apps only trust **user** CAs if they opt in via a network
    security config. System-level install (rooted devices) or an app-specific config
