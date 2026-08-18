@@ -1309,6 +1309,23 @@ pub struct RuleManager {
     /// yielded — see [`include::Includes`]. Inert unless the manager was built
     /// by [`RuleManager::with_includes`].
     includes: include::Includes,
+    /// Resolve the **default group alone**, whatever else is switched on.
+    ///
+    /// `-M multiEnv` (`nohost`) — see [`crate::config::HeaderRules::Request`].
+    /// Upstream does not disable the named groups there; it makes them
+    /// unselectable, which comes to the same thing:
+    /// `getSelectedRulesList()` returns `[]` under `config.multiEnv`
+    /// (`_original/lib/rules/util.js:204-206`), the walk that adds selected
+    /// files is skipped outright (`:94`), and `selectRulesFile` returns without
+    /// doing anything (`:149`). The **default** rules are added by a line that
+    /// never consults the flag (`:101`), so they still apply — measured, with a
+    /// Default rule and a named group under `-M multiEnv`: the Default one
+    /// applied and the named one did not.
+    ///
+    /// A field rather than a global because a manager is also what a
+    /// `rulesFile://` and a plugin's rules are parsed into, and the mode has
+    /// nothing to say about those.
+    default_group_only: bool,
 }
 
 impl RuleManager {
@@ -1321,6 +1338,7 @@ impl RuleManager {
         RuleManager {
             groups: Vec::new(),
             includes: include::Includes::default(),
+            default_group_only: false,
         }
     }
 
@@ -1332,6 +1350,7 @@ impl RuleManager {
         RuleManager {
             groups: Vec::new(),
             includes: include::Includes::resolving(),
+            default_group_only: false,
         }
     }
 
@@ -1615,10 +1634,42 @@ impl RuleManager {
     /// single-value operator, which answers with the *named* group's value there
     /// and answered with the default group's here.
     fn resolution_order(&self) -> impl Iterator<Item = &RuleGroup> {
+        let named = !self.default_group_only;
         self.groups
             .iter()
-            .filter(|g| g.enabled && g.name != "default")
+            .filter(move |g| named && g.enabled && g.name != "default")
             .chain(self.groups.iter().filter(|g| g.enabled && g.name == "default"))
+    }
+
+    /// Resolve the default group alone from here on — see
+    /// [`default_group_only`](Self::default_group_only). One-way: nothing turns
+    /// it back off, because the mode that sets it is fixed at startup.
+    pub fn only_default_group(&mut self) {
+        self.default_group_only = true;
+    }
+
+    /// Is this manager resolving the default group alone?
+    ///
+    /// Read by the console, which refuses to switch a named group on when the
+    /// answer is yes rather than accepting a change that would do nothing —
+    /// upstream's `selectRulesFile` returns early for the same reason
+    /// (`_original/lib/rules/util.js:148-151`).
+    pub fn is_default_group_only(&self) -> bool {
+        self.default_group_only
+    }
+
+    /// The text of one group by name, for `x-whistle-rule-name`.
+    ///
+    /// Upstream's `globalRules.get(nameHeader)` (`rules/index.js:602-607`),
+    /// which reads the file's **stored text** and not its resolution — so a
+    /// group that is switched off, or one the mode has stopped resolving, still
+    /// answers here. That is the point of the header: it names an environment
+    /// to use for this one request.
+    pub fn group_text(&self, name: &str) -> Option<&str> {
+        self.groups
+            .iter()
+            .find(|g| g.name == name)
+            .map(|g| g.text.as_str())
     }
 
     /// Every rule of every enabled group, with its resolution index.

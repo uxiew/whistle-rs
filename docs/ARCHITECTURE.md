@@ -35,6 +35,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split), upstream HTTP/SOCKS proxies |
 | `src/proxy/apply.rs` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations |
 | `src/proxy/dest.rs` | `lib/inspectors/rules.js:40` | Where the request is addressed once a URL-replacement rule has spoken |
+| `src/proxy/header_rules.rs` | `lib/rules/index.js:558-657` | The five headers a request may carry its own rules in — taken from every request, read only under `-M enableRequestHeaderRules` / `-M multiEnv` |
 | `src/proxy/template.rs` | `lib/handlers/file-proxy.js` (`render`) | `tpl`/`dust`/`jsonp` two-pass rendering + `${var}` variables |
 | `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation) |
 | `src/proxy/sni.rs` | `lib/https/index.js:1281`, `lib/https/load-cert.js` | The SNI stage: peek the ClientHello, pick the certificate, or relay the connection untouched |

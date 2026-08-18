@@ -167,6 +167,10 @@ export interface ProxyStatus {
   host: string | null;
   socks_port: number | null;
   intercept_https: boolean;
+  /** A `-M` mode has taken the HTTPS switch away — `multiEnv`, `notAllowedEnableHTTPS`. */
+  capture_locked_off: boolean;
+  /** Whether a request may carry its own rules: `off`, `enableRequestHeaderRules`, `multiEnv`. */
+  header_rules: 'off' | 'enableRequestHeaderRules' | 'multiEnv';
   insecure_upstream: boolean;
   storage_dir: string;
   root_ca: string;

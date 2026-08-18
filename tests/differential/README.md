@@ -415,7 +415,38 @@ not part of a normal bench run. Reach for it when the vocabulary changes.
 into six behaviours — turn the console hostnames off, turn the console off,
 intercept HTTPS from startup, keep the client's `x-forwarded-for`, read rules out
 of a request header, trust a front proxy's forwarded headers. This port honours
-the first four; the last two are declared, with the reason, in the bench itself.
+the first five. The last — trusting `x-forwarded-proto` / `x-forwarded-host` — is
+declared with the reason in the bench itself.
+
+The last full run reports **`ran: 57, differing: 0, declared: 0`**: every token
+in the vocabulary, and nothing left for a declaration to excuse.
+
+## Rules a request brings with it
+
+`header-rules-bench.js` is what `mode-bench.js`'s one `proxy.headerRules` probe
+grew into. A request can carry its own rules in five headers, and one probe
+could say whether they were honoured but not *how*:
+
+```sh
+PORT_BASE=20500 node header-rules-bench.js
+```
+
+It starts and kills its own proxies like the mode bench, seeds each through that
+proxy's own console API (one Default rules text, one named group, one values
+entry), and then sends ten requests per mode across five modes. Each answer is
+two things: the marker headers the rules set — which says **which rules applied
+and which won** — and which `x-whistle-*` headers survived, which says **what a
+client can hand the origin**.
+
+The second half is the part worth keeping even if the feature is never switched
+on. `getValue`'s delete is unconditional and only the reading is gated, so four
+of the five must never reach the origin whatever the mode. The fifth,
+`x-whistle-rule-name`, is the exception upstream forwards — and the corner where
+`-M strict|multiEnv` consumes it while reading nothing is a real two-row
+difference this bench found.
+
+**A clean run is `probes: 50, differing: 0`.** `tests/header_rules_e2e.rs` pins
+the same facts under `cargo test`, without node.
 
 Three things about how it compares, each of which it got wrong first:
 

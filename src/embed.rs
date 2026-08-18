@@ -128,6 +128,8 @@ pub struct Builder {
     intercept_https: Option<bool>,
     persist: bool,
     body_preview_cap: Option<usize>,
+    /// A whistle `-M/--mode` list, applied last — see [`Builder::mode`].
+    mode: Option<String>,
 }
 
 impl Builder {
@@ -215,6 +217,17 @@ impl Builder {
         self
     }
 
+    /// Apply a whistle `-M/--mode` list — the same string the binary's `-M`
+    /// takes, `|`, `,` or `&` separated.
+    ///
+    /// Returns the builder and the report, so an embedder can see which tokens
+    /// meant something. Read [`crate::config::HeaderRules`] before reaching for
+    /// `multiEnv` here: it lets whoever sends a request choose where it goes.
+    pub fn mode(mut self, list: impl AsRef<str>) -> Self {
+        self.mode = Some(list.as_ref().to_string());
+        self
+    }
+
     /// Bind, start accepting, and return once the address is known.
     ///
     /// The accept loop runs on a spawned task, so this returns immediately and
@@ -243,6 +256,13 @@ impl Builder {
         if let Some(cap) = self.body_preview_cap {
             config.body_preview_cap = cap;
         }
+        // After the explicit setters, because a mode is upstream's way of
+        // saying the same things and the later word should win — `-M capture`
+        // beside `.intercept_https(false)` is a caller contradicting itself,
+        // and the mode is the more specific statement.
+        if let Some(list) = &self.mode {
+            config.apply_modes(list);
+        }
 
         let ca = CertAuthority::load_or_create(&config)?;
         // `with_includes`: an embedded proxy's rules are as long-lived as the
@@ -251,6 +271,11 @@ impl Builder {
         let mut rules = RuleManager::with_includes();
         if let Some(text) = &self.rules {
             rules.set_text(text);
+        }
+        // `-M multiEnv` resolves the default group alone — see
+        // [`RuleManager::only_default_group`].
+        if config.multi_env {
+            rules.only_default_group();
         }
         let mut registry = Plugins::new();
         for plugin in self.plugins {

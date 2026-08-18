@@ -96,8 +96,9 @@
 | `cases-frames.js`（**body 分帧**：SSE 与自定义分隔符） | 29 | 6 项，具名 | 23 |
 | `cases-paths.js`（**Windows 路径与非 ASCII**） | 58 | 9 项，具名 | 7 |
 | `auth-bench.js`（**控制台的前门**：登录 + 域名入口） | 54 | 0 差异，6 项具名 | — |
-| `mode-bench.js`（**`-M/--mode` 全词表**，每个 token 各起一次代理） | 57 | 0 差异，5 项具名 | — |
+| `mode-bench.js`（**`-M/--mode` 全词表**，每个 token 各起一次代理） | 57 | 0 差异，**0 项具名** | — |
 | `frames-bench.js`（**帧本身**：两边控制台各自的 API 读出来比对） | 14 | 0 差异 | — |
+| `header-rules-bench.js`（**请求自带规则**：五个头 × 五种模式） | 50 | 0 差异 | — |
 
 「有意偏离」都是**上游的缺陷本移植不打算复制**，每一条在语料头部具名、带上游行号。
 
@@ -267,7 +268,8 @@
 - **规则头不再流到源站**：`x-whistle-rule-value` 等四个头上游**无条件删除**
   （读不读它们才受 `enableRequestHeaderRules` 控制），本移植原样转发 —— 客户端写的规则
   文本能一路送到源站，链路上游的 whistle 还会照做。另外三个连接标记
-  （`client-port`/`alpn-protocol`/`client-id`）同理。
+  （`client-port`/`alpn-protocol`/`client-id`）同理。**后来把「读」也补上了**，见
+  下面的 `-M multiEnv`。
 - **Body 也能是帧**：SSE 与 `x-whistle-custom-frame-separator`（上游
   `data.js:67-135`）。抓包界面原本只把这种响应显示成一段预览，而对一条不会结束的流来说
   那等于什么都没有。
@@ -371,21 +373,37 @@
   看得见、改得动、关得掉。两边都读文件、都生效，差别在「读完之后谁看得见」。
   已写进 `--help`；真正实现 shadowRules（连同 `allowDisableShadowRules`）是另一件事。
 
-- **`-M/--mode`（新，四个模式）** —— 上游的 `--mode` 是一份**五十六个 token** 的词表，
-  `cli.md` 只印了九个。与其挑着读，不如机械地量：`tests/differential/mode-bench.js`
-  给**每个 token 各起一次代理**（两边各一次），跑同一套九项探针再比对。
-  - **实测：五十六个里只有十五个能被客户端看见**，且归并成六种行为。本移植接了其中四种：
+- **`-M/--mode`（现已 0 项具名差异）** —— 上游的 `--mode` 是一份**五十六个 token** 的
+  词表，`cli.md` 只印了九个。与其挑着读，不如机械地量：
+  `tests/differential/mode-bench.js` 给**每个 token 各起一次代理**（两边各一次），
+  跑同一套九项探针再比对。最近一次全量：`ran: 57, differing: 0, declared: 0` ——
+  模式表上一条具名差异都不剩。
+  - **实测：五十六个里只有十五个能被客户端看见**，且归并成六种行为。本移植接了其中
+    五种，先说最早接的四种：
     `pureProxy`（连同 `proxyOnly`/`httpProxy`：不再应答控制台域名）、`headless`（连同
     `shadowRulesOnly`：关掉控制台，但**证书、PAC 与 `/api/status` 仍答** —— 上游
     `headless` 下也保留 `/cgi-bin/rootca` 与 `/cgi-bin/status`，实测）、
     `capture` 一族（启动即解密 HTTPS，本移植的默认；`disableCapture` 就是
     `--no-intercept-https` 的上游拼法）、`keepXFF`（放行客户端自带的 `x-forwarded-for`，
     两边默认都删）。
-  - 另两种**具名不做**：`multiEnv`/`nohost`/`enableRequestHeaderRules`（从请求头
-    `x-whistle-rule-value` 里读规则 —— 一台 whistle 服务多套环境就靠它；本移植在入口就
-    删掉这些头、从不读，是同一件事的安全那一半），以及
-    `x-forwarded-proto`/`x-forwarded-host`（信任前置代理的转发头，让它们决定协议与目的地；
-    关掉时两边都原样转发，而关掉正是两边的默认）。
+  - **请求自带规则**（`enableRequestHeaderRules` 与 `multiEnv`/`nohost`/`multienv`）
+    这一轮做完了。五个头：`x-whistle-rule-value` 是规则文本，`-host` 追加一行，
+    `-key` 指一个 values 条目、内容前置，`-name` 指一个规则组、文本追加（**仅
+    multiEnv**），`x-whistle-key-value` 是这段文本私有的 JSON values。两种模式的唯一
+    区别是合并方向：`enableRequestHeaderRules` 下**存量规则赢**，`multiEnv` 下
+    **请求自带的赢**（上游 `initRules`，`rules/index.js:647-652`，就一个 `if`）。
+    `multiEnv` 还顺带两件事，都是上游的：只解析 default 规则组（具名组仍在、但选中
+    无效，控制台这边直接拒绝这次 toggle），以及 HTTPS 不再从开关走解密
+    （`isEnableCapture()` 第一行就 return false，`-M capture|multiEnv` 与
+    `-M multiEnv|capture` 实测都是透传）。`-M strict` 只收回「读」，删除照旧 ——
+    所以 `-M strict|multiEnv` 会吞掉 `x-whistle-rule-name` 却什么也不读，这个角落
+    是 `header-rules-bench.js` 找出来的（当时两件事写成了一个标志位）。
+    `notAllowedEnableHTTPS` 也一并做了，它就是上面那半个开关锁。
+
+    **默认关，两边都是**：这些头等于让发请求的人自己决定请求去哪。它是给「一台代理
+    服务多套环境」用的，不是给共享网络上的代理用的。
+  - 剩下**具名不做**的只有 `x-forwarded-proto`/`x-forwarded-host`（信任前置代理的
+    转发头，让它们决定协议与目的地；关掉时两边都原样转发，而关掉正是两边的默认）。
   - 其余四十一个是控制台选项、部署形态与 Node 运行时的事。**不静默吞掉**：上游有而这里
     无对应行为的会在启动时点名，两边都不认识的按疑似拼错报 warning —— 复制一条 whistle
     命令行过来，它会告诉你哪几段没生效。`multiple`/`admin` 是复合模式，按上游的方式先展开

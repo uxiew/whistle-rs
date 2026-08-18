@@ -450,7 +450,7 @@ pub async fn decide(
     // the answer is the same one a plugin's `false` produces — the connection is
     // still *routed* by its rules, it is simply not read. whistle spells this
     // `-M pureProxy`; here it is `--no-intercept-https`.
-    if !state.config.intercept_https {
+    if !state.config.intercepts_https() {
         let (info, resolved) = {
             let rules = state.rules.read().unwrap();
             let info = connection_req_info(servername, port, peer, has_sni);

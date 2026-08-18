@@ -7,6 +7,7 @@ pub mod apply;
 #[cfg(test)]
 mod bench;
 pub mod body;
+pub mod header_rules;
 pub mod ciphers;
 pub mod coding;
 pub mod dest;
@@ -119,23 +120,9 @@ fn take_https_marker(headers: &mut hyper::HeaderMap) -> bool {
 /// a stable one is what lets a client exercise the condition deliberately.
 pub const COMPOSER_REQ_HEADER: &str = "x-whistle-composer";
 
-/// The headers whistle reads rules out of, and removes either way.
-///
-/// `x-whistle-rule-value` carries a rules text, `x-whistle-rule-host` a line
-/// appended to it, `x-whistle-rule-key` the name of a values entry to prepend,
-/// and `x-whistle-key-value` a JSON object of values for them
-/// (`_original/lib/rules/index.js:25-29,:586-591`).
-///
-/// **`x-whistle-rule-name` is deliberately not here.** It is read only in
-/// `multiEnv` mode, and `getValue` — which is what deletes a header — is never
-/// called for it otherwise, so upstream forwards that one to the origin.
-/// Measured against whistle 2.10.8, which strips the four and passes the fifth.
-pub const HEADER_RULE_HEADERS: [&str; 4] = [
-    "x-whistle-rule-value",
-    "x-whistle-rule-host",
-    "x-whistle-rule-key",
-    "x-whistle-key-value",
-];
+/// The headers whistle reads rules out of, and removes either way — see
+/// [`header_rules`], which is where reading them lives.
+pub use header_rules::ALWAYS_TAKEN as HEADER_RULE_HEADERS;
 
 /// Proxy-internal markers a client may not forge.
 ///
@@ -152,15 +139,21 @@ pub const HEADER_RULE_HEADERS: [&str; 4] = [
 pub const CONNECTION_MARKER_HEADERS: [&str; 2] =
     ["x-whistle-client-port", "x-whistle-alpn-protocol"];
 
-/// Remove [`HEADER_RULE_HEADERS`] from a request on its way in.
+/// Take the rules-carrying headers and the connection markers off a request on
+/// its way in, returning what the first four said.
 ///
-/// The values are dropped rather than used: reading them is what upstream gates
-/// behind `enableRequestHeaderRules`, and this port has no such mode — so the
-/// headers do nothing here, and now they do nothing *at the origin* too.
-fn take_header_rules(headers: &mut hyper::HeaderMap) {
-    for name in HEADER_RULE_HEADERS.iter().chain(&CONNECTION_MARKER_HEADERS) {
-        headers.remove(*name);
+/// The removal is unconditional in both proxies — see [`header_rules::take`].
+/// What the mode decides is whether the contents are *returned* here or
+/// dropped on the floor.
+fn take_header_rules(
+    headers: &mut hyper::HeaderMap,
+    cfg: &crate::config::Config,
+) -> header_rules::Carried {
+    let carried = header_rules::take(headers, cfg.header_rules, cfg.multi_env);
+    for name in CONNECTION_MARKER_HEADERS {
+        headers.remove(name);
     }
+    carried
 }
 
 /// Strip the composer marker, reporting whether it was present.
@@ -4008,7 +4001,11 @@ async fn serve(
     // only the *reading* is gated on `enableRequestHeaderRules`/`multiEnv`).
     // Leaving them on meant a rules text written by a client reached the origin
     // — and would be honoured by any whistle further up the chain.
-    take_header_rules(req.headers_mut());
+    //
+    // Under `-M enableRequestHeaderRules` or `-M multiEnv` what they said is
+    // also *kept*, and becomes a rules text for this one request — see
+    // [`header_rules`]. Off by default in both proxies.
+    let carried = take_header_rules(req.headers_mut(), &state.config);
 
     // A request that asks to change protocol is matched as a `ws://` one, and
     // that has to be known *before* the rules resolve. whistle stamps
@@ -4157,11 +4154,42 @@ async fn serve(
         // A ``` block in a rules file declares a value that travels with it.
         // Configured values are laid *over* those, so a `--value` or a
         // console-edited one of the same name wins over what a file brought.
-        let values = effective_values(&state);
+        let mut values = effective_values(&state);
+        // The rules this request brought in its own headers, if the mode reads
+        // them at all. Composed and merged **before** anything is substituted,
+        // so a `{name}` inside them is expanded in the same pass as every other
+        // rule's — and against the private values the request carried, which is
+        // what `x-whistle-key-value` is for.
+        let from_headers = (!carried.is_empty())
+            .then(|| {
+                let rules = state.rules.read().unwrap();
+                let text = header_rules::compose(
+                    &carried,
+                    // `values.get(keyHeader)` — the store by its plain name.
+                    // Not a private lookup: the request is naming an entry the
+                    // *proxy* holds, which is the whole point of the header.
+                    |key| values.get(key).cloned(),
+                    |name| rules.group_text(name).map(str::to_string),
+                )?;
+                drop(rules);
+                values.extend(header_rules::private_values(carried.kv.as_deref()));
+                Some(header_rules::merge(
+                    &mut resolved,
+                    &info,
+                    &text,
+                    state.config.header_rules,
+                    is_internal_req,
+                ))
+            })
+            .flatten();
         let tpl = tpl_ctx(&bind_host, state.config.port, &info);
         apply::substitute_values(&mut resolved, &values, tpl);
-        let managers = apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
+        let mut managers =
+            apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
         apply::substitute_values(&mut resolved, &values, tpl);
+        // Kept for the response phase, exactly as upstream re-resolves `hRules`
+        // there (`_original/lib/plugins/index.js:1326-1335`).
+        managers.extend(from_headers);
         managers
     };
     apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
@@ -6713,7 +6741,9 @@ mod req_origin_tests {
         }
         h.insert("x-whistle-rule-name", "n".parse().unwrap());
         h.insert("x-other", "kept".parse().unwrap());
-        take_header_rules(&mut h);
+        // The default configuration, which is what a proxy run with no `-M`
+        // has: the four are taken, and nothing is read.
+        take_header_rules(&mut h, &crate::config::Config::default());
         for name in HEADER_RULE_HEADERS.iter().chain(&CONNECTION_MARKER_HEADERS) {
             assert!(h.get(*name).is_none(), "{name} must not survive");
         }

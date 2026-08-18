@@ -568,7 +568,7 @@ pub fn response_phase_of(
 /// everything in its own class, behind the class above". Equal keys keep
 /// insertion order, so several merged sets stay in the sequence they were merged
 /// in.
-fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
+pub(crate) fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
     let key = |op: &RuleOp| match op.props.has("important") {
         true => MERGED_ORDER,
         false => MERGED_AFTER_IMPORTANT,

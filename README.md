@@ -251,6 +251,37 @@ mock an endpoint, throttle a connection, debug a phone, export a HAR — are in
 operator, precedence rules, coverage — is in
 [`docs/RULES.md`](docs/RULES.md).**
 
+### One proxy, many environments
+
+A request can also bring its own rules, in its own headers — whistle's
+`nohost`/`multiEnv` deployment, where nothing is stored and each request names
+the environment it wants:
+
+```sh
+whistle-rs -M multiEnv
+```
+
+```sh
+curl -x 127.0.0.1:8899 http://example.com/ \
+  -H "x-whistle-rule-value: $(printf 'example.com 127.0.0.1:3000' | jq -sRr @uri)"
+```
+
+Five headers are read: `x-whistle-rule-value` (the rules text),
+`x-whistle-rule-host` (one more line), `x-whistle-rule-key` (a values entry to
+prepend), `x-whistle-rule-name` (a rule group to append) and
+`x-whistle-key-value` (JSON values private to that text). `-M multiEnv` lets
+them beat the stored rules; `-M enableRequestHeaderRules` reads them but lets
+the stored rules win.
+
+> **This lets whoever sends a request decide where it goes.** It is off by
+> default in both proxies, and should stay off for anything a wider network can
+> reach. The headers are **stripped from every request either way**, mode or no
+> mode, so a rules text a client wrote never reaches your origin.
+
+Full behaviour, including what `-M multiEnv` does to the rule groups and to
+HTTPS interception:
+[Rules in a request header](docs/RULES.md#rules-in-a-request-header).
+
 ## Use as a library
 
 whistle-rs is a library with a binary on top, not the other way round. If you are
@@ -316,7 +347,7 @@ CA.
 | `-P, --uiport <PORT>` | Serve the console on its own port (whistle's `-P`). Without it the console lives on the proxy port, as it does there | proxy port |
 | `-n, --username <NAME>` / `-w, --password <PASS>` | Console login (whistle's `-n`/`-w`). With neither, the console is open | open |
 | `-N, --guest-name <NAME>` / `-W, --guest-password <PASS>` | Read-only console account (whistle's `-N`/`-W`): `GET` only, so it can watch the capture and change nothing | — |
-| `-M, --mode <LIST>` | Startup modes (whistle's `-M`), `\|`/`,`/`&` separated. Honoured: `pureProxy` (stop answering for the console hostnames), `headless` (no console at all, bar the CA and the PAC), `capture`/`disableCapture` (the HTTPS switch), `keepXFF` (let the client's `x-forwarded-for` through). Anything else whistle knows is reported as having no effect here | — |
+| `-M, --mode <LIST>` | Startup modes (whistle's `-M`), `\|`/`,`/`&` separated. Honoured: `pureProxy` (stop answering for the console hostnames), `headless` (no console at all, bar the CA and the PAC), `capture`/`disableCapture` (the HTTPS switch), `keepXFF` (let the client's `x-forwarded-for` through), `enableRequestHeaderRules` and `multiEnv`/`nohost` (**let a request carry its own rules** — see below), `notAllowedEnableHTTPS`, `strict`. Anything else whistle knows is reported as having no effect here | — |
 | `-l, --local-ui-host <HOSTS>` | More hostnames that open the console (whistle's `-l`), separated by `\|`, `,` or `&`. `local.whistlejs.com`, `local.wproxy.org` and `rootca.pro` answer without it | the built-in three |
 | `--allow-origin <LIST>` | Origins allowed to call the console API cross-origin (whistle's `--allowOrigin`), `\|`/`,`/`&` separated; `*` means any. `/api/status` and the root certificate answer anyone regardless | none |
 | `-z, --cert-dir <DIR>` | Serve certificates from this directory instead of forging them (whistle's `-z`), matched on each certificate's `subjectAltName`. `root.key`+`root.crt` there replaces the root CA — see [`docs/CLI.md`](docs/CLI.md#hand-supplied-certificates) | — |

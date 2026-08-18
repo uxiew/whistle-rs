@@ -18,9 +18,12 @@
 // into six behaviours: turn the console hostnames off (`pureProxy`), turn the
 // console off (`headless`), intercept HTTPS from startup (`capture`), keep the
 // client's `x-forwarded-for` (`keepXFF`), read rules out of request headers
-// (`multiEnv`), and trust a front proxy's forwarded headers
-// (`x-forwarded-proto`). This port honours the first four; the last two are
+// (`multiEnv`, `enableRequestHeaderRules`), and trust a front proxy's forwarded
+// headers (`x-forwarded-proto`). This port honours the first five; the last is
 // named in `docs/ROADMAP.md` with the reason.
+//
+// The fifth wanted more than one probe can hold, so it has a bench of its own:
+// `header-rules-bench.js` walks all five headers under every setting.
 'use strict';
 const http = require('http');
 const tls = require('tls');
@@ -225,33 +228,21 @@ async function main() {
   // The baseline row is compared too: a mode bench whose no-mode row diverged
   // would be measuring the launch rather than the mode.
   const DECLARED = [
-    {
-      match: (mode) => ['multiEnv', 'multienv', 'nohost', 'enableRequestHeaderRules', 'multiple'].includes(mode),
-      // `tunnel` comes with it, and not by accident: `isEnableCapture()` opens
-      // with `if (config.multiEnv || config.notAllowedEnableHTTPS) return false`
-      // (`_original/lib/rules/util.js:547-550`), so switching multiEnv on
-      // switches HTTPS interception off however the switch is set. This port
-      // has no multiEnv to switch on, so it keeps intercepting — a consequence
-      // of the gap below rather than a second one.
-      probes: ['proxy.headerRules', 'tunnel'],
-      why: 'reading rules out of a request header. Upstream serves many environments '
-        + 'from one proxy that way; this port deletes those headers on arrival and '
-        + 'never reads them, which is the safe half of the same behaviour and is '
-        + 'named in docs/ROADMAP.md. multiEnv also forces HTTPS capture off '
-        + 'upstream (`rules/util.js:547-550`), which this port has nothing to '
-        + 'switch off.',
-    },
-    {
-      // The same line, reached by its other name.
-      match: (mode) => ['notAllowEnableHTTPS', 'notAllowedEnableHTTPS'].includes(mode),
-      probes: ['tunnel'],
-      why: '`isEnableCapture()` returns false outright under this '
-        + '(`_original/lib/rules/util.js:547-550`), so upstream stops intercepting '
-        + 'HTTPS. It is a console restriction — "do not let anyone turn this on" — '
-        + 'and this port has no console switch for it to forbid.',
-    },
+    // `multiEnv` / `nohost` / `enableRequestHeaderRules` / `multiple` and
+    // `notAllowedEnableHTTPS` used to be declared here. They are implemented —
+    // see `header-rules-bench.js`, which measures the five headers probe by
+    // probe, and `src/proxy/header_rules.rs`. The `tunnel` probe moves with
+    // them because `isEnableCapture()` opens with
+    // `if (config.multiEnv || config.notAllowedEnableHTTPS) return false`
+    // (`_original/lib/rules/util.js:547-550`), which this port spells
+    // `Config::intercepts_https`.
     {
       match: (mode) => ['x-forwarded-proto', 'x-forwarded-host'].includes(mode),
+      // The one declaration left, and it currently excuses nothing: the battery
+      // sends `x-forwarded-for` and not the two headers these modes consume, so
+      // neither proxy moves for them here. It stays because the gap is real —
+      // see `docs/ROADMAP.md` — and because a probe that sends them is the
+      // obvious next thing to add.
       probes: ['proxy.status', 'proxy.headers', 'proxy.xff'],
       why: 'trusting a front proxy\'s forwarded headers. With these on upstream '
         + 'consumes `x-forwarded-proto` / `x-forwarded-host` and lets them decide '

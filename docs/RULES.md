@@ -2046,18 +2046,73 @@ rather than failing the rule.
 
 #### Rules in a request header
 
-whistle reads a rules text out of `x-whistle-rule-value`, a line to append out
-of `x-whistle-rule-host`, a values-store key out of `x-whistle-rule-key` and a
-JSON object of values out of `x-whistle-key-value`
-(`_original/lib/rules/index.js:25-29,:586-591`). Reading them is off unless it
-was started with `enableRequestHeaderRules` or `-M multiEnv`; **deleting** them
-is not — `getValue`'s `delete req.headers[key]` runs either way (`:558-572`).
+A request can carry its own rules, in five headers
+(`initHeaderRules`, `_original/lib/rules/index.js:576-638`):
 
-This port does not read them, and now does not forward them either. It used to:
-a client could hand the origin the rules text it had written, and a whistle
-further up the chain would have obeyed it. Measured against whistle 2.10.8,
-which strips those four and forwards `x-whistle-rule-name` — that one is read
-only in `multiEnv`, so `getValue` is never called for it and it survives.
+| Header | What it carries |
+|---|---|
+| `x-whistle-rule-value` | the rules text |
+| `x-whistle-rule-host` | one more line, appended to it |
+| `x-whistle-rule-key` | the name of a **values** entry, whose content is prepended |
+| `x-whistle-rule-name` | the name of a **rule group**, whose text is appended — `multiEnv` only |
+| `x-whistle-key-value` | a JSON object of values private to that text |
+
+Each is percent-decoded (`decodeURIComponent`, and a malformed escape leaves the
+text alone rather than half-decoding it), and they compose in this order:
+
+```
+<values[x-whistle-rule-key]>
+<x-whistle-rule-value>
+<x-whistle-rule-host>
+<groups[x-whistle-rule-name]>
+```
+
+**Reading them is a mode. Deleting them is not.** `getValue`'s
+`delete req.headers[key]` runs before it decides whether to return anything
+(`:558-570`), so a rules text a client wrote never reaches the origin — and is
+never obeyed by a whistle further up the chain — whatever this proxy is set to.
+That is true here too, and always has been.
+
+Which mode, and what changes:
+
+| Started with | The five headers | Who wins |
+|---|---|---|
+| *(nothing)* | taken, contents dropped | — |
+| `-M enableRequestHeaderRules` | read | **the stored rules** |
+| `-M multiEnv` (`nohost`, `multienv`, and inside `-M multiple`) | read, including `x-whistle-rule-name` | **the request's** |
+| `-M strict` beside either | taken, contents dropped | — |
+
+The precedence is upstream's, and it is one `if` (`initRules`, `:647-652`):
+`multiEnv` resolves the stored rules and merges the request's **over** them,
+and `enableRequestHeaderRules` does it the other way round.
+
+`-M multiEnv` brings two more things with it, both upstream's and both
+measured:
+
+* only the **default** rule group resolves. Named groups stay loaded and stay
+  editable, but selecting one does nothing — `getSelectedRulesList()` returns
+  `[]` under it (`_original/lib/rules/util.js:204-206`). The console refuses the
+  toggle here rather than recording a state the proxy then ignores;
+* HTTPS is no longer intercepted from the switch. `isEnableCapture()` opens with
+  `if (config.multiEnv || config.notAllowedEnableHTTPS) return false`
+  (`rules/util.js:547-550`), so `-M capture|multiEnv` and `-M multiEnv|capture`
+  both pass CONNECT through. A `enable://capture` **rule** still works: it is
+  resolved from the rules and never consults the switch.
+
+> **`multiEnv` lets whoever sends a request decide where it goes.** It is for
+> one proxy serving many environments — each request naming its own, nothing
+> stored — and not for a proxy on a shared network. Both proxies are off by
+> default for that reason.
+
+`x-whistle-rule-name` is the odd one: outside `multiEnv` upstream never calls
+`getValue` for it, so it is neither read **nor deleted** and reaches the origin.
+Measured against whistle 2.10.8, and matched here — including the corner where
+`-M strict|multiEnv` consumes it and reads nothing, because `strict` suppresses
+what the call returns rather than the call.
+
+All of the above is measured probe by probe by
+`tests/differential/header-rules-bench.js` (50 probes, 0 differing) and pinned
+without node by `tests/header_rules_e2e.rs`.
 
 Three more markers go the same way, and for the same reason — they name facts
 about the *connection*, which the connection already answers:

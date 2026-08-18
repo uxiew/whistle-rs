@@ -1293,6 +1293,17 @@ async fn rule_group_toggle(state: &Arc<AppState>, req: Request<Incoming>) -> Res
         .unwrap_or("");
     let result = {
         let mut mgr = state.rules.write().unwrap();
+        // `-M multiEnv` resolves the default group alone, so switching a named
+        // one on would record a state the proxy then ignores. Upstream refuses
+        // the same call for the same reason — `selectRulesFile` returns without
+        // doing anything under `config.multiEnv`
+        // (`_original/lib/rules/util.js:148-151`).
+        if mgr.is_default_group_only() && name != "default" {
+            return json_error(
+                "-M multiEnv is on: only the default group resolves, and each \
+                 request brings its own rules",
+            );
+        }
         let r = mgr.toggle_group(name);
         if r.is_some() {
             crate::rules::storage::save_meta(&rules_dir(state), &mgr);
@@ -1465,7 +1476,18 @@ async fn status_json(state: &Arc<AppState>) -> Response<DynBody> {
             .map(|ip| ip.to_string())
             .collect::<Vec<_>>(),
         "socks_port": cfg.socks_port,
-        "intercept_https": cfg.intercept_https,
+        // What a connection actually meets, so the console does not claim to be
+        // decrypting when `-M multiEnv` has taken the switch away — see
+        // `Config::intercepts_https`.
+        "intercept_https": cfg.intercepts_https(),
+        // Why, when the two disagree: the switch is on and a mode overrode it.
+        "capture_locked_off": cfg.capture_locked_off,
+        // Whether a request may carry its own rules, and whose win when it does.
+        "header_rules": match cfg.header_rules {
+            crate::config::HeaderRules::Off => "off",
+            crate::config::HeaderRules::Console => "enableRequestHeaderRules",
+            crate::config::HeaderRules::Request => "multiEnv",
+        },
         "insecure_upstream": super::upstream::insecure_upstream(),
         "storage_dir": cfg.storage_dir.to_string_lossy(),
         "root_ca": cfg.root_ca_cert_path().to_string_lossy(),

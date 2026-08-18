@@ -78,6 +78,40 @@ pub struct Config {
     /// `-M keepXFF`. Off by default in both proxies, so a client cannot hand
     /// the origin an address the proxy appears to vouch for.
     pub keep_client_xff: bool,
+    /// Whether this proxy reads rules out of a request's **own headers**, and
+    /// whose rules win when it does — `-M enableRequestHeaderRules` and
+    /// `-M multiEnv`/`nohost`. Off in both proxies by default; see
+    /// [`HeaderRules`] for what each setting means and why the default matters.
+    pub header_rules: HeaderRules,
+    /// Was `-M multiEnv` (or `nohost`, or `multienv`) named?
+    ///
+    /// Separate from [`header_rules`](Self::header_rules) because `-M strict`
+    /// takes away the *reading* and nothing else: `getValue` still runs for
+    /// `x-whistle-rule-name` — `config.multiEnv && ... getValue(...)`
+    /// (`_original/lib/rules/index.js:586`) — and the delete inside it is
+    /// unconditional, so the header is consumed under `strict|multiEnv` and
+    /// forwarded to the origin under `strict` alone. Measured, and the two-line
+    /// difference the bench found when this was one field.
+    ///
+    /// The other two things the mode does — resolving the default group alone,
+    /// and taking the HTTPS switch away — read it for the same reason: they
+    /// check `config.multiEnv` directly and have never heard of `strict`.
+    pub multi_env: bool,
+    /// Whether a mode has taken the global HTTPS switch away.
+    ///
+    /// `-M multiEnv` and `-M notAllowedEnableHTTPS` do not *set*
+    /// [`intercept_https`](Self::intercept_https) — they make it unanswerable:
+    /// upstream's `isEnableCapture()` opens with
+    /// `if (config.multiEnv || config.notAllowedEnableHTTPS) return false`
+    /// (`_original/lib/rules/util.js:547-550`), so it is false whatever the
+    /// stored property says and whatever order the tokens came in. Measured:
+    /// `-M capture|multiEnv` passes CONNECT through, and so does
+    /// `-M multiEnv|capture`.
+    ///
+    /// A rule may still ask for one host — `enable://capture` is resolved from
+    /// the rules and never consults this, exactly as upstream's per-rule
+    /// enable does.
+    pub capture_locked_off: bool,
     /// Extra hostnames that **are** the console rather than somewhere to
     /// forward to — whistle's `-l/--localUIHost`, which appends to a built-in
     /// list rather than replacing it (`uiHostList`,
@@ -152,6 +186,9 @@ impl Default for Config {
             console: true,
             console_hostnames: true,
             keep_client_xff: false,
+            header_rules: HeaderRules::Off,
+            multi_env: false,
+            capture_locked_off: false,
             local_ui_hosts: Vec::new(),
             socks_port: None,
             plugins: HashMap::new(),
@@ -252,6 +289,70 @@ pub struct ModeReport {
 /// (`_original/lib/config.js:766-773`). `admin`'s expansion differs under
 /// `debug`, and this takes the non-debug one; the extra tokens it adds are all
 /// inert here, so the difference is not reachable.
+/// Whether a request may carry its **own rules**, in its own headers.
+///
+/// whistle reads five headers off an arriving request and, when a mode says so,
+/// parses their contents as a rules text that applies to that request alone
+/// (`initHeaderRules`, `_original/lib/rules/index.js:576-638`):
+///
+/// | header | what it carries |
+/// |---|---|
+/// | `x-whistle-rule-value` | the rules text |
+/// | `x-whistle-rule-host` | one more line, appended |
+/// | `x-whistle-rule-key` | the name of a **values** entry, whose content is prepended |
+/// | `x-whistle-rule-name` | the name of a **rule group**, whose text is appended — `multiEnv` only |
+/// | `x-whistle-key-value` | a JSON object of values private to that text |
+///
+/// Each is percent-decoded, and each is **removed from the request either way**
+/// — the delete in `getValue` (`:558-570`) is unconditional and only the
+/// *reading* is gated. This port has always done the removing; what follows is
+/// the reading.
+///
+/// **Why it is off by default, in both proxies.** These headers let whoever
+/// sends the request choose where it goes and what it carries — a proxy that
+/// honours them by default is one any client on the network can redirect. The
+/// deployment they exist for is the opposite of accidental: one whistle serving
+/// many environments, each request naming its own
+/// (`nohost`/`multiEnv` — hence the name).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HeaderRules {
+    /// The headers are removed and their contents dropped. The default, and
+    /// what `-M strict` forces regardless of the other tokens
+    /// (`config.strict ||` in `getValue`, `rules/index.js:561`).
+    #[default]
+    Off,
+    /// `-M enableRequestHeaderRules`: the headers are read, but **the console's
+    /// rules win** — upstream resolves the header rules first and merges the
+    /// stored ones over them (`initRules`, `rules/index.js:647-652`), and the
+    /// merge is what decides. `x-whistle-rule-name` is neither read nor removed
+    /// under this one; measured, it reaches the origin.
+    Console,
+    /// `-M multiEnv` (also spelled `nohost`, `multienv`, and reached through
+    /// `-M multiple`): the headers are read and **they win**, because upstream
+    /// merges them the other way round. Two things come with it, both measured
+    /// and both upstream's:
+    ///
+    ///   * the console's **named** rule groups stop applying — `multiEnv` makes
+    ///     `getSelectedRulesList()` return `[]` and refuses select/unselect
+    ///     (`rules/util.js:94,:149,:164,:204`). The **default** group still
+    ///     applies; only selection is gone;
+    ///   * HTTPS is no longer intercepted from the switch — see
+    ///     [`Config::capture_locked_off`].
+    Request,
+}
+
+impl HeaderRules {
+    /// Are the five headers read at all?
+    pub fn reads_headers(self) -> bool {
+        self != HeaderRules::Off
+    }
+
+    /// Do the rules a request brought beat the ones the console holds?
+    pub fn beats_stored_rules(self) -> bool {
+        self == HeaderRules::Request
+    }
+}
+
 fn expand_mode(token: &str) -> Option<&'static [&'static str]> {
     match token {
         "multiple" => Some(&["multiEnv", "disableUpdateTips", "keepXFF", "x-forwarded-proto"]),
@@ -269,11 +370,6 @@ fn expand_mode(token: &str) -> Option<&'static [&'static str]> {
 /// answers are different advice: "whistle has this and whistle-rs does not" is
 /// something to look up, and "no such mode" is a typo to fix. Grouped by why.
 const INERT_MODES: &[&str] = &[
-    // Reading rules out of request headers — a real feature, not done here.
-    // `nohost`/`multiEnv` deployments serve many environments from one proxy by
-    // letting each request carry its own rules; measured, upstream honours
-    // `x-whistle-rule-value` under any of these three.
-    "multiEnv", "multienv", "nohost", "enableRequestHeaderRules",
     // Trusting a front proxy's forwarded headers. Measured: with these on,
     // upstream *consumes* `x-forwarded-proto` / `x-forwarded-host` and lets them
     // decide the scheme and the destination. Off — which is the default in both
@@ -286,12 +382,12 @@ const INERT_MODES: &[&str] = &[
     "disableBackOption", "disabledBackOption", "disableMultipleOption",
     "disabledMultipleOption", "disableRulesOptions", "disabledRulesOptions",
     "notAllowDisablePlugins", "notAllowedDisablePlugins",
-    "notAllowEnableHTTPS", "notAllowedEnableHTTPS", "disableUpdateTips",
+    "disableUpdateTips",
     "disableCustomCerts", "showPluginReq",
     // Which subsystem the instance is for. This port has one shape.
     "rules", "rulesOnly", "plugins", "pluginsOnly", "network", "shadowRules",
     "socks", "master", "client", "agent", "proxyServer", "proxifier",
-    "proxifier2", "diagnose", "encrypted", "captureData", "strict", "noGzip",
+    "proxifier2", "diagnose", "encrypted", "captureData", "noGzip",
     "INADDR_ANY", "buildIn", "build-in",
     // DNS resolution order — `gui/online.md`'s three radio buttons.
     "ipv6Only", "ipv6only", "ipv4First", "ipv4first", "ipv6first", "verbatim",
@@ -301,6 +397,19 @@ const INERT_MODES: &[&str] = &[
 ];
 
 impl Config {
+    /// Is HTTPS intercepted from the switch, for connections no rule speaks for?
+    ///
+    /// upstream's `isEnableCapture()` (`_original/lib/rules/util.js:547-554`),
+    /// whose first line refuses outright under two modes and whose second
+    /// consults the stored property. Both halves are asked here rather than
+    /// folded into one field, so that `/api/status` can still report what the
+    /// switch says *and* that a mode has taken it away — and so the answer does
+    /// not depend on the order `-M capture|multiEnv` came in. Measured: it does
+    /// not, either way round.
+    pub fn intercepts_https(&self) -> bool {
+        self.intercept_https && !self.capture_locked_off
+    }
+
     /// Apply a `-M/--mode` list: `|`, `,` or `&` separated, as upstream splits
     /// it (`newConf.mode.trim().split(/\s*[|,&]\s*/)`, `config.js:763`).
     ///
@@ -311,6 +420,7 @@ impl Config {
     /// four of which this port has something to apply them to.
     pub fn apply_modes(&mut self, list: &str) -> ModeReport {
         let mut report = ModeReport::default();
+        let mut saw_strict = false;
         let mut tokens: Vec<String> = Vec::new();
         for raw in list.split(['|', ',', '&']) {
             let token = raw.trim();
@@ -359,8 +469,44 @@ impl Config {
                     self.keep_client_xff = true;
                     true
                 }
+                // A request may bring its own rules, and they lose to the
+                // console's.
+                "enableRequestHeaderRules" => {
+                    // `multiEnv` is the stronger of the two and upstream checks
+                    // it first everywhere, so a list naming both means
+                    // `multiEnv` whichever order it came in.
+                    if self.header_rules != HeaderRules::Request {
+                        self.header_rules = HeaderRules::Console;
+                    }
+                    true
+                }
+                // A request may bring its own rules, and they win. HTTPS
+                // interception goes with it — see `capture_locked_off`.
+                "multiEnv" | "multienv" | "nohost" => {
+                    self.header_rules = HeaderRules::Request;
+                    self.multi_env = true;
+                    self.capture_locked_off = true;
+                    true
+                }
+                // "do not let anyone switch HTTPS on": the same lock, without
+                // the rules half.
+                "notAllowEnableHTTPS" | "notAllowedEnableHTTPS" => {
+                    self.capture_locked_off = true;
+                    true
+                }
+                // Handled after the loop: what `strict` does is take away what
+                // another token gave, so whether it did anything cannot be
+                // known until every token has been read.
+                "strict" => {
+                    saw_strict = true;
+                    false
+                }
                 _ => false,
             };
+            // Bucketed after the loop instead: what it did is not knowable yet.
+            if token == "strict" {
+                continue;
+            }
             let bucket = if honoured {
                 &mut report.honoured
             } else if INERT_MODES.contains(&token.as_str()) {
@@ -371,6 +517,21 @@ impl Config {
             if !bucket.contains(&token) {
                 bucket.push(token);
             }
+        }
+        // `strict` is the one token whose effect is entirely negative: it makes
+        // `getValue` refuse to return a header's contents
+        // (`config.strict || ...`, `_original/lib/rules/index.js:561`), which is
+        // visible only if something else asked for them. Reported as honoured
+        // when it took something away and as inert when there was nothing to
+        // take — the two are different advice, and the token is the same.
+        if saw_strict {
+            let bucket = if self.header_rules.reads_headers() {
+                self.header_rules = HeaderRules::Off;
+                &mut report.honoured
+            } else {
+                &mut report.inert
+            };
+            bucket.push("strict".to_string());
         }
         report
     }
@@ -492,11 +653,12 @@ mod tests {
     #[test]
     fn a_mode_list_is_split_and_triaged() {
         let mut c = Config::default();
-        let r = c.apply_modes(" pureProxy , nohost | notAThing & keepXFF ");
-        assert_eq!(r.honoured, ["pureProxy", "keepXFF"]);
-        assert_eq!(r.inert, ["nohost"]);
+        let r = c.apply_modes(" pureProxy , nohost | notAThing & keepXFF | noGzip ");
+        assert_eq!(r.honoured, ["pureProxy", "nohost", "keepXFF"]);
+        assert_eq!(r.inert, ["noGzip"]);
         assert_eq!(r.unknown, ["notAThing"]);
         assert!(!c.console_hostnames && c.keep_client_xff);
+        assert_eq!(c.header_rules, HeaderRules::Request);
 
         // An empty list changes nothing and reports nothing.
         let mut c = Config::default();
@@ -514,9 +676,11 @@ mod tests {
         let r = c.apply_modes("multiple");
         assert!(c.keep_client_xff, "multiple carries keepXFF");
         assert!(r.honoured.contains(&"keepXFF".to_string()));
-        // The rest of the expansion is real vocabulary, so it is inert and not
-        // unknown — the distinction is the advice the report gives.
-        assert!(r.inert.contains(&"multiEnv".to_string()));
+        // `multiple` carries `multiEnv`, which is a behaviour and not just
+        // vocabulary: a request may bring its own rules, and they win.
+        assert!(r.honoured.contains(&"multiEnv".to_string()));
+        assert_eq!(c.header_rules, HeaderRules::Request);
+        assert!(c.multi_env && c.capture_locked_off && !c.intercepts_https());
         // The composite's own name is not reported: it stands for its parts and
         // they are what happened.
         assert!(!r.inert.contains(&"multiple".to_string()));
@@ -525,6 +689,70 @@ mod tests {
         let mut c = Config::default();
         let r = c.apply_modes("admin");
         assert!(r.unknown.is_empty(), "admin expands to known tokens: {r:?}");
+        // `admin` carries `strict`, and there is nothing for it to suppress —
+        // so it is reported as the inert token it was in that list.
+        assert!(r.inert.contains(&"strict".to_string()), "{r:?}");
+        assert_eq!(c.header_rules, HeaderRules::Off);
+    }
+
+    /// The three settings of [`HeaderRules`], and the two facts `-M multiEnv`
+    /// carries that `-M strict` does not take back. Every line here was
+    /// measured against whistle 2.10.8 by
+    /// `tests/differential/header-rules-bench.js` before it was written.
+    #[test]
+    fn the_header_rules_modes_are_read_the_way_upstream_reads_them() {
+        // Off unless asked, in both proxies.
+        assert_eq!(Config::default().header_rules, HeaderRules::Off);
+
+        let mut c = Config::default();
+        c.apply_modes("enableRequestHeaderRules");
+        assert_eq!(c.header_rules, HeaderRules::Console);
+        assert!(!c.multi_env, "this one is not multiEnv");
+        assert!(c.intercepts_https(), "and it does not touch the switch");
+
+        // Three spellings of the same mode.
+        for token in ["multiEnv", "multienv", "nohost"] {
+            let mut c = Config::default();
+            c.apply_modes(token);
+            assert_eq!(c.header_rules, HeaderRules::Request, "{token}");
+            assert!(c.multi_env, "{token}");
+        }
+
+        // `multiEnv` is the stronger of the two whichever order they come in —
+        // upstream checks `config.multiEnv` first at every site.
+        for list in ["multiEnv|enableRequestHeaderRules", "enableRequestHeaderRules|multiEnv"] {
+            let mut c = Config::default();
+            c.apply_modes(list);
+            assert_eq!(c.header_rules, HeaderRules::Request, "{list}");
+        }
+
+        // `strict` takes the reading away and leaves everything else standing:
+        // the name header is still consumed, the named groups still stop, and
+        // the HTTPS switch is still gone.
+        for list in ["strict|multiEnv", "multiEnv|strict"] {
+            let mut c = Config::default();
+            let r = c.apply_modes(list);
+            assert_eq!(c.header_rules, HeaderRules::Off, "{list}");
+            assert!(c.multi_env && c.capture_locked_off, "{list}");
+            assert!(r.honoured.contains(&"strict".to_string()), "{list}: {r:?}");
+        }
+    }
+
+    /// `isEnableCapture()` refuses under two modes before it consults anything,
+    /// so the token order cannot decide it. Measured: `-M capture|multiEnv` and
+    /// `-M multiEnv|capture` both pass CONNECT through.
+    #[test]
+    fn a_mode_can_take_the_https_switch_away_whatever_the_order() {
+        for list in ["capture|multiEnv", "multiEnv|capture", "capture|notAllowedEnableHTTPS"] {
+            let mut c = Config::default();
+            c.apply_modes(list);
+            assert!(c.intercept_https, "{list}: the switch itself is still on");
+            assert!(!c.intercepts_https(), "{list}: and it no longer answers");
+        }
+        // Without one of those modes the switch is the whole answer.
+        let mut c = Config::default();
+        c.apply_modes("capture");
+        assert!(c.intercepts_https());
     }
 
     /// The last word wins when two tokens in one list disagree, which is what

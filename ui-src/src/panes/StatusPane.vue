@@ -23,7 +23,11 @@ const proxy = computed<Pair[]>(() => [
 ]);
 
 const tls = computed<Pair[]>(() => [
-  ['Intercept HTTPS', yesNo(!!st.value?.intercept_https)],
+  // A mode can take the switch away, and the answer without the reason reads
+  // like a bug — see `Config::intercepts_https`.
+  ['Intercept HTTPS', st.value?.capture_locked_off
+    ? 'no — a -M mode turned it off'
+    : yesNo(!!st.value?.intercept_https)],
   ['Verify origin', st.value?.insecure_upstream ? 'NO — --insecure-upstream' : 'yes'],
   ['Root CA', st.value?.root_ca],
 ]);
@@ -37,6 +41,13 @@ const capture = computed<Pair[]>(() => [
 
 const rules = computed<Pair[]>(() => [
   ['Active rules', st.value?.rules],
+  // Off is the default and says nothing; on is worth saying, because it changes
+  // who decides where a request goes.
+  ...(st.value && st.value.header_rules !== 'off'
+    ? [['Rules from request headers', st.value.header_rules === 'multiEnv'
+        ? 'yes — and they beat these (-M multiEnv)'
+        : 'yes — these still win (-M enableRequestHeaderRules)'] as Pair]
+    : []),
   ['Storage', st.value?.storage_dir],
 ]);
 </script>

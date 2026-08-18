@@ -57,7 +57,7 @@ struct Cli {
     ///
     /// whistle's vocabulary is fifty-six tokens, of which fifteen change
     /// anything a proxy client can see — measured, one whistle per token, by
-    /// `tests/differential/mode-probe.js`. This honours the four that mean
+    /// `tests/differential/mode-bench.js`. This honours the ones that mean
     /// something here:
     ///
     /// * `pureProxy` (`proxyOnly`, `httpProxy`) — stop answering for the console
@@ -69,7 +69,17 @@ struct Cli {
     ///   here; `disableCapture` is the off switch and is `--no-intercept-https`
     ///   under whistle's name;
     /// * `keepXFF` (`forwardedFor`) — let a client's own `x-forwarded-for` reach
-    ///   the origin, which both proxies otherwise drop.
+    ///   the origin, which both proxies otherwise drop;
+    /// * `enableRequestHeaderRules` — let a request carry its own rules in
+    ///   `x-whistle-rule-value` and friends. The stored rules still win;
+    /// * `multiEnv` (`nohost`, `multienv`) — the same, except the request's
+    ///   rules win, `x-whistle-rule-name` is read too, only the default rule
+    ///   group resolves, and HTTPS is no longer intercepted from the switch.
+    ///   **This lets whoever sends a request decide where it goes**: it is for
+    ///   one proxy serving many environments, not for a shared network;
+    /// * `notAllowedEnableHTTPS` — take the HTTPS switch away on its own;
+    /// * `strict` — refuse to read the rules headers after all, which is how
+    ///   upstream's `admin` preset composes.
     ///
     /// A token whistle has and this port cannot apply is reported at startup,
     /// and so is one neither program knows. See `docs/ROADMAP.md` for the rest.
@@ -430,6 +440,21 @@ async fn main() -> Result<()> {
         let mut merged = persisted;
         merged.extend(config.values.clone());
         config.values = merged;
+    }
+    // `-M multiEnv` stops the **named** groups resolving: upstream's
+    // `getSelectedRulesList()` returns `[]` there and nothing can select one
+    // (`_original/lib/rules/util.js:94,:149,:204`). The default group still
+    // applies. Set after the groups are loaded, because loading is what would
+    // otherwise switch some of them on.
+    if config.multi_env {
+        manager.only_default_group();
+        let named = manager.groups().iter().filter(|g| g.name != "default").count();
+        if named > 0 {
+            tracing::info!(
+                "-M multiEnv: {named} named rule group(s) loaded but not resolved; \
+                 the default group and each request's own rules apply"
+            );
+        }
     }
     tracing::info!("loaded {} rules ({} groups)", manager.len(), manager.groups().len());
 

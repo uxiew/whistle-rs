@@ -75,8 +75,12 @@ whistle's `--mode` takes a `|`, `,` or `&` separated list out of a vocabulary of
 token — whistle and whistle-rs in turn — and runs the same nine probes through
 each. **Sixteen** move anything a client can see (fifteen against whistle's own
 defaults, and a sixteenth that only shows once HTTPS interception is on), and
-they collapse into six behaviours. Four of the six mean something here; the other
+they collapse into six behaviours. Five of the six mean something here; the other
 forty are console options, deployment shapes and Node concerns.
+
+As of the last full run, that bench reports **`ran: 57, differing: 0,
+declared: 0`** — every token in the vocabulary, and no declared divergence left
+in the mode table.
 
 | mode (and its spellings) | what it does | |
 | --- | --- | --- |
@@ -84,28 +88,53 @@ forty are console options, deployment shapes and Node concerns.
 | `headless`, `shadowRulesOnly` | no console at all. The root certificate, the PAC file and `/api/status` still answer, because a client that cannot fetch them cannot be configured to use the proxy | ✅ |
 | `capture`, `intercept`, `enableCapture`, `enableHttps`, `persistentCapture` | intercept HTTPS from startup — already the default here. `disableCapture` is the off switch, and is `--no-intercept-https` under whistle's name | ✅ |
 | `keepXFF`, `forwardedFor` | let a client's own `x-forwarded-for` reach the origin. Both proxies drop it by default, so that a client cannot hand the origin an address the proxy appears to vouch for | ✅ |
-| `multiEnv`, `nohost`, `enableRequestHeaderRules` | read rules out of a request's own `x-whistle-rule-value` header, which is how one whistle serves many environments | ➖ this port deletes those headers on arrival and never reads them |
+| `enableRequestHeaderRules` | let a request carry its own rules in `x-whistle-rule-value` and four companions. The **stored** rules still win | ✅ |
+| `multiEnv`, `nohost`, `multienv` | the same, except the request's rules win, `x-whistle-rule-name` is read too, only the default rule group resolves, and HTTPS stops being intercepted from the switch | ✅ |
+| `notAllowedEnableHTTPS` | forbid turning HTTPS interception on — which upstream implements by refusing to intercept at all | ✅ |
+| `strict` | refuse to read the rules headers after all. Visible only beside one of the two above, which is how upstream's `admin` preset composes | ✅ |
 | `x-forwarded-proto`, `x-forwarded-host` | trust a front proxy's forwarded headers and let them decide the scheme and the destination | ➖ they travel on untouched here, which is also whistle's default |
-| `notAllowedEnableHTTPS` | forbid turning HTTPS interception on from the console — which upstream implements by refusing to intercept at all | ➖ there is no console switch here for it to forbid |
 
-One interaction is worth knowing before you compose a list: **`multiEnv` (and
-`nohost`) turns HTTPS interception off**, whatever `capture` said —
-`isEnableCapture()` opens with `if (config.multiEnv || config.notAllowedEnableHTTPS)
-return false`. It is not obvious from either name.
+> **`-M multiEnv` lets whoever sends a request decide where it goes.** The
+> headers name a destination, a rules text, and values to expand into it. That
+> is what the mode is *for* — one proxy serving many environments, each request
+> naming its own — and it is why both proxies are off by default. Do not switch
+> it on for a proxy anything else on the network can reach.
+> [Rules in a request header](RULES.md#rules-in-a-request-header) has the full
+> shape, including which of the five headers is the one that reaches the origin.
+
+Two interactions are worth knowing before you compose a list:
+
+* **`multiEnv` (and `nohost`) turns HTTPS interception off**, whatever `capture`
+  said and in whichever order — `isEnableCapture()` opens with
+  `if (config.multiEnv || config.notAllowedEnableHTTPS) return false`, so the
+  switch never gets consulted. It is not obvious from either name. A per-host
+  `enable://capture` **rule** still works;
+* **`strict` takes the reading back away**, and nothing else. Under
+  `-M strict|multiEnv` the headers are still consumed, the named groups still
+  stop resolving, and HTTPS is still not intercepted — only the rules text is
+  ignored. `-M admin` carries `strict`, so an `admin` instance never reads them.
 
 The tokens this port has nothing to do with are not silently swallowed: a mode whistle has and this port cannot apply is
 named at startup, and one **neither** program knows is reported as a probable
 typo.
 
 ```
-$ whistle-rs -M "pureProxy|nohost|notAThing"
-INFO mode: pureProxy
-INFO mode: nohost — whistle has these and this port has nothing to apply them to; see docs/ROADMAP.md
+$ whistle-rs -M "pureProxy|nohost|x-forwarded-proto|notAThing"
+INFO mode: pureProxy, nohost
+INFO mode: x-forwarded-proto — whistle has these and this port has nothing to apply them to; see docs/ROADMAP.md
 WARN mode: notAThing — no such mode in whistle either, so probably a typo
 ```
 
+With named rule groups on disk, `nohost` adds one more line, because a group
+that is loaded and not resolved is worth saying out loud:
+
+```
+INFO -M multiEnv: 2 named rule group(s) loaded but not resolved; the default group and each request's own rules apply
+```
+
 `multiple` and `admin` are composites and are expanded first, exactly as upstream
-expands them, so `-M multiple` really does bring `keepXFF` with it.
+expands them, so `-M multiple` really does bring `keepXFF` **and** `multiEnv`
+with it, and `-M admin` brings `strict`.
 
 ## Hand-supplied certificates
 
