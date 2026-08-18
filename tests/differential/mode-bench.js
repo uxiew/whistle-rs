@@ -19,11 +19,12 @@
 // console off (`headless`), intercept HTTPS from startup (`capture`), keep the
 // client's `x-forwarded-for` (`keepXFF`), read rules out of request headers
 // (`multiEnv`, `enableRequestHeaderRules`), and trust a front proxy's forwarded
-// headers (`x-forwarded-proto`). This port honours the first five; the last is
-// named in `docs/ROADMAP.md` with the reason.
+// headers (`x-forwarded-proto`, `x-forwarded-host`). **All six are honoured.**
 //
-// The fifth wanted more than one probe can hold, so it has a bench of its own:
-// `header-rules-bench.js` walks all five headers under every setting.
+// Two of them wanted more than one probe can hold, so each has a bench of its
+// own: `header-rules-bench.js` walks the five rules-carrying headers under every
+// setting, and `forwarded-bench.js` walks the four forwarding ones against two
+// origins.
 'use strict';
 const http = require('http');
 const tls = require('tls');
@@ -236,19 +237,9 @@ async function main() {
     // `if (config.multiEnv || config.notAllowedEnableHTTPS) return false`
     // (`_original/lib/rules/util.js:547-550`), which this port spells
     // `Config::intercepts_https`.
-    {
-      match: (mode) => ['x-forwarded-proto', 'x-forwarded-host'].includes(mode),
-      // The one declaration left, and it currently excuses nothing: the battery
-      // sends `x-forwarded-for` and not the two headers these modes consume, so
-      // neither proxy moves for them here. It stays because the gap is real —
-      // see `docs/ROADMAP.md` — and because a probe that sends them is the
-      // obvious next thing to add.
-      probes: ['proxy.status', 'proxy.headers', 'proxy.xff'],
-      why: 'trusting a front proxy\'s forwarded headers. With these on upstream '
-        + 'consumes `x-forwarded-proto` / `x-forwarded-host` and lets them decide '
-        + 'the scheme and the destination; off — the default in both — they travel '
-        + 'on untouched, which is what this port always does.',
-    },
+    // `x-forwarded-proto` / `x-forwarded-host` were declared here. They are
+    // implemented — see `forwarded-bench.js`, which sends the headers this
+    // battery does not and compares where the request ended up.
   ];
 
   /**

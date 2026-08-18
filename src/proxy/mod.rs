@@ -7,6 +7,7 @@ pub mod apply;
 #[cfg(test)]
 mod bench;
 pub mod body;
+pub mod forwarded;
 pub mod header_rules;
 pub mod ciphers;
 pub mod coding;
@@ -4006,6 +4007,12 @@ async fn serve(
     // also *kept*, and becomes a rules text for this one request — see
     // [`header_rules`]. Off by default in both proxies.
     let carried = take_header_rules(req.headers_mut(), &state.config);
+    // What a front proxy claims about this request — the host it was addressed
+    // to and the scheme it arrived under. Believed only when a `-M` mode says a
+    // front proxy is there; two of the four headers are taken off either way,
+    // because this port will not act on them and they may not travel on. See
+    // [`forwarded`].
+    let claimed = forwarded::take(req.headers_mut(), &state.config);
 
     // A request that asks to change protocol is matched as a `ws://` one, and
     // that has to be known *before* the rules resolve. whistle stamps
@@ -4021,7 +4028,10 @@ async fn serve(
     // (`matcher::serves_no_file`).
     let upgrading = asks_to_upgrade(req.headers());
     // Derive scheme/host/port/path for matching.
-    let (scheme, host, port, path) = match &origin {
+    // `port_explicit` says the port came from the request rather than from the
+    // scheme's default, which is what decides whether a forwarded-proto claim
+    // may move it — see below.
+    let (mut scheme, mut host, mut port, path, port_explicit) = match &origin {
         Origin::Forward => {
             let uri = req.uri();
             let host = uri.host().unwrap_or_default().to_string();
@@ -4048,7 +4058,7 @@ async fn serve(
                 .path_and_query()
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string());
-            (scheme, host, port, path)
+            (scheme, host, port, path, uri.port_u16().is_some())
         }
         Origin::Mitm { host, port, tls, .. } => {
             let path = req
@@ -4062,9 +4072,63 @@ async fn serve(
                 (false, true) => "ws",
                 (false, false) => "http",
             };
-            (scheme.to_string(), host.clone(), *port, path)
+            // The port a CONNECT named is the port, and no claim moves it.
+            (scheme.to_string(), host.clone(), *port, path, true)
         }
     };
+
+    // A front proxy's claim, applied to what the rules will match. Upstream
+    // does the same two things and no more: `headers.host = host` before the
+    // full URL is built (`_original/lib/util/common.js:1259-1265`) and
+    // `req.isHttps = proto === 'https'` (`util/index.js:3722-3727`). Measured:
+    // the *outgoing* request is unaffected — a request labelled `https` still
+    // left over plain HTTP and still reached a plain origin, it simply matched
+    // `https://` patterns on the way.
+    // What the request actually arrived as, kept because a forwarded-proto claim
+    // changes **which pattern matches** and nothing else — see below.
+    let wire_scheme = scheme.clone();
+    let mut wire_port = port;
+    if let Some(https) = claimed.https {
+        scheme = match (https, upgrading) {
+            (true, true) => "wss",
+            (true, false) => "https",
+            (false, true) => "ws",
+            (false, false) => "http",
+        }
+        .to_string();
+        // The port the request addressed was read against the *old* scheme, so
+        // a claim that changes it moves a default port with it — 80 and 443 are
+        // the same request to two different servers. An explicit port in the
+        // request stands.
+        let (from, to) = match https {
+            true => (80, 443),
+            false => (443, 80),
+        };
+        if port == from && !port_explicit {
+            port = to;
+        }
+    }
+    if let Some(claimed_host) = &claimed.host {
+        match forwarded::split_host(claimed_host, port) {
+            Some((h, p)) => {
+                host = h;
+                port = p;
+                // A host claim moves the *destination*, so its port is the one
+                // to connect to — it replaces whatever a proto claim implied.
+                wire_port = p;
+                // Upstream assigns `headers.host`, so everything downstream —
+                // the rules, the capture, the origin — sees one answer rather
+                // than two.
+                if let Ok(value) = claimed_host.parse() {
+                    req.headers_mut().insert(hyper::header::HOST, value);
+                }
+            }
+            // A claim this proxy cannot address is ignored, and said so: an
+            // operator who switched the mode on wants to know their front proxy
+            // is sending something unusable.
+            None => tracing::warn!("ignoring an unusable forwarded host: {claimed_host:?}"),
+        }
+    }
 
     let mut info = apply::build_req_info(
         req.method().as_str(),
@@ -4459,7 +4523,30 @@ async fn serve(
     // Resolved before the target because the target is *how* to reach it, and
     // because the forwarding family is matched against *this* URL rather than
     // the client's — see `forwarding_resolution`.
-    let dest = dest::Destination::of(&info, &resolved);
+    // The destination is read against the scheme and port the request **arrived
+    // under**, not the one a front proxy claimed.
+    //
+    // Measured, and the measurement is the whole reason this is here: with
+    // `-M x-forwarded-proto` and `x-forwarded-proto: https`, whistle sends
+    // **no ClientHello at all** — a plain origin logged zero client errors —
+    // while it matched the `https://` rule. The claim describes the hop *before*
+    // this proxy; the hop after it is whatever it always was. A rule that writes
+    // a destination of its own still governs, scheme and all.
+    //
+    // This port promoted the transport too, and the difference was invisible to
+    // the bench because a failed handshake retries in plain: the answer looked
+    // right and every request had paid for a doomed TLS attempt first. An origin
+    // that read the ClientHello instead of rejecting it hung forever, which is
+    // how it surfaced.
+    let dest = match claimed.https.is_some() && (scheme != wire_scheme || port != wire_port) {
+        false => dest::Destination::of(&info, &resolved),
+        true => {
+            let mut wire = info.clone();
+            wire.scheme = wire_scheme;
+            wire.port = wire_port;
+            dest::Destination::of(&wire, &resolved)
+        }
+    };
     let forwarding =
         forwarding_resolution(&state, &info, &dest, &resolved, &merged_rules, is_internal_req);
     let forwarding = forwarding.as_ref().unwrap_or(&resolved);

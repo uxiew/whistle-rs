@@ -92,7 +92,8 @@ in the mode table.
 | `multiEnv`, `nohost`, `multienv` | the same, except the request's rules win, `x-whistle-rule-name` is read too, only the default rule group resolves, and HTTPS stops being intercepted from the switch | ✅ |
 | `notAllowedEnableHTTPS` | forbid turning HTTPS interception on — which upstream implements by refusing to intercept at all | ✅ |
 | `strict` | refuse to read the rules headers after all. Visible only beside one of the two above, which is how upstream's `admin` preset composes | ✅ |
-| `x-forwarded-proto`, `x-forwarded-host` | trust a front proxy's forwarded headers and let them decide the scheme and the destination | ➖ they travel on untouched here, which is also whistle's default |
+| `x-forwarded-host` | believe a front proxy about the host the client asked for, and send the request there | ✅ |
+| `x-forwarded-proto` | believe it about the scheme, which decides whether `https://` patterns match a request that arrived in the clear | ✅ |
 
 > **`-M multiEnv` lets whoever sends a request decide where it goes.** The
 > headers name a destination, a rules text, and values to expand into it. That
@@ -102,6 +103,23 @@ in the mode table.
 > [Rules in a request header](RULES.md#rules-in-a-request-header) has the full
 > shape, including which of the five headers is the one that reaches the origin.
 
+Two more headers belong to that family and are **read with no gate at all
+upstream**, which this port does not follow:
+
+| Header | upstream | here |
+|---|---|---|
+| `x-whistle-real-host` | redirects the request, in **every** mode | honoured under `-M x-forwarded-host`; removed from every request either way |
+| `x-whistle-forwarded-props` | `host` / `proto` / `ip` in its value open those gates **for that one request**, in every mode | removed from every request, never read |
+
+A mode is an operator deciding once, at startup, that a front proxy is there
+and is to be believed. A header is the *sender* deciding — and a proxy has no
+way to tell an operator's front proxy from any client on the network, because
+the header is the only evidence and the sender wrote it. Measured against
+whistle 2.10.8 with no mode set: `x-whistle-real-host` sent a request to a
+different origin, and `x-whistle-forwarded-props: proto` made `https://…`
+patterns fire on a plain request. `tests/differential/forwarded-bench.js`
+declares the divergence probe by probe.
+
 Two interactions are worth knowing before you compose a list:
 
 * **`multiEnv` (and `nohost`) turns HTTPS interception off**, whatever `capture`
@@ -109,6 +127,11 @@ Two interactions are worth knowing before you compose a list:
   `if (config.multiEnv || config.notAllowedEnableHTTPS) return false`, so the
   switch never gets consulted. It is not obvious from either name. A per-host
   `enable://capture` **rule** still works;
+* **`x-forwarded-host` and `x-forwarded-proto` travel on when they are not
+  believed.** Upstream's delete lives inside the branch that consumes them, so
+  without the mode the origin still sees a front proxy's claim — which it may
+  legitimately want. Dropping them anyway would be this port inventing a policy;
+  it does that only for the two ungated headers above, which it will not act on;
 * **`strict` takes the reading back away**, and nothing else. Under
   `-M strict|multiEnv` the headers are still consumed, the named groups still
   stop resolving, and HTTPS is still not intercepted — only the rules text is

@@ -97,6 +97,15 @@ pub struct Config {
     /// and taking the HTTPS switch away — read it for the same reason: they
     /// check `config.multiEnv` directly and have never heard of `strict`.
     pub multi_env: bool,
+    /// Believe `x-forwarded-host` (and whistle's `x-whistle-real-host`) about
+    /// where the request was addressed — `-M x-forwarded-host`.
+    ///
+    /// Off in both proxies by default. See [`crate::proxy::forwarded`], which
+    /// is also where this port's one divergence in that family is named.
+    pub trust_forwarded_host: bool,
+    /// Believe `x-forwarded-proto` about the scheme the client used, which
+    /// decides whether `https://` patterns match — `-M x-forwarded-proto`.
+    pub trust_forwarded_proto: bool,
     /// Whether a mode has taken the global HTTPS switch away.
     ///
     /// `-M multiEnv` and `-M notAllowedEnableHTTPS` do not *set*
@@ -188,6 +197,8 @@ impl Default for Config {
             keep_client_xff: false,
             header_rules: HeaderRules::Off,
             multi_env: false,
+            trust_forwarded_host: false,
+            trust_forwarded_proto: false,
             capture_locked_off: false,
             local_ui_hosts: Vec::new(),
             socks_port: None,
@@ -370,11 +381,6 @@ fn expand_mode(token: &str) -> Option<&'static [&'static str]> {
 /// answers are different advice: "whistle has this and whistle-rs does not" is
 /// something to look up, and "no such mode" is a typo to fix. Grouped by why.
 const INERT_MODES: &[&str] = &[
-    // Trusting a front proxy's forwarded headers. Measured: with these on,
-    // upstream *consumes* `x-forwarded-proto` / `x-forwarded-host` and lets them
-    // decide the scheme and the destination. Off — which is the default in both
-    // — the headers travel on untouched, which is what this port does.
-    "x-forwarded-proto", "x-forwarded-host",
     // Console options: which switches the web UI offers, and how it looks.
     "disableAuthUI", "disableUIAuth", "keepProxyUI", "hideLeftBar", "hideLeftMenu",
     "allowMultipleChoice", "useMultipleRules", "enableMultipleRules",
@@ -486,6 +492,20 @@ impl Config {
                     self.header_rules = HeaderRules::Request;
                     self.multi_env = true;
                     self.capture_locked_off = true;
+                    true
+                }
+                // Believe a front proxy about the host the client asked for.
+                // `x-whistle-real-host` rides on this gate too — upstream reads
+                // that one with no gate at all, which is the divergence named
+                // in `crate::proxy::forwarded`.
+                "x-forwarded-host" => {
+                    self.trust_forwarded_host = true;
+                    true
+                }
+                // Believe it about the scheme, which decides whether `https://`
+                // patterns match a request that arrived in the clear.
+                "x-forwarded-proto" => {
+                    self.trust_forwarded_proto = true;
                     true
                 }
                 // "do not let anyone switch HTTPS on": the same lock, without

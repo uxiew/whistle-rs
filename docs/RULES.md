@@ -2114,8 +2114,44 @@ All of the above is measured probe by probe by
 `tests/differential/header-rules-bench.js` (50 probes, 0 differing) and pinned
 without node by `tests/header_rules_e2e.rs`.
 
-Three more markers go the same way, and for the same reason — they name facts
-about the *connection*, which the connection already answers:
+#### What a front proxy claims
+
+A proxy behind another one is told the client's address, scheme and host in
+headers. whistle reads four (`handleForwardedProps`,
+`_original/lib/util/index.js:3697-3728`; `getFullUrl`,
+`lib/util/common.js:1231-1266`):
+
+| Header | What it claims | Believed when |
+|---|---|---|
+| `x-forwarded-host` | the host the client asked for | `-M x-forwarded-host` |
+| `x-forwarded-proto` | the scheme the client used | `-M x-forwarded-proto` |
+| `x-forwarded-for` | the client's address | `-M keepXFF` |
+| `x-whistle-real-host` | the host, in whistle's own spelling | **`-M x-forwarded-host`** here; **always** upstream |
+| `x-whistle-forwarded-props` | *"open the three gates for me"* | **never** here; **always** upstream |
+
+The first three are removed **only when they are believed** — upstream's delete
+lives inside the branch that consumes them, so without the mode a front proxy's
+claim still reaches the origin, which may legitimately want it.
+
+**The last two this port removes from every request and does not read.** A mode
+is an operator deciding once, at startup, that a front proxy is there. A header
+is the *sender* deciding, and a proxy cannot tell an operator's front proxy from
+any client on the network, because the header is the only evidence and the
+sender wrote it. Measured with no mode set at all: `x-whistle-real-host` sent a
+request to a different origin, and `x-whistle-forwarded-props: proto` made
+`https://…` patterns fire on a plain request. `x-whistle-real-host` is honoured
+under `-M x-forwarded-host`, whose subject is exactly that claim.
+
+**`x-forwarded-proto` changes which pattern matches, not the connection.** A
+request labelled `https` is matched as `https://…` (and against port 443 when it
+named no port), and still leaves this proxy exactly as it arrived. Measured:
+whistle sends no ClientHello for it. `tests/differential/forwarded-bench.js`
+counts handshakes at the origin for that reason, and
+`tests/forwarded_e2e.rs` reads the first byte the origin receives.
+
+Three more markers go the same way as the rules headers, and for the same
+reason — they name facts about the *connection*, which the connection already
+answers:
 
 | Header | Where whistle drops it |
 |---|---|

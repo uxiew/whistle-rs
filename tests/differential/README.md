@@ -414,12 +414,45 @@ not part of a normal bench run. Reach for it when the vocabulary changes.
 **Fifteen of the fifty-six move anything a client can see**, and they collapse
 into six behaviours — turn the console hostnames off, turn the console off,
 intercept HTTPS from startup, keep the client's `x-forwarded-for`, read rules out
-of a request header, trust a front proxy's forwarded headers. This port honours
-the first five. The last — trusting `x-forwarded-proto` / `x-forwarded-host` — is
-declared with the reason in the bench itself.
+of a request header, trust a front proxy's forwarded headers. **This port
+honours all six.**
 
 The last full run reports **`ran: 57, differing: 0, declared: 0`**: every token
-in the vocabulary, and nothing left for a declaration to excuse.
+in the vocabulary, and nothing left for a declaration to excuse. The two
+subjects that outgrew a single probe have benches of their own — see below.
+
+## What a front proxy claims
+
+`forwarded-bench.js` is the other half of the same subject: a proxy behind
+another one is told the client's address, scheme and host in headers, and has to
+decide what to believe.
+
+```sh
+PORT_BASE=20900 node forwarded-bench.js
+```
+
+Two origins, because the interesting claim is a **destination** — a request
+addressed to A that arrives at B is a redirect a header performed. A rule pair
+(`https://…` and `http://…`) makes the scheme claim visible in the same answer.
+
+**It also counts ClientHellos**, and that counter exists because of a bug this
+bench had already passed over. A claimed `x-forwarded-proto: https` changes
+*which pattern matches*; this port promoted the outbound **connection** to TLS
+as well. Every probe still passed, because a failed handshake retries in plain
+and the answer comes out identical — every request simply paid for a doomed
+handshake first. It surfaced only against an origin that *read* the handshake
+instead of rejecting it, and then hung forever. Upstream, measured afterwards,
+sends no ClientHello at all.
+
+The lesson is worth more than the fix: **when two proxies can reach the same
+answer by different routes, the route has to become an observable of its own.**
+`tests/forwarded_e2e.rs` pins the same invariant by reading the first byte the
+origin receives — `0x16` is TLS.
+
+**A clean run is `differing: 0`** with declared rows for the one divergence:
+upstream lets a *request* open the gates a mode is otherwise required to open
+(`x-whistle-real-host`, `x-whistle-forwarded-props`). The reasoning is in
+`src/proxy/forwarded.rs`.
 
 ## Rules a request brings with it
 
