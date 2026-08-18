@@ -14,7 +14,7 @@
 > **算子取值可以指向文件或 URL**（`readRuleValue`），**反引号整值按请求渲染**（`renderTpl`）。
 > **⚠️ 「已应用」不等于「与上游逐位一致」** —— 四路审计确认了 45 项行为差异，
 > **失败开放已清空**；不再维护一个精确的「已修 N 项」整数，下一节的清单才是准的。
-> 单元测试 **908** 项 + 端到端 **6** 项（`tests/console_e2e.rs`，真 socket 进出、
+> 单元测试 **910** 项 + 端到端 **6** 项（`tests/console_e2e.rs`，真 socket 进出、
 > 再问控制台自己的 API）全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
 > 与 `cargo test --doc` 均 **0 警告 / 0 失败**（clippy 由 `Cargo.toml` 的
 > `[lints.clippy]` 把住）。此外还有 **2297 条差分用例**对着真 whistle 2.10.8 实测，
@@ -457,6 +457,22 @@ Non-goal；**与 `w2` 守护进程管理绑定的**（`-S/--storage`、`-C/--cop
     没人用的 CA（有测试钉住）。
   - 不引新依赖：`rcgen` 的 `from_ca_cert_pem` 明确不做 CA 校验、且会解析出 SAN，正好
     用来读叶子证书。
+
+- **`--allow-origin`：控制台 API 的跨域（新）** —— 上游 `checkAllowOrigin`
+  （`biz/webui/lib/index.js:356-378`）逐分支实测后照做：
+  - 没有 `Origin`、或浏览器标了 `sec-fetch-site: same-origin` 的，本就不是跨域，什么都不加；
+  - **`/api/status` 与根证书对任何来源都应答**，配不配都一样（上游的 `CORS_PATHS` 开的是
+    对应的两条）——「这个代理还活着吗」和「该信哪张证书」，是一个页面对一台不属于它的
+    代理唯一合理的两个问题；
+  - 其余路径要求 `Origin` 的**主机名**（去掉端口）在列表里，而回给浏览器的头**原样回显
+    `Origin`**（带端口），因为那才是浏览器拿去比对的东西。
+  - 列表按 `|,&` 切、小写化，`*` 出现在任何位置即「全部放行」；带星的条目走**与 pattern
+    层同一套**域名通配（`*` 一段、`**` 任意段、`***.` 连点可选）——上游在两处调的就是同一个
+    `domainToRegExp`，所以这里复用了 `wildcard::expand_domain_stars`，没有第二份实现。
+  - **故意不发 `access-control-allow-methods` / `-allow-headers`**：上游也不发，所以带
+    JSON body 或自定义头的请求（会触发预检的那些）两边都会被浏览器挡下。补上它们等于把
+    整套 API 交给一个具名来源，而这个控制台另一道门可能只是一个密码——这个口子不该由
+    一个「允许跨域读」的开关顺手开出来。
 
 **读完了 `extensions/`（4 页）与 `gui/`（11 页）。** 规则语义上没有新的缺口：
 `network.md` 里那四个逐方向 WebSocket 标志（`enable://ignoreReceive|ignoreSend|

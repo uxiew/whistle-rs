@@ -483,7 +483,7 @@ fn escape_regexp(s: &str, with_star: bool) -> String {
 /// A star run followed by an escaped dot swallows the dot too, and three or more
 /// stars make the whole thing optional — which is how `***.example.com` matches
 /// `example.com` itself.
-fn expand_domain_stars(escaped: &str) -> String {
+pub(crate) fn expand_domain_stars(escaped: &str) -> String {
     let mut out = String::with_capacity(escaped.len());
     let bytes = escaped.as_bytes();
     let mut i = 0;
@@ -547,6 +547,16 @@ fn expand_stars(escaped: &str, expand: fn(usize) -> &'static str) -> String {
         i += run;
     }
     out
+}
+
+/// A hostname pattern in whistle's domain-star vocabulary, compiled.
+///
+/// Shared with `--allow-origin`, which takes the same kind of list — one
+/// implementation of `*` / `**` / `***.` for both, because upstream calls the
+/// same `domainToRegExp` from both places and two copies would drift.
+pub fn domain_pattern(host: &str) -> Option<Regex> {
+    let escaped = escape_regexp(host, false);
+    Regex::new(&format!("^{}$", expand_domain_stars(&escaped))).ok()
 }
 
 #[cfg(test)]

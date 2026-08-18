@@ -28,6 +28,9 @@ pub struct Config {
     /// Whether HTTPS interception (MITM) is enabled by default. whistle only
     /// intercepts when told to; we expose a global switch for the core.
     pub intercept_https: bool,
+    /// Which origins may call the console's API from a page on another site —
+    /// whistle's `--allowOrigin`. Empty means none, which is the default in both.
+    pub allow_origins: AllowedOrigins,
     /// A directory of certificates supplied by hand — whistle's `-z/--certDir`.
     ///
     /// Each `<name>.key` paired with `<name>.crt` (or `.cer`, `.pem`) is served
@@ -138,6 +141,7 @@ impl Default for Config {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             storage_dir: base.join(DATA_DIRNAME),
             intercept_https: true,
+            allow_origins: AllowedOrigins::default(),
             cert_dir: None,
             rules: None,
             ui_username: None,
@@ -163,6 +167,70 @@ impl Default for Config {
 }
 
 /// Default preview cap: 16 KB of each body kept for inspection.
+/// The `--allow-origin` list, parsed once.
+///
+/// whistle's own shape (`_original/lib/config.js:612-634`): the value is split
+/// on `|`, `,` or `&` and lower-cased; a `*` **anywhere in the list** means every
+/// origin and the rest is ignored; any other entry containing a star becomes a
+/// domain pattern, and the rest are literal hostnames.
+///
+/// The star vocabulary is the one the pattern layer already speaks — `*` is one
+/// label, `**` is any number, `***.` makes the label optional — because it is
+/// the same function upstream uses in both places, and this reuses the same one
+/// here rather than growing a second dialect.
+#[derive(Debug, Clone, Default)]
+pub struct AllowedOrigins {
+    /// `--allow-origin '*'`: every origin, which is the only way to say "any".
+    pub all: bool,
+    /// Literal hostnames, lower-cased.
+    pub hosts: Vec<String>,
+    /// Hostnames written with a star, compiled.
+    pub patterns: Vec<regex::Regex>,
+}
+
+impl AllowedOrigins {
+    /// Parse a `--allow-origin` value.
+    pub fn parse(list: &str) -> Self {
+        let mut out = AllowedOrigins::default();
+        for raw in list.split(['|', ',', '&']) {
+            let entry = raw.trim().to_ascii_lowercase();
+            if entry.is_empty() {
+                continue;
+            }
+            if entry == "*" {
+                // Upstream checks for `*` before compiling anything, so a list
+                // that contains one is simply "all".
+                return AllowedOrigins { all: true, ..Default::default() };
+            }
+            match entry.contains('*') {
+                true => {
+                    if let Some(re) = crate::rules::wildcard::domain_pattern(&entry) {
+                        out.patterns.push(re);
+                    }
+                }
+                false => out.hosts.push(entry),
+            }
+        }
+        out
+    }
+
+    /// Whether `host` — an origin's hostname, without its port — is on the list.
+    pub fn allows(&self, host: &str) -> bool {
+        if self.all {
+            return true;
+        }
+        let host = host.to_ascii_lowercase();
+        self.hosts.iter().any(|h| h == &host)
+            || self.patterns.iter().any(|re| re.is_match(&host))
+    }
+
+    /// Nothing was configured, which is the default and means no cross-origin
+    /// caller is named.
+    pub fn is_empty(&self) -> bool {
+        !self.all && self.hosts.is_empty() && self.patterns.is_empty()
+    }
+}
+
 /// What a `-M/--mode` list did, so the launch can say so out loud.
 ///
 /// A whistle command line that names a mode this port cannot honour should not
@@ -469,5 +537,40 @@ mod tests {
         let mut c = Config::default();
         c.apply_modes("disableCapture|capture");
         assert!(c.intercept_https);
+    }
+
+    /// `--allow-origin` takes whistle's list: split on any of three separators,
+    /// lower-cased, and a `*` anywhere in it means every origin.
+    #[test]
+    fn the_allowed_origin_list_is_parsed_like_upstreams() {
+        let a = AllowedOrigins::parse("good.test, Other.TEST|third.test");
+        assert!(!a.all);
+        assert!(a.allows("good.test"));
+        assert!(a.allows("other.test"), "lower-cased on the way in");
+        assert!(a.allows("OTHER.test"), "and on the way out");
+        assert!(a.allows("third.test"));
+        assert!(!a.allows("evil.test"));
+
+        // One star is one label — the same vocabulary a rule pattern speaks,
+        // because it is the same function upstream calls in both places.
+        let w = AllowedOrigins::parse("*.wild.test");
+        assert!(w.allows("api.wild.test"));
+        assert!(!w.allows("wild.test"), "a star is a label, not nothing");
+        assert!(!w.allows("deep.api.wild.test"), "and one label, not two");
+        assert!(AllowedOrigins::parse("**.wild.test").allows("deep.api.wild.test"));
+        assert!(AllowedOrigins::parse("***.wild.test").allows("wild.test"), "three makes it optional");
+
+        // A `*` anywhere is "all", and the rest of the list stops mattering.
+        for list in ["*", "good.test|*", "*|good.test"] {
+            let all = AllowedOrigins::parse(list);
+            assert!(all.all, "{list}");
+            assert!(all.allows("anything.at.all"), "{list}");
+        }
+
+        // Nothing configured is nothing allowed, which is the default.
+        assert!(AllowedOrigins::default().is_empty());
+        assert!(AllowedOrigins::parse("").is_empty());
+        assert!(AllowedOrigins::parse("  |  ,").is_empty());
+        assert!(!AllowedOrigins::default().allows("good.test"));
     }
 }

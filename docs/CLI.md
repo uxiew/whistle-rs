@@ -43,7 +43,7 @@ nothing to apply it to.
 | `-c, --dnsCache` / `--dnsServer` | — | ➖ DNS is the OS resolver's |
 | `-s, --sockets` | — | ➖ no per-host connection cap to tune |
 | `--httpPort` / `--httpsPort` | — | ➖ one proxy port; `-P` moves the console |
-| `--allowOrigin` | — | ➖ the console API sends no CORS headers |
+| `--allowOrigin` | `--allow-origin` (and `--allowOrigin`) | ✅ [see below](#calling-the-console-from-another-page) |
 | `-A, --addon` / `-L, --pluginHost` / `-e, --extra` | — | ➖ this port has its own plugin system ([`PLUGINS.md`](PLUGINS.md)) |
 | `-m, --middlewares` / `-f, --secureFilter` | — | ➖ they name Node modules to load |
 | `--cluster` / `--inspect` / `--inspectBrk` | — | ➖ Node process concerns |
@@ -147,6 +147,38 @@ INFO certificates supplied by hand for: *.wild.example, api.example.com
 
 A plugin can also choose a certificate per connection, which is the dynamic
 version of the same thing — see `sniCallback://` in [`RULES.md`](RULES.md).
+
+## Calling the console from another page
+
+By default a page on another site cannot read the console's API — the browser
+refuses, because no `Access-Control-Allow-Origin` comes back. `--allow-origin`
+names the origins that may:
+
+```sh
+whistle-rs --allow-origin 'dash.example.com|*.internal.test'
+whistle-rs --allow-origin '*'          # anyone
+```
+
+Separated by `|`, `,` or `&`. An entry may carry the same domain stars a rule
+pattern may — `*` is one label, `**` any number, `***.` makes the label optional
+— and a `*` on its own anywhere in the list means every origin.
+
+Matching is on the origin's **host**, with the port dropped; the header echoes
+the `Origin` exactly as the browser sent it, port and all. A request with no
+`Origin`, or one the browser marks `sec-fetch-site: same-origin`, is not
+cross-origin and gets nothing.
+
+**Two paths answer any origin, list or no list** — `/api/status` and the root
+certificate. Whether a proxy is alive and which certificate to trust are the two
+things a page may reasonably ask of a proxy it does not own, and upstream opens
+the same two.
+
+> **A preflight is not covered**, here or upstream: neither sends
+> `Access-Control-Allow-Methods` or `-Allow-Headers`, so anything the browser
+> preflights — a JSON body, a custom header — is refused whatever the list says.
+> Simple `GET`s work, which is what the two open paths are. Widening that would
+> hand a named origin the whole API, on a console whose only other gate may be a
+> password.
 
 ## Coming from `w2`
 

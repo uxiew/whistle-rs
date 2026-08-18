@@ -17,6 +17,8 @@ use super::{AppState, Capture, ReplayBody, Session, WsFrame};
 /// Route a direct (non-proxied) request to the UI / API.
 pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let path = req.uri().path().to_string();
+    // Read before the request is consumed; applied to whatever answers.
+    let cors = allowed_origin(state, &req, &path);
     // `-M headless`: no console. The root certificate and the PAC file answer
     // anyway — a client that cannot fetch them cannot be configured to use the
     // proxy at all, and upstream keeps its own two open under `headless` for the
@@ -37,7 +39,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
     if crate::plugins::ui::split_route(&path).is_some() {
         return plugin_ui(state, req).await;
     }
-    match (req.method().as_str(), path.as_str()) {
+    let mut answer = match (req.method().as_str(), path.as_str()) {
         (_, "/rootCA.crt") | (_, "/rootca.crt") => root_ca(state),
         (_, "/proxy.pac") | (_, "/pac") => pac(state, &req),
         (_, "/sessions.json") => sessions_json(state),
@@ -72,8 +74,82 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("GET", "/plugin") => redirect_to("/plugin/"),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => not_found(),
+    };
+    if let Some(origin) = cors {
+        let headers = answer.headers_mut();
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&origin) {
+            headers.insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+            headers.insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                hyper::header::HeaderValue::from_static("true"),
+            );
+        }
     }
+    answer
 }
+
+/// The `Origin` to echo back, or `None` when this is not a cross-origin request
+/// the console is willing to answer.
+///
+/// whistle's `checkAllowOrigin` (`_original/biz/webui/lib/index.js:356-378`),
+/// measured branch by branch:
+///
+/// * no `Origin`, or `sec-fetch-site: same-origin` — not cross-origin, and
+///   nothing is added;
+/// * **`/api/status` and the root certificate answer any origin**, configured or
+///   not. Upstream opens the same two (`CORS_PATHS`): whether a proxy is alive
+///   and which certificate to trust are the two things a page may legitimately
+///   ask of a proxy it does not own;
+/// * otherwise the origin's **host**, with its port dropped, has to be on the
+///   `--allow-origin` list.
+///
+/// The header echoes the `Origin` **as it was sent**, port and all, because that
+/// is what a browser compares it against.
+///
+/// Deliberately no `access-control-allow-methods` or `-allow-headers`: upstream
+/// sends neither, so a preflighted request (anything with a JSON body or a
+/// custom header) is refused by the browser in both. Adding them here would let
+/// a named origin drive the whole API — a bigger grant than the flag asks for,
+/// on a console whose only other gate may be a password.
+fn allowed_origin<B>(state: &Arc<AppState>, req: &Request<B>, path: &str) -> Option<String> {
+    let origin = req
+        .headers()
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())?
+        .to_string();
+    if origin.is_empty() {
+        return None;
+    }
+    let same_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("same-origin"));
+    if same_site {
+        return None;
+    }
+    if state.config.allow_origins.all || CORS_PATHS.contains(&path) {
+        return Some(origin);
+    }
+    if state.config.allow_origins.is_empty() {
+        return None;
+    }
+    // `scheme://host:port` → `host`.
+    let host = origin.split_once("://").map_or(origin.as_str(), |(_, rest)| rest);
+    let host = host.split('/').next().unwrap_or(host);
+    let host = match host.rsplit_once(':') {
+        // Not a port if what follows is not a number — an IPv6 literal.
+        Some((left, port)) if port.chars().all(|c| c.is_ascii_digit()) => left,
+        _ => host,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    state.config.allow_origins.allows(host).then_some(origin)
+}
+
+/// The two paths that answer a cross-origin caller whatever the configuration —
+/// upstream's `CORS_PATHS` (`biz/webui/lib/index.js:43`), in this console's
+/// spelling.
+const CORS_PATHS: [&str; 3] = ["/api/status", "/rootCA.crt", "/rootca.crt"];
 
 /// The hostnames that **are** the console rather than somewhere to forward to.
 ///
@@ -2686,6 +2762,69 @@ mod login_tests {
         // And a guest that is not configured is nobody.
         let s2 = state((Some("admin"), Some("s3cret"), None, None));
         assert!(!allowed(&s2, "GET", "/sessions.json", Some(&guest)));
+    }
+
+    /// Which cross-origin callers the console answers, branch by branch —
+    /// every row measured against whistle 2.10.8 first.
+    ///
+    /// The two that answer *any* origin are upstream's `CORS_PATHS`: whether a
+    /// proxy is alive, and which certificate to trust. Everything else needs the
+    /// origin's host — port dropped — to be on the list, and the header echoes
+    /// the `Origin` as it was sent, because that is what a browser compares.
+    #[test]
+    fn the_console_answers_the_origins_it_was_told_to() {
+        let with = |list: &str| {
+            let mut c = crate::config::Config {
+                storage_dir: std::env::temp_dir().join(format!(
+                    "whistle-rs-cors-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                )),
+                persist_sessions: false,
+                ..crate::config::Config::default()
+            };
+            c.allow_origins = crate::config::AllowedOrigins::parse(list);
+            let ca = crate::ca::CertAuthority::load_or_create(&c).expect("ca");
+            Arc::new(AppState::new(c, crate::rules::RuleManager::new(), ca))
+        };
+        let ask = |state: &Arc<AppState>, path: &str, origin: Option<&str>, hint: bool| {
+            let mut b = Request::builder().method("GET").uri(path);
+            if let Some(o) = origin {
+                b = b.header(hyper::header::ORIGIN, o);
+            }
+            if hint {
+                b = b.header("sec-fetch-site", "same-origin");
+            }
+            let r = b.body(()).expect("request");
+            allowed_origin(state, &r, path)
+        };
+
+        let s = with("good.test|*.wild.test");
+        assert_eq!(ask(&s, "/api/rules", Some("http://good.test"), false).as_deref(), Some("http://good.test"));
+        assert_eq!(ask(&s, "/api/rules", Some("http://api.wild.test"), false).as_deref(), Some("http://api.wild.test"));
+        assert_eq!(ask(&s, "/api/rules", Some("http://wild.test"), false), None, "one star is one label");
+        assert_eq!(ask(&s, "/api/rules", Some("http://evil.test"), false), None);
+        // The port is dropped before matching and kept in the answer.
+        assert_eq!(
+            ask(&s, "/api/rules", Some("http://good.test:8080"), false).as_deref(),
+            Some("http://good.test:8080")
+        );
+        // Not cross-origin at all.
+        assert_eq!(ask(&s, "/api/rules", None, false), None);
+        assert_eq!(ask(&s, "/api/rules", Some("http://good.test"), true), None, "same-origin hint");
+        // The two that answer anyone, list or no list.
+        for path in ["/api/status", "/rootCA.crt"] {
+            assert_eq!(ask(&s, path, Some("http://evil.test"), false).as_deref(), Some("http://evil.test"), "{path}");
+        }
+
+        // With nothing configured, only those two answer.
+        let none = with("");
+        assert_eq!(ask(&none, "/api/rules", Some("http://good.test"), false), None);
+        assert_eq!(ask(&none, "/api/status", Some("http://good.test"), false).as_deref(), Some("http://good.test"));
+
+        // And `*` answers everyone, everywhere.
+        let all = with("*");
+        assert_eq!(ask(&all, "/api/rules", Some("http://anywhere.test"), false).as_deref(), Some("http://anywhere.test"));
     }
 
     /// The three hostnames that open the console through the proxy, and the

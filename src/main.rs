@@ -86,6 +86,16 @@ struct Cli {
     #[arg(short = 'l', long = "local-ui-host")]
     local_ui_host: Option<String>,
 
+    /// Origins allowed to call the console's API from a page on another site
+    /// (whistle's `--allowOrigin`), separated by `|`, `,` or `&`.
+    ///
+    /// `*` anywhere in the list means every origin. An entry may carry the same
+    /// domain stars a rule pattern may — `*` is one label, `**` any number.
+    /// `/api/status` and the root certificate answer any origin regardless,
+    /// which is upstream's `CORS_PATHS`.
+    #[arg(long = "allow-origin", alias = "allowOrigin")]
+    allow_origin: Option<String>,
+
     /// A directory of certificates to serve instead of forged ones (whistle's
     /// `-z/--certDir`).
     ///
@@ -357,6 +367,11 @@ async fn main() -> Result<()> {
         timeout_ms: cli.timeout,
         intercept_https: !cli.no_intercept_https,
         cert_dir: cli.cert_dir,
+        allow_origins: cli
+            .allow_origin
+            .as_deref()
+            .map(whistle_rs::config::AllowedOrigins::parse)
+            .unwrap_or_default(),
         ..Config::default()
     };
 
