@@ -171,6 +171,8 @@ export interface ProxyStatus {
   capture_locked_off: boolean;
   /** Whether a request may carry its own rules: `off`, `enableRequestHeaderRules`, `multiEnv`. */
   header_rules: 'off' | 'enableRequestHeaderRules' | 'multiEnv';
+  /** Addresses a device on the same network can reach this proxy at. */
+  lan_addresses: string[];
   insecure_upstream: boolean;
   storage_dir: string;
   root_ca: string;

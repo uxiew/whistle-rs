@@ -454,6 +454,40 @@ upstream lets a *request* open the gates a mode is otherwise required to open
 (`x-whistle-real-host`, `x-whistle-forwarded-props`). The reasoning is in
 `src/proxy/forwarded.rs`.
 
+## The QR code
+
+`qr-bench.js` is the odd one out: no proxy, no origin, no port. `gui/mobile.md`
+is a page about typing a proxy address into a phone, and both consoles shorten
+it by drawing a QR code per LAN address. whistle gets that from `qrcode@1.2.0`;
+this port has its own encoder, so the encoder is what gets compared.
+
+```sh
+npm install                            # brings in qrcode@1.2.0, whistle's own version
+npm run qr
+```
+
+194 symbols, **every module of every one**, plus the SVG parsed back into
+modules so that "the matrix is right" and "the image is right" are two separate
+claims. **A clean run is `differing: 0`** — there is nothing to declare, because
+a single wrong module is a symbol some cameras read and others do not.
+
+The reference is held to byte mode, since `qrcode` splits a URL across numeric
+and alphanumeric segments and this port does not; what that costs is reported
+rather than assumed (one of the twelve addresses the console draws comes out one
+version larger).
+
+It found three bugs, and they have the same shape: **each produced a QR code
+that looked right and scanned.**
+
+* a separator reserved too few modules, so the data was shifted — three finders,
+  correct size, unreadable content. Found by reading the codewords back out;
+* the mask was scored without the format information written, which is 31
+  modules the penalty rules count. A third of the payloads picked a different
+  mask than upstream — all readable, none the same;
+* version information (version 7 and up) was written after the mask was picked
+  rather than before. Only reachable by a payload longer than any URL the
+  console draws, which is why the corpus walks every length from 1 to 120.
+
 ## Rules a request brings with it
 
 `header-rules-bench.js` is what `mode-bench.js`'s one `proxy.headerRules` probe

@@ -235,6 +235,30 @@ enum Command {
     /// so a working rule and a silently inert one look identical from the
     /// client side.
     Explain(ExplainArgs),
+
+    /// Print a QR code for a URL — what the console draws beside each LAN
+    /// address so a phone can reach the root certificate without typing.
+    ///
+    /// Useful on its own for the same reason the console's is: reading an
+    /// address off a screen and into a phone is where a setup goes wrong.
+    Qr(QrArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct QrArgs {
+    /// The text to encode. Usually a URL.
+    text: String,
+
+    /// Print the module matrix as rows of `0` and `1` instead of drawing it.
+    ///
+    /// This is the machine-readable form `tests/differential/qr-bench.js`
+    /// compares against `qrcode@1.2.0`, module for module.
+    #[arg(long)]
+    matrix: bool,
+
+    /// Print an SVG instead, at this many pixels per module.
+    #[arg(long, value_name = "SCALE")]
+    svg: Option<usize>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -304,6 +328,10 @@ async fn main() -> Result<()> {
     // for while a proxy is already running must not disturb the one running.
     if let Some(Command::Explain(args)) = &cli.command {
         return run_explain(args, cli.rules.as_deref());
+    }
+    // Same reasoning: encoding a string starts nothing and touches no storage.
+    if let Some(Command::Qr(args)) = &cli.command {
+        return run_qr(args);
     }
 
     tracing_subscriber::fmt()
@@ -542,6 +570,59 @@ async fn main() -> Result<()> {
 ///
 /// `fallback_rules` is the top-level `--rules`, so that the file a running
 /// proxy was started with can be tested by naming it once.
+/// Draw a QR code, or print the modules behind it.
+///
+/// The terminal form uses one half-block per two rows, so a version-3 symbol
+/// fits in a normal window — a symbol drawn one character per module is 29
+/// lines tall and twice as wide as it is high, and a phone reads a squashed one
+/// badly or not at all.
+fn run_qr(args: &QrArgs) -> Result<()> {
+    let code = whistle_rs::qr::encode(&args.text).with_context(|| {
+        format!(
+            "{} bytes is more than this encoder takes ({} bytes at version {})",
+            args.text.len(),
+            213,
+            whistle_rs::qr::MAX_VERSION
+        )
+    })?;
+    if args.matrix {
+        for y in 0..code.size {
+            let row: String = (0..code.size)
+                .map(|x| if code.get(x, y) { '1' } else { '0' })
+                .collect();
+            println!("{row}");
+        }
+        return Ok(());
+    }
+    if let Some(scale) = args.svg {
+        println!("{}", code.to_svg(scale));
+        return Ok(());
+    }
+    // Four modules of quiet zone, which a camera needs as much as a scanner
+    // does — and a terminal's own background is not white enough to count.
+    let quiet = 4;
+    let side = code.size + quiet * 2;
+    let dark = |x: usize, y: usize| {
+        x >= quiet
+            && y >= quiet
+            && x < quiet + code.size
+            && y < quiet + code.size
+            && code.get(x - quiet, y - quiet)
+    };
+    for y in (0..side).step_by(2) {
+        let row: String = (0..side)
+            .map(|x| match (dark(x, y), y + 1 < side && dark(x, y + 1)) {
+                (true, true) => ' ',
+                (true, false) => '\u{2584}',
+                (false, true) => '\u{2580}',
+                (false, false) => '\u{2588}',
+            })
+            .collect();
+        println!("{row}");
+    }
+    Ok(())
+}
+
 fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> Result<()> {
     use std::io::{BufRead, Write};
     use whistle_rs::explain::{self, Query};

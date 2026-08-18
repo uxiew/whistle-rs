@@ -159,6 +159,21 @@ INFO -M multiEnv: 2 named rule group(s) loaded but not resolved; the default gro
 expands them, so `-M multiple` really does bring `keepXFF` **and** `multiEnv`
 with it, and `-M admin` brings `strict`.
 
+## A QR code for a phone
+
+`gui/mobile.md` is a page about typing a proxy address into a phone. Both
+consoles shorten it with a QR code per LAN address; this one is also a command:
+
+```sh
+whistle-rs qr "http://192.168.1.5:8899/rootCA.crt"   # drawn in the terminal
+whistle-rs qr --svg 6 "http://192.168.1.5:8899/"     # an SVG on stdout
+whistle-rs qr --matrix "hello"                       # rows of 0/1
+```
+
+The console serves the same thing at `GET /api/qr?text=…&scale=…`. The encoder
+handles up to 213 bytes (byte mode, error-correction level M, versions 1-10);
+past that it answers 400 and the console falls back to showing the link.
+
 ## Hand-supplied certificates
 
 `-z/--cert-dir` names a directory of certificates to serve **instead of forged

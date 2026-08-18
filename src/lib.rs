@@ -33,5 +33,6 @@ pub mod config;
 pub mod embed;
 pub mod explain;
 pub mod plugins;
+pub mod qr;
 pub mod proxy;
 pub mod rules;

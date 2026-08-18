@@ -157,6 +157,15 @@ Add more names with `-l/--local-ui-host`, or stop answering for them at all with
 `GET /sessions.json` returns the captured traffic as JSON, and `GET /proxy.pac`
 serves a PAC file that auto-configures a client to use this proxy.
 
+**For a phone**, the console's General pane lists every address this machine
+answers on and draws a QR code for each one's certificate link — point the
+camera at it instead of typing four numbers. The same code from the terminal:
+
+```sh
+whistle-rs qr "http://192.168.1.5:8899/rootCA.crt"     # drawn in the terminal
+whistle-rs qr --svg 4 "http://192.168.1.5:8899/"       # or as an SVG
+```
+
 ### Finding a request
 
 The console's search box speaks whistle's filter language: a bare word matches
@@ -410,6 +419,18 @@ absent entirely, which is the answer to "why is my mock being ignored". Add
 `--batch` to answer one JSON query per line from stdin. That last one is how
 `tests/differential/rules-oracle.js` puts 17k questions through this port and
 through whistle's own parser and compares the answers.
+
+### `whistle-rs qr` — an address a phone can point at
+
+```
+$ whistle-rs qr "http://192.168.1.5:8899/rootCA.crt"
+```
+
+Drawn in the terminal by default, `--svg <scale>` for an image, `--matrix` for
+rows of `0`/`1`. The console draws the same code beside each LAN address. The
+encoder is this port's own (`src/qr.rs`) rather than a dependency for one
+dialog, and every module of it is compared against the package whistle uses by
+`tests/differential/qr-bench.js`.
 
 ## Documentation
 - [`docs/UPSTREAM.md`](docs/UPSTREAM.md) — where to fetch the upstream whistle tree the 513 `_original/…` citations point at, and at which commit

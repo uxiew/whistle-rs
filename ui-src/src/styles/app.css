@@ -621,6 +621,39 @@ table.requests tbody tr[aria-selected="true"] .mark { fill: var(--accent-fg); }
 
 .status-pane .hint a { color: var(--accent); }
 
+/* The addresses a phone can reach this at, each with a code to point at.
+   `gui/mobile.md` is a whole page about typing one of these in by hand. */
+.lan { margin-top: 18px; }
+.lan h3 {
+  margin: 0 0 4px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.lan-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(212px, max-content));
+  gap: 12px;
+  margin-top: 10px;
+}
+.lan figure { margin: 0; }
+/* The white ground is the quiet zone's, and it has to stay white in a dark
+   theme: a code drawn dark-on-dark is one no camera reads. */
+.lan img {
+  display: block;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.lan figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 5px;
+  font-size: 11.5px;
+}
+.lan figcaption a { color: var(--accent); }
+
 .empty {
   display: flex;
   align-items: center;

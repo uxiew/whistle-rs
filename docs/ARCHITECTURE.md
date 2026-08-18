@@ -37,6 +37,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/dest.rs` | `lib/inspectors/rules.js:40` | Where the request is addressed once a URL-replacement rule has spoken |
 | `src/proxy/header_rules.rs` | `lib/rules/index.js:558-657` | The five headers a request may carry its own rules in — taken from every request, read only under `-M enableRequestHeaderRules` / `-M multiEnv` |
 | `src/proxy/forwarded.rs` | `lib/util/index.js:3697-3728`, `util/common.js:1231-1266` | What a front proxy claims — `x-forwarded-host`/`-proto` behind their modes, and the two whistle spellings upstream reads with no gate |
+| `src/qr.rs` | `qrcode@1.2.0` (a dependency there) | A QR encoder for the console's LAN addresses: byte mode, level M, versions 1-10. Compared module for module by `tests/differential/qr-bench.js` |
 | `src/proxy/template.rs` | `lib/handlers/file-proxy.js` (`render`) | `tpl`/`dust`/`jsonp` two-pass rendering + `${var}` variables |
 | `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation) |
 | `src/proxy/sni.rs` | `lib/https/index.js:1281`, `lib/https/load-cert.js` | The SNI stage: peek the ClientHello, pick the certificate, or relay the connection untouched |

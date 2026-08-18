@@ -39,6 +39,21 @@ const capture = computed<Pair[]>(() => [
   ['Persist', st.value?.persist_sessions ? `${st.value.persist_days} days` : 'off'],
 ]);
 
+/**
+ * Where a phone should point, one per address this machine answers on.
+ *
+ * `gui/mobile.md` is a page about typing a proxy address into a phone; the QR
+ * code is how upstream shortens it, and `rootca.pro` only resolves *through*
+ * the proxy — so the certificate link has to name an address, and the address
+ * has to survive being read off a screen. A camera does not mistype.
+ */
+const lan = computed(() => (st.value?.lan_addresses || []).map((ip) => {
+  const base = `http://${ip}:${st.value?.port}`;
+  return { ip, base, cert: `${base}/rootCA.crt` };
+}));
+
+const qr = (text: string) => `/api/qr?scale=4&text=${encodeURIComponent(text)}`;
+
 const rules = computed<Pair[]>(() => [
   ['Active rules', st.value?.rules],
   // Off is the default and says nothing; on is worth saying, because it changes
@@ -68,6 +83,22 @@ const rules = computed<Pair[]>(() => [
           PAC: <a href="/proxy.pac">/proxy.pac</a> ·
           Export: <a href="/sessions.har" download>HAR</a>
         </p>
+        <section v-if="lan.length" class="lan">
+          <h3>On this network</h3>
+          <p class="hint">
+            Set one of these as the proxy on a phone — try each if unsure — then
+            scan its code to install the certificate.
+          </p>
+          <div class="lan-cards">
+            <figure v-for="a in lan" :key="a.ip">
+              <img :src="qr(a.cert)" :alt="`QR code for ${a.cert}`" width="212" height="212" />
+              <figcaption>
+                <code>{{ a.ip }}:{{ st?.port }}</code>
+                <a :href="a.cert">certificate</a>
+              </figcaption>
+            </figure>
+          </div>
+        </section>
       </template>
     </div>
   </section>

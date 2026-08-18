@@ -65,6 +65,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/rule-group/update") => rule_group_update(state, req).await,
         ("GET", "/api/rule-group") => rule_group_get(state, &req),
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
+        ("GET", "/api/qr") => qr_svg(&req),
         ("GET", "/api/ws/status") => ws_status(state, &req),
         ("POST", "/api/ws/release") => ws_release(state, req).await,
         ("POST", "/api/ws/send") => ws_send(state, req).await,
@@ -1573,6 +1574,41 @@ async fn values_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<
             .status(StatusCode::BAD_REQUEST)
             .body(body::full(Bytes::from_static(b"expected a JSON object")))
             .unwrap(),
+    }
+}
+
+/// A QR code for a URL, as an SVG — `GET /api/qr?text=…&scale=…`.
+///
+/// What `gui/mobile.md` is a whole page about: reading an address off a screen
+/// and into a phone is where a setup goes wrong, and a camera does not mistype.
+/// The console draws one per LAN address beside the certificate link.
+///
+/// The text is never markup here — it becomes modules — so there is nothing to
+/// escape and nothing a payload can do to the page it is drawn on. A payload
+/// larger than the encoder takes is a 400 rather than a broken image, and the
+/// console falls back to showing the link.
+fn qr_svg(req: &Request<Incoming>) -> Response<DynBody> {
+    let text = query_param(req, "text").unwrap_or_default();
+    if text.is_empty() {
+        return json_error("nothing to encode");
+    }
+    // Clamped rather than trusted: a scale is a multiplier on a square, and an
+    // unbounded one is a denial of service written in someone else's query
+    // string.
+    let scale = query_param(req, "scale")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 20);
+    match crate::qr::encode(&text) {
+        Some(code) => Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "image/svg+xml")
+            // A QR code for a fixed string never changes, and the console draws
+            // several on every visit to the status pane.
+            .header(hyper::header::CACHE_CONTROL, "public, max-age=3600")
+            .body(body::full(Bytes::from(code.to_svg(scale))))
+            .unwrap(),
+        None => json_error("too long to encode"),
     }
 }
 
