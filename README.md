@@ -268,7 +268,8 @@ CA.
 | `-P, --uiport <PORT>` | Serve the console on its own port (whistle's `-P`). Without it the console lives on the proxy port, as it does there | proxy port |
 | `-n, --username <NAME>` / `-w, --password <PASS>` | Console login (whistle's `-n`/`-w`). With neither, the console is open | open |
 | `-N, --guest-name <NAME>` / `-W, --guest-password <PASS>` | Read-only console account (whistle's `-N`/`-W`): `GET` only, so it can watch the capture and change nothing | — |
-| `--socks-port <PORT>` | Also run an inbound SOCKS5 server | off |
+| `-l, --local-ui-host <HOSTS>` | More hostnames that open the console (whistle's `-l`), separated by `\|`, `,` or `&`. `local.whistlejs.com`, `local.wproxy.org` and `rootca.pro` answer without it | the built-in three |
+| `--socks-port <PORT>` | Also run an inbound SOCKS5 server (whistle spells it `--socksPort`, which is accepted too) | off |
 | `--plugin <NAME=HOST:PORT>` | Register a remote (Node/HTTP) plugin (repeatable) | — |
 | `--node-plugin <NAME=PATH>` | Spawn a Node plugin from a script (repeatable) | — |
 | `--value <NAME=CONTENT>` | Define a named value (repeatable); referenced by `{name}` | — |

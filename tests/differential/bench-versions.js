@@ -82,30 +82,42 @@ function runCorpus(corpus, attempt = 0) {
 }
 
 /**
- * Which whistle this run is measuring against — read from the same package the
- * oracle was told to load, so the label on the output cannot drift from what
- * actually answered. `WHISTLE_PKG` has to be set for *both* processes.
+ * Which whistle is actually answering on this port.
+ *
+ * Asked of the **running server** rather than read off a `package.json`: the
+ * label on a result should come from the thing that produced it, and
+ * `WHISTLE_PKG` only says which package was *told* to load.
+ *
+ * (An earlier revision of this read the package instead, on the strength of a
+ * `curl` that 502'd here. The 502 was an `http_proxy` in the environment, which
+ * `curl` honours and `http.request` does not — nothing to do with whistle. The
+ * endpoint answers fine.)
  */
+function oracleStatus(port) {
+  const http = require('http');
+  return new Promise((resolve) => {
+    const req = http.get({ port, path: '/cgi-bin/status' }, (r) => {
+      let b = '';
+      r.on('data', (c) => (b += c));
+      r.on('end', () => {
+        try {
+          resolve({ up: r.statusCode === 200, version: JSON.parse(b).version });
+        } catch (e) {
+          resolve({ up: r.statusCode === 200, version: undefined });
+        }
+      });
+    });
+    req.on('error', () => resolve({ up: false }));
+  });
+}
+
+/** What `WHISTLE_PKG` asked for — the fallback, and a cross-check. */
 function packageVersion() {
   try {
     return require(`${process.env.WHISTLE_PKG || 'whistle'}/package.json`).version;
   } catch (e) {
     return 'unknown';
   }
-}
-
-/** That an oracle is answering at all, before spending minutes finding out. */
-function oracleIsUp(port) {
-  const http = require('http');
-  return new Promise((resolve) => {
-    // `/cgi-bin/rules/list`, not `/cgi-bin/status`: the console answers this one
-    // to the plain `http.request` every bench here uses.
-    const req = http.get({ port, path: '/cgi-bin/rules/list' }, (r) => {
-      r.resume();
-      resolve(r.statusCode === 200);
-    });
-    req.on('error', () => resolve(false));
-  });
 }
 
 function diff(aPath, bPath) {
@@ -154,11 +166,19 @@ async function main() {
     return diff(args[1], args[2]);
   }
   const base = Number(process.env.PORT_BASE || 19400);
-  if (!(await oracleIsUp(base))) {
+  const status = await oracleStatus(base);
+  if (!status.up) {
     console.error(`no oracle answering on ${base}; start one first`);
     process.exit(1);
   }
-  const version = packageVersion();
+  const version = status.version || packageVersion();
+  const asked = packageVersion();
+  if (status.version && asked !== 'unknown' && status.version !== asked) {
+    // The oracle is not the package this run was told to load — which would
+    // silently label a whole run with the wrong version.
+    console.error(`WHISTLE_PKG says ${asked} but ${base} is running ${status.version}`);
+    process.exit(1);
+  }
   const corpora = {};
   for (const corpus of CORPORA) {
     process.stderr.write(`  ${corpus} … `);

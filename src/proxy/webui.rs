@@ -66,6 +66,65 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
     }
 }
 
+/// The hostnames that **are** the console rather than somewhere to forward to.
+///
+/// whistle's `LOCAL_UI_HOST_LIST` (`_original/lib/config.js:38-42`). A browser
+/// pointed at the proxy and sent to `http://local.whistlejs.com/` gets the
+/// console, which is what `w2 status` tells people to do — and what this port
+/// used to answer with a `502`, because the name resolves to `127.0.0.1` and
+/// there is nothing on port 80 there.
+///
+/// **`rootca.pro` is not the console**: it serves the root certificate, at
+/// every path. That is the phone workflow — set the proxy, open `rootca.pro`,
+/// install what it hands you — and it is why the name exists.
+pub(super) const BUILTIN_UI_HOSTS: [&str; 2] = ["local.whistlejs.com", "local.wproxy.org"];
+
+/// The one that hands out the certificate instead.
+pub(super) const ROOT_CA_HOST: &str = "rootca.pro";
+
+/// Whether a **proxied** request for this host is the console's to answer.
+///
+/// Measured against whistle 2.10.8 rather than read: this beats the rules. With
+/// `local.whistlejs.com http://127.0.0.1:19902` installed and matching, upstream
+/// still serves the console — so the question is asked before a rule is
+/// resolved, and it is asked here for the same reason.
+pub(super) fn console_host(state: &Arc<AppState>, host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    BUILTIN_UI_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
+        || host.eq_ignore_ascii_case(ROOT_CA_HOST)
+        || state
+            .config
+            .local_ui_hosts
+            .iter()
+            .any(|h| host.eq_ignore_ascii_case(h))
+}
+
+/// Answer a proxied request that named one of those hostnames.
+///
+/// `rootca.pro` answers with the certificate whatever the path is — measured:
+/// `/`, `/anything` and `/cgi-bin/rules/list` all return it. Everything else
+/// goes to the ordinary console router, so the API, the login and `/-/` behave
+/// exactly as they do on the proxy's own port.
+pub(super) async fn handle_proxied(
+    state: &Arc<AppState>,
+    mut req: Request<Incoming>,
+    host: &str,
+) -> Response<DynBody> {
+    if host.eq_ignore_ascii_case(ROOT_CA_HOST) {
+        return root_ca(state);
+    }
+    // Origin-form, so the router sees the path it would have seen anyway.
+    let rest = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    if let Ok(uri) = rest.parse::<hyper::Uri>() {
+        *req.uri_mut() = uri;
+    }
+    handle(state, req).await
+}
+
 /// Paths that answer before the login does.
 ///
 /// A device that cannot reach the root certificate cannot trust the proxy, and
@@ -2578,6 +2637,49 @@ mod login_tests {
         // And a guest that is not configured is nobody.
         let s2 = state((Some("admin"), Some("s3cret"), None, None));
         assert!(!allowed(&s2, "GET", "/sessions.json", Some(&guest)));
+    }
+
+    /// The three hostnames that open the console through the proxy, and the
+    /// one that hands out the certificate instead.
+    ///
+    /// Measured against whistle 2.10.8: `local.whistlejs.com` and
+    /// `local.wproxy.org` serve the console at every path, API included, and
+    /// `rootca.pro` serves the root certificate at every path — `/`,
+    /// `/anything` and `/cgi-bin/rules/list` all return it.
+    #[test]
+    fn the_console_hostnames_are_the_console() {
+        let s = state((None, None, None, None));
+        for host in ["local.whistlejs.com", "local.wproxy.org", "rootca.pro"] {
+            assert!(console_host(&s, host), "{host}");
+            // Case is not part of a hostname.
+            assert!(console_host(&s, &host.to_ascii_uppercase()), "{host} upper");
+        }
+        assert!(!console_host(&s, "www.example.com"));
+        assert!(!console_host(&s, "local.whistlejs.com.evil.test"));
+        assert!(!console_host(&s, "notlocal.whistlejs.com"));
+    }
+
+    /// `-l/--localUIHost` **adds to** the built-in list rather than replacing
+    /// it, which is what upstream does with it.
+    #[test]
+    fn extra_console_hostnames_are_added_not_substituted() {
+        let mut config = crate::config::Config {
+            storage_dir: std::env::temp_dir().join(format!(
+                "whistle-rs-uihost-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            )),
+            persist_sessions: false,
+            local_ui_hosts: vec!["my.console.test".into(), "other.test".into()],
+            ..crate::config::Config::default()
+        };
+        config.intercept_https = false;
+        let ca = crate::ca::CertAuthority::load_or_create(&config).expect("ca");
+        let s = Arc::new(AppState::new(config, crate::rules::RuleManager::new(), ca));
+        assert!(console_host(&s, "my.console.test"));
+        assert!(console_host(&s, "other.test"));
+        assert!(console_host(&s, "local.whistlejs.com"), "the built-ins survive");
+        assert!(!console_host(&s, "somewhere.else.test"));
     }
 
     /// The certificate and the PAC file answer before the login does: a device

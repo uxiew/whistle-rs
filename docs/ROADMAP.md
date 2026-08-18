@@ -14,10 +14,10 @@
 > **算子取值可以指向文件或 URL**（`readRuleValue`），**反引号整值按请求渲染**（`renderTpl`）。
 > **⚠️ 「已应用」不等于「与上游逐位一致」** —— 四路审计确认了 45 项行为差异，
 > **失败开放已清空**；不再维护一个精确的「已修 N 项」整数，下一节的清单才是准的。
-> 单元测试 **897** 项 + 端到端 **6** 项（`tests/console_e2e.rs`，真 socket 进出、
+> 单元测试 **899** 项 + 端到端 **6** 项（`tests/console_e2e.rs`，真 socket 进出、
 > 再问控制台自己的 API）全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
 > 与 `cargo test --doc` 均 **0 警告 / 0 失败**（clippy 由 `Cargo.toml` 的
-> `[lints.clippy]` 把住）。此外还有 **2212 条差分用例**对着真 whistle 2.10.8 实测，
+> `[lints.clippy]` 把住）。此外还有 **2226 条差分用例**对着真 whistle 2.10.8 实测，
 > 见下一节——本轮的 bug 绝大多数出自那里，通读源码一个都没找到。
 > **本轮还把「对着哪个版本」变成了一个可以问的问题**：全套语料对着 whistle 2.9.109
 > 再跑一遍、按用例名比对，60 条差异全部是单向新增的 —— 没有一处对齐是对上了某一版的
@@ -55,7 +55,7 @@
 都没发现**，因为出问题的地方恰恰是「读起来对、跑起来不对」的那类：一个筛选器悄悄
 把整行打开或关掉，从不报错。
 
-**2212 条用例**（十六份语料 2028 条 + 四个专项基准 184 条），全部在**同一个二进制**上
+**2226 条用例**（十六份语料 2028 条 + 四个专项基准 198 条），全部在**同一个二进制**上
 复跑过（下表即那一次的实测数字，不是各分支自报的）—— 包括三个专项基准，而正是这次
 重测把一条今早刚进来的回归揪了出来，见表下的注。
 
@@ -87,7 +87,7 @@
 | `cases-values.js`（取值与模板） | 132 | 13 项，同上 | 10 |
 | `cases-includes.js`（`@` 引入） | 35 | 0 差异（其中 24 项在真 whistle 一侧确有改变） | 11 |
 | `cases-proxy.js`（转发族） | 115 | 25 项，同上 | 19 |
-| `https-bench.js`（MITM 隧道内，**含证书、隧道载荷与套件**） | 66 | 0 差异 | — |
+| `https-bench.js`（MITM 隧道内，**含证书、隧道载荷、套件与控制台域名**） | 72 | 0 差异，1 项具名 | — |
 | `timing-bench.js`（延时与限速） | 33 | 0 差异 | — |
 | `write-bench.js`（落盘族，比对磁盘） | 39 | 1 项，具名 | — |
 | `cases-flags.js`（`enable`/`disable` 标志矩阵） | 65 | 1 项，具名 | 21 |
@@ -95,7 +95,7 @@
 | `cases-docs.js`（**官网文档里的写法**） | 111 | 5 项，具名 | 34 |
 | `cases-frames.js`（**body 分帧**：SSE 与自定义分隔符） | 29 | 6 项，具名 | 23 |
 | `cases-paths.js`（**Windows 路径与非 ASCII**） | 58 | 9 项，具名 | 7 |
-| `auth-bench.js`（**控制台登录**） | 46 | 0 差异，6 项具名 | — |
+| `auth-bench.js`（**控制台的前门**：登录 + 域名入口） | 54 | 0 差异，6 项具名 | — |
 
 「有意偏离」都是**上游的缺陷本移植不打算复制**，每一条在语料头部具名、带上游行号。
 
@@ -338,6 +338,48 @@
     断言**：直接问 whistle-rs 有没有协商出它被要求的那个套件（这是全文件唯一一条
     「whistle 消失了也还成立」的主张），另四条问选不中的值有没有把请求留住。
     单边断言故意验证过会失败：换一个 rustls 没有的套件名，它当场报出来。
+
+- **控制台的三个域名（新）** —— 读 `cli.md` 读出来的。`w2 status` 打印的最后一行是
+  「用 Chrome 打开 http://local.whistlejs.com/」，也就是说**上游的控制台入口是一个域名**，
+  不是 `ip:port`。上游认三个（`LOCAL_UI_HOST_LIST`，`config.js:38-42`），**本移植一个
+  都不认**：这些名字公网解析到 `127.0.0.1`，那里 80 端口没人听，于是全部 502。
+  - 逐条量清楚了：`local.whistlejs.com` 与 `local.wproxy.org` 给**整个控制台**（含
+    `/cgi-bin/*` API）；**`rootca.pro` 在任何路径下都给根证书**
+    （`Content-Disposition: attachment; filename="rootCA.cer"`）—— 这就是手机的装证书
+    流程：设好代理、打开这个名字、装它给你的东西。
+  - **它压过规则**：装上 `local.whistlejs.com http://127.0.0.1:19902` 并确实命中，上游
+    依然给控制台。所以这个判断在规则解析**之前**，本移植也放在那里。
+  - **隧道里也一样**：上游会为这些名字伪造证书，然后在 MITM 里用控制台应答，所以
+    `https://rootca.pro/` 在还没装证书的手机上也能work。本移植的检查因此放在 `serve()`
+    的入口，正向代理与解密隧道两条路共用。
+  - 顺带补了 `-l/--local-ui-host`（追加域名，按上游的 `|,&` 切分，且是**追加**不是替换）
+    与 `--socksPort` 别名。差分覆盖：`auth-bench.js` 46 → 54 例（明文，含「域名进来也要
+    过登录、而证书豁免」），`https-bench.js` 66 → 72 例（隧道内）。
+  - 隧道那一侧还量出上游一个 quirk 并具名：**`rootca.pro` 那条判断读的是 `Host` 头，
+    且不剥默认端口**。`Host: rootca.pro` 任何路径都给证书；`Host: rootca.pro:443` 就
+    不认了 —— `/` 给控制台、`/whatever` 给 404，四种组合都实测过。本移植按 `CONNECT`
+    指定的 authority 判，两种写法一样答：带默认端口的 `Host` 就是同一个主机
+    （RFC 7230 §5.4），一个名字的两种写法答两样东西不是要复刻的行为。这条声明**窄到
+    只覆盖那一条用例**，而且「声明的差异消失了」本身也会报出来（验证过会失败）。
+
+- **`-r` 不完全是上游的 `-r`（已具名，未实现）** —— 上游的 `-r` 是 `--shadowRules`：
+  同样读那个文件、同样生效，但它是**垫在所有东西下面的一层**，`/cgi-bin/rules/list`
+  返回空列表而规则照样命中（实测：`shadow.test http://127.0.0.1:1234` 打出
+  `ECONNREFUSED 127.0.0.1:1234`）。本移植的 `-r` 把文件读进 **Default 分组**，在界面里
+  看得见、改得动、关得掉。两边都读文件、都生效，差别在「读完之后谁看得见」。
+  已写进 `--help`；真正实现 shadowRules（连同 `allowDisableShadowRules`）是另一件事。
+
+**`cli.md` 的其余参数**（本轮清点：上游 25 个，本移植 14 个）。除上面两条外，尚未
+对齐的按性质分三类，都还没做：**与 Node 运行时绑定的**（`--cluster`、`--inspect`、
+`--inspectBrk`、`-m/--middlewares`、`-f/--secureFilter`）——本移植不是 Node 进程，属
+Non-goal；**与 `w2` 守护进程管理绑定的**（`-S/--storage`、`-C/--copy`、`-D/--baseDir`、
+`--no-prev-options`、`--config`、`--rcPath`、`--init`）——本移植是单个前台进程，多实例
+靠 `--dir` + `--port`，但 `-S/-D` 的语义差别值得单独记一笔；**真功能但未做的**：
+`-M/--mode`（`pureProxy|debug|multiEnv|capture|disableH2|network|rules|plugins|prod`
+九个模式，其中 `pureProxy` 恰好会关掉上面那三个控制台域名）、`-z/--certDir`（自定义
+证书目录，对应 `gui/https.md` 的 Custom Certs）、`--allowOrigin`（控制台 API 的跨域）、
+`-s/--sockets`（每域名连接池上限）、`-c/--dnsCache`、`--dnsServer`、`--httpPort` /
+`--httpsPort`、`-A/--addon`、`-e/--extra`、`-L/--pluginHost`。
 
 **读完了 `extensions/`（4 页）与 `gui/`（11 页）。** 规则语义上没有新的缺口：
 `network.md` 里那四个逐方向 WebSocket 标志（`enable://ignoreReceive|ignoreSend|

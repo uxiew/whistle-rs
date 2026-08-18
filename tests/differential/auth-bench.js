@@ -1,4 +1,5 @@
-// The console **login**, asked of both proxies with the same credentials.
+// The console's **front door**, asked of both proxies: the login, and the
+// hostnames that open it.
 //
 // `-n`/`-w` name the account that may do anything and `-N`/`-W` one that may
 // only read. Nothing else in this directory can ask about them: every other
@@ -53,7 +54,7 @@ const EXPECTED = [
   },
 ];
 
-/** One request, reduced to the two things the gate decides. */
+/** One request, reduced to the three things the front door decides. */
 function probe(port, { method = 'GET', path = '/no-such-route', headers = {} }) {
   return new Promise((resolve) => {
     const req = http.request({ port, path, method, headers }, (r) => {
@@ -61,6 +62,7 @@ function probe(port, { method = 'GET', path = '/no-such-route', headers = {} }) 
       r.on('end', () =>
         resolve({
           status: r.statusCode,
+          type: (r.headers['content-type'] || '').split(';')[0],
           // Presence, not the value: upstream's carries a leading space
           // (`' Basic realm=User Login'`) which no client sees, since a header
           // value's leading whitespace is not part of it.
@@ -68,7 +70,20 @@ function probe(port, { method = 'GET', path = '/no-such-route', headers = {} }) 
         }),
       );
     });
-    req.on('error', (e) => resolve({ status: 0, challenged: false, error: e.code }));
+    req.on('error', (e) => resolve({ status: 0, type: '', challenged: false, error: e.code }));
+    req.end();
+  });
+}
+
+/** A proxied `GET` of an absolute URL, reduced to the door it opened. */
+function proxied(port, url, headers = {}) {
+  return new Promise((resolve) => {
+    const req = http.request({ port, path: url, method: 'GET', headers: { host: new URL(url).host, ...headers } }, (r) => {
+      r.resume();
+      r.on('end', () =>
+        resolve({ status: r.statusCode, type: (r.headers['content-type'] || '').split(';')[0] }));
+    });
+    req.on('error', (e) => resolve({ status: 0, type: e.code }));
     req.end();
   });
 }
@@ -274,6 +289,65 @@ async function main() {
         problems: [`answer: whistle=${w.status} ${JSON.stringify(w.body)} `
           + `rs=${rs.status} ${JSON.stringify(rs.body)}`],
       });
+    }
+  }
+
+  // ── the hostnames that are the console ────────────────────────────────
+  //
+  // `w2 status` tells people to open `http://local.whistlejs.com/` **through
+  // the proxy**, and `rootca.pro` is how a phone gets the certificate: set the
+  // proxy, open it, install what it hands you. Neither name is special to DNS
+  // as far as this matters — both resolve to `127.0.0.1`, where nothing is
+  // listening on port 80 — so a proxy that does not know them answers `502`,
+  // which is what this port used to do.
+  //
+  // Compared on **status and content type**, not on bytes: two different
+  // consoles serve two different pages, and two different CAs are two different
+  // certificates. What is comparable is whether the door opened and what kind
+  // of thing came through it.
+  //
+  // Upstream's list is `LOCAL_UI_HOST_LIST` (`_original/lib/config.js:38-42`).
+  // That it beats a matching rule was measured, not assumed: with
+  // `local.whistlejs.com http://…` installed, whistle still serves the console.
+  const CONSOLE_HOSTS = [
+    ['the console hostname', 'http://local.whistlejs.com/'],
+    ['the console hostname, a sub-path', 'http://local.whistlejs.com/index.html'],
+    ['the other console hostname', 'http://local.wproxy.org/'],
+    ['the certificate hostname', 'http://rootca.pro/'],
+    ['the certificate hostname, any path at all', 'http://rootca.pro/anything'],
+    ['a hostname that is none of them', `http://127.0.0.1:${ORIGIN}/echo`],
+  ];
+  const creds = { authorization: `Basic ${ADMIN}` };
+  for (const [name, url] of CONSOLE_HOSTS) {
+    // **Logged in**, or this would be asking about the login again: this bench
+    // runs both consoles gated, so an anonymous request for a console hostname
+    // is a 401 on both sides and the only thing left to differ is the prose of
+    // the refusal. With credentials the door actually opens, and what came
+    // through it can be compared.
+    const [w, rs] = [await proxied(W, url, creds), await proxied(RS, url, creds)];
+    ran++;
+    const problems = [];
+    if (w.status !== rs.status) problems.push(`status: whistle=${w.status} rs=${rs.status}`);
+    if (w.type !== rs.type) problems.push(`content-type: whistle=${w.type} rs=${rs.type}`);
+    if (problems.length) {
+      differing++;
+      report.push({ name, problems });
+    }
+  }
+  // And without credentials: the console reached by hostname is still the
+  // console, so the login still stands in front of it — while the certificate
+  // answers anyway, for the same reason `/cgi-bin/rootca` is in upstream's
+  // `DONT_CHECK_PATHS`. A device that cannot fetch it cannot be configured to
+  // use the proxy at all, and `rootca.pro` exists for exactly that device.
+  for (const [name, url] of [
+    ['the console hostname, not logged in', 'http://local.whistlejs.com/'],
+    ['the certificate hostname, not logged in', 'http://rootca.pro/'],
+  ]) {
+    const [w, rs] = [await proxied(W, url), await proxied(RS, url)];
+    ran++;
+    if (w.status !== rs.status) {
+      differing++;
+      report.push({ name, problems: [`status: whistle=${w.status} rs=${rs.status}`] });
     }
   }
 

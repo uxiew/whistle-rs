@@ -3864,6 +3864,25 @@ async fn serve(
     origin: Origin,
     peer: SocketAddr,
 ) -> Result<Response<DynBody>> {
+    // The handful of hostnames that *are* the console, before anything else
+    // looks at this request. `http://local.whistlejs.com/` through the proxy is
+    // how whistle's own `w2 status` tells people to open it, and `rootca.pro` is
+    // how a phone gets the certificate — set the proxy, open the name, install
+    // what it hands you. Both names resolve to `127.0.0.1`, where nothing is
+    // listening on port 80, so a proxy that does not know them answers `502`.
+    //
+    // Here rather than in `top_level` because a tunnel has to answer too:
+    // upstream serves both over TLS inside its own MITM, measured. And before
+    // the rules, because upstream is before the rules — measured with a
+    // matching `host://` line installed, which it serves the console over.
+    let console = match &origin {
+        Origin::Forward => req.uri().host().map(str::to_string),
+        Origin::Mitm { host, .. } => Some(host.clone()),
+    }
+    .filter(|h| webui::console_host(&state, h));
+    if let Some(host) = console {
+        return Ok(webui::handle_proxied(&state, req, &host).await);
+    }
     let client_ip = Some(peer.ip().to_string());
     // Consumed before anything else looks at the headers, exactly like whistle
     // deletes its own marker on arrival: rule filters, plugins, the capture and

@@ -240,7 +240,8 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `-P, --uiport <PORT>` | 把控制台单独放到一个端口（上游的 `-P`）。不设则跟上游一样，控制台就在代理端口上 | 代理端口 |
 | `-n, --username <NAME>` / `-w, --password <PASS>` | 控制台登录（上游的 `-n`/`-w`）。都不设则控制台不设防 | 不设防 |
 | `-N, --guest-name <NAME>` / `-W, --guest-password <PASS>` | 只读账号（上游的 `-N`/`-W`）：只放行 `GET`，能看抓包、改不了任何东西 | —— |
-| `--socks-port <PORT>` | 额外启动内建 SOCKS5 服务 | 关闭 |
+| `-l, --local-ui-host <HOSTS>` | 追加能打开控制台的域名（上游的 `-l`），用 `\|`、`,` 或 `&` 分隔。不设时 `local.whistlejs.com`、`local.wproxy.org`、`rootca.pro` 也已生效 | 内建三个 |
+| `--socks-port <PORT>` | 额外启动内建 SOCKS5 服务（上游拼作 `--socksPort`，同样接受） | 关闭 |
 | `--plugin <NAME=HOST:PORT>` | 注册一个远程（Node/HTTP）插件（可重复） | —— |
 | `--node-plugin <NAME=PATH>` | 从脚本拉起一个 Node 插件（可重复） | —— |
 | `--value <NAME=CONTENT>` | 定义命名 value（可重复），规则中以 `{name}` 引用 | —— |

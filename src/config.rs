@@ -50,6 +50,12 @@ pub struct Config {
     /// unless the flag moved it, and only a *different* value starts a second
     /// server (`customUIPort`, `_original/biz/init.js:8-19`).
     pub ui_port: Option<u16>,
+    /// Extra hostnames that **are** the console rather than somewhere to
+    /// forward to — whistle's `-l/--localUIHost`, which appends to a built-in
+    /// list rather than replacing it (`uiHostList`,
+    /// `_original/lib/config.js:1040-1054`). Lower-cased on the way in; the
+    /// built-in three live in [`crate::proxy::webui::BUILTIN_UI_HOSTS`].
+    pub local_ui_hosts: Vec<String>,
     /// Optional inbound SOCKS5 port (whistle's `socksPort`).
     pub socks_port: Option<u16>,
     /// Registered plugin servers: name → `host:port` (whistle plugin servers).
@@ -113,6 +119,7 @@ impl Default for Config {
             guest_username: None,
             guest_password: None,
             ui_port: None,
+            local_ui_hosts: Vec::new(),
             socks_port: None,
             plugins: HashMap::new(),
             values: HashMap::new(),

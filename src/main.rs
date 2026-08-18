@@ -53,8 +53,18 @@ struct Cli {
     #[arg(short = 'P', long = "uiport")]
     ui_port: Option<u16>,
 
+    /// More hostnames that open the console (whistle's `-l/--localUIHost`),
+    /// separated by `|`, `,` or `&`.
+    ///
+    /// It **adds to** the built-in three rather than replacing them, which is
+    /// what upstream does with it (`uiHostList`, `_original/lib/config.js:1040-1054`).
+    /// `local.whistlejs.com`, `local.wproxy.org` and `rootca.pro` answer without
+    /// it.
+    #[arg(short = 'l', long = "local-ui-host")]
+    local_ui_host: Option<String>,
+
     /// Also run an inbound SOCKS5 server on this port.
-    #[arg(long)]
+    #[arg(long, alias = "socksPort")]
     socks_port: Option<u16>,
 
     /// Register a remote plugin as `name=host:port` (repeatable). Routes
@@ -74,6 +84,14 @@ struct Cli {
     values: Vec<String>,
 
     /// Path to a whistle rules file to load at startup.
+    ///
+    /// **Not quite whistle's `-r`.** There the flag is `--shadowRules`, and what
+    /// it loads is a layer *beneath* everything: the rules apply and they do not
+    /// appear in the console's list at all — measured, `/cgi-bin/rules/list`
+    /// comes back empty while the rule still fires. This loads the file into the
+    /// **Default group**, where it is listed, editable, and switchable off. Both
+    /// read the file and both apply it; who can see it afterwards differs. See
+    /// `docs/ROADMAP.md`.
     #[arg(short = 'r', long)]
     rules: Option<PathBuf>,
 
@@ -279,6 +297,16 @@ async fn main() -> Result<()> {
         port: cli.port,
         host: cli.host,
         storage_dir,
+        local_ui_hosts: cli
+            .local_ui_host
+            .as_deref()
+            .map(|list| {
+                list.split(['|', ',', '&'])
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
         ui_username: cli.username,
         ui_password: cli.password,
         guest_username: cli.guest_name,

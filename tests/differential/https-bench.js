@@ -94,22 +94,26 @@ async function setRules(text) {
  * then an ordinary request. `ca` is the proxy's root, so a forged certificate
  * verifies and an un-intercepted one does not — which is itself a signal.
  */
-function throughTunnel(port, ca, { method = 'GET', path = '/echo', headers = {} } = {}) {
+function throughTunnel(port, ca, { method = 'GET', path = '/echo', headers = {}, authority } = {}) {
   return new Promise((resolve) => {
     const done = (v) => resolve(v);
+    // `authority` names somewhere other than the origin — which the console
+    // hostnames need, because nothing is listening where they point and the
+    // proxy is supposed to answer for them itself.
+    const target = authority || `localhost:${ORIGIN}`;
     const req = http.request({
-      port, host: '127.0.0.1', method: 'CONNECT', path: `localhost:${ORIGIN}`,
+      port, host: '127.0.0.1', method: 'CONNECT', path: target,
     });
     req.on('connect', (res, socket) => {
       if (res.statusCode !== 200) { socket.destroy(); return done({ status: 0, note: `CONNECT ${res.statusCode}` }); }
-      const secure = tls.connect({ socket, servername: 'localhost', ca }, () => {
+      const secure = tls.connect({ socket, servername: target.split(':')[0], ca }, () => {
         // The tunnel's socket is already decrypted, so what travels inside it
         // is plain HTTP. `https.request` would negotiate TLS a second time on
         // top of it — which fails as `EPROTO`, identically in both proxies, and
         // therefore looks like agreement.
         const inner = http.request({
           createConnection: () => secure, method, path,
-          headers: { host: `localhost:${ORIGIN}`, ...headers },
+          headers: { host: target, ...headers },
         }, (r) => {
           const c = [];
           r.on('data', (x) => c.push(x));
@@ -546,6 +550,72 @@ async function main() {
     }
   }
   plain.close();
+
+  // ── the console's own hostnames, inside a tunnel ──────────────────────
+  //
+  // `local.whistlejs.com` and `rootca.pro` are the console and the certificate
+  // over **plain HTTP** — `auth-bench.js` measures that half. They are also
+  // both over TLS, inside the proxy's own MITM: upstream forges a certificate
+  // for the name and then answers from the console behind it, which is what a
+  // phone does when it opens `https://rootca.pro/` with the proxy set and no
+  // certificate installed yet.
+  //
+  // Compared on status and content type. The two consoles serve two different
+  // pages and the two proxies have two different roots, so the bytes were never
+  // going to match; whether the tunnel opened and what kind of thing came out
+  // of it is the question.
+  //
+  // The `Host` header is spelled the way a browser spells it — **without the
+  // default port** — and for `rootca.pro` that is not a detail. Upstream reads
+  // the header and does not strip `:443` from it, so `Host: rootca.pro` gets the
+  // certificate at any path while `Host: rootca.pro:443` gets the console at `/`
+  // and a 404 anywhere else. Measured all four ways. The last case below pins
+  // that, and `EXPECTED` excuses it: a `Host` carrying the scheme's default port
+  // is the same host (RFC 7230 §5.4), this port keys off the authority the
+  // `CONNECT` named, and answering two different things to two spellings of one
+  // name is not a behaviour to reproduce.
+  let declaredHostPort = null;
+  for (const [name, authority, path, host] of [
+    ['tunnel: the console hostname', 'local.whistlejs.com:443', '/'],
+    ['tunnel: the console hostname, a sub-path', 'local.whistlejs.com:443', '/index.html'],
+    ['tunnel: the other console hostname', 'local.wproxy.org:443', '/'],
+    ['tunnel: the certificate hostname', 'rootca.pro:443', '/', 'rootca.pro'],
+    ['tunnel: the certificate hostname, any path', 'rootca.pro:443', '/whatever', 'rootca.pro'],
+    ['tunnel: the certificate hostname, Host with :443', 'rootca.pro:443', '/whatever'],
+  ]) {
+    const opts = { authority, path };
+    if (host) opts.headers = { host };
+    const [w, rs] = [
+      await throughTunnel(W, wCa, opts),
+      await throughTunnel(RS, rsCa, opts),
+    ];
+    ran++;
+    const type = (r) => (r.headers && r.headers['content-type'] || '').split(';')[0];
+    const problems = [];
+    if (w.status !== rs.status) {
+      problems.push(`status: whistle=${w.status}${w.note ? ` (${w.note})` : ''} `
+        + `rs=${rs.status}${rs.note ? ` (${rs.note})` : ''}`);
+    }
+    if (type(w) !== type(rs)) problems.push(`content-type: whistle=${type(w)} rs=${type(rs)}`);
+    // Declared here rather than in `EXPECTED`, which is given a problem string
+    // and not a case: `status: whistle=404 rs=200` written there would excuse
+    // that shape everywhere, and it earns an excuse in exactly one case.
+    if (problems.length && /Host with :443/.test(name)) {
+      declaredHostPort = problems;
+    } else if (problems.length) {
+      differing++;
+      report.push({ name, rules: authority + path, problems });
+    }
+  }
+  if (!declaredHostPort) {
+    // The quirk is declared, so its *absence* is news too — upstream may have
+    // fixed it, and this port would then be excusing nothing.
+    differing++;
+    report.push({
+      name: 'tunnel: the certificate hostname, Host with :443',
+      problems: ['the declared `Host: rootca.pro:443` divergence did not happen'],
+    });
+  }
 
   // ── which suite a pin actually produces ────────────────────────────────
   //

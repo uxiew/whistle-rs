@@ -102,13 +102,15 @@ Eight corpora are not clean on a bare run, by design:
   therefore drops — for a *response* header it loses the whole response), and
   two are `urlReplace://` values whistle declines to apply at all.
 
-## The login bench
+## The console's front door
 
 `auth-bench.js` is the one bench that never installs a rule, because its subject
-is the gate in front of the console every *other* bench installs its rules
-through. `-n`/`-w` name the account that may do anything and `-N`/`-W` one that
-may only read; a corpus that locked itself out would have nothing left to say,
-so this stands alone and both proxies are launched with the credentials.
+is the way in to the console every *other* bench installs its rules through —
+the login, and the hostnames that open it.
+
+`-n`/`-w` name the account that may do anything and `-N`/`-W` one that may only
+read; a corpus that locked itself out would have nothing left to say, so this
+stands alone and both proxies are launched with the credentials.
 
 ```sh
 W2_USER=admin W2_PASS=s3cret W2_GUEST=guest W2_GUEST_PASS=look \
@@ -126,14 +128,29 @@ wrong and 404 when they are right, and the difference between those two is the
 gate and nothing else. The prose and content type of the 401 body are each
 proxy's own words and are not compared.
 
-46 cases: every spelling of a credential (`Basic`, `basic`, no scheme at all,
+54 cases: every spelling of a credential (`Basic`, `basic`, no scheme at all,
 padding trimmed, no colon, a password containing one), each of the three places
 upstream reads them from, the read-only account against five methods, the
 `.js`/`.css`/`.ico`/`.png` exemption, the root certificate answering before the
 login does, and — the case that would matter most if it ever broke — that a
-console login **does not gate proxied traffic**. A clean run is `differing: 0,
-declared: 6`, the six being upstream's static-suffix exemption, which a console
-that is one self-contained page has nothing to use and would only be a hole.
+console login **does not gate proxied traffic**. A clean run is
+`differing: 0, declared: 6`, the six being upstream's static-suffix exemption,
+which a console that is one self-contained page has nothing to use and would only
+be a hole.
+
+It also carries the **hostnames that are the console**. `w2 status` tells people
+to open `http://local.whistlejs.com/` through the proxy, and `rootca.pro` is how
+a phone gets the certificate — set the proxy, open the name, install what it
+hands you. Both resolve to `127.0.0.1`, where nothing is listening on port 80, so
+a proxy that does not know them answers `502`, which is what this port did.
+Compared on status and content type: two different consoles serve two different
+pages and two different roots are two different certificates, so the bytes were
+never going to match. They are asked **logged in**, because this bench runs both
+consoles gated and an anonymous request for a console hostname is a 401 on both
+sides with only the prose of the refusal left to differ; two more ask them
+anonymously, to say that the login still stands in front of the console and that
+the certificate still answers anyway. `https-bench.js` asks the same questions
+inside a tunnel.
 
 It found two things this port had wrong, both now fixed and both pinned in
 `login_tests`: `parseAuth` decodes a value with **no scheme** and does not
