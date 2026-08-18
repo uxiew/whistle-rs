@@ -160,6 +160,33 @@ body {
   font-size: 12.5px;
 }
 
+/* The note under the box when a condition cannot be answered. Absolutely
+   positioned so it does not push the toolbar around as it appears. */
+.filter-gap {
+  position: absolute;
+  top: 30px;
+  right: 0;
+  z-index: 20;
+  max-width: 340px;
+  margin: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--muted, var(--fg));
+  font-size: 11.5px;
+  line-height: 1.45;
+  box-shadow: 0 4px 14px rgb(0 0 0 / 18%);
+}
+
+.filter-gap span {
+  display: block;
+}
+
+.filter-gap code {
+  color: var(--fg);
+}
+
 .search input:focus {
   outline: none;
   border-color: var(--accent);

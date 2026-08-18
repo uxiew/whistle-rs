@@ -157,6 +157,22 @@ Add more names with `-l/--local-ui-host`, or stop answering for them at all with
 `GET /sessions.json` returns the captured traffic as JSON, and `GET /proxy.pac`
 serves a PAC file that auto-configures a client to use this proxy.
 
+### Finding a request
+
+The console's search box speaks whistle's filter language: a bare word matches
+the URL, and a prefix asks about something else. Several conditions are AND-ed.
+
+| | | | |
+|---|---|---|---|
+| `m:` method | `s:` status | `t:` content type | `H:` host |
+| `i:` client or server IP | `e:` went wrong | `style:` a `style://` value | `mark:` marked by hand |
+
+Each takes a keyword or a `/regexp/flags` — `m:POST s:/^5/ H:api.example.com`
+finds the failing POSTs to one host. `e:` and `mark:` on their own mean the whole
+set. The four conditions this console cannot answer — `h:` and `b:` (the list
+rows carry no headers or bodies), `app:` and `fc:` — say so under the box rather
+than quietly matching nothing.
+
 ## Intercepting HTTPS
 
 HTTPS traffic is encrypted, so to read/rewrite it whistle-rs presents a certificate it

@@ -3,7 +3,7 @@
 // filter box.
 
 import { computed, onMounted, ref } from 'vue';
-import { applyTheme, loadStatus, showPane, state } from '../store';
+import { applyTheme, filterGaps, loadStatus, showPane, state } from '../store';
 import type { Pane } from '../store';
 
 const PANES: { key: Pane; label: string }[] = [
@@ -43,6 +43,16 @@ onMounted(() => {
 });
 
 const filterInput = ref<HTMLInputElement | null>(null);
+
+/** The grammar, in the tooltip — the same one `gui/network.md` documents. */
+const FILTER_HELP = [
+  'A word matches the URL. Prefixes ask about something else:',
+  '  m:  method        s:  status        t:  content type',
+  '  H:  host          i:  client or server IP',
+  '  e:  went wrong    style:  a style:// value    mark:  marked by hand',
+  'Each takes a keyword or a /regexp/flags. Several are AND-ed:',
+  '  m:POST s:/^5/ H:api.example.com',
+].join('\n');
 
 /** ⌘F focuses the filter from anywhere, the way a request list should. */
 function focusFilter(): void {
@@ -94,9 +104,18 @@ defineExpose({ focusFilter });
         id="filter"
         ref="filterInput"
         v-model="state.filter"
-        placeholder="Filter"
+        :title="FILTER_HELP"
+        placeholder="Filter — m: s: t: H: i: e: style: mark:"
         spellcheck="false"
       />
+      <!-- A condition this console cannot answer would otherwise just show an
+           empty list, which reads as "nothing matched" rather than "I cannot
+           ask that". Saying so is the whole point. -->
+      <p v-if="filterGaps.length" class="filter-gap">
+        <span v-for="g in filterGaps" :key="g.prefix">
+          <code>{{ g.prefix }}:</code> {{ g.why }}
+        </span>
+      </p>
     </div>
   </div>
 </template>

@@ -363,7 +363,17 @@ port framed a body on a separator header alone, where upstream also wants
 `enable://captureStream`, and nothing on the wire could tell.
 
 It compares the payloads in order, each tagged with its direction, and nothing
-else: ids, timestamps and lengths are each console's own bookkeeping. 14 cases —
+else: ids, timestamps and lengths are each console's own bookkeeping. It polls
+rather than sleeping — upstream emits the tail of a body only when the body ends
+(`if (end) emitFrame(buf)`, `data.js:126-129`), so a case whose separator never
+matches has nothing to show until then, and a fixed wait made it pass on a quiet
+machine and fail on a busy one.
+
+It also **refuses to run against an origin it did not start**. A leftover server
+on the origin's port produced three separate false findings here in one
+afternoon, each looking exactly like news: the bench binds, reports numbers, and
+they are about somebody else's server. Now it fails loudly if the port is held,
+and checks that what answers is really its own origin before running a case. 14 cases —
 the event stream, the flag on both sides of the exchange, the leading slash that
 keeps the separator, a separator that appears nowhere, and the FAQ's own example
 including its typo (`%A0` where it means `%0A`, which frames the whole body as

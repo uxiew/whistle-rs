@@ -492,6 +492,15 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
                     "has_req_body": s.req_body.as_ref().map(|c| c.total() > 0).unwrap_or(false),
                     "has_res_body": s.res_body.as_ref().map(|c| c.total() > 0).unwrap_or(false),
                     "has_frames": s.status == 101 || framed.contains(&s.id),
+                    // The response's content type, for the console's `t:` filter
+                    // — `t:json` is one of the two or three questions anyone
+                    // asks of a busy capture, and the summary is the only place
+                    // that can answer it without fetching every row's detail.
+                    // One short string; the header itself, not a guess at a
+                    // category, so a filter written `t:event-stream` works too.
+                    "type": s.res_headers.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.as_str()),
                 })
             })
             .collect()
@@ -2830,6 +2839,111 @@ mod login_tests {
 #[cfg(test)]
 mod tests {
     use crate::rules::protocols;
+
+    /// The search box's filter language, run in the engine the proxy already
+    /// carries — the same arrangement as the classifier below, and for the same
+    /// reason: one copy of the logic, and a test that cannot drift from what the
+    /// console actually does.
+    ///
+    /// The grammar is `gui/network.md`'s. What is pinned here is every prefix
+    /// this console can answer, that a bare word still means the URL, that a
+    /// `/regexp/` is one, that conditions are AND-ed, and — the part that made
+    /// this worth writing — that a prefix it *cannot* answer is reported instead
+    /// of quietly matching nothing.
+    #[test]
+    fn the_search_box_speaks_whistles_filter_language() {
+        use boa_engine::{Context, Source};
+
+        let mut ctx = Context::default();
+        ctx.eval(Source::from_bytes(include_str!(
+            "../../ui-src/src/filter/session-filter.js"
+        )))
+        .expect("session-filter.js evaluates");
+
+        // One row, standing in for a busy capture.
+        let row = r#"{
+            id: 7, method: 'POST', url: 'https://api.example.com/v1/users?id=2',
+            status: 404, client_ip: '10.1.2.3', target: '93.184.216.34:443',
+            type: 'application/json; charset=utf-8',
+            rules: [{ protocol: 'style', value: 'italic', raw: 'style://italic' }]
+        }"#;
+        let ask = |ctx: &mut Context, query: &str, marked: &str| -> bool {
+            let script = format!(
+                "(() => {{ const p = whistleParseFilter({query:?});\n\
+                   return whistleMatchSession({row}, p.conditions, {{ marked: {marked} }}); }})()"
+            );
+            ctx.eval(Source::from_bytes(script.as_bytes()))
+                .expect("the filter runs")
+                .as_boolean()
+                .expect("a boolean")
+        };
+        let unsupported = |ctx: &mut Context, query: &str| -> String {
+            let script = format!(
+                "whistleParseFilter({query:?}).unsupported.map((u) => u.prefix).join(',')"
+            );
+            let value = ctx.eval(Source::from_bytes(script.as_bytes())).expect("parses");
+            value
+                .as_string()
+                .expect("a string")
+                .to_std_string_escaped()
+        };
+
+        for (query, want) in [
+            // A bare word is the URL, as it always was.
+            ("users", true),
+            ("nothing-like-it", false),
+            ("/v1/", true),
+            // …and the prefixes, which used to be searched for as literal text.
+            ("m:POST", true),
+            ("m:GET", false),
+            ("s:404", true),
+            ("s:200", false),
+            ("H:api.example.com", true),
+            ("H:example.org", false),
+            ("t:json", true),
+            ("t:html", false),
+            ("i:10.1.2.3", true),
+            ("i:93.184", true),
+            ("i:172.16", false),
+            ("style:italic", true),
+            ("style:bold", false),
+            // `e:` is "did this go wrong", which the status answers.
+            ("e:users", true),
+            // A regexp, with and without flags.
+            ("m:/^p/i", true),
+            ("m:/^p/", false),
+            // Several conditions are AND-ed.
+            ("m:POST s:404", true),
+            ("m:POST s:200", false),
+            ("m:POST users t:json", true),
+            // A colon that is not a prefix leaves the word alone.
+            ("api.example.com/v1", true),
+            // An unfinished regexp matches nothing rather than throwing.
+            ("m:/^(", false),
+        ] {
+            assert_eq!(ask(&mut ctx, query, "[]"), want, "{query}");
+        }
+
+        // `mark:` reads the console's own list, not the row.
+        assert!(!ask(&mut ctx, "mark:users", "[]"));
+        assert!(ask(&mut ctx, "mark:users", "[7]"));
+        assert!(!ask(&mut ctx, "mark:elsewhere", "[7]"));
+        // `mark:` and `e:` with no value mean the *set*, not "match anything":
+        // an empty needle is inside every string, so without this `e:` on its
+        // own would select the whole capture — the opposite of what it says.
+        assert!(!ask(&mut ctx, "mark:", "[]"));
+        assert!(ask(&mut ctx, "mark:", "[7]"));
+        assert!(ask(&mut ctx, "e:", "[]"), "the row is a 404");
+        assert!(!ask(&mut ctx, "s:200 e:", "[]"), "and 200s are not errors");
+
+        // And the four this console cannot answer are named, not dropped.
+        assert_eq!(unsupported(&mut ctx, "b:hello"), "b");
+        assert_eq!(unsupported(&mut ctx, "h:cookie b:x app:wechat fc:y"), "h,b,app,fc");
+        assert_eq!(unsupported(&mut ctx, "m:POST"), "");
+        // An unsupported condition does not also silently filter everything out:
+        // it is removed from the conditions and reported beside the box instead.
+        assert!(ask(&mut ctx, "b:whatever m:POST", "[]"));
+    }
 
     /// The rules editor highlights whichever token the proxy will treat as the
     /// **pattern**, and that is the whole reason the mode exists: whistle's line

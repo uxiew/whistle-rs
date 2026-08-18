@@ -49,16 +49,38 @@ const BODIES = {
 };
 
 function startOrigin() {
-  return new Promise((res) => {
+  return new Promise((res, rej) => {
     const srv = http.createServer((q, r) => {
       const path = q.url.split('?')[0];
       const body = BODIES[path] || BODIES['/nosep'];
-      r.writeHead(200, { 'content-type': body[0] });
+      r.writeHead(200, { 'content-type': body[0], 'x-frames-origin': 'yes' });
       for (const chunk of body[1]) r.write(chunk);
       r.end();
     });
+    // A port held by somebody else is the worst thing that can happen to a
+    // bench: it reports numbers, and they are about a server nobody meant to
+    // measure. It has happened three times in one afternoon here, always with a
+    // leftover from an earlier experiment, and always looking like a finding.
+    srv.on('error', (e) => rej(new Error(
+      `origin cannot listen on ${ORIGIN}: ${e.code}. Something else is holding `
+      + 'that port — a leftover origin from an earlier run is the usual answer.',
+    )));
     srv.listen(ORIGIN, () => res(srv));
   });
+}
+
+/**
+ * Refuse to run until the origin answering on that port is **this** one.
+ *
+ * Binding proves the port was free at that instant; it does not prove that what
+ * answers a request is the server just started, and a bench that measures the
+ * wrong server is worse than one that does not run.
+ */
+async function checkOrigin() {
+  const a = await req(ORIGIN, { path: '/sse' });
+  if (!/data: one/.test(a.body)) {
+    throw new Error(`the server on ${ORIGIN} is not this bench's origin: ${a.status} ${a.body.slice(0, 60)}`);
+  }
 }
 
 const req = (port, { method = 'GET', path, headers = {}, body }) =>
@@ -164,6 +186,7 @@ const CASES = [
 
 async function main() {
   const origin = await startOrigin();
+  await checkOrigin();
   let ran = 0;
   let differing = 0;
   const report = [];
@@ -180,8 +203,19 @@ async function main() {
     };
     await req(W, shape);
     await req(RS, shape);
-    await new Promise((x) => setTimeout(x, 450));
-    const [w, rs] = [await whistleFrames(tag.slice(1)), await rsFrames(tag.slice(1))];
+    // **Poll, do not sleep.** Upstream emits the tail of a body only when the
+    // body ends (`if (end) emitFrame(buf)`, `data.js:126-129`), so a case whose
+    // separator never matches has *nothing* to show until then — it is the most
+    // timing-sensitive case in the file, and a fixed wait made it pass on a
+    // quiet machine and fail on a busy one. A real difference survives the
+    // waiting; a race does not.
+    let w = [];
+    let rs = [];
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise((x) => setTimeout(x, 120));
+      [w, rs] = [await whistleFrames(tag.slice(1)), await rsFrames(tag.slice(1))];
+      if (JSON.stringify(w) === JSON.stringify(rs)) break;
+    }
     ran++;
     if (JSON.stringify(w) !== JSON.stringify(rs)) {
       differing++;

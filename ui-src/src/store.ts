@@ -9,6 +9,11 @@
 
 import { computed, reactive, watch } from 'vue';
 import { api } from './api';
+// The filter grammar, imported for its side effect: the module is plain
+// script-shaped JavaScript with no exports, because the same file is evaluated
+// by a Rust test in the engine the proxy already carries. One copy, so the
+// console and the test cannot drift. See the note at the top of the file.
+import './filter/session-filter.js';
 import type {
   Composition,
   ExplainQuery,
@@ -210,21 +215,39 @@ export const state = reactive<State>({
 watch(() => state.compose, (c) => writeStored(COMPOSE_KEY, c), { deep: true });
 watch(() => state.test, (t) => writeStored(TEST_KEY, t), { deep: true });
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const parseFilter = (globalThis as any).whistleParseFilter as (
+  q: string,
+) => { conditions: unknown[]; unsupported: { prefix: string; why: string }[] };
+const matchSession = (globalThis as any).whistleMatchSession as (
+  s: SessionSummary,
+  c: unknown[],
+  ctx: { marked: number[] },
+) => boolean;
+
 // ── derived ────────────────────────────────────────────────────────────────
+
+/**
+ * The filter box's query, parsed.
+ *
+ * `whistle`'s little language: a bare word matches the URL, `m:` the method,
+ * `s:` the status, and so on, with several conditions AND-ed — see
+ * `filter/session-filter.js`, which is the one copy of the grammar and is tested
+ * from Rust against the same table.
+ */
+const parsedFilter = computed(() => parseFilter(state.filter));
+
+/** The prefixes in the box this console has no answer for, with the reason. */
+export const filterGaps = computed(() => parsedFilter.value.unsupported);
 
 /** The sessions the source list and the filter box agree on. */
 const visibleSessions = computed(() => {
-  const q = state.filter.trim().toLowerCase();
+  const { conditions } = parsedFilter.value;
   return state.sessions.filter((s) => {
     if (state.client && clientOf(s) !== state.client) return false;
     if (state.markedOnly && !state.marked.includes(s.id)) return false;
-    if (!q) return true;
-    return (
-      (s.url || '').toLowerCase().includes(q) ||
-      (s.method || '').toLowerCase().includes(q) ||
-      (s.target || '').toLowerCase().includes(q) ||
-      String(s.status).includes(q)
-    );
+    if (!conditions.length) return true;
+    return matchSession(s, conditions, { marked: state.marked });
   });
 });
 
