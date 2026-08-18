@@ -105,6 +105,16 @@ pub struct CertAuthority {
     /// supplied for. Bounded the same way the generated ones are, and for the
     /// same reason: one entry per made-up SNI name would otherwise grow forever.
     remote_certs: Mutex<HostCache<RemoteCert>>,
+    /// Certificates supplied by hand in `--cert-dir`, keyed by **every name the
+    /// certificate carries**. Read once at startup and never evicted: the
+    /// directory is small, somebody put each file there on purpose, and a
+    /// certificate that fell out of a cache would be silently replaced by a
+    /// forged one — which is the failure the whole feature exists to avoid.
+    custom_certs: std::collections::HashMap<String, TlsAcceptor>,
+    /// Where the root actually came from. Not always the storage directory: a
+    /// `root.crt` in `--cert-dir` replaces it, and a startup line naming the
+    /// file that is *not* in use would send somebody to install the wrong one.
+    ca_cert_path: std::path::PathBuf,
 }
 
 impl CertAuthority {
@@ -112,6 +122,26 @@ impl CertAuthority {
     pub fn load_or_create(config: &Config) -> Result<Arc<Self>> {
         let cert_path = config.root_ca_cert_path();
         let key_path = config.root_ca_key_path();
+
+        // A `root.key` + `root.crt` in the certificate directory replaces the
+        // root CA outright. It is the only way to supply one — the console's own
+        // upload form refuses a root (`gui/https.md`) — and it is why the flag
+        // takes a directory rather than a pair of paths.
+        let custom_root = config.cert_dir.as_ref().and_then(|dir| {
+            let cert = ["crt", "cer", "pem"]
+                .iter()
+                .map(|ext| dir.join(format!("root.{ext}")))
+                .find(|p| p.exists())?;
+            let key = dir.join("root.key");
+            key.exists().then_some((cert, key))
+        });
+        let (cert_path, key_path) = match custom_root {
+            Some((cert, key)) => {
+                tracing::info!("root CA supplied by hand: {}", cert.display());
+                (cert, key)
+            }
+            None => (cert_path, key_path),
+        };
 
         let (ca_cert, ca_key, ca_cert_pem) = if cert_path.exists() && key_path.exists() {
             let cert_pem = std::fs::read_to_string(&cert_path)
@@ -138,13 +168,31 @@ impl CertAuthority {
             (ca_cert, ca_key, cert_pem)
         };
 
+        let custom_certs = config
+            .cert_dir
+            .as_deref()
+            .map(load_custom_certs)
+            .unwrap_or_default();
+        if !custom_certs.is_empty() {
+            let mut names: Vec<&str> = custom_certs.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            tracing::info!("certificates supplied by hand for: {}", names.join(", "));
+        }
+
         Ok(Arc::new(CertAuthority {
             ca_cert,
             ca_key,
             ca_cert_pem,
             acceptors: Mutex::new(AcceptorCache::default()),
             remote_certs: Mutex::new(HostCache::default()),
+            custom_certs,
+            ca_cert_path: cert_path,
         }))
+    }
+
+    /// The file the root certificate was read from — the one to install.
+    pub fn root_cert_path(&self) -> &std::path::Path {
+        &self.ca_cert_path
     }
 
     /// PEM of the root certificate.
@@ -164,6 +212,13 @@ impl CertAuthority {
     /// parent domain rather than one per hostname.
     pub fn acceptor_for(&self, host: &str) -> Result<TlsAcceptor> {
         let host = host.to_ascii_lowercase();
+        // A certificate somebody put in the directory wins over one this proxy
+        // would sign. Exact name first, then the wildcard the certificate may
+        // carry instead — upstream looks the same two up, in the same order
+        // (`existsCustomCert`, `_original/lib/https/ca.js:161-173`).
+        if let Some(acc) = self.custom_cert(&host) {
+            return Ok(acc);
+        }
         let key = {
             let cache = self.acceptors.lock().unwrap();
             cert_host(&host, |name| cache.by_host.contains_key(name))
@@ -320,6 +375,153 @@ fn acceptor_from_der(
 /// `with_single_cert` refuses a key whose `SubjectPublicKeyInfo` does not match
 /// the leaf certificate's, so a valid-looking pair that does not actually go
 /// together is rejected here rather than at handshake time on every connection.
+/// The hand-supplied certificate for `host`, if the directory carried one.
+///
+/// Two lookups, in upstream's order: the name itself, then the wildcard form
+/// with the first label replaced — a certificate for `*.example.com` answers for
+/// `api.example.com` and not for `example.com`, which is what a wildcard means.
+impl CertAuthority {
+    fn custom_cert(&self, host: &str) -> Option<TlsAcceptor> {
+        if self.custom_certs.is_empty() {
+            return None;
+        }
+        let host = host.split(':').next().unwrap_or(host);
+        if let Some(acc) = self.custom_certs.get(host) {
+            return Some(acc.clone());
+        }
+        let (_, rest) = host.split_once('.')?;
+        self.custom_certs.get(&format!("*.{rest}")).cloned()
+    }
+
+    /// Whether a hand-supplied certificate covers `host` — the question
+    /// `enable://capture` asks when deciding whether a connection is worth
+    /// intercepting without being told to.
+    pub fn has_custom_cert(&self, host: &str) -> bool {
+        self.custom_cert(host).is_some()
+    }
+}
+
+/// Read a directory of `<name>.key` + `<name>.(crt|cer|pem)` pairs into a map
+/// from **every name each certificate carries** to an acceptor serving it.
+///
+/// The filename only pairs the two files; what a certificate answers for comes
+/// out of its own `subjectAltName`, which is the only reading a TLS client would
+/// accept anyway. Upstream does exactly this, and **ignores a certificate with
+/// no SANs at all** (`parseCert` returns nothing without them,
+/// `_original/lib/https/ca.js:272-279`) — a certificate that names nothing
+/// cannot be matched to a request.
+///
+/// Nothing here is fatal. A directory that does not exist, a file that is not a
+/// certificate, a key that does not match — each is logged and skipped, because
+/// the alternative is a proxy that will not start over one stale file in a
+/// directory somebody forgot about.
+fn load_custom_certs(dir: &std::path::Path) -> std::collections::HashMap<String, TlsAcceptor> {
+    use std::collections::HashMap;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        tracing::warn!("cert dir {}: cannot be read, so nothing is loaded", dir.display());
+        return HashMap::new();
+    };
+    // Stem → (cert path, key path, mtime of the certificate).
+    let mut pairs: HashMap<String, (Option<std::path::PathBuf>, Option<std::path::PathBuf>, u64)> =
+        HashMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let (Some(stem), Some(ext)) = (
+            path.file_stem().and_then(|s| s.to_str()).map(str::to_string),
+            path.extension().and_then(|s| s.to_str()),
+        ) else {
+            continue;
+        };
+        // `root` is the CA itself and is loaded by `load_or_create`, not here.
+        if stem == "root" {
+            continue;
+        }
+        let slot = pairs.entry(stem).or_insert((None, None, 0));
+        match ext {
+            "key" => slot.1 = Some(path),
+            "crt" | "cer" | "pem" => {
+                let mtime = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // A stem with two certificate files keeps the newer one, which
+                // is upstream's `cert.mtime >= mtime` test.
+                if slot.0.is_none() || mtime > slot.2 {
+                    slot.0 = Some(path);
+                    slot.2 = mtime;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Oldest first, and the first claim on a name wins: upstream sorts by mtime
+    // and skips a name it already has (`if (!pairs[item.value])`,
+    // `ca.js:285-300`). So adding a newer certificate does not silently take a
+    // name away from one that was already answering for it.
+    let mut stems: Vec<(String, std::path::PathBuf, std::path::PathBuf, u64)> = pairs
+        .into_iter()
+        .filter_map(|(stem, (cert, key, mtime))| Some((stem, cert?, key?, mtime)))
+        .collect();
+    stems.sort_by_key(|(stem, _, _, mtime)| (*mtime, stem.clone()));
+
+    let mut out: HashMap<String, TlsAcceptor> = HashMap::new();
+    for (stem, cert_path, key_path, _) in stems {
+        let (Ok(cert_pem), Ok(key_pem)) = (
+            std::fs::read_to_string(&cert_path),
+            std::fs::read_to_string(&key_path),
+        ) else {
+            tracing::warn!("cert {stem}: cannot be read, skipped");
+            continue;
+        };
+        let names = match certificate_names(&cert_pem) {
+            Ok(names) if !names.is_empty() => names,
+            Ok(_) => {
+                tracing::warn!(
+                    "cert {stem}: no subjectAltName, so there is no request it could answer — skipped"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("cert {stem}: {e:#}, skipped");
+                continue;
+            }
+        };
+        let acceptor = match acceptor_from_pem(&cert_pem, &key_pem) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("cert {stem}: {e:#}, skipped");
+                continue;
+            }
+        };
+        for name in names {
+            out.entry(name).or_insert_with(|| acceptor.clone());
+        }
+    }
+    out
+}
+
+/// Every DNS name and IP address a certificate carries, lower-cased.
+fn certificate_names(cert_pem: &str) -> Result<Vec<String>> {
+    use rcgen::SanType;
+    // `from_ca_cert_pem` performs no CA validation — it says so — and it does
+    // extract the subject alternative names, which is the whole reason it is
+    // used on a leaf here.
+    let params = CertificateParams::from_ca_cert_pem(cert_pem).context("not a certificate")?;
+    Ok(params
+        .subject_alt_names
+        .iter()
+        .filter_map(|san| match san {
+            SanType::DnsName(name) => Some(name.to_string().to_ascii_lowercase()),
+            SanType::IpAddress(ip) => Some(ip.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
 pub fn acceptor_from_pem(cert_pem: &str, key_pem: &str) -> Result<TlsAcceptor> {
     let chain = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
@@ -542,5 +744,115 @@ mod tests {
         assert!(cache.by_host.contains_key("*.example.com"));
         assert!(cache.by_host.contains_key("*.evil.com"));
         assert_eq!(cache.by_host.len(), 2, "each domain has its own certificate");
+    }
+
+    /// A certificate somebody put in `--cert-dir` is served instead of a forged
+    /// one, for **every name it carries** — its `subjectAltName` entries, not
+    /// its filename, because a name in the filename is a name no TLS client
+    /// would ever look at.
+    #[test]
+    fn a_hand_supplied_certificate_answers_for_the_names_it_carries() {
+        let dir = std::env::temp_dir().join(format!("wrs-certdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let _ = std::fs::remove_file(dir.join("one.crt"));
+
+        // A leaf with two names, written the way somebody would put it there.
+        let mut params = CertificateParams::new(vec![
+            "pinned.test".to_string(),
+            "*.wild.test".to_string(),
+        ])
+        .expect("params");
+        params.distinguished_name.push(DnType::CommonName, "pinned.test");
+        let key = KeyPair::generate().expect("key");
+        let cert = params.self_signed(&key).expect("self-signed");
+        std::fs::write(dir.join("one.crt"), cert.pem()).expect("write cert");
+        std::fs::write(dir.join("one.key"), key.serialize_pem()).expect("write key");
+
+        let loaded = load_custom_certs(&dir);
+        let mut names: Vec<&str> = loaded.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["*.wild.test", "pinned.test"], "the SANs, not `one`");
+
+        let ca = CertAuthority::load_or_create(&crate::config::Config {
+            storage_dir: dir.join("store"),
+            cert_dir: Some(dir.clone()),
+            ..crate::config::Config::default()
+        })
+        .expect("ca");
+        assert!(ca.has_custom_cert("pinned.test"));
+        // A wildcard covers one label and not the bare domain, which is what a
+        // wildcard means everywhere else.
+        assert!(ca.has_custom_cert("api.wild.test"));
+        assert!(!ca.has_custom_cert("wild.test"));
+        assert!(!ca.has_custom_cert("deeper.api.wild.test"));
+        assert!(!ca.has_custom_cert("somewhere.else"));
+        // A port is not part of a name.
+        assert!(ca.has_custom_cert("pinned.test:8443"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nothing in that directory is allowed to stop the proxy starting, and a
+    /// certificate with no `subjectAltName` names nothing a request could match,
+    /// so it is skipped — upstream's `parseCert` returns nothing for one too.
+    #[test]
+    fn an_unusable_file_in_the_cert_dir_is_skipped_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("wrs-certdir-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Not a certificate at all.
+        std::fs::write(dir.join("junk.crt"), b"-----BEGIN CERTIFICATE-----\nnope\n").ok();
+        std::fs::write(dir.join("junk.key"), b"nor this").ok();
+        // A certificate with no SANs: `new(vec![])` names nothing.
+        let params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        let key = KeyPair::generate().expect("key");
+        let cert = params.self_signed(&key).expect("self-signed");
+        std::fs::write(dir.join("nosan.crt"), cert.pem()).ok();
+        std::fs::write(dir.join("nosan.key"), key.serialize_pem()).ok();
+        // A certificate with no key beside it is half a pair and not usable.
+        std::fs::write(dir.join("lonely.crt"), cert.pem()).ok();
+
+        assert!(load_custom_certs(&dir).is_empty());
+        // And a directory that is not there at all is simply nothing.
+        assert!(load_custom_certs(&dir.join("no-such-place")).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `root.crt` + `root.key` in the directory **replace the root CA**, which
+    /// is the only way to supply one — the console's upload form refuses a root
+    /// (`gui/https.md`) — and `root` is therefore not loaded as a leaf.
+    #[test]
+    fn a_root_in_the_cert_dir_becomes_the_root() {
+        let dir = std::env::temp_dir().join(format!("wrs-certdir-root-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let mut params = CertificateParams::new(vec!["ignored.test".to_string()]).expect("params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, "Somebody Else's Root");
+        let key = KeyPair::generate().expect("key");
+        let root = params.self_signed(&key).expect("self-signed");
+        std::fs::write(dir.join("root.crt"), root.pem()).expect("write cert");
+        std::fs::write(dir.join("root.key"), key.serialize_pem()).expect("write key");
+
+        // Not loaded as a leaf, even though it carries a name.
+        assert!(load_custom_certs(&dir).is_empty(), "`root` is the CA, not a leaf");
+
+        let ca = CertAuthority::load_or_create(&crate::config::Config {
+            storage_dir: dir.join("store"),
+            cert_dir: Some(dir.clone()),
+            ..crate::config::Config::default()
+        })
+        .expect("ca");
+        assert_eq!(ca.root_cert_path(), dir.join("root.crt"));
+        assert!(
+            ca.root_cert_pem().contains("BEGIN CERTIFICATE"),
+            "and it is the one served for installing"
+        );
+        // Nothing was written into the storage directory: the root came from
+        // elsewhere and generating one beside it would be a second, unused CA.
+        assert!(!dir.join("store").join("certs").join("root.crt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

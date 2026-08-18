@@ -14,7 +14,7 @@
 > **算子取值可以指向文件或 URL**（`readRuleValue`），**反引号整值按请求渲染**（`renderTpl`）。
 > **⚠️ 「已应用」不等于「与上游逐位一致」** —— 四路审计确认了 45 项行为差异，
 > **失败开放已清空**；不再维护一个精确的「已修 N 项」整数，下一节的清单才是准的。
-> 单元测试 **905** 项 + 端到端 **6** 项（`tests/console_e2e.rs`，真 socket 进出、
+> 单元测试 **908** 项 + 端到端 **6** 项（`tests/console_e2e.rs`，真 socket 进出、
 > 再问控制台自己的 API）全绿；`cargo build --all-targets`、`cargo clippy --all-targets`
 > 与 `cargo test --doc` 均 **0 警告 / 0 失败**（clippy 由 `Cargo.toml` 的
 > `[lints.clippy]` 把住）。此外还有 **2297 条差分用例**对着真 whistle 2.10.8 实测，
@@ -441,6 +441,22 @@ Non-goal；**与 `w2` 守护进程管理绑定的**（`-S/--storage`、`-C/--cop
   - 仍缺的是 `mobile.md` 里那个**二维码**：上游在 HTTPS 对话框里为每个本机 IP 生成一个，
     扫码即下载证书。本移植的控制台没有（生成二维码要么引依赖要么手写编码器）。
     现在的替代是「启动时打印地址 + `rootca.pro`」，够用但不等同。
+
+- **`-z/--cert-dir`：自定义证书（新）** —— `gui/https.md` 与 FAQ 都写了它，是对付
+  **SSL pinning** 的正经手段：客户端只认它服务端那张证书，那就把真证书给代理，让它直接
+  下发而不是伪造一张。
+  - 语义按上游逐条实测：目录里 `<name>.key` 配 `<name>.(crt|cer|pem)`；**文件名只负责配对，
+    一张证书答哪些名字取自它自己的 `subjectAltName`**（`parseCert`，`ca.js:272-279`）——
+    这也是 TLS 客户端唯一会看的地方。通配符只覆盖一层：`*.wild.test` 答
+    `api.wild.test`、不答 `wild.test`。查找先精确后通配，与 `existsCustomCert` 同序。
+  - **没有 SAN 的证书直接跳过**（上游也是），不是证书的文件、缺了 key 的证书同样跳过并
+    各自说明原因——这个目录里任何东西都不该让代理起不来。
+  - **`root.key` + `root.crt` 会替换根 CA**，而且这是唯一的供给途径：控制台的上传表单
+    明确不收根证书（`gui/https.md`）。此时启动日志报的是**实际在用的那个文件**，而不是
+    存储目录里那个——指错了会让人去装一张没用的证书。此路径下也不会再往存储目录写一张
+    没人用的 CA（有测试钉住）。
+  - 不引新依赖：`rcgen` 的 `from_ca_cert_pem` 明确不做 CA 校验、且会解析出 SAN，正好
+    用来读叶子证书。
 
 **读完了 `extensions/`（4 页）与 `gui/`（11 页）。** 规则语义上没有新的缺口：
 `network.md` 里那四个逐方向 WebSocket 标志（`enable://ignoreReceive|ignoreSend|

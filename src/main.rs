@@ -86,6 +86,16 @@ struct Cli {
     #[arg(short = 'l', long = "local-ui-host")]
     local_ui_host: Option<String>,
 
+    /// A directory of certificates to serve instead of forged ones (whistle's
+    /// `-z/--certDir`).
+    ///
+    /// `<name>.key` beside `<name>.crt` (or `.cer`, `.pem`) is served for every
+    /// name the certificate carries — its `subjectAltName` entries, not the
+    /// filename — so a client that pins its server's certificate can still be
+    /// read. `root.key` + `root.crt` replaces the root CA itself.
+    #[arg(short = 'z', long = "cert-dir", alias = "certDir")]
+    cert_dir: Option<PathBuf>,
+
     /// Also run an inbound SOCKS5 server on this port.
     #[arg(long, alias = "socksPort")]
     socks_port: Option<u16>,
@@ -346,6 +356,7 @@ async fn main() -> Result<()> {
         frame_cache_size: whistle_rs::config::clamp_frame_cache_size(cli.frame_cache_size),
         timeout_ms: cli.timeout,
         intercept_https: !cli.no_intercept_https,
+        cert_dir: cli.cert_dir,
         ..Config::default()
     };
 

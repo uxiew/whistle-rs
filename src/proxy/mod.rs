@@ -1939,7 +1939,8 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
     state.rules.write().unwrap().set_include_port(addr.port());
     tracing::info!(
         "root CA: {} (download at http://{}/rootCA.crt)",
-        state.config.root_ca_cert_path().display(),
+        // The file actually in use, which `--cert-dir` may have replaced.
+        state.ca.root_cert_path().display(),
         addr
     );
     // The address to give a phone. `0.0.0.0:8899` is not something anyone can

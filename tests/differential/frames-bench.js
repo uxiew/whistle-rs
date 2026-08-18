@@ -21,6 +21,16 @@
 //   PORT_BASE=19300 node frames-bench.js
 //     19300 whistle · 19301 whistle-rs · 19302 the origin
 //
+// **Two things this bench had to learn the hard way**, both about state it did
+// not own. An oracle is meant to be left running between runs, so its capture
+// holds every earlier run's sessions too — a per-case tag that repeated across
+// runs made the session lookup land on an answer from hours before, and a
+// passing case read as a failing one for most of an afternoon. Tags now carry
+// the run, and the lookup takes the newest match rather than the first. And an
+// origin left listening on this bench's port from an earlier experiment made it
+// measure somebody else's server while reporting numbers; it now refuses to
+// start in that case, and checks that what answers is really its own origin.
+//
 // **What is compared.** The payloads, in order, each tagged with its direction.
 // Not the ids, the timestamps or the lengths: those are each console's own
 // bookkeeping. A frame's *content* is the thing a person opens the panel to see.
@@ -113,7 +123,13 @@ async function whistleFrames(tag) {
   const sessions = json((await req(W, { method: 'POST', path: '/cgi-bin/sessions',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify({ latest: true }) })).body, []);
   const list = Array.isArray(sessions) ? sessions : (sessions.data || []);
-  const s = list.find((x) => (x.url || '').includes(tag));
+  // The **newest** match, not the first. Upstream's list is oldest first, and
+  // an oracle left running between runs keeps every session it has ever seen —
+  // so a tag that is not unique per run reads somebody's older answer. That is
+  // exactly what happened: a tag repeated across eight runs, `find` returned the
+  // one from hours earlier, and a passing case looked like a failing one.
+  const hits = list.filter((x) => (x.url || '').includes(tag));
+  const s = hits[hits.length - 1];
   if (!s) return ['(no session)'];
   const frames = json((await req(W, { method: 'POST', path: '/cgi-bin/frames',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reqId: s.id, latest: true }) })).body, []);
@@ -125,6 +141,8 @@ async function whistleFrames(tag) {
 
 /** The same, from this port. */
 async function rsFrames(tag) {
+  // Newest first here, so the first match is the newest — the same care as
+  // above, from the other end of the list.
   const sessions = json((await req(RS, { path: '/sessions.json' })).body, []);
   const s = sessions.find((x) => (x.url || '').includes(tag));
   if (!s) return ['(no session)'];
@@ -187,11 +205,15 @@ const CASES = [
 async function main() {
   const origin = await startOrigin();
   await checkOrigin();
+  // Unique to this run. An oracle is meant to be left running between runs — it
+  // takes seconds to start — so its capture holds every earlier run's sessions
+  // too, and a tag reused across runs is a lookup that can land on any of them.
+  const run = Date.now().toString(36);
   let ran = 0;
   let differing = 0;
   const report = [];
   for (const [i, c] of CASES.entries()) {
-    const tag = `/f${i}`;
+    const tag = `/f${run}x${i}`;
     await setRules(c.rules);
     const r = c.request || {};
     const shape = {

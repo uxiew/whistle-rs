@@ -143,6 +143,26 @@ and you'll see the injected header appear — proof the tunnel was decrypted.
 
 ---
 
+## Serving a real certificate instead
+
+Some clients refuse a certificate they did not expect, however well it is
+trusted — the app pins its server's certificate. There is nothing to install
+your way out of; the proxy has to present the certificate the client is looking
+for, which means you have to have it.
+
+```sh
+whistle-rs -z ./certs      # api.example.com.key + api.example.com.crt inside
+```
+
+Each `<name>.key` paired with `<name>.crt` (or `.cer`, `.pem`) is served for
+**every name the certificate carries** — its `subjectAltName`, not the filename.
+`root.key` + `root.crt` in the same directory replaces the root CA itself, which
+is the only way to supply one. Full rules in
+[`docs/CLI.md`](CLI.md#hand-supplied-certificates).
+
+A plugin can decide per connection instead, including deciding not to intercept
+at all — see `sniCallback://` in [`RULES.md`](RULES.md).
+
 ## How it works
 
 1. The client sends `CONNECT example.com:443` to the proxy.

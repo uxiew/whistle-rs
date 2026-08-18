@@ -369,11 +369,23 @@ rather than sleeping — upstream emits the tail of a body only when the body en
 matches has nothing to show until then, and a fixed wait made it pass on a quiet
 machine and fail on a busy one.
 
-It also **refuses to run against an origin it did not start**. A leftover server
-on the origin's port produced three separate false findings here in one
-afternoon, each looking exactly like news: the bench binds, reports numbers, and
-they are about somebody else's server. Now it fails loudly if the port is held,
-and checks that what answers is really its own origin before running a case. 14 cases —
+Two more things it had to learn, both about state it did not own — and both of
+which produced a false finding that looked exactly like news.
+
+* **It refuses to run against an origin it did not start.** A leftover server on
+  the origin's port makes the bench report numbers about somebody else's server.
+  It now fails loudly if the port is held, and checks that what answers is really
+  its own origin before running a case.
+* **Its per-case tags carry the run.** An oracle is meant to be left running
+  between runs, so its capture holds every earlier run's sessions too. A tag that
+  repeated across runs made the session lookup land on an answer recorded hours
+  before — from a build that predated the very gate under test — and one case
+  read as a failure for most of an afternoon. The lookup also takes the *newest*
+  match now rather than the first, since upstream lists sessions oldest first.
+
+The general lesson, and it is the third time today: **a bench that reads state it
+did not create is not measuring what it says it is**, and the failure looks like
+a finding rather than like a bug. 14 cases —
 the event stream, the flag on both sides of the exchange, the leading slash that
 keeps the separator, a separator that appears nowhere, and the FAQ's own example
 including its typo (`%A0` where it means `%0A`, which frames the whole body as

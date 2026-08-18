@@ -39,7 +39,7 @@ nothing to apply it to.
 | `--socksPort` | `--socks-port` (and `--socksPort`) | ✅ inbound SOCKS5 |
 | `-r, --shadowRules` | `-r, --rules` | ⚠️ **not the same thing** — see the note below |
 | `-D, --baseDir` / `-S, --storage` | `--dir` | ⚠️ one directory, named in full |
-| `-z, --certDir` | — | ➖ no directory of custom server certificates. A plugin can choose one per connection instead — [`sniCallback://`](RULES.md) |
+| `-z, --certDir` | `-z, --cert-dir` (and `--certDir`) | ✅ [see below](#hand-supplied-certificates) |
 | `-c, --dnsCache` / `--dnsServer` | — | ➖ DNS is the OS resolver's |
 | `-s, --sockets` | — | ➖ no per-host connection cap to tune |
 | `--httpPort` / `--httpsPort` | — | ➖ one proxy port; `-P` moves the console |
@@ -106,6 +106,47 @@ WARN mode: notAThing — no such mode in whistle either, so probably a typo
 
 `multiple` and `admin` are composites and are expanded first, exactly as upstream
 expands them, so `-M multiple` really does bring `keepXFF` with it.
+
+## Hand-supplied certificates
+
+`-z/--cert-dir` names a directory of certificates to serve **instead of forged
+ones**. It is how you read a client that pins its server's certificate: give the
+proxy the real key and certificate, and it presents them rather than one it
+signed.
+
+```
+certs/
+  api.example.com.key    # the private key
+  api.example.com.crt    # …and its certificate (.cer and .pem also work)
+  root.key               # optional: replaces the root CA itself
+  root.crt
+```
+
+The filename only pairs the two files. **What a certificate answers for comes out
+of its own `subjectAltName`** — a certificate carrying `DNS:api.example.com` and
+`DNS:*.wild.example` answers for both, whatever the file is called, which is the
+only reading a TLS client would accept anyway. A wildcard covers one label:
+`*.wild.example` answers for `api.wild.example` and not for `wild.example`.
+
+A certificate with no `subjectAltName` names nothing a request could match and is
+skipped with a line saying so, as are a file that is not a certificate and a
+certificate with no key beside it. Nothing in that directory can stop the proxy
+starting.
+
+`root.key` + `root.crt` **replace the root CA**, and that is the only way to
+supply one — whistle's console refuses a root through its upload form for the
+same reason. Everything not covered by a hand-supplied certificate is then signed
+by yours. The startup line names the file actually in use, which is the one to
+install:
+
+```
+INFO root CA supplied by hand: /path/to/certs/root.crt
+INFO root CA: /path/to/certs/root.crt (download at http://0.0.0.0:8899/rootCA.crt)
+INFO certificates supplied by hand for: *.wild.example, api.example.com
+```
+
+A plugin can also choose a certificate per connection, which is the dynamic
+version of the same thing — see `sniCallback://` in [`RULES.md`](RULES.md).
 
 ## Coming from `w2`
 

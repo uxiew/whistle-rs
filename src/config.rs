@@ -28,6 +28,15 @@ pub struct Config {
     /// Whether HTTPS interception (MITM) is enabled by default. whistle only
     /// intercepts when told to; we expose a global switch for the core.
     pub intercept_https: bool,
+    /// A directory of certificates supplied by hand — whistle's `-z/--certDir`.
+    ///
+    /// Each `<name>.key` paired with `<name>.crt` (or `.cer`, `.pem`) is served
+    /// **instead of a forged one** for every name the certificate carries, which
+    /// is how a client that pins its server's certificate can still be read.
+    /// `root.key` + `root.crt` there replaces the root CA itself, which is the
+    /// only way to supply one: `gui/https.md` says the console will not accept a
+    /// root through its upload form.
+    pub cert_dir: Option<PathBuf>,
     /// Inline rules text loaded at startup (`-r`/`--rules`), whistle's
     /// `config.rules`.
     pub rules: Option<String>,
@@ -129,6 +138,7 @@ impl Default for Config {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             storage_dir: base.join(DATA_DIRNAME),
             intercept_https: true,
+            cert_dir: None,
             rules: None,
             ui_username: None,
             ui_password: None,
