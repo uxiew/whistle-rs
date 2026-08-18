@@ -380,8 +380,8 @@
   `tests/differential/mode-bench.js` 给**每个 token 各起一次代理**（两边各一次），
   跑同一套九项探针再比对。最近一次全量：`ran: 57, differing: 0, declared: 0` ——
   模式表上一条具名差异都不剩。
-  - **实测：五十六个里只有十五个能被客户端看见**，且归并成六种行为。本移植接了其中
-    五种，先说最早接的四种：
+  - **实测：五十六个里只有十五个能被客户端看见**，且归并成六种行为，**六种全部接了**。
+    先说最早接的四种：
     `pureProxy`（连同 `proxyOnly`/`httpProxy`：不再应答控制台域名）、`headless`（连同
     `shadowRulesOnly`：关掉控制台，但**证书、PAC 与 `/api/status` 仍答** —— 上游
     `headless` 下也保留 `/cgi-bin/rootca` 与 `/cgi-bin/status`，实测）、

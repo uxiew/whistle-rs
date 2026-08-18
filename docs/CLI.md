@@ -75,8 +75,8 @@ whistle's `--mode` takes a `|`, `,` or `&` separated list out of a vocabulary of
 token — whistle and whistle-rs in turn — and runs the same nine probes through
 each. **Sixteen** move anything a client can see (fifteen against whistle's own
 defaults, and a sixteenth that only shows once HTTPS interception is on), and
-they collapse into six behaviours. Five of the six mean something here; the other
-forty are console options, deployment shapes and Node concerns.
+they collapse into six behaviours — **all six of which are honoured here**. The
+other forty tokens are console options, deployment shapes and Node concerns.
 
 As of the last full run, that bench reports **`ran: 57, differing: 0,
 declared: 0`** — every token in the vocabulary, and no declared divergence left
