@@ -94,6 +94,12 @@ sudo cp ~/.whistle-rs/certs/root.crt /etc/pki/ca-trust/source/anchors/whistle-rs
 sudo update-ca-trust
 ```
 
+> **Which IP?** whistle-rs prints the addresses a device on the same network can
+> reach it at, at startup and in `GET /api/status`. `0.0.0.0` in the listen line
+> is not one of them — it means "every interface", and a phone needs a specific
+> one. If nothing is printed, this machine has no private address the kernel will
+> admit to; read it off `ifconfig` / `ipconfig` instead.
+
 ### iOS
 
 1. Set the device's Wi-Fi HTTP proxy to your machine's IP and port `8899`.

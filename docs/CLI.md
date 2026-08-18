@@ -116,7 +116,7 @@ proxy, so the subcommands have no counterpart — here is what to do instead.
 | --- | --- |
 | `w2 start` / `run` | run the binary. It stays in the foreground; background it with your shell, a service file, or a container |
 | `w2 stop` / `restart` | `Ctrl-C`, or whatever supervises the process |
-| `w2 status` | `GET /api/status` on the console port |
+| `w2 status` | `GET /api/status` on the console port — it carries the same `lan_addresses` list `w2 status` prints |
 | `w2 ca` | install the certificate yourself — [`CERTIFICATES.md`](CERTIFICATES.md), and on a device just open <http://rootca.pro/> with the proxy set |
 | `w2 proxy` | set the system proxy with your OS's own tools |
 | `w2 add` | `--rules` / `--rule` at launch, or `POST /api/rules` while running |

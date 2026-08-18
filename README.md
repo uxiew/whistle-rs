@@ -126,8 +126,17 @@ export http_proxy=http://127.0.0.1:8899 https_proxy=http://127.0.0.1:8899
 ```
 
 **Browser / OS:** set the system or browser HTTP+HTTPS proxy to the same host/port.
-For a device on your LAN, use your machine's IP instead of `127.0.0.1` and make sure
-the port is reachable.
+
+**A phone or another machine** needs this machine's address on the network, not
+`127.0.0.1`. whistle-rs prints it at startup:
+
+```
+INFO on this network: http://192.168.2.203:8899 — set one as the proxy on a phone
+     (try each if unsure), then open http://rootca.pro/ to install the certificate
+```
+
+`GET /api/status` reports the same list as `lan_addresses`. Make sure the port is
+reachable — a firewall on this machine is the usual reason it is not.
 
 ### Opening the console
 

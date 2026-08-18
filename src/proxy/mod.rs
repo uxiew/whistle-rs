@@ -1942,7 +1942,102 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
         state.config.root_ca_cert_path().display(),
         addr
     );
+    // The address to give a phone. `0.0.0.0:8899` is not something anyone can
+    // type into a Wi-Fi proxy field, and `mobile.md` is an entire page about
+    // typing exactly that in — whistle's own `w2 status` prints the reachable
+    // URLs for the same reason. This prints the one a device on the same network
+    // should use, when it is not the address that was bound anyway.
+    if addr.ip().is_unspecified() {
+        let candidates = lan_addresses();
+        if !candidates.is_empty() {
+            let urls: Vec<String> = candidates
+                .iter()
+                .map(|ip| format!("http://{ip}:{}", addr.port()))
+                .collect();
+            tracing::info!(
+                "on this network: {} — set one as the proxy on a phone (try each \
+                 if unsure), then open http://rootca.pro/ to install the certificate",
+                urls.join("  ")
+            );
+        }
+    }
     Ok((listener, addr))
+}
+
+/// The addresses a device on the same network might reach this machine at.
+///
+/// No interface enumeration and no new dependency: a UDP socket *connected* to
+/// an address sends nothing, and the kernel fills in the local address it would
+/// have used to get there. Asking that once per private range is asking "if
+/// something on a 10.x network talked to me, which of my addresses would it be
+/// talking to" — and the answers, deduplicated, are the candidates.
+///
+/// **Several, not one.** A single probe against a public address returns
+/// whatever holds the default route, which on a machine running a VPN is the
+/// tunnel — an address no phone on the Wi-Fi can reach. Upstream sidesteps the
+/// same problem by listing every interface and telling you to try them in turn
+/// (`getIpList`, `_original/bin/util.js:33-49`, and the FAQ's "试看看"), and this
+/// keeps that shape.
+///
+/// Only private addresses are offered. A public one is either a server, where
+/// this line is not the advice anyone needs, or a VPN's, where it is wrong.
+pub(crate) fn lan_addresses() -> Vec<std::net::IpAddr> {
+    let probe = |target: &str| -> Option<std::net::IpAddr> {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.connect(target).ok()?;
+        Some(sock.local_addr().ok()?.ip())
+    };
+    let private = |ip: &std::net::IpAddr| match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private(),
+        std::net::IpAddr::V6(_) => false,
+    };
+    let mut out: Vec<std::net::IpAddr> = Vec::new();
+    // `224.0.0.1` — the all-hosts multicast group — first, and it is the one
+    // that works. Link-local multicast is not carried through a tunnel, so the
+    // kernel answers with the physical interface even on a machine whose default
+    // route belongs to a VPN. Measured here: with a full-tunnel VPN running,
+    // every unicast probe below answers with the tunnel's own address and this
+    // one answers `192.168.2.203`, which is what the phone on the same Wi-Fi can
+    // actually reach.
+    //
+    // Then one target per RFC 1918 range, which adds a second interface on a
+    // machine that has one and costs nothing on a machine that does not.
+    for target in ["224.0.0.1:80", "10.0.0.1:80", "172.16.0.1:80", "192.168.0.1:80"] {
+        if let Some(ip) = probe(target)
+            && private(&ip)
+            && !out.contains(&ip)
+        {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod lan_tests {
+    /// Whatever this machine's network looks like, the answer has a shape: only
+    /// private IPv4 addresses, and no duplicates.
+    ///
+    /// It cannot assert *which* addresses without asserting a fact about the
+    /// machine running the test — a CI container may have none, and this one has
+    /// a VPN that hides them from every unicast probe. What it can hold is that
+    /// nothing public, loopback or repeated ever reaches the line a person is
+    /// about to type into a phone.
+    #[test]
+    fn the_addresses_offered_are_private_and_distinct() {
+        let found = super::lan_addresses();
+        let mut seen = std::collections::HashSet::new();
+        for ip in &found {
+            assert!(seen.insert(*ip), "{ip} offered twice");
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    assert!(v4.is_private(), "{v4} is not an address on a local network");
+                    assert!(!v4.is_loopback(), "{v4} is this machine talking to itself");
+                }
+                std::net::IpAddr::V6(v6) => panic!("{v6}: only IPv4 is offered"),
+            }
+        }
+    }
 }
 
 /// Accept connections until `shutdown` resolves (or forever, if it is `None`).

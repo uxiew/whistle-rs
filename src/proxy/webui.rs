@@ -1372,6 +1372,13 @@ async fn status_json(state: &Arc<AppState>) -> Response<DynBody> {
         "version": crate::config::VERSION,
         "port": cfg.port,
         "host": cfg.host.map(|h| h.to_string()),
+        // The addresses a device on the same network can reach this at — the
+        // thing `mobile.md` is an entire page about typing into a phone, and
+        // which `0.0.0.0` does not answer. See `proxy::lan_addresses`.
+        "lan_addresses": super::lan_addresses()
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>(),
         "socks_port": cfg.socks_port,
         "intercept_https": cfg.intercept_https,
         "insecure_upstream": super::upstream::insecure_upstream(),

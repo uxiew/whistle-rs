@@ -114,7 +114,17 @@ export http_proxy=http://127.0.0.1:8899 https_proxy=http://127.0.0.1:8899
 ```
 
 **浏览器 / 系统：** 将系统或浏览器的 HTTP+HTTPS 代理设为同一 host/port。
-局域网内的设备请改用本机 IP（而非 `127.0.0.1`），并确保端口可达。
+
+**手机或另一台机器**要用的是本机在局域网里的地址，不是 `127.0.0.1`。whistle-rs 启动时
+就会打印出来：
+
+```
+INFO on this network: http://192.168.2.203:8899 — set one as the proxy on a phone
+     (try each if unsure), then open http://rootca.pro/ to install the certificate
+```
+
+`GET /api/status` 里的 `lan_addresses` 是同一份列表。另外确认端口可达——十有八九是本机
+防火墙拦了。
 
 ### 打开控制台
 
