@@ -89,28 +89,41 @@ function toTest(value) {
 /**
  * Split a query into conditions.
  *
- * Space-separated, except inside a `/regexp/` — `b:/a b/` is one condition and
- * not two, which is the only place the split has to be careful.
+ * Space-separated, except that a `/regexp/` may contain spaces: `b:/a b/` is one
+ * condition and not two. The care is in telling that from a **path**, which is
+ * the most natural thing to type here and also starts with a slash —
+ * `/heartbeat m:POST` is two conditions, and an earlier version of this read it
+ * as one unterminated regexp and therefore matched nothing at all.
+ *
+ * So a slash only opens a regexp when the token it starts does not already
+ * close one, and the joining stops at the first token that does. A `/…` that
+ * never closes is left as the plain text it looks like.
  */
 function split(query) {
+  const words = String(query).split(/\s+/).filter(Boolean);
   const out = [];
-  let buf = '';
-  let inRegex = false;
-  for (let i = 0; i < query.length; i++) {
-    const ch = query[i];
-    if (ch === '/' && query[i - 1] !== '\\') {
-      // A `/` opens a regexp only where a value starts.
-      if (!inRegex && /(^|:)$/.test(buf)) inRegex = true;
-      else if (inRegex) inRegex = false;
-    }
-    if (ch === ' ' && !inRegex) {
-      if (buf) out.push(buf);
-      buf = '';
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    const at = word.indexOf(':');
+    const value = at === -1 ? word : word.slice(at + 1);
+    // Already a closed regexp, or not one at all.
+    if (value[0] !== '/' || /^\/.*\/[a-z]*$/.test(value)) {
+      out.push(word);
       continue;
     }
-    buf += ch;
+    // Open: join words until one closes it. If none does, this was a path.
+    let joined = word;
+    let closed = false;
+    for (let j = i + 1; j < words.length; j++) {
+      joined += ' ' + words[j];
+      if (/\/[a-z]*$/.test(words[j])) {
+        i = j;
+        closed = true;
+        break;
+      }
+    }
+    out.push(closed ? joined : word);
   }
-  if (buf) out.push(buf);
   return out;
 }
 
@@ -174,5 +187,18 @@ function matchSession(session, conditions, ctx) {
   return true;
 }
 
+/**
+ * Does this row satisfy **any** condition?
+ *
+ * The capture filters read this way where the search box reads `matchSession`:
+ * `gui/network.md` says conditions inside one box are OR-ed and the two boxes
+ * are AND-ed, which is the opposite grouping from the search box's single
+ * AND-ed line. Same conditions, same parser, different join.
+ */
+function matchAny(session, conditions, ctx) {
+  return conditions.some((c) => matchSession(session, [c], ctx));
+}
+
+globalThis.whistleMatchAny = matchAny;
 globalThis.whistleParseFilter = parseFilter;
 globalThis.whistleMatchSession = matchSession;

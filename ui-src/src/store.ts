@@ -7,7 +7,7 @@
 // hot-swapped modules, devtools timelines) never comes up in a single window
 // with five panes.
 
-import { computed, reactive, watch } from 'vue';
+import { computed, reactive, ref, watch } from 'vue';
 import { api } from './api';
 // The filter grammar, imported for its side effect: the module is plain
 // script-shaped JavaScript with no exports, because the same file is evaluated
@@ -57,6 +57,7 @@ const THEME_KEY = 'whistle-rs-theme';
 const COMPOSE_KEY = 'whistle-rs-composer';
 const TEST_KEY = 'whistle-rs-test-rules';
 const COMPOSE_HISTORY_KEY = 'whistle-rs-composer-history';
+const CAPTURE_KEY = 'whistle-rs-capture-filter';
 
 /** How many sent compositions the source list keeps. Upstream keeps 100. */
 const COMPOSE_HISTORY_MAX = 20;
@@ -79,6 +80,14 @@ interface State {
   /** Rows flagged by hand — see [`toggleMark`]. */
   marked: number[];
   markedOnly: boolean;
+  /**
+   * The capture filters — `gui/network.md`'s Include/Exclude Filter. Unlike the
+   * search box these decide what is **kept at all**, they read only what a
+   * request carries, and they apply to requests that arrive *after* they are
+   * set: a row already on screen stays there.
+   */
+  captureInclude: string;
+  captureExclude: string;
   detail: SessionDetail | null;
   frames: WsFrame[] | null;
   /** Whether the selected WebSocket is being held — `null` until asked. */
@@ -177,6 +186,8 @@ export const state = reactive<State>({
   anchor: null,
   marked: [],
   markedOnly: false,
+  captureInclude: readStored<{ inc: string; exc: string }>(CAPTURE_KEY, { inc: '', exc: '' }).inc,
+  captureExclude: readStored<{ inc: string; exc: string }>(CAPTURE_KEY, { inc: '', exc: '' }).exc,
   detail: null,
   frames: null,
   wsPause: null,
@@ -212,6 +223,10 @@ export const state = reactive<State>({
   status: null,
 });
 
+watch(
+  () => [state.captureInclude, state.captureExclude],
+  ([inc, exc]) => writeStored(CAPTURE_KEY, { inc, exc }),
+);
 watch(() => state.compose, (c) => writeStored(COMPOSE_KEY, c), { deep: true });
 watch(() => state.test, (t) => writeStored(TEST_KEY, t), { deep: true });
 
@@ -224,6 +239,57 @@ const matchSession = (globalThis as any).whistleMatchSession as (
   c: unknown[],
   ctx: { marked: number[] },
 ) => boolean;
+const matchAny = (globalThis as any).whistleMatchAny as (
+  s: SessionSummary,
+  c: unknown[],
+  ctx: { marked: number[] },
+) => boolean;
+
+/**
+ * Rows the capture filters have already let through.
+ *
+ * The filters apply to what *arrives*, not to what is on screen — upstream says
+ * so in as many words, and it is the useful behaviour: tightening a filter to
+ * silence a poller should not make the request you are reading vanish. Since the
+ * console re-reads the whole list on every poll rather than accumulating, the
+ * only way to keep that promise is to remember what was already admitted.
+ */
+const admitted = new Set<number>();
+
+/** How many arriving rows the capture filters have refused. */
+const refused = ref(0);
+
+/** The refused count, for the status line — a filter nobody can see is a trap. */
+export const captureRefused = computed(() => refused.value);
+
+/** Whether either capture filter has anything in it. */
+export const captureFiltering = computed(
+  () => !!(state.captureInclude.trim() || state.captureExclude.trim()),
+);
+
+/** Apply the capture filters to a freshly fetched list. */
+function admit(list: SessionSummary[]): SessionSummary[] {
+  const inc = parseFilter(state.captureInclude).conditions;
+  const exc = parseFilter(state.captureExclude).conditions;
+  if (!inc.length && !exc.length) {
+    for (const s of list) admitted.add(s.id);
+    refused.value = 0;
+    return list;
+  }
+  const ctx = { marked: state.marked };
+  let dropped = 0;
+  const kept = list.filter((s) => {
+    if (admitted.has(s.id)) return true;
+    // Include is a whitelist, exclude a blacklist, and the two are AND-ed —
+    // conditions *within* a box are OR-ed, which `matchAny` does.
+    const ok = (!inc.length || matchAny(s, inc, ctx)) && !(exc.length && matchAny(s, exc, ctx));
+    if (ok) admitted.add(s.id);
+    else dropped++;
+    return ok;
+  });
+  refused.value = dropped;
+  return kept;
+}
 
 // ── derived ────────────────────────────────────────────────────────────────
 
@@ -361,13 +427,17 @@ async function reach<T>(call: () => Promise<T>): Promise<T | undefined> {
 // ── requests ───────────────────────────────────────────────────────────────
 
 export async function loadSessions(): Promise<void> {
-  const list = await reach(api.sessions);
-  if (!list) return;
+  const fetched = await reach(api.sessions);
+  if (!fetched) return;
+  const list = admit(fetched);
   state.sessions = list;
   if (state.client && !list.some((s) => clientOf(s) === state.client)) state.client = null;
   // A session that has fallen out of the proxy's ring takes its selection and
   // its mark with it: both name a row by an id that now belongs to nothing.
   const live = new Set(list.map((s) => s.id));
+  // A row that has left the proxy's ring takes its admission with it, so the
+  // set cannot grow without bound.
+  for (const id of [...admitted]) if (!live.has(id)) admitted.delete(id);
   state.selection = state.selection.filter((id) => live.has(id));
   state.marked = state.marked.filter((id) => live.has(id));
   if (state.markedOnly && !state.marked.length) state.markedOnly = false;

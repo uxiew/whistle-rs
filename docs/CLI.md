@@ -41,7 +41,7 @@ nothing to apply it to.
 | `-D, --baseDir` / `-S, --storage` | `--dir` | ⚠️ one directory, named in full |
 | `-z, --certDir` | `-z, --cert-dir` (and `--certDir`) | ✅ [see below](#hand-supplied-certificates) |
 | `-c, --dnsCache` / `--dnsServer` | — | ➖ DNS is the OS resolver's |
-| `-s, --sockets` | — | ➖ no per-host connection cap to tune |
+| `-s, --sockets` | — | ➖ nothing to cap: this opens a connection per request rather than pooling. Measured: the flag changes nothing a client can see upstream either — with `sockets: 1`, six concurrent requests still finish in parallel |
 | `--httpPort` / `--httpsPort` | — | ➖ one proxy port; `-P` moves the console |
 | `--allowOrigin` | `--allow-origin` (and `--allowOrigin`) | ✅ [see below](#calling-the-console-from-another-page) |
 | `-A, --addon` / `-L, --pluginHost` / `-e, --extra` | — | ➖ this port has its own plugin system ([`PLUGINS.md`](PLUGINS.md)) |

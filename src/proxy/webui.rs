@@ -3075,6 +3075,42 @@ mod tests {
         assert!(ask(&mut ctx, "e:", "[]"), "the row is a 404");
         assert!(!ask(&mut ctx, "s:200 e:", "[]"), "and 200s are not errors");
 
+        // **A path is not a regexp.** A leading `/` looks like the start of one,
+        // and a path is the most natural thing to type into these boxes: an
+        // earlier split read `/heartbeat m:POST` as one unterminated regexp, so
+        // it matched nothing at all and the filter silently did nothing. A slash
+        // only opens a regexp when something later closes it.
+        let count = |ctx: &mut Context, query: &str| -> f64 {
+            let script = format!("whistleParseFilter({query:?}).conditions.length");
+            ctx.eval(Source::from_bytes(script.as_bytes()))
+                .expect("parses")
+                .as_number()
+                .expect("a number")
+        };
+        assert_eq!(count(&mut ctx, "/heartbeat m:POST"), 2.0);
+        assert_eq!(count(&mut ctx, "/api/users"), 1.0);
+        assert_eq!(count(&mut ctx, "/never-closes m:GET"), 2.0);
+        // …and a regexp that really does contain a space stays one condition.
+        assert_eq!(count(&mut ctx, "H:/a b/ m:GET"), 2.0);
+        assert_eq!(count(&mut ctx, "H:/a b/"), 1.0);
+
+        // Conditions join differently in the two places they are used: the
+        // search box AND-s one line, the capture filters OR the contents of one
+        // box (`gui/network.md`). Same parser, same conditions, different join.
+        let any = |ctx: &mut Context, query: &str| -> bool {
+            let script = format!(
+                "(() => {{ const p = whistleParseFilter({query:?});
+                   return whistleMatchAny({row}, p.conditions, {{ marked: [] }}); }})()"
+            );
+            ctx.eval(Source::from_bytes(script.as_bytes()))
+                .expect("runs")
+                .as_boolean()
+                .expect("a boolean")
+        };
+        assert!(any(&mut ctx, "m:POST s:999"), "either may match");
+        assert!(!ask(&mut ctx, "m:POST s:999", "[]"), "but both must, joined the other way");
+        assert!(!any(&mut ctx, "m:GET s:999"), "and neither matching is still no");
+
         // And the four this console cannot answer are named, not dropped.
         assert_eq!(unsupported(&mut ctx, "b:hello"), "b");
         assert_eq!(unsupported(&mut ctx, "h:cookie b:x app:wechat fc:y"), "h,b,app,fc");

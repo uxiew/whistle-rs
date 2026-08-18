@@ -4,7 +4,22 @@
 import { onMounted, ref } from 'vue';
 import DetailPanel from './DetailPanel.vue';
 import RequestTable from './RequestTable.vue';
-import { clearSessions, countLabel, loadSessions, replaySelected, state } from '../store';
+import {
+  captureFiltering,
+  captureRefused,
+  clearSessions,
+  countLabel,
+  loadSessions,
+  replaySelected,
+  state,
+} from '../store';
+
+/**
+ * The capture filters, shown on demand. Two boxes rather than one because they
+ * are AND-ed with each other and OR-ed within themselves, which is `whistle`'s
+ * arrangement and is hard to express in a single line.
+ */
+const showCapture = ref(captureFiltering.value);
 
 const HEIGHT_KEY = 'whistle-rs-detail-h';
 
@@ -65,8 +80,36 @@ function onClear(): void {
       <button class="btn" @click="loadSessions()">Reload</button>
       <button class="btn" :disabled="state.selected === null" @click="replaySelected()">Replay</button>
       <label class="check"><input v-model="state.autoRefresh" type="checkbox" /> Auto refresh</label>
+      <button
+        class="btn"
+        :class="{ on: captureFiltering }"
+        title="Keep or drop requests as they arrive, by URL, m:, H: or i:"
+        @click="showCapture = !showCapture"
+      >
+        Capture filter{{ captureRefused ? ` (${captureRefused} hidden)` : '' }}
+      </button>
       <span class="spacer"></span>
       <span class="status">{{ countLabel }}</span>
+    </div>
+
+    <!-- Deliberately below the table and not in a dialog: what these do is
+         invisible — a request that never appears leaves no trace — so the boxes
+         and the count of what they refused stay where the capture is. -->
+    <div v-if="showCapture" class="capture-filter">
+      <label>
+        <span>Include</span>
+        <input v-model="state.captureInclude" placeholder="keep only these — space separated, any may match" spellcheck="false" />
+      </label>
+      <label>
+        <span>Exclude</span>
+        <input v-model="state.captureExclude" placeholder="drop these — e.g. /heartbeat m:OPTIONS" spellcheck="false" />
+      </label>
+      <p class="hint">
+        Applies to requests that arrive from now on; rows already listed stay.
+        Conditions in one box are OR-ed, the two boxes are AND-ed. Prefixes:
+        <code>m:</code> <code>H:</code> <code>i:</code> <code>s:</code>
+        <code>t:</code>, or a bare word for the URL.
+      </p>
     </div>
 
     <div

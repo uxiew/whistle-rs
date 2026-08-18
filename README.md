@@ -169,7 +169,13 @@ the URL, and a prefix asks about something else. Several conditions are AND-ed.
 
 Each takes a keyword or a `/regexp/flags` — `m:POST s:/^5/ H:api.example.com`
 finds the failing POSTs to one host. `e:` and `mark:` on their own mean the whole
-set. The four conditions this console cannot answer — `h:` and `b:` (the list
+set.
+
+**Capture filters** are a different thing, under the table: Include keeps only
+what matches, Exclude drops it, they read only what a request carries, and they
+apply to requests **arriving from now on** — a row already listed stays. Useful
+for silencing a poller without losing the request you are reading. Conditions in
+one box are OR-ed; the two boxes are AND-ed. The four conditions this console cannot answer — `h:` and `b:` (the list
 rows carry no headers or bodies), `app:` and `fc:` — say so under the box rather
 than quietly matching nothing.
 
