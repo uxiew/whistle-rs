@@ -330,7 +330,7 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `-N, --guest-name <NAME>` / `-W, --guest-password <PASS>` | 只读账号（上游的 `-N`/`-W`）：只放行 `GET`，能看抓包、改不了任何东西 | —— |
 | `-M, --mode <LIST>` | 启动模式（上游的 `-M`），用 `\|`/`,`/`&` 分隔。已生效：`pureProxy`（不再应答控制台域名）、`headless`（关掉控制台，只留证书与 PAC）、`capture`/`disableCapture`（HTTPS 解密开关）、`keepXFF`（放行客户端自带的 `x-forwarded-for`）、`x-forwarded-host` / `x-forwarded-proto`（相信前置代理说的主机与协议）、`enableRequestHeaderRules` 与 `multiEnv`/`nohost`（**让请求自己带规则**，见上文）、`notAllowedEnableHTTPS`、`strict`。上游五十六个 token 里凡是客户端能看出差别的都已实现；其余会在启动时报「此处无对应行为」 | — |
 | `-l, --local-ui-host <HOSTS>` | 追加能打开控制台的域名（上游的 `-l`），用 `\|`、`,` 或 `&` 分隔。不设时 `local.whistlejs.com`、`local.wproxy.org`、`rootca.pro` 也已生效 | 内建三个 |
-| `--allow-origin <LIST>` | 允许跨域调用控制台 API 的来源（上游的 `--allowOrigin`），用 `\|`/`,`/`&` 分隔，`*` 表示任意。`/api/status` 与根证书无论如何都应答 | 无 |
+| `--allow-origin <LIST>` | 允许跨域调用控制台 API 的来源（上游的 `--allowOrigin`），用 `\|`/`,`/`&` 分隔，`*` 表示任意。`/api/status` 与根证书无论如何都应答 —— 但不在列表里的来源，status 只拿到存活信息（`version`、`port`） | 无 |
 | `-z, --cert-dir <DIR>` | 从这个目录取证书直接下发、不再伪造（上游的 `-z`），按证书自己的 `subjectAltName` 匹配。目录里的 `root.key`+`root.crt` 会替换根 CA —— 见 [`docs/CLI.md`](docs/CLI.md#hand-supplied-certificates) | — |
 | `--socks-port <PORT>` | 额外启动内建 SOCKS5 服务（上游拼作 `--socksPort`，同样接受） | 关闭 |
 | `--plugin <NAME=HOST:PORT>` | 注册一个远程（Node/HTTP）插件（可重复） | —— |

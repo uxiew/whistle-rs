@@ -16,6 +16,7 @@ Every recipe here was run against the proxy before it was written down.
 - [Scope a rule precisely](#scope-a-rule-precisely)
 - [Debug a phone or another device](#debug-a-phone-or-another-device)
 - [Capture, export and replay](#capture-export-and-replay)
+- [Drive it from a script, or from an agent](#drive-it-from-a-script-or-from-an-agent)
 - [Embed the proxy in your own program](#embed-the-proxy-in-your-own-program)
 - [When a rule does not fire](#when-a-rule-does-not-fire)
 
@@ -795,7 +796,7 @@ are **direct** requests, not through the proxy:
 | `GET /session.json?id=N` | one transaction with its request/response headers and body previews |
 | `GET /frames.json?id=N` | the WebSocket frames of connection `N`, both directions |
 | `GET /sessions.har` | everything as a HAR 1.2 file |
-| `GET /api/status` | ports, TLS posture, root CA path, rule count, registered plugins |
+| `GET /api/status` | ports, TLS posture, root CA path, rule count, registered plugins. A cross-origin browser fetch from an origin not on `--allow-origin` gets `version` and `port` only — see [`CLI.md`](CLI.md#calling-the-console-from-another-page) |
 | `POST /api/sessions/clear` | drop the capture |
 
 ```bash
@@ -853,6 +854,81 @@ rotation and reloaded at startup. `--persist-days N` sets the retention;
 harness.
 
 ---
+
+## Drive it from a script, or from an agent
+
+Everything the console does is an HTTP endpoint taking plain text or JSON, so a
+script — or a model with a shell — can run the whole loop without a browser:
+**see what an interface does, change it, check the change, and ask why a rule
+did or did not fire.** No SDK, no session, no CSRF token; a `curl` is enough.
+
+The four calls, in the order that loop uses them:
+
+| Step | Call |
+|---|---|
+| **see** | `GET /sessions.json` — every transaction, with the operators that matched it |
+| **change** | `POST /api/rules` — the body *is* the rules text, exactly as typed in the console |
+| **check** | send the request through the proxy again and read the answer |
+| **explain** | `POST /api/explain` — `{"rules": …, "url": …}` in, the matching operators out, without touching the running proxy |
+
+Worked through, against an origin serving `{"id":1,"name":"real-user"}` at
+`/api/user`. Mock that one endpoint and leave the rest of the origin alone:
+
+````bash
+curl -s -X POST http://127.0.0.1:8899/api/rules --data-binary '
+127.0.0.1:18080/api/user resBody://{mock.json} resHeaders://x-patched=yes statusCode://418
+
+```mock.json
+{"id": 42, "name": "patched", "admin": true}
+```
+'
+# {"ok":true,"rules":1}
+
+curl -si -x http://127.0.0.1:8899 http://127.0.0.1:18080/api/user
+# HTTP/1.1 418 I'm a teapot
+# x-patched: yes
+# {"id": 42, "name": "patched", "admin": true}
+
+curl -s -x http://127.0.0.1:8899 http://127.0.0.1:18080/other
+# {"other":"endpoint"}      <- same origin, untouched
+````
+
+`POST /api/rules` replaces the default group wholesale, so read the current text
+back with `GET /api/rules` and append to it if you mean to add rather than
+replace. Named groups have their own endpoints (`/api/rule-groups`,
+`/api/rule-group/toggle`) when you want a set you can switch off in one call.
+
+### Ask why, instead of guessing
+
+`POST /api/explain` answers the question that costs the most time — *did this
+pattern match, and what did the operator resolve to* — for a URL you have not
+sent yet, against a rules text that is not installed:
+
+```bash
+curl -s -X POST http://127.0.0.1:8899/api/explain -H 'Content-Type: application/json' -d '{
+  "rules": "127.0.0.1:18080/api/user statusCode://418",
+  "url": "http://127.0.0.1:18080/api/user",
+  "method": "GET"
+}'
+```
+
+```json
+{ "url": "http://127.0.0.1:18080/api/user",
+  "ops": [ { "protocol": "statusCode", "value": "418",
+             "pattern": "127.0.0.1:18080/api/user", "slot": true, "…": "raw, content, order" } ] }
+```
+
+An empty `ops` means the pattern did not match — the answer a silent rule never
+gives you. The same engine runs offline as `whistle-rs explain`, and
+`--batch` reads one JSON query per line and writes one answer per line, which is
+how you check a hundred candidate rules without starting a proxy at all.
+
+> **Two things that will waste your time.** `POST /api/rules` returning
+> `{"ok":true,"rules":1}` means *parsed and stored*, not *matched* — it is a
+> count of lines, not a promise about your URL. And if the change seems not to
+> apply, check `/sessions.json` is not empty before suspecting the rule: a
+> request that never reached the proxy cannot be modified by it, and
+> `--noproxy '*'` together with `-x` is the usual reason it did not.
 
 ## Embed the proxy in your own program
 
@@ -977,6 +1053,7 @@ Then work down this list:
 | a body operator does nothing to an SSE stream | it is skipped there on purpose, so the stream keeps flowing — see [What throttling will not do](#what-throttling-will-not-do) |
 | the console shows `CONNECT` and nothing inside it | the client does not trust the root CA — see [`CERTIFICATES.md`](CERTIFICATES.md) |
 | a direct request to the console returns `502` with `Proxy-Connection` | your shell has `http_proxy` set. `curl --noproxy '*'` |
+| a rule you can see in `/api/rules` does not fire, and the capture is **empty** | the request never reached the proxy. `curl --noproxy '*' -x http://127.0.0.1:8899 …` silently wins over the `-x` and goes direct, so the origin answers unmodified and nothing is recorded. Use `-x` alone for a proxied request, and `--noproxy '*'` alone for a direct one — never both. An empty `/sessions.json` is the tell: the proxy cannot fail to record a request it handled |
 | a request that failed is missing from the console entirely | a request that never got a response — connection refused, DNS failure, TLS handshake failure — is **not** recorded as a session. The proxy log is the only place it appears, which is the other reason to keep `-v` on while debugging |
 | the editor highlights the wrong token as the pattern | it is telling you the truth. `example.com http://localhost:5173` is pattern + destination; `http://a.com/x host://1.2.3.4` is pattern + operator. Whichever token it marks is what the proxy will match on |
 

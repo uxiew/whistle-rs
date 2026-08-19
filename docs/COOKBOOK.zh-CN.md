@@ -15,6 +15,7 @@
 - [把规则的作用范围收窄](#把规则的作用范围收窄)
 - [调试手机或其它设备](#调试手机或其它设备)
 - [抓包、导出与重放](#抓包导出与重放)
+- [用脚本驱动它，或者交给一个 agent](#用脚本驱动它或者交给一个-agent)
 - [把代理嵌进你自己的程序](#把代理嵌进你自己的程序)
 - [规则不生效时](#规则不生效时)
 
@@ -722,7 +723,7 @@ TLS 会话是客户端与源站之间的，代理只搬字节。
 | `GET /session.json?id=N` | 单条事务，含请求/响应头与 body 预览 |
 | `GET /frames.json?id=N` | 第 `N` 条连接的 WebSocket 帧，双向 |
 | `GET /sessions.har` | 全部导出为 HAR 1.2 文件 |
-| `GET /api/status` | 端口、TLS 姿态、根证书路径、规则数、已注册插件 |
+| `GET /api/status` | 端口、TLS 姿态、根证书路径、规则数、已注册插件。跨域调用时，若来源不在 `--allow-origin` 列表里，只返回 `version` 与 `port` —— 见 [`CLI.md`](CLI.md#calling-the-console-from-another-page) |
 | `POST /api/sessions/clear` | 清空抓包 |
 
 ```bash
@@ -772,6 +773,77 @@ api.example.com   resHeaders://x-replayed=1   includeFilter://from:composer
 `--persist-days N` 控制保留天数；`--no-persist` 整个关掉 —— 测试夹具里你要的就是这个。
 
 ---
+
+## 用脚本驱动它，或者交给一个 agent
+
+控制台做的每一件事都是一个 HTTP 端点，收的是纯文本或 JSON。所以一个脚本 ——
+或者一个能敲 shell 的模型 —— 不用浏览器就能跑完整个回路：**看一个接口现在是什么样、
+把它改掉、验证改动、再问「这条规则到底匹没匹上」**。没有 SDK，没有会话，
+没有 CSRF token，一条 `curl` 就够。
+
+回路用到的四个调用，按顺序：
+
+| 步骤 | 调用 |
+|---|---|
+| **看** | `GET /sessions.json` —— 每一条事务，以及匹配到它的 operator |
+| **改** | `POST /api/rules` —— body **就是**规则文本，和你在控制台里敲的一模一样 |
+| **验** | 再经代理发一次请求，读回答 |
+| **问** | `POST /api/explain` —— 传 `{"rules": …, "url": …}`，回匹配上的 operator，且不碰正在跑的代理 |
+
+完整走一遍。origin 在 `/api/user` 上返回 `{"id":1,"name":"real-user"}`，
+现在只 mock 这一个接口，同 origin 的其它接口不动：
+
+````bash
+curl -s -X POST http://127.0.0.1:8899/api/rules --data-binary '
+127.0.0.1:18080/api/user resBody://{mock.json} resHeaders://x-patched=yes statusCode://418
+
+```mock.json
+{"id": 42, "name": "patched", "admin": true}
+```
+'
+# {"ok":true,"rules":1}
+
+curl -si -x http://127.0.0.1:8899 http://127.0.0.1:18080/api/user
+# HTTP/1.1 418 I'm a teapot
+# x-patched: yes
+# {"id": 42, "name": "patched", "admin": true}
+
+curl -s -x http://127.0.0.1:8899 http://127.0.0.1:18080/other
+# {"other":"endpoint"}      <- 同一个 origin，没被碰
+````
+
+`POST /api/rules` 是**整体替换**默认分组，所以想「追加」而不是「替换」，
+先用 `GET /api/rules` 读回当前文本再拼。想要一组能一次性开关的规则，
+用具名分组的那几个端点（`/api/rule-groups`、`/api/rule-group/toggle`）。
+
+### 与其猜，不如问
+
+`POST /api/explain` 回答的是最费时间的那个问题 —— *这个 pattern 到底匹没匹上、
+operator 解析成了什么* —— 而且针对的可以是一个你还没发出去的 URL、
+一份还没装上去的规则文本：
+
+```bash
+curl -s -X POST http://127.0.0.1:8899/api/explain -H 'Content-Type: application/json' -d '{
+  "rules": "127.0.0.1:18080/api/user statusCode://418",
+  "url": "http://127.0.0.1:18080/api/user",
+  "method": "GET"
+}'
+```
+
+```json
+{ "url": "http://127.0.0.1:18080/api/user",
+  "ops": [ { "protocol": "statusCode", "value": "418",
+             "pattern": "127.0.0.1:18080/api/user", "slot": true, "…": "另有 raw、content、order" } ] }
+```
+
+`ops` 为空就是 pattern 没匹上 —— 一条静默失效的规则永远不会告诉你这件事。
+同一套引擎离线跑就是 `whistle-rs explain`，加 `--batch` 时每行读一个 JSON 查询、
+每行写一个答案，用来一次性核对上百条候选规则，连代理都不用起。
+
+> **两个会白白耗掉你时间的点。** `POST /api/rules` 回 `{"ok":true,"rules":1}`
+> 只代表**解析并存下了**，不代表**匹配上了** —— 那是行数，不是对你那个 URL 的承诺。
+> 另外，如果改动看起来没生效，先确认 `/sessions.json` 不是空的，再去怀疑规则：
+> 没到过代理的请求，代理改不了它，而最常见的原因就是 `--noproxy '*'` 和 `-x` 一起写了。
 
 ## 把代理嵌进你自己的程序
 
@@ -888,6 +960,7 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 | body 算子对 SSE 流毫无作用 | 那是刻意跳过的，为的是让流继续走 —— 见[限速做不到的事](#限速做不到的事) |
 | 控制台只显示 `CONNECT`，里面什么都没有 | 客户端不信任根证书 —— 见 [`CERTIFICATES.md`](CERTIFICATES.md) |
 | 直连控制台却返回带 `Proxy-Connection` 的 `502` | 你的 shell 设了 `http_proxy`。`curl --noproxy '*'` |
+| `/api/rules` 里明明有规则却不生效，而且抓包是**空的** | 请求压根没到代理。`curl --noproxy '*' -x http://127.0.0.1:8899 …` 里 `--noproxy` 会悄悄盖过 `-x` 直连出去，于是 origin 原样应答、什么也没被记录。走代理就只用 `-x`，直连控制台就只用 `--noproxy '*'`，别同时写。`/sessions.json` 为空就是信号：代理处理过的请求不可能不记录 |
 | 失败的请求在控制台里根本找不到 | **没有拿到响应**的请求 —— 连接被拒、DNS 失败、TLS 握手失败 —— 不会被记为会话。它只出现在代理日志里，这也是调试期间该一直开着 `-v` 的另一个理由 |
 | 编辑器把「不该是 pattern 的 token」标成了 pattern | 它说的是实话。`example.com http://localhost:5173` 是 pattern + 目标；`http://a.com/x host://1.2.3.4` 是 pattern + 算子。它标出来的那个，就是代理真正会拿去匹配的 |
 

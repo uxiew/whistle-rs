@@ -2,7 +2,8 @@
 
 [English README](../README.md) · [简体中文 README](../README.zh-CN.md)
 
-本移植的源码与文档里有 **513 处**形如 `_original/lib/rules/rules.js:1449` 的引用。
+本移植的源码与文档里有 **1079 处**形如 `_original/lib/rules/rules.js:1449` 的引用
+（834 处在 `src/**.rs`，164 处在 `docs/`，其余在 `tests/differential/` 的对比脚本里）。
 它们指向的是**原版 whistle 的源码**，是每一条对齐声明的凭据 —— 没有它，任何
 「与上游一致」的说法都无法复核。
 
@@ -16,15 +17,19 @@
 cd ..
 git clone https://github.com/avwo/whistle.git _original
 cd _original
-git checkout 6da6e6c174c4d308199b9512c1ce1a7a671893ba
+git checkout 1df0805f09fd979e0e31fd6eab99ca97239ac1ec
 ```
 
 | | |
 |---|---|
 | 仓库 | `https://github.com/avwo/whistle.git` |
-| 提交 | `6da6e6c174c4d308199b9512c1ce1a7a671893ba` |
-| 标签 | `Release v2.10.4` |
-| 本移植对齐的版本 | whistle **2.10.4** |
+| 提交 | `1df0805f09fd979e0e31fd6eab99ca97239ac1ec` |
+| 标签 | `v2.10.8` |
+| 本移植对齐的版本 | whistle **2.10.8** |
+
+也可以不用 git：`tests/differential/package.json` 把上游钉在同一个版本上，
+`cd tests/differential && npm install` 之后，`node_modules/whistle/` 就是同一棵树
+（差分对比脚本读的正是它）。
 
 **行号只对这个提交有效。** 上游后续版本会移动它们；如果你在核对时发现某个引用
 指向了明显无关的代码，先确认 checkout 的是上面这个提交，再怀疑引用写错了。

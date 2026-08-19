@@ -240,6 +240,24 @@ certificate. Whether a proxy is alive and which certificate to trust are the two
 things a page may reasonably ask of a proxy it does not own, and upstream opens
 the same two.
 
+> **`/api/status` answers those callers with less than it answers the console.**
+> Upstream's status is a storage name, two labels and a version. This one also
+> reports the storage *path* — which carries the account's username — the
+> machine's LAN addresses and the installed plugins, which is enough for a page
+> the operator never named to fingerprint the host. So a caller allowed *only*
+> by the blanket exemption gets the liveness subset:
+>
+> ```json
+> { "version": "0.1.0", "port": 8899 }
+> ```
+>
+> Everyone the operator did trust still sees the whole pane: the console itself
+> (same-origin), a host on the `--allow-origin` list, a deliberate
+> `--allow-origin '*'`, and any client that sends no `Origin` at all — CORS
+> never gated that one, and it can read the port directly regardless. The
+> headers are unchanged either way, so "status answers anyone" still holds; only
+> the body shrinks.
+
 > **A preflight is not covered**, here or upstream: neither sends
 > `Access-Control-Allow-Methods` or `-Allow-Headers`, so anything the browser
 > preflights — a JSON body, a custom header — is refused whatever the list says.

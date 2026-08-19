@@ -527,6 +527,17 @@ Non-goal；**与 `w2` 守护进程管理绑定的**（`-S/--storage`、`-C/--cop
   - **`/api/status` 与根证书对任何来源都应答**，配不配都一样（上游的 `CORS_PATHS` 开的是
     对应的两条）——「这个代理还活着吗」和「该信哪张证书」，是一个页面对一台不属于它的
     代理唯一合理的两个问题；
+  - **但 status 的 body 对这类来源是缩过的，这是本移植的一处有意分歧。** 上游的
+    `/cgi-bin/status` 只回 storage 名、两个 label 和版本号（`biz/webui/cgi-bin/status.js`）；
+    这里的 status 还报存储**路径**（里面带着账号用户名）、本机内网地址、已装插件列表。
+    照搬「对谁都应答」而不看 body 变厚了，等于任何网页都能带 credentials 跨域读到这些，
+    足以给主机打指纹 —— 实测两条路径都通：直连默认端口 `fetch('http://127.0.0.1:8899/api/status')`，
+    以及浏览器把 whistle 设为代理后 `fetch('http://local.whistlejs.com/api/status')`；
+    默认没设密码时 status 连登录都不过。所以**仅凭这条豁免**进来的跨域浏览器请求只拿到
+    `{version, port}`；同源的控制台、列表里的来源、`--allow-origin '*'`、以及压根不带
+    `Origin` 的非浏览器客户端（CORS 本就管不着它，它能直连读端口）仍拿到完整面板。
+    响应头两边都不变，所以「status 对谁都应答」这个存活契约照旧，缩的只是 body。
+    钉在 `cross_origin_status_is_liveness_only`。
   - 其余路径要求 `Origin` 的**主机名**（去掉端口）在列表里，而回给浏览器的头**原样回显
     `Origin`**（带端口），因为那才是浏览器拿去比对的东西。
   - 列表按 `|,&` 切、小写化，`*` 出现在任何位置即「全部放行」；带星的条目走**与 pattern
