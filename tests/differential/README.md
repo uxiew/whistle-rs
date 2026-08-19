@@ -49,7 +49,24 @@ run says `differing: 0` — except for the corpora whose own header declares a
 number, because the reason those cases differ is a rule the harness cannot see:
 `cases-delete.js` at 8, `cases-values.js` at 13, `cases-compose.js` at 9,
 `cases-docs.js` at 5, `cases-groups.js` at 3, `cases-file.js` at 2,
-`cases-proxy.js` at 25, `cases-frames.js` at 6 and `cases-paths.js` at 9.
+`cases-flags.js` at 1, `cases-proxy.js` at 25, `cases-frames.js` at 6 and
+`cases-paths.js` at 9.
+
+**`cases-generated.js` is not for this harness.** It is the cross product — 2270
+questions — and it is answered by `rules-oracle.js`, which resolves rather than
+runs. Putting it through `npm run bench` sends two thousand real requests to
+hosts like `example.com`, and the differences that come back are about the
+network rather than about either proxy. (Measured the hard way: 125 of them,
+none real.) See [The rules oracle](#the-rules-oracle).
+
+`forward-servers.js` is not a corpus at all — it is the scenery
+`cases-proxy.js` requires, and it starts itself.
+
+Two more run clean and need nothing said about them here:
+`cases-lineprops.js` (one case per property in `docs/LINE_PROPS.md` this bench
+can reach) and `timing-bench.js` (`reqDelay`, `resDelay`, `reqSpeed`, `resSpeed`
+— the rules that are only visible on a clock, and which the main harness passes
+without noticing because the response is byte-identical, just sooner).
 
 Every run also reports `inert` — the cases that would answer the same with no
 rules loaded at all, and therefore prove nothing. See [below](#inert-which-cases-prove-nothing).

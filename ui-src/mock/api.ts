@@ -635,6 +635,11 @@ export function mockApi(): Plugin {
           host: null,
           socks_port: 1080,
           intercept_https: true,
+          capture_locked_off: false,
+          header_rules: 'off',
+          // Two, because the pane's whole point is "try each if unsure" — one
+          // address would not show the layout the real thing has.
+          lan_addresses: ['192.168.1.42', '10.0.0.7'],
           insecure_upstream: false,
           storage_dir: '/Users/you/.whistle-rs',
           root_ca: '/Users/you/.whistle-rs/rootCA.crt',
@@ -650,6 +655,23 @@ export function mockApi(): Plugin {
             { name: 'remote-auth', hooks: null, remote: 'http://127.0.0.1:9001' },
           ],
         });
+      case '/api/qr': {
+        // A placeholder, not an encoder. The real one is `src/qr.rs`, checked
+        // module for module against `qrcode@1.2.0` by `qr-bench.js`; there is
+        // nothing for the console to get right about it beyond asking for the
+        // right URL, and a mock that drew a real code would be a second
+        // encoder to keep correct.
+        const text = url.searchParams.get('text') || '';
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="212" height="212" `
+          + `viewBox="0 0 212 212"><rect width="212" height="212" fill="#fff"/>`
+          + `<rect x="16" y="16" width="180" height="180" fill="none" stroke="#000" `
+          + `stroke-width="2" stroke-dasharray="6 4"/>`
+          + `<text x="106" y="100" text-anchor="middle" font-family="monospace" `
+          + `font-size="11" fill="#000">QR (mock)</text>`
+          + `<text x="106" y="118" text-anchor="middle" font-family="monospace" `
+          + `font-size="8" fill="#666">${text.replace(/[<&]/g, '')}</text></svg>`;
+        return reply(svg, 'image/svg+xml');
+      }
       case '/rootCA.crt':
         return reply('-----BEGIN CERTIFICATE-----\nmock\n-----END CERTIFICATE-----\n', 'text/plain');
       case '/proxy.pac':

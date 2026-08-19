@@ -30,6 +30,8 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/rules/wildcard.rs` | `lib/rules/rules.js` (`parseWildcard`, `isRegUrl`) | The two wildcard pattern kinds, and a filter's own |
 | `src/rules/url.rs` | `lib/rules/rules.js` (`joinUrl`, `setProtocol`) | Where a destination's path comes from, and the bracket forms |
 | `src/rules/replace.rs` | `lib/util/replace-pattern-transform.js` | `$0`–`$9` expansion, for pattern captures and `*Replace` alike |
+| `src/rules/storage.rs` | `lib/rules/util.js` (`rulesStorage`) | Rule groups and values on disk, and which of them were switched on |
+| `src/rules/include.rs` | `lib/rules/util.js` (`getRemoteRulesResolver`) | `@` lines: fetch what they name, keep it fresh, re-parse what changed |
 | `src/ca.rs` | `lib/https/ca.js` | Root CA generation/persistence, per-host leaf signing |
 | `src/proxy/mod.rs` | `lib/index.js`, `lib/tunnel.js` | Server, forward proxy, CONNECT + MITM, WebSocket, capture log, status page/PAC |
 | `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split), upstream HTTP/SOCKS proxies |
@@ -56,9 +58,16 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/plugins/sni.rs` | `plugins/index.js:228`, `load-plugin.js:1841` | `sniCallback` — the certificate a connection is served, or no interception at all |
 | `src/plugins/stats.rs` | `plugins/index.js:1369` | Fire-and-forget per-phase stats |
 | `sdk/whistle-rs-plugin.js` | `lib/plugins/load-plugin.js` | Zero-dependency JS/TS plugin SDK (+ `.d.ts` types) |
+| `src/proxy/restream.rs` | `lib/inspectors/data.js` (`parseFrameSep`) | A body cut into frames: event streams and `x-whistle-custom-frame-separator` |
+| `src/proxy/coding.rs` | `lib/util/index.js` (`getZipType`, transforms) | gzip / deflate / brotli / zstd, decoded to inspect and re-encoded to forward |
+| `src/proxy/ciphers.rs` | `lib/rules/index.js` (`getTlsOptions`) | `cipher://` and the TLS options a rule may pin |
+| `src/proxy/timing.rs` | `lib/inspectors` (timings) | Per-phase timings, as the console's waterfall reads them |
+| `src/proxy/bench.rs` | — | An in-process load harness, kept out of the normal suite |
+| `src/explain.rs` | `biz/webui/cgi-bin/rules/test.js` | `whistle-rs explain` — which rules a request would hit, without making one |
 | `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
 | `src/embed.rs` | — | The library facade: bind on port 0, observe sessions, swap rules, shut down |
 | `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
+| `src/lib.rs` | — | The module root, and the crate-level documentation |
 
 ## Request lifecycle
 
@@ -312,41 +321,65 @@ curl -x http://127.0.0.1:8899 --cacert ~/.whistle-rs/certs/root.crt https://exam
 ```
 whistle-rs/
 ├── Cargo.toml
-├── README.md
+├── build.rs               # inlines the built console into the binary
+├── README.md              # + README.zh-CN.md
 ├── rules.txt              # example rules
 ├── docs/
+│   ├── COOKBOOK.md        # task-oriented recipes (+ .zh-CN)
 │   ├── RULES.md           # rule syntax reference
+│   ├── CLI.md             # the command line, flag by flag, against whistle's
 │   ├── TEMPLATES.md       # local files + template rendering
 │   ├── PLUGINS.md         # plugin system + wire protocol
 │   ├── LINE_PROPS.md      # per-line rule properties
 │   ├── CERTIFICATES.md    # root CA install guide
-│   ├── ROADMAP.md         # what is and isn't ported
+│   ├── UPSTREAM.md        # which whistle tree the `_original/…` citations mean
+│   ├── ROADMAP.md         # what is and isn't ported (Chinese)
 │   └── ARCHITECTURE.md    # this file
 ├── sdk/                   # JS/TS plugin SDK (zero deps) + .d.ts types
 ├── examples/plugins/      # hello.js, body-rewrite.js, typed.ts
+├── ui-src/                # the console: Vue 3 + Vite, built to one file
+│   ├── mock/api.ts        # the proxy's API, mocked, for `npm run dev`
+│   └── src/               # panes/, sidebar/, components/, editor/, filter/
+├── tests/
+│   ├── *_e2e.rs           # end-to-end, over a real socket, no node needed
+│   └── differential/      # the benches — see its own README
 └── src/
     ├── main.rs            # CLI
     ├── lib.rs             # module root
     ├── config.rs
     ├── ca.rs
+    ├── embed.rs           # the library facade
+    ├── explain.rs         # `whistle-rs explain`
+    ├── qr.rs              # the console's QR encoder
     ├── rules/
     │   ├── mod.rs
     │   ├── protocols.rs
     │   ├── matcher.rs
+    │   ├── storage.rs     # rule groups and values, on disk
+    │   ├── include.rs     # `@` sources, fetched and kept fresh
     │   ├── wildcard.rs    # `*` in a host, and `^…$` everywhere else
     │   ├── url.rs         # joinUrl/setProtocol + the (inline)/<verbatim> forms
     │   └── replace.rs     # $0-$9 expansion
+    ├── plugins/           # registry, hooks, `pipe://`, ws frames, auth, sni, ui
     └── proxy/
-        ├── mod.rs
-        ├── apply.rs
+        ├── mod.rs         # `serve()` — every request flows through it
+        ├── apply.rs       # resolved rules → request/response mutations
         ├── dest.rs        # the URL a request is forwarded to
+        ├── header_rules.rs # rules a request carries in its own headers
+        ├── forwarded.rs   # what a front proxy claims, and whether to believe it
         ├── template.rs    # tpl/dust/jsonp rendering + ${var} variables
         ├── persist.rs     # session persistence (JSONL)
         ├── upstream.rs
+        ├── sni.rs         # peek the ClientHello, pick a certificate, or relay
         ├── socks.rs       # inbound SOCKS5 server
         ├── script.rs      # JS engine (resScript/frameScript/pac)
-        ├── ws.rs          # WebSocket frame codec + capturing tunnel (frameScript, frame hooks)
+        ├── ws.rs          # WebSocket frame codec + capturing tunnel
+        ├── restream.rs    # a body cut into frames (SSE, custom separators)
+        ├── coding.rs      # gzip/deflate/brotli/zstd
+        ├── ciphers.rs     # `cipher://` and the TLS options
+        ├── timing.rs      # per-phase timings
         ├── webui.rs       # console routes + API
+        ├── bench.rs
         └── body.rs
 ```
 

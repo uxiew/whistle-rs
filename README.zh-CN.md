@@ -142,6 +142,14 @@ http://local.whistlejs.com/   # 经过代理 —— 这个域名本身就是控�
 
 `GET /sessions.json` 返回抓包数据（JSON），`GET /proxy.pac` 提供可自动配置客户端的 PAC 文件。
 
+**给手机用**：控制台的 General 面板会列出本机在局域网里能被访问到的每一个地址，并为各自的
+证书链接画一个二维码 —— 用摄像头对着扫，不用手输四个数字。同一个码也能从命令行拿：
+
+```sh
+whistle-rs qr "http://192.168.1.5:8899/rootCA.crt"     # 画在终端里
+whistle-rs qr --svg 4 "http://192.168.1.5:8899/"       # 或者出一张 SVG
+```
+
 ### 在一堆请求里找东西
 
 控制台的搜索框用的是 whistle 那套筛选语法：不带前缀就是匹配 URL，带前缀则问别的东西，
@@ -223,6 +231,43 @@ $example.com          host://2.2.2.2
 见 [`docs/COOKBOOK.zh-CN.md`](docs/COOKBOOK.zh-CN.md)。完整语法 —— 每种模式与算子、
 优先级规则、算子覆盖 —— 见 [`docs/RULES.md`](docs/RULES.md)。**
 
+### 一台代理，多套环境
+
+请求也可以**自己带规则**，写在自己的请求头里 —— 上游 `nohost`/`multiEnv` 的部署方式：
+什么都不存，每个请求自己说明要哪套环境。
+
+```sh
+whistle-rs -M multiEnv
+```
+
+```sh
+curl -x 127.0.0.1:8899 http://example.com/ \
+  -H "x-whistle-rule-value: $(printf 'example.com 127.0.0.1:3000' | jq -sRr @uri)"
+```
+
+一共读五个头：`x-whistle-rule-value`（规则文本）、`x-whistle-rule-host`（追加一行）、
+`x-whistle-rule-key`（前置一个 values 条目）、`x-whistle-rule-name`（追加一个规则组）、
+`x-whistle-key-value`（这段文本私有的 JSON values）。`-M multiEnv` 下**请求自带的赢**；
+`-M enableRequestHeaderRules` 也读，但**存量规则赢**。
+
+> **这等于让发请求的人自己决定请求去哪。** 两边默认都关，凡是更大范围的网络能碰到的代理都
+> 应该保持关闭。不管开不开，这些头**都会从每个请求上摘掉**，所以客户端写的规则文本永远到不了
+> 你的源站。
+
+完整行为（包括 `-M multiEnv` 对规则组与 HTTPS 解密的影响）见
+[Rules in a request header](docs/RULES.md#rules-in-a-request-header)。
+
+### 挂在另一台代理后面
+
+`-M x-forwarded-host` 与 `-M x-forwarded-proto` 让本代理相信前置代理转发过来的
+「客户端原本请求的主机」和「客户端用的协议」。协议那条只改**哪条 pattern 命中** ——
+到达时是明文的请求也能命中 `https://…` 规则 —— 除此之外什么都不改：本代理往外发的那一跳
+还是原来那一跳。
+
+同一族还有两个头（`x-whistle-real-host`、`x-whistle-forwarded-props`），上游**完全不设门**
+就读；本移植从每个请求上摘掉它们、一律不读，因为头是发请求的人写的，而模式不是。理由与实测见
+[What a front proxy claims](docs/RULES.md#what-a-front-proxy-claims)。
+
 ## 作为库使用
 
 whistle-rs 是「一个库 + 一个跑在它上面的二进制」，而不是反过来。如果你要做的东西**自己内部**
@@ -283,7 +328,7 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 | `-P, --uiport <PORT>` | 把控制台单独放到一个端口（上游的 `-P`）。不设则跟上游一样，控制台就在代理端口上 | 代理端口 |
 | `-n, --username <NAME>` / `-w, --password <PASS>` | 控制台登录（上游的 `-n`/`-w`）。都不设则控制台不设防 | 不设防 |
 | `-N, --guest-name <NAME>` / `-W, --guest-password <PASS>` | 只读账号（上游的 `-N`/`-W`）：只放行 `GET`，能看抓包、改不了任何东西 | —— |
-| `-M, --mode <LIST>` | 启动模式（上游的 `-M`），用 `\|`/`,`/`&` 分隔。已生效：`pureProxy`（不再应答控制台域名）、`headless`（关掉控制台，只留证书与 PAC）、`capture`/`disableCapture`（HTTPS 解密开关）、`keepXFF`（放行客户端自带的 `x-forwarded-for`）。其余上游认识的 token 会在启动时报「此处无对应行为」 | — |
+| `-M, --mode <LIST>` | 启动模式（上游的 `-M`），用 `\|`/`,`/`&` 分隔。已生效：`pureProxy`（不再应答控制台域名）、`headless`（关掉控制台，只留证书与 PAC）、`capture`/`disableCapture`（HTTPS 解密开关）、`keepXFF`（放行客户端自带的 `x-forwarded-for`）、`x-forwarded-host` / `x-forwarded-proto`（相信前置代理说的主机与协议）、`enableRequestHeaderRules` 与 `multiEnv`/`nohost`（**让请求自己带规则**，见上文）、`notAllowedEnableHTTPS`、`strict`。上游五十六个 token 里凡是客户端能看出差别的都已实现；其余会在启动时报「此处无对应行为」 | — |
 | `-l, --local-ui-host <HOSTS>` | 追加能打开控制台的域名（上游的 `-l`），用 `\|`、`,` 或 `&` 分隔。不设时 `local.whistlejs.com`、`local.wproxy.org`、`rootca.pro` 也已生效 | 内建三个 |
 | `--allow-origin <LIST>` | 允许跨域调用控制台 API 的来源（上游的 `--allowOrigin`），用 `\|`/`,`/`&` 分隔，`*` 表示任意。`/api/status` 与根证书无论如何都应答 | 无 |
 | `-z, --cert-dir <DIR>` | 从这个目录取证书直接下发、不再伪造（上游的 `-z`），按证书自己的 `subjectAltName` 匹配。目录里的 `root.key`+`root.crt` 会替换根 CA —— 见 [`docs/CLI.md`](docs/CLI.md#hand-supplied-certificates) | — |
@@ -327,6 +372,16 @@ http://www.example.com/api/list?id=2
 `--value NAME=CONTENT`（取值）、`--json`，以及 `--batch`（stdin 一行一个 JSON 问题）。
 最后这个就是 `tests/differential/rules-oracle.js` 的接口：同样一万七千个问题，一边问
 本移植、一边问 whistle 自己的解析器，逐条比对。
+
+### `whistle-rs qr` —— 给手机一个可以对着扫的地址
+
+```
+$ whistle-rs qr "http://192.168.1.5:8899/rootCA.crt"
+```
+
+默认直接画在终端里，`--svg <倍数>` 出图，`--matrix` 出 0/1 矩阵。控制台在每个局域网地址旁边
+画的是同一个码。编码器是本移植自己写的（`src/qr.rs`）而不是为一个对话框引一个依赖，
+并且 `tests/differential/qr-bench.js` 会拿它和上游用的那个包**逐个模块**比对。
 
 ## 文档
 - [`docs/UPSTREAM.md`](docs/UPSTREAM.md) —— 原版 whistle 的取回方式与提交号；源码里 513 处 `_original/…` 引用都指向它

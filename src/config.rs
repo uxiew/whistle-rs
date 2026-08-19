@@ -420,7 +420,7 @@ impl Config {
     /// it (`newConf.mode.trim().split(/\s*[|,&]\s*/)`, `config.js:763`).
     ///
     /// Only the tokens a *proxy client* can tell apart are honoured, and that
-    /// set was measured rather than chosen: `tests/differential/mode-probe.js`
+    /// set was measured rather than chosen: `tests/differential/mode-bench.js`
     /// runs one whistle per token and reports which ones move any of nine
     /// probes. Fifteen of the fifty-six do; they collapse into six behaviours,
     /// four of which this port has something to apply them to.
