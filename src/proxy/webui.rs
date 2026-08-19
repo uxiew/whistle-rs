@@ -71,7 +71,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/ws/send") => ws_send(state, req).await,
         // Takes a body now: the console can forget just the rows it selected.
         ("POST", "/api/sessions/clear") => sessions_clear(state, req).await,
-        ("GET", "/api/status") => status_json(state).await,
+        ("GET", "/api/status") => status_json(state, status_body_restricted(state, &req)).await,
         ("GET", "/plugin") => redirect_to("/plugin/"),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
         _ => not_found(),
@@ -135,8 +135,14 @@ fn allowed_origin<B>(state: &Arc<AppState>, req: &Request<B>, path: &str) -> Opt
     if state.config.allow_origins.is_empty() {
         return None;
     }
+    origin_on_allow_list(state, &origin).then_some(origin)
+}
+
+/// Is `origin`'s host on the `--allow-origin` list — the origin dropped to its
+/// host, the way the browser is not asked and upstream's `isAllowHost` is.
+fn origin_on_allow_list(state: &Arc<AppState>, origin: &str) -> bool {
     // `scheme://host:port` → `host`.
-    let host = origin.split_once("://").map_or(origin.as_str(), |(_, rest)| rest);
+    let host = origin.split_once("://").map_or(origin, |(_, rest)| rest);
     let host = host.split('/').next().unwrap_or(host);
     let host = match host.rsplit_once(':') {
         // Not a port if what follows is not a number — an IPv6 literal.
@@ -144,7 +150,45 @@ fn allowed_origin<B>(state: &Arc<AppState>, req: &Request<B>, path: &str) -> Opt
         _ => host,
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    state.config.allow_origins.allows(host).then_some(origin)
+    state.config.allow_origins.allows(host)
+}
+
+/// Whether `/api/status` must answer this caller with **only** its liveness
+/// fields, holding back the rest of the pane.
+///
+/// `/api/status` is one of the [`CORS_PATHS`] that answer any origin, and for
+/// upstream that is safe: its `/cgi-bin/status` returns a storage *name*, a
+/// couple of labels and a version. This console's status also reports the
+/// storage *path* — which carries the account's username — the machine's LAN
+/// addresses and the installed plugins. Handed to any origin with
+/// `access-control-allow-credentials: true`, that lets a page the operator never
+/// allow-listed fingerprint the host: the home directory, the internal network,
+/// the tooling. So a caller answered **only** because of the blanket exemption —
+/// a cross-origin browser fetch from an unlisted page — gets the liveness subset.
+///
+/// Everyone the operator did trust sees the whole pane: the console itself
+/// (same-origin, so no `Origin` or `sec-fetch-site: same-origin`), a host on the
+/// `--allow-origin` list, and a deliberate `--allow-origin '*'`. So does a
+/// non-browser client that sends no `Origin` — CORS never gated it and it can
+/// read the port directly regardless; the drive-by page is the whole threat.
+fn status_body_restricted<B>(state: &Arc<AppState>, req: &Request<B>) -> bool {
+    let Some(origin) = req
+        .headers()
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .filter(|o| !o.is_empty())
+    else {
+        return false;
+    };
+    let same_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("same-origin"));
+    if same_site || state.config.allow_origins.all {
+        return false;
+    }
+    !origin_on_allow_list(state, origin)
 }
 
 /// The two paths that answer a cross-origin caller whatever the configuration —
@@ -1449,8 +1493,23 @@ fn hook_names(m: &crate::plugins::PluginManifest) -> Vec<&'static str> {
 /// by the time you have a question — "which port is SOCKS on", "is that plugin
 /// actually registered", "where does the root certificate live", "is upstream
 /// verification off". The console can answer them without a restart.
-async fn status_json(state: &Arc<AppState>) -> Response<DynBody> {
+async fn status_json(state: &Arc<AppState>, restricted: bool) -> Response<DynBody> {
     let cfg = &state.config;
+    // A cross-origin caller reached this only through the blanket `CORS_PATHS`
+    // exemption — see [`status_body_restricted`]. Answer that it is alive and
+    // what version, and nothing that fingerprints the host: not the storage path
+    // (which names the account), not the LAN addresses, not the plugin list.
+    if restricted {
+        let body = serde_json::json!({
+            "version": crate::config::VERSION,
+            "port": cfg.port,
+        });
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(body::full(Bytes::from(body.to_string())))
+            .unwrap();
+    }
     let plugins: Vec<serde_json::Value> = {
         let mut out = Vec::new();
         for name in state.plugins.names() {
@@ -2883,6 +2942,71 @@ mod login_tests {
         // And `*` answers everyone, everywhere.
         let all = with("*");
         assert_eq!(ask(&all, "/api/rules", Some("http://anywhere.test"), false).as_deref(), Some("http://anywhere.test"));
+    }
+
+    /// `/api/status` answers *any* origin (it is a [`CORS_PATHS`]), but a
+    /// cross-origin browser reaching it only through that blanket exemption gets
+    /// the liveness subset — not the storage path, the LAN addresses or the
+    /// plugin list, which a page the operator never allow-listed could otherwise
+    /// read with credentials and fingerprint the host by.
+    ///
+    /// Everyone the operator trusted — the console (same-origin), the
+    /// `--allow-origin` list, `--allow-origin '*'`, and a non-browser client
+    /// with no `Origin` — still sees the whole pane.
+    #[tokio::test]
+    async fn cross_origin_status_is_liveness_only() {
+        let with = |list: &str| {
+            let mut c = crate::config::Config {
+                storage_dir: std::env::temp_dir().join(format!(
+                    "whistle-rs-status-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                )),
+                persist_sessions: false,
+                ..crate::config::Config::default()
+            };
+            c.allow_origins = crate::config::AllowedOrigins::parse(list);
+            let ca = crate::ca::CertAuthority::load_or_create(&c).expect("ca");
+            Arc::new(AppState::new(c, crate::rules::RuleManager::new(), ca))
+        };
+        let restricted = |state: &Arc<AppState>, origin: Option<&str>, same_site: bool| {
+            let mut b = Request::builder().method("GET").uri("/api/status");
+            if let Some(o) = origin {
+                b = b.header(hyper::header::ORIGIN, o);
+            }
+            if same_site {
+                b = b.header("sec-fetch-site", "same-origin");
+            }
+            status_body_restricted(state, &b.body(()).expect("request"))
+        };
+
+        let s = with("good.test");
+        // The drive-by page: only allowed by the blanket exemption, so held back.
+        assert!(restricted(&s, Some("https://evil.example.com"), false));
+        // Everyone the operator trusted sees the whole pane.
+        assert!(!restricted(&s, Some("https://evil.example.com"), true), "same-origin");
+        assert!(!restricted(&s, Some("http://good.test"), false), "allow-listed");
+        assert!(!restricted(&s, Some("http://good.test:8443"), false), "allow-listed, port dropped");
+        assert!(!restricted(&s, None, false), "no Origin — not a browser cross-origin read");
+        assert!(!restricted(&with("*"), Some("https://evil.example.com"), false), "--allow-origin '*'");
+
+        // And the bodies match those verdicts: the fingerprinting fields are
+        // present for a trusted caller and absent for the drive-by one.
+        async fn body(state: &Arc<AppState>, restricted: bool) -> serde_json::Value {
+            let resp = status_json(state, restricted).await;
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+        let full = body(&s, false).await;
+        assert!(full.get("storage_dir").is_some(), "the console needs the whole pane");
+        assert!(full.get("lan_addresses").is_some());
+        assert!(full.get("plugins").is_some());
+
+        let lean = body(&s, true).await;
+        assert_eq!(lean.get("version").and_then(|v| v.as_str()), Some(crate::config::VERSION));
+        for leaked in ["storage_dir", "root_ca", "lan_addresses", "plugins", "intercept_https"] {
+            assert!(lean.get(leaked).is_none(), "{leaked} must not cross an untrusted origin");
+        }
     }
 
     /// The three hostnames that open the console through the proxy, and the
