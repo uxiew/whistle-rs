@@ -267,10 +267,7 @@ fn token_selects(token: &str, s: &Suite) -> Option<bool> {
     }
     let mut all = true;
     for word in token.split('+') {
-        match alias_matches(word, s) {
-            Some(hit) => all &= hit,
-            None => return None,
-        }
+        all &= alias_matches(word, s)?;
     }
     Some(all)
 }
