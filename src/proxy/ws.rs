@@ -212,7 +212,11 @@ impl FramePlan {
                 dir,
             };
             if let Some(hook) = plugins.ws_frame_hook(&m.name, &meta).await {
-                tracing::debug!("wsFrame {} hooks session {session} ({})", m.name, dir.label());
+                tracing::debug!(
+                    "wsFrame {} hooks session {session} ({})",
+                    m.name,
+                    dir.label()
+                );
                 hooks.push(hook);
             }
         }
@@ -272,7 +276,11 @@ pub async fn capturing_tunnel<A, B>(
     // is held, so an injected one can never interleave with a relayed one, and
     // the ordinary path pays one uncontended lock per frame.
     let writers = Arc::new(SessionWriters::new(uw, cw));
-    state.ws_write.lock().unwrap().insert(session, writers.clone());
+    state
+        .ws_write
+        .lock()
+        .unwrap()
+        .insert(session, writers.clone());
     let (uw, cw) = (writers.to_server(), writers.to_client());
     let up = tokio::spawn(pump(
         cr,
@@ -342,11 +350,15 @@ impl SessionWriters {
     }
 
     fn to_server(&self) -> SharedWriter {
-        SharedWriter { inner: self.to_server.clone() }
+        SharedWriter {
+            inner: self.to_server.clone(),
+        }
     }
 
     fn to_client(&self) -> SharedWriter {
-        SharedWriter { inner: self.to_client.clone() }
+        SharedWriter {
+            inner: self.to_client.clone(),
+        }
     }
 
     /// Write one text frame into the live connection, from the console.
@@ -549,7 +561,9 @@ pub struct SessionPause {
 impl SessionPause {
     fn new(flow: FrameFlow) -> Self {
         let gate = SessionPause::default();
-        gate.send.paused.store(flow.send == DirMode::Pause, Ordering::Relaxed);
+        gate.send
+            .paused
+            .store(flow.send == DirMode::Pause, Ordering::Relaxed);
         gate.receive
             .paused
             .store(flow.receive == DirMode::Pause, Ordering::Relaxed);
@@ -662,9 +676,7 @@ where
         session,
     };
     match (mode, pause) {
-        (DirMode::Pause, Some(gate)) => {
-            pump_held(r, w, ctx, gate, dir, keepalive, inject).await
-        }
+        (DirMode::Pause, Some(gate)) => pump_held(r, w, ctx, gate, dir, keepalive, inject).await,
         // Everything else, which is very nearly every session: read, decide,
         // write, with no companion task and no channel between the two.
         _ => pump_direct(r, w, ctx, inject).await,
@@ -681,8 +693,12 @@ async fn write_injections<W: AsyncWrite + Unpin>(w: &mut W, ctx: &FrameCtx, inje
         if deliver(w, true, OPCODE_TEXT, data.as_bytes(), ctx.to_server).await != Sent::Ok {
             return;
         }
-        ctx.state
-            .record_frame(WsFrame::new(ctx.session, ctx.direction, OPCODE_TEXT, data.as_bytes()));
+        ctx.state.record_frame(WsFrame::new(
+            ctx.session,
+            ctx.direction,
+            OPCODE_TEXT,
+            data.as_bytes(),
+        ));
     }
 }
 
@@ -783,7 +799,10 @@ async fn deliver<W: AsyncWrite + Unpin>(
     payload: &[u8],
     to_server: bool,
 ) -> Sent {
-    if write_frame(w, fin, opcode, payload, to_server).await.is_err() {
+    if write_frame(w, fin, opcode, payload, to_server)
+        .await
+        .is_err()
+    {
         return Sent::Failed;
     }
     if opcode == OPCODE_CLOSE {
@@ -1206,11 +1225,13 @@ mod tests {
             let plan = plan_for(&state, "ws.test resHeaders://x=1\n");
             assert!(plan.is_empty());
             // …and so does one naming a plugin with no frame hook.
-            assert!(plan_for(&state, "ws.test plugin://stamp\n")
-                .connect(&state.plugins, 7)
-                .await
-                .0
-                .is_empty());
+            assert!(
+                plan_for(&state, "ws.test plugin://stamp\n")
+                    .connect(&state.plugins, 7)
+                    .await
+                    .0
+                    .is_empty()
+            );
 
             let mut wire = spawn_tunnel(&state, plan, None);
             let payloads: [&[u8]; 3] = [b"hello", b"\x00\xff\xfe binary", &[0u8; 300]];
@@ -1265,13 +1286,19 @@ mod tests {
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"up", true)
                 .await
                 .expect("client write");
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.payload, b"UP");
 
             write_frame(&mut wire.server, true, OPCODE_TEXT, b"down", false)
                 .await
                 .expect("server write");
-            let back = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            let back = read_frame(&mut wire.client)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(back.payload, b"DOWN");
             finish(wire).await;
 
@@ -1288,9 +1315,7 @@ mod tests {
     #[test]
     fn binary_frames_survive_the_hook_byte_for_byte() {
         rt().block_on(async {
-            let state = state_hooking("echo-bytes", |f| {
-                Verdict::Replace(f.payload.clone())
-            });
+            let state = state_hooking("echo-bytes", |f| Verdict::Replace(f.payload.clone()));
             let plan = plan_for(&state, "ws.test pipe://echo-bytes\n");
             let mut wire = spawn_tunnel(&state, plan, None);
 
@@ -1303,7 +1328,10 @@ mod tests {
                     .expect("client write");
                 client
             });
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.payload.len(), payload.len(), "no inflation");
             assert_eq!(got.payload, payload, "and no substitution");
             wire.client = writer.await.expect("writer");
@@ -1331,8 +1359,14 @@ mod tests {
                     .await
                     .expect("client write");
             }
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
-            assert_eq!(got.payload, b"public", "the dropped frame is simply not there");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
+            assert_eq!(
+                got.payload, b"public",
+                "the dropped frame is simply not there"
+            );
             finish(wire).await;
 
             let frames = state.ws_frames.lock().unwrap();
@@ -1355,7 +1389,11 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Ignore, receive: DirMode::Pass, ..FrameFlow::default() },
+                FrameFlow {
+                    send: DirMode::Ignore,
+                    receive: DirMode::Pass,
+                    ..FrameFlow::default()
+                },
             );
 
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"muted", true)
@@ -1366,7 +1404,10 @@ mod tests {
             write_frame(&mut wire.server, true, OPCODE_TEXT, b"heard", false)
                 .await
                 .expect("server write");
-            let back = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            let back = read_frame(&mut wire.client)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(back.payload, b"heard", "receive is untouched");
             finish(wire).await;
 
@@ -1375,7 +1416,10 @@ mod tests {
             let sent = frames.iter().find(|f| f.dir == "send").expect("send frame");
             assert_eq!(sent.preview, "muted");
             assert!(sent.ignored, "the dropped frame is flagged, not hidden");
-            let recv = frames.iter().find(|f| f.dir == "receive").expect("receive frame");
+            let recv = frames
+                .iter()
+                .find(|f| f.dir == "receive")
+                .expect("receive frame");
             assert!(!recv.ignored);
         });
     }
@@ -1393,7 +1437,11 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pass, receive: DirMode::Ignore, ..FrameFlow::default() },
+                FrameFlow {
+                    send: DirMode::Pass,
+                    receive: DirMode::Ignore,
+                    ..FrameFlow::default()
+                },
             );
 
             // Data from the origin is dropped…
@@ -1404,19 +1452,28 @@ mod tests {
             write_frame(&mut wire.server, true, 0x9, b"", false)
                 .await
                 .expect("server ping");
-            let got = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.client)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.opcode, 0x9, "the ping got through; the text did not");
 
             // The client's own direction is unaffected by this flag.
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"sent", true)
                 .await
                 .expect("client write");
-            let up = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let up = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(up.payload, b"sent");
             finish(wire).await;
 
             let frames = state.ws_frames.lock().unwrap();
-            let dropped = frames.iter().find(|f| f.preview == "dropped").expect("recorded");
+            let dropped = frames
+                .iter()
+                .find(|f| f.preview == "dropped")
+                .expect("recorded");
             assert!(dropped.ignored);
             assert!(frames.iter().any(|f| f.opcode == "ping" && !f.ignored));
             assert!(frames.iter().any(|f| f.preview == "sent" && !f.ignored));
@@ -1441,7 +1498,13 @@ mod tests {
 
     /// How many of the captures are still waiting to be let go.
     fn still_held(state: &AppState) -> usize {
-        state.ws_frames.lock().unwrap().iter().filter(|f| f.held).count()
+        state
+            .ws_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.held)
+            .count()
     }
 
     /// Wait until `cond` holds. The legs pump on tasks of their own, so a test
@@ -1494,7 +1557,11 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass, ..FrameFlow::default() },
+                FrameFlow {
+                    send: DirMode::Pause,
+                    receive: DirMode::Pass,
+                    ..FrameFlow::default()
+                },
             );
 
             for payload in [&b"one"[..], b"two"] {
@@ -1503,24 +1570,36 @@ mod tests {
                     .expect("client write");
             }
             until("both frames held", || still_held(&state) == 2).await;
-            assert!(stays_silent(&mut wire.server).await, "and none of it crosses");
+            assert!(
+                stays_silent(&mut wire.server).await,
+                "and none of it crosses"
+            );
 
             let gate = gate_of(&state).await;
             assert!(gate.send.paused());
             assert_eq!(gate.send.held(), 2);
-            assert!(!gate.receive.paused(), "the other direction was not asked for");
+            assert!(
+                !gate.receive.paused(),
+                "the other direction was not asked for"
+            );
 
             // Which is also how we know the tunnel is alive rather than merely
             // quiet: the unheld direction still carries.
             write_frame(&mut wire.server, true, OPCODE_TEXT, b"down", false)
                 .await
                 .expect("server write");
-            let back = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            let back = read_frame(&mut wire.client)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(back.payload, b"down");
 
             assert_eq!(gate.send.release(), 2, "the release says what it freed");
             for expected in [&b"one"[..], b"two"] {
-                let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+                let got = read_frame(&mut wire.server)
+                    .await
+                    .expect("read")
+                    .expect("frame");
                 assert_eq!(got.payload, expected, "in the order they were sent");
             }
             // A frame that went out is no longer waiting, so the console stops
@@ -1533,7 +1612,10 @@ mod tests {
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"three", true)
                 .await
                 .expect("client write");
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.payload, b"three");
             finish(wire).await;
 
@@ -1557,7 +1639,11 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pass, receive: DirMode::Pause, ..FrameFlow::default() },
+                FrameFlow {
+                    send: DirMode::Pass,
+                    receive: DirMode::Pause,
+                    ..FrameFlow::default()
+                },
             );
 
             write_frame(&mut wire.server, true, OPCODE_TEXT, b"later", false)
@@ -1567,20 +1653,32 @@ mod tests {
                 .await
                 .expect("server ping");
             until("both frames held", || still_held(&state) == 2).await;
-            assert!(stays_silent(&mut wire.client).await, "the ping waits with the text");
+            assert!(
+                stays_silent(&mut wire.client).await,
+                "the ping waits with the text"
+            );
 
             // The client's own direction is untouched by this flag.
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"sent", true)
                 .await
                 .expect("client write");
-            let up = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let up = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(up.payload, b"sent");
 
             let gate = gate_of(&state).await;
             assert_eq!(gate.receive.release(), 2);
-            let text = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            let text = read_frame(&mut wire.client)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(text.payload, b"later");
-            let ping = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            let ping = read_frame(&mut wire.client)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(ping.opcode, OPCODE_PING);
             finish(wire).await;
         });
@@ -1600,26 +1698,47 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass, ..FrameFlow::default() },
+                FrameFlow {
+                    send: DirMode::Pause,
+                    receive: DirMode::Pass,
+                    ..FrameFlow::default()
+                },
             );
 
             let total = MAX_HELD_FRAMES + 16;
             for i in 0..total {
-                write_frame(&mut wire.client, true, OPCODE_TEXT, format!("{i}").as_bytes(), true)
-                    .await
-                    .expect("client write");
+                write_frame(
+                    &mut wire.client,
+                    true,
+                    OPCODE_TEXT,
+                    format!("{i}").as_bytes(),
+                    true,
+                )
+                .await
+                .expect("client write");
             }
             let gate = gate_of(&state).await;
             until("the queue to fill", || gate.send.held() == MAX_HELD_FRAMES).await;
             tokio::time::sleep(Duration::from_millis(30)).await;
             assert_eq!(gate.send.held(), MAX_HELD_FRAMES, "and to stay there");
-            assert_eq!(still_held(&state), MAX_HELD_FRAMES, "nothing past it is captured");
+            assert_eq!(
+                still_held(&state),
+                MAX_HELD_FRAMES,
+                "nothing past it is captured"
+            );
 
             // The back-pressured frames were never dropped, only not yet read.
             gate.send.release();
             for i in 0..total {
-                let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
-                assert_eq!(got.payload, format!("{i}").as_bytes(), "all of it, in order");
+                let got = read_frame(&mut wire.server)
+                    .await
+                    .expect("read")
+                    .expect("frame");
+                assert_eq!(
+                    got.payload,
+                    format!("{i}").as_bytes(),
+                    "all of it, in order"
+                );
             }
             finish(wire).await;
         });
@@ -1635,7 +1754,11 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass, ..FrameFlow::default() },
+                FrameFlow {
+                    send: DirMode::Pause,
+                    receive: DirMode::Pass,
+                    ..FrameFlow::default()
+                },
             );
 
             // Five one-mebibyte frames against a four-mebibyte budget. They go
@@ -1657,11 +1780,18 @@ mod tests {
             let cap = MAX_HELD_BYTES / (1024 * 1024);
             until("the budget to fill", || gate.send.held() == cap).await;
             tokio::time::sleep(Duration::from_millis(30)).await;
-            assert_eq!(gate.send.held(), cap, "the fifth frame is not held, it is unread");
+            assert_eq!(
+                gate.send.held(),
+                cap,
+                "the fifth frame is not held, it is unread"
+            );
 
             gate.send.release();
             for _ in 0..5 {
-                let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+                let got = read_frame(&mut wire.server)
+                    .await
+                    .expect("read")
+                    .expect("frame");
                 assert_eq!(got.payload.len(), 1024 * 1024);
             }
             wire.client = writer.await.expect("writer");
@@ -1690,7 +1820,11 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pause, receive: DirMode::Pass, ..FrameFlow::default() },
+                FrameFlow {
+                    send: DirMode::Pause,
+                    receive: DirMode::Pass,
+                    ..FrameFlow::default()
+                },
             );
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"stranded", true)
                 .await
@@ -1706,7 +1840,10 @@ mod tests {
             );
             let frames = state.ws_frames.lock().unwrap();
             assert_eq!(frames.len(), 1);
-            assert!(frames[0].held, "and what it was holding is still marked as held");
+            assert!(
+                frames[0].held,
+                "and what it was holding is still marked as held"
+            );
         });
     }
 
@@ -1727,10 +1864,17 @@ mod tests {
                 &state,
                 plan,
                 None,
-                FrameFlow { send: DirMode::Pass, receive: DirMode::Pause, ..FrameFlow::default() },
+                FrameFlow {
+                    send: DirMode::Pass,
+                    receive: DirMode::Pause,
+                    ..FrameFlow::default()
+                },
             );
 
-            let probe = read_frame(&mut wire.client).await.expect("read").expect("frame");
+            let probe = read_frame(&mut wire.client)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(probe.opcode, OPCODE_PING, "with nothing at all flowing");
             assert!(probe.payload.is_empty());
             assert!(
@@ -1794,8 +1938,14 @@ mod tests {
     /// once released instead of quietly starting to drop.
     #[test]
     fn pause_outranks_ignore_on_the_same_direction() {
-        assert_eq!(flow_for("ws.test enable://pauseSend\n").send, DirMode::Pause);
-        assert_eq!(flow_for("ws.test enable://ignoreSend\n").send, DirMode::Ignore);
+        assert_eq!(
+            flow_for("ws.test enable://pauseSend\n").send,
+            DirMode::Pause
+        );
+        assert_eq!(
+            flow_for("ws.test enable://ignoreSend\n").send,
+            DirMode::Ignore
+        );
         assert_eq!(flow_for("ws.test resHeaders://x=1\n").send, DirMode::Pass);
 
         let both = flow_for("ws.test enable://pauseSend|ignoreSend\n");
@@ -1803,7 +1953,11 @@ mod tests {
         assert_eq!(both.receive, DirMode::Pass);
 
         let mixed = flow_for("ws.test enable://pauseReceive|ignoreSend\n");
-        assert_eq!(mixed.send, DirMode::Ignore, "each direction is judged alone");
+        assert_eq!(
+            mixed.send,
+            DirMode::Ignore,
+            "each direction is judged alone"
+        );
         assert_eq!(mixed.receive, DirMode::Pause);
     }
 
@@ -1825,11 +1979,17 @@ mod tests {
                 .await
                 .expect("client write");
 
-            let first = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let first = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert!(!first.fin);
             assert_eq!(first.opcode, OPCODE_TEXT);
             assert!(first.payload.is_empty());
-            let second = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let second = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert!(second.fin);
             assert_eq!(second.opcode, OPCODE_CONTINUATION);
             assert!(second.payload.is_empty());
@@ -1850,7 +2010,10 @@ mod tests {
                 write_frame(&mut wire.client, true, opcode, payload, true)
                     .await
                     .expect("client write");
-                let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+                let got = read_frame(&mut wire.server)
+                    .await
+                    .expect("read")
+                    .expect("frame");
                 assert_eq!(got.opcode, opcode);
                 assert_eq!(got.payload, payload);
             }
@@ -1859,13 +2022,19 @@ mod tests {
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"data", true)
                 .await
                 .expect("client write");
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.payload, b"X");
 
             write_frame(&mut wire.client, true, OPCODE_CLOSE, &[0x03, 0xe8], true)
                 .await
                 .expect("client write");
-            let close = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let close = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(close.opcode, OPCODE_CLOSE);
             assert_eq!(close.payload, vec![0x03, 0xe8]);
             finish(wire).await;
@@ -1946,7 +2115,10 @@ mod tests {
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"hi", true)
                 .await
                 .expect("client write");
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.payload, b"HI VIA SEND");
             finish(wire).await;
         });
@@ -1962,12 +2134,15 @@ mod tests {
             let script = "ctx.handleSendToServerFrame = function (buf) { \
                               return (buf + '').replace(/1/g, '***'); \
                           };"
-                .to_string();
+            .to_string();
             let mut wire = spawn_tunnel(&state, plan, Some(script));
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"1 and 1", true)
                 .await
                 .expect("client write");
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.payload, b"*** and ***");
             finish(wire).await;
         });
@@ -1983,7 +2158,7 @@ mod tests {
             let script = "ctx.handleSendToServerFrame = function (buf) { \
                               return (buf + '') === 'drop' ? '' : buf; \
                           };"
-                .to_string();
+            .to_string();
             let mut wire = spawn_tunnel(&state, plan, Some(script));
             write_frame(&mut wire.client, true, OPCODE_TEXT, b"drop", true)
                 .await
@@ -1992,7 +2167,10 @@ mod tests {
                 .await
                 .expect("client write");
             // The dropped frame never arrives, so the next one is what reads.
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.payload, b"keep");
             finish(wire).await;
         });
@@ -2006,7 +2184,10 @@ mod tests {
             let plan = plan_for(&state, "ws.test enable://websocket\n");
             let script = "ctx.sendToServer('hello server');".to_string();
             let mut wire = spawn_tunnel(&state, plan, Some(script));
-            let got = read_frame(&mut wire.server).await.expect("read").expect("frame");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
             assert_eq!(got.payload, b"hello server");
             finish(wire).await;
         });
@@ -2044,12 +2225,16 @@ mod tests {
 
         writers.send("send", b"abc").await;
         let mut head = [0u8; 2];
-        tokio::io::AsyncReadExt::read_exact(&mut server, &mut head).await.expect("head");
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut head)
+            .await
+            .expect("head");
         assert_eq!(head[1] & 0x80, 0x80, "a client frame is masked");
 
         writers.send("receive", b"abc").await;
         let mut head = [0u8; 2];
-        tokio::io::AsyncReadExt::read_exact(&mut client, &mut head).await.expect("head");
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut head)
+            .await
+            .expect("head");
         assert_eq!(head[1] & 0x80, 0, "a server frame is not masked");
     }
 

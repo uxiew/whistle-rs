@@ -390,7 +390,11 @@ mod tests {
                         break;
                     }
                     seen.extend_from_slice(&buf[..n]);
-                    if sock.write_all(&buf[..n].to_ascii_uppercase()).await.is_err() {
+                    if sock
+                        .write_all(&buf[..n].to_ascii_uppercase())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -535,7 +539,10 @@ mod tests {
             host_port("localhost:1234").unwrap(),
             ("localhost".to_string(), 1234)
         );
-        assert_eq!(host_port("example.com").unwrap(), ("example.com".to_string(), 80));
+        assert_eq!(
+            host_port("example.com").unwrap(),
+            ("example.com".to_string(), 80)
+        );
         assert!(host_port("https://example.com").is_err());
         assert!(host_port("http://").is_err());
     }

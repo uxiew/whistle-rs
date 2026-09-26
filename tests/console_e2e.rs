@@ -59,13 +59,11 @@ async fn origin(response: &'static [u8]) -> std::net::SocketAddr {
 
 /// One proxied request, written and read as bytes so the request line is
 /// exactly what this test says it is.
-async fn through_proxy(
-    proxy: std::net::SocketAddr,
-    url: &str,
-    extra_headers: &str,
-) -> String {
+async fn through_proxy(proxy: std::net::SocketAddr, url: &str, extra_headers: &str) -> String {
     let mut sock = TcpStream::connect(proxy).await.expect("connect proxy");
-    let req = format!("GET {url} HTTP/1.1\r\nHost: origin.test\r\n{extra_headers}Connection: close\r\n\r\n");
+    let req = format!(
+        "GET {url} HTTP/1.1\r\nHost: origin.test\r\n{extra_headers}Connection: close\r\n\r\n"
+    );
     sock.write_all(req.as_bytes()).await.expect("write request");
     let mut out = Vec::new();
     sock.read_to_end(&mut out).await.expect("read answer");
@@ -86,7 +84,9 @@ async fn console(
              content-length: {}\r\nConnection: close\r\n\r\n{b}",
             b.len()
         ),
-        None => format!("{method} {path} HTTP/1.1\r\nHost: console.test\r\nConnection: close\r\n\r\n"),
+        None => {
+            format!("{method} {path} HTTP/1.1\r\nHost: console.test\r\nConnection: close\r\n\r\n")
+        }
     };
     sock.write_all(head.as_bytes()).await.expect("write");
     let mut out = Vec::new();
@@ -159,7 +159,10 @@ async fn an_event_stream_arrives_whole_and_is_shown_as_frames() {
     let proxy = proxy_with(&format!("origin.test host://{addr}\n")).await;
 
     let answer = through_proxy(proxy.addr(), "http://origin.test/stream", "").await;
-    assert!(answer.contains("data: one\n\ndata: two\n\ndata: three\n\n"), "{answer}");
+    assert!(
+        answer.contains("data: one\n\ndata: two\n\ndata: three\n\n"),
+        "{answer}"
+    );
 
     let state = proxy.state().clone();
     let frames = until(async || {
@@ -191,10 +194,7 @@ async fn capture_stream_can_be_turned_off() {
     // The session lands even when the frames do not, so waiting for it is a
     // real wait rather than a fixed sleep.
     let state = proxy.state().clone();
-    until(async || {
-        (!state.sessions.lock().unwrap().is_empty()).then_some(())
-    })
-    .await;
+    until(async || (!state.sessions.lock().unwrap().is_empty()).then_some(())).await;
     assert!(frames_of(&state).is_empty(), "{:?}", frames_of(&state));
 
     proxy.shutdown().await;
@@ -224,9 +224,14 @@ x-whistle-custom-frame-separator: |\r\ncontent-length: 23\r\nConnection: close\r
     ))
     .await;
     let answer = through_proxy(proxy.addr(), "http://origin.test/x", "").await;
-    assert!(answer.contains(BODY), "the body is forwarded whole: {answer}");
     assert!(
-        !answer.to_lowercase().contains("x-whistle-custom-frame-separator"),
+        answer.contains(BODY),
+        "the body is forwarded whole: {answer}"
+    );
+    assert!(
+        !answer
+            .to_lowercase()
+            .contains("x-whistle-custom-frame-separator"),
         "the separator header is the proxy's alone: {answer}"
     );
     let state = proxy.state().clone();
@@ -268,7 +273,13 @@ async fn test_rules_answers_which_operators_matched() {
         "url": "http://www.example.com/api?id=1",
         "method": "GET",
     });
-    let body = console(proxy.addr(), "POST", "/api/explain", Some(&query.to_string())).await;
+    let body = console(
+        proxy.addr(),
+        "POST",
+        "/api/explain",
+        Some(&query.to_string()),
+    )
+    .await;
     let answer: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
         panic!("explain did not answer JSON: {e}; body was {body}");
     });
@@ -301,7 +312,10 @@ async fn test_rules_refuses_in_json() {
 async fn sending_a_frame_into_nothing_is_refused() {
     let proxy = proxy_with("").await;
     for (payload, expect) in [
-        (r#"{"id":999999,"dir":"send","data":"hi"}"#, "no live WebSocket"),
+        (
+            r#"{"id":999999,"dir":"send","data":"hi"}"#,
+            "no live WebSocket",
+        ),
         (r#"{"dir":"send","data":"hi"}"#, "id is required"),
         (r#"{"id":1,"dir":"sideways","data":"hi"}"#, "dir must be"),
     ] {

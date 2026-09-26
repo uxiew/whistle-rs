@@ -81,7 +81,8 @@ static TPL_VAR: Lazy<Regex> = Lazy::new(|| {
 /// whistle's `REPLACE_PATTERN_RE` (`rules.js:81`): a `.replace(...)` suffix on a
 /// variable key, e.g. `${url.replace(/a/g,b)}`. The suffix is a modifier on the
 /// resolved *value*, not part of the key.
-static REPLACE_SUFFIX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(^|\.)replace\((.+)\)$").unwrap());
+static REPLACE_SUFFIX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)(^|\.)replace\((.+)\)$").unwrap());
 
 /// whistle's `ORIG_REG_EXP` (`_original/lib/util/index.js:610`): the `/…/flags`
 /// spelling that turns a replace pattern into a real regular expression.
@@ -178,7 +179,9 @@ fn interpolate_query(body: &str, query: &Query) -> String {
                 .map(|m| m.as_str())
                 .unwrap_or_default();
             // Unknown names survive into the output; whistle does not blank them.
-            query.get(name, Decode::Full).unwrap_or_else(|| text.to_string())
+            query
+                .get(name, Decode::Full)
+                .unwrap_or_else(|| text.to_string())
         })
         .into_owned()
 }
@@ -256,7 +259,11 @@ fn resolve_var(
             Some(_) => String::new(),
             None => {
                 let search = url.prop(Some("search"), query, mode)?;
-                if search.is_empty() { "?".to_string() } else { search }
+                if search.is_empty() {
+                    "?".to_string()
+                } else {
+                    search
+                }
             }
         },
         "query" => match key {
@@ -319,10 +326,7 @@ fn resolve_var(
             _ => String::new(),
         },
         "rescookie" | "rescookies" => res_cookie(info, key),
-        "clientport" => info
-            .client_port
-            .map(|p| p.to_string())
-            .unwrap_or_default(),
+        "clientport" => info.client_port.map(|p| p.to_string()).unwrap_or_default(),
 
         // -- known to whistle, unavailable here ------------------------------
         // whistle-rs has no request-id or client-identity bookkeeping, and
@@ -544,9 +548,7 @@ impl Replace {
             // Repeated flags make `new RegExp` throw, and whistle's
             // `toOriginalRegExp` then returns null — i.e. a literal replace of
             // the `/…/` text itself (`util/index.js:623-631`).
-            let repeated = flags
-                .char_indices()
-                .any(|(i, c)| flags[..i].contains(c));
+            let repeated = flags.char_indices().any(|(i, c)| flags[..i].contains(c));
             if !repeated {
                 let mut inline = String::new();
                 if flags.contains('i') {
@@ -625,7 +627,10 @@ impl Replace {
         let substitute = |caps: &Captures| {
             let whole = caps.get(0).expect("group 0 always exists");
             let parts = MatchParts {
-                groups: caps.iter().map(|g| g.map(|g| g.as_str().to_string())).collect(),
+                groups: caps
+                    .iter()
+                    .map(|g| g.map(|g| g.as_str().to_string()))
+                    .collect(),
                 before: &value[..whole.start()],
                 after: &value[whole.end()..],
             };
@@ -1104,10 +1109,7 @@ mod tests {
     #[test]
     fn percent_encoded_and_plus_values_are_decoded() {
         // Pass 1 uses Node's querystring decoder: `+` becomes a space.
-        assert_eq!(
-            render_url("{q}", "http://x.com/?q=a%20b+c%2Fd"),
-            "a b c/d"
-        );
+        assert_eq!(render_url("{q}", "http://x.com/?q=a%20b+c%2Fd"), "a b c/d");
     }
 
     #[test]
@@ -1188,12 +1190,22 @@ mod tests {
         // Upstream reads these off whistle's own config, not the request
         // (`resolveVarValue`, rules.js:657-668) — `${host}` is the proxy's bind
         // address, which is empty when bound to all interfaces.
-        assert_eq!(render_url("${port}/${version}", "http://x.com/?a=1"), "8899/9.9.9");
+        assert_eq!(
+            render_url("${port}/${version}", "http://x.com/?a=1"),
+            "8899/9.9.9"
+        );
         assert_eq!(render_url("[${host}]", "http://x.com/?a=1"), "[]");
         assert_eq!(render_url("${realPort}", "http://x.com/?a=1"), "8899");
 
-        let bound = ProxyEnv { host: "127.0.0.1", port: 1234, version: "1.0" };
-        assert_eq!(render("${host}:${port}", &req("http://x.com/?a=1", &[]), bound), "127.0.0.1:1234");
+        let bound = ProxyEnv {
+            host: "127.0.0.1",
+            port: 1234,
+            version: "1.0",
+        };
+        assert_eq!(
+            render("${host}:${port}", &req("http://x.com/?a=1", &[]), bound),
+            "127.0.0.1:1234"
+        );
     }
 
     // -- pass 2: the `.replace(...)` modifier -------------------------------
@@ -1206,14 +1218,20 @@ mod tests {
             render_url("${query.replace(a,Z)}", "http://x.com/?a=1&ba=2"),
             "Z=1&ba=2"
         );
-        assert_eq!(render_url("${method.replace(GET,PUT)}", "http://x.com/?a=1"), "PUT");
+        assert_eq!(
+            render_url("${method.replace(GET,PUT)}", "http://x.com/?a=1"),
+            "PUT"
+        );
     }
 
     #[test]
     fn replace_keeps_the_rest_of_the_key() {
         // `${query.<name>.replace(...)}` must still resolve `<name>`.
         assert_eq!(
-            render_url("${query.who.replace(world,there)}", "http://x.com/?who=hello%20world"),
+            render_url(
+                "${query.who.replace(world,there)}",
+                "http://x.com/?who=hello%20world"
+            ),
             "hello there"
         );
     }
@@ -1290,7 +1308,10 @@ mod tests {
         );
         // An empty value with a *non*-empty pattern stays empty — no default.
         assert_eq!(
-            render_url("[${query.missing.replace(a,fallback)}]", "http://x.com/?a=1"),
+            render_url(
+                "[${query.missing.replace(a,fallback)}]",
+                "http://x.com/?a=1"
+            ),
             "[]"
         );
     }
@@ -1358,7 +1379,10 @@ mod tests {
             status: 404,
             headers: vec![
                 ("x-served-by".to_string(), "edge-7".to_string()),
-                ("set-cookie".to_string(), "sid=abc; Path=/; HttpOnly".to_string()),
+                (
+                    "set-cookie".to_string(),
+                    "sid=abc; Path=/; HttpOnly".to_string(),
+                ),
                 ("set-cookie".to_string(), "theme=dark".to_string()),
             ],
             server_ip: Some("93.184.216.34".to_string()),
@@ -1401,10 +1425,16 @@ mod tests {
 
     #[test]
     fn search_and_query_string_fallbacks() {
-        assert_eq!(render_url("${search}|${queryString}", "http://x.com/a?k=v"), "?k=v|?k=v");
+        assert_eq!(
+            render_url("${search}|${queryString}", "http://x.com/a?k=v"),
+            "?k=v|?k=v"
+        );
         // `${queryString}` degrades to "?" when there is no query; `${search}`
         // to "". A trailing `{x}` only satisfies the placeholder gate.
-        assert_eq!(render_url("${search}|${queryString}|{x}", "http://x.com/a"), "|?|{x}");
+        assert_eq!(
+            render_url("${search}|${queryString}|{x}", "http://x.com/a"),
+            "|?|{x}"
+        );
     }
 
     #[test]
@@ -1415,17 +1445,27 @@ mod tests {
     #[test]
     fn generated_values_have_the_right_shape() {
         let now = render_url("${now}", "http://x.com/?a=1");
-        assert!(now.len() >= 13 && now.chars().all(|c| c.is_ascii_digit()), "{now}");
+        assert!(
+            now.len() >= 13 && now.chars().all(|c| c.is_ascii_digit()),
+            "{now}"
+        );
 
         let uuid = render_url("${randomUUID}", "http://x.com/?a=1");
         assert_eq!(uuid.len(), 36);
         assert_eq!(uuid.as_bytes()[14], b'4', "version nibble: {uuid}");
-        assert!(matches!(uuid.as_bytes()[19], b'8' | b'9' | b'a' | b'b'), "{uuid}");
+        assert!(
+            matches!(uuid.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
+            "{uuid}"
+        );
 
-        let unit: f64 = render_url("${random}", "http://x.com/?a=1").parse().unwrap();
+        let unit: f64 = render_url("${random}", "http://x.com/?a=1")
+            .parse()
+            .unwrap();
         assert!((0.0..1.0).contains(&unit), "{unit}");
 
-        let n: u64 = render_url("${randomInt(5-9)}", "http://x.com/?a=1").parse().unwrap();
+        let n: u64 = render_url("${randomInt(5-9)}", "http://x.com/?a=1")
+            .parse()
+            .unwrap();
         assert!((5..=9).contains(&n), "{n}");
         assert_eq!(render_url("${randomInt(0)}", "http://x.com/?a=1"), "0");
     }
@@ -1449,8 +1489,14 @@ mod tests {
     #[test]
     fn parsed_url_splits_default_and_explicit_ports() {
         let u = ParsedUrl::of("https://x.com/a?k=v");
-        assert_eq!((u.protocol, u.hostname, u.port, u.path), ("https:", "x.com", "", "/a?k=v"));
+        assert_eq!(
+            (u.protocol, u.hostname, u.port, u.path),
+            ("https:", "x.com", "", "/a?k=v")
+        );
         let u = ParsedUrl::of("http://x.com:8080/a");
-        assert_eq!((u.host, u.hostname, u.port, u.search), ("x.com:8080", "x.com", "8080", ""));
+        assert_eq!(
+            (u.host, u.hostname, u.port, u.search),
+            ("x.com:8080", "x.com", "8080", "")
+        );
     }
 }

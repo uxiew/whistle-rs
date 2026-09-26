@@ -10,7 +10,7 @@ use serde_json::json;
 use super::auth::{AuthVerdict, Denial, DenyPage};
 use super::pipe::{Dir, PipeMeta};
 use super::sni::{SniReq, SniVerdict};
-use super::ui::{escape_html, UiReq, UiResp};
+use super::ui::{UiReq, UiResp, escape_html};
 use super::wsframe::{FrameMeta, HookFrame, Verdict};
 use super::{
     PluginManifest, PluginReq, PluginRes, PluginResResult, PluginResp, PluginResult, RustPlugin,

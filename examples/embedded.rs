@@ -79,10 +79,13 @@ async fn main() -> anyhow::Result<()> {
     // Rules are live: swap them and the next request sees the change.
     proxy.set_rules("api.test statusCode://503");
     let again = get_via(addr, "http://api.test/users").await;
-    println!("  [client]  after swapping rules: {}\n", match again {
-        Ok(b) => b,
-        Err(e) => e.to_string(),
-    });
+    println!(
+        "  [client]  after swapping rules: {}\n",
+        match again {
+            Ok(b) => b,
+            Err(e) => e.to_string(),
+        }
+    );
 
     println!("sessions your program was told about:");
     for line in seen.lock().unwrap().iter() {
@@ -108,6 +111,11 @@ async fn get_via(addr: std::net::SocketAddr, url: &str) -> anyhow::Result<String
     sock.read_to_end(&mut raw).await?;
     let text = String::from_utf8_lossy(&raw);
     let status = text.lines().next().unwrap_or("").to_string();
-    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     Ok(format!("{status} · {body}"))
 }

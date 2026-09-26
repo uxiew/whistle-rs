@@ -84,7 +84,10 @@ pub fn matches_but_for_body(rule: &Rule, req: &ReqInfo, is_internal_req: bool) -
 /// practice, since only regexp and port patterns can be negated and neither
 /// joins a tail.
 fn pattern_match<'r>(rule: &Rule, req: &'r ReqInfo) -> Option<Matched<'r>> {
-    match (pattern_accepts(&rule.pattern, req, rule.has_capture_ref), rule.negate) {
+    match (
+        pattern_accepts(&rule.pattern, req, rule.has_capture_ref),
+        rule.negate,
+    ) {
         // `lineProps://originUrl` on a host-only pattern replaces the tail with
         // `/` — the line asked for the destination's own root, not the path the
         // request happened to use (`rules.js:1105`; undocumented upstream).
@@ -178,9 +181,7 @@ fn pattern_accepts<'r>(
         }),
         // Without a `$` reference on the line there is nothing to collect, and
         // `is_match` skips building the capture locations entirely.
-        Pattern::Regex(re) if !want_groups => {
-            re.is_match(&req.full_url).then(Matched::default)
-        }
+        Pattern::Regex(re) if !want_groups => re.is_match(&req.full_url).then(Matched::default),
         Pattern::Regex(re) => re.captures(&req.full_url).map(|caps| Matched {
             // `$0` is the whole URL for a regexp pattern, which is upstream's
             // `regExp['0'] = curUrl` (`rules.js:1009`) rather than the regexp's
@@ -262,10 +263,12 @@ fn pattern_accepts<'r>(
             // A pattern carrying a query matched into the query string, so what
             // is left is more query — upstream puts back the `?` that its own
             // substring arithmetic cut off (`rules.js:1103-1105`).
-            Some(Matched::with_tail(match path.contains('?') && !rest.is_empty() {
-                true => Tail::Owned(format!("?{rest}")),
-                false => Tail::Borrowed(rest),
-            }))
+            Some(Matched::with_tail(
+                match path.contains('?') && !rest.is_empty() {
+                    true => Tail::Owned(format!("?{rest}")),
+                    false => Tail::Borrowed(rest),
+                },
+            ))
         }
     }
 }
@@ -391,12 +394,7 @@ fn cond_holds(cond: &Cond, req: &ReqInfo) -> Option<bool> {
 ///   reads the response's header when the request has none. In the request
 ///   phase there are no response headers, which is exactly upstream's state
 ///   there, and the condition answers "no".
-fn header_holds(
-    req: &ReqInfo,
-    name: &str,
-    value: &CondValue,
-    scope: HeaderScope,
-) -> Option<bool> {
+fn header_holds(req: &ReqInfo, name: &str, value: &CondValue, scope: HeaderScope) -> Option<bool> {
     let res_headers = || req.res.as_ref().map(|r| r.headers.as_slice());
     match scope {
         HeaderScope::Request => Some(header_matches(&req.headers, name, value)),
@@ -586,7 +584,13 @@ fn resolve_walk(
                 if serves_no_file(req) && is_file_proxy(&op.protocol) {
                     continue;
                 }
-                take(&mut resolved, rule, op, super::token_order(line, at), &matched);
+                take(
+                    &mut resolved,
+                    rule,
+                    op,
+                    super::token_order(line, at),
+                    &matched,
+                );
             }
         }
     }
@@ -858,9 +862,7 @@ pub(crate) fn join_each_path(protocol: &str, value: &str, tail: &str) -> String 
         true => path.to_string(),
         false => super::url::join_url(path, tail),
     };
-    if !protocols::is_file_protocol(protocol)
-        || protocol.starts_with("xs")
-        || !value.contains('|')
+    if !protocols::is_file_protocol(protocol) || protocol.starts_with("xs") || !value.contains('|')
     {
         return join(value);
     }
@@ -966,7 +968,13 @@ pub fn resolve_response_ops(
         };
         for (at, op) in rule.ops.iter().enumerate() {
             if protocols::is_res_phase(&op.protocol) || op.protocol == "ignore" {
-                take(&mut resolved, rule, op, super::token_order(*order, at), &matched);
+                take(
+                    &mut resolved,
+                    rule,
+                    op,
+                    super::token_order(*order, at),
+                    &matched,
+                );
             }
         }
     }
@@ -1175,7 +1183,11 @@ mod tests {
         // A destination rewrite is always a URL and always joins — that is the
         // whole of "the path is concatenated by default".
         assert_eq!(
-            join_each_path(crate::rules::protocols::URL_REPLACE, "http://host/base", "/js/a.js"),
+            join_each_path(
+                crate::rules::protocols::URL_REPLACE,
+                "http://host/base",
+                "/js/a.js"
+            ),
             "http://host/base/js/a.js"
         );
     }
@@ -1214,7 +1226,9 @@ mod tests {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("a.com file:///srv/x\n");
         assert_eq!(
-            m.resolve(&req("http://a.com/s")).slot().map(|op| op.protocol.as_str()),
+            m.resolve(&req("http://a.com/s"))
+                .slot()
+                .map(|op| op.protocol.as_str()),
             Some("file")
         );
         for url in ["ws://a.com/s", "wss://a.com/s", "tunnel://a.com:443"] {
@@ -1248,11 +1262,15 @@ mod tests {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("a.com file:///srv/x\na.com http://b.com\n");
         assert_eq!(
-            m.resolve(&req("ws://a.com/s")).slot().map(|op| op.value.as_str()),
+            m.resolve(&req("ws://a.com/s"))
+                .slot()
+                .map(|op| op.value.as_str()),
             Some("http://b.com/s")
         );
         assert_eq!(
-            m.resolve(&req("http://a.com/s")).slot().map(|op| op.protocol.as_str()),
+            m.resolve(&req("http://a.com/s"))
+                .slot()
+                .map(|op| op.protocol.as_str()),
             Some("file")
         );
         // Only the slot is passed over — the rest of the line still applies.
@@ -1294,7 +1312,10 @@ mod tests {
         let re = r"/^http:\/\/case\.test/ host://1.1.1.1";
         assert!(matched(re, "http://case.test/x"));
         assert!(!matched(re, "http://CASE.TEST/x"));
-        assert!(matched(r"/^http:\/\/case\.test/i host://1.1.1.1", "http://CASE.TEST/x"));
+        assert!(matched(
+            r"/^http:\/\/case\.test/i host://1.1.1.1",
+            "http://CASE.TEST/x"
+        ));
     }
 
     /// A JSON value is a mock body, so nothing is appended to it.
@@ -1309,20 +1330,32 @@ mod tests {
         let value = |rules: &str| {
             let mut m = crate::rules::RuleManager::new();
             m.set_text(rules);
-            m.resolve(&req("http://a.com/x")).slot().map(|op| op.value.clone())
+            m.resolve(&req("http://a.com/x"))
+                .slot()
+                .map(|op| op.value.clone())
         };
         for json in ["{}", "{\"a\":1}", "[1,2]", "[]"] {
-            assert_eq!(value(&format!("a.com file://{json}\n")).as_deref(), Some(json), "{json}");
+            assert_eq!(
+                value(&format!("a.com file://{json}\n")).as_deref(),
+                Some(json),
+                "{json}"
+            );
         }
         // Neither of these is JSON — one has no colon, the other does not parse
         // — but both are `{…}`, which this port reads as a values reference and
         // therefore also leaves alone. Upstream extends the literal instead;
         // that half is the declared divergence `joins_tail` already names.
-        assert_eq!(value("a.com file://{notjson}\n").as_deref(), Some("{notjson}"));
+        assert_eq!(
+            value("a.com file://{notjson}\n").as_deref(),
+            Some("{notjson}")
+        );
         assert_eq!(value("a.com file://{a:1}\n").as_deref(), Some("{a:1}"));
         // A path is still a path.
         assert_eq!(value("a.com file:///srv/d\n").as_deref(), Some("/srv/d/x"));
-        assert_eq!(value("a.com file://[not-json\n").as_deref(), Some("[not-json/x"));
+        assert_eq!(
+            value("a.com file://[not-json\n").as_deref(),
+            Some("[not-json/x")
+        );
     }
 
     #[test]
@@ -1362,14 +1395,32 @@ mod tests {
              g.com pathReplace://a=b\n\
              h.com reqMerge://k=v\n",
         );
-        assert_eq!(m.resolve(&req("http://a.com/")).value("host"), Some("10.0.0.1:9000"));
-        assert_eq!(m.resolve(&req("http://b.com/")).value("htmlAppend"), Some("<!--x-->"));
-        assert_eq!(m.resolve(&req("http://c.com/")).value("statusCode"), Some("404"));
-        assert_eq!(m.resolve(&req("http://d.com/")).value("attachment"), Some("f.bin"));
-        assert_eq!(m.resolve(&req("http://e.com/")).value("cipher"), Some("TLSv1.2"));
+        assert_eq!(
+            m.resolve(&req("http://a.com/")).value("host"),
+            Some("10.0.0.1:9000")
+        );
+        assert_eq!(
+            m.resolve(&req("http://b.com/")).value("htmlAppend"),
+            Some("<!--x-->")
+        );
+        assert_eq!(
+            m.resolve(&req("http://c.com/")).value("statusCode"),
+            Some("404")
+        );
+        assert_eq!(
+            m.resolve(&req("http://d.com/")).value("attachment"),
+            Some("f.bin")
+        );
+        assert_eq!(
+            m.resolve(&req("http://e.com/")).value("cipher"),
+            Some("TLSv1.2")
+        );
         // `skip` is an alias of `ignore`: it should drop the resType operator.
         assert_eq!(m.resolve(&req("http://f.com/")).value("resType"), None);
-        assert_eq!(m.resolve(&req("http://g.com/")).value("urlReplace"), Some("a=b"));
+        assert_eq!(
+            m.resolve(&req("http://g.com/")).value("urlReplace"),
+            Some("a=b")
+        );
         // `params` is multi-match, so it accumulates in the list.
         let h = m.resolve(&req("http://h.com/"));
         assert!(h.all("params").iter().any(|o| o.value == "k=v"));
@@ -1392,16 +1443,25 @@ mod tests {
         m.set_text("*.example.com/api redirect://https://api.internal/\n");
         let r = m.resolve(&req("http://a.example.com/api/users"));
         assert_eq!(r.value("redirect"), Some("https://api.internal/"));
-        assert!(m.resolve(&req("http://a.b.example.com/api/x")).value("redirect").is_none());
+        assert!(
+            m.resolve(&req("http://a.b.example.com/api/x"))
+                .value("redirect")
+                .is_none()
+        );
 
         // A star in the *path* is a literal there — whistle's own documentation
         // is explicit about it (`docs/docs/rules/pattern.md`: "`*` 也是 URL 路径
         // 中的合法字符"), and `^` is how you ask for the other reading.
         m.set_text("*.example.com/api/* redirect://https://api.internal/\n");
-        assert!(m.resolve(&req("http://a.example.com/api/users")).value("redirect").is_none());
+        assert!(
+            m.resolve(&req("http://a.example.com/api/users"))
+                .value("redirect")
+                .is_none()
+        );
         m.set_text("^*.example.com/api/* redirect://https://api.internal/\n");
         assert_eq!(
-            m.resolve(&req("http://a.example.com/api/users")).value("redirect"),
+            m.resolve(&req("http://a.example.com/api/users"))
+                .value("redirect"),
             Some("https://api.internal/")
         );
     }
@@ -1431,7 +1491,10 @@ mod tests {
         // `$0` is the request URL, and `$$1` inserts the group percent-encoded.
         m.set_text("/\\/x\\/(.+)$/ reqHeaders://X-Url=$0&X-Enc=$$1\n");
         let r = m.resolve(&req("http://a.com/x/a b"));
-        assert_eq!(r.value("reqHeaders"), Some("X-Url=http://a.com/x/a b&X-Enc=a%20b"));
+        assert_eq!(
+            r.value("reqHeaders"),
+            Some("X-Url=http://a.com/x/a b&X-Enc=a%20b")
+        );
 
         // A plain pattern captures nothing, so a `$1` in its value is literal —
         // there is no group to put there, and inventing one would corrupt a
@@ -1449,7 +1512,10 @@ mod tests {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("a.com http://dev.internal lineProps://originUrl\n");
         let r = m.resolve(&req("http://a.com/deep/page?q=1"));
-        assert_eq!(r.value(crate::rules::protocols::URL_REPLACE), Some("http://dev.internal/"));
+        assert_eq!(
+            r.value(crate::rules::protocols::URL_REPLACE),
+            Some("http://dev.internal/")
+        );
         // Without it, the path comes along as usual.
         m.set_text("a.com http://dev.internal\n");
         let r = m.resolve(&req("http://a.com/deep/page?q=1"));
@@ -1475,19 +1541,43 @@ mod tests {
     fn a_path_pattern_is_scoped_to_the_default_port() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("example.com/api host://1.1.1.1\n");
-        assert!(m.resolve(&req("http://example.com/api/v2")).value("host").is_some());
-        assert!(m.resolve(&req("http://example.com:8080/api/v2")).value("host").is_none());
+        assert!(
+            m.resolve(&req("http://example.com/api/v2"))
+                .value("host")
+                .is_some()
+        );
+        assert!(
+            m.resolve(&req("http://example.com:8080/api/v2"))
+                .value("host")
+                .is_none()
+        );
         // Spelling the port out still scopes it to that port.
         m.set_text("example.com:8080/api host://1.1.1.1\n");
-        assert!(m.resolve(&req("http://example.com:8080/api/v2")).value("host").is_some());
-        assert!(m.resolve(&req("http://example.com/api/v2")).value("host").is_none());
+        assert!(
+            m.resolve(&req("http://example.com:8080/api/v2"))
+                .value("host")
+                .is_some()
+        );
+        assert!(
+            m.resolve(&req("http://example.com/api/v2"))
+                .value("host")
+                .is_none()
+        );
         // A bare-host pattern keeps matching any port, which is the case the
         // fallback exists for.
         m.set_text("example.com host://1.1.1.1\n");
-        assert!(m.resolve(&req("http://example.com:8080/api")).value("host").is_some());
+        assert!(
+            m.resolve(&req("http://example.com:8080/api"))
+                .value("host")
+                .is_some()
+        );
         // …and https on 443 is still the default, not a port to exclude.
         m.set_text("example.com/api host://1.1.1.1\n");
-        assert!(m.resolve(&req("https://example.com/api/v2")).value("host").is_some());
+        assert!(
+            m.resolve(&req("https://example.com/api/v2"))
+                .value("host")
+                .is_some()
+        );
     }
 
     /// A token with no host, path, scheme or port is not a pattern that matches
@@ -1497,7 +1587,11 @@ mod tests {
     fn a_contentless_pattern_matches_nothing() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("$ host://1.1.1.1\n");
-        assert!(m.resolve(&req("http://anything.test/")).value("host").is_none());
+        assert!(
+            m.resolve(&req("http://anything.test/"))
+                .value("host")
+                .is_none()
+        );
     }
 
     /// A shorthand operator is silenced by its **expanded** spelling only.
@@ -1518,14 +1612,18 @@ mod tests {
         let served = |text: &str| {
             let mut m = crate::rules::RuleManager::new();
             m.set_text(text);
-            m.resolve(&req("http://example.com/x")).value("file").is_some()
+            m.resolve(&req("http://example.com/x"))
+                .value("file")
+                .is_some()
         };
         assert!(served("example.com /local/path\n"), "baseline");
         assert!(!served(
             "example.com /local/path\n* ignore://matcher=file:///local/path"
         ));
         // The written form does not silence it — upstream's answer, not ours.
-        assert!(served("example.com /local/path\n* ignore://matcher=/local/path"));
+        assert!(served(
+            "example.com /local/path\n* ignore://matcher=/local/path"
+        ));
     }
 
     /// `ignore://pattern=…` / `matcher=…` silence a rule by the text it was
@@ -1547,7 +1645,10 @@ mod tests {
         const BASE: &str = "example.com host://1.1.1.1\n";
 
         // By pattern, and by operator under all three spellings that mean it.
-        assert_eq!(host_of(&format!("{BASE}* ignore://pattern=example.com")), None);
+        assert_eq!(
+            host_of(&format!("{BASE}* ignore://pattern=example.com")),
+            None
+        );
         for key in ["matcher", "operator", "operation"] {
             assert_eq!(
                 host_of(&format!("{BASE}* ignore://{key}=host://1.1.1.1")),
@@ -1556,11 +1657,17 @@ mod tests {
             );
         }
         // `:` separates as well as `=`.
-        assert_eq!(host_of(&format!("{BASE}* ignore://pattern:example.com")), None);
+        assert_eq!(
+            host_of(&format!("{BASE}* ignore://pattern:example.com")),
+            None
+        );
 
         // Written *below* the rule it silences — the case that forces the
         // pre-scan, and the one a post-hoc filter could never have handled.
-        assert_eq!(host_of(&format!("{BASE}* ignore://pattern=example.com\n")), None);
+        assert_eq!(
+            host_of(&format!("{BASE}* ignore://pattern=example.com\n")),
+            None
+        );
         // …and above it, which must work just as well.
         assert_eq!(
             host_of(&format!("* ignore://pattern=example.com\n{BASE}")),
@@ -1595,7 +1702,7 @@ mod tests {
     /// character set, so the name list was read as one matcher instead.
     #[test]
     fn skip_and_ignore_read_an_unkeyed_value_differently() {
-        use crate::rules::{is_skip_token, parse_exact_skip, ExactSkip};
+        use crate::rules::{ExactSkip, is_skip_token, parse_exact_skip};
 
         // `skip://` takes it whole…
         assert_eq!(
@@ -1649,7 +1756,11 @@ mod tests {
         // Four spellings of "everything" — only `all` used to work, and it is
         // this port's own.
         for star in ["*", "All", "allRules", "allProtocols", "all"] {
-            assert_eq!(host_of(&format!("{BASE} ignore://{star}\n")), None, "{star}");
+            assert_eq!(
+                host_of(&format!("{BASE} ignore://{star}\n")),
+                None,
+                "{star}"
+            );
         }
         // `&` separates as well as `|`; splitting on `|` alone meant
         // `ignore://host&ua` dropped nothing.
@@ -1685,7 +1796,10 @@ mod tests {
         );
         // A named protocol still goes.
         assert_eq!(host_of(&format!("{BASE} ignore://host\n")), None);
-        assert_eq!(host_of(&format!("{BASE} ignore://ua\n")).as_deref(), Some("1.1.1.1"));
+        assert_eq!(
+            host_of(&format!("{BASE} ignore://ua\n")).as_deref(),
+            Some("1.1.1.1")
+        );
     }
 
     /// An `ignore://` reaches the [shared slot](protocols::SLOT_PROTOCOLS)
@@ -1729,10 +1843,15 @@ mod tests {
             None
         );
         // …and one written without a scheme takes the request's own.
-        assert_eq!(slot("a.com //dev.test/ statusCode://204 ignore://http\n"), None);
+        assert_eq!(
+            slot("a.com //dev.test/ statusCode://204 ignore://http\n"),
+            None
+        );
         // An ignore written below the rule it silences still reaches it.
         assert_eq!(
-            slot("a.com statusCode://204\na.com redirect://http://d.test/\na.com ignore://statusCode\n"),
+            slot(
+                "a.com statusCode://204\na.com redirect://http://d.test/\na.com ignore://statusCode\n"
+            ),
             None
         );
         // An alias cannot be silenced at all: `status://204` left the text
@@ -1740,8 +1859,10 @@ mod tests {
         // two never meet. Upstream's answer, checked on the bench both ways.
         for name in ["status", "statusCode"] {
             assert_eq!(
-                slot(&format!("a.com status://204 redirect://http://d.test/ ignore://{name}\n"))
-                    .as_deref(),
+                slot(&format!(
+                    "a.com status://204 redirect://http://d.test/ ignore://{name}\n"
+                ))
+                .as_deref(),
                 Some("statusCode://204"),
                 "{name}"
             );
@@ -1813,9 +1934,7 @@ mod tests {
     #[test]
     fn multi_match_headers_accumulate() {
         let mut m = crate::rules::RuleManager::new();
-        m.set_text(
-            "example.com reqHeaders://x-a=1\nexample.com reqHeaders://x-b=2\n",
-        );
+        m.set_text("example.com reqHeaders://x-a=1\nexample.com reqHeaders://x-b=2\n");
         let r = m.resolve(&req("http://example.com/"));
         assert_eq!(r.all("reqHeaders").len(), 2);
     }
@@ -1844,7 +1963,11 @@ mod tests {
              example.com resAppend://i2 lineProps://important\n",
         );
         let r = m.resolve(&req("http://example.com/"));
-        let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
+        let values: Vec<&str> = r
+            .all("resAppend")
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
         assert_eq!(values, ["i1", "i2", "n1", "n2"]);
         // The winner the single-value accessors report is the list's head.
         assert_eq!(r.value("resAppend"), Some("i1"));
@@ -1932,12 +2055,18 @@ mod tests {
     fn ignoring_one_proxy_spelling_spares_the_others() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("example.com socks://10.0.0.1:1080\nexample.com ignore://socks\n");
-        assert!(m.resolve(&req("http://example.com/")).value("socks").is_none());
+        assert!(
+            m.resolve(&req("http://example.com/"))
+                .value("socks")
+                .is_none()
+        );
 
         let mut m = crate::rules::RuleManager::new();
         m.set_text("example.com socks://10.0.0.1:1080\nexample.com ignore://http-proxy\n");
         assert!(
-            m.resolve(&req("http://example.com/")).value("socks").is_some(),
+            m.resolve(&req("http://example.com/"))
+                .value("socks")
+                .is_some(),
             "ignoring a different spelling leaves socks:// alone"
         );
     }
@@ -1950,11 +2079,19 @@ mod tests {
     fn an_ignored_alias_is_folded_to_its_protocol() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("example.com socks://10.0.0.1:1080\nexample.com ignore://xproxy\n");
-        assert!(m.resolve(&req("http://example.com/")).value("socks").is_none());
+        assert!(
+            m.resolve(&req("http://example.com/"))
+                .value("socks")
+                .is_none()
+        );
 
         let mut m = crate::rules::RuleManager::new();
         m.set_text("example.com host://1.2.3.4\nexample.com ignore://hosts\n");
-        assert!(m.resolve(&req("http://example.com/")).value("host").is_none());
+        assert!(
+            m.resolve(&req("http://example.com/"))
+                .value("host")
+                .is_none()
+        );
     }
 
     /// Ignoring a proxy that matched takes the PAC fallback with it: upstream
@@ -1977,17 +2114,27 @@ mod tests {
     fn ignore_proxy_alone_leaves_pac_standing() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("example.com pac:///tmp/x.pac\nexample.com ignore://proxy\n");
-        assert!(m.resolve(&req("http://example.com/")).value("pac").is_some());
+        assert!(
+            m.resolve(&req("http://example.com/"))
+                .value("pac")
+                .is_some()
+        );
 
         let mut m = crate::rules::RuleManager::new();
         m.set_text("example.com pac:///tmp/x.pac\nexample.com ignore://pac\n");
-        assert!(m.resolve(&req("http://example.com/")).value("pac").is_none());
+        assert!(
+            m.resolve(&req("http://example.com/"))
+                .value("pac")
+                .is_none()
+        );
     }
 
     #[test]
     fn ignore_all_clears_everything() {
         let mut m = crate::rules::RuleManager::new();
-        m.set_text("example.com host://1.2.3.4\nexample.com resHeaders://x=1\nexample.com ignore://all\n");
+        m.set_text(
+            "example.com host://1.2.3.4\nexample.com resHeaders://x=1\nexample.com ignore://all\n",
+        );
         let r = m.resolve(&req("http://example.com/"));
         assert!(r.value("host").is_none());
         assert!(r.all("resHeaders").is_empty());
@@ -2031,8 +2178,14 @@ mod tests {
         assert!(hit("http://example.com/path/to"), "exact path");
         assert!(hit("http://example.com/path/to/xxx?q=1"), "deeper path");
         assert!(hit("http://example.com/path/to?q=1"), "query follows");
-        assert!(!hit("http://example.com/path/toxxx"), "no boundary after `to`");
-        assert!(!hit("http://example.com/path/tox/y"), "no boundary after `to`");
+        assert!(
+            !hit("http://example.com/path/toxxx"),
+            "no boundary after `to`"
+        );
+        assert!(
+            !hit("http://example.com/path/tox/y"),
+            "no boundary after `to`"
+        );
     }
 
     /// A pattern already ending on a separator imposes no further boundary, and
@@ -2041,14 +2194,21 @@ mod tests {
     fn boundary_exemptions() {
         let mut m = crate::rules::RuleManager::new();
         m.set_text("example.com/path/ host://1.1.1.1\n");
-        assert!(m.resolve(&req("http://example.com/path/anything")).value("host").is_some());
+        assert!(
+            m.resolve(&req("http://example.com/path/anything"))
+                .value("host")
+                .is_some()
+        );
 
         let mut q = crate::rules::RuleManager::new();
         q.set_text("example.com/path/to?xxx host://2.2.2.2\n");
         let hit = |u: &str| q.resolve(&req(u)).value("host").is_some();
         assert!(hit("http://example.com/path/to?xxx"));
         assert!(hit("http://example.com/path/to?xxxyyy&z"), "query prefix");
-        assert!(!hit("http://example.com/path/to/yyy?xxx"), "path must be exact");
+        assert!(
+            !hit("http://example.com/path/to/yyy?xxx"),
+            "path must be exact"
+        );
         assert!(!hit("http://example.com/path/to"), "query required");
     }
 }
@@ -2086,7 +2246,10 @@ mod filter_tests {
     /// Does a rule carrying every one of `tokens` apply to `req`?
     fn hits_all(tokens: &[&str], req: &ReqInfo) -> bool {
         let mut mgr = RuleManager::new();
-        mgr.set_text(&format!("example.com host://1.1.1.1 {}\n", tokens.join(" ")));
+        mgr.set_text(&format!(
+            "example.com host://1.1.1.1 {}\n",
+            tokens.join(" ")
+        ));
         mgr.resolve(req).value("host").is_some()
     }
 
@@ -2114,7 +2277,11 @@ mod filter_tests {
     /// is what makes upstream's own `reqH.content-type:json` example work.
     #[test]
     fn header_values_match_by_containment() {
-        let json = with_header("http://example.com/", "content-type", "application/JSON; charset=utf-8");
+        let json = with_header(
+            "http://example.com/",
+            "content-type",
+            "application/JSON; charset=utf-8",
+        );
         assert!(hits("includeFilter://reqH.content-type:json", &json));
         assert!(!hits("includeFilter://reqH.content-type:xml", &json));
     }
@@ -2124,7 +2291,10 @@ mod filter_tests {
     fn header_presence() {
         let tagged = with_header("http://example.com/", "x-tag", "");
         assert!(hits("includeFilter://reqH.x-tag", &tagged));
-        assert!(!hits("includeFilter://reqH.x-tag", &req("http://example.com/")));
+        assert!(!hits(
+            "includeFilter://reqH.x-tag",
+            &req("http://example.com/")
+        ));
     }
 
     /// A regexp value anchors what containment cannot.
@@ -2141,8 +2311,14 @@ mod filter_tests {
     #[test]
     fn negated_header() {
         let token = "includeFilter://reqH.x-tag!:yes";
-        assert!(!hits(token, &with_header("http://example.com/", "x-tag", "yes")));
-        assert!(hits(token, &with_header("http://example.com/", "x-tag", "no")));
+        assert!(!hits(
+            token,
+            &with_header("http://example.com/", "x-tag", "yes")
+        ));
+        assert!(hits(
+            token,
+            &with_header("http://example.com/", "x-tag", "no")
+        ));
         assert!(hits(token, &req("http://example.com/")));
     }
 
@@ -2150,7 +2326,10 @@ mod filter_tests {
     #[test]
     fn exclude_on_a_header() {
         let token = "excludeFilter://reqH.x-tag:yes";
-        assert!(!hits(token, &with_header("http://example.com/", "x-tag", "yes")));
+        assert!(!hits(
+            token,
+            &with_header("http://example.com/", "x-tag", "yes")
+        ));
         assert!(hits(token, &req("http://example.com/")));
     }
 
@@ -2170,7 +2349,10 @@ mod filter_tests {
     #[test]
     fn key_split_prefers_equals() {
         let r = with_header("http://example.com/", "cookie", "b=2");
-        assert!(!hits("includeFilter://reqH.cookie:b=2", &r), "key is `cookie:b`");
+        assert!(
+            !hits("includeFilter://reqH.cookie:b=2", &r),
+            "key is `cookie:b`"
+        );
         assert!(hits("includeFilter://reqH.cookie=b=2", &r));
     }
 
@@ -2209,7 +2391,10 @@ mod filter_tests {
     #[test]
     fn ip_conditions() {
         let mut r = req("http://example.com/");
-        assert!(!hits("includeFilter://i:10.0.0.5", &r), "unknown IP must fail closed");
+        assert!(
+            !hits("includeFilter://i:10.0.0.5", &r),
+            "unknown IP must fail closed"
+        );
         assert!(!hits("includeFilter://i:!10.0.0.5", &r), "…even negated");
 
         r.client_ip = Some("10.0.0.5".into());
@@ -2228,9 +2413,20 @@ mod filter_tests {
     fn an_ip_condition_that_names_no_address_is_dropped() {
         let mut r = req("http://example.com/");
         r.client_ip = Some("10.0.0.5".into());
-        for cond in ["i:localhost", "ip:localhost", "clientIp:nothing", "serverIP:x"] {
-            assert!(hits(&format!("includeFilter://{cond}"), &r), "include {cond}");
-            assert!(hits(&format!("excludeFilter://{cond}"), &r), "exclude {cond}");
+        for cond in [
+            "i:localhost",
+            "ip:localhost",
+            "clientIp:nothing",
+            "serverIP:x",
+        ] {
+            assert!(
+                hits(&format!("includeFilter://{cond}"), &r),
+                "include {cond}"
+            );
+            assert!(
+                hits(&format!("excludeFilter://{cond}"), &r),
+                "exclude {cond}"
+            );
         }
         // `remoteAddress:` has no such guard upstream, and keeps its literal.
         assert!(!hits("includeFilter://remoteAddress:localhost", &r));
@@ -2290,14 +2486,20 @@ mod filter_tests {
             "remoteAddress:1.2.3.4",
             "remotePort:80",
         ] {
-            assert!(!hits(&format!("includeFilter://{cond}"), &r), "include {cond}");
+            assert!(
+                !hits(&format!("includeFilter://{cond}"), &r),
+                "include {cond}"
+            );
             assert!(
                 hits(&format!("excludeFilter://{cond}"), &r),
                 "exclude {cond} must not fire"
             );
         }
         for cond in ["resH.content-type:json", "serverIp:1.2.3.4"] {
-            assert!(!hits(&format!("includeFilter://{cond}"), &r), "include {cond}");
+            assert!(
+                !hits(&format!("includeFilter://{cond}"), &r),
+                "include {cond}"
+            );
             assert!(
                 hits(&format!("excludeFilter://{cond}"), &r),
                 "exclude {cond} must not fire"
@@ -2336,7 +2538,10 @@ mod filter_tests {
         let mut post = req("http://example.com/");
         post.method = "POST".into();
         assert!(!hits("filter://m:POST", &post), "POST is filtered out");
-        assert!(hits("filter://m:POST", &req("http://example.com/")), "GET is not");
+        assert!(
+            hits("filter://m:POST", &req("http://example.com/")),
+            "GET is not"
+        );
 
         let tagged = with_header("http://example.com/", "x-tag", "yes");
         assert!(!hits("filter://reqH:x-tag=yes", &tagged));
@@ -2354,7 +2559,11 @@ mod filter_tests {
 
         let mut mgr = RuleManager::new();
         mgr.set_text("example.com host://1.1.1.1\nexample.com ignore://host\n");
-        assert!(mgr.resolve(&req("http://example.com/")).value("host").is_none());
+        assert!(
+            mgr.resolve(&req("http://example.com/"))
+                .value("host")
+                .is_none()
+        );
     }
 
     /// A matching exclude filter vetoes the rule even when an include matched.
@@ -2375,7 +2584,10 @@ mod filter_tests {
     fn url_pattern_filters() {
         let cgi = req("http://example.com/cgi-bin/x");
         assert!(hits("includeFilter://*/cgi-*", &cgi));
-        assert!(!hits("includeFilter://*/cgi-*", &req("http://example.com/api")));
+        assert!(!hits(
+            "includeFilter://*/cgi-*",
+            &req("http://example.com/api")
+        ));
         assert!(hits("includeFilter:///cgi-bin/", &cgi));
         assert!(hits("excludeFilter://other.com", &cgi));
         assert!(!hits("excludeFilter://example.com", &cgi));
@@ -2598,9 +2810,11 @@ mod response_phase_tests {
         assert!(hit("application/JSON; charset=utf-8"));
         assert!(!hit("text/html"));
         // A response without the header at all is a known "no".
-        assert!(resolve(text, &req("http://example.com/"), Some(res(200)))
-            .value("resAppend")
-            .is_none());
+        assert!(
+            resolve(text, &req("http://example.com/"), Some(res(200)))
+                .value("resAppend")
+                .is_none()
+        );
     }
 
     /// `h:`/`header:` reads the request first and the response only when the
@@ -2740,7 +2954,11 @@ mod response_phase_tests {
                     example.com ignore://all includeFilter://s:404\n";
         let r = resolve(text, &req("http://example.com/"), Some(res(404)));
         assert!(r.value("resHeaders").is_none());
-        assert_eq!(r.value("host"), Some("10.0.0.1"), "the request had gone already");
+        assert_eq!(
+            r.value("host"),
+            Some("10.0.0.1"),
+            "the request had gone already"
+        );
     }
 
     // ── precedence ──
@@ -2771,7 +2989,11 @@ mod response_phase_tests {
                     example.com resAppend://b includeFilter://s:404\n\
                     example.com resAppend://c\n";
         let r = resolve(text, &req("http://example.com/"), Some(res(404)));
-        let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
+        let values: Vec<&str> = r
+            .all("resAppend")
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
         assert_eq!(values, ["a", "b", "c"]);
     }
 
@@ -2781,7 +3003,11 @@ mod response_phase_tests {
         let text = "example.com resAppend://normal\n\
                     example.com resAppend://important includeFilter://s:404 lineProps://important\n";
         let r = resolve(text, &req("http://example.com/"), Some(res(404)));
-        let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
+        let values: Vec<&str> = r
+            .all("resAppend")
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
         assert_eq!(values, ["important", "normal"]);
     }
 
@@ -2790,7 +3016,11 @@ mod response_phase_tests {
     fn operators_of_one_line_keep_their_order() {
         let text = "example.com resAppend://first resAppend://second includeFilter://s:200\n";
         let r = resolve(text, &req("http://example.com/"), Some(res(200)));
-        let values: Vec<&str> = r.all("resAppend").iter().map(|o| o.value.as_str()).collect();
+        let values: Vec<&str> = r
+            .all("resAppend")
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
         assert_eq!(values, ["first", "second"]);
     }
 
@@ -2842,7 +3072,10 @@ mod response_phase_tests {
     fn the_bare_header_spelling_needs_the_response_only_when_the_request_cannot_answer() {
         let mut mgr = RuleManager::new();
         mgr.set_text("example.com resHeaders://x=1 includeFilter://h:x-tag=yes\n");
-        assert!(mgr.may_need_response_phase(), "the static answer is conservative");
+        assert!(
+            mgr.may_need_response_phase(),
+            "the static answer is conservative"
+        );
 
         let mut tagged = req("http://example.com/");
         tagged.headers.push(("x-tag".into(), "yes".into()));
@@ -2894,7 +3127,6 @@ mod response_phase_tests {
         }
     }
 }
-
 
 /// `b:` — the request body condition, and the two-stage decision that feeds it.
 #[cfg(test)]
@@ -3046,7 +3278,8 @@ mod body_filter_tests {
             "example.com resBody://hit includeFilter://env:{key}=produc\n"
         ));
         assert_eq!(
-            m.resolve(&post("http://example.com/", None)).value("resBody"),
+            m.resolve(&post("http://example.com/", None))
+                .value("resBody"),
             Some("hit"),
             "compared by containment, like a header"
         );
@@ -3060,13 +3293,13 @@ mod body_filter_tests {
         );
         let m = mgr("example.com resBody://hit includeFilter://env:WHISTLE_RS_UNSET_XYZ!=v\n");
         assert_eq!(
-            m.resolve(&post("http://example.com/", None)).value("resBody"),
+            m.resolve(&post("http://example.com/", None))
+                .value("resBody"),
             Some("hit")
         );
         unsafe { std::env::remove_var(key) };
     }
 }
-
 
 #[cfg(test)]
 mod from_tests {
@@ -3098,9 +3331,16 @@ mod from_tests {
     /// real answers rather than filters that fail closed.
     #[test]
     fn the_answerable_markers_hold_both_ways() {
-        let tunnel = ReqOrigin { tunnel: true, sni: true, composer: false };
+        let tunnel = ReqOrigin {
+            tunnel: true,
+            sni: true,
+            composer: false,
+        };
         let forward = ReqOrigin::default();
-        let composer = ReqOrigin { composer: true, ..Default::default() };
+        let composer = ReqOrigin {
+            composer: true,
+            ..Default::default()
+        };
 
         let rule = |m: &str| format!("example.com resHeaders://x=1 includeFilter://from:{m}\n");
         assert!(tagged(&rule("tunnel"), tunnel));
@@ -3110,7 +3350,13 @@ mod from_tests {
 
         assert!(tagged(&rule("sni"), tunnel));
         // A plain-HTTP tunnel is `from:tunnel` without being `from:sni`.
-        assert!(!tagged(&rule("sni"), ReqOrigin { tunnel: true, ..Default::default() }));
+        assert!(!tagged(
+            &rule("sni"),
+            ReqOrigin {
+                tunnel: true,
+                ..Default::default()
+            }
+        ));
 
         assert!(tagged(&rule("composer"), composer));
         assert!(!tagged(&rule("composer"), forward));
@@ -3140,14 +3386,19 @@ mod from_tests {
             for spelling in [marker.to_string(), format!("!{marker}")] {
                 let include =
                     format!("example.com resHeaders://x=1 includeFilter://from:{spelling}\n");
-                assert!(!tagged(&include, ReqOrigin::default()), "include from:{spelling}");
+                assert!(
+                    !tagged(&include, ReqOrigin::default()),
+                    "include from:{spelling}"
+                );
                 // …and as an exclude filter it is equally inert, so the rule
                 // still applies.
                 let exclude =
                     format!("example.com resHeaders://x=1 excludeFilter://from:{spelling}\n");
-                assert!(tagged(&exclude, ReqOrigin::default()), "exclude from:{spelling}");
+                assert!(
+                    tagged(&exclude, ReqOrigin::default()),
+                    "exclude from:{spelling}"
+                );
             }
         }
     }
 }
-

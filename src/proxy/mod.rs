@@ -7,11 +7,11 @@ pub mod apply;
 #[cfg(test)]
 mod bench;
 pub mod body;
-pub mod forwarded;
-pub mod header_rules;
 pub mod ciphers;
 pub mod coding;
 pub mod dest;
+pub mod forwarded;
+pub mod header_rules;
 pub mod persist;
 pub mod restream;
 pub mod script;
@@ -412,7 +412,13 @@ impl BodyDecoder {
 fn make_decoder(encoding: Option<&str>) -> BodyDecoder {
     // Take the first token of e.g. "gzip" / "br" / "gzip, chunked".
     let enc = encoding
-        .map(|e| e.split(',').next().unwrap_or("").trim().to_ascii_lowercase())
+        .map(|e| {
+            e.split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
         .unwrap_or_default();
     match enc.as_str() {
         "gzip" | "x-gzip" => BodyDecoder::Gzip(flate2::write::GzDecoder::new(Vec::new())),
@@ -646,7 +652,10 @@ impl Capture {
         let bytes = Bytes::copy_from_slice(&st.data);
         match !st.is_truncated() {
             true => ReplayBody::Whole(bytes),
-            false => ReplayBody::Partial { bytes, of: st.total },
+            false => ReplayBody::Partial {
+                bytes,
+                of: st.total,
+            },
         }
     }
 }
@@ -832,7 +841,10 @@ mod capture_tests {
     #[test]
     fn a_full_preview_releases_the_decompressor() {
         let body = gzip(&vec![b'a'; 8 * 1024 * 1024]);
-        assert!(body.len() < BODY_PREVIEW_CAP, "8 MiB of 'a' fits in one frame");
+        assert!(
+            body.len() < BODY_PREVIEW_CAP,
+            "8 MiB of 'a' fits in one frame"
+        );
         let cap = Capture::new(Some("text/plain".into()), Some("gzip"), BODY_PREVIEW_CAP);
         cap.append(&body);
 
@@ -854,12 +866,18 @@ mod capture_tests {
     fn a_finished_body_releases_the_decompressor() {
         let cap = Capture::new(Some("text/plain".into()), Some("gzip"), BODY_PREVIEW_CAP);
         cap.append(&gzip(b"small enough to fit"));
-        assert!(decoder_bytes(&cap) > 0, "still decoding: the body may continue");
+        assert!(
+            decoder_bytes(&cap) > 0,
+            "still decoding: the body may continue"
+        );
 
         cap.finish();
         assert_eq!(decoder_bytes(&cap), 0);
         let (_, _, text) = cap.snapshot();
-        assert_eq!(text, "small enough to fit", "the preview survives the release");
+        assert_eq!(
+            text, "small enough to fit",
+            "the preview survives the release"
+        );
     }
 
     /// Releasing must not disturb an identity capture: [`Capture::snapshot`]
@@ -909,7 +927,10 @@ mod capture_tests {
         let raw = [0u8, 159, 146, 150];
         let cap = Capture::from_bytes(&raw, Some("image/jpeg".into()), None, 64);
         assert!(cap.snapshot().2.starts_with("[binary"));
-        assert_eq!(cap.replay_body(), ReplayBody::Whole(Bytes::from(raw.to_vec())));
+        assert_eq!(
+            cap.replay_body(),
+            ReplayBody::Whole(Bytes::from(raw.to_vec()))
+        );
     }
 
     /// A compressed body is replayed **decoded** — which is why the replay drops
@@ -965,7 +986,10 @@ mod capture_tests {
         let cap = Capture::new(Some("application/octet-stream".into()), Some("gzip"), 4096);
         cap.append(&gzip(&[0u8, 1, 2, 3, 255]));
         cap.finish();
-        assert_eq!(cap.preview_bytes().bytes, Bytes::from_static(&[0, 1, 2, 3, 255]));
+        assert_eq!(
+            cap.preview_bytes().bytes,
+            Bytes::from_static(&[0, 1, 2, 3, 255])
+        );
     }
 
     /// The bytes a capped preview holds are a prefix, and the flag that says so
@@ -999,9 +1023,15 @@ mod capture_tests {
     fn iso8601_conversion() {
         assert_eq!(super::iso8601_utc(0), "1970-01-01T00:00:00.000Z");
         // 1_000_000_000 s since epoch = 2001-09-09T01:46:40Z
-        assert_eq!(super::iso8601_utc(1_000_000_000_000), "2001-09-09T01:46:40.000Z");
+        assert_eq!(
+            super::iso8601_utc(1_000_000_000_000),
+            "2001-09-09T01:46:40.000Z"
+        );
         // milliseconds are preserved
-        assert_eq!(super::iso8601_utc(1_609_459_200_123), "2021-01-01T00:00:00.123Z");
+        assert_eq!(
+            super::iso8601_utc(1_609_459_200_123),
+            "2021-01-01T00:00:00.123Z"
+        );
     }
 }
 
@@ -1294,7 +1324,11 @@ fn hex_preview(payload: &[u8]) -> String {
 
 /// Collect `log://` channel labels for a resolved request.
 fn log_labels(resolved: &Resolved) -> Vec<String> {
-    resolved.all("log").iter().map(|o| o.value.clone()).collect()
+    resolved
+        .all("log")
+        .iter()
+        .map(|o| o.value.clone())
+        .collect()
 }
 
 /// Collect every operator that applied to a request, in the order the rules file
@@ -1322,7 +1356,8 @@ fn log_labels(resolved: &Resolved) -> Vec<String> {
 /// contributes at most one: a `statusCode://` that lost to a `file://` did
 /// nothing, and reporting it as a match would say the opposite.
 fn matched_ops(resolved: &Resolved) -> Vec<MatchedOp> {
-    let mut ops: Vec<(u64, &crate::rules::RuleOp)> = resolved.ops().map(|op| (op.order, op)).collect();
+    let mut ops: Vec<(u64, &crate::rules::RuleOp)> =
+        resolved.ops().map(|op| (op.order, op)).collect();
     ops.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.protocol.cmp(&y.protocol)));
     ops.into_iter()
         .map(|(_, op)| MatchedOp {
@@ -1390,8 +1425,16 @@ mod forced_encoding_tests {
     /// every operator, or the fix would have bought the hang with the feature.
     #[test]
     fn an_ordinary_response_is_still_transformed() {
-        for ct in ["text/html", "application/json", "text/event", "application/event-stream"] {
-            assert!(ops_ct("resReplace://a=b", true, Some(ct)).needs_body(), "{ct}");
+        for ct in [
+            "text/html",
+            "application/json",
+            "text/event",
+            "application/event-stream",
+        ] {
+            assert!(
+                ops_ct("resReplace://a=b", true, Some(ct)).needs_body(),
+                "{ct}"
+            );
         }
         // A response with no content type at all is transformed as before.
         assert!(ops_ct("resReplace://a=b", true, None).needs_body());
@@ -1473,7 +1516,10 @@ mod forced_encoding_tests {
         let inject = stream_injection(&r, Some("text/event-stream")).expect("an injection");
         assert_eq!(inject.top, b"BEFORE");
         assert_eq!(inject.bottom, b"AFTER");
-        assert!(inject.replacement.is_none(), "the origin's body still flows");
+        assert!(
+            inject.replacement.is_none(),
+            "the origin's body still flows"
+        );
         // A body with an end belongs to the buffered path, which also applies
         // the typed families and the HTML gating this one cannot.
         assert!(stream_injection(&r, Some("text/html")).is_none());
@@ -1497,8 +1543,12 @@ mod forced_encoding_tests {
         let r = resolved_for("resPrepend://(X)");
         assert!(stream_injection(&r, Some("text/event-stream")).is_some());
         assert!(
-            stream_replace(&resolved_for("resReplace://a=b"), Some("text/event-stream"), Some("gzip"))
-                .is_none(),
+            stream_replace(
+                &resolved_for("resReplace://a=b"),
+                Some("text/event-stream"),
+                Some("gzip")
+            )
+            .is_none(),
             "…where the substitution still refuses one"
         );
     }
@@ -1553,7 +1603,10 @@ mod forced_encoding_tests {
         for flag in ["enable://gzip", "enable://br", "enable://deflate"] {
             let ops = ops(flag, true);
             assert!(ops.force_encoding.is_some(), "{flag}");
-            assert!(ops.needs_body(), "{flag} must buffer, or it cannot be applied");
+            assert!(
+                ops.needs_body(),
+                "{flag} must buffer, or it cannot be applied"
+            );
         }
     }
 
@@ -1651,11 +1704,17 @@ mod client_capture_tests {
         let (headers, body) = capture_client_request(&mut req, BODY_PREVIEW_CAP).await;
 
         assert_eq!(
-            headers.iter().find(|(k, _)| k == "x-tenant").map(|(_, v)| v.as_str()),
+            headers
+                .iter()
+                .find(|(k, _)| k == "x-tenant")
+                .map(|(_, v)| v.as_str()),
             Some("acme"),
         );
         let (len, truncated, text) = body.expect("a captured body").snapshot();
-        assert_eq!((len, truncated, text.as_str()), (16, false, r#"{"name":"third"}"#));
+        assert_eq!(
+            (len, truncated, text.as_str()),
+            (16, false, r#"{"name":"third"}"#)
+        );
     }
 
     /// Memory is the preview cap, not the upload. A large POST to a mocked
@@ -1997,7 +2056,12 @@ pub(crate) fn lan_addresses() -> Vec<std::net::IpAddr> {
     //
     // Then one target per RFC 1918 range, which adds a second interface on a
     // machine that has one and costs nothing on a machine that does not.
-    for target in ["224.0.0.1:80", "10.0.0.1:80", "172.16.0.1:80", "192.168.0.1:80"] {
+    for target in [
+        "224.0.0.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+        "192.168.0.1:80",
+    ] {
         if let Some(ip) = probe(target)
             && private(&ip)
             && !out.contains(&ip)
@@ -2261,9 +2325,18 @@ mod hide_tests {
         assert!(is_hidden(&session(&[("enable", "hide")])));
         assert!(is_hidden(&session(&[("disable", "show")])));
         // Un-hiding wins, from either side.
-        assert!(!is_hidden(&session(&[("enable", "hide"), ("enable", "show")])));
-        assert!(!is_hidden(&session(&[("enable", "hide"), ("disable", "hide")])));
-        assert!(!is_hidden(&session(&[("disable", "show"), ("enable", "show")])));
+        assert!(!is_hidden(&session(&[
+            ("enable", "hide"),
+            ("enable", "show")
+        ])));
+        assert!(!is_hidden(&session(&[
+            ("enable", "hide"),
+            ("disable", "hide")
+        ])));
+        assert!(!is_hidden(&session(&[
+            ("disable", "show"),
+            ("enable", "show")
+        ])));
         // The value is a prop list, so one line may carry several flags.
         assert!(is_hidden(&session(&[("enable", "gzip|hide")])));
         assert!(!is_hidden(&session(&[("enable", "gzip|hide|show")])));
@@ -2320,16 +2393,30 @@ mod console_port_tests {
             }
         }
         let page = page.expect("the console never came up");
-        assert!(page.starts_with("HTTP/1.1 200"), "index: {}", &page[..40.min(page.len())]);
+        assert!(
+            page.starts_with("HTTP/1.1 200"),
+            "index: {}",
+            &page[..40.min(page.len())]
+        );
         assert!(page.contains("<!doctype html>") || page.contains("<!DOCTYPE html>"));
 
-        let api = reqwest_get(&format!("{url}/sessions.json")).await.expect("sessions");
-        assert!(api.starts_with("HTTP/1.1 200"), "sessions: {}", &api[..40.min(api.len())]);
+        let api = reqwest_get(&format!("{url}/sessions.json"))
+            .await
+            .expect("sessions");
+        assert!(
+            api.starts_with("HTTP/1.1 200"),
+            "sessions: {}",
+            &api[..40.min(api.len())]
+        );
 
         // Nothing here proxies: an unknown path is a 404 from the UI, not a
         // gateway error from a forward that was never attempted.
         let missing = reqwest_get(&format!("{url}/nope")).await.expect("404");
-        assert!(missing.starts_with("HTTP/1.1 404"), "unknown: {}", &missing[..40.min(missing.len())]);
+        assert!(
+            missing.starts_with("HTTP/1.1 404"),
+            "unknown: {}",
+            &missing[..40.min(missing.len())]
+        );
     }
 
     /// One raw GET, so the test needs no HTTP client dependency.
@@ -2595,7 +2682,9 @@ pub(crate) mod tunnel_abort_tests {
         assert!(!refuses("example.com disable://tunnel disable://abort"));
         // Each predicate tests its own cancellation before it reaches the tunnel
         // arm, so cancelling both named gates cancels that arm with them.
-        assert!(!refuses("example.com disable://tunnel disable://abortReq disable://abortRes"));
+        assert!(!refuses(
+            "example.com disable://tunnel disable://abortReq disable://abortRes"
+        ));
     }
 
     /// A connection has no path, so a path-scoped abort cannot match one — and
@@ -2739,7 +2828,10 @@ pub(crate) mod tunnel_abort_tests {
             .await
             .unwrap();
         let mut head = [0u8; 12];
-        allowed.read_exact(&mut head).await.expect("a CONNECT reply");
+        allowed
+            .read_exact(&mut head)
+            .await
+            .expect("a CONNECT reply");
         assert_eq!(&head, b"HTTP/1.1 200");
     }
 
@@ -2798,8 +2890,10 @@ pub(crate) mod tunnel_abort_tests {
         // to the end never ends.
         client
             .write_all(
-                format!("GET http://{dead}/a HTTP/1.1\r\nHost: {dead}\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "GET http://{dead}/a HTTP/1.1\r\nHost: {dead}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
@@ -2809,7 +2903,10 @@ pub(crate) mod tunnel_abort_tests {
 
         assert!(got.starts_with("http/1.1 502"), "{got}");
         assert!(got.contains("x-server: whistle-rs"), "{got}");
-        assert!(got.contains("content-type: text/plain; charset=utf-8"), "{got}");
+        assert!(
+            got.contains("content-type: text/plain; charset=utf-8"),
+            "{got}"
+        );
     }
 }
 
@@ -2882,7 +2979,9 @@ where
                 // rather than quietly sending the bytes direct — the same call
                 // the request path makes, where it answers 502.
                 sni::Decision::Unroutable(why) => {
-                    return Err(anyhow::anyhow!("tunnel to {host}:{port} not routable: {why}"));
+                    return Err(anyhow::anyhow!(
+                        "tunnel to {host}:{port} not routable: {why}"
+                    ));
                 }
             };
         let tls_stream = acceptor.accept(stream).await?;
@@ -2895,8 +2994,7 @@ where
         // completed, exactly as it did before the peek existed.
         let sni = conn.server_name().is_some();
         if is_h2 {
-            serve_intercepted_h2(state, TokioIo::new(tls_stream), host, port, peer, true, sni)
-                .await
+            serve_intercepted_h2(state, TokioIo::new(tls_stream), host, port, peer, true, sni).await
         } else {
             serve_intercepted(state, TokioIo::new(tls_stream), host, port, peer, true, sni).await
         }
@@ -3107,7 +3205,11 @@ fn forwarding_resolution(
     };
     let host = bind_host(state);
     let values = effective_values(state);
-    apply::substitute_values(&mut second, &values, tpl_ctx(&host, state.config.port, &moved));
+    apply::substitute_values(
+        &mut second,
+        &values,
+        tpl_ctx(&host, state.config.port, &moved),
+    );
     apply::substitute_config_vars(&mut second, state.config.port, crate::config::VERSION);
     Some(second)
 }
@@ -3699,9 +3801,8 @@ fn pin_refusal(state: &AppState, res: Response<Bytes>) -> (Response<DynBody>, Op
     let (parts, bytes) = res.into_parts();
     let ct = header_str(&parts.headers, hyper::header::CONTENT_TYPE);
     let enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
-    let capture = (!bytes.is_empty()).then(|| {
-        Capture::from_bytes(&bytes, ct, enc.as_deref(), state.config.body_preview_cap)
-    });
+    let capture = (!bytes.is_empty())
+        .then(|| Capture::from_bytes(&bytes, ct, enc.as_deref(), state.config.body_preview_cap));
     (Response::from_parts(parts, body::full(bytes)), capture)
 }
 
@@ -3748,7 +3849,8 @@ async fn finish_local_response(
         apply::build_res_info(parts.status.as_u16(), &parts.headers, None, None),
         is_internal_req,
         merged_rules,
-    ).await;
+    )
+    .await;
     if let Some(ms) = apply::res_delay_ms(resolved) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
@@ -4048,19 +4150,19 @@ async fn serve(
             // Read after the marker, so a request restored to https and carrying
             // no explicit port lands on 443 rather than 80 — and after the
             // upgrade rename, so a `wss://` one does too.
-            let port = uri
-                .port_u16()
-                .unwrap_or(match scheme.as_str() {
-                    "https" | "wss" => 443,
-                    _ => 80,
-                });
+            let port = uri.port_u16().unwrap_or(match scheme.as_str() {
+                "https" | "wss" => 443,
+                _ => 80,
+            });
             let path = uri
                 .path_and_query()
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "/".to_string());
             (scheme, host, port, path, uri.port_u16().is_some())
         }
-        Origin::Mitm { host, port, tls, .. } => {
+        Origin::Mitm {
+            host, port, tls, ..
+        } => {
             let path = req
                 .uri()
                 .path_and_query()
@@ -4547,8 +4649,14 @@ async fn serve(
             dest::Destination::of(&wire, &resolved)
         }
     };
-    let forwarding =
-        forwarding_resolution(&state, &info, &dest, &resolved, &merged_rules, is_internal_req);
+    let forwarding = forwarding_resolution(
+        &state,
+        &info,
+        &dest,
+        &resolved,
+        &merged_rules,
+        is_internal_req,
+    );
     let forwarding = forwarding.as_ref().unwrap_or(&resolved);
 
     // WebSocket / other protocol upgrades are tunnelled after a 101.
@@ -4709,8 +4817,11 @@ async fn serve(
                     info.full_url,
                     apply::req_body_limit(&resolved),
                 );
-                let cap =
-                    Capture::new(req_ct.clone(), req_enc.as_deref(), state.config.body_preview_cap);
+                let cap = Capture::new(
+                    req_ct.clone(),
+                    req_enc.as_deref(),
+                    state.config.body_preview_cap,
+                );
                 req_body_cap = Some(cap.clone());
                 body::tee(body, cap)
             }
@@ -4735,8 +4846,12 @@ async fn serve(
                 let restore = decoded.restore;
                 let new = apply::transform_req_body(decoded.body, &resolved, body_ctx);
                 let (new, encoded_as) = coding::reencode(new, restore, None);
-                let req_enc =
-                    restore_content_encoding(&mut parts.headers, restore, encoded_as, req_enc.clone());
+                let req_enc = restore_content_encoding(
+                    &mut parts.headers,
+                    restore,
+                    encoded_as,
+                    req_enc.clone(),
+                );
                 if let Some(path) = &req_write {
                     write_body_file(path, &new, force_write);
                 }
@@ -4778,13 +4893,15 @@ async fn serve(
         }
     } else if has_request_body(&parts.headers) {
         // No transform: stream through, copying a bounded preview for inspection.
-        let cap = Capture::new(req_ct.clone(), req_enc.as_deref(), state.config.body_preview_cap);
+        let cap = Capture::new(
+            req_ct.clone(),
+            req_enc.as_deref(),
+            state.config.body_preview_cap,
+        );
         req_body_cap = Some(cap.clone());
         let teed = body::tee(incoming, cap);
         match req_frames.take() {
-            Some(splitter) => {
-                body::frames(teed, state.clone(), frame_session, splitter, "send")
-            }
+            Some(splitter) => body::frames(teed, state.clone(), frame_session, splitter, "send"),
             None => teed,
         }
     } else {
@@ -4848,7 +4965,8 @@ async fn serve(
         ),
         is_internal_req,
         &merged_rules,
-    ).await;
+    )
+    .await;
 
     if let Some(ms) = apply::res_delay_ms(&resolved) {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
@@ -5016,143 +5134,144 @@ async fn serve(
     } else {
         streamed = Some(body);
     }
-    let res_body: DynBody =
-        if let Some((bytes, origin_trailers)) = collected {
-            // Decompress before rewriting. Every body operator works on text,
-            // and most origins answer compressed — so without this a
-            // `resReplace://` against a gzipped page searched the deflate
-            // stream for its pattern, found nothing, and silently did nothing.
-            // whistle reaches the same place from the other end: any body
-            // transform sets `_needGunzip`, which puts a decoder in front of it
-            // and a re-encoder behind (`addZipTransform`,
-            // `_original/lib/inspectors/data.js:` and `inspectors/rules.js:60-140`).
-            let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
-            let restore = decoded.restore;
-            let mut new = apply::transform_res_body(decoded.body, &resolved, res_ct.as_deref());
+    let res_body: DynBody = if let Some((bytes, origin_trailers)) = collected {
+        // Decompress before rewriting. Every body operator works on text,
+        // and most origins answer compressed — so without this a
+        // `resReplace://` against a gzipped page searched the deflate
+        // stream for its pattern, found nothing, and silently did nothing.
+        // whistle reaches the same place from the other end: any body
+        // transform sets `_needGunzip`, which puts a decoder in front of it
+        // and a re-encoder behind (`addZipTransform`,
+        // `_original/lib/inspectors/data.js:` and `inspectors/rules.js:60-140`).
+        let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
+        let restore = decoded.restore;
+        let mut new = apply::transform_res_body(decoded.body, &resolved, res_ct.as_deref());
 
-            // Response hook, part 2: plugins that asked for the body. It sits
-            // between the content operators and the injections, which is why
-            // those two halves are separate functions.
-            for (name, param) in plugin_matches.iter() {
-                let Some(manifest) = state.plugins.manifest(name).await else {
-                    continue;
-                };
-                if !manifest.on_response || !manifest.response_body {
-                    continue;
-                }
-                let pres = crate::plugins::PluginRes {
-                    id: plugin_req_id,
-                    method: info.method.clone(),
-                    url: info.full_url.clone(),
-                    status: parts.status.as_u16(),
-                    headers: header_pairs(&parts.headers),
-                    param: param.clone(),
-                    body: Some(new.to_vec()),
-                };
-                if let Some(result) = state.plugins.on_response(name, &pres).await
-                    && let Some(replaced) = apply_plugin_res_result(&mut parts, result)
-                {
-                    new = Bytes::from(replaced);
-                }
+        // Response hook, part 2: plugins that asked for the body. It sits
+        // between the content operators and the injections, which is why
+        // those two halves are separate functions.
+        for (name, param) in plugin_matches.iter() {
+            let Some(manifest) = state.plugins.manifest(name).await else {
+                continue;
+            };
+            if !manifest.on_response || !manifest.response_body {
+                continue;
             }
-            let new = inject_res_body(&state, &mut parts, new, &ops, &info);
-            // Put the coding back on, so the client gets what the header
-            // promises. `enable://gzip|br|deflate` asks for a *different* one
-            // than arrived (`getEnableEncoding`,
-            // `_original/lib/util/index.js:1534-1548`) — the only case where the
-            // body leaves compressed that arrived plain.
-            let (new, encoded_as) = coding::reencode(new, restore, ops.force_encoding);
-            let now =
-                restore_content_encoding(&mut parts.headers, restore, encoded_as, res_enc.clone());
-            if !new.is_empty() {
-                res_body_cap = Some(Capture::from_bytes(
-                    &new,
-                    res_ct.clone(),
-                    // The preview decodes what it is told the body is, so it has
-                    // to be told what the body *now* is, not what arrived.
-                    now.as_deref(),
-                    state.config.body_preview_cap,
-                ));
-            }
-            // A buffered body is framed too, out of the bytes the client will
-            // receive — the same rule and the same separator, applied at once
-            // rather than as they arrive.
-            if let Some(mut splitter) =
-                response_frames(&resolved, &mut parts.headers, now.as_deref()).filter(|_| !hidden)
+            let pres = crate::plugins::PluginRes {
+                id: plugin_req_id,
+                method: info.method.clone(),
+                url: info.full_url.clone(),
+                status: parts.status.as_u16(),
+                headers: header_pairs(&parts.headers),
+                param: param.clone(),
+                body: Some(new.to_vec()),
+            };
+            if let Some(result) = state.plugins.on_response(name, &pres).await
+                && let Some(replaced) = apply_plugin_res_result(&mut parts, result)
             {
-                buffered_frames.extend(
-                    splitter
-                        .push(&new)
-                        .into_iter()
-                        .chain(splitter.finish())
-                        .map(|payload| ("receive", payload)),
-                );
+                new = Bytes::from(replaced);
             }
-            finish_res_body(&mut parts, new, ops, origin_trailers)
-        } else {
-            let body = streamed.expect("collected or streamed, never neither");
-            // Stream through, copying a bounded preview for inspection. The
-            // origin's trailers ride along untouched — unless a `disable://`
-            // asked for them to go, which this path acts on.
-            //
-            // One operator can travel with a body that is still arriving:
-            // `resReplace://` needs a window, not the whole thing. See
-            // [`stream_replace`] for what disqualifies a stream.
-            let body = match stream_replace(&resolved, res_ct.as_deref(), res_enc.as_deref()) {
-                Some(transform) => {
-                    // A substitution changes the length, so a promise about it
-                    // cannot be kept. An event stream does not carry one, but
-                    // the removal belongs with the rewrite rather than with the
-                    // assumption.
-                    parts.headers.remove(hyper::header::CONTENT_LENGTH);
-                    restream::wrap(body, transform)
-                }
-                None => body,
-            };
-            // …and three more that do not need the whole body either:
-            // `resPrepend://` goes ahead of the first byte, `resAppend://`
-            // after the last, and `resBody://` says there is no origin body to
-            // wait for. They sit *after* the substitution because that is the
-            // buffered path's order too — upstream's text transforms run ahead
-            // of the injection, so a `resReplace://` never sees what a
-            // `resPrepend://` put there (`_original/lib/inspectors/res.js`, and
-            // see `transform_res_body`).
-            let body = match stream_injection(&resolved, res_ct.as_deref()) {
-                Some(inject) => {
-                    parts.headers.remove(hyper::header::CONTENT_LENGTH);
-                    let origin = match inject.replacement {
-                        // `resBody://` replaces the body, so the origin's is
-                        // not waited for — dropping it here is what makes this
-                        // usable as a mock for a stream that never ends.
-                        Some(replacement) => body::full(replacement),
-                        None => body,
-                    };
-                    body::surround(origin, inject.top, inject.bottom)
-                }
-                None => body,
-            };
-            // The capture records what the client receives, so it sits *after*
-            // the substitution — as it does on the buffered path, where the
-            // preview is built from the rewritten bytes.
-            let cap = Capture::new(res_ct.clone(), res_enc.as_deref(), state.config.body_preview_cap);
-            res_body_cap = Some(cap.clone());
-            let teed = body::tee(body, cap);
-            // …and, for a stream the console shows as frames, one more watcher.
-            // It sits after the capture for the reason the capture sits after
-            // the substitution: a frame is what the client received.
-            let framed = match response_frames(&resolved, &mut parts.headers, res_enc.as_deref())
-                .filter(|_| !hidden)
-            {
-                Some(splitter) => {
-                    body::frames(teed, state.clone(), frame_session, splitter, "receive")
-                }
-                None => teed,
-            };
-            match ops.no_trailers {
-                true => retrailer(framed, None),
-                false => framed,
+        }
+        let new = inject_res_body(&state, &mut parts, new, &ops, &info);
+        // Put the coding back on, so the client gets what the header
+        // promises. `enable://gzip|br|deflate` asks for a *different* one
+        // than arrived (`getEnableEncoding`,
+        // `_original/lib/util/index.js:1534-1548`) — the only case where the
+        // body leaves compressed that arrived plain.
+        let (new, encoded_as) = coding::reencode(new, restore, ops.force_encoding);
+        let now =
+            restore_content_encoding(&mut parts.headers, restore, encoded_as, res_enc.clone());
+        if !new.is_empty() {
+            res_body_cap = Some(Capture::from_bytes(
+                &new,
+                res_ct.clone(),
+                // The preview decodes what it is told the body is, so it has
+                // to be told what the body *now* is, not what arrived.
+                now.as_deref(),
+                state.config.body_preview_cap,
+            ));
+        }
+        // A buffered body is framed too, out of the bytes the client will
+        // receive — the same rule and the same separator, applied at once
+        // rather than as they arrive.
+        if let Some(mut splitter) =
+            response_frames(&resolved, &mut parts.headers, now.as_deref()).filter(|_| !hidden)
+        {
+            buffered_frames.extend(
+                splitter
+                    .push(&new)
+                    .into_iter()
+                    .chain(splitter.finish())
+                    .map(|payload| ("receive", payload)),
+            );
+        }
+        finish_res_body(&mut parts, new, ops, origin_trailers)
+    } else {
+        let body = streamed.expect("collected or streamed, never neither");
+        // Stream through, copying a bounded preview for inspection. The
+        // origin's trailers ride along untouched — unless a `disable://`
+        // asked for them to go, which this path acts on.
+        //
+        // One operator can travel with a body that is still arriving:
+        // `resReplace://` needs a window, not the whole thing. See
+        // [`stream_replace`] for what disqualifies a stream.
+        let body = match stream_replace(&resolved, res_ct.as_deref(), res_enc.as_deref()) {
+            Some(transform) => {
+                // A substitution changes the length, so a promise about it
+                // cannot be kept. An event stream does not carry one, but
+                // the removal belongs with the rewrite rather than with the
+                // assumption.
+                parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                restream::wrap(body, transform)
             }
+            None => body,
         };
+        // …and three more that do not need the whole body either:
+        // `resPrepend://` goes ahead of the first byte, `resAppend://`
+        // after the last, and `resBody://` says there is no origin body to
+        // wait for. They sit *after* the substitution because that is the
+        // buffered path's order too — upstream's text transforms run ahead
+        // of the injection, so a `resReplace://` never sees what a
+        // `resPrepend://` put there (`_original/lib/inspectors/res.js`, and
+        // see `transform_res_body`).
+        let body = match stream_injection(&resolved, res_ct.as_deref()) {
+            Some(inject) => {
+                parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                let origin = match inject.replacement {
+                    // `resBody://` replaces the body, so the origin's is
+                    // not waited for — dropping it here is what makes this
+                    // usable as a mock for a stream that never ends.
+                    Some(replacement) => body::full(replacement),
+                    None => body,
+                };
+                body::surround(origin, inject.top, inject.bottom)
+            }
+            None => body,
+        };
+        // The capture records what the client receives, so it sits *after*
+        // the substitution — as it does on the buffered path, where the
+        // preview is built from the rewritten bytes.
+        let cap = Capture::new(
+            res_ct.clone(),
+            res_enc.as_deref(),
+            state.config.body_preview_cap,
+        );
+        res_body_cap = Some(cap.clone());
+        let teed = body::tee(body, cap);
+        // …and, for a stream the console shows as frames, one more watcher.
+        // It sits after the capture for the reason the capture sits after
+        // the substitution: a frame is what the client received.
+        let framed = match response_frames(&resolved, &mut parts.headers, res_enc.as_deref())
+            .filter(|_| !hidden)
+        {
+            Some(splitter) => body::frames(teed, state.clone(), frame_session, splitter, "receive"),
+            None => teed,
+        };
+        match ops.no_trailers {
+            true => retrailer(framed, None),
+            false => framed,
+        }
+    };
     // `receive` runs from the response head to the last byte, so it is stamped
     // by the body itself — on both paths, because a buffered body was received
     // too; it was simply received before the operators ran.
@@ -5590,7 +5709,9 @@ mod upgrade_abort_tests {
 
         let (_state, addr) = proxy_with(&format!("http://{origin} enable://abortRes")).await;
         assert!(
-            handshake_through(addr, origin, "/ws").await.starts_with(b"HTTP/1.1 101"),
+            handshake_through(addr, origin, "/ws")
+                .await
+                .starts_with(b"HTTP/1.1 101"),
             "an http:// pattern must not reach a WebSocket"
         );
 
@@ -5600,7 +5721,9 @@ mod upgrade_abort_tests {
         // relays the handshake; this port used to answer `404 Not found file`.
         let (_state, addr) = proxy_with(&format!("{origin} file:///no/such/mock.json")).await;
         assert!(
-            handshake_through(addr, origin, "/ws").await.starts_with(b"HTTP/1.1 101"),
+            handshake_through(addr, origin, "/ws")
+                .await
+                .starts_with(b"HTTP/1.1 101"),
             "a file rule must not answer an upgrade"
         );
     }
@@ -5779,12 +5902,7 @@ fn set_header_raw(headers: &mut hyper::HeaderMap, name: &str, value: &str) {
 }
 
 /// Ensure a correct `Host` header for the upstream request.
-fn ensure_host_header(
-    headers: &mut hyper::HeaderMap,
-    host: &str,
-    port: u16,
-    scheme: &str,
-) {
+fn ensure_host_header(headers: &mut hyper::HeaderMap, host: &str, port: u16, scheme: &str) {
     let default_port = if dest::is_tls(scheme) { 443 } else { 80 };
     let value = if port == default_port {
         host.to_string()
@@ -6014,7 +6132,11 @@ mod trailer_tests {
         no_trailers: bool,
         speed: Option<f64>,
         body_len: usize,
-    ) -> (hyper::http::response::Parts, Vec<Bytes>, Option<hyper::HeaderMap>) {
+    ) -> (
+        hyper::http::response::Parts,
+        Vec<Bytes>,
+        Option<hyper::HeaderMap>,
+    ) {
         let mut parts = Response::builder()
             .status(200)
             .body(())
@@ -6061,7 +6183,10 @@ mod trailer_tests {
             None,
             8,
         );
-        assert_eq!(names(&trailers), ["x-both=origin", "x-origin=2", "x-rule=1"]);
+        assert_eq!(
+            names(&trailers),
+            ["x-both=origin", "x-origin=2", "x-rule=1"]
+        );
         // The `Trailer:` header announces everything that is coming.
         let announced = parts.headers.get("trailer").unwrap().to_str().unwrap();
         for name in ["x-origin", "x-both", "x-rule"] {
@@ -6087,8 +6212,7 @@ mod trailer_tests {
     /// upstream's guard is on the way out, after the merge (`res.js:1252-1260`).
     #[test]
     fn disabling_trailers_drops_the_origins_too() {
-        let (parts, frames, trailers) =
-            finish(&[], Some(&[("x-origin", "2")]), true, None, 8);
+        let (parts, frames, trailers) = finish(&[], Some(&[("x-origin", "2")]), true, None, 8);
         assert!(trailers.is_none(), "no trailer section may be sent");
         assert!(parts.headers.get("trailer").is_none());
         assert_eq!(frames.len(), 1, "the body itself is untouched");
@@ -6157,7 +6281,12 @@ mod trailer_tests {
             content: true,
             ..ResBodyOps::default()
         };
-        let (_, trailers) = drain(finish_res_body(&mut parts, Bytes::from_static(b"x"), ops, None));
+        let (_, trailers) = drain(finish_res_body(
+            &mut parts,
+            Bytes::from_static(b"x"),
+            ops,
+            None,
+        ));
         assert_eq!(names(&trailers), ["x-a=1"]);
         assert!(parts.headers.get("trailer").is_none());
     }
@@ -6208,7 +6337,15 @@ mod pipe_wiring_tests {
             let mut headers = headers_with_length();
             let (tx, source) = body::channel(4);
 
-            let out = pipe_body(&state, &[], Dir::Response, PipeMeta::default(), &mut headers, source).await;
+            let out = pipe_body(
+                &state,
+                &[],
+                Dir::Response,
+                PipeMeta::default(),
+                &mut headers,
+                source,
+            )
+            .await;
 
             // Nothing was read, so these frames still reach the client.
             tokio::spawn(async move {
@@ -6251,7 +6388,10 @@ mod pipe_wiring_tests {
                 body::full("as-is"),
             )
             .await;
-            assert_eq!(collect_body(out).await.expect("body"), Bytes::from_static(b"as-is"));
+            assert_eq!(
+                collect_body(out).await.expect("body"),
+                Bytes::from_static(b"as-is")
+            );
             assert_eq!(headers.get(hyper::header::CONTENT_LENGTH).unwrap(), "9");
         });
     }
@@ -6282,7 +6422,10 @@ mod pipe_wiring_tests {
                 body::full("shout"),
             )
             .await;
-            assert_eq!(collect_body(out).await.expect("body"), Bytes::from_static(b"SHOUT"));
+            assert_eq!(
+                collect_body(out).await.expect("body"),
+                Bytes::from_static(b"SHOUT")
+            );
             assert!(headers.get(hyper::header::CONTENT_LENGTH).is_none());
         });
     }
@@ -6372,8 +6515,14 @@ mod internal_req_tests {
             &hyper::HeaderMap::new(),
             None,
         );
-        assert_eq!(mgr.resolve_scoped(&info, false).value("host"), Some("1.1.1.1"));
-        assert_eq!(mgr.resolve_scoped(&info, true).value("host"), Some("2.2.2.2"));
+        assert_eq!(
+            mgr.resolve_scoped(&info, false).value("host"),
+            Some("1.1.1.1")
+        );
+        assert_eq!(
+            mgr.resolve_scoped(&info, true).value("host"),
+            Some("2.2.2.2")
+        );
     }
 }
 
@@ -6585,10 +6734,7 @@ mod local_response_tests {
             crate::plugins::PluginResult::default()
         }
 
-        fn on_response(
-            &self,
-            res: &crate::plugins::PluginRes,
-        ) -> crate::plugins::PluginResResult {
+        fn on_response(&self, res: &crate::plugins::PluginRes) -> crate::plugins::PluginResResult {
             // The header proves the body arrived; the body proves what comes
             // back replaces it.
             let seen = res.body.clone().unwrap_or_default();
@@ -6708,7 +6854,10 @@ mod local_response_tests {
             "answered",
         );
         assert_eq!(
-            parts.headers.get("x-stamped-by").map(|v| v.to_str().unwrap()),
+            parts
+                .headers
+                .get("x-stamped-by")
+                .map(|v| v.to_str().unwrap()),
             Some("whistle-rs"),
             "the response hook of a matched plugin must see a local answer"
         );
@@ -6872,13 +7021,22 @@ mod req_origin_tests {
             tls,
             sni,
         };
-        assert_eq!(of(&mitm(true, true)), crate::rules::ReqOrigin {
-            tunnel: true, sni: true, composer: false,
-        });
-        assert_eq!(of(&mitm(false, false)), crate::rules::ReqOrigin {
-            tunnel: true, sni: false, composer: false,
-        });
+        assert_eq!(
+            of(&mitm(true, true)),
+            crate::rules::ReqOrigin {
+                tunnel: true,
+                sni: true,
+                composer: false,
+            }
+        );
+        assert_eq!(
+            of(&mitm(false, false)),
+            crate::rules::ReqOrigin {
+                tunnel: true,
+                sni: false,
+                composer: false,
+            }
+        );
         assert_eq!(of(&Origin::Forward), crate::rules::ReqOrigin::default());
     }
 }
-

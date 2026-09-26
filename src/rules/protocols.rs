@@ -430,7 +430,10 @@ pub fn is_file_protocol(name: &str) -> bool {
 /// `rule.url`, so a pattern that leaves part of the path unmatched gives each
 /// URL its own dump file. See [`crate::rules::matcher`]'s `joins_tail`.
 pub fn is_write_protocol(name: &str) -> bool {
-    matches!(name, "reqWrite" | "reqWriteRaw" | "resWrite" | "resWriteRaw")
+    matches!(
+        name,
+        "reqWrite" | "reqWriteRaw" | "resWrite" | "resWriteRaw"
+    )
 }
 
 /// Returns true if `name` is a protocol whistle recognises (canonical, alias, or
@@ -505,10 +508,27 @@ mod tests {
     /// reduce a whole accumulating family to a single winner.
     #[test]
     fn the_shared_slot_holds_the_family_upstream_files_under_rule() {
-        for name in ["file", "xfile", "xsfile", "rawfile", "xrawfile", "tpl", "xtpl", "jsonp",
-                     "xjsonp", "dust", "xdust", "statusCode", "redirect",
-                     "locationHref", URL_REPLACE] {
-            assert!(is_slot_protocol(name), "{name} shares the rule list upstream");
+        for name in [
+            "file",
+            "xfile",
+            "xsfile",
+            "rawfile",
+            "xrawfile",
+            "tpl",
+            "xtpl",
+            "jsonp",
+            "xjsonp",
+            "dust",
+            "xdust",
+            "statusCode",
+            "redirect",
+            "locationHref",
+            URL_REPLACE,
+        ] {
+            assert!(
+                is_slot_protocol(name),
+                "{name} shares the rule list upstream"
+            );
         }
         // `location://` is **not** one of them, and not a protocol at all: it is
         // absent from upstream's array and from its alias table, so
@@ -525,8 +545,19 @@ mod tests {
         assert_eq!(canonical("status"), Some("statusCode"));
         // Everything with a key of its own, including the three the slot is
         // most easily confused with.
-        for name in ["urlReplace", "pathReplace", "host", "proxy", "pac", "replaceStatus",
-                     "resBody", "reqHeaders", "plugin", "ignore", RULE_INCLUDE] {
+        for name in [
+            "urlReplace",
+            "pathReplace",
+            "host",
+            "proxy",
+            "pac",
+            "replaceStatus",
+            "resBody",
+            "reqHeaders",
+            "plugin",
+            "ignore",
+            RULE_INCLUDE,
+        ] {
             assert!(!is_slot_protocol(name), "{name} has a list of its own");
         }
     }
@@ -537,7 +568,10 @@ mod tests {
     #[test]
     fn tool_protocols_are_response_phase() {
         for name in TOOL_PROTOCOLS {
-            assert!(is_res_phase(name), "{name} must be resolved in the res phase");
+            assert!(
+                is_res_phase(name),
+                "{name} must be resolved in the res phase"
+            );
         }
     }
 
@@ -560,7 +594,15 @@ mod tests {
         }
         // The families that must *not* move: the request operators, the body
         // operators and the flag protocols all keep the first pass's answer.
-        for name in ["reqHeaders", "cipher", "enable", "disable", "filter", "rule", "plugin"] {
+        for name in [
+            "reqHeaders",
+            "cipher",
+            "enable",
+            "disable",
+            "filter",
+            "rule",
+            "plugin",
+        ] {
             assert!(!list.contains(&name), "{name} must not be re-resolved");
         }
     }

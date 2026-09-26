@@ -27,7 +27,11 @@ pub fn expand(value: &str, groups: &[&str]) -> String {
     let mut i = 0;
     while i < bytes.len() {
         // At most two, matching `\\{0,2}` — a third backslash is literal.
-        let slashes = bytes[i..].iter().take_while(|b| **b == b'\\').count().min(2);
+        let slashes = bytes[i..]
+            .iter()
+            .take_while(|b| **b == b'\\')
+            .count()
+            .min(2);
         let rest = &bytes[i + slashes..];
         // `$`, an optional second `$` (encode), an optional `b`, then `&` or a digit.
         let (encode, after_dollars) = match rest {

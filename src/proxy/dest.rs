@@ -282,7 +282,10 @@ mod tests {
     /// The rule whistle's getting-started guide leads with.
     #[test]
     fn a_bare_url_forwards_the_request() {
-        let d = dest("www.example.com http://localhost:5173\n", "https://www.example.com/a/b?q=1");
+        let d = dest(
+            "www.example.com http://localhost:5173\n",
+            "https://www.example.com/a/b?q=1",
+        );
         assert!(d.replaced);
         assert_eq!(d.scheme, "http");
         assert_eq!(d.host, "localhost");
@@ -297,7 +300,10 @@ mod tests {
     fn a_path_pattern_maps_onto_the_destination_path() {
         for (url, want) in [
             ("http://www.example.com/path1", "/path/xxx"),
-            ("http://www.example.com/path1/a/b/c?query", "/path/xxx/a/b/c?query"),
+            (
+                "http://www.example.com/path1/a/b/c?query",
+                "/path/xxx/a/b/c?query",
+            ),
             ("http://www.example.com/path1/", "/path/xxx/"),
         ] {
             let d = dest("www.example.com/path1 http://www.test.com/path/xxx\n", url);
@@ -324,9 +330,15 @@ mod tests {
     #[test]
     fn a_scheme_less_destination_keeps_the_request_scheme() {
         let d = dest("a.com //b.com/x\n", "https://a.com/y");
-        assert_eq!((d.scheme.as_str(), d.host.as_str(), d.port), ("https", "b.com", 443));
+        assert_eq!(
+            (d.scheme.as_str(), d.host.as_str(), d.port),
+            ("https", "b.com", 443)
+        );
         let d = dest("a.com b.com:8080\n", "https://a.com/y");
-        assert_eq!((d.scheme.as_str(), d.host.as_str(), d.port), ("https", "b.com", 8080));
+        assert_eq!(
+            (d.scheme.as_str(), d.host.as_str(), d.port),
+            ("https", "b.com", 8080)
+        );
     }
 
     /// No rule, or a rule pointing where the request was already going, leaves
@@ -337,7 +349,12 @@ mod tests {
         assert!(!dest("a.com/x http://a.com/x\n", "http://a.com/x").replaced);
         let plain = dest("", "http://a.com/x");
         assert_eq!(
-            (plain.scheme.as_str(), plain.host.as_str(), plain.port, plain.path.as_str()),
+            (
+                plain.scheme.as_str(),
+                plain.host.as_str(),
+                plain.port,
+                plain.path.as_str()
+            ),
             ("http", "a.com", 80, "/x")
         );
     }
@@ -412,7 +429,10 @@ mod tests {
         let d = dest("a.com/y http://b.com:8080/x\n", "https://a.com/y");
         let moved = d.moved_req_info(&info);
         assert_eq!(moved.full_url, "http://b.com:8080/x");
-        assert_eq!((moved.scheme.as_str(), moved.host.as_str(), moved.port), ("http", "b.com", 8080));
+        assert_eq!(
+            (moved.scheme.as_str(), moved.host.as_str(), moved.port),
+            ("http", "b.com", 8080)
+        );
         assert_eq!(moved.method, info.method);
 
         let d = dest("a.com/y http://b.com/x\n", "https://a.com/y");

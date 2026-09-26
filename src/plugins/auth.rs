@@ -381,7 +381,10 @@ mod tests {
     #[test]
     fn allow_shapes() {
         assert_eq!(parse_reply(b"{}"), AuthVerdict::Allow(Vec::new()));
-        assert_eq!(parse_reply(br#"{"allow":true}"#), AuthVerdict::Allow(Vec::new()));
+        assert_eq!(
+            parse_reply(br#"{"allow":true}"#),
+            AuthVerdict::Allow(Vec::new())
+        );
         // An empty successful reply is "nothing to say", which is an allow.
         assert_eq!(parse_reply(b""), AuthVerdict::Allow(Vec::new()));
         assert_eq!(parse_reply(b"  \n"), AuthVerdict::Allow(Vec::new()));
@@ -450,29 +453,40 @@ mod tests {
             let plain = deny_response("g", &Denial::forbidden()).await;
             assert_eq!(plain.status, 403);
             assert_eq!(plain.body, DEFAULT_BODY.as_bytes());
-            assert!(plain
-                .headers
-                .iter()
-                .any(|(k, v)| k == AUTH_HEADER && v == "g"));
+            assert!(
+                plain
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == AUTH_HEADER && v == "g")
+            );
 
             let login = deny_response("g", &deny(r#"{"allow":false,"login":true}"#)).await;
             assert_eq!(login.status, 401);
-            assert!(login
-                .headers
-                .iter()
-                .any(|(k, v)| k == "www-authenticate" && v.starts_with("Basic")));
+            assert!(
+                login
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "www-authenticate" && v.starts_with("Basic"))
+            );
 
             let tunnel = deny_response("g", &deny(r#"{"allow":false,"statusCode":407}"#)).await;
             assert_eq!(tunnel.status, 407);
-            assert!(tunnel.headers.iter().any(|(k, _)| k == "proxy-authenticate"));
+            assert!(
+                tunnel
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k == "proxy-authenticate")
+            );
 
             let redirect =
                 deny_response("g", &deny(r#"{"allow":false,"redirect":"http://a/login"}"#)).await;
             assert_eq!(redirect.status, 302);
-            assert!(redirect
-                .headers
-                .iter()
-                .any(|(k, v)| k == "location" && v == "http://a/login"));
+            assert!(
+                redirect
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "location" && v == "http://a/login")
+            );
             assert!(redirect.body.is_empty());
 
             let failed = deny_response("g", &Denial::failed("boom")).await;
@@ -503,7 +517,9 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("whistle-rs-auth-{}", std::process::id()));
             tokio::fs::create_dir_all(&dir).await.expect("mkdir");
             let path = dir.join("blocked.html");
-            tokio::fs::write(&path, b"<h1>nope</h1>").await.expect("write");
+            tokio::fs::write(&path, b"<h1>nope</h1>")
+                .await
+                .expect("write");
 
             let d = Denial {
                 page: DenyPage::Fetch(path.to_string_lossy().into_owned()),
@@ -539,8 +555,17 @@ mod tests {
     fn block_pages_are_bounded() {
         let huge = vec![b'a'; MAX_PAGE_BYTES + 4096];
         assert_eq!(truncate(huge).len(), MAX_PAGE_BYTES);
-        assert_eq!(content_type_for("/a/b.json"), "application/json; charset=utf-8");
-        assert_eq!(content_type_for("http://a/b.html?x=1"), "text/html; charset=utf-8");
-        assert_eq!(content_type_for("/no-extension"), "text/html; charset=utf-8");
+        assert_eq!(
+            content_type_for("/a/b.json"),
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(
+            content_type_for("http://a/b.html?x=1"),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            content_type_for("/no-extension"),
+            "text/html; charset=utf-8"
+        );
     }
 }

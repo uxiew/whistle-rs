@@ -145,10 +145,7 @@ pub fn parse(pattern: &str, negate: bool) -> Parsed {
     let pre_len = pattern.len() - after_exact.len() + protocol.len() + domain.len();
 
     let start_with_dot = dot_domain(domain);
-    if !start_with_dot
-        && !protocol.contains('*')
-        && !domain.contains('*')
-        && !domain.contains('~')
+    if !start_with_dot && !protocol.contains('*') && !domain.contains('*') && !domain.contains('~')
     {
         return Parsed::NotWildcard;
     }
@@ -439,7 +436,10 @@ fn is_suffix(domain: &str) -> bool {
     let Some(rest) = domain.strip_prefix("\\.") else {
         return false;
     };
-    !rest.is_empty() && rest.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Where a `scheme://` prefix ends — `(?:[a-z*]+):\/\/` in `WILDCARD_RE`.
@@ -456,7 +456,9 @@ fn scheme_prefix(url: &str) -> Option<usize> {
 fn reg_url_scheme(url: &str) -> Option<usize> {
     if let Some(i) = url.find("://")
         && i > 0
-        && url[..i].bytes().all(|b| b.is_ascii_lowercase() || b == b'*')
+        && url[..i]
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'*')
     {
         return Some(i + 3);
     }
@@ -573,15 +575,27 @@ mod tests {
     /// The examples from `_original/docs/docs/rules/pattern.md`, "域名通配符".
     #[test]
     fn a_host_star_stops_at_a_dot() {
-        assert!(hits("https://*.example.com/path/to", "https://www.example.com/path/to"));
+        assert!(hits(
+            "https://*.example.com/path/to",
+            "https://www.example.com/path/to"
+        ));
         assert!(hits(
             "https://*.example.com/path/to",
             "https://abc.example.com/path/to/xxx?query"
         ));
-        assert!(!hits("https://*.example.com/path/to", "https://a.b.example.com/path/to"));
+        assert!(!hits(
+            "https://*.example.com/path/to",
+            "https://a.b.example.com/path/to"
+        ));
         // `**` crosses dots, and a star in the port matches part of it.
-        assert!(hits("https://**.example.com:8*/path/to", "https://a.b.example.com:8080/path/to"));
-        assert!(hits("https://**.example.com:8*/path/to", "https://foo-bar.example.com:8888/path/to"));
+        assert!(hits(
+            "https://**.example.com:8*/path/to",
+            "https://a.b.example.com:8080/path/to"
+        ));
+        assert!(hits(
+            "https://**.example.com:8*/path/to",
+            "https://foo-bar.example.com:8888/path/to"
+        ));
     }
 
     /// The bug this replaced: `*.example.com` compiled to `^.*\.example\.com`,
@@ -589,8 +603,14 @@ mod tests {
     /// one site applied to every site that linked to it.
     #[test]
     fn a_leading_star_cannot_escape_into_the_path() {
-        assert!(!hits("*.example.com", "http://evil.test/?next=a.example.com"));
-        assert!(!hits("*.example.com/api", "http://evil.test/api?x=a.example.com"));
+        assert!(!hits(
+            "*.example.com",
+            "http://evil.test/?next=a.example.com"
+        ));
+        assert!(!hits(
+            "*.example.com/api",
+            "http://evil.test/api?x=a.example.com"
+        ));
         assert!(hits("*.example.com", "http://a.example.com/"));
     }
 
@@ -599,7 +619,10 @@ mod tests {
     #[test]
     fn a_path_star_is_literal_without_the_caret() {
         assert!(hits("*.example.com/api/*", "http://a.example.com/api/*"));
-        assert!(!hits("*.example.com/api/*", "http://a.example.com/api/users"));
+        assert!(!hits(
+            "*.example.com/api/*",
+            "http://a.example.com/api/users"
+        ));
     }
 
     /// …and with the caret it is a wildcard, in the path and the query alike.
@@ -644,7 +667,9 @@ mod tests {
         let Parsed::Wildcard(w) = parse("*.example.com/api", false) else {
             panic!("not a wildcard");
         };
-        let m = w.match_url("http://a.example.com/api/users?x=1", true).expect("matches");
+        let m = w
+            .match_url("http://a.example.com/api/users?x=1", true)
+            .expect("matches");
         assert_eq!(m.tail, "/users?x=1");
         assert_eq!(m.groups.expect("asked for groups")[1], "a");
         // The boundary rule still applies.
@@ -655,12 +680,20 @@ mod tests {
     /// to plain prefix matching.
     #[test]
     fn a_pattern_without_stars_is_not_a_wildcard() {
-        assert!(matches!(parse("example.com/api", false), Parsed::NotWildcard));
-        assert!(matches!(parse("http://example.com", false), Parsed::NotWildcard));
+        assert!(matches!(
+            parse("example.com/api", false),
+            Parsed::NotWildcard
+        ));
+        assert!(matches!(
+            parse("http://example.com", false),
+            Parsed::NotWildcard
+        ));
         // A negated wildcard is dropped rather than inverted.
         assert!(matches!(parse("*.example.com", true), Parsed::Dropped));
         // A leading-dot host is a wildcard even with no star.
-        assert!(matches!(parse(".example.com/x", false), Parsed::Wildcard(_)));
+        assert!(matches!(
+            parse(".example.com/x", false),
+            Parsed::Wildcard(_)
+        ));
     }
 }
-

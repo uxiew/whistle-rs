@@ -119,18 +119,31 @@ where
             }
             // Not a ClientHello, or not one rustls will parse. Hand the bytes
             // back untouched and let the real handshake say so.
-            Err(_) => return Hello { prefix, server_name: None },
+            Err(_) => {
+                return Hello {
+                    prefix,
+                    server_name: None,
+                };
+            }
             Ok(None) => {}
         }
         if prefix.len() >= MAX_HELLO_BYTES {
-            return Hello { prefix, server_name: None };
+            return Hello {
+                prefix,
+                server_name: None,
+            };
         }
         // Straight into the buffer's spare capacity: a stack array here would be
         // zeroed on every pass *and* would make this future — which is held for
         // the life of the connection — carry it.
         prefix.reserve(PEEK_CHUNK);
         match stream.read_buf(&mut prefix).await {
-            Ok(0) | Err(_) => return Hello { prefix, server_name: None },
+            Ok(0) | Err(_) => {
+                return Hello {
+                    prefix,
+                    server_name: None,
+                };
+            }
             Ok(_) => {}
         }
     }
@@ -275,7 +288,9 @@ async fn relay_decision(
 /// upstream reads it. The three spellings are one question there and one here.
 fn no_intercept(resolved: &crate::rules::Resolved) -> bool {
     let disabled = crate::proxy::apply::disabled_flags(resolved);
-    ["intercept", "https", "capture"].iter().any(|f| disabled.contains(*f))
+    ["intercept", "https", "capture"]
+        .iter()
+        .any(|f| disabled.contains(*f))
 }
 
 /// What is actually travelling inside a `CONNECT` tunnel.
@@ -346,7 +361,10 @@ fn http_request_line(text: &str) -> bool {
 /// A bracketed IPv6 authority is unwrapped first: whichever way the CONNECT line
 /// spelled it, `net.isIP` is given the address alone.
 fn is_ip_literal(host: &str) -> bool {
-    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     bare.parse::<std::net::IpAddr>().is_ok()
 }
 
@@ -408,7 +426,9 @@ fn declines_at_client_hello(
     if disabled.contains("captureIp") || disabled.contains("captureIP") {
         return true;
     }
-    !["capture", "captureIp", "captureIP"].iter().any(|f| enabled.contains(*f))
+    !["capture", "captureIp", "captureIP"]
+        .iter()
+        .any(|f| enabled.contains(*f))
 }
 
 /// The same question for a tunnel that turned out to be carrying **cleartext**:
@@ -546,7 +566,9 @@ pub async fn decide(
                 cert.mtime,
             ) {
                 Ok(acceptor) => {
-                    tracing::debug!("sniCallback {plugin}: serving its certificate for {servername}");
+                    tracing::debug!(
+                        "sniCallback {plugin}: serving its certificate for {servername}"
+                    );
                     Decision::Plugin(acceptor)
                 }
                 // Unusable material is a failure to communicate, not a
@@ -904,7 +926,10 @@ mod tests {
                             .unwrap()
                             .push((path.clone(), String::from_utf8_lossy(&payload).into_owned()));
                         let (status, out) = if path == "/manifest" {
-                            (200, r#"{"name":"certs","version":"1","hooks":["sni"]}"#.to_string())
+                            (
+                                200,
+                                r#"{"name":"certs","version":"1","hooks":["sni"]}"#.to_string(),
+                            )
                         } else if path == "/sni" {
                             (status, body)
                         } else {
@@ -923,7 +948,12 @@ mod tests {
         }
 
         fn paths(&self) -> Vec<String> {
-            self.seen.lock().unwrap().iter().map(|(p, _)| p.clone()).collect()
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(p, _)| p.clone())
+                .collect()
         }
 
         fn last_payload(&self) -> String {
@@ -998,8 +1028,10 @@ mod tests {
 
         // `host://` still moves the socket, exactly as it does for a connection
         // a plugin declined to intercept.
-        let state = relaying_state("example.test host://10.0.0.9
-");
+        let state = relaying_state(
+            "example.test host://10.0.0.9
+",
+        );
         match decide_for(&state, "example.test").await {
             Decision::Bypass(target) => assert_eq!(target.connect_host, "10.0.0.9"),
             _ => panic!("expected a relay"),
@@ -1007,10 +1039,15 @@ mod tests {
 
         // And a proxy rule that cannot be honoured still closes the connection
         // rather than putting the bytes on the wire it was told to divert.
-        let state = relaying_state("example.test proxy://
-");
+        let state = relaying_state(
+            "example.test proxy://
+",
+        );
         assert!(
-            matches!(decide_for(&state, "example.test").await, Decision::Unroutable(_)),
+            matches!(
+                decide_for(&state, "example.test").await,
+                Decision::Unroutable(_)
+            ),
             "an unusable proxy rule must not fail open"
         );
     }
@@ -1036,7 +1073,10 @@ mod tests {
         for spelling in ["intercept", "https", "capture"] {
             let state = state_with(&format!("example.test disable://{spelling}\n"), None);
             assert!(
-                matches!(decide_for(&state, "example.test").await, Decision::Bypass(_)),
+                matches!(
+                    decide_for(&state, "example.test").await,
+                    Decision::Bypass(_)
+                ),
                 "disable://{spelling} should relay"
             );
         }
@@ -1074,17 +1114,38 @@ mod tests {
             decide_for(&state, "example.test").await,
             Decision::Bypass(_)
         ));
-        assert!(plugin.seen.lock().unwrap().is_empty(), "the hook must not be asked");
+        assert!(
+            plugin.seen.lock().unwrap().is_empty(),
+            "the hook must not be asked"
+        );
     }
 
     async fn decide_for(state: &Arc<AppState>, servername: &str) -> Decision {
-        decide(state, servername, servername, 443, peer(), true, Carried::Tls).await
+        decide(
+            state,
+            servername,
+            servername,
+            443,
+            peer(),
+            true,
+            Carried::Tls,
+        )
+        .await
     }
 
     /// A CONNECT whose ClientHello named nothing, so the authority is all there
     /// is to go on — the shape `declines_at_client_hello` is about.
     async fn decide_without_sni(state: &Arc<AppState>, authority: &str) -> Decision {
-        decide(state, authority, authority, 443, peer(), false, Carried::Tls).await
+        decide(
+            state,
+            authority,
+            authority,
+            443,
+            peer(),
+            false,
+            Carried::Tls,
+        )
+        .await
     }
 
     /// **A tunnel to a bare IP that named no server is not decrypted**, and no
@@ -1109,10 +1170,16 @@ mod tests {
                 decide_without_sni(&plain, "example.com").await,
                 Decision::Generated
             ));
-            assert!(matches!(decide_for(&plain, "example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&plain, "example.com").await,
+                Decision::Generated
+            ));
             // …and so is an IP whose client *did* name a server, which TLS does
             // not allow but the expression still distinguishes.
-            assert!(matches!(decide_for(&plain, "127.0.0.1").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&plain, "127.0.0.1").await,
+                Decision::Generated
+            ));
 
             // Three spellings ask for it back.
             for rules in [
@@ -1122,7 +1189,10 @@ mod tests {
             ] {
                 let state = state_with(rules, None);
                 assert!(
-                    matches!(decide_without_sni(&state, "127.0.0.1").await, Decision::Generated),
+                    matches!(
+                        decide_without_sni(&state, "127.0.0.1").await,
+                        Decision::Generated
+                    ),
                     "{rules}"
                 );
             }
@@ -1133,7 +1203,10 @@ mod tests {
                 "127.0.0.1 enable://captureIp disable://captureIP",
             ] {
                 let state = state_with(rules, None);
-                assert!(bypass(&decide_without_sni(&state, "127.0.0.1").await), "{rules}");
+                assert!(
+                    bypass(&decide_without_sni(&state, "127.0.0.1").await),
+                    "{rules}"
+                );
             }
         });
     }
@@ -1169,7 +1242,12 @@ mod tests {
             &b"GET / HTTP/1.1 extra\r\n"[..],
             &[][..],
         ] {
-            assert_eq!(of(bytes), Carried::Opaque, "{:?}", String::from_utf8_lossy(bytes));
+            assert_eq!(
+                of(bytes),
+                Carried::Opaque,
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
         }
     }
 
@@ -1180,11 +1258,25 @@ mod tests {
         rt().block_on(async {
             let state = state_with("", None);
             let at = |c| async move {
-                decide(&state_with("", None), "probe.test", "probe.test", 443, peer(), false, c)
-                    .await
+                decide(
+                    &state_with("", None),
+                    "probe.test",
+                    "probe.test",
+                    443,
+                    peer(),
+                    false,
+                    c,
+                )
+                .await
             };
-            assert!(matches!(at(Carried::Http).await, Decision::Cleartext(Carried::Http)));
-            assert!(matches!(at(Carried::H2c).await, Decision::Cleartext(Carried::H2c)));
+            assert!(matches!(
+                at(Carried::Http).await,
+                Decision::Cleartext(Carried::Http)
+            ));
+            assert!(matches!(
+                at(Carried::H2c).await,
+                Decision::Cleartext(Carried::H2c)
+            ));
             assert!(matches!(at(Carried::Opaque).await, Decision::Bypass(_)));
             assert!(matches!(at(Carried::Tls).await, Decision::Generated));
 
@@ -1200,7 +1292,10 @@ mod tests {
                 ("probe.test enable://forHttp", Carried::Tls),
                 ("probe.test disable://captureHttps", Carried::Tls),
             ] {
-                assert!(matches!(dec(rules, half).await, Decision::Bypass(_)), "{rules}");
+                assert!(
+                    matches!(dec(rules, half).await, Decision::Bypass(_)),
+                    "{rules}"
+                );
                 let other = match half {
                     Carried::Http => Carried::Tls,
                     _ => Carried::Http,
@@ -1214,7 +1309,10 @@ mod tests {
             // the sniff does upstream.
             let _ = state;
             for c in [Carried::Http, Carried::Tls] {
-                assert!(matches!(dec("probe.test disable://intercept", c).await, Decision::Bypass(_)));
+                assert!(matches!(
+                    dec("probe.test disable://intercept", c).await,
+                    Decision::Bypass(_)
+                ));
             }
         });
     }
@@ -1235,15 +1333,17 @@ mod tests {
 
             let no_sni = state_with("example.com disable://captureNoSNI", None);
             assert!(bypass(&decide_without_sni(&no_sni, "example.com").await));
-            assert!(matches!(decide_for(&no_sni, "example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&no_sni, "example.com").await,
+                Decision::Generated
+            ));
         });
     }
 
     /// A self-signed certificate and key in PEM, as a plugin would supply them.
     fn plugin_pem(common_name: &str) -> (String, String) {
         let key = rcgen::KeyPair::generate().unwrap();
-        let mut params =
-            rcgen::CertificateParams::new(vec!["plugin.test".to_string()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["plugin.test".to_string()]).unwrap();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, common_name);
@@ -1265,9 +1365,19 @@ mod tests {
             let plugin = FakeSni::start(200, r#"{"intercept":false}"#).await;
             // Rules exist, and one even names the plugin — through a scheme that
             // has nothing to do with certificates.
-            let state = state_with("example.com plugin://certs\nother.com resHeaders://x=1", Some(&plugin));
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Generated));
-            assert!(plugin.paths().is_empty(), "the plugin was contacted: {:?}", plugin.paths());
+            let state = state_with(
+                "example.com plugin://certs\nother.com resHeaders://x=1",
+                Some(&plugin),
+            );
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
+            assert!(
+                plugin.paths().is_empty(),
+                "the plugin was contacted: {:?}",
+                plugin.paths()
+            );
             assert!(!state.rules.read().unwrap().has_sni_callback());
         });
     }
@@ -1291,7 +1401,10 @@ mod tests {
         mgr.add_group("extra", "c.com sniCallback://certs", true);
         assert!(mgr.has_sni_callback());
         mgr.toggle_group("extra");
-        assert!(!mgr.has_sni_callback(), "a disabled group does not choose certificates");
+        assert!(
+            !mgr.has_sni_callback(),
+            "a disabled group does not choose certificates"
+        );
         mgr.toggle_group("extra");
         assert!(mgr.has_sni_callback());
         mgr.update_group("extra", "c.com resHeaders://x=1");
@@ -1306,7 +1419,10 @@ mod tests {
             let plugin = FakeSni::start(200, r#"{"intercept":false}"#).await;
             let state = state_with("other.example.com sniCallback://certs", Some(&plugin));
             assert!(state.rules.read().unwrap().has_sni_callback());
-            assert!(matches!(decide_for(&state, "www.example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&state, "www.example.com").await,
+                Decision::Generated
+            ));
             assert!(plugin.paths().is_empty());
         });
     }
@@ -1318,10 +1434,12 @@ mod tests {
         rt().block_on(async {
             let plugin = FakeSni::start(200, r#"{"intercept":true}"#).await;
             let state = state_with("example.com sniCallback://certs(staging)", Some(&plugin));
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
             // And the plugin was told what it needs to decide.
-            let payload: serde_json::Value =
-                serde_json::from_str(&plugin.last_payload()).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&plugin.last_payload()).unwrap();
             assert_eq!(payload["servername"], "example.com");
             assert_eq!(payload["value"], "staging");
             assert_eq!(payload["port"], 443);
@@ -1336,7 +1454,10 @@ mod tests {
         rt().block_on(async {
             let plugin = FakeSni::start(200, r#"{"intercept":false}"#).await;
             let state = state_with("example.com sniCallback://certs", Some(&plugin));
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Bypass(_)));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Bypass(_)
+            ));
         });
     }
 
@@ -1539,7 +1660,10 @@ mod tests {
             // Nothing cached: reuse degrades to the generated certificate.
             let plugin = FakeSni::start(200, r#"{"reuse":true}"#).await;
             let state = state_with("example.com sniCallback://certs", Some(&plugin));
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
 
             // Now seed the cache the way a real reply would, and ask again.
             let (cert_pem, key_pem) = plugin_pem("cached");
@@ -1547,11 +1671,13 @@ mod tests {
                 .ca
                 .set_plugin_cert("example.com", "certs", &cert_pem, &key_pem, 11)
                 .unwrap();
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Plugin(_)));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Plugin(_)
+            ));
 
             // And the plugin is now told what is cached, so it can skip re-issuing.
-            let payload: serde_json::Value =
-                serde_json::from_str(&plugin.last_payload()).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&plugin.last_payload()).unwrap();
             assert_eq!(payload["certCacheName"], "certs");
             assert_eq!(payload["certCacheTime"], 11);
         });
@@ -1570,9 +1696,11 @@ mod tests {
                 .set_plugin_cert("example.com", "other-plugin", &cert_pem, &key_pem, 3)
                 .unwrap();
             assert!(state.ca.plugin_cert("example.com", "certs").is_none());
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Generated));
-            let payload: serde_json::Value =
-                serde_json::from_str(&plugin.last_payload()).unwrap();
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
+            let payload: serde_json::Value = serde_json::from_str(&plugin.last_payload()).unwrap();
             assert!(payload.get("certCacheName").is_none());
         });
     }
@@ -1617,14 +1745,20 @@ mod tests {
         rt().block_on(async {
             let plugin = FakeSni::start(500, "boom").await;
             let state = state_with("example.com sniCallback://certs", Some(&plugin));
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
 
             let (cert_pem, key_pem) = plugin_pem("survives a restart");
             state
                 .ca
                 .set_plugin_cert("example.com", "certs", &cert_pem, &key_pem, 5)
                 .unwrap();
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Plugin(_)));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Plugin(_)
+            ));
         });
     }
 
@@ -1640,7 +1774,10 @@ mod tests {
                 .ca
                 .set_plugin_cert("example.com", "certs", &cert_pem, &key_pem, 1)
                 .unwrap();
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
             assert!(state.ca.plugin_cert("example.com", "certs").is_none());
         });
     }
@@ -1651,10 +1788,16 @@ mod tests {
     fn a_rule_naming_no_usable_plugin_is_harmless() {
         rt().block_on(async {
             let state = state_with("example.com sniCallback://nobody", None);
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
             // `echo` is registered but declares no `sni` hook.
             let state = state_with("example.com sniCallback://echo", None);
-            assert!(matches!(decide_for(&state, "example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
         });
     }
 
@@ -1664,8 +1807,14 @@ mod tests {
     fn the_builtin_declines_interception() {
         rt().block_on(async {
             let state = state_with("pinned.example.com sniCallback://no-mitm", None);
-            assert!(matches!(decide_for(&state, "pinned.example.com").await, Decision::Bypass(_)));
-            assert!(matches!(decide_for(&state, "other.example.com").await, Decision::Generated));
+            assert!(matches!(
+                decide_for(&state, "pinned.example.com").await,
+                Decision::Bypass(_)
+            ));
+            assert!(matches!(
+                decide_for(&state, "other.example.com").await,
+                Decision::Generated
+            ));
         });
     }
 
@@ -1676,10 +1825,28 @@ mod tests {
         rt().block_on(async {
             let state = state_with("pinned.example.com sniCallback://no-mitm", None);
             // Tunnel opened to an address, SNI naming the pinned host.
-            let d = decide(&state, "pinned.example.com", "93.184.216.34", 443, peer(), true, Carried::Tls).await;
+            let d = decide(
+                &state,
+                "pinned.example.com",
+                "93.184.216.34",
+                443,
+                peer(),
+                true,
+                Carried::Tls,
+            )
+            .await;
             assert!(matches!(d, Decision::Bypass(_)));
             // Same tunnel address, a different name asked for.
-            let d = decide(&state, "www.example.com", "93.184.216.34", 443, peer(), true, Carried::Tls).await;
+            let d = decide(
+                &state,
+                "www.example.com",
+                "93.184.216.34",
+                443,
+                peer(),
+                true,
+                Carried::Tls,
+            )
+            .await;
             assert!(matches!(d, Decision::Generated));
         });
     }

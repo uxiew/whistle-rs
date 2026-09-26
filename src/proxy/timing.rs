@@ -121,7 +121,12 @@ impl Timings {
     /// of zeros.
     pub fn measured(&self) -> bool {
         let p = *self.0.lock().unwrap();
-        p.dns.or(p.connect).or(p.ssl).or(p.wait).or(p.receive).is_some()
+        p.dns
+            .or(p.connect)
+            .or(p.ssl)
+            .or(p.wait)
+            .or(p.receive)
+            .is_some()
     }
 
     /// The phases as HAR 1.2 wants them: `connect` including `ssl`, `send` as
@@ -290,7 +295,10 @@ mod tests {
         assert!(t.measured());
         let json = serde_json::to_value(&t).unwrap();
         assert!(json.get("connect").is_some());
-        assert!(json.get("ssl").is_none(), "a plain connection has no handshake");
+        assert!(
+            json.get("ssl").is_none(),
+            "a plain connection has no handshake"
+        );
     }
 
     /// HAR says `connect` includes `ssl`, so a TLS connection reports the sum
@@ -308,7 +316,10 @@ mod tests {
         assert_eq!(har["ssl"], 25.0);
         assert_eq!(har["wait"], 100.0);
         assert_eq!(har["dns"], -1.0, "not measured is -1, not 0");
-        assert_eq!(har["send"], -1, "not separable from wait — see the module doc");
+        assert_eq!(
+            har["send"], -1,
+            "not separable from wait — see the module doc"
+        );
         assert_eq!(har["receive"], -1.0, "the body has not ended");
     }
 
@@ -318,7 +329,12 @@ mod tests {
     fn receive_lands_on_a_handle_already_handed_out() {
         let t = Timings::new();
         let recorded = t.clone();
-        assert!(serde_json::to_value(&recorded).unwrap().get("receive").is_none());
+        assert!(
+            serde_json::to_value(&recorded)
+                .unwrap()
+                .get("receive")
+                .is_none()
+        );
         t.receive(Instant::now() - Duration::from_millis(40));
         let seen = serde_json::to_value(&recorded).unwrap();
         assert!(
@@ -332,7 +348,11 @@ mod tests {
     #[test]
     fn a_fast_phase_keeps_a_tenth_of_a_millisecond() {
         assert_eq!(round_ms(0.0015), 1.5);
-        assert_eq!(round_ms(0.000_04), 0.0, "below a tenth there is nothing to say");
+        assert_eq!(
+            round_ms(0.000_04),
+            0.0,
+            "below a tenth there is nothing to say"
+        );
         assert_eq!(round_ms(1.0), 1000.0);
     }
 }

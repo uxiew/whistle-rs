@@ -88,10 +88,7 @@ pub fn run_res_script(
         return None;
     }
 
-    let ctx_val = ctx
-        .global_object()
-        .get(js_string!("ctx"), &mut ctx)
-        .ok()?;
+    let ctx_val = ctx.global_object().get(js_string!("ctx"), &mut ctx).ok()?;
     let out = ctx_val.to_json(&mut ctx).ok()??;
     let res = out.get("res")?;
 
@@ -102,11 +99,17 @@ pub fn run_res_script(
     let mut new_headers = Vec::new();
     if let Some(h) = res.get("headers").and_then(|v| v.as_object()) {
         for (k, v) in h {
-            let val = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+            let val = v
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string());
             new_headers.push((k.clone(), val));
         }
     }
-    let body = res.get("body").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let body = res
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     Some(ScriptResult {
         status,
@@ -273,11 +276,15 @@ pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String>
         if let Some((plain, _group)) = name.split_once("\n\r")
             && !store.contains_key(plain)
         {
-            store.insert(plain.to_string(), serde_json::Value::String(content.clone()));
+            store.insert(
+                plain.to_string(),
+                serde_json::Value::String(content.clone()),
+            );
         }
     }
     globals["__values"] = serde_json::Value::Object(store);
-    globals["__localIp"] = json!(crate::proxy::upstream::primary_local_ip().map(|ip| ip.to_string()));
+    globals["__localIp"] =
+        json!(crate::proxy::upstream::primary_local_ip().map(|ip| ip.to_string()));
     let obj = JsValue::from_json(&globals, &mut ctx).ok()?;
     let obj = obj.as_object()?.clone();
     for key in obj.own_property_keys(&mut ctx).ok()? {
@@ -373,7 +380,10 @@ pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String>
         return None;
     }
 
-    let rules = ctx.global_object().get(js_string!("rules"), &mut ctx).ok()?;
+    let rules = ctx
+        .global_object()
+        .get(js_string!("rules"), &mut ctx)
+        .ok()?;
     let rules = rules.to_json(&mut ctx).ok()??;
     let lines: Vec<String> = rules
         .as_array()?
@@ -498,7 +508,9 @@ pub fn frame_script_injections(src: &str) -> Vec<(String, String)> {
     let mut ctx = Context::default();
     let set = |ctx: &mut Context, name: &str, value: &str| {
         let v = boa_engine::JsValue::from_json(&json!(value), ctx).ok()?;
-        ctx.global_object().set(js_string!(name), v, false, ctx).ok()
+        ctx.global_object()
+            .set(js_string!(name), v, false, ctx)
+            .ok()
     };
     // The connection has no frame yet, and a script that reads `ctx.frame.data`
     // here sees an empty one rather than failing.
@@ -731,8 +743,12 @@ fn register_pac_natives(ctx: &mut Context) -> Result<()> {
         NativeFunction::from_fn_ptr(js_dns_resolve),
     )
     .map_err(|e| anyhow!("registering dnsResolve: {e}"))?;
-    ctx.register_global_callable(js_string!("alert"), 1, NativeFunction::from_fn_ptr(js_alert))
-        .map_err(|e| anyhow!("registering alert: {e}"))?;
+    ctx.register_global_callable(
+        js_string!("alert"),
+        1,
+        NativeFunction::from_fn_ptr(js_alert),
+    )
+    .map_err(|e| anyhow!("registering alert: {e}"))?;
     // `myIpAddress` cannot fail and takes no arguments, so it is a value rather
     // than a call. whistle-rs falls back to the loopback address when the
     // routing table cannot say, which is what a PAC file expects to see when a
@@ -930,7 +946,9 @@ mod tests {
         assert!(is_rules_content("a.com reqHeaders://x-a=1"));
         // Bracketed but a comment, or a fence, or neither word: still rules.
         assert!(is_rules_content("# a.com file://(mock)"));
-        assert!(is_rules_content("```v\nfoo\n```\na.com reqHeaders://x-a={v}"));
+        assert!(is_rules_content(
+            "```v\nfoo\n```\na.com reqHeaders://x-a={v}"
+        ));
         assert!(is_rules_content("a.com file://(a subshell of nothing)"));
         // Bracketed, unfenced, uncommented, and names one of the two words:
         // this is a script.
@@ -977,7 +995,10 @@ mod tests {
         );
         // An error after a push yields nothing at all.
         assert_eq!(
-            run_rules_script("rules.push('a.com x://y'); throw new Error('boom')", &ctx("")),
+            run_rules_script(
+                "rules.push('a.com x://y'); throw new Error('boom')",
+                &ctx("")
+            ),
             None,
         );
         // A `values` write does not resolve `{name}` — the literal survives.
@@ -990,7 +1011,10 @@ mod tests {
             Some("a.com reqHeaders://x-v={m}"),
         );
         // An empty push list is an empty string, not a rule.
-        assert_eq!(run_rules_script("var unused = 1;", &ctx("")).as_deref(), Some(""));
+        assert_eq!(
+            run_rules_script("var unused = 1;", &ctx("")).as_deref(),
+            Some("")
+        );
     }
 
     /// The context `reqScript.md` prints, in the three pieces this port had to
@@ -1014,31 +1038,68 @@ mod tests {
             values: &store,
         };
         let push = |expr: &str| {
-            run_rules_script(&format!("rules.push('a.com reqHeaders://x=' + ({expr}))"), &ctx)
+            run_rules_script(
+                &format!("rules.push('a.com reqHeaders://x=' + ({expr}))"),
+                &ctx,
+            )
         };
         // `tpl` is whistle's own micro-template: `<%= … %>` interpolates and
         // `<% … %>` is code, and a string carrying neither comes back as it was.
-        assert_eq!(push("render('<%=a%>-<%=b%>', {a:1,b:2})").as_deref(), Some("a.com reqHeaders://x=1-2"));
-        assert_eq!(push("render('<% if (a) { %>yes<% } else { %>no<% } %>', {a:0})").as_deref(), Some("a.com reqHeaders://x=no"));
-        assert_eq!(push("render('plain')").as_deref(), Some("a.com reqHeaders://x=plain"));
-        assert_eq!(push("tpl === render").as_deref(), Some("a.com reqHeaders://x=true"));
+        assert_eq!(
+            push("render('<%=a%>-<%=b%>', {a:1,b:2})").as_deref(),
+            Some("a.com reqHeaders://x=1-2")
+        );
+        assert_eq!(
+            push("render('<% if (a) { %>yes<% } else { %>no<% } %>', {a:0})").as_deref(),
+            Some("a.com reqHeaders://x=no")
+        );
+        assert_eq!(
+            push("render('plain')").as_deref(),
+            Some("a.com reqHeaders://x=plain")
+        );
+        assert_eq!(
+            push("tpl === render").as_deref(),
+            Some("a.com reqHeaders://x=true")
+        );
         // `getValue` answers from the store, by the plain name for an inline
         // block as well as for a Values entry.
-        assert_eq!(push("getValue('mock')").as_deref(), Some("a.com reqHeaders://x=from-store"));
-        assert_eq!(push("getValue('block.txt')").as_deref(), Some("a.com reqHeaders://x=from-fence"));
-        assert_eq!(push("getValue('nope')").as_deref(), Some("a.com reqHeaders://x=undefined"));
+        assert_eq!(
+            push("getValue('mock')").as_deref(),
+            Some("a.com reqHeaders://x=from-store")
+        );
+        assert_eq!(
+            push("getValue('block.txt')").as_deref(),
+            Some("a.com reqHeaders://x=from-fence")
+        );
+        assert_eq!(
+            push("getValue('nope')").as_deref(),
+            Some("a.com reqHeaders://x=undefined")
+        );
         // `isLocalAddress` knows the loopback range and the two spellings of
         // the unspecified address; a public address is not local.
-        assert_eq!(push("isLocalAddress('127.0.0.1')").as_deref(), Some("a.com reqHeaders://x=true"));
-        assert_eq!(push("isLocalAddress('[::1]')").as_deref(), Some("a.com reqHeaders://x=true"));
-        assert_eq!(push("isLocalAddress('8.8.8.8')").as_deref(), Some("a.com reqHeaders://x=false"));
+        assert_eq!(
+            push("isLocalAddress('127.0.0.1')").as_deref(),
+            Some("a.com reqHeaders://x=true")
+        );
+        assert_eq!(
+            push("isLocalAddress('[::1]')").as_deref(),
+            Some("a.com reqHeaders://x=true")
+        );
+        assert_eq!(
+            push("isLocalAddress('8.8.8.8')").as_deref(),
+            Some("a.com reqHeaders://x=false")
+        );
     }
 
     /// A `resScript` sees the response head; a request script sees empty strings
     /// there, so `statusCode == 200` is false in the request pass.
     #[test]
     fn a_response_script_sees_the_status() {
-        let res = RulesScriptRes { status: 200, server_ip: None, headers: &[] };
+        let res = RulesScriptRes {
+            status: 200,
+            server_ip: None,
+            headers: &[],
+        };
         let with_res = RulesScriptCtx {
             method: "GET",
             full_url: "http://a.com/",
@@ -1106,7 +1167,10 @@ mod tests {
     #[test]
     fn pac_returns_proxy() {
         let src = wrap("return host === 'blocked.com' ? 'PROXY 10.0.0.1:8080' : 'DIRECT';");
-        assert_eq!(pac(&src, "http://blocked.com/", "blocked.com"), "PROXY 10.0.0.1:8080");
+        assert_eq!(
+            pac(&src, "http://blocked.com/", "blocked.com"),
+            "PROXY 10.0.0.1:8080"
+        );
         assert_eq!(pac(&src, "http://ok.com/", "ok.com"), "DIRECT");
     }
 
@@ -1120,12 +1184,21 @@ mod tests {
             ("dnsDomainIs('www.example.com', '.example.com')", "true"),
             ("dnsDomainIs('www.example.org', '.example.com')", "false"),
             ("localHostOrDomainIs('www', 'www.example.com')", "true"),
-            ("localHostOrDomainIs('www.example.com', 'www.example.com')", "true"),
+            (
+                "localHostOrDomainIs('www.example.com', 'www.example.com')",
+                "true",
+            ),
             ("localHostOrDomainIs('web', 'www.example.com')", "false"),
             ("dnsDomainLevels('www.example.com')", "2"),
             ("dnsDomainLevels('intranet')", "0"),
-            ("shExpMatch('http://a.example.com/x', '*.example.com/*')", "true"),
-            ("shExpMatch('http://a.example.org/x', '*.example.com/*')", "true==false"),
+            (
+                "shExpMatch('http://a.example.com/x', '*.example.com/*')",
+                "true",
+            ),
+            (
+                "shExpMatch('http://a.example.org/x', '*.example.com/*')",
+                "true==false",
+            ),
             ("shExpMatch('abc', 'a?c')", "true"),
             // `.` is a literal, not "any character".
             ("shExpMatch('axc', 'a.c')", "false"),
@@ -1195,9 +1268,14 @@ mod tests {
 
     /// Serve `body` as a PAC file, and report how many requests arrived.
     /// Answers `count` requests and then stops listening.
-    async fn pac_server(body: &'static str, count: usize) -> (String, tokio::task::JoinHandle<usize>) {
+    async fn pac_server(
+        body: &'static str,
+        count: usize,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let url = format!("http://{}/proxy.pac", listener.local_addr().expect("addr"));
         let handle = tokio::spawn(async move {
             let mut served = 0;
@@ -1262,11 +1340,17 @@ mod tests {
             let msg = format!("{err:#}");
             assert!(msg.contains("/no/such/dir/corp.pac"), "{msg}");
 
-            assert!(load_pac("   ").await.is_err(), "an empty value is not a script");
+            assert!(
+                load_pac("   ").await.is_err(),
+                "an empty value is not a script"
+            );
 
             // A script written inline is still accepted.
             let inline = wrap("return 'DIRECT';");
-            assert_eq!(&*load_pac(&inline).await.expect("inline pac"), inline.as_str());
+            assert_eq!(
+                &*load_pac(&inline).await.expect("inline pac"),
+                inline.as_str()
+            );
         });
     }
 

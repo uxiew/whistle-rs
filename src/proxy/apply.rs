@@ -43,7 +43,12 @@ pub fn build_req_info(
     let host = host.to_ascii_lowercase();
     let hdrs = headers
         .iter()
-        .map(|(n, v)| (n.as_str().to_ascii_lowercase(), v.to_str().unwrap_or("").to_string()))
+        .map(|(n, v)| {
+            (
+                n.as_str().to_ascii_lowercase(),
+                v.to_str().unwrap_or("").to_string(),
+            )
+        })
         .collect();
     ReqInfo {
         method: method.to_string(),
@@ -176,7 +181,11 @@ pub fn substitute_values(
     values: &HashMap<String, String>,
     tpl: TplCtx<'_>,
 ) -> bool {
-    fn sub(op: &mut crate::rules::RuleOp, values: &HashMap<String, String>, tpl: TplCtx<'_>) -> bool {
+    fn sub(
+        op: &mut crate::rules::RuleOp,
+        values: &HashMap<String, String>,
+        tpl: TplCtx<'_>,
+    ) -> bool {
         // Upstream expands a matcher exactly once. This runs again whenever
         // rules are merged in mid-request, and a second pass over an operator
         // whose value is *already* the store's content would read that content
@@ -524,10 +533,13 @@ pub fn response_phase_of(
             acc.single.entry(protocol).or_insert(op);
         }
         for (protocol, ops) in extra.multi {
-            acc.multi.entry(protocol).or_default().extend(ops.into_iter().map(|mut op| {
-                op.order = u64::MAX;
-                op
-            }));
+            acc.multi
+                .entry(protocol)
+                .or_default()
+                .extend(ops.into_iter().map(|mut op| {
+                    op.order = u64::MAX;
+                    op
+                }));
         }
         if let Some(mut op) = extra.slot {
             op.order = u64::MAX;
@@ -735,9 +747,7 @@ pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
         // port's own reading of `resScript` — keeps everything else. The two
         // populations are disjoint under upstream's own classifier, because a
         // hook script mutates `ctx.res.…` and never says either word.
-        .find(|op| {
-            !op.value_is_content || crate::proxy::script::is_rules_content(&op.value)
-        })
+        .find(|op| !op.value_is_content || crate::proxy::script::is_rules_content(&op.value))
 }
 
 /// `resRules://` — a rules text that applies to the **response**, merged once
@@ -774,11 +784,14 @@ pub fn merge_res_rules(
             // `resRules://`, because a rules-shaped `resScript://` is this
             // port's response hook and is consumed by `res_script_op` instead.
             if !crate::proxy::script::is_rules_content(&text) {
-                let res = info.res.as_ref().map(|r| crate::proxy::script::RulesScriptRes {
-                    status: r.status,
-                    server_ip: r.server_ip.as_deref(),
-                    headers: &r.headers,
-                });
+                let res = info
+                    .res
+                    .as_ref()
+                    .map(|r| crate::proxy::script::RulesScriptRes {
+                        status: r.status,
+                        server_ip: r.server_ip.as_deref(),
+                        headers: &r.headers,
+                    });
                 return crate::proxy::script::run_rules_script(
                     &text,
                     &crate::proxy::script::RulesScriptCtx {
@@ -811,8 +824,10 @@ pub fn merge_res_rules(
         if let Some(late) = mgr.resolve_response(info, is_internal_req) {
             sub.merge_response_phase(late);
         }
-        sub.single.retain(|proto, _| crate::rules::protocols::is_res_protocol(proto));
-        sub.multi.retain(|proto, _| crate::rules::protocols::is_res_protocol(proto));
+        sub.single
+            .retain(|proto, _| crate::rules::protocols::is_res_protocol(proto));
+        sub.multi
+            .retain(|proto, _| crate::rules::protocols::is_res_protocol(proto));
         // No shared-slot member is a `resProtocols` name, so a `file://` or a
         // destination written inside a `resRules://` text is dropped here — the
         // request it would have redirected has already gone out.
@@ -1299,7 +1314,9 @@ fn is_bare_cipher_list(value: &str) -> bool {
 /// only and cannot take OpenSSL cipher strings, so we honour the portable part:
 /// the min/max protocol version. Accepts either a JSON object or a bare version
 /// token (`cipher://TLSv1.2`). Older pins clamp to the nearest supported version.
-fn parse_cipher_versions(options: &serde_json::Map<String, serde_json::Value>) -> super::upstream::TlsVersions {
+fn parse_cipher_versions(
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> super::upstream::TlsVersions {
     use super::upstream::TlsVersions;
     let get = |k: &str| options.get(k).and_then(|v| v.as_str()).map(str::to_string);
     let (mut min, mut max) = (get("minVersion"), get("maxVersion"));
@@ -2093,7 +2110,10 @@ fn file_location(op: &RuleOp) -> Option<(std::borrow::Cow<'_, str>, Sources)> {
         Some((crate::rules::url::Fixed::Verbatim, path)) => {
             Some((std::borrow::Cow::Owned(path), Sources::PathsOnly))
         }
-        None => Some((std::borrow::Cow::Borrowed(op.value.as_str()), Sources::PathsAndUrls)),
+        None => Some((
+            std::borrow::Cow::Borrowed(op.value.as_str()),
+            Sources::PathsAndUrls,
+        )),
     }
 }
 
@@ -2203,7 +2223,11 @@ pub async fn prefetch_remote_file(resolved: &Resolved) -> Option<RemoteFile> {
                     Ok(pair) => pair,
                     Err(err) => {
                         tracing::warn!("file://{url}: {err}");
-                        return Some(RemoteFile { url, data: None, status: 0 });
+                        return Some(RemoteFile {
+                            url,
+                            data: None,
+                            status: 0,
+                        });
                     }
                 };
                 // Over the cap is this port's own refusal, not a measurement of
@@ -2212,9 +2236,17 @@ pub async fn prefetch_remote_file(resolved: &Resolved) -> Option<RemoteFile> {
                 // Refusing loudly beats serving a body that is silently short.
                 if status != 200 || body.len() > MAX_URL_FILE {
                     tracing::warn!("file://{url}: answered {status}, {} bytes", body.len());
-                    return Some(RemoteFile { url, data: None, status });
+                    return Some(RemoteFile {
+                        url,
+                        data: None,
+                        status,
+                    });
                 }
-                return Some(RemoteFile { url, data: Some(Arc::new(body.to_vec())), status });
+                return Some(RemoteFile {
+                    url,
+                    data: Some(Arc::new(body.to_vec())),
+                    status,
+                });
             }
         }
     }
@@ -2940,8 +2972,10 @@ fn parse_range(info: &ReqInfo, size: usize) -> Option<(usize, usize)> {
 fn serve_raw_value(data: &[u8]) -> Response<DynBody> {
     match find_headers_sep(data) {
         Some((head_end, body_start)) => {
-            let mut resp =
-                raw_response(&data[..head_end], Bytes::copy_from_slice(&data[body_start..]));
+            let mut resp = raw_response(
+                &data[..head_end],
+                Bytes::copy_from_slice(&data[body_start..]),
+            );
             resp.headers_mut().remove(hyper::header::CONTENT_ENCODING);
             resp
         }
@@ -3032,7 +3066,12 @@ fn find_headers_sep(data: &[u8]) -> Option<(usize, usize)> {
         }
         // `\r\r\n?` — the alternative whistle tries when the first one fails.
         if data[start] == b'\r' && data.get(start + 1) == Some(&b'\r') {
-            let end = start + if data.get(start + 2) == Some(&b'\n') { 3 } else { 2 };
+            let end = start
+                + if data.get(start + 2) == Some(&b'\n') {
+                    3
+                } else {
+                    2
+                };
             return Some((start, end));
         }
     }
@@ -3070,10 +3109,7 @@ fn content_type_for(path: &str, full_url: &str) -> &'static str {
         Some(ct) => ct,
         // Strip query/fragment before looking at the URL's extension.
         None => {
-            let pure = full_url
-                .split(['?', '#'])
-                .next()
-                .unwrap_or(full_url);
+            let pure = full_url.split(['?', '#']).next().unwrap_or(full_url);
             content_type_of_ext(pure).unwrap_or("text/html; charset=utf-8")
         }
     }
@@ -3233,15 +3269,35 @@ fn the_type_table_is_the_one_whistle_carries() {
     // stream, `.rs` is not `text/rust`, and the office formats carry a charset
     // only because `isText` looks for `xml` as a substring.
     assert_eq!(content_type_of_ext("a.ts"), Some("video/mp2t"));
-    assert_eq!(content_type_of_ext("a.rs"), Some("application/rls-services+xml; charset=utf-8"));
-    assert_eq!(content_type_of_ext("a.scss"), Some("text/x-scss; charset=utf-8"));
-    assert_eq!(content_type_of_ext("a.jsx"), Some("text/jsx; charset=utf-8"));
-    assert_eq!(content_type_of_ext("a.m3u8"), Some("application/vnd.apple.mpegurl"));
-    assert_eq!(content_type_of_ext("a.php"), Some("application/x-httpd-php"));
-    assert_eq!(content_type_of_ext("a.pem"), Some("application/x-x509-ca-cert"));
+    assert_eq!(
+        content_type_of_ext("a.rs"),
+        Some("application/rls-services+xml; charset=utf-8")
+    );
+    assert_eq!(
+        content_type_of_ext("a.scss"),
+        Some("text/x-scss; charset=utf-8")
+    );
+    assert_eq!(
+        content_type_of_ext("a.jsx"),
+        Some("text/jsx; charset=utf-8")
+    );
+    assert_eq!(
+        content_type_of_ext("a.m3u8"),
+        Some("application/vnd.apple.mpegurl")
+    );
+    assert_eq!(
+        content_type_of_ext("a.php"),
+        Some("application/x-httpd-php")
+    );
+    assert_eq!(
+        content_type_of_ext("a.pem"),
+        Some("application/x-x509-ca-cert")
+    );
     assert_eq!(
         content_type_of_ext("a.docx"),
-        Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document; charset=utf-8")
+        Some(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document; charset=utf-8"
+        )
     );
     // An extension the table does not carry has no answer here — the caller
     // then falls back to the request URL's, as `mime.lookup(path, defaultType)`
@@ -3591,14 +3647,21 @@ impl Deletions {
 /// One regex covers `resHeaders.x`, `res.headers.x`, `resHeader.x`, `resH.x` and
 /// `res.h.x`; the same shape with `C`/`ookies` covers the cookie spellings.
 fn strip_del_scope<'a>(key: &'a str, side: &str, initial: &str, rest: &str) -> Option<&'a str> {
-    let tail = key.get(..side.len()).filter(|p| p.eq_ignore_ascii_case(side))?;
+    let tail = key
+        .get(..side.len())
+        .filter(|p| p.eq_ignore_ascii_case(side))?;
     let mut tail = &key[tail.len()..];
     tail = tail.strip_prefix('.').unwrap_or(tail);
-    let after_initial = tail.get(..initial.len()).filter(|c| c.eq_ignore_ascii_case(initial))?;
+    let after_initial = tail
+        .get(..initial.len())
+        .filter(|c| c.eq_ignore_ascii_case(initial))?;
     tail = &tail[after_initial.len()..];
     // The word may be spelled out in full, with an optional plural `s`.
     for word in [rest, &rest[..rest.len() - 1]] {
-        if let Some(t) = tail.get(..word.len()).filter(|w| w.eq_ignore_ascii_case(word)) {
+        if let Some(t) = tail
+            .get(..word.len())
+            .filter(|w| w.eq_ignore_ascii_case(word))
+        {
             tail = &tail[t.len()..];
             break;
         }
@@ -3734,7 +3797,11 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, want: Head
 /// `resolve_keys` is `RESOLVE_KEY_RE` (`util/index.js:95`), which is exactly
 /// `^re[qs]Merge://` — only the merge pair reads a dotted name as a path into
 /// the object. Every other operator takes the name literally.
-fn parse_data_object(text: &str, resolve_keys: bool, is_content: bool) -> Option<serde_json::Value> {
+fn parse_data_object(
+    text: &str,
+    resolve_keys: bool,
+    is_content: bool,
+) -> Option<serde_json::Value> {
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -3879,10 +3946,16 @@ pub(crate) struct PathSegment {
 
 impl PathSegment {
     fn key(name: impl Into<String>) -> Self {
-        PathSegment { name: name.into(), is_index: false }
+        PathSegment {
+            name: name.into(),
+            is_index: false,
+        }
     }
     fn index(name: impl Into<String>) -> Self {
-        PathSegment { name: name.into(), is_index: true }
+        PathSegment {
+            name: name.into(),
+            is_index: true,
+        }
     }
     pub(crate) fn name(&self) -> &str {
         &self.name
@@ -4295,7 +4368,10 @@ fn js_number(value: &str) -> Option<f64> {
         return u64::from_str_radix(rest, 2).ok().map(|n| n as f64);
     }
     // `inf`, `infinity` and `nan` parse in Rust and are `NaN` in JavaScript.
-    if text.chars().any(|c| c.is_ascii_alphabetic() && c != 'e' && c != 'E') {
+    if text
+        .chars()
+        .any(|c| c.is_ascii_alphabetic() && c != 'e' && c != 'E')
+    {
         return None;
     }
     text.parse().ok().filter(|n: &f64| !n.is_nan())
@@ -4490,9 +4566,7 @@ pub fn apply_response_for(
         parts.status.as_u16(),
         info.map_or("GET", |i| i.method.as_str()),
     ) {
-        if !is_enabled(resolved, "keepCSP")
-            && !is_enabled(resolved, "keepAllCSP")
-        {
+        if !is_enabled(resolved, "keepCSP") && !is_enabled(resolved, "keepAllCSP") {
             disable_csp(&mut parts.headers);
         }
         if !custom_cache(resolved) && !is_enabled(resolved, "keepCache") {
@@ -4598,8 +4672,7 @@ fn apply_forwarded_for(headers: &mut HeaderMap, resolved: &Resolved) {
 /// A process-wide switch rather than a threaded parameter, for the same reason
 /// [`super::upstream::set_insecure_upstream`] is one: it is decided once, at
 /// startup, and every request reads the same answer.
-static KEEP_CLIENT_XFF: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static KEEP_CLIENT_XFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Called once by the launch; see [`KEEP_CLIENT_XFF`].
 pub fn set_keep_client_xff(keep: bool) {
@@ -4888,11 +4961,7 @@ fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&Re
 /// carries can reuse it — that is `setResCors(reader, {enable: true}, req)`
 /// upstream (`_original/lib/handlers/file-proxy.js:187`), the very same writer
 /// with a spec nobody typed.
-fn write_res_cors(
-    headers: &mut HeaderMap,
-    spec: &HashMap<String, String>,
-    info: Option<&ReqInfo>,
-) {
+fn write_res_cors(headers: &mut HeaderMap, spec: &HashMap<String, String>, info: Option<&ReqInfo>) {
     let custom_origin = match spec.get("origin").map(String::as_str) {
         Some("*") => Some("*".to_string()),
         Some(url) if is_http_url(url) => Some(parse_origin(url)),
@@ -4920,16 +4989,12 @@ fn write_res_cors(
     if let Some(list) = spec.get("headers") {
         let op = if is_options { "allow" } else { "expose" };
         set_header(headers, &format!("access-control-{op}-headers"), list);
-    } else if auto
-        && let Some(list) = req_header(info, "access-control-request-headers")
-    {
+    } else if auto && let Some(list) = req_header(info, "access-control-request-headers") {
         set_header(headers, "access-control-allow-headers", list);
     }
     if let Some(credentials) = spec.get("credentials") {
         set_header(headers, "access-control-allow-credentials", credentials);
-    } else if auto
-        && let Some(method) = req_header(info, "access-control-request-method")
-    {
+    } else if auto && let Some(method) = req_header(info, "access-control-request-method") {
         // Plural. This was singular here, with a comment calling it upstream's
         // typo — upstream has no such typo (`setResCors`,
         // `_original/lib/util/index.js:2967`, is plural in both of its two
@@ -5082,8 +5147,8 @@ fn apply_cache(headers: &mut HeaderMap, resolved: &Resolved) {
     // is a minute.
     let max_age = parse_leading_int(value);
     let lower = value.to_ascii_lowercase();
-    let no_cache = matches!(lower.as_str(), "no" | "no-cache" | "no-store")
-        || max_age.is_some_and(|n| n < 0);
+    let no_cache =
+        matches!(lower.as_str(), "no" | "no-cache" | "no-store") || max_age.is_some_and(|n| n < 0);
     // Neither a no-cache spelling nor a usable max-age: nothing to write.
     if !no_cache && max_age.is_none_or(|n| n < 0) {
         return;
@@ -5348,8 +5413,8 @@ pub fn res_write_raw_path(resolved: &Resolved, status: u16) -> Option<String> {
 ///   filename with angle brackets in it — which is what this port tried to open,
 ///   so nothing was written at all.
 fn dump_path(value: &str) -> String {
-    let text = crate::rules::url::fixed_value(value)
-        .map_or_else(|| value.to_string(), |(_, inner)| inner);
+    let text =
+        crate::rules::url::fixed_value(value).map_or_else(|| value.to_string(), |(_, inner)| inner);
     match text.find('?') {
         Some(i) => text[..i].to_string(),
         None => text,
@@ -5376,8 +5441,7 @@ fn writer_file(file: &str, status: u16) -> String {
 /// (`_original/lib/inspectors/req.js:601`) and the response side
 /// (`res.js:1304`), despite the name.
 pub fn forces_write(resolved: &Resolved) -> bool {
-    is_enabled(resolved, "forceReqWrite")
-        && !disabled_flags(resolved).contains("forceReqWrite")
+    is_enabled(resolved, "forceReqWrite") && !disabled_flags(resolved).contains("forceReqWrite")
 }
 
 /// How many bytes of a request body may be read into memory before the
@@ -5849,7 +5913,8 @@ fn merge_json_patches(resolved: &Resolved, protocol: &str) -> Option<serde_json:
         // did nothing here; so did the line format, which is how a `{value}`
         // reference carries a merge patch. `resMerge`/`reqMerge` are also the
         // only operators whose dotted names are paths (`RESOLVE_KEY_RE`).
-        let Some(value) = parse_data_object(&op.value, resolves_dotted_keys(op), op.value_is_content)
+        let Some(value) =
+            parse_data_object(&op.value, resolves_dotted_keys(op), op.value_is_content)
         else {
             continue;
         };
@@ -5931,8 +5996,14 @@ fn request_body_kind(ctx: ReqBodyCtx<'_>) -> Option<ParamsBody> {
     }
     // `isUrlEncoded` is POST-only (`_original/lib/util/common.js:692-695`),
     // while `isJSONContent` accepts any method that may carry a body.
-    if ct.to_ascii_lowercase().contains("application/x-www-form-urlencoded") {
-        return ctx.method.eq_ignore_ascii_case("POST").then_some(ParamsBody::Form);
+    if ct
+        .to_ascii_lowercase()
+        .contains("application/x-www-form-urlencoded")
+    {
+        return ctx
+            .method
+            .eq_ignore_ascii_case("POST")
+            .then_some(ParamsBody::Form);
     }
     if method_has_body(ctx.method) && matches!(res_class(ct), Some(ResClass::Json)) {
         return Some(ParamsBody::Json);
@@ -5961,7 +6032,9 @@ fn req_replace_class(ctx: ReqBodyCtx<'_>) -> Option<ResClass> {
     // `isUrlEncoded` is POST-only (`_original/lib/util/common.js:692-695`), so a
     // `PUT` carrying a form body takes the ordinary path and is refused.
     if ctx.method.eq_ignore_ascii_case("POST")
-        && ct.to_ascii_lowercase().contains("application/x-www-form-urlencoded")
+        && ct
+            .to_ascii_lowercase()
+            .contains("application/x-www-form-urlencoded")
     {
         return Some(ResClass::Form);
     }
@@ -6317,7 +6390,10 @@ pub fn transform_res_body(body: Bytes, resolved: &Resolved, content_type: Option
 /// and pushed as one part. That is byte-identical to pushing each line
 /// separately, since the typed families that follow use the same separator.
 fn collect_generic(injection: &mut Injection, gate: &InjectionGate<'_>, prefix: &str) {
-    if let Some(joined) = gate.joined(&format!("{prefix}Body")).filter(Joined::claims_body) {
+    if let Some(joined) = gate
+        .joined(&format!("{prefix}Body"))
+        .filter(Joined::claims_body)
+    {
         injection.replaces_body = true;
         injection.body.push(joined.bytes);
     }
@@ -6648,7 +6724,10 @@ fn parse_json_path(path: &str) -> Vec<PathSegment> {
         }
     }
     segments.push(cur);
-    segments.iter().flat_map(|s| parse_json_key(s.trim())).collect()
+    segments
+        .iter()
+        .flat_map(|s| parse_json_key(s.trim()))
+        .collect()
 }
 
 /// One segment of a path, with its quotes stripped and its trailing `[n]`
@@ -6921,7 +7000,9 @@ fn replace_once_or_all(text: &str, pattern: &str, value: &str) -> String {
     // syntax: `$$1` has to percent-encode the group, and no replacement string
     // can express that. See [`crate::rules::replace::expand`].
     let expand = |caps: &regex::Captures<'_>| {
-        let groups: Vec<&str> = (0..=9).map(|n| caps.get(n).map_or("", |m| m.as_str())).collect();
+        let groups: Vec<&str> = (0..=9)
+            .map(|n| caps.get(n).map_or("", |m| m.as_str()))
+            .collect();
         crate::rules::replace::expand(value, &groups)
     };
     match flags.contains('g') {
@@ -7024,8 +7105,18 @@ impl DelQuery {
 /// `Some(None)` is the bare form (drop the whole query string), `Some(Some(n))`
 /// names one parameter.
 fn strip_query_scope(key: &str) -> Option<Option<&str>> {
-    for prefix in ["query", "params", "urlParams", "urlParam", "url.Params", "url.Param"] {
-        let Some(head) = key.get(..prefix.len()).filter(|h| h.eq_ignore_ascii_case(prefix)) else {
+    for prefix in [
+        "query",
+        "params",
+        "urlParams",
+        "urlParam",
+        "url.Params",
+        "url.Param",
+    ] {
+        let Some(head) = key
+            .get(..prefix.len())
+            .filter(|h| h.eq_ignore_ascii_case(prefix))
+        else {
             continue;
         };
         let rest = &key[head.len()..];
@@ -7054,7 +7145,9 @@ fn strip_query_scope(key: &str) -> Option<Option<&str>> {
 /// dropped (`util/index.js:2688,1037-1047`). Only the word `pathname` itself is
 /// case-insensitive all the way through.
 fn strip_pathname_scope(key: &str) -> Option<PathKey> {
-    let head = key.get(.."pathname".len()).filter(|h| h.eq_ignore_ascii_case("pathname"))?;
+    let head = key
+        .get(.."pathname".len())
+        .filter(|h| h.eq_ignore_ascii_case("pathname"))?;
     let rest = &key[head.len()..];
     if rest.is_empty() {
         return Some(PathKey::All);
@@ -7432,7 +7525,11 @@ pub fn strip_length_headers(headers: &mut HeaderMap) {
 
 /// Collect every value for a protocol, in resolution order.
 fn collect_values<'a>(resolved: &'a Resolved, protocol: &str) -> Vec<&'a str> {
-    resolved.all(protocol).iter().map(|o| o.value.as_str()).collect()
+    resolved
+        .all(protocol)
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect()
 }
 
 /// Collapse every line of a cookie protocol into one ordered `name` → `value`
@@ -7592,10 +7689,7 @@ fn cookie_item(name: &str, value: &CookieValue) -> String {
         // lookup on it misses. The result is a bare `name=`.
         CookieValue::List(_) => return format!("{name}="),
     };
-    let mut attrs = vec![format!(
-        "{name}={}",
-        escape_cookie(&value.plain(), false)
-    )];
+    let mut attrs = vec![format!("{name}={}", escape_cookie(&value.plain(), false))];
     // `parseInt` on a non-number yields NaN and the pair is skipped, so a
     // `maxAge` that is not a number leaves the cookie a session cookie.
     if let Some(max_age) = json_attr(map, &["maxAge", "maxage", "MaxAge", "Max-Age", "max-age"])
@@ -7604,7 +7698,11 @@ fn cookie_item(name: &str, value: &CookieValue) -> String {
         attrs.push(format!("Expires={}", http_date(max_age * 1000)));
         // The expiring form says `Max-Age=0` rather than the sentinel: a
         // negative `Max-Age` is legal but "0" is what every browser acts on.
-        let written = if max_age == EXPIRED_MAX_AGE { 0 } else { max_age };
+        let written = if max_age == EXPIRED_MAX_AGE {
+            0
+        } else {
+            max_age
+        };
         attrs.push(format!("Max-Age={written}"));
     }
     if json_flag(map, &["secure", "Secure"]) {
@@ -7806,9 +7904,7 @@ fn apply_res_cookies(
     for (name, val) in ops {
         let name = escape_cookie(&name, true);
         let lines = match &val {
-            CookieValue::List(items) => {
-                items.iter().map(|v| cookie_item(&name, v)).collect()
-            }
+            CookieValue::List(items) => items.iter().map(|v| cookie_item(&name, v)).collect(),
             _ => vec![cookie_item(&name, &val)],
         };
         match existing.iter_mut().find(|(k, _)| *k == name) {
@@ -7833,9 +7929,8 @@ fn apply_res_cookies(
 fn escape_cookie(s: &str, is_name: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        let forbidden = matches!(c, '\r' | '\n' | ';' | '%')
-            || (c as u32) > 0xFF
-            || (is_name && c == '=');
+        let forbidden =
+            matches!(c, '\r' | '\n' | ';' | '%') || (c as u32) > 0xFF || (is_name && c == '=');
         if !forbidden {
             out.push(c);
             continue;
@@ -7862,7 +7957,9 @@ fn apply_header_ops(headers: &mut HeaderMap, resolved: &Resolved, protocol: &str
     // clobber the result. Overwriting instead dropped every other cookie the
     // origin set — the session cookie next to the one the rule named.
     if protocol == "resHeaders"
-        && let Some(i) = ops.iter().position(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+        && let Some(i) = ops
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
         && merge_set_cookies(headers, &ops[i].1)
     {
         ops.remove(i);
@@ -8024,8 +8121,7 @@ fn parse_header_pairs(value: &str, is_content: bool) -> Vec<(String, HeaderValue
     // a block holding `solo:` naming the header `solo:` — which is not a token,
     // so both proxies send nothing — and splitting it at the colon into a
     // header named `solo`, which is what this port used to send.
-    if (is_content && !value.contains(char::is_whitespace))
-        || (value.contains('=') && !is_content)
+    if (is_content && !value.contains(char::is_whitespace)) || (value.contains('=') && !is_content)
     {
         // A name repeated in one value is a *list*, not a contest: Node's
         // `querystring.parse("a=1&a=2")` yields `{a: ["1","2"]}`, whistle
@@ -8122,7 +8218,11 @@ mod tests {
 
     /// Proxy facts for tests that reach the template engine.
     fn test_env() -> super::super::template::ProxyEnv<'static> {
-        super::super::template::ProxyEnv { host: "", port: 8899, version: "9.9.9" }
+        super::super::template::ProxyEnv {
+            host: "",
+            port: 8899,
+            version: "9.9.9",
+        }
     }
 
     /// Tests drive the async parts on a runtime of their own; `resolve_target`
@@ -8136,8 +8236,12 @@ mod tests {
 
     /// The target `resolved` produces for `info`, which must not fail.
     fn resolved_target(info: &ReqInfo, resolved: &Resolved) -> Target {
-        rt().block_on(resolve_target(info, &crate::proxy::dest::Destination::of(info, resolved), resolved))
-            .expect("resolve_target")
+        rt().block_on(resolve_target(
+            info,
+            &crate::proxy::dest::Destination::of(info, resolved),
+            resolved,
+        ))
+        .expect("resolve_target")
     }
 
     fn resolve(rules: &str, url: &str) -> Resolved {
@@ -8162,7 +8266,10 @@ mod tests {
 
     /// Request facts for the body operators: a POST carrying `content_type`.
     fn body_ctx(content_type: Option<&str>) -> ReqBodyCtx<'_> {
-        ReqBodyCtx { method: "POST", content_type }
+        ReqBodyCtx {
+            method: "POST",
+            content_type,
+        }
     }
 
     /// A method that carries no body is not given one
@@ -8174,12 +8281,12 @@ mod tests {
     /// A GET with a payload is what a CDN answers with a 400.
     #[test]
     fn a_bodyless_method_is_not_given_a_body() {
-        let resolved = resolve(
-            "example.com reqBody://INJECTED\n",
-            "http://example.com/",
-        );
+        let resolved = resolve("example.com reqBody://INJECTED\n", "http://example.com/");
         let sent = |method: &str| {
-            let ctx = ReqBodyCtx { method, content_type: None };
+            let ctx = ReqBodyCtx {
+                method,
+                content_type: None,
+            };
             let out = transform_req_body(Bytes::new(), &resolved, ctx);
             String::from_utf8(out.to_vec()).expect("utf-8")
         };
@@ -8194,8 +8301,14 @@ mod tests {
         }
 
         // Nothing is buffered for a method that will discard it anyway.
-        let get = ReqBodyCtx { method: "GET", content_type: None };
-        let post = ReqBodyCtx { method: "POST", content_type: None };
+        let get = ReqBodyCtx {
+            method: "GET",
+            content_type: None,
+        };
+        let post = ReqBodyCtx {
+            method: "POST",
+            content_type: None,
+        };
         assert!(!wants_req_body(&resolved, get));
         assert!(wants_req_body(&resolved, post));
     }
@@ -8210,7 +8323,10 @@ mod tests {
             "http://example.com/",
         );
         // The caller passes the rewritten method, which is what `serve` does.
-        let ctx = ReqBodyCtx { method: "POST", content_type: None };
+        let ctx = ReqBodyCtx {
+            method: "POST",
+            content_type: None,
+        };
         assert!(wants_req_body(&resolved, ctx));
         assert_eq!(
             &transform_req_body(Bytes::new(), &resolved, ctx)[..],
@@ -8256,7 +8372,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(hyper::header::COOKIE, "old=x; keep=y".parse().unwrap());
         apply_req_cookies(&mut headers, &resolved);
-        let cookie = headers.get(hyper::header::COOKIE).unwrap().to_str().unwrap();
+        let cookie = headers
+            .get(hyper::header::COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         // The merge is `extend` over the *reversed* line list, so the later
         // line's names are laid down first (`readRuleList`,
         // `_original/lib/util/index.js:1325-1331`).
@@ -8319,7 +8439,10 @@ mod tests {
     /// by `handleReplace` (`_original/lib/inspectors/res.js:129-132`).
     #[test]
     fn res_replace_needs_a_replaceable_content_type() {
-        let resolved = resolve("example.com/x resReplace://foo=bar\n", "http://example.com/x");
+        let resolved = resolve(
+            "example.com/x resReplace://foo=bar\n",
+            "http://example.com/x",
+        );
         for ct in [None, Some("image/png")] {
             let out = transform_res_body(Bytes::from_static(b"a foo b"), &resolved, ct);
             assert_eq!(&out[..], b"a foo b", "{ct:?} should not be rewritten");
@@ -8391,7 +8514,14 @@ mod tests {
         // `req.body` is the request's alone.
         let resolved = resolve("example.com/x delete://req.body\n", "http://example.com/x");
         assert!(wants_req_body(&resolved, body_ctx(None)) && !wants_res_body(&resolved));
-        assert_eq!(&transform_req_body(Bytes::from_static(b"x"), &resolved, body_ctx(Some("text/plain")))[..], b"");
+        assert_eq!(
+            &transform_req_body(
+                Bytes::from_static(b"x"),
+                &resolved,
+                body_ctx(Some("text/plain"))
+            )[..],
+            b""
+        );
     }
 
     /// The `/regexp/flags` form follows JavaScript's `String#replace`: without
@@ -8443,7 +8573,10 @@ mod tests {
 
     #[test]
     fn res_body_regex_replace_honours_the_g_flag() {
-        let once = resolve("example.com/x resReplace:///\\d+/=N\n", "http://example.com/x");
+        let once = resolve(
+            "example.com/x resReplace:///\\d+/=N\n",
+            "http://example.com/x",
+        );
         let out = transform_res_body(
             Bytes::from_static(b"id=123 and 45"),
             &once,
@@ -8451,7 +8584,10 @@ mod tests {
         );
         assert_eq!(&out[..], b"id=N and 45");
 
-        let all = resolve("example.com/x resReplace:///\\d+/g=N\n", "http://example.com/x");
+        let all = resolve(
+            "example.com/x resReplace:///\\d+/g=N\n",
+            "http://example.com/x",
+        );
         let out = transform_res_body(
             Bytes::from_static(b"id=123 and 45"),
             &all,
@@ -8477,7 +8613,11 @@ mod tests {
             &resolved,
             Some("text/plain"),
         );
-        assert_eq!(&out[..], b"a Z b Z c", "a literal pattern replaces them all");
+        assert_eq!(
+            &out[..],
+            b"a Z b Z c",
+            "a literal pattern replaces them all"
+        );
     }
 
     /// `$&` and `$1` reach the replacement, and `/.*/ ` swaps the whole body.
@@ -8487,7 +8627,11 @@ mod tests {
             "example.com/x resReplace:///(\\w+)@(\\w+)/g=$2.$1x\n",
             "http://example.com/x",
         );
-        let out = transform_res_body(Bytes::from_static(b"a@b c@d"), &resolved, Some("text/plain"));
+        let out = transform_res_body(
+            Bytes::from_static(b"a@b c@d"),
+            &resolved,
+            Some("text/plain"),
+        );
         assert_eq!(&out[..], b"b.ax d.cx", "`$1x` is group 1 then a literal x");
 
         // `\$1` escapes the reference, so the literal `$1` survives.
@@ -8498,7 +8642,10 @@ mod tests {
         let out = transform_res_body(Bytes::from_static(b"a@"), &esc, Some("text/plain"));
         assert_eq!(&out[..], b"$1-a");
 
-        let all = resolve("example.com/x resReplace:///.*/g=ONLY\n", "http://example.com/x");
+        let all = resolve(
+            "example.com/x resReplace:///.*/g=ONLY\n",
+            "http://example.com/x",
+        );
         let out = transform_res_body(Bytes::from_static(b"whatever"), &all, Some("text/plain"));
         assert_eq!(&out[..], b"ONLY", "`/.*/ ` replaces the body exactly once");
     }
@@ -8515,8 +8662,11 @@ mod tests {
                 &format!("example.com/x resReplace://{rule}\n"),
                 "http://example.com/x",
             );
-            let out =
-                transform_res_body(Bytes::from_static(input.as_bytes()), &resolved, Some("text/plain"));
+            let out = transform_res_body(
+                Bytes::from_static(input.as_bytes()),
+                &resolved,
+                Some("text/plain"),
+            );
             String::from_utf8(out.to_vec()).expect("utf-8")
         };
 
@@ -8550,7 +8700,11 @@ mod tests {
         assert!(!wants_req_body(&none, body_ctx(None)));
         let some = resolve("example.com reqBody://HELLO\n", "http://example.com/");
         assert!(wants_req_body(&some, body_ctx(None)));
-        let out = transform_req_body(Bytes::from_static(b"orig"), &some, body_ctx(Some("text/plain")));
+        let out = transform_req_body(
+            Bytes::from_static(b"orig"),
+            &some,
+            body_ctx(Some("text/plain")),
+        );
         assert_eq!(&out[..], b"HELLO");
     }
 
@@ -8579,18 +8733,26 @@ mod tests {
                 body_ctx(Some(ct)),
             );
             let (out, coded) = coding::reencode(new, restore, None);
-            assert_eq!(coded, coding::Coding::Gzip, "{rule} must go back out gzipped");
+            assert_eq!(
+                coded,
+                coding::Coding::Gzip,
+                "{rule} must go back out gzipped"
+            );
             String::from_utf8(coding::decode(coding::Coding::Gzip, &out).expect("inflates"))
                 .expect("utf-8")
         };
 
-        assert_eq!(sent("reqReplace://ORIGINAL=REWRITTEN", "text/plain"), "REWRITTEN body");
+        assert_eq!(
+            sent("reqReplace://ORIGINAL=REWRITTEN", "text/plain"),
+            "REWRITTEN body"
+        );
         assert_eq!(sent("reqAppend://END", "text/plain"), "ORIGINAL bodyEND");
         assert_eq!(sent("reqBody://NEW", "text/plain"), "NEW");
 
         // A coding this proxy cannot undo is not re-encoded over: the operators
         // run on bytes they will not usefully match, and nothing is corrupted.
-        let opaque = coding::decode_for_rewrite(Bytes::from_static(b"not really zstd"), Some("zstd"));
+        let opaque =
+            coding::decode_for_rewrite(Bytes::from_static(b"not really zstd"), Some("zstd"));
         assert!(!opaque.restore.plain);
         let (out, coded) = coding::reencode(opaque.body, opaque.restore, None);
         assert_eq!(coded, coding::Coding::Identity);
@@ -8660,7 +8822,10 @@ mod tests {
         assert_eq!(sent(":pass"), auth("Basic OnBhc3M="));
 
         // ── the JSON object ──
-        assert_eq!(sent(r#"{"username":"u","password":"p"}"#), auth("Basic dTpw"));
+        assert_eq!(
+            sent(r#"{"username":"u","password":"p"}"#),
+            auth("Basic dTpw")
+        );
         // `"proxy":true` re-addresses the credentials at the proxy.
         assert_eq!(
             sent(r#"{"username":"u","password":"p","proxy":true}"#),
@@ -8669,9 +8834,15 @@ mod tests {
         assert_eq!(sent(r#"{"username":"u"}"#), auth("Basic dQ=="));
         // A password alone still gets its colon, so the server sees two fields.
         assert_eq!(sent(r#"{"password":"p"}"#), auth("Basic OnA="));
-        assert_eq!(sent(r#"{"username":null,"password":"p"}"#), auth("Basic OnA="));
+        assert_eq!(
+            sent(r#"{"username":null,"password":"p"}"#),
+            auth("Basic OnA=")
+        );
         // Non-strings are stringified (`String(username)`).
-        assert_eq!(sent(r#"{"username":123,"password":true}"#), auth("Basic MTIzOnRydWU="));
+        assert_eq!(
+            sent(r#"{"username":123,"password":true}"#),
+            auth("Basic MTIzOnRydWU=")
+        );
         // Naming neither half sends nothing — and so does a JSON object
         // upstream cannot parse, which it turns into an empty one.
         assert_eq!(sent("{}"), None);
@@ -8679,9 +8850,15 @@ mod tests {
         // unparseable case is spelled without one.)
         assert_eq!(sent("{not-json}"), None);
         // `!!obj.proxy`, so the JSON `false` really is false.
-        assert_eq!(sent(r#"{"username":"u","proxy":false}"#), auth("Basic dQ=="));
+        assert_eq!(
+            sent(r#"{"username":"u","proxy":false}"#),
+            auth("Basic dQ==")
+        );
         // …but the *string* `"false"` is not.
-        assert_eq!(sent(r#"{"username":"u","proxy":"false"}"#), proxy("Basic dQ=="));
+        assert_eq!(
+            sent(r#"{"username":"u","proxy":"false"}"#),
+            proxy("Basic dQ==")
+        );
 
         // ── `username=…&password=…` ──
         assert_eq!(sent("username=u&password=p"), auth("Basic dTpw"));
@@ -8690,10 +8867,16 @@ mod tests {
         assert_eq!(sent("username=u&password=p&proxy=1"), proxy("Basic dTpw"));
         // Every query value is a non-empty string, so `proxy=false` is **true**
         // here. Use the JSON spelling when the answer is no.
-        assert_eq!(sent("username=u&password=p&proxy=false"), proxy("Basic dTpw"));
+        assert_eq!(
+            sent("username=u&password=p&proxy=false"),
+            proxy("Basic dTpw")
+        );
         // Values are taken raw: `parseQuery` is given the escaping decoder, so
         // a `%2F` reaches the server as `%2F` and a `+` stays a `+`.
-        assert_eq!(sent("username=u&password=p%2Fx"), auth("Basic dTpwJTJGeA=="));
+        assert_eq!(
+            sent("username=u&password=p%2Fx"),
+            auth("Basic dTpwJTJGeA==")
+        );
         assert_eq!(sent("username=a+b&password=p"), auth("Basic YStiOnA="));
         // Only the first `=` splits a pair.
         assert_eq!(sent("username=u&password=a=b"), auth("Basic dTphPWI="));
@@ -8721,7 +8904,10 @@ mod tests {
         assert_eq!(sent("dom\\user:secret"), None);
         // The JSON and query forms are tested first, so a slash inside either
         // is a password character after all.
-        assert_eq!(sent(r#"{"username":"u","password":"p/q"}"#), auth("Basic dTpwL3E="));
+        assert_eq!(
+            sent(r#"{"username":"u","password":"p/q"}"#),
+            auth("Basic dTpwL3E=")
+        );
         assert_eq!(sent("username=u&password=p/q"), auth("Basic dTpwL3E="));
     }
 
@@ -8771,14 +8957,20 @@ mod tests {
 
     #[test]
     fn delay_parsing() {
-        let resolved = resolve("example.com reqDelay://250\nexample.com resDelay://40\n", "http://example.com/");
+        let resolved = resolve(
+            "example.com reqDelay://250\nexample.com resDelay://40\n",
+            "http://example.com/",
+        );
         assert_eq!(req_delay_ms(&resolved), Some(250));
         assert_eq!(res_delay_ms(&resolved), Some(40));
     }
 
     #[test]
     fn speed_parsing() {
-        let resolved = resolve("example.com reqSpeed://16\nexample.com resSpeed://20\n", "http://example.com/");
+        let resolved = resolve(
+            "example.com reqSpeed://16\nexample.com resSpeed://20\n",
+            "http://example.com/",
+        );
         assert_eq!(req_speed_kbps(&resolved), Some(16.0));
         assert_eq!(res_speed_kbps(&resolved), Some(20.0));
     }
@@ -8820,16 +9012,25 @@ mod tests {
         };
         assert_eq!(limit("example.com resMerge://{\"a\":1}\n", 1024), 1024);
         assert_eq!(
-            limit("example.com resMerge://{\"a\":1} lineProps://enableBigData\n", 1024),
+            limit(
+                "example.com resMerge://{\"a\":1} lineProps://enableBigData\n",
+                1024
+            ),
             BIG
         );
         assert_eq!(limit("example.com enable://resMergeBigData\n", 1024), BIG);
         assert_eq!(
-            limit("example.com enable://resMergeBigData\nexample.com disable://resMergeBigData\n", 1024),
+            limit(
+                "example.com enable://resMergeBigData\nexample.com disable://resMergeBigData\n",
+                1024
+            ),
             1024
         );
         // A ceiling already higher than upstream's stays where it is.
-        assert_eq!(limit("example.com enable://resMergeBigData\n", BIG * 2), BIG * 2);
+        assert_eq!(
+            limit("example.com enable://resMergeBigData\n", BIG * 2),
+            BIG * 2
+        );
     }
 
     /// `lineProps://enableBigData` on the `reqMerge://` line raises it, exactly
@@ -8864,14 +9065,14 @@ mod tests {
             REQ_BODY_LIMIT
         );
         assert_eq!(
-            limit(
-                "example.com params://a=1 lineProps://enableBigData disable://reqMergeBigData\n"
-            ),
+            limit("example.com params://a=1 lineProps://enableBigData disable://reqMergeBigData\n"),
             BIG
         );
         // Line-scoped: on some other line it raises nothing.
         assert_eq!(
-            limit("example.com params://a=1\nexample.com resHeaders://x=1 lineProps://enableBigData\n"),
+            limit(
+                "example.com params://a=1\nexample.com resHeaders://x=1 lineProps://enableBigData\n"
+            ),
             REQ_BODY_LIMIT
         );
     }
@@ -8900,7 +9101,10 @@ mod tests {
             "b=2&a=9"
         );
         // An empty body becomes the params outright.
-        assert_eq!(merged_body("example.com params://a=1\n", Some(FORM), ""), "a=1");
+        assert_eq!(
+            merged_body("example.com params://a=1\n", Some(FORM), ""),
+            "a=1"
+        );
 
         let resolved = resolve(
             "example.com params://b=2 urlParams://c=3\n",
@@ -8922,11 +9126,17 @@ mod tests {
     fn a_form_body_takes_params_only_on_post() {
         const FORM: &str = "application/x-www-form-urlencoded";
         let resolved = resolve("example.com params://b=2\n", "http://example.com/p");
-        let put = ReqBodyCtx { method: "PUT", content_type: Some(FORM) };
+        let put = ReqBodyCtx {
+            method: "PUT",
+            content_type: Some(FORM),
+        };
         assert!(!wants_req_body(&resolved, put));
         assert_eq!(rewrite_path("/p", &resolved, put), "/p?b=2");
 
-        let post = ReqBodyCtx { method: "POST", content_type: Some(FORM) };
+        let post = ReqBodyCtx {
+            method: "POST",
+            content_type: Some(FORM),
+        };
         assert!(wants_req_body(&resolved, post));
         assert_eq!(rewrite_path("/p", &resolved, post), "/p");
     }
@@ -8962,7 +9172,10 @@ mod tests {
         );
         // A GET carries no body upstream, so the params address the query.
         let resolved = resolve("example.com params://b=2\n", "http://example.com/p");
-        let get = ReqBodyCtx { method: "GET", content_type: Some(JSON) };
+        let get = ReqBodyCtx {
+            method: "GET",
+            content_type: Some(JSON),
+        };
         assert_eq!(rewrite_path("/p", &resolved, get), "/p?b=2");
     }
 
@@ -8999,21 +9212,34 @@ mod tests {
     #[test]
     fn a_json_delete_path_reads_upstreams_escapes_and_indices() {
         let json = |rule: &str, body: &str| {
-            merged_body(&format!("example.com delete://{rule}\n"), Some("application/json"), body)
+            merged_body(
+                &format!("example.com delete://{rule}\n"),
+                Some("application/json"),
+                body,
+            )
         };
         // A backslash escapes the dot, naming one key that contains it.
         assert_eq!(json(r"reqBody.a\.b", r#"{"a.b":1,"c":2}"#), r#"{"c":2}"#);
         // Two backslashes are one backslash and a real separator, so this
         // names the key `b` inside the key `a\`.
-        assert_eq!(json(r"reqBody.a\\.b", r#"{"a\\":{"b":1,"c":2}}"#), r#"{"a\\":{"c":2}}"#);
+        assert_eq!(
+            json(r"reqBody.a\\.b", r#"{"a\\":{"b":1,"c":2}}"#),
+            r#"{"a\\":{"c":2}}"#
+        );
         // Brackets index an array, at the top level and nested.
         assert_eq!(json("reqBody.a[0]", r#"{"a":[1,2,3]}"#), r#"{"a":[2,3]}"#);
-        assert_eq!(json("reqBody.a.b[1]", r#"{"a":{"b":[1,2,3]}}"#), r#"{"a":{"b":[1,3]}}"#);
+        assert_eq!(
+            json("reqBody.a.b[1]", r#"{"a":{"b":[1,2,3]}}"#),
+            r#"{"a":{"b":[1,3]}}"#
+        );
         // …and the dotted spelling names the same element.
         assert_eq!(json("reqBody.a.0", r#"{"a":[1,2,3]}"#), r#"{"a":[2,3]}"#);
         // Quotes take a segment literally, which is how a key ending in
         // brackets is named at all.
-        assert_eq!(json(r#"reqBody."a[0]""#, r#"{"a[0]":1,"b":2}"#), r#"{"b":2}"#);
+        assert_eq!(
+            json(r#"reqBody."a[0]""#, r#"{"a[0]":1,"b":2}"#),
+            r#"{"b":2}"#
+        );
         // An index with a leading zero is not one (`NUM_RE`), so it deletes
         // nothing rather than the wrong element.
         assert_eq!(json("reqBody.a.01", r#"{"a":[1,2,3]}"#), r#"{"a":[1,2,3]}"#);
@@ -9093,7 +9319,9 @@ mod tests {
     #[test]
     fn a_bracket_index_opens_an_array() {
         let merged = |line: &str| {
-            parse_data_object(line, true, true).map(|v| v.to_string()).unwrap_or_default()
+            parse_data_object(line, true, true)
+                .map(|v| v.to_string())
+                .unwrap_or_default()
         };
         assert_eq!(merged("a[0]: 1"), r#"{"a":["1"]}"#);
         assert_eq!(merged("a[1]: x"), r#"{"a":[null,"x"]}"#);
@@ -9204,14 +9432,20 @@ mod tests {
             h.get(hyper::header::COOKIE)
                 .map(|v| v.to_str().unwrap().to_string())
         };
-        assert_eq!(cookie_after("reqCookies.sid", "sid=abc"), Some(String::new()));
+        assert_eq!(
+            cookie_after("reqCookies.sid", "sid=abc"),
+            Some(String::new())
+        );
         // A valueless pair gains its `=`, and a trailing `;` becomes one.
         assert_eq!(
             cookie_after("reqCookies.sid", "sid=abc; flag; other=1;"),
             Some("flag=; other=1; =".to_string())
         );
         // With no `Cookie` at all there is nothing to rebuild, and none is made.
-        let resolved = resolve("example.com delete://reqCookies.sid\n", "http://example.com/");
+        let resolved = resolve(
+            "example.com delete://reqCookies.sid\n",
+            "http://example.com/",
+        );
         let mut h = HeaderMap::new();
         apply_deletes(&mut h, &Deletions::of(&resolved, true), true);
         assert!(h.get(hyper::header::COOKIE).is_none());
@@ -9223,7 +9457,10 @@ mod tests {
     #[test]
     fn delete_keys_follow_upstreams_spellings() {
         let names = |rule: &str, request_side: bool| {
-            let r = resolve(&format!("example.com delete://{rule}\n"), "http://example.com/");
+            let r = resolve(
+                &format!("example.com delete://{rule}\n"),
+                "http://example.com/",
+            );
             Deletions::of(&r, request_side).headers
         };
         for spelling in [
@@ -9241,7 +9478,10 @@ mod tests {
             assert!(names(ignored, false).is_empty(), "{ignored} must be inert");
         }
         // The type/charset keys are their own thing, not header names.
-        let r = resolve("example.com delete://resType&res.charset\n", "http://example.com/");
+        let r = resolve(
+            "example.com delete://resType&res.charset\n",
+            "http://example.com/",
+        );
         let del = Deletions::of(&r, false);
         assert!(del.drop_type && del.drop_charset && del.headers.is_empty());
     }
@@ -9269,15 +9509,24 @@ mod tests {
         };
         // The two spellings mean the same thing.
         assert_eq!(replaced("resH.x-a:/yes/=no"), Some("no".to_string()));
-        assert_eq!(replaced(r#"{"resH.x-a:/yes/":"no"}"#), Some("no".to_string()));
+        assert_eq!(
+            replaced(r#"{"resH.x-a:/yes/":"no"}"#),
+            Some("no".to_string())
+        );
         // `&` separates entries and the *first* `=` splits one — a pattern may
         // contain `/` and `:` but the value starts after the first `=`.
-        assert_eq!(replaced("resH.x-b:/keep/=x&resH.x-a:/yes/=no"), Some("no".to_string()));
+        assert_eq!(
+            replaced("resH.x-b:/keep/=x&resH.x-a:/yes/=no"),
+            Some("no".to_string())
+        );
         // A literal pattern, not a regexp, in the same spelling.
         assert_eq!(replaced("resH.x-a:yes=no"), Some("no".to_string()));
         // Scope inheritance still works across the query-string form: the
         // second key names no scope, so it reuses `x-a`.
-        assert_eq!(replaced("resH.x-a:/nope/=x&:/yes/=no"), Some("no".to_string()));
+        assert_eq!(
+            replaced("resH.x-a:/nope/=x&:/yes/=no"),
+            Some("no".to_string())
+        );
     }
 
     /// The form the documentation leads with — several `pattern=value` pairs on
@@ -9302,7 +9551,10 @@ mod tests {
             apply_header_replace(&mut h, &resolved, HeaderScope::Response);
             h.get("x-mark").map(|v| v.to_str().unwrap().to_string())
         };
-        assert_eq!(replaced("res.x-mark:html=X&more=Y"), Some("X-and-Y".to_string()));
+        assert_eq!(
+            replaced("res.x-mark:html=X&more=Y"),
+            Some("X-and-Y".to_string())
+        );
         // Three of them, and a regexp among the bare ones.
         assert_eq!(
             replaced("res.x-mark:html=X&/and/=AND&more=Y"),
@@ -9393,7 +9645,10 @@ mod tests {
     fn forced_encoding_follows_upstream_precedence() {
         use super::super::coding::Coding;
         let forced = |rule: &str| {
-            forced_encoding(&resolve(&format!("example.com {rule}\n"), "http://example.com/"))
+            forced_encoding(&resolve(
+                &format!("example.com {rule}\n"),
+                "http://example.com/",
+            ))
         };
         assert_eq!(forced("host://1.1.1.1"), None);
         assert_eq!(forced("enable://gzip"), Some(Coding::Gzip));
@@ -9428,7 +9683,10 @@ mod tests {
             ));
             let mut parts = res_parts(&[]);
             apply_response_for(&mut parts, &resolved, Some(&info));
-            parts.headers.get("x-host-ip").map(|v| v.to_str().unwrap().to_string())
+            parts
+                .headers
+                .get("x-host-ip")
+                .map(|v| v.to_str().unwrap().to_string())
         };
 
         assert_eq!(
@@ -9442,7 +9700,10 @@ mod tests {
             Some("127.0.0.1".to_string())
         );
         // Inert without the flag.
-        assert_eq!(header("example.com host://1.1.1.1\n", Some("1.1.1.1")), None);
+        assert_eq!(
+            header("example.com host://1.1.1.1\n", Some("1.1.1.1")),
+            None
+        );
         // It runs after `resHeaders://`, as upstream does, so the flag wins.
         assert_eq!(
             header(
@@ -9460,35 +9721,36 @@ mod tests {
     /// upstream makes a network call here.
     #[test]
     fn response_for_annotates_rather_than_fetches() {
-        let annotate = |rules: &str, res_headers: Vec<(&str, &str)>, req_headers: Vec<(&str, &str)>| {
-            let mut mgr = RuleManager::new();
-            mgr.set_text(rules);
-            let mut hm = HeaderMap::new();
-            for (k, v) in &req_headers {
-                hm.insert(
-                    hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                    v.parse().unwrap(),
-                );
-            }
-            let mut info = build_req_info("GET", "http", "example.com", 80, "/x", &hm, None);
-            info.res = Some(crate::rules::ResInfo {
-                status: 200,
-                headers: Vec::new(),
-                server_ip: Some("10.0.0.9".into()),
-                server_port: Some(80),
-            });
-            let resolved = mgr.resolve(&info);
-            let mut out = HeaderMap::new();
-            for (k, v) in &res_headers {
-                out.insert(
-                    hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                    v.parse().unwrap(),
-                );
-            }
-            annotate_response_for(&mut out, &resolved, Some(&info));
-            out.get("x-whistle-response-for")
-                .map(|v| v.to_str().unwrap().to_string())
-        };
+        let annotate =
+            |rules: &str, res_headers: Vec<(&str, &str)>, req_headers: Vec<(&str, &str)>| {
+                let mut mgr = RuleManager::new();
+                mgr.set_text(rules);
+                let mut hm = HeaderMap::new();
+                for (k, v) in &req_headers {
+                    hm.insert(
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                        v.parse().unwrap(),
+                    );
+                }
+                let mut info = build_req_info("GET", "http", "example.com", 80, "/x", &hm, None);
+                info.res = Some(crate::rules::ResInfo {
+                    status: 200,
+                    headers: Vec::new(),
+                    server_ip: Some("10.0.0.9".into()),
+                    server_port: Some(80),
+                });
+                let resolved = mgr.resolve(&info);
+                let mut out = HeaderMap::new();
+                for (k, v) in &res_headers {
+                    out.insert(
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                        v.parse().unwrap(),
+                    );
+                }
+                annotate_response_for(&mut out, &resolved, Some(&info));
+                out.get("x-whistle-response-for")
+                    .map(|v| v.to_str().unwrap().to_string())
+            };
 
         // A plain value is emitted as written.
         assert_eq!(
@@ -9511,7 +9773,10 @@ mod tests {
             Some("10.0.0.9".into())
         );
         // No rule, no header.
-        assert_eq!(annotate("example.com host://1.1.1.1\n", vec![], vec![]), None);
+        assert_eq!(
+            annotate("example.com host://1.1.1.1\n", vec![], vec![]),
+            None
+        );
     }
 
     /// whistle reads a speed or a delay with `parseFloat`/`parseInt`, so a value
@@ -9745,12 +10010,18 @@ mod tests {
             out("a.com forwardedFor://203.0.113.7\n", None).as_deref(),
             Some("203.0.113.7")
         );
-        assert_eq!(out("a.com forwardedFor://2001:db8::1\n", None).as_deref(), Some("2001:db8::1"));
+        assert_eq!(
+            out("a.com forwardedFor://2001:db8::1\n", None).as_deref(),
+            Some("2001:db8::1")
+        );
         // A non-address value sets nothing — and does not rescue the client's.
         assert_eq!(out("a.com forwardedFor://hello\n", Some("10.0.0.5")), None);
         // `disable://clientIp` removes it whatever else said.
         assert_eq!(
-            out("a.com forwardedFor://203.0.113.7 disable://clientIp\n", None),
+            out(
+                "a.com forwardedFor://203.0.113.7 disable://clientIp\n",
+                None
+            ),
             None
         );
     }
@@ -9764,7 +10035,15 @@ mod tests {
     fn url_replace_sees_what_params_wrote() {
         let mut mgr = RuleManager::new();
         mgr.set_text("example.com params://token=SECRET urlReplace://SECRET=redacted\n");
-        let info = build_req_info("GET", "http", "example.com", 80, "/api", &HeaderMap::new(), None);
+        let info = build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/api",
+            &HeaderMap::new(),
+            None,
+        );
         let resolved = mgr.resolve(&info);
         let out = rewrite_path("/api", &resolved, ReqBodyCtx::default());
         assert_eq!(out, "/api?token=redacted");
@@ -9787,7 +10066,15 @@ mod tests {
             "example.com resHeaders://x-src=main host://1.1.1.1 rulesFile://{}\n",
             inc.display()
         ));
-        let info = build_req_info("GET", "http", "example.com", 80, "/x", &HeaderMap::new(), None);
+        let info = build_req_info(
+            "GET",
+            "http",
+            "example.com",
+            80,
+            "/x",
+            &HeaderMap::new(),
+            None,
+        );
         let mut resolved = mgr.resolve(&info);
         let _keep = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
 
@@ -9796,7 +10083,10 @@ mod tests {
         // Multi-match: the included one comes first, and these fold first-wins.
         let mut headers = HeaderMap::new();
         apply_header_ops(&mut headers, &resolved, "resHeaders");
-        assert_eq!(headers.get("x-src").map(|v| v.to_str().unwrap()), Some("inc"));
+        assert_eq!(
+            headers.get("x-src").map(|v| v.to_str().unwrap()),
+            Some("inc")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -9817,11 +10107,21 @@ mod tests {
         .collect();
         let merged = |rules: &str| {
             let (info, mut resolved) = resolve_with_info(rules, "http://example.com/");
-            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            substitute_values(
+                &mut resolved,
+                &values,
+                TplCtx {
+                    info: &info,
+                    env: test_env(),
+                },
+            );
             let _keep = merge_included_rules(&mut resolved, &info, &values, false);
             let mut h = HeaderMap::new();
             apply_header_ops(&mut h, &resolved, "reqHeaders");
-            (h.get("x-w").map(|v| v.to_str().unwrap().to_string()), resolved)
+            (
+                h.get("x-w").map(|v| v.to_str().unwrap().to_string()),
+                resolved,
+            )
         };
 
         // Important on the including line: it holds both slots.
@@ -9847,17 +10147,40 @@ mod tests {
     /// produced rules vanished without a word.
     #[test]
     fn a_produced_rules_text_may_come_from_a_value() {
-        let values: HashMap<String, String> =
-            [("extra".to_string(), "example.com resHeaders://x-src=inc\n".to_string())]
-                .into_iter()
-                .collect();
-        for spelling in ["reqRules", "rulesFile", "ruleFile", "ruleScript", "rulesScript", "reqScript"] {
+        let values: HashMap<String, String> = [(
+            "extra".to_string(),
+            "example.com resHeaders://x-src=inc\n".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        for spelling in [
+            "reqRules",
+            "rulesFile",
+            "ruleFile",
+            "ruleScript",
+            "rulesScript",
+            "reqScript",
+        ] {
             let mut mgr = RuleManager::new();
             mgr.set_text(&format!("example.com {spelling}://{{extra}}\n"));
-            let info =
-                build_req_info("GET", "http", "example.com", 80, "/x", &HeaderMap::new(), None);
+            let info = build_req_info(
+                "GET",
+                "http",
+                "example.com",
+                80,
+                "/x",
+                &HeaderMap::new(),
+                None,
+            );
             let mut resolved = mgr.resolve(&info);
-            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            substitute_values(
+                &mut resolved,
+                &values,
+                TplCtx {
+                    info: &info,
+                    env: test_env(),
+                },
+            );
             let _keep = merge_included_rules(&mut resolved, &info, &values, false);
             let mut headers = HeaderMap::new();
             apply_header_ops(&mut headers, &resolved, "resHeaders");
@@ -9885,10 +10208,16 @@ mod tests {
         let of = |text: &str, proto: &str| {
             let mut mgr = RuleManager::new();
             mgr.set_text(text);
-            let info =
-                build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
+            let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
             let mut resolved = mgr.resolve(&info);
-            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            substitute_values(
+                &mut resolved,
+                &values,
+                TplCtx {
+                    info: &info,
+                    env: test_env(),
+                },
+            );
             resolved.value(proto).map(str::to_string)
         };
 
@@ -9899,11 +10228,18 @@ mod tests {
         );
         // More than one, and one of them repeated.
         assert_eq!(
-            of("a.com resHeaders://a=${myval}&b=${host}&c=${myval}\n", "resHeaders").as_deref(),
+            of(
+                "a.com resHeaders://a=${myval}&b=${host}&c=${myval}\n",
+                "resHeaders"
+            )
+            .as_deref(),
             Some("a=hello&b=10.0.0.9&c=hello")
         );
         // The whole-value form still replaces with the content itself.
-        assert_eq!(of("a.com resBody://{myval}\n", "resBody").as_deref(), Some("hello"));
+        assert_eq!(
+            of("a.com resBody://{myval}\n", "resBody").as_deref(),
+            Some("hello")
+        );
         // A name with no value is left as written, so a typo shows as itself
         // rather than as an empty string.
         assert_eq!(
@@ -9933,12 +10269,22 @@ mod tests {
                 let mut v = mgr.inline_values();
                 // What the console and `--value` hold, laid over the top exactly
                 // as `crate::proxy::effective_values` does.
-                v.extend(HashMap::from([("stored".to_string(), "FROM-STORE".to_string())]));
+                v.extend(HashMap::from([(
+                    "stored".to_string(),
+                    "FROM-STORE".to_string(),
+                )]));
                 v
             };
             let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
             let mut resolved = mgr.resolve(&info);
-            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            substitute_values(
+                &mut resolved,
+                &values,
+                TplCtx {
+                    info: &info,
+                    env: test_env(),
+                },
+            );
             resolved.value("resBody").map(str::to_string)
         };
 
@@ -9979,9 +10325,24 @@ mod tests {
     fn substituted(text: &str, values: &HashMap<String, String>) -> Resolved {
         let mut mgr = RuleManager::new();
         mgr.set_text(text);
-        let info = build_req_info("GET", "http", "a.com", 80, "/p?q=1", &HeaderMap::new(), None);
+        let info = build_req_info(
+            "GET",
+            "http",
+            "a.com",
+            80,
+            "/p?q=1",
+            &HeaderMap::new(),
+            None,
+        );
         let mut resolved = mgr.resolve(&info);
-        substitute_values(&mut resolved, values, TplCtx { info: &info, env: test_env() });
+        substitute_values(
+            &mut resolved,
+            values,
+            TplCtx {
+                info: &info,
+                env: test_env(),
+            },
+        );
         resolved
     }
 
@@ -9992,9 +10353,8 @@ mod tests {
     #[test]
     fn a_backtick_value_renders_against_the_request() {
         let none = HashMap::new();
-        let of = |text: &str, proto: &str| {
-            substituted(text, &none).value(proto).map(str::to_string)
-        };
+        let of =
+            |text: &str, proto: &str| substituted(text, &none).value(proto).map(str::to_string);
 
         assert_eq!(
             of("a.com reqHeaders://`x-m=${method}`\n", "reqHeaders").as_deref(),
@@ -10036,14 +10396,27 @@ mod tests {
         let none = HashMap::new();
         let slot = |text: &str| {
             let (info, mut resolved) = resolve_with_info(text, "http://b.com/x");
-            substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+            substitute_values(
+                &mut resolved,
+                &none,
+                TplCtx {
+                    info: &info,
+                    env: test_env(),
+                },
+            );
             resolved.slot().map(|op| op.value.clone())
         };
 
         // Backticks around the whole destination, and around the part after the
         // scheme — upstream's regexp accepts either.
-        assert_eq!(slot("b.com `http://${method}.dev`\n").as_deref(), Some("http://GET.dev/x"));
-        assert_eq!(slot("b.com http://`${method}.dev`\n").as_deref(), Some("http://GET.dev/x"));
+        assert_eq!(
+            slot("b.com `http://${method}.dev`\n").as_deref(),
+            Some("http://GET.dev/x")
+        );
+        assert_eq!(
+            slot("b.com http://`${method}.dev`\n").as_deref(),
+            Some("http://GET.dev/x")
+        );
         // A scheme this port does not know keeps its place too.
         assert_eq!(
             slot("b.com tunnel://`${method}.dev:443`\n").as_deref(),
@@ -10055,9 +10428,20 @@ mod tests {
             Some("/srv/GET.json/x")
         );
         // A pattern that leaves no tail renders just the same.
-        let (info, mut resolved) = resolve_with_info("b.com/x `http://${method}.dev`\n", "http://b.com/x");
-        substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
-        assert_eq!(resolved.slot().map(|op| op.value.as_str()), Some("http://GET.dev"));
+        let (info, mut resolved) =
+            resolve_with_info("b.com/x `http://${method}.dev`\n", "http://b.com/x");
+        substitute_values(
+            &mut resolved,
+            &none,
+            TplCtx {
+                info: &info,
+                env: test_env(),
+            },
+        );
+        assert_eq!(
+            resolved.slot().map(|op| op.value.as_str()),
+            Some("http://GET.dev")
+        );
         // Not a template — a `//` that is not a scheme separator leaves the
         // value alone, backtick or no backtick.
         assert_eq!(
@@ -10072,14 +10456,28 @@ mod tests {
         // mock's own bytes, plus a path appended to a body.
         let (info, mut resolved) =
             resolve_with_info("b.com file://`(mock-${method})`\n", "http://b.com/x");
-        substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+        substitute_values(
+            &mut resolved,
+            &none,
+            TplCtx {
+                info: &info,
+                env: test_env(),
+            },
+        );
         let op = resolved.slot().expect("a file rule");
         assert_eq!(op.value, "mock-GET");
         assert!(op.value_is_content);
         // …and the same for an operator that never joins anything.
         let (info, mut resolved) =
             resolve_with_info("b.com reqHeaders://`(x-m=${method})`\n", "http://b.com/x");
-        substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+        substitute_values(
+            &mut resolved,
+            &none,
+            TplCtx {
+                info: &info,
+                env: test_env(),
+            },
+        );
         assert_eq!(resolved.value("reqHeaders"), Some("x-m=GET"));
     }
 
@@ -10089,16 +10487,25 @@ mod tests {
     /// it is written once and reused by every rule that names it.
     #[test]
     fn a_backtick_value_renders_what_the_values_store_returned() {
-        let values: HashMap<String, String> =
-            [("hdr".to_string(), "x-m=${method}".to_string())].into_iter().collect();
+        let values: HashMap<String, String> = [("hdr".to_string(), "x-m=${method}".to_string())]
+            .into_iter()
+            .collect();
         let of = |text: &str| {
-            substituted(text, &values).value("reqHeaders").map(str::to_string)
+            substituted(text, &values)
+                .value("reqHeaders")
+                .map(str::to_string)
         };
 
-        assert_eq!(of("a.com reqHeaders://`${hdr}`\n").as_deref(), Some("x-m=GET"));
+        assert_eq!(
+            of("a.com reqHeaders://`${hdr}`\n").as_deref(),
+            Some("x-m=GET")
+        );
         // Without the backticks the stored text is used as written — upstream
         // renders it only when `rule.isTpl`.
-        assert_eq!(of("a.com reqHeaders://${hdr}\n").as_deref(), Some("x-m=${method}"));
+        assert_eq!(
+            of("a.com reqHeaders://${hdr}\n").as_deref(),
+            Some("x-m=${method}")
+        );
     }
 
     /// A stored value is **content**, and content is not rescanned. Upstream
@@ -10125,7 +10532,10 @@ mod tests {
             mgr.set_text(text);
             let info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
             let mut resolved = mgr.resolve(&info);
-            let tpl = TplCtx { info: &info, env: test_env() };
+            let tpl = TplCtx {
+                info: &info,
+                env: test_env(),
+            };
             substitute_values(&mut resolved, &values, tpl);
             // The second call is the one the proxy makes after merging an
             // include, and it must change nothing here.
@@ -10133,9 +10543,15 @@ mod tests {
             resolved.value("resBody").map(str::to_string)
         };
 
-        assert_eq!(of("a.com resBody://{braced}\n").as_deref(), Some("outer-${inner}"));
+        assert_eq!(
+            of("a.com resBody://{braced}\n").as_deref(),
+            Some("outer-${inner}")
+        );
         assert_eq!(of("a.com resBody://{whole}\n").as_deref(), Some("{inner}"));
-        assert_eq!(of("a.com resBody://{fenced}\n").as_deref(), Some("```\ncode\n```"));
+        assert_eq!(
+            of("a.com resBody://{fenced}\n").as_deref(),
+            Some("```\ncode\n```")
+        );
     }
 
     /// The whole-value form takes the backticks too: `resolveValue` renders what
@@ -10156,7 +10572,14 @@ mod tests {
             mgr.set_text(text);
             let info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
             let mut resolved = mgr.resolve(&info);
-            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            substitute_values(
+                &mut resolved,
+                &values,
+                TplCtx {
+                    info: &info,
+                    env: test_env(),
+                },
+            );
             resolved.value("reqHeaders").map(str::to_string)
         };
 
@@ -10182,23 +10605,40 @@ mod tests {
     /// the origin as written.
     #[test]
     fn a_pattern_capture_reaches_the_text_a_value_contributed() {
-        let values: HashMap<String, String> =
-            [("tag".to_string(), "got-$1".to_string())].into_iter().collect();
+        let values: HashMap<String, String> = [("tag".to_string(), "got-$1".to_string())]
+            .into_iter()
+            .collect();
         let of = |text: &str| {
             let mut mgr = RuleManager::new();
             mgr.set_text(text);
             let info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
             let mut resolved = mgr.resolve(&info);
-            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            substitute_values(
+                &mut resolved,
+                &values,
+                TplCtx {
+                    info: &info,
+                    env: test_env(),
+                },
+            );
             resolved.value("reqHeaders").map(str::to_string)
         };
 
-        assert_eq!(of("/a\\.(com)/ reqHeaders://x=${tag}\n").as_deref(), Some("x=got-com"));
+        assert_eq!(
+            of("/a\\.(com)/ reqHeaders://x=${tag}\n").as_deref(),
+            Some("x=got-com")
+        );
         // A wildcard's captures are the same captures.
-        assert_eq!(of("^http://a.com/* reqHeaders://x=${tag}\n").as_deref(), Some("x=got-p"));
+        assert_eq!(
+            of("^http://a.com/* reqHeaders://x=${tag}\n").as_deref(),
+            Some("x=got-p")
+        );
         // A pattern that captured nothing leaves the `$1` alone, exactly as it
         // does for a `$1` written on the rule line itself.
-        assert_eq!(of("a.com reqHeaders://x=${tag}\n").as_deref(), Some("x=got-$1"));
+        assert_eq!(
+            of("a.com reqHeaders://x=${tag}\n").as_deref(),
+            Some("x=got-$1")
+        );
     }
 
     /// `${statusCode}` and the rest of the response-side names are what a
@@ -10215,7 +10655,14 @@ mod tests {
         mgr.set_text("a.com resHeaders://`x-s=${statusCode}` reqHeaders://`x-m=${method}`\n");
         let mut info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
         let mut resolved = mgr.resolve(&info);
-        substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() });
+        substitute_values(
+            &mut resolved,
+            &none,
+            TplCtx {
+                info: &info,
+                env: test_env(),
+            },
+        );
 
         // The request-side operator rendered; the response-side one is still a
         // template, waiting.
@@ -10228,7 +10675,14 @@ mod tests {
             server_ip: None,
             server_port: None,
         });
-        assert!(substitute_values(&mut resolved, &none, TplCtx { info: &info, env: test_env() }));
+        assert!(substitute_values(
+            &mut resolved,
+            &none,
+            TplCtx {
+                info: &info,
+                env: test_env()
+            }
+        ));
         assert_eq!(resolved.value("resHeaders"), Some("x-s=503"));
         // And the request-side one was not rendered a second time.
         assert_eq!(resolved.value("reqHeaders"), Some("x-m=GET"));
@@ -10371,9 +10825,21 @@ mod tests {
 
         // The mirror image, so the gate cannot be "always no".
         for (proto, value, want) in [
-            ("reqHeaders", "/etc/h.json", ValueSource::File("/etc/h.json".into())),
-            ("resBody", "~/mock.html", ValueSource::File("~/mock.html".into())),
-            ("jsAppend", "/tmp/d.js", ValueSource::File("/tmp/d.js".into())),
+            (
+                "reqHeaders",
+                "/etc/h.json",
+                ValueSource::File("/etc/h.json".into()),
+            ),
+            (
+                "resBody",
+                "~/mock.html",
+                ValueSource::File("~/mock.html".into()),
+            ),
+            (
+                "jsAppend",
+                "/tmp/d.js",
+                ValueSource::File("/tmp/d.js".into()),
+            ),
             (
                 "resBody",
                 "https://cdn.test/m.json",
@@ -10391,13 +10857,21 @@ mod tests {
     /// whole-value `{name}` the values store answered.
     #[test]
     fn content_short_circuits_the_read() {
-        let values: HashMap<String, String> =
-            [("mock".to_string(), "/etc/passwd".to_string())].into_iter().collect();
+        let values: HashMap<String, String> = [("mock".to_string(), "/etc/passwd".to_string())]
+            .into_iter()
+            .collect();
         let mut mgr = RuleManager::new();
         mgr.set_text("a.com reqBody://(/etc/passwd)\na.com resBody://{mock}\n");
         let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
         let mut resolved = mgr.resolve(&info);
-        substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+        substitute_values(
+            &mut resolved,
+            &values,
+            TplCtx {
+                info: &info,
+                env: test_env(),
+            },
+        );
         rt().block_on(load_rule_values(&mut resolved, &info));
 
         // Both are content: the path text survives instead of being opened.
@@ -10419,10 +10893,11 @@ mod tests {
             let mut mgr = RuleManager::new();
             mgr.set_text(text);
             let (scheme, rest) = url.split_once("://").expect("absolute");
-            let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}")))
+            let (host, path) = rest
+                .split_once('/')
+                .map(|(h, p)| (h, format!("/{p}")))
                 .unwrap_or((rest, "/".into()));
-            let info =
-                build_req_info("GET", scheme, host, 80, &path, &HeaderMap::new(), None);
+            let info = build_req_info("GET", scheme, host, 80, &path, &HeaderMap::new(), None);
             let resolved = mgr.resolve(&info);
             resolved.slot().map(|op| op.protocol.clone())
         };
@@ -10430,7 +10905,8 @@ mod tests {
         let is = |got: Option<String>, want: &str| assert_eq!(got.as_deref(), Some(want));
 
         // Written first wins, whatever the protocols are.
-        let forward_first = "example.com http://127.0.0.1:9000\nexample.com/api file:///mock.json\n";
+        let forward_first =
+            "example.com http://127.0.0.1:9000\nexample.com/api file:///mock.json\n";
         is(winner(forward_first, "http://example.com/api"), "rule");
         let mock_first = "example.com/api file:///mock.json\nexample.com http://127.0.0.1:9000\n";
         is(winner(mock_first, "http://example.com/api"), "file");
@@ -10460,13 +10936,40 @@ mod tests {
         // order the slot protocols happened to be enumerated in — and
         // `statusCode` came first, so `example.com file:///mock statusCode://204`
         // served the mock upstream and answered 204 here.
-        is(winner("a.com file:///mock.json statusCode://204\n", "http://a.com/"), "file");
-        is(winner("a.com statusCode://204 file:///mock.json\n", "http://a.com/"), "statusCode");
-        is(winner("a.com redirect://http://x/ statusCode://204\n", "http://a.com/"), "redirect");
-        is(winner("a.com http://127.0.0.1:9000 statusCode://204\n", "http://a.com/"), "rule");
+        is(
+            winner(
+                "a.com file:///mock.json statusCode://204\n",
+                "http://a.com/",
+            ),
+            "file",
+        );
+        is(
+            winner(
+                "a.com statusCode://204 file:///mock.json\n",
+                "http://a.com/",
+            ),
+            "statusCode",
+        );
+        is(
+            winner(
+                "a.com redirect://http://x/ statusCode://204\n",
+                "http://a.com/",
+            ),
+            "redirect",
+        );
+        is(
+            winner(
+                "a.com http://127.0.0.1:9000 statusCode://204\n",
+                "http://a.com/",
+            ),
+            "rule",
+        );
         // A second bare host on a pattern-first line is an operator, not a
         // pattern, and it takes the slot before anything written after it.
-        is(winner("a.com b.com statusCode://204\n", "http://a.com/"), "rule");
+        is(
+            winner("a.com b.com statusCode://204\n", "http://a.com/"),
+            "rule",
+        );
     }
 
     /// `statusCode://` only speaks when it won the shared slot.
@@ -10491,7 +10994,10 @@ mod tests {
             parts.status
         };
         // Alone, it still answers.
-        assert_eq!(status_after("a.com statusCode://204\n"), StatusCode::NO_CONTENT);
+        assert_eq!(
+            status_after("a.com statusCode://204\n"),
+            StatusCode::NO_CONTENT
+        );
         // Behind a destination — on its own line or on the same one — it does not.
         assert_eq!(
             status_after("a.com http://127.0.0.1:9000\na.com statusCode://204\n"),
@@ -10501,7 +11007,10 @@ mod tests {
             status_after("a.com http://127.0.0.1:9000 statusCode://204\n"),
             StatusCode::OK
         );
-        assert_eq!(status_after("a.com file:///mock.json statusCode://204\n"), StatusCode::OK);
+        assert_eq!(
+            status_after("a.com file:///mock.json statusCode://204\n"),
+            StatusCode::OK
+        );
         // In front of one, it wins the slot and speaks.
         assert_eq!(
             status_after("a.com statusCode://204\na.com http://127.0.0.1:9000\n"),
@@ -10522,7 +11031,15 @@ mod tests {
     /// [`ReqInfo::host`] is still folded — that one is compared as a host.
     #[test]
     fn the_matched_url_keeps_the_host_as_written() {
-        let info = build_req_info("GET", "http", "API.Example.COM", 80, "/p", &HeaderMap::new(), None);
+        let info = build_req_info(
+            "GET",
+            "http",
+            "API.Example.COM",
+            80,
+            "/p",
+            &HeaderMap::new(),
+            None,
+        );
         assert_eq!(info.full_url, "http://API.Example.COM/p");
         assert_eq!(info.host, "api.example.com");
         // The default port is still the one thing the URL drops, as upstream's
@@ -10645,11 +11162,20 @@ mod tests {
         );
         // An unknown short name is whistle's octet-stream default; `sse` is the
         // one name that is not a file extension.
-        assert_eq!(lookup_type("nosuchtype", no_type_alias), "application/octet-stream");
+        assert_eq!(
+            lookup_type("nosuchtype", no_type_alias),
+            "application/octet-stream"
+        );
         assert_eq!(lookup_type("sse", no_type_alias), "text/event-stream");
         // The request side has extra aliases of its own.
-        assert_eq!(lookup_type("form", req_type_alias), "application/x-www-form-urlencoded");
-        assert_eq!(lookup_type("form", no_type_alias), "application/octet-stream");
+        assert_eq!(
+            lookup_type("form", req_type_alias),
+            "application/x-www-form-urlencoded"
+        );
+        assert_eq!(
+            lookup_type("form", no_type_alias),
+            "application/octet-stream"
+        );
     }
 
     /// A `ReqInfo` for a request a page on `https://app.test` made.
@@ -10667,9 +11193,13 @@ mod tests {
     #[test]
     fn a_local_file_answer_carries_cors_for_a_cross_origin_page() {
         let resolved = resolve("a.com/api file:///no/such/mock.json\n", "http://a.com/api");
-        let resp = short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("file://");
+        let resp =
+            short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("file://");
         let h = resp.headers();
-        assert_eq!(h.get("access-control-allow-origin").unwrap(), "https://app.test");
+        assert_eq!(
+            h.get("access-control-allow-origin").unwrap(),
+            "https://app.test"
+        );
         assert_eq!(h.get("access-control-allow-credentials").unwrap(), "true");
     }
 
@@ -10698,7 +11228,10 @@ mod tests {
         let resp = short_circuit(&info, &resolved, test_env(), None).expect("file://");
         assert_eq!(resp.status(), StatusCode::OK, "not the file's 404");
         let hs = resp.headers();
-        assert_eq!(hs.get("access-control-allow-origin").unwrap(), "https://app.test");
+        assert_eq!(
+            hs.get("access-control-allow-origin").unwrap(),
+            "https://app.test"
+        );
         assert_eq!(hs.get("access-control-allow-methods").unwrap(), "PUT");
         assert_eq!(hs.get("access-control-allow-headers").unwrap(), "x-token");
     }
@@ -10712,13 +11245,15 @@ mod tests {
             "a.com/api file:///no/such/mock.json disable://autoCors",
         ] {
             let resolved = resolve(&format!("{rule}\n"), "http://a.com/api");
-            let resp = short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("file://");
+            let resp =
+                short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("file://");
             assert!(
                 resp.headers().get("access-control-allow-origin").is_none(),
                 "{rule} should have silenced it"
             );
             // …and with it off, the preflight is the file's own answer again.
-            let resp = short_circuit(&cross_origin("OPTIONS"), &resolved, test_env(), None).expect("f");
+            let resp =
+                short_circuit(&cross_origin("OPTIONS"), &resolved, test_env(), None).expect("f");
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{rule}");
         }
     }
@@ -10775,7 +11310,11 @@ mod tests {
     #[test]
     fn a_self_made_response_says_who_made_it() {
         let info = build_req_info("GET", "http", "a.com", 80, "/x", &HeaderMap::new(), None);
-        for rule in ["statusCode://204", "redirect://http://b.com/", "file:///nope"] {
+        for rule in [
+            "statusCode://204",
+            "redirect://http://b.com/",
+            "file:///nope",
+        ] {
             let resolved = resolve(&format!("a.com/x {rule}\n"), "http://a.com/x");
             let resp = short_circuit(&info, &resolved, test_env(), None).expect("an answer");
             assert_eq!(
@@ -10874,13 +11413,19 @@ mod tests {
             "a.com/x locationHref://http://b.com/go\na.com/x file://(MOCK)\n",
             "http://a.com/x",
         );
-        assert_eq!(first.slot().map(|op| op.protocol.as_str()), Some("locationHref"));
+        assert_eq!(
+            first.slot().map(|op| op.protocol.as_str()),
+            Some("locationHref")
+        );
         let second = resolve(
             "a.com/x file://(MOCK)\na.com/x locationHref://http://b.com/go\n",
             "http://a.com/x",
         );
         assert_eq!(second.slot().map(|op| op.protocol.as_str()), Some("file"));
-        assert_eq!(body_text(short_circuit(&info, &second, test_env(), None).unwrap()), "MOCK");
+        assert_eq!(
+            body_text(short_circuit(&info, &second, test_env(), None).unwrap()),
+            "MOCK"
+        );
     }
 
     /// Only the file family. `redirect://` and `statusCode://` are answered by
@@ -10889,8 +11434,12 @@ mod tests {
     fn redirect_and_status_code_carry_no_automatic_cors() {
         for rule in ["redirect://http://b.com/", "statusCode://204"] {
             let resolved = resolve(&format!("a.com/api {rule}\n"), "http://a.com/api");
-            let resp = short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("answer");
-            assert!(resp.headers().get("access-control-allow-origin").is_none(), "{rule}");
+            let resp =
+                short_circuit(&cross_origin("GET"), &resolved, test_env(), None).expect("answer");
+            assert!(
+                resp.headers().get("access-control-allow-origin").is_none(),
+                "{rule}"
+            );
         }
     }
 
@@ -10915,10 +11464,14 @@ mod tests {
             "a.com file:///definitely/missing/file resHeaders://x-mock=1 resType://json",
             "http://a.com/x",
         );
-        let resp = short_circuit(&info, &resolved, test_env(), None).expect("file:// short-circuits");
+        let resp =
+            short_circuit(&info, &resolved, test_env(), None).expect("file:// short-circuits");
         let mut parts = resp.into_parts().0;
         apply_response(&mut parts, &resolved);
-        assert_eq!(parts.headers.get("x-mock").map(|v| v.to_str().unwrap()), Some("1"));
+        assert_eq!(
+            parts.headers.get("x-mock").map(|v| v.to_str().unwrap()),
+            Some("1")
+        );
         assert!(
             parts
                 .headers
@@ -10932,7 +11485,16 @@ mod tests {
     #[test]
     fn file_protocol_recognised() {
         use crate::rules::protocols::is_file_protocol;
-        for p in ["file", "rawfile", "tpl", "jsonp", "dust", "xfile", "xsrawfile", "xtpl"] {
+        for p in [
+            "file",
+            "rawfile",
+            "tpl",
+            "jsonp",
+            "dust",
+            "xfile",
+            "xsrawfile",
+            "xtpl",
+        ] {
             assert!(is_file_protocol(p), "{p} should be a file protocol");
         }
         assert!(!is_file_protocol("host"));
@@ -10955,7 +11517,9 @@ mod tests {
     #[test]
     fn config_vars_leave_a_mock_body_alone() {
         let values: HashMap<String, String> =
-            [("mock".to_string(), "listening on ${port}".to_string())].into_iter().collect();
+            [("mock".to_string(), "listening on ${port}".to_string())]
+                .into_iter()
+                .collect();
         let mut r = substituted("a.com resBody://{mock}\n", &values);
         substitute_config_vars(&mut r, 8899, "1.2.3");
         assert_eq!(r.value("resBody"), Some("listening on ${port}"));
@@ -10970,13 +11534,23 @@ mod tests {
         use super::super::upstream::ProxyKind;
         let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
 
-        let r = resolve("a.com internal-https-proxy://1.2.3.4:8080\n", "http://a.com/");
-        let p = resolved_target(&info, &r).proxy.expect("internal-https-proxy");
+        let r = resolve(
+            "a.com internal-https-proxy://1.2.3.4:8080\n",
+            "http://a.com/",
+        );
+        let p = resolved_target(&info, &r)
+            .proxy
+            .expect("internal-https-proxy");
         assert_eq!(p.kind, ProxyKind::Https);
         assert_eq!(p.port, 8080);
 
-        let r2 = resolve("a.com internal-http-proxy://1.2.3.4:8081\n", "http://a.com/");
-        let p2 = resolved_target(&info, &r2).proxy.expect("internal-http-proxy");
+        let r2 = resolve(
+            "a.com internal-http-proxy://1.2.3.4:8081\n",
+            "http://a.com/",
+        );
+        let p2 = resolved_target(&info, &r2)
+            .proxy
+            .expect("internal-http-proxy");
         assert_eq!(p2.kind, ProxyKind::Http);
 
         // `xproxy` is an alias of `proxy`.
@@ -10991,24 +11565,34 @@ mod tests {
     #[test]
     fn cipher_maps_to_tls_versions() {
         use super::super::upstream::TlsVersions;
-        let versions = |rules: &str| {
-            parse_cipher_versions(&cipher_options(&resolve(rules, "https://a.com/")))
-        };
+        let versions =
+            |rules: &str| parse_cipher_versions(&cipher_options(&resolve(rules, "https://a.com/")));
         let one = |value: &str| versions(&format!("a.com cipher://{value}\n"));
         assert_eq!(one("TLSv1.2"), TlsVersions::Only12);
         assert_eq!(one("TLSv1.3"), TlsVersions::Only13);
         assert_eq!(one(r#"{"maxVersion":"TLSv1.2"}"#), TlsVersions::Only12);
         assert_eq!(one(r#"{"minVersion":"TLSv1.3"}"#), TlsVersions::Only13);
-        assert_eq!(one(r#"{"secureProtocol":"TLSv1_2_method"}"#), TlsVersions::Only12);
+        assert_eq!(
+            one(r#"{"secureProtocol":"TLSv1_2_method"}"#),
+            TlsVersions::Only12
+        );
         // An OpenSSL cipher string carries no version pin → default (1.2+1.3).
-        assert_eq!(one(r#"{"ciphers":"ECDHE-RSA-AES128-GCM-SHA256"}"#), TlsVersions::Default);
+        assert_eq!(
+            one(r#"{"ciphers":"ECDHE-RSA-AES128-GCM-SHA256"}"#),
+            TlsVersions::Default
+        );
         // The query spelling the page leads with, which this port used to
         // ignore outright.
         assert_eq!(one("maxVersion=TLSv1.2"), TlsVersions::Only12);
-        assert_eq!(one("minVersion=TLSv1.3&maxVersion=TLSv1.3"), TlsVersions::Only13);
+        assert_eq!(
+            one("minVersion=TLSv1.3&maxVersion=TLSv1.3"),
+            TlsVersions::Only13
+        );
         // Several lines merge, and the first to name a key keeps it.
         assert_eq!(
-            versions("a.com cipher://minVersion=TLSv1.3\na.com cipher://ciphers=ECDHE-RSA-AES128-GCM-SHA256\n"),
+            versions(
+                "a.com cipher://minVersion=TLSv1.3\na.com cipher://ciphers=ECDHE-RSA-AES128-GCM-SHA256\n"
+            ),
             TlsVersions::Only13
         );
         assert_eq!(
@@ -11028,7 +11612,8 @@ mod tests {
                 .map(str::to_string)
         };
         assert_eq!(
-            ciphers("a.com cipher://ECDHE-ECDSA-AES256-GCM-SHA384:DH-RSA-AES256-GCM-SHA384\n").as_deref(),
+            ciphers("a.com cipher://ECDHE-ECDSA-AES256-GCM-SHA384:DH-RSA-AES256-GCM-SHA384\n")
+                .as_deref(),
             Some("ECDHE-ECDSA-AES256-GCM-SHA384:DH-RSA-AES256-GCM-SHA384")
         );
         assert_eq!(
@@ -11217,7 +11802,10 @@ mod tests {
         );
         let merged = merge_included_rules(&mut resolved, &info, &HashMap::new(), false);
         info.res = Some(build_res_info(404, &HeaderMap::new(), None, None));
-        assert!(response_phase_of(&merged, &info, false).is_some_and(|e| e.all("resHeaders").is_empty()));
+        assert!(
+            response_phase_of(&merged, &info, false)
+                .is_some_and(|e| e.all("resHeaders").is_empty())
+        );
     }
 
     /// An included file that says nothing about the response gets no second
@@ -11275,7 +11863,10 @@ mod tests {
         let values: HashMap<String, String> = [
             ("r", "example.com resHeaders://x-w=inner\n"),
             ("q", "example.com host://192.0.2.1 reqHeaders://x-late=1\n"),
-            ("g", "example.com resHeaders://x-g=1 includeFilter://s:404\n"),
+            (
+                "g",
+                "example.com resHeaders://x-g=1 includeFilter://s:404\n",
+            ),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -11283,7 +11874,14 @@ mod tests {
 
         let headers_of = |rules: &str, status: u16| {
             let (mut info, mut resolved) = resolve_with_info(rules, "http://example.com/");
-            substitute_values(&mut resolved, &values, TplCtx { info: &info, env: test_env() });
+            substitute_values(
+                &mut resolved,
+                &values,
+                TplCtx {
+                    info: &info,
+                    env: test_env(),
+                },
+            );
             info.res = Some(build_res_info(status, &HeaderMap::new(), None, None));
             merge_res_rules(&mut resolved, &info, &HashMap::new(), false);
             let mut h = HeaderMap::new();
@@ -11295,10 +11893,7 @@ mod tests {
         assert_eq!(h.get("x-file").unwrap(), "1");
 
         // The produced text wins over the line that named it.
-        let (h, _) = headers_of(
-            "example.com resHeaders://x-w=outer resRules://{r}\n",
-            200,
-        );
+        let (h, _) = headers_of("example.com resHeaders://x-w=outer resRules://{r}\n", 200);
         assert_eq!(h.get("x-w").unwrap(), "inner");
 
         // A request-side operator inside the text is dropped: by the time it is
@@ -11410,7 +12005,10 @@ mod tests {
         // that would have supplied one is empty (`rules.js:1100-1101`). Writing
         // the rule with the slash — `file:///srv/static/` — is what asks for the
         // index, and then both proxies serve it.
-        assert_eq!(served(&rules, "http://static.test/").map(|(s, _)| s), Some(404));
+        assert_eq!(
+            served(&rules, "http://static.test/").map(|(s, _)| s),
+            Some(404)
+        );
         assert_eq!(
             served(&format!("{}/\n", rules.trim_end()), "http://static.test/"),
             Some((200, b"<h1>root</h1>".to_vec()))
@@ -11439,19 +12037,15 @@ mod tests {
     /// so every inline mock 404'd.
     #[test]
     fn a_bracketed_value_is_the_response_body() {
-        let (status, ctype, body) = serve_at(
-            "file",
-            "({\"status\":\"ok\"})",
-            "http://api.test/data.json",
-        )
-        .expect("served");
+        let (status, ctype, body) =
+            serve_at("file", "({\"status\":\"ok\"})", "http://api.test/data.json").expect("served");
         assert_eq!(status, 200);
         assert_eq!(body, b"{\"status\":\"ok\"}");
         // With no file to name the type, the request URL does.
         assert_eq!(ctype, "application/json; charset=utf-8");
         // A template renders the inline text like it renders a file's.
-        let (_, _, body) = serve_at("tpl", "(hello {name})", "http://api.test/x?name=world")
-            .expect("served");
+        let (_, _, body) =
+            serve_at("tpl", "(hello {name})", "http://api.test/x?name=world").expect("served");
         assert_eq!(body, b"hello world");
     }
 
@@ -11552,7 +12146,9 @@ mod tests {
     /// fixed status line with a fixed body is the whole of what it needs to
     /// answer with. Returns the `http://127.0.0.1:PORT` it is listening on.
     async fn one_answer(status: u16, ctype: &str, body: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let head = format!(
             "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\n\r\n",
@@ -11621,18 +12217,24 @@ mod tests {
     async fn a_file_rule_may_name_a_url_instead_of_a_path() {
         let base = one_answer(200, "application/json", r#"{"remote":true}"#).await;
 
-        let (status, ctype, body) = serve_remote("file", &format!("{base}/data.json"), "http://x.com/echo").await;
+        let (status, ctype, body) =
+            serve_remote("file", &format!("{base}/data.json"), "http://x.com/echo").await;
         assert_eq!((status, body.as_str()), (200, r#"{"remote":true}"#));
-        assert!(ctype.starts_with("application/json"), "type from the URL: {ctype}");
+        assert!(
+            ctype.starts_with("application/json"),
+            "type from the URL: {ctype}"
+        );
 
         // No extension to guess from, and upstream falls back to the request's
         // own default rather than to what the source said.
-        let (_, ctype, _) = serve_remote("file", &format!("{base}/noext"), "http://x.com/echo").await;
+        let (_, ctype, _) =
+            serve_remote("file", &format!("{base}/noext"), "http://x.com/echo").await;
         assert!(ctype.starts_with("text/html"), "{ctype}");
 
         // A final segment that *is* an extension name counts as one, with no
         // dot in sight — `mime.lookup` cuts at the last `.`, `/` or `\`.
-        let (_, ctype, _) = serve_remote("file", &format!("{base}/json"), "http://x.com/echo").await;
+        let (_, ctype, _) =
+            serve_remote("file", &format!("{base}/json"), "http://x.com/echo").await;
         assert!(ctype.starts_with("application/json"), "{ctype}");
 
         // `<…>` is paths only. Measured: whistle opens it as a path and 404s.
@@ -11648,11 +12250,13 @@ mod tests {
     #[tokio::test]
     async fn a_broken_url_source_is_a_502_and_a_missing_one_is_a_404() {
         let broken = one_answer(500, "text/plain", "boom").await;
-        let (status, _, body) = serve_remote("file", &format!("{broken}/x.json"), "http://x.com/echo").await;
+        let (status, _, body) =
+            serve_remote("file", &format!("{broken}/x.json"), "http://x.com/echo").await;
         assert_eq!((status, body.as_str()), (502, "Error: response 500"));
 
         let missing = one_answer(404, "text/plain", "gone").await;
-        let (status, _, body) = serve_remote("file", &format!("{missing}/x.json"), "http://x.com/echo").await;
+        let (status, _, body) =
+            serve_remote("file", &format!("{missing}/x.json"), "http://x.com/echo").await;
         assert_eq!(status, 404);
         assert!(body.contains("file not found"), "{body}");
     }
@@ -11679,7 +12283,10 @@ mod tests {
             "http://x.com/echo",
         )
         .await;
-        assert_eq!(body, r#"{"remote":true}"#, "and the URL when it is not there");
+        assert_eq!(
+            body, r#"{"remote":true}"#,
+            "and the URL when it is not there"
+        );
     }
 
     #[test]
@@ -11737,7 +12344,10 @@ mod tests {
         // at all and the origin answers 400.
         assert_eq!(target("/echo?q=中"), Some("/echo?q=%E4%B8%AD".to_string()));
         assert_eq!(target("/echo?q=é"), Some("/echo?q=%C3%A9".to_string()));
-        assert_eq!(target("/echo?q=🚀"), Some("/echo?q=%F0%9F%9A%80".to_string()));
+        assert_eq!(
+            target("/echo?q=🚀"),
+            Some("/echo?q=%F0%9F%9A%80".to_string())
+        );
         // A backtick is not a URI character, so the last resort escapes the
         // rest rather than letting the whole rewrite vanish.
         assert_eq!(target("/ec`ho"), Some("/ec%60ho".to_string()));
@@ -11757,7 +12367,10 @@ mod tests {
     #[test]
     fn template_rules_render_the_file() {
         let fx = Fixtures::new("tpl");
-        let path = fx.write("api.json", br#"{"cb":"{callback}","m":"${method.replace(GET,get)}"}"#);
+        let path = fx.write(
+            "api.json",
+            br#"{"cb":"{callback}","m":"${method.replace(GET,get)}"}"#,
+        );
         let (status, ctype, body) =
             serve_at("tpl", &path, "http://x.com/api?callback=cb1").expect("served");
         assert_eq!(status, 200);
@@ -11806,7 +12419,9 @@ mod tests {
     #[test]
     fn headers_separator_accepts_every_line_ending() {
         // `HEADERS_SEP_RE`, file-proxy.js:12.
-        for sep in ["\r\n\r\n", "\r\n\r", "\r\n\n", "\n\r\n", "\n\r", "\n\n", "\r\r\n", "\r\r"] {
+        for sep in [
+            "\r\n\r\n", "\r\n\r", "\r\n\n", "\n\r\n", "\n\r", "\n\n", "\r\r\n", "\r\r",
+        ] {
             let data = format!("head{sep}body");
             let (head_end, body_start) = find_headers_sep(data.as_bytes()).expect(sep);
             assert_eq!(&data[..head_end], "head", "{sep:?}");
@@ -11912,12 +12527,21 @@ mod tests {
                 .unwrap_or_default()
                 .to_string()
         };
-        assert_eq!(typed(Some("mock.json"), "x.com/echo"), "application/json; charset=utf-8");
+        assert_eq!(
+            typed(Some("mock.json"), "x.com/echo"),
+            "application/json; charset=utf-8"
+        );
         // A key with no extension of its own falls back to the request URL's,
         // and then to `text/html` — the same chain a nameless inline value takes.
-        assert_eq!(typed(Some("mockbody"), "x.com/thing.css"), "text/css; charset=utf-8");
+        assert_eq!(
+            typed(Some("mockbody"), "x.com/thing.css"),
+            "text/css; charset=utf-8"
+        );
         assert_eq!(typed(None, "x.com/thing.css"), "text/css; charset=utf-8");
-        assert_eq!(typed(Some("mockbody"), "x.com/echo"), "text/html; charset=utf-8");
+        assert_eq!(
+            typed(Some("mockbody"), "x.com/echo"),
+            "text/html; charset=utf-8"
+        );
     }
 
     /// `util.isText` is a substring test, so a type merely *naming* xml or html
@@ -11937,7 +12561,11 @@ mod tests {
             ("mp4", "video/mp4"),
             ("zip", "application/zip"),
         ] {
-            assert_eq!(content_type_of_ext(&format!("a.{ext}")), Some(want), "{ext}");
+            assert_eq!(
+                content_type_of_ext(&format!("a.{ext}")),
+                Some(want),
+                "{ext}"
+            );
         }
     }
 
@@ -11980,8 +12608,14 @@ mod tests {
         let path = fx.write("r.txt", b"ranged-0123456789-end");
         let (status, heads, body) = serve_with_header("file", &path, "range", "bytes=0-5");
         assert_eq!((status, body.as_slice()), (206, b"ranged".as_slice()));
-        assert!(heads.contains(&("content-range".into(), "bytes 0-5/21".into())), "{heads:?}");
-        assert!(heads.contains(&("accept-ranges".into(), "bytes".into())), "{heads:?}");
+        assert!(
+            heads.contains(&("content-range".into(), "bytes 0-5/21".into())),
+            "{heads:?}"
+        );
+        assert!(
+            heads.contains(&("accept-ranges".into(), "bytes".into())),
+            "{heads:?}"
+        );
         // An inline value is rangeable too — it is the same `if (!isRawFile)`
         // arm upstream (`file-proxy.js:280-289`).
         let (status, _, body) = serve_with_header("file", "(0123456789)", "range", "bytes=2-4");
@@ -12041,7 +12675,15 @@ mod tests {
     /// The path form falls back to the file handler's header block instead.
     #[test]
     fn an_inline_raw_response_without_a_blank_line_is_untyped() {
-        let info = build_req_info("GET", "http", "x.com", 80, "/a.json", &HeaderMap::new(), None);
+        let info = build_req_info(
+            "GET",
+            "http",
+            "x.com",
+            80,
+            "/a.json",
+            &HeaderMap::new(),
+            None,
+        );
         let op = RuleOp {
             protocol: "rawfile".into(),
             value: "(no-blank-line)".into(),
@@ -12111,7 +12753,15 @@ mod tests {
     fn cipher_sets_target_tls_versions() {
         use super::super::upstream::TlsVersions;
         let resolved = resolve("example.com cipher://TLSv1.2\n", "https://example.com/");
-        let info = build_req_info("GET", "https", "example.com", 443, "/", &HeaderMap::new(), None);
+        let info = build_req_info(
+            "GET",
+            "https",
+            "example.com",
+            443,
+            "/",
+            &HeaderMap::new(),
+            None,
+        );
         let target = resolved_target(&info, &resolved);
         assert_eq!(target.tls_versions, TlsVersions::Only12);
     }
@@ -12160,7 +12810,10 @@ mod tests {
             "https://example.com/",
         )
         .expect("a usable cipher string");
-        assert!(target.tls_ciphers.is_some(), "a matchable string still pins");
+        assert!(
+            target.tls_ciphers.is_some(),
+            "a matchable string still pins"
+        );
     }
 
     // ── host / proxy precedence (proxyFirst, proxyHost, proxyHostOnly) ──
@@ -12183,7 +12836,11 @@ mod tests {
             &HeaderMap::new(),
             None,
         );
-        rt().block_on(resolve_target(&info, &crate::proxy::dest::Destination::of(&info, &resolved), &resolved))
+        rt().block_on(resolve_target(
+            &info,
+            &crate::proxy::dest::Destination::of(&info, &resolved),
+            &resolved,
+        ))
     }
 
     /// The upstream target `rules` produce for `url`.
@@ -12212,7 +12869,10 @@ mod tests {
                 .map(|v| v.to_str().unwrap().to_string())
         };
         assert_eq!(sent("example.com reqHeaders://x-a=1"), None);
-        assert_eq!(sent("example.com enable://keepClientId").as_deref(), Some("cid"));
+        assert_eq!(
+            sent("example.com enable://keepClientId").as_deref(),
+            Some("cid")
+        );
         // `disable://` beats it, as it beats every flag.
         assert_eq!(
             sent("example.com enable://keepClientId\nexample.com disable://keepClientId"),
@@ -12238,8 +12898,20 @@ mod tests {
         // And so is saying it.
         assert!(target("example.com enable://auto2http", https).auto2http);
         // `disable://` beats every one of them.
-        assert!(!target("example.com host://127.0.0.1:5173\nexample.com disable://auto2http", https).auto2http);
-        assert!(!target("example.com enable://auto2http\nexample.com disable://auto2http", https).auto2http);
+        assert!(
+            !target(
+                "example.com host://127.0.0.1:5173\nexample.com disable://auto2http",
+                https
+            )
+            .auto2http
+        );
+        assert!(
+            !target(
+                "example.com enable://auto2http\nexample.com disable://auto2http",
+                https
+            )
+            .auto2http
+        );
         // An http request has no leg to downgrade — the flag is read, the
         // retry is not reachable.
         let plain = target("example.com host://127.0.0.1:5173", "http://example.com/");
@@ -12264,11 +12936,20 @@ mod tests {
     #[test]
     fn only_the_x_spelling_of_host_falls_back() {
         let t = target("example.com xhost://10.0.0.9:8443\n", "http://example.com/");
-        assert_eq!((t.connect_host.as_str(), t.connect_port), ("10.0.0.9", 8443));
-        assert!(t.host_fallback_direct, "xhost:// is the pass-through spelling");
+        assert_eq!(
+            (t.connect_host.as_str(), t.connect_port),
+            ("10.0.0.9", 8443)
+        );
+        assert!(
+            t.host_fallback_direct,
+            "xhost:// is the pass-through spelling"
+        );
 
         let t = target("example.com host://10.0.0.9:8443\n", "http://example.com/");
-        assert_eq!((t.connect_host.as_str(), t.connect_port), ("10.0.0.9", 8443));
+        assert_eq!(
+            (t.connect_host.as_str(), t.connect_port),
+            ("10.0.0.9", 8443)
+        );
         assert!(!t.host_fallback_direct, "host:// fails the request instead");
 
         // `hosts://` is the third spelling and is *not* the x one.
@@ -12279,7 +12960,10 @@ mod tests {
     /// A proxy rule with no host rule to lose to is used as-is.
     #[test]
     fn proxy_alone_is_untouched() {
-        let t = target("example.com proxy://127.0.0.1:8888\n", "http://example.com/");
+        let t = target(
+            "example.com proxy://127.0.0.1:8888\n",
+            "http://example.com/",
+        );
         assert_eq!(t.proxy.expect("proxy").port, 8888);
     }
 
@@ -12314,7 +12998,10 @@ mod tests {
         ] {
             let t = target(rules, "http://example.com/");
             assert!(t.proxy.is_some(), "proxy should survive: {rules}");
-            assert_eq!(t.connect_host, "example.com", "the host address is dropped: {rules}");
+            assert_eq!(
+                t.connect_host, "example.com",
+                "the host address is dropped: {rules}"
+            );
             assert_eq!(t.connect_port, 80);
         }
         // Both properties together: `proxyHost` is the one that speaks, so the
@@ -12336,7 +13023,10 @@ mod tests {
         );
         let p = t.proxy.expect("?proxyHost should keep the proxy");
         assert_eq!(p.host, "127.0.0.1");
-        assert_eq!(p.port, 8888, "the query flag must not leak into the address");
+        assert_eq!(
+            p.port, 8888,
+            "the query flag must not leak into the address"
+        );
     }
 
     /// `proxyHostOnly` keeps both when a host rule matched, and discards the
@@ -12390,7 +13080,9 @@ mod tests {
             "http://example.com/",
         );
         assert_eq!(
-            t.proxy.expect("ignore://socks must not touch proxy://").port,
+            t.proxy
+                .expect("ignore://socks must not touch proxy://")
+                .port,
             8888
         );
         let t = target(
@@ -12415,10 +13107,15 @@ mod tests {
         );
 
         let t = target(
-            &format!("example.com proxy://127.0.0.1:8888\nexample.com pac://{pac}\nexample.com ignore://proxy\n"),
+            &format!(
+                "example.com proxy://127.0.0.1:8888\nexample.com pac://{pac}\nexample.com ignore://proxy\n"
+            ),
             "http://example.com/",
         );
-        assert!(t.proxy.is_none(), "ignore://proxy must not fall back to PAC");
+        assert!(
+            t.proxy.is_none(),
+            "ignore://proxy must not fall back to PAC"
+        );
 
         let t = target(&format!("example.com pac://{pac}\n"), "http://example.com/");
         assert_eq!(t.proxy.expect("pac chooses the proxy").port, 3128);
@@ -12442,8 +13139,9 @@ mod tests {
             "example.com http-proxy://@\n",
             "example.com proxy://?proxyHost\n",
         ] {
-            let err = try_target(rules, "http://example.com/")
-                .expect_err(&format!("{rules:?} must not resolve to a direct connection"));
+            let err = try_target(rules, "http://example.com/").expect_err(&format!(
+                "{rules:?} must not resolve to a direct connection"
+            ));
             assert!(
                 format!("{err:#}").contains("proxy address"),
                 "{rules:?}: {err:#}"
@@ -12456,9 +13154,17 @@ mod tests {
     #[test]
     fn a_pac_result_we_cannot_use_is_not_a_direct_connection() {
         assert!(parse_pac_result("DIRECT").expect("DIRECT parses").is_none());
-        assert!(parse_pac_result("PROXY 1.2.3.4:8080; DIRECT").expect("parses").is_some());
+        assert!(
+            parse_pac_result("PROXY 1.2.3.4:8080; DIRECT")
+                .expect("parses")
+                .is_some()
+        );
         // Unknown entry, then DIRECT: the DIRECT still wins.
-        assert!(parse_pac_result("SOCKS4 1.2.3.4:1080; DIRECT").expect("parses").is_none());
+        assert!(
+            parse_pac_result("SOCKS4 1.2.3.4:1080; DIRECT")
+                .expect("parses")
+                .is_none()
+        );
         // …but on its own, an entry we cannot honour is not a direct connection.
         assert!(parse_pac_result("SOCKS4 1.2.3.4:1080").is_err());
         assert!(parse_pac_result("PROXY").is_err());
@@ -12473,7 +13179,9 @@ mod tests {
     /// into an `x`-prefixed rule (`prefix = 'x'`, `node-pac/lib/Pac.js:96-103`).
     #[test]
     fn a_pac_direct_after_the_proxy_is_that_proxys_fallback() {
-        let with = parse_pac_result("PROXY 1.2.3.4:8080; DIRECT").unwrap().unwrap();
+        let with = parse_pac_result("PROXY 1.2.3.4:8080; DIRECT")
+            .unwrap()
+            .unwrap();
         assert!(with.fallback_direct, "the trailing DIRECT is a fallback");
 
         let without = parse_pac_result("PROXY 1.2.3.4:8080").unwrap().unwrap();
@@ -12486,7 +13194,11 @@ mod tests {
         assert!(past.fallback_direct);
 
         // A `DIRECT` reached *first* is the answer itself, not a fallback.
-        assert!(parse_pac_result("DIRECT; PROXY 1.2.3.4:8080").unwrap().is_none());
+        assert!(
+            parse_pac_result("DIRECT; PROXY 1.2.3.4:8080")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// `http2https-proxy://` upgrades an http origin to TLS
@@ -12534,7 +13246,10 @@ mod tests {
         }
 
         // A plain proxy converts nothing.
-        let t = target("example.com proxy://127.0.0.1:8888\n", "https://example.com/");
+        let t = target(
+            "example.com proxy://127.0.0.1:8888\n",
+            "https://example.com/",
+        );
         assert!(t.tls);
         assert!(!t.origin_tls_stripped);
 
@@ -12575,7 +13290,10 @@ mod tests {
         ] {
             let t = target(rules, "https://example.com/");
             assert!(!t.tls, "the hop should carry plaintext: {rules}");
-            assert!(t.origin_tls_stripped, "…and say so with the marker: {rules}");
+            assert!(
+                t.origin_tls_stripped,
+                "…and say so with the marker: {rules}"
+            );
         }
 
         // An http origin has no TLS to strip, so the property changes nothing.
@@ -12693,20 +13411,36 @@ mod tests {
             "an unguarded line still injects into JSON"
         );
         assert_eq!(
-            inject("example.com/x htmlAppend://<!--t--> lineProps://safeHtml\n", json, HTML),
+            inject(
+                "example.com/x htmlAppend://<!--t--> lineProps://safeHtml\n",
+                json,
+                HTML
+            ),
             json
         );
         assert_eq!(
-            inject("example.com/x htmlAppend://<!--t--> lineProps://strictHtml\n", json, HTML),
+            inject(
+                "example.com/x htmlAppend://<!--t--> lineProps://strictHtml\n",
+                json,
+                HTML
+            ),
             json
         );
         // Bare text is "safe" but not markup: only strictHtml refuses it.
         assert_eq!(
-            inject("example.com/x htmlAppend://<!--t--> lineProps://safeHtml\n", "hello", HTML),
+            inject(
+                "example.com/x htmlAppend://<!--t--> lineProps://safeHtml\n",
+                "hello",
+                HTML
+            ),
             "hello<!--t-->"
         );
         assert_eq!(
-            inject("example.com/x htmlAppend://<!--t--> lineProps://strictHtml\n", "hello", HTML),
+            inject(
+                "example.com/x htmlAppend://<!--t--> lineProps://strictHtml\n",
+                "hello",
+                HTML
+            ),
             "hello"
         );
     }
@@ -12802,7 +13536,10 @@ mod tests {
             "<p>hi</p>",
             HTML,
         );
-        assert_eq!(out, "<p>hi</p><script src=\"https://cdn.test/a.js\"></script>");
+        assert_eq!(
+            out,
+            "<p>hi</p><script src=\"https://cdn.test/a.js\"></script>"
+        );
 
         let out = inject(
             "example.com/x cssAppend:////cdn.test/a.css disable://doctype\n",
@@ -12902,7 +13639,12 @@ mod tests {
     /// return the origin's page with its `Cache-Control` and CSP intact.
     #[test]
     fn an_operator_written_with_no_value_leaves_the_response_alone() {
-        for rule in ["resBody://()", "resBody://", "htmlBody://()", "resPrepend://()"] {
+        for rule in [
+            "resBody://()",
+            "resBody://",
+            "htmlBody://()",
+            "resPrepend://()",
+        ] {
             assert_eq!(
                 inject(&format!("example.com/x {rule}\n"), "<p>keep</p>", HTML),
                 "<p>keep</p>",
@@ -12912,11 +13654,16 @@ mod tests {
             let (info, resolved) =
                 resolve_with_info(&format!("example.com/x {rule}\n"), "http://example.com/x");
             let mut parts = hyper::Response::new(()).into_parts().0;
-            parts.headers.insert(hyper::header::CONTENT_TYPE, HTML.parse().unwrap());
-            parts.headers.insert("cache-control", "max-age=600".parse().unwrap());
             parts
                 .headers
-                .insert("content-security-policy", "default-src 'self'".parse().unwrap());
+                .insert(hyper::header::CONTENT_TYPE, HTML.parse().unwrap());
+            parts
+                .headers
+                .insert("cache-control", "max-age=600".parse().unwrap());
+            parts.headers.insert(
+                "content-security-policy",
+                "default-src 'self'".parse().unwrap(),
+            );
             apply_response_for(&mut parts, &resolved, Some(&info));
             assert_eq!(
                 parts.headers.get("cache-control").unwrap(),
@@ -12930,11 +13677,18 @@ mod tests {
         }
 
         // The same operators with a value do all of it, which is the point.
-        let (info, resolved) =
-            resolve_with_info("example.com/x resPrepend://(<!--t-->)\n", "http://example.com/x");
+        let (info, resolved) = resolve_with_info(
+            "example.com/x resPrepend://(<!--t-->)\n",
+            "http://example.com/x",
+        );
         let mut parts = hyper::Response::new(()).into_parts().0;
-        parts.headers.insert(hyper::header::CONTENT_TYPE, HTML.parse().unwrap());
-        parts.headers.insert("content-security-policy", "default-src 'self'".parse().unwrap());
+        parts
+            .headers
+            .insert(hyper::header::CONTENT_TYPE, HTML.parse().unwrap());
+        parts.headers.insert(
+            "content-security-policy",
+            "default-src 'self'".parse().unwrap(),
+        );
         apply_response_for(&mut parts, &resolved, Some(&info));
         assert!(!parts.headers.contains_key("content-security-policy"));
         assert_eq!(parts.headers.get("cache-control").unwrap(), "no-store");
@@ -13219,9 +13973,8 @@ mod tests {
         let gbk = "text/html; charset=gbk";
 
         assert!(
-            inject("example.com/x htmlAppend://<i>中文</i>", gbk).ends_with(
-                b"<i>\xd6\xd0\xce\xc4</i>"
-            ),
+            inject("example.com/x htmlAppend://<i>中文</i>", gbk)
+                .ends_with(b"<i>\xd6\xd0\xce\xc4</i>"),
             "htmlAppend must land as GBK"
         );
         // The `js`/`css` families are wrapped first, then encoded whole.
@@ -13281,7 +14034,10 @@ mod tests {
             "example.com/api urlReplace://v1=v2\nexample.com/api urlReplace://old=new\n",
             "http://example.com/api/v1/old",
         );
-        assert_eq!(rewrite_path("/api/v1/old", &resolved, body_ctx(None)), "/api/v2/new");
+        assert_eq!(
+            rewrite_path("/api/v1/old", &resolved, body_ctx(None)),
+            "/api/v2/new"
+        );
     }
 
     /// `delete://` also names query parameters and path segments
@@ -13311,7 +14067,15 @@ mod tests {
         // ── query parameters ──
         assert_eq!(out("delete://query.a", "/p?a=1&b=2"), "/p?b=2");
         // Every spelling `QUERY_RE` takes, and it is case-insensitive.
-        for spelling in ["query", "params", "urlParams", "urlParam", "url.Param", "url.Params", "QUERY"] {
+        for spelling in [
+            "query",
+            "params",
+            "urlParams",
+            "urlParam",
+            "url.Param",
+            "url.Params",
+            "QUERY",
+        ] {
             assert_eq!(
                 out(&format!("delete://{spelling}.a"), "/p?a=1&b=2"),
                 "/p?b=2",
@@ -13377,12 +14141,18 @@ mod tests {
         assert_eq!(out("delete://pathname.last", "/a?x=1"), "/?x=1");
 
         // ── together, and against the operators they run beside ──
-        assert_eq!(out("delete://pathname.last|query.a", "/a/b?a=1&b=2"), "/a/?b=2");
+        assert_eq!(
+            out("delete://pathname.last|query.a", "/a/b?a=1&b=2"),
+            "/a/?b=2"
+        );
         // `deleteQuery` runs after `params://`, so it wins over a parameter the
         // same line had just written (`req.js:568-570`).
         assert_eq!(out("params://a=9 delete://query.a", "/p?b=2"), "/p?b=2");
         // …and the path deletion runs with `urlReplace://`, over its output.
-        assert_eq!(out("urlReplace://b=x delete://pathname.-1", "/a/b/c"), "/a/x");
+        assert_eq!(
+            out("urlReplace://b=x delete://pathname.-1", "/a/b/c"),
+            "/a/x"
+        );
     }
 
     /// The request side accumulates through the same code path.
@@ -13393,7 +14163,11 @@ mod tests {
              example.com reqAppend://a1\nexample.com reqAppend://a2\n",
             "http://example.com/",
         );
-        let out = transform_req_body(Bytes::from_static(b"BODY"), &resolved, body_ctx(Some("text/plain")));
+        let out = transform_req_body(
+            Bytes::from_static(b"BODY"),
+            &resolved,
+            body_ctx(Some("text/plain")),
+        );
         assert_eq!(out, Bytes::from_static(b"p1\r\np2BODYa1\r\na2"));
     }
 
@@ -13664,7 +14438,11 @@ mod tests {
     fn cache_operator_spellings() {
         let cc = |v: &str| res_header(&format!("example.com cache://{v}\n"), &[], "cache-control");
         assert_eq!(cc("600"), Some("max-age=600".to_string()));
-        assert_eq!(cc("60s"), Some("max-age=60".to_string()), "parseInt semantics");
+        assert_eq!(
+            cc("60s"),
+            Some("max-age=60".to_string()),
+            "parseInt semantics"
+        );
         assert_eq!(cc("-1"), Some("no-cache".to_string()));
         assert_eq!(cc("no"), Some("no-cache".to_string()));
         assert_eq!(cc("No-Cache"), Some("no-cache".to_string()));
@@ -13769,7 +14547,11 @@ mod tests {
             ("cache-control", "max-age=600"),
         ];
         assert_eq!(
-            res_header("example.com weinre://mysession\n", &html, "content-security-policy"),
+            res_header(
+                "example.com weinre://mysession\n",
+                &html,
+                "content-security-policy"
+            ),
             None
         );
         assert_eq!(
@@ -13796,12 +14578,19 @@ mod tests {
     #[test]
     fn attachment_names_the_download() {
         assert_eq!(
-            res_header("example.com attachment://报告.pdf\n", &[], "content-disposition"),
+            res_header(
+                "example.com attachment://报告.pdf\n",
+                &[],
+                "content-disposition"
+            ),
             Some("attachment; filename=\"%E6%8A%A5%E5%91%8A.pdf\"".to_string()),
             "a header value cannot carry non-Latin-1 bytes"
         );
         assert_eq!(encode_non_latin1("a b.pdf"), "a%20b.pdf");
-        let resolved = resolve("example.com attachment://\n", "http://example.com/d/report.csv");
+        let resolved = resolve(
+            "example.com attachment://\n",
+            "http://example.com/d/report.csv",
+        );
         let info = build_req_info(
             "GET",
             "http",
@@ -13830,7 +14619,11 @@ mod tests {
             Some("Basic realm=User Login".to_string())
         );
         assert_eq!(
-            res_header("example.com replaceStatus://407\n", &[], "proxy-authenticate"),
+            res_header(
+                "example.com replaceStatus://407\n",
+                &[],
+                "proxy-authenticate"
+            ),
             Some("Basic realm=User Login".to_string())
         );
     }
@@ -13855,7 +14648,10 @@ mod tests {
             let info = build_req_info(method, "http", "example.com", 80, "/x", &hm, None);
             let mut parts = res_parts(&[]);
             apply_response_for(&mut parts, &resolved, Some(&info));
-            parts.headers.get(name).map(|v| v.to_str().unwrap().to_string())
+            parts
+                .headers
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
         };
 
         // `*` allows any origin but never credentials.
@@ -13863,7 +14659,10 @@ mod tests {
             cors("*", "GET", &[], "access-control-allow-origin"),
             Some("*".to_string())
         );
-        assert_eq!(cors("*", "GET", &[], "access-control-allow-credentials"), None);
+        assert_eq!(
+            cors("*", "GET", &[], "access-control-allow-credentials"),
+            None
+        );
 
         // `enable` echoes the caller's origin, with credentials.
         let origin = [("origin", "https://app.test")];
@@ -13876,7 +14675,10 @@ mod tests {
             Some("true".to_string())
         );
         // …and does nothing at all when the request carries no origin.
-        assert_eq!(cors("enable", "GET", &[], "access-control-allow-origin"), None);
+        assert_eq!(
+            cors("enable", "GET", &[], "access-control-allow-origin"),
+            None
+        );
 
         // An explicit URL is trimmed to its origin.
         assert_eq!(
@@ -13925,7 +14727,12 @@ mod tests {
 
         // The query-string form.
         assert_eq!(
-            cors("methods=GET&maxAge=30", "GET", &[], "access-control-max-age"),
+            cors(
+                "methods=GET&maxAge=30",
+                "GET",
+                &[],
+                "access-control-max-age"
+            ),
             Some("30".to_string())
         );
     }
@@ -13951,7 +14758,10 @@ mod tests {
         );
         let mut parts = res_parts(&[]);
         apply_response_for(&mut parts, &resolved, Some(&info));
-        assert_eq!(parts.headers.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            parts.headers.get("access-control-allow-origin").unwrap(),
+            "*"
+        );
     }
 
     /// `resCookies` replaces a `Set-Cookie` the response already sent under the
@@ -13961,10 +14771,7 @@ mod tests {
     /// with no `content-type`, or an image one, is left alone.
     #[test]
     fn req_replace_is_gated_on_the_request_content_type() {
-        let resolved = resolve(
-            "example.com reqReplace://old=new\n",
-            "http://example.com/",
-        );
+        let resolved = resolve("example.com reqReplace://old=new\n", "http://example.com/");
         let body = || Bytes::from_static(b"old");
 
         assert_eq!(
@@ -13997,7 +14804,10 @@ mod tests {
     fn req_replace_reaches_a_form_post() {
         let resolved = resolve("example.com reqReplace://old=new\n", "http://example.com/");
         let sent = |method: &str, ct: Option<&str>| {
-            let ctx = ReqBodyCtx { method, content_type: ct };
+            let ctx = ReqBodyCtx {
+                method,
+                content_type: ct,
+            };
             let out = transform_req_body(Bytes::from_static(b"q=old"), &resolved, ctx);
             String::from_utf8(out.to_vec()).expect("utf-8")
         };
@@ -14006,7 +14816,10 @@ mod tests {
         assert_eq!(sent("POST", form), "q=new");
         // The charset parameter does not change the answer.
         assert_eq!(
-            sent("POST", Some("application/x-www-form-urlencoded; charset=UTF-8")),
+            sent(
+                "POST",
+                Some("application/x-www-form-urlencoded; charset=UTF-8")
+            ),
             "q=new"
         );
         // `isUrlEncoded` is POST-only, so a `PUT` carrying the same body takes
@@ -14061,11 +14874,17 @@ mod tests {
         );
         // The JSON array spelling is a list of cookies, not a header value.
         assert_eq!(
-            sent(r#"{"set-cookie":["sid=new","theme=dark"]}"#, &["sid=old", "csrf=abc"]),
+            sent(
+                r#"{"set-cookie":["sid=new","theme=dark"]}"#,
+                &["sid=old", "csrf=abc"]
+            ),
             ["sid=new", "theme=dark", "csrf=abc"]
         );
         // A plain string is split on commas, so this is two cookies…
-        assert_eq!(sent("set-cookie=a=1,b=2", &["sid=old"]), ["a=1", "b=2", "sid=old"]);
+        assert_eq!(
+            sent("set-cookie=a=1,b=2", &["sid=old"]),
+            ["a=1", "b=2", "sid=old"]
+        );
         // …and an array element is not, which is the only way to write a cookie
         // whose attributes contain a comma (an `Expires=Wed, 21 Oct …`).
         assert_eq!(
@@ -14076,7 +14895,10 @@ mod tests {
         assert_eq!(sent("set-cookie=sid=new", &[]), ["sid=new"]);
         // A cookie with no `=` is a name of its own, and does not collide.
         assert_eq!(sent("set-cookie=flag", &["sid=old"]), ["flag", "sid=old"]);
-        assert_eq!(sent("set-cookie=sid=new", &["sid=old", "flag"]), ["sid=new", "flag"]);
+        assert_eq!(
+            sent("set-cookie=sid=new", &["sid=old", "flag"]),
+            ["sid=new", "flag"]
+        );
         // An empty value is not a merge: it falls through to the assignment,
         // like any other empty header value.
         assert_eq!(sent("set-cookie=", &["sid=old"]), [""]);
@@ -14104,7 +14926,11 @@ mod tests {
             .iter()
             .map(|v| v.to_str().unwrap())
             .collect();
-        assert_eq!(values, ["1", "2"], "the arrived value is replaced, not added to");
+        assert_eq!(
+            values,
+            ["1", "2"],
+            "the arrived value is replaced, not added to"
+        );
         assert_eq!(parts.headers.get("x-b").unwrap(), "3");
     }
 
@@ -14115,9 +14941,17 @@ mod tests {
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
-        headers.append(hyper::header::SET_COOKIE, "sid=old; Path=/".parse().unwrap());
+        headers.append(
+            hyper::header::SET_COOKIE,
+            "sid=old; Path=/".parse().unwrap(),
+        );
         headers.append(hyper::header::SET_COOKIE, "other=1".parse().unwrap());
-        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
+        apply_res_cookies(
+            &mut headers,
+            &resolved,
+            &Deletions::of(&resolved, false),
+            None,
+        );
         let vals: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
@@ -14132,10 +14966,21 @@ mod tests {
         // (`_original/lib/util/index.js:3093-3096`) — `escapeValue` is reached
         // only down the attribute path. This asserted the opposite, and the
         // encoded form is a cookie with a nonsense value and no attribute at all.
-        let resolved = resolve("example.com resCookies://a=x;Secure\n", "http://example.com/");
+        let resolved = resolve(
+            "example.com resCookies://a=x;Secure\n",
+            "http://example.com/",
+        );
         let mut headers = HeaderMap::new();
-        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
-        assert_eq!(headers.get(hyper::header::SET_COOKIE).unwrap(), "a=x;Secure");
+        apply_res_cookies(
+            &mut headers,
+            &resolved,
+            &Deletions::of(&resolved, false),
+            None,
+        );
+        assert_eq!(
+            headers.get(hyper::header::SET_COOKIE).unwrap(),
+            "a=x;Secure"
+        );
     }
 
     /// One `Set-Cookie`, rendered from `resCookies`, for a given JSON spec.
@@ -14145,7 +14990,12 @@ mod tests {
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
-        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
+        apply_res_cookies(
+            &mut headers,
+            &resolved,
+            &Deletions::of(&resolved, false),
+            None,
+        );
         headers
             .get(hyper::header::SET_COOKIE)
             .expect("a cookie")
@@ -14195,7 +15045,12 @@ mod tests {
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
-        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
+        apply_res_cookies(
+            &mut headers,
+            &resolved,
+            &Deletions::of(&resolved, false),
+            None,
+        );
         let vals: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
@@ -14208,7 +15063,12 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append(hyper::header::SET_COOKIE, "sid=old".parse().unwrap());
         headers.append(hyper::header::SET_COOKIE, "keep=1".parse().unwrap());
-        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
+        apply_res_cookies(
+            &mut headers,
+            &resolved,
+            &Deletions::of(&resolved, false),
+            None,
+        );
         let vals: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
@@ -14291,7 +15151,10 @@ mod tests {
         info.from.tunnel = true;
         assert_eq!(lines("resCookies.sid", Some(&info)).len(), 4);
         // Three labels keep the leading dot; two have no parent at all.
-        assert_eq!(parent_domain("b.example.com").as_deref(), Some(".example.com"));
+        assert_eq!(
+            parent_domain("b.example.com").as_deref(),
+            Some(".example.com")
+        );
         assert_eq!(parent_domain("example.com"), None);
     }
 
@@ -14305,7 +15168,12 @@ mod tests {
             "http://example.com/",
         );
         let mut headers = HeaderMap::new();
-        apply_res_cookies(&mut headers, &resolved, &Deletions::of(&resolved, false), None);
+        apply_res_cookies(
+            &mut headers,
+            &resolved,
+            &Deletions::of(&resolved, false),
+            None,
+        );
         let out: Vec<_> = headers
             .get_all(hyper::header::SET_COOKIE)
             .iter()
@@ -14353,7 +15221,9 @@ mod tests {
         assert!(out.starts_with("a=1; Expires="), "got {out}");
         assert!(out.ends_with(" GMT; Max-Age=600"), "got {out}");
 
-        let out = set_cookie(&format!(r#"{{"a":{{"value":"1","maxAge":{EXPIRED_MAX_AGE}}}}}"#));
+        let out = set_cookie(&format!(
+            r#"{{"a":{{"value":"1","maxAge":{EXPIRED_MAX_AGE}}}}}"#
+        ));
         assert!(out.ends_with("; Max-Age=0"), "got {out}");
 
         // Every spelling upstream accepts, and only those.
@@ -14365,7 +15235,12 @@ mod tests {
             );
         }
         // `parseInt` semantics: a leading integer, or the attribute is skipped.
-        assert_eq!(set_cookie(r#"{"a":{"value":"1","maxAge":"600s"}}"#).split("; ").last(), Some("Max-Age=600"));
+        assert_eq!(
+            set_cookie(r#"{"a":{"value":"1","maxAge":"600s"}}"#)
+                .split("; ")
+                .last(),
+            Some("Max-Age=600")
+        );
         assert_eq!(set_cookie(r#"{"a":{"value":"1","maxAge":"soon"}}"#), "a=1");
     }
 
@@ -14393,10 +15268,7 @@ mod tests {
     #[test]
     fn the_method_is_uppercased_whether_or_not_a_rule_names_one() {
         let sent = |rule: &str, arrived: &str| {
-            let resolved = resolve(
-                &format!("example.com {rule}\n"),
-                "http://example.com/",
-            );
+            let resolved = resolve(&format!("example.com {rule}\n"), "http://example.com/");
             let mut parts = hyper::Request::builder()
                 .method(arrived)
                 .uri("http://example.com/")
@@ -14459,7 +15331,10 @@ mod tests {
         );
         // …and `enable://userLogin` wins over it.
         assert_eq!(
-            challenge("replaceStatus://401 disable://userLogin enable://userLogin", 200),
+            challenge(
+                "replaceStatus://401 disable://userLogin enable://userLogin",
+                200
+            ),
             (401, Some("Basic realm=User Login".to_string()))
         );
         // The line's own properties say the same, and were read as being about
@@ -14485,7 +15360,10 @@ mod tests {
         let mut parts = res_parts(&[]);
         apply_response(&mut parts, &resolved);
         assert_eq!(
-            parts.headers.get("www-authenticate").map(|v| v.to_str().unwrap()),
+            parts
+                .headers
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap()),
             Some("Basic realm=User Login")
         );
         // 407 takes the proxy spelling.
@@ -14510,21 +15388,36 @@ mod tests {
         let challenge = |rule: &str, header: &str| {
             let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
             let resolved = resolve(&format!("a.com {rule}\n"), "http://a.com/");
-            let resp = short_circuit(&info, &resolved, test_env(), None).expect("a status is answered");
+            let resp =
+                short_circuit(&info, &resolved, test_env(), None).expect("a status is answered");
             (
                 resp.status().as_u16(),
-                resp.headers().get(header).map(|v| v.to_str().unwrap().to_string()),
+                resp.headers()
+                    .get(header)
+                    .map(|v| v.to_str().unwrap().to_string()),
             )
         };
         let basic = || Some("Basic realm=User Login".to_string());
 
-        assert_eq!(challenge("statusCode://401", "www-authenticate"), (401, basic()));
-        assert_eq!(challenge("statusCode://407", "proxy-authenticate"), (407, basic()));
+        assert_eq!(
+            challenge("statusCode://401", "www-authenticate"),
+            (401, basic())
+        );
+        assert_eq!(
+            challenge("statusCode://407", "proxy-authenticate"),
+            (407, basic())
+        );
         // Only those two statuses carry one.
-        assert_eq!(challenge("statusCode://403", "www-authenticate"), (403, None));
+        assert_eq!(
+            challenge("statusCode://403", "www-authenticate"),
+            (403, None)
+        );
         // …and the line, or the request, can decline it.
         assert_eq!(
-            challenge("statusCode://401 lineProps://disableUserLogin", "www-authenticate"),
+            challenge(
+                "statusCode://401 lineProps://disableUserLogin",
+                "www-authenticate"
+            ),
             (401, None)
         );
         assert_eq!(
@@ -14549,7 +15442,12 @@ mod tests {
     fn disable_301_downgrades_the_redirect() {
         let status = |rule: &str, from: u16| {
             let resolved = resolve(&format!("example.com {rule}\n"), "http://example.com/");
-            let mut parts = Response::builder().status(from).body(()).unwrap().into_parts().0;
+            let mut parts = Response::builder()
+                .status(from)
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
             apply_response(&mut parts, &resolved);
             parts.status.as_u16()
         };
@@ -14610,7 +15508,10 @@ mod tests {
             "example.com resAppend://x delete://resHeaders.cache-control\n",
             "http://example.com/",
         );
-        let mut parts = res_parts(&[("content-type", "text/html"), ("cache-control", "max-age=60")]);
+        let mut parts = res_parts(&[
+            ("content-type", "text/html"),
+            ("cache-control", "max-age=60"),
+        ]);
         apply_response(&mut parts, &resolved);
         assert!(
             parts.headers.get("cache-control").is_none(),
@@ -14656,7 +15557,10 @@ mod tests {
         let res = resolve("example.com resHeaders://x-a=\n", "http://example.com/");
         let mut parts = res_parts(&[("x-a", "arrived")]);
         apply_response(&mut parts, &res);
-        assert_eq!(parts.headers.get("x-a").map(|v| v.to_str().unwrap()), Some(""));
+        assert_eq!(
+            parts.headers.get("x-a").map(|v| v.to_str().unwrap()),
+            Some("")
+        );
 
         // Removal is still available, under its own name.
         let del = resolve(
@@ -14676,10 +15580,7 @@ mod tests {
     #[test]
     fn disable_strips_request_headers() {
         let sent = |rule: &str, name: &str| {
-            let resolved = resolve(
-                &format!("example.com {rule}\n"),
-                "http://example.com/",
-            );
+            let resolved = resolve(&format!("example.com {rule}\n"), "http://example.com/");
             let mut parts = req_parts(&[
                 ("cookie", "sid=secret"),
                 ("user-agent", "MyUA"),
@@ -14688,7 +15589,10 @@ mod tests {
                 ("x-requested-with", "XMLHttpRequest"),
             ]);
             apply_request(&mut parts, &resolved);
-            parts.headers.get(name).map(|v| v.to_str().unwrap().to_string())
+            parts
+                .headers
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
         };
 
         assert_eq!(sent("disable://ua", "user-agent"), None);
@@ -14698,7 +15602,11 @@ mod tests {
         assert_eq!(sent("disable://referrer", "referer"), None);
         assert_eq!(sent("disable://ajax", "x-requested-with"), None);
         for spelling in ["cookie", "cookies", "reqCookie", "reqCookies"] {
-            assert_eq!(sent(&format!("disable://{spelling}"), "cookie"), None, "{spelling}");
+            assert_eq!(
+                sent(&format!("disable://{spelling}"), "cookie"),
+                None,
+                "{spelling}"
+            );
         }
         // `enable://captureStream` drops the encoding too: whistle wants the
         // origin's bytes uncompressed (`isEnable`, `util/index.js:675-677`).
@@ -14706,11 +15614,17 @@ mod tests {
         // …unless the same request also disables it, which is what `isEnable`
         // means — `enable` alone is not enough.
         assert_eq!(
-            sent("enable://captureStream disable://captureStream", "accept-encoding"),
+            sent(
+                "enable://captureStream disable://captureStream",
+                "accept-encoding"
+            ),
             Some("gzip".to_string())
         );
         // A flag nobody set leaves everything alone.
-        assert_eq!(sent("host://1.1.1.1", "cookie"), Some("sid=secret".to_string()));
+        assert_eq!(
+            sent("host://1.1.1.1", "cookie"),
+            Some("sid=secret".to_string())
+        );
     }
 
     /// The two abort gates are two different moments, and each has its own
@@ -14741,7 +15655,10 @@ mod tests {
         assert_eq!(gates("enable://abort disable://abortRes"), (true, false));
         // …and `disable://abort` cancels both, whatever armed them.
         assert_eq!(gates("enable://abort disable://abort"), (false, false));
-        assert_eq!(gates("enable://abortReq|abortRes disable://abort"), (false, false));
+        assert_eq!(
+            gates("enable://abortReq|abortRes disable://abort"),
+            (false, false)
+        );
 
         // Nothing set: nothing aborts.
         assert_eq!(gates("host://1.1.1.1"), (false, false));
@@ -14811,11 +15728,18 @@ mod tests {
         assert_eq!(sent("  GZIP , BR  "), Some("gzip, br".into()));
         // `deflate` goes, though this port could decode it — upstream's caller
         // does not pass `supportsDeflate`.
-        assert_eq!(sent("deflate"), Some("deflate".into()), "left alone: nothing survived");
+        assert_eq!(
+            sent("deflate"),
+            Some("deflate".into()),
+            "left alone: nothing survived"
+        );
         assert_eq!(sent("gzip, deflate"), Some("gzip".into()));
         // A `q` parameter takes the coding with it: the comparison is against
         // the whole token.
-        assert_eq!(sent("gzip;q=1.0, br;q=0.9"), Some("gzip;q=1.0, br;q=0.9".into()));
+        assert_eq!(
+            sent("gzip;q=1.0, br;q=0.9"),
+            Some("gzip;q=1.0, br;q=0.9".into())
+        );
         assert_eq!(sent("gzip;q=1.0, br"), Some("br".into()));
         // Empty tokens are not codings.
         assert_eq!(sent("gzip,,br"), Some("gzip, br".into()));
@@ -14848,7 +15772,12 @@ mod tests {
             ("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT"),
         ]);
         apply_request(&mut parts, &resolved);
-        for gone in ["if-none-match", "if-modified-since", "etag", "last-modified"] {
+        for gone in [
+            "if-none-match",
+            "if-modified-since",
+            "etag",
+            "last-modified",
+        ] {
             assert!(parts.headers.get(gone).is_none(), "{gone} must be stripped");
         }
         assert_eq!(parts.headers.get("pragma").unwrap(), "no-cache");
@@ -14939,7 +15868,11 @@ mod tests {
 
         // A rule that does not touch the body leaves the request conditional —
         // stripping it unasked would cost every such request its 304.
-        for rule in ["host://1.1.1.1", "resHeaders://x-a=1", "replaceStatus://500"] {
+        for rule in [
+            "host://1.1.1.1",
+            "resHeaders://x-a=1",
+            "replaceStatus://500",
+        ] {
             assert!(conditional_survives(rule), "{rule} must keep the 304 path");
         }
     }
@@ -14995,20 +15928,27 @@ mod tests {
             true => reresolve_forwarding(&resolved, &dest.moved_req_info(&info), &m, &[], false),
             false => resolved,
         };
-        rt().block_on(resolve_target(&info, &dest, &forwarding)).expect("resolve_target")
+        rt().block_on(resolve_target(&info, &dest, &forwarding))
+            .expect("resolve_target")
     }
 
     const MOVED: &str = "a.com/ http://b.com:9311/echo\n";
 
     #[test]
     fn a_proxy_only_the_replacement_matches_is_the_one_used() {
-        let r = second_pass(&format!("{MOVED}b.com proxy://127.0.0.1:9310\n"), "http://a.com/x");
+        let r = second_pass(
+            &format!("{MOVED}b.com proxy://127.0.0.1:9310\n"),
+            "http://a.com/x",
+        );
         assert_eq!(r.value("proxy"), Some("127.0.0.1:9310"));
     }
 
     #[test]
     fn a_proxy_only_the_original_matched_is_dropped() {
-        let r = second_pass(&format!("{MOVED}a.com proxy://127.0.0.1:9310\n"), "http://a.com/x");
+        let r = second_pass(
+            &format!("{MOVED}a.com proxy://127.0.0.1:9310\n"),
+            "http://a.com/x",
+        );
         assert_eq!(r.value("proxy"), None);
     }
 
@@ -15023,7 +15963,10 @@ mod tests {
     #[test]
     fn the_replacements_host_beats_the_originals() {
         let rules = format!("{MOVED}b.com host://1.2.3.4\na.com host://9.9.9.9\n");
-        assert_eq!(second_pass(&rules, "http://a.com/x").value("host"), Some("1.2.3.4"));
+        assert_eq!(
+            second_pass(&rules, "http://a.com/x").value("host"),
+            Some("1.2.3.4")
+        );
     }
 
     #[test]
@@ -15039,7 +15982,8 @@ mod tests {
     /// request-header operators reading the URL the client asked for.
     #[test]
     fn the_rest_of_the_rule_set_is_left_on_the_first_pass() {
-        let rules = format!("{MOVED}a.com reqHeaders://x-a=1 cipher://TLSv1.2\nb.com reqHeaders://x-b=2\n");
+        let rules =
+            format!("{MOVED}a.com reqHeaders://x-a=1 cipher://TLSv1.2\nb.com reqHeaders://x-b=2\n");
         let r = second_pass(&rules, "http://a.com/x");
         assert_eq!(r.value("reqHeaders"), Some("x-a=1"));
         assert_eq!(r.value("cipher"), Some("TLSv1.2"));
@@ -15064,7 +16008,10 @@ mod tests {
     #[test]
     fn a_capture_group_is_taken_from_the_replacement() {
         let rules = format!("{MOVED}/^http:\\/\\/([a-z]+)\\.com/ host://$1.example\n");
-        assert_eq!(second_pass(&rules, "http://a.com/x").value("host"), Some("b.example"));
+        assert_eq!(
+            second_pass(&rules, "http://a.com/x").value("host"),
+            Some("b.example")
+        );
     }
 
     /// End to end: the second pass reaches the connection decision, and the
@@ -15082,5 +16029,3 @@ mod tests {
         assert_eq!(t.connect_port, 9311);
     }
 }
-
-

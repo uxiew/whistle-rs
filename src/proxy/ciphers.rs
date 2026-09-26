@@ -134,63 +134,117 @@ static SUITES: &[Suite] = &[
         iana: "TLS_AES_256_GCM_SHA384",
         openssl: "",
         tls13: true,
-        attrs: Attrs { kx: Kx::None13, au: Au::None13, enc: Enc::AesGcm, bits: 256, prf: Prf::Sha384 },
+        attrs: Attrs {
+            kx: Kx::None13,
+            au: Au::None13,
+            enc: Enc::AesGcm,
+            bits: 256,
+            prf: Prf::Sha384,
+        },
     },
     Suite {
         rustls: ring::TLS13_AES_128_GCM_SHA256,
         iana: "TLS_AES_128_GCM_SHA256",
         openssl: "",
         tls13: true,
-        attrs: Attrs { kx: Kx::None13, au: Au::None13, enc: Enc::AesGcm, bits: 128, prf: Prf::Sha256 },
+        attrs: Attrs {
+            kx: Kx::None13,
+            au: Au::None13,
+            enc: Enc::AesGcm,
+            bits: 128,
+            prf: Prf::Sha256,
+        },
     },
     Suite {
         rustls: ring::TLS13_CHACHA20_POLY1305_SHA256,
         iana: "TLS_CHACHA20_POLY1305_SHA256",
         openssl: "",
         tls13: true,
-        attrs: Attrs { kx: Kx::None13, au: Au::None13, enc: Enc::Chacha20, bits: 256, prf: Prf::Sha256 },
+        attrs: Attrs {
+            kx: Kx::None13,
+            au: Au::None13,
+            enc: Enc::Chacha20,
+            bits: 256,
+            prf: Prf::Sha256,
+        },
     },
     Suite {
         rustls: ring::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
         iana: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
         openssl: "ECDHE-ECDSA-AES256-GCM-SHA384",
         tls13: false,
-        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Ecdsa, enc: Enc::AesGcm, bits: 256, prf: Prf::Sha384 },
+        attrs: Attrs {
+            kx: Kx::Ecdhe,
+            au: Au::Ecdsa,
+            enc: Enc::AesGcm,
+            bits: 256,
+            prf: Prf::Sha384,
+        },
     },
     Suite {
         rustls: ring::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
         iana: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
         openssl: "ECDHE-ECDSA-AES128-GCM-SHA256",
         tls13: false,
-        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Ecdsa, enc: Enc::AesGcm, bits: 128, prf: Prf::Sha256 },
+        attrs: Attrs {
+            kx: Kx::Ecdhe,
+            au: Au::Ecdsa,
+            enc: Enc::AesGcm,
+            bits: 128,
+            prf: Prf::Sha256,
+        },
     },
     Suite {
         rustls: ring::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
         iana: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
         openssl: "ECDHE-ECDSA-CHACHA20-POLY1305",
         tls13: false,
-        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Ecdsa, enc: Enc::Chacha20, bits: 256, prf: Prf::Sha256 },
+        attrs: Attrs {
+            kx: Kx::Ecdhe,
+            au: Au::Ecdsa,
+            enc: Enc::Chacha20,
+            bits: 256,
+            prf: Prf::Sha256,
+        },
     },
     Suite {
         rustls: ring::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
         iana: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
         openssl: "ECDHE-RSA-AES256-GCM-SHA384",
         tls13: false,
-        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Rsa, enc: Enc::AesGcm, bits: 256, prf: Prf::Sha384 },
+        attrs: Attrs {
+            kx: Kx::Ecdhe,
+            au: Au::Rsa,
+            enc: Enc::AesGcm,
+            bits: 256,
+            prf: Prf::Sha384,
+        },
     },
     Suite {
         rustls: ring::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         iana: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
         openssl: "ECDHE-RSA-AES128-GCM-SHA256",
         tls13: false,
-        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Rsa, enc: Enc::AesGcm, bits: 128, prf: Prf::Sha256 },
+        attrs: Attrs {
+            kx: Kx::Ecdhe,
+            au: Au::Rsa,
+            enc: Enc::AesGcm,
+            bits: 128,
+            prf: Prf::Sha256,
+        },
     },
     Suite {
         rustls: ring::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
         iana: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         openssl: "ECDHE-RSA-CHACHA20-POLY1305",
         tls13: false,
-        attrs: Attrs { kx: Kx::Ecdhe, au: Au::Rsa, enc: Enc::Chacha20, bits: 256, prf: Prf::Sha256 },
+        attrs: Attrs {
+            kx: Kx::Ecdhe,
+            au: Au::Rsa,
+            enc: Enc::Chacha20,
+            bits: 256,
+            prf: Prf::Sha256,
+        },
     },
 ];
 
@@ -257,7 +311,9 @@ fn alias_matches(word: &str, s: &Suite) -> Option<bool> {
 /// operator entirely — see [`evaluate`].)
 fn token_selects(token: &str, s: &Suite) -> Option<bool> {
     // A full suite name, in either spelling, selects exactly itself.
-    if token.eq_ignore_ascii_case(s.iana) || (!s.openssl.is_empty() && token.eq_ignore_ascii_case(s.openssl)) {
+    if token.eq_ignore_ascii_case(s.iana)
+        || (!s.openssl.is_empty() && token.eq_ignore_ascii_case(s.openssl))
+    {
         return Some(true);
     }
     // …but a name that belongs to *some* suite must not fall through to the
@@ -275,7 +331,8 @@ fn token_selects(token: &str, s: &Suite) -> Option<bool> {
 /// Is this token the full name of one of our suites?
 fn names_a_suite(token: &str) -> bool {
     SUITES.iter().any(|s| {
-        token.eq_ignore_ascii_case(s.iana) || (!s.openssl.is_empty() && token.eq_ignore_ascii_case(s.openssl))
+        token.eq_ignore_ascii_case(s.iana)
+            || (!s.openssl.is_empty() && token.eq_ignore_ascii_case(s.openssl))
     })
 }
 
@@ -345,7 +402,11 @@ pub fn evaluate(spec: &str) -> Result<CipherPolicy, NoCipherMatch> {
     let mut named13: Vec<usize> = Vec::new();
     let mut empty_tokens: Vec<String> = Vec::new();
 
-    for raw in spec.split([':', ',', ' ']).map(str::trim).filter(|t| !t.is_empty()) {
+    for raw in spec
+        .split([':', ',', ' '])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
         // `@STRENGTH` and `@SECLEVEL=n` are directives, not selections.
         if let Some(directive) = raw.strip_prefix('@') {
             if directive.eq_ignore_ascii_case("STRENGTH") {
@@ -370,7 +431,10 @@ pub fn evaluate(spec: &str) -> Result<CipherPolicy, NoCipherMatch> {
         // `CHACHA20` leaves TLS 1.3 at its default while
         // `TLS_CHACHA20_POLY1305_SHA256` pins it. An alias reaching the 1.3 list
         // would silently narrow it on strings that never meant to.
-        if let Some(i) = SUITES.iter().position(|s| s.tls13 && token.eq_ignore_ascii_case(s.iana)) {
+        if let Some(i) = SUITES
+            .iter()
+            .position(|s| s.tls13 && token.eq_ignore_ascii_case(s.iana))
+        {
             if op == ' ' && !named13.contains(&i) {
                 named13.push(i);
             }
@@ -433,7 +497,12 @@ pub fn evaluate(spec: &str) -> Result<CipherPolicy, NoCipherMatch> {
     // Node's behaviour and the alternative is a downgrade: with no 1.3 suite to
     // offer, a connection that could have been TLS 1.3 falls back to 1.2.
     let mut order: Vec<usize> = match named13.is_empty() {
-        true => SUITES.iter().enumerate().filter(|(_, s)| s.tls13).map(|(i, _)| i).collect(),
+        true => SUITES
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.tls13)
+            .map(|(i, _)| i)
+            .collect(),
         false => named13,
     };
     order.extend(list);
@@ -470,7 +539,10 @@ mod tests {
     /// Measured against Node 26 / OpenSSL 3.6 — see the module doc.
     #[test]
     fn a_tls12_pin_does_not_touch_the_tls13_suites() {
-        assert_eq!(tls12("ECDHE-RSA-AES128-GCM-SHA256"), ["ECDHE-RSA-AES128-GCM-SHA256"]);
+        assert_eq!(
+            tls12("ECDHE-RSA-AES128-GCM-SHA256"),
+            ["ECDHE-RSA-AES128-GCM-SHA256"]
+        );
         assert_eq!(
             tls13("ECDHE-RSA-AES128-GCM-SHA256").len(),
             3,
@@ -495,14 +567,21 @@ mod tests {
     #[test]
     fn a_tls13_name_selects_only_that_tls13_suite() {
         assert_eq!(tls13("TLS_AES_128_GCM_SHA256"), ["TLS_AES_128_GCM_SHA256"]);
-        assert!(tls12("TLS_AES_128_GCM_SHA256").is_empty(), "as OpenSSL empties it");
+        assert!(
+            tls12("TLS_AES_128_GCM_SHA256").is_empty(),
+            "as OpenSSL empties it"
+        );
     }
 
     /// The whole point: an ordinary string people actually write evaluates to
     /// an ordinary answer, with nothing to warn about.
     #[test]
     fn the_strings_people_write_just_work() {
-        assert_eq!(tls12("HIGH:!aNULL:!MD5").len(), 6, "every suite here is HIGH");
+        assert_eq!(
+            tls12("HIGH:!aNULL:!MD5").len(),
+            6,
+            "every suite here is HIGH"
+        );
         assert_eq!(tls12("DEFAULT").len(), 6);
         assert_eq!(tls12("ALL").len(), 6);
         assert_eq!(tls12("AESGCM").len(), 4, "the four AES-GCM suites");
@@ -536,7 +615,11 @@ mod tests {
         assert_eq!(tls12("AESGCM:-AES128").len(), 2, "the 256-bit AES-GCM pair");
         // `-` allows a later token to bring them back; `!` does not.
         assert_eq!(tls12("ALL:-AESGCM:AES128").len(), 4);
-        assert_eq!(tls12("ALL:!AESGCM:AES128").len(), 2, "only the ChaCha20 pair");
+        assert_eq!(
+            tls12("ALL:!AESGCM:AES128").len(),
+            2,
+            "only the ChaCha20 pair"
+        );
         assert_eq!(tls12("HIGH:!CHACHA20").len(), 4);
     }
 
@@ -583,7 +666,11 @@ mod tests {
     fn every_selected_suite_is_one_the_provider_has() {
         let provider = rustls::crypto::ring::default_provider();
         for suite in evaluate("ALL").expect("all").suites() {
-            assert!(provider.cipher_suites.contains(&suite), "{:?}", suite.suite());
+            assert!(
+                provider.cipher_suites.contains(&suite),
+                "{:?}",
+                suite.suite()
+            );
         }
     }
 

@@ -248,7 +248,10 @@ impl AllowedOrigins {
             if entry == "*" {
                 // Upstream checks for `*` before compiling anything, so a list
                 // that contains one is simply "all".
-                return AllowedOrigins { all: true, ..Default::default() };
+                return AllowedOrigins {
+                    all: true,
+                    ..Default::default()
+                };
             }
             match entry.contains('*') {
                 true => {
@@ -268,8 +271,7 @@ impl AllowedOrigins {
             return true;
         }
         let host = host.to_ascii_lowercase();
-        self.hosts.iter().any(|h| h == &host)
-            || self.patterns.iter().any(|re| re.is_match(&host))
+        self.hosts.iter().any(|h| h == &host) || self.patterns.iter().any(|re| re.is_match(&host))
     }
 
     /// Nothing was configured, which is the default and means no cross-origin
@@ -366,10 +368,21 @@ impl HeaderRules {
 
 fn expand_mode(token: &str) -> Option<&'static [&'static str]> {
     match token {
-        "multiple" => Some(&["multiEnv", "disableUpdateTips", "keepXFF", "x-forwarded-proto"]),
+        "multiple" => Some(&[
+            "multiEnv",
+            "disableUpdateTips",
+            "keepXFF",
+            "x-forwarded-proto",
+        ]),
         "admin" => Some(&[
-            "proxyServer", "master", "x-forwarded-proto", "strict", "rules",
-            "disableUpdateTips", "proxifier", "notAllowedDisablePlugins",
+            "proxyServer",
+            "master",
+            "x-forwarded-proto",
+            "strict",
+            "rules",
+            "disableUpdateTips",
+            "proxifier",
+            "notAllowedDisablePlugins",
         ]),
         _ => None,
     }
@@ -382,24 +395,63 @@ fn expand_mode(token: &str) -> Option<&'static [&'static str]> {
 /// something to look up, and "no such mode" is a typo to fix. Grouped by why.
 const INERT_MODES: &[&str] = &[
     // Console options: which switches the web UI offers, and how it looks.
-    "disableAuthUI", "disableUIAuth", "keepProxyUI", "hideLeftBar", "hideLeftMenu",
-    "allowMultipleChoice", "useMultipleRules", "enableMultipleRules",
-    "disableMultipleRules", "notAllowDisableRules", "notAllowedDisableRules",
-    "disableBackOption", "disabledBackOption", "disableMultipleOption",
-    "disabledMultipleOption", "disableRulesOptions", "disabledRulesOptions",
-    "notAllowDisablePlugins", "notAllowedDisablePlugins",
+    "disableAuthUI",
+    "disableUIAuth",
+    "keepProxyUI",
+    "hideLeftBar",
+    "hideLeftMenu",
+    "allowMultipleChoice",
+    "useMultipleRules",
+    "enableMultipleRules",
+    "disableMultipleRules",
+    "notAllowDisableRules",
+    "notAllowedDisableRules",
+    "disableBackOption",
+    "disabledBackOption",
+    "disableMultipleOption",
+    "disabledMultipleOption",
+    "disableRulesOptions",
+    "disabledRulesOptions",
+    "notAllowDisablePlugins",
+    "notAllowedDisablePlugins",
     "disableUpdateTips",
-    "disableCustomCerts", "showPluginReq",
+    "disableCustomCerts",
+    "showPluginReq",
     // Which subsystem the instance is for. This port has one shape.
-    "rules", "rulesOnly", "plugins", "pluginsOnly", "network", "shadowRules",
-    "socks", "master", "client", "agent", "proxyServer", "proxifier",
-    "proxifier2", "diagnose", "encrypted", "captureData", "noGzip",
-    "INADDR_ANY", "buildIn", "build-in",
+    "rules",
+    "rulesOnly",
+    "plugins",
+    "pluginsOnly",
+    "network",
+    "shadowRules",
+    "socks",
+    "master",
+    "client",
+    "agent",
+    "proxyServer",
+    "proxifier",
+    "proxifier2",
+    "diagnose",
+    "encrypted",
+    "captureData",
+    "noGzip",
+    "INADDR_ANY",
+    "buildIn",
+    "build-in",
     // DNS resolution order — `gui/online.md`'s three radio buttons.
-    "ipv6Only", "ipv6only", "ipv4First", "ipv4first", "ipv6first", "verbatim",
-    "dnsResolve", "dnsResolve4", "dnsResolve6",
+    "ipv6Only",
+    "ipv6only",
+    "ipv4First",
+    "ipv4first",
+    "ipv6first",
+    "verbatim",
+    "dnsResolve",
+    "dnsResolve4",
+    "dnsResolve6",
     // Node's own inspector and process shape.
-    "debug", "safe", "rejectUnauthorized",
+    "debug",
+    "safe",
+    "rejectUnauthorized",
 ];
 
 impl Config {
@@ -458,8 +510,8 @@ impl Config {
                 // The HTTPS switch, at launch. This port intercepts by default,
                 // so the `on` spellings are the default and say so; the `off`
                 // ones are `--no-intercept-https` under whistle's name.
-                "capture" | "intercept" | "enable-capture" | "enableCapture"
-                | "enableHttps" | "enableHTTPS" | "persistentCapture" => {
+                "capture" | "intercept" | "enable-capture" | "enableCapture" | "enableHttps"
+                | "enableHTTPS" | "persistentCapture" => {
                     self.intercept_https = true;
                     true
                 }
@@ -652,7 +704,13 @@ mod tests {
             assert!(c.console_hostnames, "{token}");
             assert_eq!(r.honoured, [token]);
         }
-        for token in ["capture", "intercept", "enableCapture", "enableHttps", "persistentCapture"] {
+        for token in [
+            "capture",
+            "intercept",
+            "enableCapture",
+            "enableHttps",
+            "persistentCapture",
+        ] {
             let (c, _) = with(token);
             assert!(c.intercept_https, "{token}");
         }
@@ -740,7 +798,10 @@ mod tests {
 
         // `multiEnv` is the stronger of the two whichever order they come in —
         // upstream checks `config.multiEnv` first at every site.
-        for list in ["multiEnv|enableRequestHeaderRules", "enableRequestHeaderRules|multiEnv"] {
+        for list in [
+            "multiEnv|enableRequestHeaderRules",
+            "enableRequestHeaderRules|multiEnv",
+        ] {
             let mut c = Config::default();
             c.apply_modes(list);
             assert_eq!(c.header_rules, HeaderRules::Request, "{list}");
@@ -763,7 +824,11 @@ mod tests {
     /// `-M multiEnv|capture` both pass CONNECT through.
     #[test]
     fn a_mode_can_take_the_https_switch_away_whatever_the_order() {
-        for list in ["capture|multiEnv", "multiEnv|capture", "capture|notAllowedEnableHTTPS"] {
+        for list in [
+            "capture|multiEnv",
+            "multiEnv|capture",
+            "capture|notAllowedEnableHTTPS",
+        ] {
             let mut c = Config::default();
             c.apply_modes(list);
             assert!(c.intercept_https, "{list}: the switch itself is still on");
@@ -806,7 +871,10 @@ mod tests {
         assert!(!w.allows("wild.test"), "a star is a label, not nothing");
         assert!(!w.allows("deep.api.wild.test"), "and one label, not two");
         assert!(AllowedOrigins::parse("**.wild.test").allows("deep.api.wild.test"));
-        assert!(AllowedOrigins::parse("***.wild.test").allows("wild.test"), "three makes it optional");
+        assert!(
+            AllowedOrigins::parse("***.wild.test").allows("wild.test"),
+            "three makes it optional"
+        );
 
         // A `*` anywhere is "all", and the rest of the list stops mattering.
         for list in ["*", "good.test|*", "*|good.test"] {

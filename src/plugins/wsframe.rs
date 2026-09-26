@@ -263,7 +263,10 @@ pub struct RemoteHook {
 impl RemoteHook {
     async fn exchange(&mut self, frame: &HookFrame) -> anyhow::Result<Verdict> {
         if frame.payload.len() > u32::MAX as usize {
-            anyhow::bail!("frame of {} bytes exceeds the record format", frame.payload.len());
+            anyhow::bail!(
+                "frame of {} bytes exceeds the record format",
+                frame.payload.len()
+            );
         }
         self.send(frame).await?;
         let record = tokio::time::timeout(VERDICT_TIMEOUT, self.reader.next())
@@ -298,7 +301,10 @@ impl RemoteHook {
             head.extend_from_slice(&frame.payload);
         }
         let stopped = || anyhow::anyhow!("plugin stopped reading frames");
-        self.tx.send(Ok(head.freeze())).await.map_err(|_| stopped())?;
+        self.tx
+            .send(Ok(head.freeze()))
+            .await
+            .map_err(|_| stopped())?;
         if big {
             self.tx
                 .send(Ok(frame.payload.clone()))
@@ -482,7 +488,10 @@ mod tests {
     fn records_reassemble_from_arbitrary_pieces() {
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&record(FLAG_FIN, 0x1, b"hello")[..4]);
-        assert!(take_record(&mut buf).is_none(), "a partial header must wait");
+        assert!(
+            take_record(&mut buf).is_none(),
+            "a partial header must wait"
+        );
 
         buf.clear();
         buf.extend_from_slice(&record(FLAG_FIN, 0x1, b"hello"));
@@ -567,7 +576,11 @@ mod tests {
                 let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
                 l.local_addr().expect("addr")
             };
-            assert!(connect("gone", &format!("http://{addr}"), &meta()).await.is_err());
+            assert!(
+                connect("gone", &format!("http://{addr}"), &meta())
+                    .await
+                    .is_err()
+            );
         });
     }
 

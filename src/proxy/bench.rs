@@ -78,7 +78,9 @@ impl Body for ChunkedBody {
         let take = this.chunk.min(this.remaining);
         let start = this.source.len() - this.remaining;
         this.remaining -= take;
-        Poll::Ready(Some(Ok(Frame::data(this.source.slice(start..start + take)))))
+        Poll::Ready(Some(Ok(Frame::data(
+            this.source.slice(start..start + take),
+        ))))
     }
 }
 
@@ -659,10 +661,7 @@ impl crate::plugins::RustPlugin for SilentSni {
         }
     }
 
-    fn sni(
-        &self,
-        _req: &crate::plugins::sni::SniReq,
-    ) -> crate::plugins::sni::SniVerdict {
+    fn sni(&self, _req: &crate::plugins::sni::SniReq) -> crate::plugins::sni::SniVerdict {
         crate::plugins::sni::SniVerdict::Generated
     }
 
@@ -737,7 +736,9 @@ async fn bench_accept(setup: Setup, state: &Arc<super::AppState>, stream: TcpStr
     // The plumbing on its own: read once, replay, hand rustls the socket.
     if let Setup::RawRead = setup {
         let mut prefix = Vec::with_capacity(8192);
-        tokio::io::AsyncReadExt::read_buf(&mut stream, &mut prefix).await.ok();
+        tokio::io::AsyncReadExt::read_buf(&mut stream, &mut prefix)
+            .await
+            .ok();
         let s = super::sni::Prefixed::new(prefix, stream);
         let acceptor = state.ca.acceptor_for(BENCH_SNI).expect("acceptor");
         acceptor.accept(s).await.ok();
@@ -747,7 +748,17 @@ async fn bench_accept(setup: Setup, state: &Arc<super::AppState>, stream: TcpStr
     let has_sni = hello.server_name.is_some();
     let name = hello.server_name.unwrap_or_else(|| BENCH_SNI.to_string());
     let stream = super::sni::Prefixed::new(hello.prefix, stream);
-    let acceptor = match super::sni::decide(state, &name, &name, 443, peer, has_sni, super::sni::Carried::Tls).await {
+    let acceptor = match super::sni::decide(
+        state,
+        &name,
+        &name,
+        443,
+        peer,
+        has_sni,
+        super::sni::Carried::Tls,
+    )
+    .await
+    {
         super::sni::Decision::Generated => state.ca.acceptor_for(&name).expect("acceptor"),
         super::sni::Decision::Plugin(a) => a,
         // Neither is reachable in this benchmark — its rules name no plugin —
@@ -775,7 +786,13 @@ fn tls_handshake_latency() {
     let dir = std::env::temp_dir().join(format!("whistle-rs-sni-bench-{}", std::process::id()));
 
     rt.block_on(async {
-        let setups = [Setup::Eager, Setup::RawRead, Setup::Peek, Setup::RuleMiss, Setup::Plugin];
+        let setups = [
+            Setup::Eager,
+            Setup::RawRead,
+            Setup::Peek,
+            Setup::RuleMiss,
+            Setup::Plugin,
+        ];
         let labels = [
             "eager (pre-change)",
             "read + replay, no parse",
@@ -875,7 +892,10 @@ fn client_hello_peek_cost() {
         conn.write_tls(&mut hello).expect("hello");
         println!("\nClientHello: {} bytes", hello.len());
 
-        let mut runs = vec![Samples::new("copy the bytes only"), Samples::new("peek (parse + copy)")];
+        let mut runs = vec![
+            Samples::new("copy the bytes only"),
+            Samples::new("peek (parse + copy)"),
+        ];
         for i in 0..5_000 + 200 {
             for k in 0..2 {
                 let slot = (i + k) % 2;

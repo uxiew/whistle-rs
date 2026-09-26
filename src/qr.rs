@@ -679,10 +679,16 @@ mod tests {
     /// arithmetic cannot pass quietly.
     #[test]
     fn it_takes_what_it_says_it_takes() {
-        assert!(encode("").is_some(), "an empty payload still makes a symbol");
+        assert!(
+            encode("").is_some(),
+            "an empty payload still makes a symbol"
+        );
         // 213 bytes is the level-M byte capacity of version 10.
         assert_eq!(encode(&"a".repeat(213)).map(|m| m.version), Some(10));
-        assert!(encode(&"a".repeat(214)).is_none(), "and one more does not fit");
+        assert!(
+            encode(&"a".repeat(214)).is_none(),
+            "and one more does not fit"
+        );
     }
 
     /// Each version is one module wider than the last by four, and the payload

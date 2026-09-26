@@ -250,11 +250,7 @@ async fn writer_task(
 
 /// Open (or create) a file for appending.
 fn open_append(path: &Path) -> Option<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
 /// List all `sessions-*.jsonl` files in `dir`.

@@ -346,7 +346,10 @@ mod tests {
             .rules("mock.test plugin://canned")
             .plugin(Canned)
             .on_session(move |s| {
-                recorder.lock().unwrap().push(format!("{} {}", s.status, s.url));
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push(format!("{} {}", s.status, s.url));
             })
             .start()
             .await

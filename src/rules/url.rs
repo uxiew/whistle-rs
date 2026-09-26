@@ -302,9 +302,15 @@ mod tests {
     fn a_rule_value_is_read_as_json5() {
         let obj = |s: &str| super::parse_json(s).map(|v| v.to_string());
         assert_eq!(obj("{\"a\":1}").as_deref(), Some(r#"{"a":1}"#));
-        assert_eq!(obj("{a: 'one', b: 'two'}").as_deref(), Some(r#"{"a":"one","b":"two"}"#));
+        assert_eq!(
+            obj("{a: 'one', b: 'two'}").as_deref(),
+            Some(r#"{"a":"one","b":"two"}"#)
+        );
         assert_eq!(obj("{a: 'one',}").as_deref(), Some(r#"{"a":"one"}"#));
-        assert_eq!(obj("{\n // a comment\n a: 1\n}").as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(
+            obj("{\n // a comment\n a: 1\n}").as_deref(),
+            Some(r#"{"a":1}"#)
+        );
         assert_eq!(obj("{a: 0x1f}").as_deref(), Some(r#"{"a":31}"#));
         assert_eq!(obj("{a: .5}").as_deref(), Some(r#"{"a":0.5}"#));
         // A dashed key cannot be unquoted: `-` ends the identifier, in the
@@ -324,7 +330,11 @@ mod tests {
     #[test]
     fn a_destination_picks_up_the_rest_of_the_path() {
         for (base, tail, want) in [
-            ("http://www.test.com/path/xxx", "", "http://www.test.com/path/xxx"),
+            (
+                "http://www.test.com/path/xxx",
+                "",
+                "http://www.test.com/path/xxx",
+            ),
             (
                 "http://www.test.com/path/xxx",
                 "/a/b/c?query",
@@ -334,7 +344,11 @@ mod tests {
             ("http://localhost:5173", "/a/b", "http://localhost:5173/a/b"),
             ("http://localhost:5173", "", "http://localhost:5173"),
             // A base with no path at all still ends up a well-formed URL.
-            ("http://localhost:5173", "?q=1", "http://localhost:5173/?q=1"),
+            (
+                "http://localhost:5173",
+                "?q=1",
+                "http://localhost:5173/?q=1",
+            ),
             // Exactly one separator survives when both sides bring one.
             ("http://a.com/dir/", "/x", "http://a.com/dir/x"),
             ("http://a.com/dir/", "x", "http://a.com/dir/x"),
@@ -351,7 +365,10 @@ mod tests {
 
     #[test]
     fn a_scheme_less_destination_inherits_the_request_scheme() {
-        assert_eq!(set_protocol("localhost:5173", "https"), "https://localhost:5173");
+        assert_eq!(
+            set_protocol("localhost:5173", "https"),
+            "https://localhost:5173"
+        );
         assert_eq!(set_protocol("//a.com/x", "https"), "https://a.com/x");
         assert_eq!(set_protocol("http://a.com/x", "https"), "http://a.com/x");
         // A protocol whistle does not know is still a protocol.
@@ -391,14 +408,23 @@ mod tests {
     /// its example (https://wproxy.org/docs/rules/inherit.html).
     #[test]
     fn a_scheme_relative_destination_takes_the_bracket_forms() {
-        assert_eq!(fixed_value("//<a.com/x>"), Some((Fixed::Verbatim, "//a.com/x".into())));
-        assert_eq!(fixed_value("//(a.com/x)"), Some((Fixed::Inline, "//a.com/x".into())));
+        assert_eq!(
+            fixed_value("//<a.com/x>"),
+            Some((Fixed::Verbatim, "//a.com/x".into()))
+        );
+        assert_eq!(
+            fixed_value("//(a.com/x)"),
+            Some((Fixed::Inline, "//a.com/x".into()))
+        );
         // Only *both* brackets count, and only around something.
         assert_eq!(fixed_value("//a.com/x"), None);
         assert_eq!(fixed_value("//<a.com/x"), None);
         assert_eq!(fixed_value("//"), None);
         // The spelled-out schemes are unchanged.
-        assert_eq!(fixed_value("http://<a.com/x>"), Some((Fixed::Verbatim, "http://a.com/x".into())));
+        assert_eq!(
+            fixed_value("http://<a.com/x>"),
+            Some((Fixed::Verbatim, "http://a.com/x".into()))
+        );
     }
 
     /// A pattern is written against the URL the client's own request line
@@ -410,7 +436,10 @@ mod tests {
         assert_eq!(full_url("wss", "a.com", 443, "/x"), "wss://a.com/x");
         assert_eq!(full_url("http", "a.com", 443, "/x"), "http://a.com:443/x");
         assert_eq!(full_url("https", "a.com", 80, "/x"), "https://a.com:80/x");
-        assert_eq!(full_url("http", "a.com", 8080, "/x?q=1"), "http://a.com:8080/x?q=1");
+        assert_eq!(
+            full_url("http", "a.com", 8080, "/x?q=1"),
+            "http://a.com:8080/x?q=1"
+        );
     }
 
     #[test]

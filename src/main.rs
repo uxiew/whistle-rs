@@ -476,7 +476,11 @@ async fn main() -> Result<()> {
     // otherwise switch some of them on.
     if config.multi_env {
         manager.only_default_group();
-        let named = manager.groups().iter().filter(|g| g.name != "default").count();
+        let named = manager
+            .groups()
+            .iter()
+            .filter(|g| g.name != "default")
+            .count();
         if named > 0 {
             tracing::info!(
                 "-M multiEnv: {named} named rule group(s) loaded but not resolved; \
@@ -484,7 +488,11 @@ async fn main() -> Result<()> {
             );
         }
     }
-    tracing::info!("loaded {} rules ({} groups)", manager.len(), manager.groups().len());
+    tracing::info!(
+        "loaded {} rules ({} groups)",
+        manager.len(),
+        manager.groups().len()
+    );
 
     let ca = CertAuthority::load_or_create(&config).context("initialising root CA")?;
 
@@ -552,10 +560,8 @@ async fn main() -> Result<()> {
             state.set_next_id(max_id + 1);
             tracing::info!("loaded {} sessions from disk", q.len());
         }
-        let store = whistle_rs::proxy::persist::SessionStore::new(
-            sessions_dir,
-            state.config.persist_days,
-        );
+        let store =
+            whistle_rs::proxy::persist::SessionStore::new(sessions_dir, state.config.persist_days);
         state.enable_persistence(store);
     }
 
@@ -669,16 +675,17 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
         return Ok(());
     }
 
-    let split_headers = |given: &[String], flag: &str| -> Result<std::collections::BTreeMap<String, String>> {
-        let mut out = std::collections::BTreeMap::new();
-        for header in given {
-            let (name, value) = header
-                .split_once(':')
-                .with_context(|| format!("invalid {flag} '{header}', expected 'name: value'"))?;
-            out.insert(name.trim().to_string(), value.trim().to_string());
-        }
-        Ok(out)
-    };
+    let split_headers =
+        |given: &[String], flag: &str| -> Result<std::collections::BTreeMap<String, String>> {
+            let mut out = std::collections::BTreeMap::new();
+            for header in given {
+                let (name, value) = header.split_once(':').with_context(|| {
+                    format!("invalid {flag} '{header}', expected 'name: value'")
+                })?;
+                out.insert(name.trim().to_string(), value.trim().to_string());
+            }
+            Ok(out)
+        };
     let headers = split_headers(&args.headers, "--header")?;
     let response = match args.status {
         None => None,
@@ -719,7 +726,10 @@ fn free_port() -> Result<u16> {
 async fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

@@ -156,7 +156,9 @@ impl UiResp {
         }
         builder
             .body(body::full(Bytes::from(self.body)))
-            .unwrap_or_else(|_| error_page(StatusCode::INTERNAL_SERVER_ERROR, "bad plugin UI response"))
+            .unwrap_or_else(|_| {
+                error_page(StatusCode::INTERNAL_SERVER_ERROR, "bad plugin UI response")
+            })
     }
 }
 
@@ -181,7 +183,10 @@ pub async fn forward(
         .uri(uri)
         .header(hyper::header::HOST, authority);
     for (k, v) in parts.headers.iter() {
-        if !HOP_BY_HOP.iter().any(|h| k.as_str().eq_ignore_ascii_case(h)) {
+        if !HOP_BY_HOP
+            .iter()
+            .any(|h| k.as_str().eq_ignore_ascii_case(h))
+        {
             out = out.header(k, v);
         }
     }
@@ -193,7 +198,11 @@ pub async fn forward(
         .map_err(|_| anyhow::anyhow!("no response within {UI_TIMEOUT:?}"))??;
 
     let (rparts, rbody) = resp.into_parts();
-    tracing::debug!("ui {name}: {} {path_and_query} -> {}", parts.method, rparts.status);
+    tracing::debug!(
+        "ui {name}: {} {path_and_query} -> {}",
+        parts.method,
+        rparts.status
+    );
     let mut builder = Response::builder().status(rparts.status);
     for (k, v) in rparts.headers.iter() {
         // `content-length` survives here: the body is forwarded verbatim, so the
@@ -290,7 +299,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("text/html; charset=utf-8")
         );
-        assert_eq!(UiResp::not_found().into_response().status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            UiResp::not_found().into_response().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// An unreachable plugin is an error, never a hang and never a panic.

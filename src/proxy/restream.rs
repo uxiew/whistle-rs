@@ -172,7 +172,11 @@ impl Stage {
             // looked at; the value goes out with the first chunk and the stage
             // is silent from then on.
             Stage::Whole { value } => value.take().unwrap_or_default(),
-            Stage::Literal { needle, value, rest } => {
+            Stage::Literal {
+                needle,
+                value,
+                rest,
+            } => {
                 if input.is_empty() {
                     return String::new();
                 }
@@ -198,7 +202,12 @@ impl Stage {
                 chunk.truncate(cut);
                 chunk.replace(needle.as_str(), value)
             }
-            Stage::Pattern { re, value, global, rest } => {
+            Stage::Pattern {
+                re,
+                value,
+                global,
+                rest,
+            } => {
                 if input.is_empty() {
                     return String::new();
                 }
@@ -231,10 +240,17 @@ impl Stage {
     fn finish(&mut self) -> String {
         match self {
             Stage::Whole { value } => value.take().unwrap_or_default(),
-            Stage::Literal { needle, value, rest } => {
-                std::mem::take(rest).replace(needle.as_str(), value)
-            }
-            Stage::Pattern { re, value, global, rest } => {
+            Stage::Literal {
+                needle,
+                value,
+                rest,
+            } => std::mem::take(rest).replace(needle.as_str(), value),
+            Stage::Pattern {
+                re,
+                value,
+                global,
+                rest,
+            } => {
                 let held = std::mem::take(rest);
                 if held.is_empty() {
                     return held;
@@ -308,7 +324,9 @@ fn event_cut(chunk: &str, sse: bool) -> usize {
 /// buffered path uses, so `$1`, `$$1` and the backslash escapes mean one thing
 /// in this port. See [`crate::rules::replace::expand`].
 fn expand(value: &str, caps: &regex::Captures<'_>) -> String {
-    let groups: Vec<&str> = (0..=9).map(|n| caps.get(n).map_or("", |m| m.as_str())).collect();
+    let groups: Vec<&str> = (0..=9)
+        .map(|n| caps.get(n).map_or("", |m| m.as_str()))
+        .collect();
     crate::rules::replace::expand(value, &groups)
 }
 
@@ -568,7 +586,11 @@ mod tests {
 
     #[test]
     fn a_literal_is_replaced_wherever_the_chunk_boundary_falls() {
-        let out = every_split(&[("ORIGINAL", "REPLACED")], false, "a ORIGINAL b ORIGINAL c");
+        let out = every_split(
+            &[("ORIGINAL", "REPLACED")],
+            false,
+            "a ORIGINAL b ORIGINAL c",
+        );
         assert_eq!(out, "a REPLACED b REPLACED c");
     }
 
@@ -590,7 +612,10 @@ mod tests {
     fn dot_star_replaces_the_whole_body_exactly_once() {
         // The empty match at the end of every chunk would otherwise repeat the
         // replacement for as long as the stream ran.
-        assert_eq!(chunks(&[("/.*/g", "ONLY")], false, &["a", "b", "c"]), "ONLY");
+        assert_eq!(
+            chunks(&[("/.*/g", "ONLY")], false, &["a", "b", "c"]),
+            "ONLY"
+        );
         assert_eq!(chunks(&[("/.+/", "ONLY")], false, &["a", "b", "c"]), "ONLY");
     }
 
@@ -663,7 +688,10 @@ mod tests {
         let owned = vec![("ping".to_string(), "pong".to_string())];
         let mut t = TextReplace::new(&owned, true).expect("a stage");
         let first = String::from_utf8(t.push(b"data: pi")).unwrap();
-        assert_eq!(first, "data:", "only the last three bytes could start `ping`");
+        assert_eq!(
+            first, "data:",
+            "only the last three bytes could start `ping`"
+        );
         let second = String::from_utf8(t.push(b"ng\n\n")).unwrap();
         assert_eq!(first + &second, "data: pong\n\n");
     }
@@ -921,13 +949,21 @@ mod frame_tests {
     #[test]
     fn an_event_stream_is_one_frame_per_event() {
         let mut s = FrameSplitter::sse();
-        assert_eq!(text(s.push(b"data: a\n\ndata: b\n\n")), ["data: a", "data: b"]);
+        assert_eq!(
+            text(s.push(b"data: a\n\ndata: b\n\n")),
+            ["data: a", "data: b"]
+        );
         assert_eq!(text(s.push(b"data: c")), Vec::<String>::new());
         assert_eq!(text(s.push(b"\n\n")), ["data: c"]);
         assert_eq!(s.finish(), None);
         // A tail with no separator is the last frame.
         assert_eq!(text(s.push(b"data: d")), Vec::<String>::new());
-        assert_eq!(s.finish().map(|f| String::from_utf8_lossy(&f).into_owned()).as_deref(), Some("data: d"));
+        assert_eq!(
+            s.finish()
+                .map(|f| String::from_utf8_lossy(&f).into_owned())
+                .as_deref(),
+            Some("data: d")
+        );
     }
 
     /// A custom separator, and the `/` that keeps it — `keepSep`
@@ -959,13 +995,20 @@ mod frame_tests {
         assert!(!left, "the header must not survive");
         let mut split = split.expect("a separator");
         assert_eq!(
-            split.push(b"one\ntwo\n").into_iter().map(|f| String::from_utf8_lossy(&f).into_owned()).collect::<Vec<_>>(),
+            split
+                .push(b"one\ntwo\n")
+                .into_iter()
+                .map(|f| String::from_utf8_lossy(&f).into_owned())
+                .collect::<Vec<_>>(),
             ["one", "two"]
         );
         // A leading slash keeps the separator on the frame.
         let mut kept = with("/%0A").0.expect("a separator");
         assert_eq!(
-            kept.push(b"one\n").into_iter().map(|f| String::from_utf8_lossy(&f).into_owned()).collect::<Vec<_>>(),
+            kept.push(b"one\n")
+                .into_iter()
+                .map(|f| String::from_utf8_lossy(&f).into_owned())
+                .collect::<Vec<_>>(),
             ["one\n"]
         );
         // An empty value yields no splitter, and still loses the header.
@@ -974,7 +1017,11 @@ mod frame_tests {
         // A `%` that is not an escape is text.
         let mut literal = with("%zz").0.expect("a separator");
         assert_eq!(
-            literal.push(b"a%zzb%zz").into_iter().map(|f| String::from_utf8_lossy(&f).into_owned()).collect::<Vec<_>>(),
+            literal
+                .push(b"a%zzb%zz")
+                .into_iter()
+                .map(|f| String::from_utf8_lossy(&f).into_owned())
+                .collect::<Vec<_>>(),
             ["a", "b"]
         );
     }
@@ -985,6 +1032,11 @@ mod frame_tests {
         let mut s = FrameSplitter::new(b"--END--", false).expect("separator");
         assert_eq!(text(s.push(b"first--")), Vec::<String>::new());
         assert_eq!(text(s.push(b"END--second")), ["first"]);
-        assert_eq!(s.finish().map(|f| String::from_utf8_lossy(&f).into_owned()).as_deref(), Some("second"));
+        assert_eq!(
+            s.finish()
+                .map(|f| String::from_utf8_lossy(&f).into_owned())
+                .as_deref(),
+            Some("second")
+        );
     }
 }

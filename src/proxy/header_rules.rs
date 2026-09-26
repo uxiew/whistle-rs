@@ -151,7 +151,12 @@ fn decode_uri_component(s: &str) -> String {
         }
         // Fewer than two hex digits after a `%` is a `URIError` too, which the
         // `zip` below reports as `None`.
-        match bytes.get(i + 1).copied().and_then(hex).zip(bytes.get(i + 2).copied().and_then(hex)) {
+        match bytes
+            .get(i + 1)
+            .copied()
+            .and_then(hex)
+            .zip(bytes.get(i + 2).copied().and_then(hex))
+        {
             Some((hi, lo)) => {
                 out.push((hi << 4) | lo);
                 i += 3;
@@ -206,10 +211,20 @@ pub fn compose(
     }
     // Only a name the store answers contributes anything; an unknown one is
     // silently nothing, because `trimStr(values.get(key))` is falsy.
-    if let Some(found) = carried.key.as_deref().and_then(lookup_value).and_then(trimmed) {
+    if let Some(found) = carried
+        .key
+        .as_deref()
+        .and_then(lookup_value)
+        .and_then(trimmed)
+    {
         text = format!("{found}\n{text}");
     }
-    if let Some(found) = carried.name.as_deref().and_then(lookup_group).and_then(trimmed) {
+    if let Some(found) = carried
+        .name
+        .as_deref()
+        .and_then(lookup_group)
+        .and_then(trimmed)
+    {
         text.push('\n');
         text.push_str(&found);
     }
@@ -429,11 +444,13 @@ mod tests {
     fn private_values_are_filed_under_the_header_rules_file() {
         let vals = private_values(Some(r#"{"pv":"FROMKV","n":7}"#));
         assert_eq!(
-            vals.get(&crate::rules::inline_key("pv", FILE)).map(String::as_str),
+            vals.get(&crate::rules::inline_key("pv", FILE))
+                .map(String::as_str),
             Some("FROMKV")
         );
         assert_eq!(
-            vals.get(&crate::rules::inline_key("n", FILE)).map(String::as_str),
+            vals.get(&crate::rules::inline_key("n", FILE))
+                .map(String::as_str),
             Some("7")
         );
         // Not under the plain name: a request may not overwrite the store.

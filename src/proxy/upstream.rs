@@ -432,8 +432,7 @@ async fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
 /// is the default and this opts out, because a debugging proxy that silently
 /// accepts any upstream certificate cannot tell its user when the connection it
 /// is inspecting has itself been intercepted. See `--insecure-upstream`.
-static INSECURE_UPSTREAM: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static INSECURE_UPSTREAM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Opt out of origin certificate verification, process-wide. Call before
 /// serving; the TLS configs are built once, on first use.
@@ -498,7 +497,9 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
-fn build_client_config(versions: &[&'static rustls::SupportedProtocolVersion]) -> Arc<ClientConfig> {
+fn build_client_config(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Arc<ClientConfig> {
     build_client_config_with(versions, None)
 }
 
@@ -603,7 +604,9 @@ fn client_config_for(
 static ONLY_12: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
 static ONLY_13: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
-fn protocol_versions(versions: TlsVersions) -> &'static [&'static rustls::SupportedProtocolVersion] {
+fn protocol_versions(
+    versions: TlsVersions,
+) -> &'static [&'static rustls::SupportedProtocolVersion] {
     match versions {
         TlsVersions::Default => rustls::ALL_VERSIONS,
         TlsVersions::Only12 => ONLY_12,
@@ -984,7 +987,10 @@ static CONNECT_BUDGET: std::sync::atomic::AtomicU64 =
 /// two. Call before serving.
 pub fn set_request_timeout(timeout_ms: u64) {
     let budget = CONNECT_TIMEOUT.as_millis() as u64;
-    CONNECT_BUDGET.store(budget.min(timeout_ms.max(1)), std::sync::atomic::Ordering::Relaxed);
+    CONNECT_BUDGET.store(
+        budget.min(timeout_ms.max(1)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Open a TCP connection, timing the name lookup apart from the connect.
@@ -1063,7 +1069,9 @@ async fn origin_stream(
                 let connector = TlsConnector::from(CLIENT_CONFIG.clone());
                 let name = ServerName::try_from(proxy.host.clone())
                     .map_err(|_| anyhow!("invalid proxy host {}", proxy.host))?;
-                BoxedIo(Box::new(connector.connect(name, ptcp).await.context("proxy TLS")?))
+                BoxedIo(Box::new(
+                    connector.connect(name, ptcp).await.context("proxy TLS")?,
+                ))
             } else {
                 BoxedIo(Box::new(ptcp))
             };
@@ -1104,8 +1112,10 @@ async fn origin_stream(
 
     timings.connect(connecting);
     if target.tls {
-        let connector =
-            TlsConnector::from(client_config_for(target.tls_versions, target.tls_ciphers.as_ref()));
+        let connector = TlsConnector::from(client_config_for(
+            target.tls_versions,
+            target.tls_ciphers.as_ref(),
+        ));
         let server_name = ServerName::try_from(target.sni.clone())
             .map_err(|_| anyhow!("invalid SNI host {}", target.sni))?;
         let shaking_hands = Instant::now();
@@ -1208,12 +1218,16 @@ async fn http_connect(
         req.push_str(&format!("{POLICY_HEADER}: intercept\r\n"));
     }
     req.push_str("\r\n");
-    s.write_all(req.as_bytes()).await.context("proxy CONNECT write")?;
+    s.write_all(req.as_bytes())
+        .await
+        .context("proxy CONNECT write")?;
 
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        s.read_exact(&mut byte).await.context("proxy CONNECT read")?;
+        s.read_exact(&mut byte)
+            .await
+            .context("proxy CONNECT read")?;
         buf.push(byte[0]);
         if buf.ends_with(b"\r\n\r\n") {
             break;
@@ -1230,7 +1244,10 @@ async fn http_connect(
         .map(|c| c.starts_with('2'))
         .unwrap_or(false);
     if !ok {
-        bail!("proxy CONNECT rejected: {}", head.lines().next().unwrap_or(""));
+        bail!(
+            "proxy CONNECT rejected: {}",
+            head.lines().next().unwrap_or("")
+        );
     }
     Ok(s)
 }
@@ -1349,7 +1366,9 @@ pub async fn simple_post_json(url: &str, json: &str) -> Result<(u16, Bytes)> {
 
 /// Split an absolute URL into a direct [`Target`] and its origin-form path.
 fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow!("bad url {url}"))?;
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow!("bad url {url}"))?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -1563,8 +1582,14 @@ mod timeout_tests {
         // a neighbour from seeing the shortened one.
         set_request_timeout(CONNECT_TIMEOUT.as_millis() as u64);
 
-        assert!(waited < std::time::Duration::from_secs(3), "waited {waited:?}");
-        assert!(waited >= std::time::Duration::from_millis(250), "gave up early: {waited:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(3),
+            "waited {waited:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(250),
+            "gave up early: {waited:?}"
+        );
         assert!(format!("{err:#}").contains("timed out"), "{err:#}");
     }
 
@@ -1751,7 +1776,11 @@ mod tests {
         rt().block_on(async {
             let cfg = |v: &str| parse_proxy(ProxyKind::Http, v).unwrap();
             // Nothing is registered until the server starts: no port matches.
-            assert!(self_loop(&target("a.com", 80, Some(cfg("127.0.0.1:8899")))).await.is_none());
+            assert!(
+                self_loop(&target("a.com", 80, Some(cfg("127.0.0.1:8899"))))
+                    .await
+                    .is_none()
+            );
 
             // Registration is additive, so another test starting a proxy of
             // its own can no longer erase these — which is what made this test
@@ -1771,9 +1800,17 @@ mod tests {
             assert!(self_loop(&target("a.com", 80, Some(socks))).await.is_some());
 
             // A different local port is somebody else's proxy.
-            assert!(self_loop(&target("a.com", 80, Some(cfg("127.0.0.1:8898")))).await.is_none());
+            assert!(
+                self_loop(&target("a.com", 80, Some(cfg("127.0.0.1:8898"))))
+                    .await
+                    .is_none()
+            );
             // Our port number on another machine is not us.
-            assert!(self_loop(&target("a.com", 80, Some(cfg("203.0.113.7:8899")))).await.is_none());
+            assert!(
+                self_loop(&target("a.com", 80, Some(cfg("203.0.113.7:8899"))))
+                    .await
+                    .is_none()
+            );
             // A direct connection to our own port cannot recurse; not checked.
             assert!(self_loop(&target("127.0.0.1", 8899, None)).await.is_none());
 
@@ -1806,7 +1843,8 @@ mod tests {
                 head
             });
 
-            let cfg = parse_proxy(ProxyKind::Http, &format!("bob:s3cr3t@127.0.0.1:{port}")).unwrap();
+            let cfg =
+                parse_proxy(ProxyKind::Http, &format!("bob:s3cr3t@127.0.0.1:{port}")).unwrap();
             let resp = forward(
                 &target("example.com", 80, Some(cfg)),
                 get("/p?q=1", "example.com"),
@@ -1820,9 +1858,13 @@ mod tests {
                 head.starts_with("GET http://example.com/p?q=1 HTTP/1.1\r\n"),
                 "absolute-form request line, got: {head:?}"
             );
-            assert!(head.to_lowercase().contains("proxy-authorization: basic Ym9iOnMzY3IzdA=="
-                .to_lowercase()
-                .as_str()));
+            assert!(
+                head.to_lowercase().contains(
+                    "proxy-authorization: basic Ym9iOnMzY3IzdA=="
+                        .to_lowercase()
+                        .as_str()
+                )
+            );
         });
     }
 
@@ -1840,8 +1882,11 @@ mod tests {
                 let head = read_head(&mut s).await;
                 let body = head.lines().next().unwrap_or("").to_string();
                 s.write_all(
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
-                        .as_bytes(),
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .unwrap();
@@ -1856,7 +1901,9 @@ mod tests {
                     .await
                     .unwrap();
                 // Splice the tunnel onto the real origin.
-                let mut up = TcpStream::connect(("127.0.0.1", origin_port)).await.unwrap();
+                let mut up = TcpStream::connect(("127.0.0.1", origin_port))
+                    .await
+                    .unwrap();
                 tokio::io::copy_bidirectional(&mut s, &mut up).await.ok();
                 head
             });
@@ -1866,7 +1913,9 @@ mod tests {
             t.connect_host = "127.0.0.1".into();
             t.connect_port = origin_port;
 
-            let resp = forward(&t, get("/x", "example.com")).await.expect("tunnelled");
+            let resp = forward(&t, get("/x", "example.com"))
+                .await
+                .expect("tunnelled");
             assert_eq!(resp.status(), 200);
             let echoed = resp.into_body().collect().await.unwrap().to_bytes();
             // Inside the tunnel the request is origin-form, not absolute-form.
@@ -1878,7 +1927,10 @@ mod tests {
                 "CONNECT to the overridden address, got: {head:?}"
             );
             let lower = head.to_lowercase();
-            assert!(lower.contains("proxy-connection: keep-alive\r\n"), "{head:?}");
+            assert!(
+                lower.contains("proxy-connection: keep-alive\r\n"),
+                "{head:?}"
+            );
             assert!(lower.contains("user-agent: probe/1.0\r\n"), "{head:?}");
         });
     }
@@ -1897,7 +1949,9 @@ mod tests {
                 let (mut s, _) = proxy.accept().await.unwrap();
                 let head = read_head(&mut s).await;
                 // Refused: the CONNECT head is all this test is about.
-                s.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await.unwrap();
+                s.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                    .await
+                    .unwrap();
                 head
             });
 
@@ -1910,7 +1964,10 @@ mod tests {
 
             let head = seen.await.unwrap().to_lowercase();
             assert!(head.contains("proxy-connection: close\r\n"), "{head:?}");
-            assert!(!head.contains("user-agent:"), "the UA is not echoed: {head:?}");
+            assert!(
+                !head.contains("user-agent:"),
+                "the UA is not echoed: {head:?}"
+            );
         });
     }
 
@@ -1955,7 +2012,9 @@ mod tests {
                     s.read_exact(&mut greeting[..3]).await.unwrap();
                     let nmethods = greeting[1] as usize;
                     if nmethods > 1 {
-                        s.read_exact(&mut greeting[3..3 + nmethods - 1]).await.unwrap();
+                        s.read_exact(&mut greeting[3..3 + nmethods - 1])
+                            .await
+                            .unwrap();
                     }
                     s.write_all(&[0x05, 0x02]).await.unwrap(); // demand user/pass
                     let mut hdr = [0u8; 2];
@@ -1981,15 +2040,18 @@ mod tests {
                     };
                     let mut addr = vec![0u8; len + 2];
                     s.read_exact(&mut addr).await.unwrap();
-                    s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                    s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
                     // Play the origin inside the tunnel.
                     read_head(&mut s).await;
-                    s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                    s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                        .await
+                        .unwrap();
                     (req[3], len, addr, user, pass)
                 });
 
-                let cfg =
-                    parse_proxy(ProxyKind::Socks, &format!("bob@127.0.0.1:{port}")).unwrap();
+                let cfg = parse_proxy(ProxyKind::Socks, &format!("bob@127.0.0.1:{port}")).unwrap();
                 let resp = forward(&target(host, 80, Some(cfg)), get("/", host))
                     .await
                     .expect("socks forward");
@@ -2031,9 +2093,11 @@ mod tests {
                     [&head[..], &methods[..]].concat()
                 });
 
-                let cfg =
-                    parse_proxy(ProxyKind::Socks, &value.replace("127.0.0.1", &format!("127.0.0.1:{port}")))
-                        .unwrap();
+                let cfg = parse_proxy(
+                    ProxyKind::Socks,
+                    &value.replace("127.0.0.1", &format!("127.0.0.1:{port}")),
+                )
+                .unwrap();
                 let _ = forward(&target("a.com", 80, Some(cfg)), get("/", "a.com")).await;
                 assert_eq!(seen.await.unwrap(), want, "greeting for socks://{value}");
             });
@@ -2076,25 +2140,52 @@ mod tests {
         assert_eq!((p.host.as_str(), p.port), ("127.0.0.1", 8888));
         assert_eq!(
             p.host_override,
-            Some(HostOverride { host: "10.0.0.9".into(), port: Some(8080) })
+            Some(HostOverride {
+                host: "10.0.0.9".into(),
+                port: Some(8080)
+            })
         );
 
         let no_port = parse_proxy_rule(ProxyKind::Http, "127.0.0.1?host=10.0.0.9").unwrap();
         assert_eq!(
             no_port.host_override,
-            Some(HostOverride { host: "10.0.0.9".into(), port: None })
+            Some(HostOverride {
+                host: "10.0.0.9".into(),
+                port: None
+            })
         );
 
         // It may sit anywhere in the query, beside whistle's other flags.
-        let mixed = parse_proxy_rule(ProxyKind::Socks, "1.2.3.4?proxyHost&host=a.internal").unwrap();
+        let mixed =
+            parse_proxy_rule(ProxyKind::Socks, "1.2.3.4?proxyHost&host=a.internal").unwrap();
         assert_eq!(mixed.host_override.unwrap().host, "a.internal");
 
         // No query, an empty value, or a character outside upstream's
         // `[\w.:-]+` leaves the origin alone.
-        assert!(parse_proxy_rule(ProxyKind::Http, "1.2.3.4:8888").unwrap().host_override.is_none());
-        assert!(parse_proxy_rule(ProxyKind::Http, "1.2.3.4?host=").unwrap().host_override.is_none());
-        assert!(parse_proxy_rule(ProxyKind::Http, "1.2.3.4?host=a/b").unwrap().host_override.is_none());
-        assert!(parse_proxy_rule(ProxyKind::Http, "1.2.3.4?hosts=x").unwrap().host_override.is_none());
+        assert!(
+            parse_proxy_rule(ProxyKind::Http, "1.2.3.4:8888")
+                .unwrap()
+                .host_override
+                .is_none()
+        );
+        assert!(
+            parse_proxy_rule(ProxyKind::Http, "1.2.3.4?host=")
+                .unwrap()
+                .host_override
+                .is_none()
+        );
+        assert!(
+            parse_proxy_rule(ProxyKind::Http, "1.2.3.4?host=a/b")
+                .unwrap()
+                .host_override
+                .is_none()
+        );
+        assert!(
+            parse_proxy_rule(ProxyKind::Http, "1.2.3.4?hosts=x")
+                .unwrap()
+                .host_override
+                .is_none()
+        );
         // The address still parses when the query is present.
         assert!(parse_proxy_rule(ProxyKind::Http, "?host=x").is_none());
     }
@@ -2136,7 +2227,10 @@ mod tests {
         cfg.tunnel = true;
         assert!(!target("a.com", 80, Some(cfg.clone())).uses_proxy_tunnel());
 
-        cfg.host_override = Some(HostOverride { host: "10.0.0.9".into(), port: Some(8080) });
+        cfg.host_override = Some(HostOverride {
+            host: "10.0.0.9".into(),
+            port: Some(8080),
+        });
         assert!(target("a.com", 80, Some(cfg.clone())).uses_proxy_tunnel());
 
         // The flag is what asks for the second CONNECT; an override alone is
@@ -2157,8 +2251,11 @@ mod tests {
                 let head = read_head(&mut s).await;
                 let line = head.lines().next().unwrap_or("").to_string();
                 s.write_all(
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{line}", line.len())
-                        .as_bytes(),
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{line}",
+                        line.len()
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .unwrap();
@@ -2169,8 +2266,12 @@ mod tests {
             let seen = tokio::spawn(async move {
                 let (mut s, _) = proxy.accept().await.unwrap();
                 let head = read_head(&mut s).await;
-                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
-                let mut up = TcpStream::connect(("127.0.0.1", origin_port)).await.unwrap();
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut up = TcpStream::connect(("127.0.0.1", origin_port))
+                    .await
+                    .unwrap();
                 tokio::io::copy_bidirectional(&mut s, &mut up).await.ok();
                 head
             });
@@ -2180,9 +2281,12 @@ mod tests {
                 &format!("127.0.0.1:{proxy_port}?host=127.0.0.1:{origin_port}"),
             )
             .unwrap();
-            let resp = forward(&target("example.com", 80, Some(cfg)), get("/x", "example.com"))
-                .await
-                .expect("tunnelled via ?host=");
+            let resp = forward(
+                &target("example.com", 80, Some(cfg)),
+                get("/x", "example.com"),
+            )
+            .await
+            .expect("tunnelled via ?host=");
             assert_eq!(resp.status(), 200);
             let echoed = resp.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(echoed, Bytes::from("GET /x HTTP/1.1"));
@@ -2206,7 +2310,9 @@ mod tests {
             tokio::spawn(async move {
                 let (mut s, _) = origin.accept().await.unwrap();
                 read_head(&mut s).await;
-                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .unwrap();
             });
 
             // The second proxy: answers the *inner* CONNECT and reaches the origin.
@@ -2215,8 +2321,12 @@ mod tests {
             let inner_seen = tokio::spawn(async move {
                 let (mut s, _) = second.accept().await.unwrap();
                 let head = read_head(&mut s).await;
-                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
-                let mut up = TcpStream::connect(("127.0.0.1", origin_port)).await.unwrap();
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut up = TcpStream::connect(("127.0.0.1", origin_port))
+                    .await
+                    .unwrap();
                 tokio::io::copy_bidirectional(&mut s, &mut up).await.ok();
                 head
             });
@@ -2227,8 +2337,12 @@ mod tests {
             let outer_seen = tokio::spawn(async move {
                 let (mut s, _) = first.accept().await.unwrap();
                 let head = read_head(&mut s).await;
-                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
-                let mut up = TcpStream::connect(("127.0.0.1", second_port)).await.unwrap();
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut up = TcpStream::connect(("127.0.0.1", second_port))
+                    .await
+                    .unwrap();
                 tokio::io::copy_bidirectional(&mut s, &mut up).await.ok();
                 head
             });
@@ -2239,9 +2353,12 @@ mod tests {
             )
             .unwrap();
             cfg.tunnel = true;
-            let resp = forward(&target("example.com", 443, Some(cfg)), get("/", "example.com"))
-                .await
-                .expect("double CONNECT");
+            let resp = forward(
+                &target("example.com", 443, Some(cfg)),
+                get("/", "example.com"),
+            )
+            .await
+            .expect("double CONNECT");
             assert_eq!(resp.status(), 204);
 
             let outer = outer_seen.await.unwrap();
@@ -2255,12 +2372,17 @@ mod tests {
                 "inner CONNECT names the real origin, got: {inner:?}"
             );
             assert!(
-                inner.to_lowercase().contains("x-whistle-policy: intercept\r\n"),
+                inner
+                    .to_lowercase()
+                    .contains("x-whistle-policy: intercept\r\n"),
                 "{inner:?}"
             );
             // One rule, one credential: it authenticates both hops (patch.js
             // copies the CONNECT headers onto the inner request).
-            assert!(inner.contains("Proxy-Authorization: Basic Ym9iOnMzY3IzdA==\r\n"), "{inner:?}");
+            assert!(
+                inner.contains("Proxy-Authorization: Basic Ym9iOnMzY3IzdA==\r\n"),
+                "{inner:?}"
+            );
         });
     }
 
@@ -2275,7 +2397,9 @@ mod tests {
             let seen = tokio::spawn(async move {
                 let (mut s, _) = origin.accept().await.unwrap();
                 let head = read_head(&mut s).await;
-                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .unwrap();
                 head
             });
 
@@ -2301,10 +2425,16 @@ mod tests {
 
             // Without the flag the same rule fails closed.
             cfg.fallback_direct = false;
-            let err = forward(&target("127.0.0.1", origin_port, Some(cfg)), get("/x", "example.com"))
-                .await
-                .unwrap_err();
-            assert!(format!("{err:#}").contains("connecting to proxy"), "{err:#}");
+            let err = forward(
+                &target("127.0.0.1", origin_port, Some(cfg)),
+                get("/x", "example.com"),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("connecting to proxy"),
+                "{err:#}"
+            );
         });
     }
 
@@ -2320,7 +2450,9 @@ mod tests {
             let seen = tokio::spawn(async move {
                 let (mut s, _) = origin.accept().await.unwrap();
                 let head = read_head(&mut s).await;
-                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .unwrap();
                 head
             });
             // A port nothing listens on: bind it, read the port, drop it.
@@ -2375,7 +2507,10 @@ mod tests {
         t.connect_port = 8443;
         t.host_fallback_direct = true;
         let next = t.fallback_target().expect("the host override falls back");
-        assert_eq!((next.connect_host.as_str(), next.connect_port), ("example.com", 443));
+        assert_eq!(
+            (next.connect_host.as_str(), next.connect_port),
+            ("example.com", 443)
+        );
         assert!(!next.host_fallback_direct, "one retry, not a loop");
     }
 
@@ -2391,7 +2526,9 @@ mod tests {
                 let (mut s, _) = proxy.accept().await.unwrap();
                 read_head(&mut s).await;
                 // Accept the tunnel, then hang up mid-conversation.
-                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
                 read_head(&mut s).await;
                 drop(s);
             });
@@ -2419,7 +2556,9 @@ mod tests {
                     let (mut s, _) = origin.accept().await.unwrap();
                     tokio::spawn(async move {
                         read_head(&mut s).await;
-                        s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+                        s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                            .await
+                            .unwrap();
                     });
                 }
             });
@@ -2445,7 +2584,10 @@ mod tests {
             )
             .await
             .expect("proxied");
-            assert_eq!(via.map(|a| a.to_string()), Some(format!("127.0.0.1:{origin_port}")));
+            assert_eq!(
+                via.map(|a| a.to_string()),
+                Some(format!("127.0.0.1:{origin_port}"))
+            );
         });
     }
 }

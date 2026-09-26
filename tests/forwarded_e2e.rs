@@ -53,7 +53,10 @@ async fn through(
     headers: &[(&str, &str)],
 ) -> String {
     let mut sock = TcpStream::connect(proxy).await.expect("connect proxy");
-    let extra: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+    let extra: String = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
     let req = format!("GET {url} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n");
     sock.write_all(req.as_bytes()).await.expect("write request");
     let mut out = Vec::new();
@@ -106,7 +109,10 @@ async fn nothing_is_believed_and_the_ungated_pair_is_still_taken() {
     )
     .await;
     assert!(seen.contains("who=A"), "the claim was not acted on: {seen}");
-    assert!(!seen.contains(REAL_HOST), "and not forwarded either: {seen}");
+    assert!(
+        !seen.contains(REAL_HOST),
+        "and not forwarded either: {seen}"
+    );
     assert!(!seen.contains(PROPS), "{seen}");
     // The gated one travels on: upstream's delete is inside the branch that did
     // not run, and dropping it would be this port inventing a policy.
@@ -143,7 +149,10 @@ async fn the_host_claim_redirects_and_rewrites_the_host_header() {
     )
     .await;
     assert!(seen.contains("who=B"), "{seen}");
-    assert!(!seen.contains(FWD_HOST), "the losing claim must not travel on: {seen}");
+    assert!(
+        !seen.contains(FWD_HOST),
+        "the losing claim must not travel on: {seen}"
+    );
 }
 
 /// A request cannot open its own gate. Upstream lets `x-whistle-forwarded-props`
@@ -187,7 +196,10 @@ async fn the_proto_claim_decides_which_pattern_matches() {
     .await;
     assert!(claimed.contains("x-scheme=https"), "{claimed}");
     assert!(!claimed.contains(FWD_PROTO), "consumed: {claimed}");
-    assert!(claimed.contains("who=A"), "still the same connection: {claimed}");
+    assert!(
+        claimed.contains("who=A"),
+        "still the same connection: {claimed}"
+    );
 }
 
 /// A default port moves with a scheme the claim changed: 80 and 443 are the
@@ -260,7 +272,10 @@ async fn a_claimed_scheme_never_reaches_for_tls() {
     )
     .await;
     // The `https://` rule matched — so the claim was believed.
-    assert!(answer.contains("418"), "the claim was not believed: {answer}");
+    assert!(
+        answer.contains("418"),
+        "the claim was not believed: {answer}"
+    );
 
     // And nothing was ever spoken at the origin, because the rule answered
     // outright. Now one that does reach it.
@@ -277,7 +292,8 @@ async fn a_claimed_scheme_never_reaches_for_tls() {
         .expect("the origin was never reached")
         .expect("channel closed");
     assert_eq!(
-        first, b'G',
+        first,
+        b'G',
         "the origin was spoken to in {}, not HTTP",
         match first {
             0x16 => "TLS".to_string(),
@@ -300,6 +316,9 @@ async fn an_unusable_claim_fails_visibly() {
         &[(FWD_HOST, ":::not-a-host")],
     )
     .await;
-    assert!(!seen.contains("who=A"), "it must not go to the old destination: {seen}");
+    assert!(
+        !seen.contains("who=A"),
+        "it must not go to the old destination: {seen}"
+    );
     assert!(seen.contains("502"), "{seen}");
 }

@@ -649,7 +649,10 @@ mod tests {
             "@/etc/team.rules # the team's",
             "@/etc/team.rules#the-team's",
         ] {
-            assert!(include_target(line).is_some(), "should be an include: {line}");
+            assert!(
+                include_target(line).is_some(),
+                "should be an include: {line}"
+            );
         }
     }
 
@@ -674,15 +677,27 @@ mod tests {
             "@$key",
             "@$key/",
         ] {
-            assert!(include_target(line).is_none(), "should not be an include: {line}");
+            assert!(
+                include_target(line).is_none(),
+                "should not be an include: {line}"
+            );
         }
     }
 
     #[test]
     fn a_backticked_source_loses_its_backticks() {
-        assert_eq!(include_target("@`/etc/team.rules`"), Some("/etc/team.rules"));
-        assert_eq!(include_target("@`/etc/team.rules` # note"), Some("/etc/team.rules"));
-        assert_eq!(include_target("@`/etc/team.rules `"), Some("/etc/team.rules"));
+        assert_eq!(
+            include_target("@`/etc/team.rules`"),
+            Some("/etc/team.rules")
+        );
+        assert_eq!(
+            include_target("@`/etc/team.rules` # note"),
+            Some("/etc/team.rules")
+        );
+        assert_eq!(
+            include_target("@`/etc/team.rules `"),
+            Some("/etc/team.rules")
+        );
         assert_eq!(include_target("@`/etc/team.rules"), None);
     }
 
@@ -690,7 +705,10 @@ mod tests {
     fn a_backticked_source_answers_port_and_version() {
         let mut inc = Includes::resolving();
         assert!(inc.set_port(8899));
-        assert_eq!(inc.source_of("http://127.0.0.1:${port}/r"), "http://127.0.0.1:8899/r");
+        assert_eq!(
+            inc.source_of("http://127.0.0.1:${port}/r"),
+            "http://127.0.0.1:8899/r"
+        );
         assert_eq!(
             inc.source_of("http://x/${VERSION}"),
             format!("http://x/{}", crate::config::VERSION)
@@ -698,7 +716,10 @@ mod tests {
         // An unbound port is left as written: a fetch of port 0 would fail in a
         // way that names nothing.
         let unbound = Includes::resolving();
-        assert_eq!(unbound.source_of("http://127.0.0.1:${port}/r"), "http://127.0.0.1:${port}/r");
+        assert_eq!(
+            unbound.source_of("http://127.0.0.1:${port}/r"),
+            "http://127.0.0.1:${port}/r"
+        );
     }
 
     #[test]
@@ -727,7 +748,10 @@ mod tests {
             "/t/inc.rules",
             "example.com host://10.0.0.2 lineProps://important\n",
         );
-        assert_eq!(mgr.resolve(&req("http://example.com/")).value("host"), Some("10.0.0.2"));
+        assert_eq!(
+            mgr.resolve(&req("http://example.com/")).value("host"),
+            Some("10.0.0.2")
+        );
     }
 
     #[test]
@@ -749,7 +773,10 @@ mod tests {
             assert!(!mgr.record_include("/t/inc.rules", None));
         }
         assert_eq!(mgr.len(), 1);
-        assert_eq!(mgr.resolve(&req("http://b.com/")).value("host"), Some("10.0.0.2"));
+        assert_eq!(
+            mgr.resolve(&req("http://b.com/")).value("host"),
+            Some("10.0.0.2")
+        );
     }
 
     /// A source answering 204 *is* empty, and emptying it is something a rules
@@ -772,7 +799,12 @@ mod tests {
         );
         // The nested line is neither followed nor registered — one level, and so
         // no cycle to guard against.
-        assert!(!mgr.includes().targets().iter().any(|t| t == "/t/other.rules"));
+        assert!(
+            !mgr.includes()
+                .targets()
+                .iter()
+                .any(|t| t == "/t/other.rules")
+        );
         assert_eq!(mgr.len(), 1);
     }
 
@@ -783,7 +815,10 @@ mod tests {
         assert!(mgr.includes().targets().is_empty());
         // Keyed to the group that declared it — see `RuleManager::inline_values`.
         let key = crate::rules::inline_key("v", "default");
-        assert_eq!(mgr.inline_values().get(&key).map(String::as_str), Some("@/t/inc.rules"));
+        assert_eq!(
+            mgr.inline_values().get(&key).map(String::as_str),
+            Some("@/t/inc.rules")
+        );
     }
 
     #[test]
@@ -794,8 +829,14 @@ mod tests {
             "```v\nINNER\n```\n```w\nONLY-INNER\n```\na.com resBody://{v}\n",
         );
         let key = |name| crate::rules::inline_key(name, "default");
-        assert_eq!(mgr.inline_values().get(&key("v")).map(String::as_str), Some("OUTER"));
-        assert_eq!(mgr.inline_values().get(&key("w")).map(String::as_str), Some("ONLY-INNER"));
+        assert_eq!(
+            mgr.inline_values().get(&key("v")).map(String::as_str),
+            Some("OUTER")
+        );
+        assert_eq!(
+            mgr.inline_values().get(&key("w")).map(String::as_str),
+            Some("ONLY-INNER")
+        );
     }
 
     #[test]
@@ -807,7 +848,10 @@ mod tests {
         let mut mgr = RuleManager::with_includes();
         mgr.set_text(&text);
         for i in 0..25 {
-            mgr.record_include(&format!("/t/inc{i}.rules"), Some(format!("h{i}.com host://10.0.0.1\n")));
+            mgr.record_include(
+                &format!("/t/inc{i}.rules"),
+                Some(format!("h{i}.com host://10.0.0.1\n")),
+            );
         }
         assert_eq!(mgr.len(), MAX_INCLUDES);
     }
@@ -916,7 +960,10 @@ mod tests {
     /// something else.
     #[test]
     fn a_rules_server_answers_with_a_status_as_well_as_a_body() {
-        assert_eq!(url_answer("u", 200, b"a.com host://1.1.1.1\n").as_deref(), Some("a.com host://1.1.1.1\n"));
+        assert_eq!(
+            url_answer("u", 200, b"a.com host://1.1.1.1\n").as_deref(),
+            Some("a.com host://1.1.1.1\n")
+        );
         assert_eq!(url_answer("u", 204, b"").as_deref(), Some(""));
         // Upstream reads 204 as empty whatever body came with it.
         assert_eq!(url_answer("u", 204, b"ignored").as_deref(), Some(""));

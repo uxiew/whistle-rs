@@ -216,7 +216,11 @@ pub fn explain(query: &Query) -> Result<Explanation, String> {
     // Resolution order is the whole answer for the operators that compete, so
     // report it rather than a hash map's whim. The protocol name breaks the tie
     // between two operators written on the same line.
-    ops.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.protocol.cmp(&b.protocol)));
+    ops.sort_by(|a, b| {
+        a.order
+            .cmp(&b.order)
+            .then_with(|| a.protocol.cmp(&b.protocol))
+    });
 
     Ok(Explanation {
         url: info.full_url,
@@ -349,7 +353,10 @@ mod tests {
 
     #[test]
     fn a_matching_line_reports_its_operators() {
-        let e = ask("example.com reqHeaders://a=1 resHeaders://b=2", "http://example.com/x");
+        let e = ask(
+            "example.com reqHeaders://a=1 resHeaders://b=2",
+            "http://example.com/x",
+        );
         assert_eq!(protocols(&e), ["reqHeaders", "resHeaders"]);
         assert_eq!(e.ops[0].value, "a=1");
         assert_eq!(e.ops[0].pattern, "example.com");
@@ -452,18 +459,26 @@ mod tests {
     /// the reported URL only when it is not the scheme's own.
     #[test]
     fn a_scheme_less_url_is_http() {
-        assert_eq!(ask("", "www.example.com/api").url, "http://www.example.com/api");
+        assert_eq!(
+            ask("", "www.example.com/api").url,
+            "http://www.example.com/api"
+        );
         assert_eq!(ask("", "https://example.com/").url, "https://example.com/");
-        assert_eq!(ask("", "http://example.com:8080/").url, "http://example.com:8080/");
+        assert_eq!(
+            ask("", "http://example.com:8080/").url,
+            "http://example.com:8080/"
+        );
     }
 
     #[test]
     fn a_url_with_no_host_is_an_error() {
-        assert!(explain(&Query {
-            url: "/just/a/path".into(),
-            ..Default::default()
-        })
-        .is_err());
+        assert!(
+            explain(&Query {
+                url: "/just/a/path".into(),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     /// Important lines resolve first, and the report says so by its order.

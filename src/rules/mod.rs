@@ -1638,7 +1638,11 @@ impl RuleManager {
         self.groups
             .iter()
             .filter(move |g| named && g.enabled && g.name != "default")
-            .chain(self.groups.iter().filter(|g| g.enabled && g.name == "default"))
+            .chain(
+                self.groups
+                    .iter()
+                    .filter(|g| g.enabled && g.name == "default"),
+            )
     }
 
     /// Resolve the default group alone from here on — see
@@ -1859,7 +1863,10 @@ fn merge_lines(text: &str) -> String {
         match &mut block {
             None => {
                 if trimmed == "line`" {
-                    block = Some(Block { parts: Vec::new(), raw: vec![raw.to_string()] });
+                    block = Some(Block {
+                        parts: Vec::new(),
+                        raw: vec![raw.to_string()],
+                    });
                 } else {
                     out.push(raw.to_string());
                 }
@@ -2043,7 +2050,9 @@ pub fn split_line<'t>(tokens: &[&'t str]) -> Option<(Vec<&'t str>, Vec<&'t str>)
         _ => {
             let (mut ops, mut patterns) = (vec![tokens[0]], Vec::new());
             for tok in &tokens[1..] {
-                match is_pattern_token(tok) || parse_ip_shorthand(tok).is_some() || !has_protocol(tok)
+                match is_pattern_token(tok)
+                    || parse_ip_shorthand(tok).is_some()
+                    || !has_protocol(tok)
                 {
                     true => patterns.push(*tok),
                     false => ops.push(*tok),
@@ -2212,8 +2221,7 @@ pub fn parse_exact_skip(value: &str, from_skip: bool) -> Option<(ExactSkip, Stri
     }
     // Not one of the four keys, so `NO_PROTO_RE` decides — and only for
     // `skip://`, which is what `from_skip` is for.
-    (from_skip && has_non_protocol_char(value))
-        .then(|| (ExactSkip::Matcher, value.to_string()))
+    (from_skip && has_non_protocol_char(value)).then(|| (ExactSkip::Matcher, value.to_string()))
 }
 
 /// Was this operator written `skip://` rather than `ignore://`?
@@ -2296,8 +2304,18 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("ip", CondKind::Ip, true, false),
     // `h`/`header` are upstream's `filter.header`, the one header spelling that
     // reads the response too — see [`HeaderScope`].
-    ("h", CondKind::Header(HeaderScope::RequestThenResponse), true, false),
-    ("header", CondKind::Header(HeaderScope::RequestThenResponse), true, false),
+    (
+        "h",
+        CondKind::Header(HeaderScope::RequestThenResponse),
+        true,
+        false,
+    ),
+    (
+        "header",
+        CondKind::Header(HeaderScope::RequestThenResponse),
+        true,
+        false,
+    ),
     // `host:` is this port's own spelling (upstream has only the pure form, and
     // routes it to proxy-host filtering rather than to the request's host).
     ("host", CondKind::Host, true, true),
@@ -2305,8 +2323,18 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("clientIP", CondKind::ClientIp, true, true),
     ("req", CondKind::Header(HeaderScope::Request), true, true),
     ("reqH", CondKind::Header(HeaderScope::Request), true, true),
-    ("reqHeader", CondKind::Header(HeaderScope::Request), true, true),
-    ("reqHeaders", CondKind::Header(HeaderScope::Request), true, true),
+    (
+        "reqHeader",
+        CondKind::Header(HeaderScope::Request),
+        true,
+        true,
+    ),
+    (
+        "reqHeaders",
+        CondKind::Header(HeaderScope::Request),
+        true,
+        true,
+    ),
     ("chance", CondKind::Chance, true, true),
     ("probability", CondKind::Chance, true, true),
     ("s", CondKind::StatusCode, true, false),
@@ -2315,8 +2343,18 @@ const COND_SPECS: &[(&str, CondKind, bool, bool)] = &[
     ("body", CondKind::Body, true, false),
     ("res", CondKind::Header(HeaderScope::Response), true, true),
     ("resH", CondKind::Header(HeaderScope::Response), true, true),
-    ("resHeader", CondKind::Header(HeaderScope::Response), true, true),
-    ("resHeaders", CondKind::Header(HeaderScope::Response), true, true),
+    (
+        "resHeader",
+        CondKind::Header(HeaderScope::Response),
+        true,
+        true,
+    ),
+    (
+        "resHeaders",
+        CondKind::Header(HeaderScope::Response),
+        true,
+        true,
+    ),
     ("serverIp", CondKind::ServerIp, true, true),
     ("serverIP", CondKind::ServerIp, true, true),
     ("clientPort", CondKind::ClientPort, true, true),
@@ -2625,9 +2663,13 @@ fn build_cond(kind: CondKind, rest: &str) -> Option<(Cond, bool)> {
 /// a condition that asks for a header named `""` and never finds one. Dropping
 /// it here left the line with no include filter, and so applying to everything.
 fn split_keyed_value(rest: &str, colon_separates: bool) -> Option<(&str, bool, &str)> {
-    let sep = rest
-        .find('=')
-        .or_else(|| if colon_separates { rest.find(':') } else { None });
+    let sep = rest.find('=').or_else(|| {
+        if colon_separates {
+            rest.find(':')
+        } else {
+            None
+        }
+    });
     let (key, value) = match sep {
         Some(i) => (&rest[..i], &rest[i + 1..]),
         None => (rest, ""),
@@ -2677,7 +2719,10 @@ fn format_shorthand(tok: &str) -> String {
         _ => {}
     }
     // `{key}`, `<path>`, `(value)` and the empty object all name file content.
-    if tok == "{}" || is_wrapped(tok, '{', '}') || is_wrapped(tok, '<', '>') || is_wrapped(tok, '(', ')')
+    if tok == "{}"
+        || is_wrapped(tok, '{', '}')
+        || is_wrapped(tok, '<', '>')
+        || is_wrapped(tok, '(', ')')
     {
         return format!("file://{tok}");
     }
@@ -2915,10 +2960,7 @@ fn parse_op(tok: &str) -> Option<RuleOp> {
         // It was only unwrapped for `file://` here, so `reqBody://(Hello)` —
         // upstream's own documented example — sent the seven characters
         // `(Hello)` to the origin, parentheses and all.
-        let inline = matches!(
-            url::fixed_value(value),
-            Some((url::Fixed::Inline, _))
-        );
+        let inline = matches!(url::fixed_value(value), Some((url::Fixed::Inline, _)));
         let value = match inline {
             true => url::fixed_value(value).map(|(_, v)| v).unwrap_or_default(),
             false => value.to_string(),
@@ -3035,12 +3077,7 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
         Some(rest) => (true, rest),
         None => (false, tok),
     };
-    let done = |pattern| {
-        Some(ParsedPattern {
-            pattern,
-            negate,
-        })
-    };
+    let done = |pattern| Some(ParsedPattern { pattern, negate });
 
     // A `^`-prefixed URL turns every `*` into a wildcard, in the path and the
     // query as well as the host. Upstream tests this first too — `regUrlCache`
@@ -3284,7 +3321,10 @@ mod group_tests {
         mgr.add_group("b", "example.com host://5.6.7.8", false);
 
         let r = mgr.resolve(&req("http://example.com/"));
-        assert_eq!(r.single.get("host").map(|o| o.value.as_str()), Some("1.2.3.4"));
+        assert_eq!(
+            r.single.get("host").map(|o| o.value.as_str()),
+            Some("1.2.3.4")
+        );
         assert_eq!(mgr.len(), 2); // both parsed
     }
 
@@ -3292,7 +3332,11 @@ mod group_tests {
     fn toggle_changes_resolution() {
         let mut mgr = RuleManager::new();
         mgr.add_group("main", "example.com host://1.1.1.1", true);
-        assert!(mgr.resolve(&req("http://example.com/")).single.contains_key("host"));
+        assert!(
+            mgr.resolve(&req("http://example.com/"))
+                .single
+                .contains_key("host")
+        );
 
         mgr.toggle_group("main");
         assert!(mgr.resolve(&req("http://example.com/")).single.is_empty());
@@ -3321,7 +3365,11 @@ mod group_tests {
 
         assert!(!mgr.remove_group("default"));
         assert_eq!(mgr.text(), "example.com host://1.1.1.1");
-        assert!(mgr.resolve(&req("http://example.com/")).single.contains_key("host"));
+        assert!(
+            mgr.resolve(&req("http://example.com/"))
+                .single
+                .contains_key("host")
+        );
 
         // A named group is still removable, and the refusal above is about the
         // one name rather than about removal having stopped working.
@@ -3341,7 +3389,11 @@ mod group_tests {
         assert_eq!(mgr.text(), "example.com host://1.1.1.1");
 
         assert_eq!(mgr.toggle_group("default"), Some(true));
-        assert!(mgr.resolve(&req("http://example.com/")).single.contains_key("host"));
+        assert!(
+            mgr.resolve(&req("http://example.com/"))
+                .single
+                .contains_key("host")
+        );
     }
 
     #[test]
@@ -3350,7 +3402,11 @@ mod group_tests {
         mgr.set_text("example.com host://1.1.1.1");
         assert_eq!(mgr.groups().len(), 1);
         assert_eq!(mgr.groups()[0].name, "default");
-        assert!(mgr.resolve(&req("http://example.com/")).single.contains_key("host"));
+        assert!(
+            mgr.resolve(&req("http://example.com/"))
+                .single
+                .contains_key("host")
+        );
 
         mgr.set_text("other.com host://2.2.2.2");
         assert_eq!(mgr.groups().len(), 1);
@@ -3389,7 +3445,6 @@ mod group_tests {
         assert_eq!(host_of(&mgr).as_deref(), Some("1.1.1.1"));
     }
 }
-
 
 #[cfg(test)]
 mod line_props_tests {
@@ -3479,9 +3534,11 @@ mod line_props_tests {
         let r = one("example.com htmlAppend://<!--x--> includeFilter://safeHtml");
         assert!(r.props.has("safeHtml"));
         assert!(r.filters.is_empty(), "must not become a filter condition");
-        assert!(one("example.com htmlAppend://<!--x--> includeFilter://strictHtml")
-            .props
-            .has("strictHtml"));
+        assert!(
+            one("example.com htmlAppend://<!--x--> includeFilter://strictHtml")
+                .props
+                .has("strictHtml")
+        );
     }
 
     // ── important ──
@@ -3496,7 +3553,10 @@ mod line_props_tests {
         );
         let refs: Vec<&Rule> = rules.iter().collect();
         let r = matcher::resolve_refs(&refs, &req("http://example.com/"));
-        assert_eq!(r.single.get("host").map(|o| o.value.as_str()), Some("2.2.2.2"));
+        assert_eq!(
+            r.single.get("host").map(|o| o.value.as_str()),
+            Some("2.2.2.2")
+        );
     }
 
     /// Without it, first-match-wins still holds.
@@ -3508,7 +3568,10 @@ mod line_props_tests {
         );
         let refs: Vec<&Rule> = rules.iter().collect();
         let r = matcher::resolve_refs(&refs, &req("http://example.com/"));
-        assert_eq!(r.single.get("host").map(|o| o.value.as_str()), Some("1.1.1.1"));
+        assert_eq!(
+            r.single.get("host").map(|o| o.value.as_str()),
+            Some("1.1.1.1")
+        );
     }
 
     // ── internal / internalOnly scoping ──
@@ -3519,8 +3582,16 @@ mod line_props_tests {
         let refs: Vec<&Rule> = rules.iter().collect();
         let info = req("http://example.com/");
 
-        assert!(matcher::resolve_refs_scoped(&refs, &info, false).single.is_empty());
-        assert!(matcher::resolve_refs_scoped(&refs, &info, true).single.contains_key("host"));
+        assert!(
+            matcher::resolve_refs_scoped(&refs, &info, false)
+                .single
+                .is_empty()
+        );
+        assert!(
+            matcher::resolve_refs_scoped(&refs, &info, true)
+                .single
+                .contains_key("host")
+        );
     }
 
     #[test]
@@ -3529,8 +3600,16 @@ mod line_props_tests {
         let refs: Vec<&Rule> = rules.iter().collect();
         let info = req("http://example.com/");
 
-        assert!(matcher::resolve_refs_scoped(&refs, &info, false).single.contains_key("host"));
-        assert!(matcher::resolve_refs_scoped(&refs, &info, true).single.contains_key("host"));
+        assert!(
+            matcher::resolve_refs_scoped(&refs, &info, false)
+                .single
+                .contains_key("host")
+        );
+        assert!(
+            matcher::resolve_refs_scoped(&refs, &info, true)
+                .single
+                .contains_key("host")
+        );
     }
 
     /// A plain line is invisible to whistle's own outgoing requests.
@@ -3540,8 +3619,16 @@ mod line_props_tests {
         let refs: Vec<&Rule> = rules.iter().collect();
         let info = req("http://example.com/");
 
-        assert!(matcher::resolve_refs_scoped(&refs, &info, false).single.contains_key("host"));
-        assert!(matcher::resolve_refs_scoped(&refs, &info, true).single.is_empty());
+        assert!(
+            matcher::resolve_refs_scoped(&refs, &info, false)
+                .single
+                .contains_key("host")
+        );
+        assert!(
+            matcher::resolve_refs_scoped(&refs, &info, true)
+                .single
+                .is_empty()
+        );
     }
 
     // ── safeHtml / strictHtml injection gating ──
@@ -3678,7 +3765,10 @@ mod filter_parse_tests {
     /// is never mistaken for `h`, nor `statusCode` for `s`.
     #[test]
     fn longer_names_are_not_shadowed() {
-        assert!(matches!(cond_of("filter://host:example.com").cond, Cond::Host(_)));
+        assert!(matches!(
+            cond_of("filter://host:example.com").cond,
+            Cond::Host(_)
+        ));
         assert!(matches!(
             cond_of("filter://statusCode:200").cond,
             Cond::StatusCode(_)
@@ -3695,7 +3785,10 @@ mod filter_parse_tests {
     /// deferred forever.
     #[test]
     fn response_phase_conditions_are_recognised() {
-        assert!(matches!(cond_of("filter://s:200").cond, Cond::StatusCode(_)));
+        assert!(matches!(
+            cond_of("filter://s:200").cond,
+            Cond::StatusCode(_)
+        ));
         assert!(matches!(
             cond_of("filter://statusCode:200").cond,
             Cond::StatusCode(_)
@@ -3820,9 +3913,9 @@ mod filter_parse_tests {
     #[test]
     fn near_misses_degrade_to_literals() {
         for token in [
-            "filter://m:／/",     // not a slash at all
-            "filter://m://",      // empty body
-            "filter://m:/GET/g",  // flag whistle's regex does not accept
+            "filter://m:／/",      // not a slash at all
+            "filter://m://",       // empty body
+            "filter://m:/GET/g",   // flag whistle's regex does not accept
             "filter://m:/(?<=x)/", // valid in JS, unsupported by Rust's engine
         ] {
             assert!(
@@ -3862,7 +3955,10 @@ mod filter_parse_tests {
         assert!(!cond_of("filter://m:GET").negate);
         // A `!` in front of a condition *name* is not a negation: upstream's
         // props regex requires the name first, so this is a URL pattern.
-        assert!(matches!(cond_of("includeFilter://!m:GET").cond, Cond::Url(_)));
+        assert!(matches!(
+            cond_of("includeFilter://!m:GET").cond,
+            Cond::Url(_)
+        ));
     }
 
     /// A header condition can carry a `!` in both places, and they cancel —
@@ -3966,7 +4062,11 @@ mod filter_parse_tests {
     /// matches — which is not the same as being dropped.
     #[test]
     fn a_condition_name_with_no_value_is_a_url_pattern() {
-        for token in ["includeFilter://reqH.", "includeFilter://m:", "includeFilter://s:"] {
+        for token in [
+            "includeFilter://reqH.",
+            "includeFilter://m:",
+            "includeFilter://s:",
+        ] {
             assert!(
                 matches!(cond_of(token).cond, Cond::Url(_)),
                 "{token} should be a URL pattern"
@@ -4001,9 +4101,11 @@ mod filter_parse_tests {
         let rules = parse_text("example.com host://1.1.1.1 ignore://host");
         assert!(rules[0].filters.is_empty());
         assert!(rules[0].ops.iter().any(|op| op.protocol == "ignore"));
-        assert!(parse_text("example.com host://1.1.1.1 ignore://all")[0]
-            .filters
-            .is_empty());
+        assert!(
+            parse_text("example.com host://1.1.1.1 ignore://all")[0]
+                .filters
+                .is_empty()
+        );
     }
 }
 
@@ -4091,14 +4193,20 @@ mod pattern_tests {
         assert!(!hits(text, "http://example.test/"));
         assert!(!hits(text, "http://other.test:8080/"));
         // A portless pattern still matches any port.
-        assert!(hits("example.test host://1.1.1.1", "http://example.test:8080/"));
+        assert!(hits(
+            "example.test host://1.1.1.1",
+            "http://example.test:8080/"
+        ));
     }
 
     /// A `:` that is not a port stays part of the host, which then matches
     /// nothing — rather than being dropped and widening the rule.
     #[test]
     fn unparsable_port_does_not_widen_the_pattern() {
-        assert!(!hits("example.test:99999 host://1.1.1.1", "http://example.test/"));
+        assert!(!hits(
+            "example.test:99999 host://1.1.1.1",
+            "http://example.test/"
+        ));
         assert!(!hits(": host://1.1.1.1", "http://example.test/"));
     }
 
@@ -4127,9 +4235,15 @@ mod pattern_tests {
             r.method = "POST".into();
             r
         };
-        assert!(mgr.resolve(&post("http://other.test/")).value("host").is_some());
         assert!(
-            mgr.resolve(&post("http://example.test/")).value("host").is_none(),
+            mgr.resolve(&post("http://other.test/"))
+                .value("host")
+                .is_some()
+        );
+        assert!(
+            mgr.resolve(&post("http://example.test/"))
+                .value("host")
+                .is_none(),
             "the negated pattern still excludes example.test"
         );
     }
@@ -4195,13 +4309,28 @@ mod pattern_tests {
     fn an_exact_pattern_may_be_a_wildcard() {
         let text = "$*.example.test/echo host://1.1.1.1";
         assert!(hits(text, "http://a.example.test/echo"));
-        assert!(hits(text, "http://a.example.test/echo?q=1"), "the query may differ");
-        assert!(!hits(text, "http://a.example.test/echo/more"), "still exact");
+        assert!(
+            hits(text, "http://a.example.test/echo?q=1"),
+            "the query may differ"
+        );
+        assert!(
+            !hits(text, "http://a.example.test/echo/more"),
+            "still exact"
+        );
         assert!(!hits(text, "http://a.example.test/ec"));
-        assert!(!hits(text, "http://a.b.example.test/echo"), "one label only");
+        assert!(
+            !hits(text, "http://a.b.example.test/echo"),
+            "one label only"
+        );
         // The leading-dot and multi-star hosts are wildcards too.
-        assert!(hits("$.example.test/echo host://1.1.1.1", "http://a.example.test/echo"));
-        assert!(hits("$**.example.test/echo host://1.1.1.1", "http://a.b.example.test/echo"));
+        assert!(hits(
+            "$.example.test/echo host://1.1.1.1",
+            "http://a.example.test/echo"
+        ));
+        assert!(hits(
+            "$**.example.test/echo host://1.1.1.1",
+            "http://a.b.example.test/echo"
+        ));
         // And a `$` with no wildcard in it is still a plain exact pattern.
         assert!(matches!(
             &parse_text("$example.test/p host://1.1.1.1")[0].pattern,
@@ -4267,15 +4396,24 @@ mod pattern_tests {
         assert!(hits(text, "http://example.test/?q=1"));
         assert!(hits(text, "http://example.test/?q=1&r=2"), "a query prefix");
         assert!(!hits(text, "http://example.test/?q=2"));
-        assert!(!hits(text, "http://example.test/"), "the request has no query");
+        assert!(
+            !hits(text, "http://example.test/"),
+            "the request has no query"
+        );
         // The query goes before the `/` test that decides `rule.isDomain`
         // (`rules.js:1343-1348`), so this is still a domain pattern and still
         // matches on any port.
         assert!(hits(text, "http://example.test:8080/?q=1"));
         // …where a pattern with a real path is scoped to the default port.
-        assert!(!hits("example.test/p host://1.1.1.1", "http://example.test:8080/p"));
+        assert!(!hits(
+            "example.test/p host://1.1.1.1",
+            "http://example.test:8080/p"
+        ));
         // A bare `?` is a query prefix of everything.
-        assert!(hits("example.test? host://1.1.1.1", "http://example.test/?q=1"));
+        assert!(hits(
+            "example.test? host://1.1.1.1",
+            "http://example.test/?q=1"
+        ));
     }
 
     /// A pattern with no host matches nothing.
@@ -4287,9 +4425,19 @@ mod pattern_tests {
     /// alone applied its line to every plain-HTTP request that arrived.
     #[test]
     fn a_pattern_with_no_host_matches_nothing() {
-        for pattern in ["http://", "http:///", "http:///echo", ":80/echo", "///example.test", "/echo"] {
+        for pattern in [
+            "http://",
+            "http:///",
+            "http:///echo",
+            ":80/echo",
+            "///example.test",
+            "/echo",
+        ] {
             assert!(
-                !hits(&format!("{pattern} host://1.1.1.1"), "http://example.test/echo"),
+                !hits(
+                    &format!("{pattern} host://1.1.1.1"),
+                    "http://example.test/echo"
+                ),
                 "{pattern}"
             );
         }
@@ -4307,13 +4455,19 @@ mod pattern_tests {
     fn only_i_and_u_are_regexp_flags() {
         for flags in ["", "i", "u", "iu", "ui"] {
             assert!(
-                hits(&format!("/echo/{flags} host://1.1.1.1"), "http://example.test/echo"),
+                hits(
+                    &format!("/echo/{flags} host://1.1.1.1"),
+                    "http://example.test/echo"
+                ),
                 "/echo/{flags}"
             );
         }
         for flags in ["g", "m", "s", "gi", "ig", "xyz", "I"] {
             assert!(
-                !hits(&format!("/echo/{flags} host://1.1.1.1"), "http://example.test/echo"),
+                !hits(
+                    &format!("/echo/{flags} host://1.1.1.1"),
+                    "http://example.test/echo"
+                ),
                 "/echo/{flags}"
             );
         }
@@ -4361,9 +4515,18 @@ mod pattern_tests {
 
         // `\r\n` is one separator, not two, and `\r\r\n` is two — the ordered
         // alternation upstream's regexp gives.
-        assert_eq!(parse_text("a.test host://1.1.1.1\r\nb.test host://2.2.2.2").len(), 2);
-        assert_eq!(parse_text("a.test host://1.1.1.1\r\r\nb.test host://2.2.2.2").len(), 2);
-        assert_eq!(parse_text("a.test host://1.1.1.1\n\rb.test host://2.2.2.2").len(), 2);
+        assert_eq!(
+            parse_text("a.test host://1.1.1.1\r\nb.test host://2.2.2.2").len(),
+            2
+        );
+        assert_eq!(
+            parse_text("a.test host://1.1.1.1\r\r\nb.test host://2.2.2.2").len(),
+            2
+        );
+        assert_eq!(
+            parse_text("a.test host://1.1.1.1\n\rb.test host://2.2.2.2").len(),
+            2
+        );
     }
 
     /// A `ws://` pattern does not reach a plain request, and an `http://` one
@@ -4386,12 +4549,27 @@ mod pattern_tests {
             mgr.set_text(text);
             mgr.resolve(info).value("host").is_some()
         };
-        assert!(!hits("ws://example.test host://1.1.1.1", "http://example.test/"));
-        assert!(!hits("wss://example.test host://1.1.1.1", "https://example.test/"));
-        assert!(!matched("http://example.test host://1.1.1.1", &ws("ws://example.test/c")));
-        assert!(matched("ws://example.test host://1.1.1.1", &ws("ws://example.test/c")));
+        assert!(!hits(
+            "ws://example.test host://1.1.1.1",
+            "http://example.test/"
+        ));
+        assert!(!hits(
+            "wss://example.test host://1.1.1.1",
+            "https://example.test/"
+        ));
+        assert!(!matched(
+            "http://example.test host://1.1.1.1",
+            &ws("ws://example.test/c")
+        ));
+        assert!(matched(
+            "ws://example.test host://1.1.1.1",
+            &ws("ws://example.test/c")
+        ));
         // A pattern with no scheme reaches both, which is whistle's idiom for it.
-        assert!(matched("example.test host://1.1.1.1", &ws("ws://example.test/c")));
+        assert!(matched(
+            "example.test host://1.1.1.1",
+            &ws("ws://example.test/c")
+        ));
         assert!(hits("example.test host://1.1.1.1", "http://example.test/"));
     }
 
@@ -4402,11 +4580,20 @@ mod pattern_tests {
         // No query in the pattern: the path must match, the query may be anything.
         assert!(hits("example.test/p", "http://example.test/p"));
         assert!(hits("example.test/p", "http://example.test/p?a=1"));
-        assert!(!hits("example.test/p", "http://example.test/p/s"), "no sub-paths");
+        assert!(
+            !hits("example.test/p", "http://example.test/p/s"),
+            "no sub-paths"
+        );
         // A query in the pattern makes both exact.
-        assert!(hits("http://example.test/p?a=1", "http://example.test/p?a=1"));
+        assert!(hits(
+            "http://example.test/p?a=1",
+            "http://example.test/p?a=1"
+        ));
         assert!(!hits("http://example.test/p?a=1", "http://example.test/p"));
-        assert!(!hits("http://example.test/p?a=1", "http://example.test/p?b=2"));
+        assert!(!hits(
+            "http://example.test/p?a=1",
+            "http://example.test/p?b=2"
+        ));
         // The root, and only the root.
         assert!(hits("example.test/", "http://example.test/"));
         assert!(!hits("example.test/", "http://example.test/p"));
@@ -4484,15 +4671,33 @@ mod parse_text_tests {
     /// quietly preserve a `Host` header upstream rewrites.
     #[test]
     fn only_an_ip_literal_is_the_address_shorthand() {
-        for tok in ["127.0.0.1", "1.2.3.4:8080", "[::1]:8080", "::1", "::ffff:1.2.3.4:80"] {
+        for tok in [
+            "127.0.0.1",
+            "1.2.3.4:8080",
+            "[::1]:8080",
+            "::1",
+            "::ffff:1.2.3.4:80",
+        ] {
             assert!(parse_ip_shorthand(tok).is_some(), "{tok} is an address");
         }
-        for tok in ["localhost:8080", "example.com", "example.com:80", "1.2.3", "1.2.3.4:abc"] {
+        for tok in [
+            "localhost:8080",
+            "example.com",
+            "example.com:80",
+            "1.2.3",
+            "1.2.3.4:abc",
+        ] {
             assert!(parse_ip_shorthand(tok).is_none(), "{tok} is not an address");
         }
         // The port travels with the address, and a v4-mapped form is unmapped.
-        assert_eq!(parse_ip_shorthand("1.2.3.4:8080"), Some(("1.2.3.4".into(), Some(8080))));
-        assert_eq!(parse_ip_shorthand("::ffff:1.2.3.4"), Some(("1.2.3.4".into(), None)));
+        assert_eq!(
+            parse_ip_shorthand("1.2.3.4:8080"),
+            Some(("1.2.3.4".into(), Some(8080)))
+        );
+        assert_eq!(
+            parse_ip_shorthand("::ffff:1.2.3.4"),
+            Some(("1.2.3.4".into(), None))
+        );
         assert_eq!(parse_ip_shorthand("[::1]:9"), Some(("::1".into(), Some(9))));
     }
 
@@ -4543,7 +4748,11 @@ mod parse_text_tests {
         let rules = parse_text("/Users/me/mock.json  www.example.com  api.example.com");
         assert_eq!(rules.len(), 2, "one rule per pattern");
         for rule in &rules {
-            let op = rule.ops.iter().find(|op| op.protocol == "file").expect("a file operator");
+            let op = rule
+                .ops
+                .iter()
+                .find(|op| op.protocol == "file")
+                .expect("a file operator");
             assert_eq!(op.value, "/Users/me/mock.json");
         }
         let file_for = |text: &str, url: &str| {
@@ -4576,12 +4785,20 @@ mod parse_text_tests {
             "example.com host://1.1.1.1 includeFilter://(m:GET)",
             "example.com host://1.1.1.1 includeFilter://<m:GET>",
         ] {
-            assert_eq!(host_of(line, "http://example.com/x").as_deref(), Some("1.1.1.1"), "{line}");
+            assert_eq!(
+                host_of(line, "http://example.com/x").as_deref(),
+                Some("1.1.1.1"),
+                "{line}"
+            );
         }
         // The condition is still a condition — a GET filter excludes a POST.
         let mut m = RuleManager::new();
         m.set_text("example.com host://1.1.1.1 includeFilter://(m:POST)");
-        assert!(m.resolve(&req("http://example.com/x")).value("host").is_none());
+        assert!(
+            m.resolve(&req("http://example.com/x"))
+                .value("host")
+                .is_none()
+        );
     }
 
     /// `filter://` is two operators sharing one name, and this port only knew
@@ -4594,25 +4811,45 @@ mod parse_text_tests {
         let host_of = |text: &str| {
             let mut m = RuleManager::new();
             m.set_text(text);
-            m.resolve(&req("http://example.com/x")).value("host").map(str::to_string)
+            m.resolve(&req("http://example.com/x"))
+                .value("host")
+                .map(str::to_string)
         };
         assert_eq!(host_of("example.com host://1.1.1.1 filter://host"), None);
-        assert_eq!(host_of("example.com host://1.1.1.1 filter://ua").as_deref(), Some("1.1.1.1"));
+        assert_eq!(
+            host_of("example.com host://1.1.1.1 filter://ua").as_deref(),
+            Some("1.1.1.1")
+        );
 
         // A URL payload is still a URL filter — it ends in `/`…
-        assert_eq!(host_of("example.com host://1.1.1.1 filter:///api/"), Some("1.1.1.1".into()));
+        assert_eq!(
+            host_of("example.com host://1.1.1.1 filter:///api/"),
+            Some("1.1.1.1".into())
+        );
         // …and one that matches excludes the rule.
         let mut m = RuleManager::new();
         m.set_text("example.com host://1.1.1.1 filter:///x/");
-        assert!(m.resolve(&req("http://example.com/x/y")).value("host").is_none());
+        assert!(
+            m.resolve(&req("http://example.com/x/y"))
+                .value("host")
+                .is_none()
+        );
 
         // And a named condition is still a condition. `filter://` excludes, so
         // a condition that *holds* is what removes the rule.
         let mut m = RuleManager::new();
         m.set_text("example.com host://1.1.1.1 filter://m:GET");
-        assert!(m.resolve(&req("http://example.com/x")).value("host").is_none());
+        assert!(
+            m.resolve(&req("http://example.com/x"))
+                .value("host")
+                .is_none()
+        );
         m.set_text("example.com host://1.1.1.1 filter://m:POST");
-        assert!(m.resolve(&req("http://example.com/x")).value("host").is_some());
+        assert!(
+            m.resolve(&req("http://example.com/x"))
+                .value("host")
+                .is_some()
+        );
     }
 
     /// A rules file can carry its own mocks in a ``` fenced block. Without the
@@ -4629,7 +4866,10 @@ mod parse_text_tests {
             "example.com file://{mock.json}\n",
         );
         let (body, values) = lift_inline_values(text);
-        assert_eq!(values.get("mock.json").map(String::as_str), Some("{\"ok\": true,\n \"n\": 1}"));
+        assert_eq!(
+            values.get("mock.json").map(String::as_str),
+            Some("{\"ok\": true,\n \"n\": 1}")
+        );
         assert_eq!(body.trim(), "example.com file://{mock.json}");
         // The rule survives the lift and is the only one.
         assert_eq!(parse_text(&body).len(), 1);
@@ -4638,12 +4878,18 @@ mod parse_text_tests {
         // its own length.
         let nested = "````` outer\n```\ninner\n```\n`````\na.com file://{outer}\n";
         let (body, values) = lift_inline_values(nested);
-        assert_eq!(values.get("outer").map(String::as_str), Some("```\ninner\n```"));
+        assert_eq!(
+            values.get("outer").map(String::as_str),
+            Some("```\ninner\n```")
+        );
         assert_eq!(body.trim(), "a.com file://{outer}");
 
         // A name declared twice keeps the first block.
         let twice = "``` k\nfirst\n```\n``` k\nsecond\n```\n";
-        assert_eq!(lift_inline_values(twice).1.get("k").map(String::as_str), Some("first"));
+        assert_eq!(
+            lift_inline_values(twice).1.get("k").map(String::as_str),
+            Some("first")
+        );
 
         // An unterminated fence is not a block: the text is left alone rather
         // than swallowing the rest of the file.
@@ -4701,7 +4947,11 @@ mod parse_text_tests {
         assert_eq!(got(&mgr, "b", "default"), None);
 
         mgr.toggle_group("extra");
-        assert_eq!(got(&mgr, "b", "extra"), None, "a disabled group contributes nothing");
+        assert_eq!(
+            got(&mgr, "b", "extra"),
+            None,
+            "a disabled group contributes nothing"
+        );
     }
 
     /// Every operator carries the group its line was written in, and a
@@ -4721,7 +4971,9 @@ mod parse_text_tests {
                 &hyper::HeaderMap::new(),
                 None,
             );
-            mgr.resolve(&info).get(proto).and_then(|op| op.group.clone())
+            mgr.resolve(&info)
+                .get(proto)
+                .and_then(|op| op.group.clone())
         };
         assert_eq!(group_of(&mgr, "host").as_deref(), Some("default"));
         assert_eq!(group_of(&mgr, "resHeaders").as_deref(), Some("extra"));
@@ -4834,7 +5086,13 @@ mod parse_text_tests {
         // `a.com ~/mock.json` to `http://~/mock.json/…`. Reading these as files
         // turned a leading-dot hostname into a 404 and a whistle rules file
         // into a different program.
-        for tok in ["~/mock.json", "./mock.json", "../mock.json", "...", ".internal.example"] {
+        for tok in [
+            "~/mock.json",
+            "./mock.json",
+            "../mock.json",
+            "...",
+            ".internal.example",
+        ] {
             let rules = parse_text(&format!("example.com {tok}"));
             assert_eq!(rules[0].ops[0].protocol, protocols::URL_REPLACE, "{tok}");
             assert_eq!(rules[0].ops[0].value, tok, "{tok}");
@@ -4924,7 +5182,11 @@ mod parse_text_tests {
             Some("1.1.1.1")
         );
         let rules = parse_text("a.com host://1.1.1.1 # b.com c.com");
-        assert_eq!(rules.len(), 1, "commented-out patterns must not become rules");
+        assert_eq!(
+            rules.len(),
+            1,
+            "commented-out patterns must not become rules"
+        );
     }
 
     #[test]
@@ -4953,9 +5215,18 @@ mod parse_text_tests {
     #[test]
     fn rules_around_a_block_still_parse() {
         let text = "before.com host://1.1.1.1\nline`\nhost://2.2.2.2\ninside.com\n`\nafter.com host://3.3.3.3";
-        assert_eq!(host_for(text, "http://before.com/").as_deref(), Some("1.1.1.1"));
-        assert_eq!(host_for(text, "http://inside.com/").as_deref(), Some("2.2.2.2"));
-        assert_eq!(host_for(text, "http://after.com/").as_deref(), Some("3.3.3.3"));
+        assert_eq!(
+            host_for(text, "http://before.com/").as_deref(),
+            Some("1.1.1.1")
+        );
+        assert_eq!(
+            host_for(text, "http://inside.com/").as_deref(),
+            Some("2.2.2.2")
+        );
+        assert_eq!(
+            host_for(text, "http://after.com/").as_deref(),
+            Some("3.3.3.3")
+        );
     }
 
     /// Comments are stripped before blocks are collapsed, so a `#` inside a
@@ -4963,7 +5234,10 @@ mod parse_text_tests {
     #[test]
     fn comment_inside_a_block() {
         let text = "line`\nhost://4.4.4.4\nkept.com\n# skipped.com\n`";
-        assert_eq!(host_for(text, "http://kept.com/").as_deref(), Some("4.4.4.4"));
+        assert_eq!(
+            host_for(text, "http://kept.com/").as_deref(),
+            Some("4.4.4.4")
+        );
         assert_eq!(host_for(text, "http://skipped.com/"), None);
     }
 
@@ -4974,7 +5248,10 @@ mod parse_text_tests {
     /// this port used to join them and serve the half-written rule.
     #[test]
     fn an_unterminated_block_is_not_a_block() {
-        assert_eq!(host_for("line`\nhost://5.5.5.5\nlonely.com", "http://lonely.com/"), None);
+        assert_eq!(
+            host_for("line`\nhost://5.5.5.5\nlonely.com", "http://lonely.com/"),
+            None
+        );
         // The closing backtick is all it takes.
         assert_eq!(
             host_for("line`\nhost://5.5.5.5\nlonely.com\n`", "http://lonely.com/").as_deref(),
@@ -4983,7 +5260,11 @@ mod parse_text_tests {
         // Whitespace inside a block collapses: `toLine` is one `/\s+/g` over
         // everything between the backticks.
         assert_eq!(
-            host_for("line`\n  host://5.5.5.5   \n  lonely.com\n`", "http://lonely.com/").as_deref(),
+            host_for(
+                "line`\n  host://5.5.5.5   \n  lonely.com\n`",
+                "http://lonely.com/"
+            )
+            .as_deref(),
             Some("5.5.5.5")
         );
     }
@@ -5060,32 +5341,107 @@ mod documented_rules {
     /// The 92 names the documentation's rules sidebar lists.
     const DOCUMENTED: &[&str] = &[
         // Map Local
-        "file", "xfile", "tpl", "xtpl", "rawfile", "xrawfile",
+        "file",
+        "xfile",
+        "tpl",
+        "xtpl",
+        "rawfile",
+        "xrawfile",
         // Map Remote — destinations, not named operators
-        "https", "http", "wss", "ws", "tunnel",
+        "https",
+        "http",
+        "wss",
+        "ws",
+        "tunnel",
         // DNS spoofing
-        "host", "xhost", "proxy", "xproxy", "https-proxy", "xhttps-proxy", "socks", "xsocks", "pac",
+        "host",
+        "xhost",
+        "proxy",
+        "xproxy",
+        "https-proxy",
+        "xhttps-proxy",
+        "socks",
+        "xsocks",
+        "pac",
         // Rewrite request
-        "urlParams", "pathReplace", "sniCallback", "method", "tlsOptions", "reqHeaders",
-        "forwardedFor", "ua", "auth", "cache", "referer", "reqType", "reqCharset", "reqCookies",
-        "reqCors", "reqBody", "reqMerge", "reqPrepend", "reqAppend", "reqReplace", "reqWrite",
-        "reqWriteRaw", "reqRules", "reqScript",
+        "urlParams",
+        "pathReplace",
+        "sniCallback",
+        "method",
+        "tlsOptions",
+        "reqHeaders",
+        "forwardedFor",
+        "ua",
+        "auth",
+        "cache",
+        "referer",
+        "reqType",
+        "reqCharset",
+        "reqCookies",
+        "reqCors",
+        "reqBody",
+        "reqMerge",
+        "reqPrepend",
+        "reqAppend",
+        "reqReplace",
+        "reqWrite",
+        "reqWriteRaw",
+        "reqRules",
+        "reqScript",
         // Rewrite response
-        "statusCode", "replaceStatus", "redirect", "locationHref", "resHeaders", "responseFor",
-        "resType", "resCharset", "resCookies", "attachment", "resCors", "resBody", "resMerge",
-        "resPrepend", "resAppend", "resReplace", "htmlPrepend", "htmlBody", "htmlAppend",
-        "cssPrepend", "cssBody", "cssAppend", "jsPrepend", "jsBody", "jsAppend", "trailers",
-        "resWrite", "resWriteRaw", "resRules", "resScript", "frameScript",
+        "statusCode",
+        "replaceStatus",
+        "redirect",
+        "locationHref",
+        "resHeaders",
+        "responseFor",
+        "resType",
+        "resCharset",
+        "resCookies",
+        "attachment",
+        "resCors",
+        "resBody",
+        "resMerge",
+        "resPrepend",
+        "resAppend",
+        "resReplace",
+        "htmlPrepend",
+        "htmlBody",
+        "htmlAppend",
+        "cssPrepend",
+        "cssBody",
+        "cssAppend",
+        "jsPrepend",
+        "jsBody",
+        "jsAppend",
+        "trailers",
+        "resWrite",
+        "resWriteRaw",
+        "resRules",
+        "resScript",
+        "frameScript",
         // General
-        "pipe", "delete", "headerReplace",
+        "pipe",
+        "delete",
+        "headerReplace",
         // Throttle
-        "reqDelay", "resDelay", "reqSpeed", "resSpeed",
+        "reqDelay",
+        "resDelay",
+        "reqSpeed",
+        "resSpeed",
         // Tools
-        "weinre", "log",
+        "weinre",
+        "log",
         // Settings
-        "style", "enable", "disable", "lineProps",
+        "style",
+        "enable",
+        "disable",
+        "lineProps",
         // Filters
-        "excludeFilter", "includeFilter", "ignore", "skip",
+        "excludeFilter",
+        "includeFilter",
+        "ignore",
+        "skip",
     ];
 
     /// **What this proves and what it does not.** It proves every documented
@@ -5118,7 +5474,11 @@ mod documented_rules {
             stray.is_empty(),
             "silently became a destination rewrite, which is fail-open: {stray:?}"
         );
-        assert_eq!(DOCUMENTED.len(), 92, "the sidebar had 92 entries when this was written");
+        assert_eq!(
+            DOCUMENTED.len(),
+            92,
+            "the sidebar had 92 entries when this was written"
+        );
     }
 
     /// Every documented rule is *measured* against real whistle, not merely

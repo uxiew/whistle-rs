@@ -117,19 +117,31 @@ async fn by_default_the_headers_are_taken_and_ignored() {
         p.addr(),
         origin,
         &[
-            (RULES, &urlencode(&format!("{origin} reqHeaders://x-mark-hdr=1"))),
-            (HOST, &urlencode(&format!("{origin} reqHeaders://x-mark-host=1"))),
+            (
+                RULES,
+                &urlencode(&format!("{origin} reqHeaders://x-mark-hdr=1")),
+            ),
+            (
+                HOST,
+                &urlencode(&format!("{origin} reqHeaders://x-mark-host=1")),
+            ),
             (KEY, "envA"),
             (KV, r#"{"pv":"x"}"#),
         ],
     )
     .await;
     assert_eq!(seen.get("x-who").map(String::as_str), Some("stored"));
-    assert!(!seen.contains_key("x-mark-hdr"), "nothing was read: {seen:?}");
+    assert!(
+        !seen.contains_key("x-mark-hdr"),
+        "nothing was read: {seen:?}"
+    );
     assert!(!seen.contains_key("x-mark-host"));
     assert!(!seen.contains_key("x-mark-key"));
     for name in [RULES, HOST, KEY, KV] {
-        assert!(!seen.contains_key(name), "{name} reached the origin: {seen:?}");
+        assert!(
+            !seen.contains_key(name),
+            "{name} reached the origin: {seen:?}"
+        );
     }
 }
 
@@ -144,7 +156,10 @@ async fn the_console_keeps_the_last_word_under_enable_request_header_rules() {
     let seen = through(
         p.addr(),
         origin,
-        &[(RULES, &urlencode(&format!("{origin} reqHeaders://x-mark-hdr=1")))],
+        &[(
+            RULES,
+            &urlencode(&format!("{origin} reqHeaders://x-mark-hdr=1")),
+        )],
     )
     .await;
     assert_eq!(seen.get("x-mark-hdr").map(String::as_str), Some("1"));
@@ -154,7 +169,10 @@ async fn the_console_keeps_the_last_word_under_enable_request_header_rules() {
     let seen = through(
         p.addr(),
         origin,
-        &[(RULES, &urlencode(&format!("{origin} reqHeaders://x-who=header")))],
+        &[(
+            RULES,
+            &urlencode(&format!("{origin} reqHeaders://x-who=header")),
+        )],
     )
     .await;
     assert_eq!(seen.get("x-who").map(String::as_str), Some("stored"));
@@ -168,7 +186,10 @@ async fn the_request_wins_under_multi_env() {
     let seen = through(
         p.addr(),
         origin,
-        &[(RULES, &urlencode(&format!("{origin} reqHeaders://x-who=header")))],
+        &[(
+            RULES,
+            &urlencode(&format!("{origin} reqHeaders://x-who=header")),
+        )],
     )
     .await;
     assert_eq!(seen.get("x-who").map(String::as_str), Some("header"));
@@ -184,7 +205,10 @@ async fn the_other_headers_compose_into_the_same_text() {
     let seen = through(
         p.addr(),
         origin,
-        &[(HOST, &urlencode(&format!("{origin} reqHeaders://x-mark-host=1")))],
+        &[(
+            HOST,
+            &urlencode(&format!("{origin} reqHeaders://x-mark-host=1")),
+        )],
     )
     .await;
     assert_eq!(seen.get("x-mark-host").map(String::as_str), Some("1"));
@@ -200,7 +224,10 @@ async fn the_other_headers_compose_into_the_same_text() {
         p.addr(),
         origin,
         &[
-            (RULES, &urlencode(&format!("{origin} reqHeaders://x-mark-kv=${{pv}}"))),
+            (
+                RULES,
+                &urlencode(&format!("{origin} reqHeaders://x-mark-kv=${{pv}}")),
+            ),
             (KV, r#"{"pv":"FROMKV"}"#),
         ],
     )
@@ -238,12 +265,18 @@ async fn strict_takes_the_reading_and_not_the_delete() {
         p.addr(),
         origin,
         &[
-            (RULES, &urlencode(&format!("{origin} reqHeaders://x-mark-hdr=1"))),
+            (
+                RULES,
+                &urlencode(&format!("{origin} reqHeaders://x-mark-hdr=1")),
+            ),
             (NAME, "Named"),
         ],
     )
     .await;
-    assert!(!seen.contains_key("x-mark-hdr"), "nothing is read: {seen:?}");
+    assert!(
+        !seen.contains_key("x-mark-hdr"),
+        "nothing is read: {seen:?}"
+    );
     assert!(!seen.contains_key(RULES));
     assert!(
         !seen.contains_key(NAME),
@@ -263,7 +296,11 @@ async fn either_spelling_of_the_rules_text_is_honoured() {
         format!("{origin} reqHeaders://x-mark-hdr=1"),
     ] {
         let seen = through(p.addr(), origin, &[(RULES, &value)]).await;
-        assert_eq!(seen.get("x-mark-hdr").map(String::as_str), Some("1"), "{value}");
+        assert_eq!(
+            seen.get("x-mark-hdr").map(String::as_str),
+            Some("1"),
+            "{value}"
+        );
     }
 }
 
@@ -272,8 +309,18 @@ fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*'
-            | b'\'' | b'(' | b')' => out.push(b as char),
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

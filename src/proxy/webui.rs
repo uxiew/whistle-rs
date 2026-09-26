@@ -24,7 +24,9 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
     // proxy at all, and upstream keeps its own two open under `headless` for the
     // same reason (measured: `/cgi-bin/rootca` and `/cgi-bin/status` answer, the
     // rest is 404).
-    if !state.config.console && !open_without_login(&path) && !ALIVE_WHEN_HEADLESS.contains(&path.as_str())
+    if !state.config.console
+        && !open_without_login(&path)
+        && !ALIVE_WHEN_HEADLESS.contains(&path.as_str())
     {
         return not_found();
     }
@@ -232,7 +234,9 @@ pub(super) fn console_host(state: &Arc<AppState>, host: &str) -> bool {
         return false;
     }
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    BUILTIN_UI_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
+    BUILTIN_UI_HOSTS
+        .iter()
+        .any(|h| host.eq_ignore_ascii_case(h))
         || host.eq_ignore_ascii_case(ROOT_CA_HOST)
         || state
             .config
@@ -538,7 +542,9 @@ fn root_ca(state: &Arc<AppState>) -> Response<DynBody> {
             hyper::header::CONTENT_DISPOSITION,
             "attachment; filename=\"whistle-rs-rootCA.crt\"",
         )
-        .body(body::full(Bytes::from(state.ca.root_cert_pem().to_string())))
+        .body(body::full(Bytes::from(
+            state.ca.root_cert_pem().to_string(),
+        )))
         .unwrap()
 }
 
@@ -810,8 +816,11 @@ fn query_param(req: &Request<Incoming>, name: &str) -> Option<String> {
 /// every caller reads as "all of them" — an *empty* list is a selection of
 /// nothing and stays distinct from it.
 fn id_list(req: &Request<Incoming>, name: &str) -> Option<Vec<u64>> {
-    query_param(req, name)
-        .map(|v| v.split(',').filter_map(|id| id.trim().parse().ok()).collect())
+    query_param(req, name).map(|v| {
+        v.split(',')
+            .filter_map(|id| id.trim().parse().ok())
+            .collect()
+    })
 }
 
 /// The captured bytes of one body (`?id=N&side=req|res`).
@@ -1033,8 +1042,15 @@ async fn ws_send(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynB
     }
     // Recorded like any other frame, because it is one — the direction says
     // where it went, and the console shows it in the same list.
-    state.record_frame(crate::proxy::WsFrame::console_frame(id, dir, data.as_bytes()));
-    tracing::info!("console sent {} bytes into session {id} ({dir})", data.len());
+    state.record_frame(crate::proxy::WsFrame::console_frame(
+        id,
+        dir,
+        data.as_bytes(),
+    ));
+    tracing::info!(
+        "console sent {} bytes into session {id} ({dir})",
+        data.len()
+    );
     json_value(&serde_json::json!({ "ok": true, "sent": data.len() }))
 }
 
@@ -1080,7 +1096,9 @@ async fn rules_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(body::full(Bytes::from(format!("{{\"ok\":true,\"rules\":{count}}}"))))
+        .body(body::full(Bytes::from(format!(
+            "{{\"ok\":true,\"rules\":{count}}}"
+        ))))
         .unwrap()
 }
 
@@ -1163,7 +1181,11 @@ fn apply_bundle(
     bundle: &serde_json::Value,
 ) -> (usize, usize) {
     let mut groups = 0;
-    for g in bundle.get("rules").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+    for g in bundle
+        .get("rules")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&vec![])
+    {
         let Some(name) = g.get("name").and_then(|v| v.as_str()).map(str::trim) else {
             continue;
         };
@@ -1172,7 +1194,11 @@ fn apply_bundle(
         }
         let text = g.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let enabled = g.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-        let was = mgr.groups().iter().find(|x| x.name == name).map(|x| x.enabled);
+        let was = mgr
+            .groups()
+            .iter()
+            .find(|x| x.name == name)
+            .map(|x| x.enabled);
         match (name, was) {
             ("default", _) => mgr.set_text(text),
             (_, Some(_)) => {
@@ -1192,7 +1218,9 @@ fn apply_bundle(
     let mut count = 0;
     if let Some(map) = bundle.get("values").and_then(|v| v.as_object()) {
         for (name, value) in map {
-            let Some(value) = value.as_str() else { continue };
+            let Some(value) = value.as_str() else {
+                continue;
+            };
             values.insert(name.clone(), value.to_string());
             count += 1;
         }
@@ -1306,11 +1334,11 @@ async fn rule_groups_add(state: &Arc<AppState>, req: Request<Incoming>) -> Respo
     if name.is_empty() {
         return json_error("name is required");
     }
-    let text = payload
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let enabled = payload.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let enabled = payload
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let ok = {
         let mut mgr = state.rules.write().unwrap();
         let ok = mgr.add_group(name, text, enabled);
@@ -1332,10 +1360,7 @@ async fn rule_group_toggle(state: &Arc<AppState>, req: Request<Incoming>) -> Res
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let name = payload
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let result = {
         let mut mgr = state.rules.write().unwrap();
         // `-M multiEnv` resolves the default group alone, so switching a named
@@ -1376,14 +1401,8 @@ async fn rule_group_update(state: &Arc<AppState>, req: Request<Incoming>) -> Res
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let name = payload
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let text = payload
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let ok = {
         let mut mgr = state.rules.write().unwrap();
         let ok = mgr.update_group(name, text);
@@ -1405,10 +1424,7 @@ async fn rule_group_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Res
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let name = payload
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
     // Said here rather than left to "group not found", which would be a lie:
     // the default group is there, and is the one group that may not go. See
     // [`crate::rules::RuleManager::remove_group`] for why.
@@ -1725,7 +1741,11 @@ fn rename_value(
 /// The `name` a value endpoint was given, trimmed. A blank one is not a name:
 /// `{}` resolves to nothing, so a value stored under it could never be read.
 fn value_name(payload: &serde_json::Value, key: &str) -> Option<String> {
-    let name = payload.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+    let name = payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     (!name.is_empty()).then(|| name.to_string())
 }
 
@@ -1822,10 +1842,7 @@ async fn replay_session(state: &Arc<AppState>, req: Request<Incoming>) -> Respon
     let ids: Vec<u64> = if let Some(id) = payload.get("id").and_then(|v| v.as_u64()) {
         vec![id]
     } else if let Some(arr) = payload.get("ids").and_then(|v| v.as_array()) {
-        arr.iter()
-            .filter_map(|v| v.as_u64())
-            .take(100)
-            .collect()
+        arr.iter().filter_map(|v| v.as_u64()).take(100).collect()
     } else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -2183,7 +2200,6 @@ fn composed_request(c: &Composed) -> Result<hyper::Request<DynBody>, String> {
     Ok(request)
 }
 
-
 fn html_ok(html: String) -> Response<DynBody> {
     Response::builder()
         .status(StatusCode::OK)
@@ -2282,7 +2298,10 @@ mod bundle_tests {
         });
         apply_bundle(&mut mgr, &mut values, &bundle);
         assert_eq!(
-            mgr.groups().iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            mgr.groups()
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
             ["default", "staging", "archive"]
         );
         assert_eq!(mgr.groups()[1].text, "changed\n");
@@ -2355,8 +2374,14 @@ mod value_tests {
     #[test]
     fn a_renamed_value_keeps_its_content_under_the_new_name() {
         let mut values = store(&[("mock.json", "{\"ok\":true}")]);
-        assert_eq!(rename_value(&mut values, "mock.json", "fixture.json"), Ok(()));
-        assert_eq!(values.get("fixture.json").map(String::as_str), Some("{\"ok\":true}"));
+        assert_eq!(
+            rename_value(&mut values, "mock.json", "fixture.json"),
+            Ok(())
+        );
+        assert_eq!(
+            values.get("fixture.json").map(String::as_str),
+            Some("{\"ok\":true}")
+        );
         assert!(!values.contains_key("mock.json"));
     }
 
@@ -2447,7 +2472,12 @@ mod body_tests {
         let raw = [0x89, b'P', b'N', b'G', 0x0d];
         let s = Session {
             res_headers: vec![("content-type".into(), "image/png".into())],
-            res_body: Some(Capture::from_bytes(&raw, Some("image/png".into()), None, 64)),
+            res_body: Some(Capture::from_bytes(
+                &raw,
+                Some("image/png".into()),
+                None,
+                64,
+            )),
             ..session("https://example.com/logo.png", 1)
         };
         let entry = har_entry(&s);
@@ -2523,7 +2553,12 @@ mod replay_tests {
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap().to_string()))
             .collect();
-        let bytes = req.into_body().collect().await.expect("a full body").to_bytes();
+        let bytes = req
+            .into_body()
+            .collect()
+            .await
+            .expect("a full body")
+            .to_bytes();
         (headers, bytes)
     }
 
@@ -2600,7 +2635,12 @@ mod replay_tests {
     async fn a_replay_does_not_inherit_chunked_framing() {
         let sess = captured(
             &[("transfer-encoding", "chunked")],
-            Some(Capture::from_bytes(b"abc", Some("text/plain".into()), None, 4096)),
+            Some(Capture::from_bytes(
+                b"abc",
+                Some("text/plain".into()),
+                None,
+                4096,
+            )),
         );
         let (headers, _) = sent(&sess).await;
         assert_eq!(header(&headers, "transfer-encoding"), None);
@@ -2612,7 +2652,10 @@ mod replay_tests {
     #[tokio::test]
     async fn a_replay_announces_itself() {
         let (headers, _) = sent(&captured(&[], None)).await;
-        assert_eq!(header(&headers, super::super::COMPOSER_REQ_HEADER), Some("1"));
+        assert_eq!(
+            header(&headers, super::super::COMPOSER_REQ_HEADER),
+            Some("1")
+        );
     }
 
     /// What the console is told, so it can warn rather than let a short replay
@@ -2692,7 +2735,10 @@ mod composer_tests {
     #[tokio::test]
     async fn a_composition_announces_itself() {
         let (_, _, headers, _) = sent(&composed("GET", "example.com", "", "")).await;
-        assert_eq!(header(&headers, super::super::COMPOSER_REQ_HEADER), Some("1"));
+        assert_eq!(
+            header(&headers, super::super::COMPOSER_REQ_HEADER),
+            Some("1")
+        );
     }
 
     /// Typing a bare host is how anyone reaches for a quick request, and whistle
@@ -2763,7 +2809,12 @@ mod composer_tests {
     /// or the console shows a request that is not the one that went out.
     #[test]
     fn a_line_that_is_not_a_header_is_refused() {
-        let c = composed("GET", "http://example.com/", "Accept: */*\nX-Tenant acme", "");
+        let c = composed(
+            "GET",
+            "http://example.com/",
+            "Accept: */*\nX-Tenant acme",
+            "",
+        );
         assert_eq!(
             composed_request(&c).err().as_deref(),
             Some("not a header: X-Tenant acme")
@@ -2869,7 +2920,12 @@ mod login_tests {
         assert!(!allowed(&s, "GET", "/", Some(&basic("admin", "wrong"))));
         assert!(!allowed(&s, "GET", "/", Some(&basic("root", "s3cret"))));
         assert!(allowed(&s, "GET", "/", Some(&basic("admin", "s3cret"))));
-        assert!(allowed(&s, "POST", "/api/rules", Some(&basic("admin", "s3cret"))));
+        assert!(allowed(
+            &s,
+            "POST",
+            "/api/rules",
+            Some(&basic("admin", "s3cret"))
+        ));
         // A password may contain a colon: only the first one splits.
         let s2 = state((Some("admin"), Some("a:b"), None, None));
         assert!(allowed(&s2, "GET", "/", Some(&basic("admin", "a:b"))));
@@ -2925,9 +2981,19 @@ mod login_tests {
         };
 
         let s = with("good.test|*.wild.test");
-        assert_eq!(ask(&s, "/api/rules", Some("http://good.test"), false).as_deref(), Some("http://good.test"));
-        assert_eq!(ask(&s, "/api/rules", Some("http://api.wild.test"), false).as_deref(), Some("http://api.wild.test"));
-        assert_eq!(ask(&s, "/api/rules", Some("http://wild.test"), false), None, "one star is one label");
+        assert_eq!(
+            ask(&s, "/api/rules", Some("http://good.test"), false).as_deref(),
+            Some("http://good.test")
+        );
+        assert_eq!(
+            ask(&s, "/api/rules", Some("http://api.wild.test"), false).as_deref(),
+            Some("http://api.wild.test")
+        );
+        assert_eq!(
+            ask(&s, "/api/rules", Some("http://wild.test"), false),
+            None,
+            "one star is one label"
+        );
         assert_eq!(ask(&s, "/api/rules", Some("http://evil.test"), false), None);
         // The port is dropped before matching and kept in the answer.
         assert_eq!(
@@ -2936,20 +3002,37 @@ mod login_tests {
         );
         // Not cross-origin at all.
         assert_eq!(ask(&s, "/api/rules", None, false), None);
-        assert_eq!(ask(&s, "/api/rules", Some("http://good.test"), true), None, "same-origin hint");
+        assert_eq!(
+            ask(&s, "/api/rules", Some("http://good.test"), true),
+            None,
+            "same-origin hint"
+        );
         // The two that answer anyone, list or no list.
         for path in ["/api/status", "/rootCA.crt"] {
-            assert_eq!(ask(&s, path, Some("http://evil.test"), false).as_deref(), Some("http://evil.test"), "{path}");
+            assert_eq!(
+                ask(&s, path, Some("http://evil.test"), false).as_deref(),
+                Some("http://evil.test"),
+                "{path}"
+            );
         }
 
         // With nothing configured, only those two answer.
         let none = with("");
-        assert_eq!(ask(&none, "/api/rules", Some("http://good.test"), false), None);
-        assert_eq!(ask(&none, "/api/status", Some("http://good.test"), false).as_deref(), Some("http://good.test"));
+        assert_eq!(
+            ask(&none, "/api/rules", Some("http://good.test"), false),
+            None
+        );
+        assert_eq!(
+            ask(&none, "/api/status", Some("http://good.test"), false).as_deref(),
+            Some("http://good.test")
+        );
 
         // And `*` answers everyone, everywhere.
         let all = with("*");
-        assert_eq!(ask(&all, "/api/rules", Some("http://anywhere.test"), false).as_deref(), Some("http://anywhere.test"));
+        assert_eq!(
+            ask(&all, "/api/rules", Some("http://anywhere.test"), false).as_deref(),
+            Some("http://anywhere.test")
+        );
     }
 
     /// `/api/status` answers *any* origin (it is a [`CORS_PATHS`]), but a
@@ -2992,11 +3075,26 @@ mod login_tests {
         // The drive-by page: only allowed by the blanket exemption, so held back.
         assert!(restricted(&s, Some("https://evil.example.com"), false));
         // Everyone the operator trusted sees the whole pane.
-        assert!(!restricted(&s, Some("https://evil.example.com"), true), "same-origin");
-        assert!(!restricted(&s, Some("http://good.test"), false), "allow-listed");
-        assert!(!restricted(&s, Some("http://good.test:8443"), false), "allow-listed, port dropped");
-        assert!(!restricted(&s, None, false), "no Origin — not a browser cross-origin read");
-        assert!(!restricted(&with("*"), Some("https://evil.example.com"), false), "--allow-origin '*'");
+        assert!(
+            !restricted(&s, Some("https://evil.example.com"), true),
+            "same-origin"
+        );
+        assert!(
+            !restricted(&s, Some("http://good.test"), false),
+            "allow-listed"
+        );
+        assert!(
+            !restricted(&s, Some("http://good.test:8443"), false),
+            "allow-listed, port dropped"
+        );
+        assert!(
+            !restricted(&s, None, false),
+            "no Origin — not a browser cross-origin read"
+        );
+        assert!(
+            !restricted(&with("*"), Some("https://evil.example.com"), false),
+            "--allow-origin '*'"
+        );
 
         // And the bodies match those verdicts: the fingerprinting fields are
         // present for a trusted caller and absent for the drive-by one.
@@ -3006,14 +3104,29 @@ mod login_tests {
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
         }
         let full = body(&s, false).await;
-        assert!(full.get("storage_dir").is_some(), "the console needs the whole pane");
+        assert!(
+            full.get("storage_dir").is_some(),
+            "the console needs the whole pane"
+        );
         assert!(full.get("lan_addresses").is_some());
         assert!(full.get("plugins").is_some());
 
         let lean = body(&s, true).await;
-        assert_eq!(lean.get("version").and_then(|v| v.as_str()), Some(crate::config::VERSION));
-        for leaked in ["storage_dir", "root_ca", "lan_addresses", "plugins", "intercept_https"] {
-            assert!(lean.get(leaked).is_none(), "{leaked} must not cross an untrusted origin");
+        assert_eq!(
+            lean.get("version").and_then(|v| v.as_str()),
+            Some(crate::config::VERSION)
+        );
+        for leaked in [
+            "storage_dir",
+            "root_ca",
+            "lan_addresses",
+            "plugins",
+            "intercept_https",
+        ] {
+            assert!(
+                lean.get(leaked).is_none(),
+                "{leaked} must not cross an untrusted origin"
+            );
         }
     }
 
@@ -3056,7 +3169,10 @@ mod login_tests {
         let s = Arc::new(AppState::new(config, crate::rules::RuleManager::new(), ca));
         assert!(console_host(&s, "my.console.test"));
         assert!(console_host(&s, "other.test"));
-        assert!(console_host(&s, "local.whistlejs.com"), "the built-ins survive");
+        assert!(
+            console_host(&s, "local.whistlejs.com"),
+            "the built-ins survive"
+        );
         assert!(!console_host(&s, "somewhere.else.test"));
     }
 
@@ -3086,12 +3202,20 @@ mod login_tests {
         assert!(login_required(&s, &proxy_auth, "/").is_none());
         let query = Request::builder()
             .method("GET")
-            .uri(format!("/sessions.json?authorization={}", creds.replace(' ', "%20")))
+            .uri(format!(
+                "/sessions.json?authorization={}",
+                creds.replace(' ', "%20")
+            ))
             .body(())
             .expect("request");
         assert!(login_required(&s, &query, "/sessions.json").is_none());
         // A lower-case scheme is still Basic.
-        assert!(allowed(&s, "GET", "/", Some(&creds.replace("Basic", "basic"))));
+        assert!(allowed(
+            &s,
+            "GET",
+            "/",
+            Some(&creds.replace("Basic", "basic"))
+        ));
     }
 
     /// A header and a query parameter are **two candidates**, and either one
@@ -3121,7 +3245,10 @@ mod login_tests {
         // And the other way round: a right header beside a wrong parameter.
         let r = Request::builder()
             .method("GET")
-            .uri(format!("/sessions.json?authorization={}", basic("admin", "wrong").replace(' ', "%20")))
+            .uri(format!(
+                "/sessions.json?authorization={}",
+                basic("admin", "wrong").replace(' ', "%20")
+            ))
             .header(hyper::header::AUTHORIZATION, basic("admin", "s3cret"))
             .body(())
             .expect("request");
@@ -3138,10 +3265,18 @@ mod login_tests {
         use base64::Engine;
         let s = state((Some("admin"), Some("look"), None, None));
         let raw = base64::engine::general_purpose::STANDARD.encode("admin:look");
-        assert!(raw.ends_with('='), "the fixture has to carry padding to prove anything");
+        assert!(
+            raw.ends_with('='),
+            "the fixture has to carry padding to prove anything"
+        );
         assert!(allowed(&s, "GET", "/", Some(&raw)));
         assert!(allowed(&s, "GET", "/", Some(raw.trim_end_matches('='))));
-        assert!(allowed(&s, "GET", "/", Some(&format!("Basic {}", raw.trim_end_matches('=')))));
+        assert!(allowed(
+            &s,
+            "GET",
+            "/",
+            Some(&format!("Basic {}", raw.trim_end_matches('=')))
+        ));
         // Still no: the wrong credentials are wrong however they are spelled.
         let wrong = base64::engine::general_purpose::STANDARD.encode("admin:wrong");
         assert!(!allowed(&s, "GET", "/", Some(&wrong)));
@@ -3161,7 +3296,12 @@ mod login_tests {
         assert!(allowed(&s, "GET", "/", Some(&format!("Basic {name_only}"))));
         // And it does not open an account that has a password.
         let s2 = state((Some("admin"), Some("s3cret"), None, None));
-        assert!(!allowed(&s2, "GET", "/", Some(&format!("Basic {name_only}"))));
+        assert!(!allowed(
+            &s2,
+            "GET",
+            "/",
+            Some(&format!("Basic {name_only}"))
+        ));
     }
 }
 
@@ -3207,14 +3347,12 @@ mod tests {
                 .expect("a boolean")
         };
         let unsupported = |ctx: &mut Context, query: &str| -> String {
-            let script = format!(
-                "whistleParseFilter({query:?}).unsupported.map((u) => u.prefix).join(',')"
-            );
-            let value = ctx.eval(Source::from_bytes(script.as_bytes())).expect("parses");
-            value
-                .as_string()
-                .expect("a string")
-                .to_std_string_escaped()
+            let script =
+                format!("whistleParseFilter({query:?}).unsupported.map((u) => u.prefix).join(',')");
+            let value = ctx
+                .eval(Source::from_bytes(script.as_bytes()))
+                .expect("parses");
+            value.as_string().expect("a string").to_std_string_escaped()
         };
 
         for (query, want) in [
@@ -3298,12 +3436,21 @@ mod tests {
                 .expect("a boolean")
         };
         assert!(any(&mut ctx, "m:POST s:999"), "either may match");
-        assert!(!ask(&mut ctx, "m:POST s:999", "[]"), "but both must, joined the other way");
-        assert!(!any(&mut ctx, "m:GET s:999"), "and neither matching is still no");
+        assert!(
+            !ask(&mut ctx, "m:POST s:999", "[]"),
+            "but both must, joined the other way"
+        );
+        assert!(
+            !any(&mut ctx, "m:GET s:999"),
+            "and neither matching is still no"
+        );
 
         // And the four this console cannot answer are named, not dropped.
         assert_eq!(unsupported(&mut ctx, "b:hello"), "b");
-        assert_eq!(unsupported(&mut ctx, "h:cookie b:x app:wechat fc:y"), "h,b,app,fc");
+        assert_eq!(
+            unsupported(&mut ctx, "h:cookie b:x app:wechat fc:y"),
+            "h,b,app,fc"
+        );
         assert_eq!(unsupported(&mut ctx, "m:POST"), "");
         // An unsupported condition does not also silently filter everything out:
         // it is removed from the conditions and reported beside the box instead.

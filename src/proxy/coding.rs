@@ -275,7 +275,10 @@ pub fn reencode(body: Bytes, restore: Restore, forced: Option<Coding>) -> (Bytes
     match encode(want, &body) {
         Some(out) => (Bytes::from(out), want),
         None => {
-            tracing::warn!("could not re-encode {} bytes as {want:?}; sent plain", body.len());
+            tracing::warn!(
+                "could not re-encode {} bytes as {want:?}; sent plain",
+                body.len()
+            );
             (body, Coding::Identity)
         }
     }
@@ -420,27 +423,62 @@ mod tests {
     #[test]
     fn reencode_restores_or_forces_a_coding() {
         // Restore the coding a body arrived under.
-        let (out, c) = reencode(Bytes::from_static(b"hello"), Restore { coding: Coding::Gzip, plain: true }, None);
+        let (out, c) = reencode(
+            Bytes::from_static(b"hello"),
+            Restore {
+                coding: Coding::Gzip,
+                plain: true,
+            },
+            None,
+        );
         assert_eq!(c, Coding::Gzip);
         assert_eq!(decode(Coding::Gzip, &out).as_deref(), Some(&b"hello"[..]));
 
         // A forced coding wins over the arrived one (`enable://br` on a gzip body).
-        let (out, c) = reencode(Bytes::from_static(b"hello"), Restore { coding: Coding::Gzip, plain: true }, Some(Coding::Brotli));
+        let (out, c) = reencode(
+            Bytes::from_static(b"hello"),
+            Restore {
+                coding: Coding::Gzip,
+                plain: true,
+            },
+            Some(Coding::Brotli),
+        );
         assert_eq!(c, Coding::Brotli);
         assert_eq!(decode(Coding::Brotli, &out).as_deref(), Some(&b"hello"[..]));
 
         // A body that arrived plain and stays plain is untouched.
-        let (out, c) = reencode(Bytes::from_static(b"hello"), Restore { coding: Coding::Identity, plain: true }, None);
+        let (out, c) = reencode(
+            Bytes::from_static(b"hello"),
+            Restore {
+                coding: Coding::Identity,
+                plain: true,
+            },
+            None,
+        );
         assert_eq!(c, Coding::Identity);
         assert_eq!(&out[..], b"hello");
 
         // `enable://gzip` compresses a body that arrived plain.
-        let (out, c) = reencode(Bytes::from_static(b"hello"), Restore { coding: Coding::Identity, plain: true }, Some(Coding::Gzip));
+        let (out, c) = reencode(
+            Bytes::from_static(b"hello"),
+            Restore {
+                coding: Coding::Identity,
+                plain: true,
+            },
+            Some(Coding::Gzip),
+        );
         assert_eq!(c, Coding::Gzip);
         assert_eq!(decode(Coding::Gzip, &out).as_deref(), Some(&b"hello"[..]));
 
         // An empty body is never compressed — the header would outweigh it.
-        let (out, c) = reencode(Bytes::new(), Restore { coding: Coding::Gzip, plain: true }, None);
+        let (out, c) = reencode(
+            Bytes::new(),
+            Restore {
+                coding: Coding::Gzip,
+                plain: true,
+            },
+            None,
+        );
         assert_eq!(c, Coding::Identity);
         assert!(out.is_empty());
     }
@@ -468,7 +506,10 @@ mod tests {
         assert_eq!(label("text/html; charset=gbk"), Some("GBK"));
         assert_eq!(label("text/html;charset=GB2312"), Some("GBK"));
         assert_eq!(label("text/html; charset=big5"), Some("Big5"));
-        assert_eq!(label("text/plain; charset=iso-8859-1"), Some("windows-1252"));
+        assert_eq!(
+            label("text/plain; charset=iso-8859-1"),
+            Some("windows-1252")
+        );
         // Already UTF-8, in either spelling: nothing to undo.
         assert_eq!(label("text/html; charset=utf-8"), None);
         assert_eq!(label("text/html; charset=UTF8"), None);
@@ -515,20 +556,30 @@ mod tests {
 
         // Arrived under a coding we cannot round-trip: the force is refused and
         // the bytes go out exactly as they came.
-        let opaque = Restore { coding: Coding::Identity, plain: false };
+        let opaque = Restore {
+            coding: Coding::Identity,
+            plain: false,
+        };
         let (out, c) = reencode(payload.clone(), opaque, Some(Coding::Gzip));
         assert_eq!(out, payload, "an undecodable body must not be re-encoded");
         assert_eq!(c, Coding::Identity, "and must not be labelled as encoded");
 
         // Genuinely plain: the force is honoured, which is the whole point of
         // the flag.
-        let plain = Restore { coding: Coding::Identity, plain: true };
+        let plain = Restore {
+            coding: Coding::Identity,
+            plain: true,
+        };
         let (out, c) = reencode(payload.clone(), plain, Some(Coding::Gzip));
         assert_eq!(c, Coding::Gzip);
         assert_eq!(decode(Coding::Gzip, &out).as_deref(), Some(&payload[..]));
 
         // And `decode_for_rewrite` reports the distinction in the first place.
-        assert!(!decode_for_rewrite(payload.clone(), Some("zstd")).restore.plain);
+        assert!(
+            !decode_for_rewrite(payload.clone(), Some("zstd"))
+                .restore
+                .plain
+        );
         assert!(decode_for_rewrite(payload.clone(), None).restore.plain);
         // A gzip header that does not decode is not plain either.
         assert!(!decode_for_rewrite(payload, Some("gzip")).restore.plain);

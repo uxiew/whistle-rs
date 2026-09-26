@@ -236,8 +236,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let client = tokio::spawn(async move {
                 let mut s = TcpStream::connect(addr).await.unwrap();
-                let mut greeting =
-                    vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, host.len() as u8];
+                let mut greeting = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, host.len() as u8];
                 greeting.extend_from_slice(host.as_bytes());
                 greeting.extend_from_slice(&443u16.to_be_bytes());
                 s.write_all(&greeting).await.unwrap();
@@ -289,8 +288,10 @@ mod tests {
     #[test]
     fn only_connect_is_offered() {
         // UDP ASSOCIATE (0x03) — upstream's SOCKS server has no UDP path either.
-        let (reply, dst) =
-            exchange(vec![0x05, 0x01, 0x00, 0x05, 0x03, 0x00, 0x01, 1, 2, 3, 4, 0, 80], 12);
+        let (reply, dst) = exchange(
+            vec![0x05, 0x01, 0x00, 0x05, 0x03, 0x00, 0x01, 1, 2, 3, 4, 0, 80],
+            12,
+        );
         assert_eq!(&reply[..2], &[0x05, 0x00], "the greeting still succeeds");
         assert_eq!(reply[2], 0x05);
         assert_eq!(reply[3], 0x07, "command not supported");

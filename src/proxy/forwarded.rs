@@ -229,7 +229,10 @@ mod tests {
         assert!(!h.contains_key(FWD_HOST), "consumed, so removed");
 
         let mut h = headers(&[(REAL_HOST, "front.test")]);
-        assert_eq!(take(&mut h, &trusting(true, false)).host.as_deref(), Some("front.test"));
+        assert_eq!(
+            take(&mut h, &trusting(true, false)).host.as_deref(),
+            Some("front.test")
+        );
 
         // Both: upstream's `||` keeps the whistle spelling.
         let mut h = headers(&[(REAL_HOST, "real.test"), (FWD_HOST, "fwd.test")]);
@@ -241,8 +244,12 @@ mod tests {
     /// upstream's `req.isHttps = proto === 'https'` assigns either way.
     #[test]
     fn the_proto_gate_hears_both_answers() {
-        for (sent, expect) in [("https", true), ("HTTPS", true), ("http", false), ("gopher", false)]
-        {
+        for (sent, expect) in [
+            ("https", true),
+            ("HTTPS", true),
+            ("http", false),
+            ("gopher", false),
+        ] {
             let mut h = headers(&[(FWD_PROTO, sent)]);
             let got = take(&mut h, &trusting(false, true));
             assert_eq!(got.https, Some(expect), "{sent}");
@@ -261,7 +268,10 @@ mod tests {
         let got = take(&mut h, &trusting(true, false));
         assert_eq!(got.host.as_deref(), Some("front.test"));
         assert_eq!(got.https, None);
-        assert!(h.contains_key(FWD_PROTO), "still untrusted, so still forwarded");
+        assert!(
+            h.contains_key(FWD_PROTO),
+            "still untrusted, so still forwarded"
+        );
     }
 
     #[test]
@@ -271,7 +281,10 @@ mod tests {
         assert_eq!(split_host("a.test:8080", 80), Some(("a.test".into(), 8080)));
         assert_eq!(split_host("[::1]", 80), Some(("[::1]".into(), 80)));
         assert_eq!(split_host("[::1]:8080", 80), Some(("[::1]".into(), 8080)));
-        assert_eq!(split_host(" a.test:8080 ", 80), Some(("a.test".into(), 8080)));
+        assert_eq!(
+            split_host(" a.test:8080 ", 80),
+            Some(("a.test".into(), 8080))
+        );
     }
 
     /// Nonsense is a hostname that will not resolve, which is a 502 — the same
@@ -299,6 +312,9 @@ mod tests {
         let mut h = headers(&[(REAL_HOST, "real.test"), (FWD_HOST, "fwd.test")]);
         let got = take(&mut h, &trusting(true, false));
         assert_eq!(got.host.as_deref(), Some("real.test"));
-        assert!(!h.contains_key(FWD_HOST), "the losing claim must not travel on");
+        assert!(
+            !h.contains_key(FWD_HOST),
+            "the losing claim must not travel on"
+        );
     }
 }

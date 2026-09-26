@@ -247,7 +247,6 @@ pub fn throttled<T: Into<Bytes>>(data: T, kbits_per_sec: f64) -> DynBody {
     .boxed()
 }
 
-
 /// Body impl that paces chunk delivery (see [`throttled`]).
 struct ThrottledBody {
     data: Bytes,
@@ -332,12 +331,19 @@ pub async fn collect_capped(body: DynBody, limit: usize) -> Result<Capped, BodyE
         if total > limit {
             return Ok(Capped::TooBig {
                 prefix: flatten(&seen, total),
-                body: QueuedBody { queued: seen.into(), inner: body }.boxed(),
+                body: QueuedBody {
+                    queued: seen.into(),
+                    inner: body,
+                }
+                .boxed(),
             });
         }
     }
     let trailers = seen.iter().find_map(|f| f.trailers_ref().cloned());
-    Ok(Capped::Whole { bytes: flatten(&seen, total), trailers })
+    Ok(Capped::Whole {
+        bytes: flatten(&seen, total),
+        trailers,
+    })
 }
 
 /// The data bytes of `frames`, in order. Trailer frames carry none and are
@@ -387,7 +393,8 @@ mod capped_tests {
     fn framed(parts: &[&[u8]]) -> DynBody {
         let (tx, body) = channel(parts.len().max(1));
         for part in parts {
-            tx.try_send(Ok(Bytes::copy_from_slice(part))).expect("capacity");
+            tx.try_send(Ok(Bytes::copy_from_slice(part)))
+                .expect("capacity");
         }
         drop(tx);
         body
@@ -406,7 +413,9 @@ mod capped_tests {
 
     #[tokio::test]
     async fn a_body_within_the_limit_comes_back_whole() {
-        let got = collect_capped(framed(&[b"hello ", b"world"]), 1024).await.expect("ok");
+        let got = collect_capped(framed(&[b"hello ", b"world"]), 1024)
+            .await
+            .expect("ok");
         match got {
             Capped::Whole { bytes, .. } => assert_eq!(&bytes[..], b"hello world"),
             Capped::TooBig { .. } => panic!("11 bytes is not too big for 1024"),
@@ -417,7 +426,9 @@ mod capped_tests {
     /// Not truncated, not reordered, not one byte short — only un-rewritten.
     #[tokio::test]
     async fn a_body_over_the_limit_still_arrives_byte_for_byte() {
-        let got = collect_capped(framed(&[b"aaaa", b"bbbb", b"cccc"]), 6).await.expect("ok");
+        let got = collect_capped(framed(&[b"aaaa", b"bbbb", b"cccc"]), 6)
+            .await
+            .expect("ok");
         match got {
             Capped::Whole { .. } => panic!("12 bytes is too big for 6"),
             Capped::TooBig { prefix, body } => {
@@ -444,11 +455,16 @@ mod capped_tests {
         let (tx, body) = channel(2);
         let mut trailers = hyper::HeaderMap::new();
         trailers.insert("x-checksum", "abc".parse().unwrap());
-        tx.try_send(Ok(Bytes::from_static(b"data"))).expect("capacity");
+        tx.try_send(Ok(Bytes::from_static(b"data")))
+            .expect("capacity");
         drop(tx);
         // `channel` carries data frames only, so the trailer is added by hand
         // through the same path a real body would take.
-        let with_trailers = TrailerAfter { inner: Box::pin(body), trailers: Some(trailers) }.boxed();
+        let with_trailers = TrailerAfter {
+            inner: Box::pin(body),
+            trailers: Some(trailers),
+        }
+        .boxed();
         match collect_capped(with_trailers, 1024).await.expect("ok") {
             Capped::Whole { bytes, trailers } => {
                 assert_eq!(&bytes[..], b"data");
@@ -473,9 +489,9 @@ mod capped_tests {
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             let this = self.get_mut();
             match this.inner.as_mut().poll_frame(cx) {
-                Poll::Ready(None) => Poll::Ready(
-                    this.trailers.take().map(|t| Ok(Frame::trailers(t))),
-                ),
+                Poll::Ready(None) => {
+                    Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))))
+                }
                 other => other,
             }
         }
@@ -596,8 +612,17 @@ mod surround_tests {
 
     #[tokio::test]
     async fn an_empty_slot_adds_no_frame() {
-        assert_eq!(drain(surround(full("B"), Vec::new(), Vec::new())).await, b"B");
-        assert_eq!(drain(surround(full("B"), b"T".to_vec(), Vec::new())).await, b"TB");
-        assert_eq!(drain(surround(full("B"), Vec::new(), b"E".to_vec())).await, b"BE");
+        assert_eq!(
+            drain(surround(full("B"), Vec::new(), Vec::new())).await,
+            b"B"
+        );
+        assert_eq!(
+            drain(surround(full("B"), b"T".to_vec(), Vec::new())).await,
+            b"TB"
+        );
+        assert_eq!(
+            drain(surround(full("B"), Vec::new(), b"E".to_vec())).await,
+            b"BE"
+        );
     }
 }

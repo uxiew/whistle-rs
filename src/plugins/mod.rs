@@ -291,7 +291,10 @@ pub fn matched(resolved: &Resolved) -> Vec<PluginMatch> {
             let Some(m) = parse_match(&op.value, via_pipe) else {
                 continue;
             };
-            if !out.iter().any(|o| o.name == m.name && o.via_pipe == m.via_pipe) {
+            if !out
+                .iter()
+                .any(|o| o.name == m.name && o.via_pipe == m.via_pipe)
+            {
                 out.push(m);
             }
         }
@@ -315,7 +318,11 @@ fn parse_match(value: &str, via_pipe: bool) -> Option<PluginMatch> {
         });
     }
     let head = value.split(['/', '?']).next().unwrap_or("").trim();
-    let name = if via_pipe { clean_name(head) } else { head.to_string() };
+    let name = if via_pipe {
+        clean_name(head)
+    } else {
+        head.to_string()
+    };
     if name.is_empty() {
         return None;
     }
@@ -873,9 +880,7 @@ fn parse_headers_value(v: Option<&serde_json::Value>) -> Vec<(String, String)> {
 /// Accept a list of names as an array, or a single string.
 fn parse_string_list(v: Option<&serde_json::Value>) -> Vec<String> {
     match v {
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().map(value_to_string).collect()
-        }
+        Some(serde_json::Value::Array(arr)) => arr.iter().map(value_to_string).collect(),
         Some(serde_json::Value::String(s)) => vec![s.clone()],
         _ => Vec::new(),
     }
@@ -1053,11 +1058,7 @@ impl Plugins {
     /// A plugin that does not declare the hook is *not* an error: a rule can
     /// name a plugin that has no `sni` hook, and that means the same thing as
     /// having no opinion.
-    pub async fn sni_cert(
-        &self,
-        name: &str,
-        req: &sni::SniReq,
-    ) -> Result<sni::SniVerdict, String> {
+    pub async fn sni_cert(&self, name: &str, req: &sni::SniReq) -> Result<sni::SniVerdict, String> {
         let Some(plugin) = self.map.get(name) else {
             return Err(format!("no plugin named {name}"));
         };
@@ -1103,7 +1104,9 @@ impl Plugins {
                     headers: parts
                         .headers
                         .iter()
-                        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                        .map(|(k, v)| {
+                            (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                        })
                         .collect(),
                     body: bytes,
                 };
@@ -1243,7 +1246,9 @@ mod tests {
     fn rust_echo_returns_response() {
         let p = Plugins::new();
         // Dispatch is async but the built-ins are sync; drive on a tiny runtime.
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let out = rt.block_on(p.on_request("echo", &req())).unwrap();
         let resp = out.response.expect("echo should return a response");
         assert_eq!(resp.status, 200);
@@ -1255,7 +1260,9 @@ mod tests {
     #[test]
     fn rust_tag_injects_rules() {
         let p = Plugins::new();
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let out = rt.block_on(p.on_request("tag", &req())).unwrap();
         let rules = out.rules.expect("tag should return rules");
         assert!(rules.contains("resHeaders://x-rust-plugin-res=hi"));
@@ -1270,7 +1277,11 @@ mod tests {
         let resp = r.response.unwrap();
         assert_eq!(resp.status, 201);
         assert_eq!(resp.body, b"hi");
-        assert!(resp.headers.iter().any(|(k, v)| k == "content-type" && v == "text/plain"));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v == "text/plain")
+        );
     }
 
     #[test]
@@ -1332,9 +1343,15 @@ mod tests {
     /// Nonsense status codes are ignored rather than propagated.
     #[test]
     fn response_result_rejects_bad_status() {
-        assert_eq!(parse_response_result(br#"{"statusCode":9000}"#).status, None);
+        assert_eq!(
+            parse_response_result(br#"{"statusCode":9000}"#).status,
+            None
+        );
         assert_eq!(parse_response_result(br#"{"statusCode":0}"#).status, None);
-        assert_eq!(parse_response_result(br#"{"statusCode":302}"#).status, Some(302));
+        assert_eq!(
+            parse_response_result(br#"{"statusCode":302}"#).status,
+            Some(302)
+        );
     }
 
     #[test]
@@ -1433,7 +1450,10 @@ mod tests {
         // The same plugin may appear once per scheme; a repeated scheme does not.
         assert_eq!(ms.len(), 2);
         assert!(ms.iter().any(|m| !m.via_pipe && m.pipe_value.is_none()));
-        assert!(ms.iter().any(|m| m.via_pipe && m.pipe_value.as_deref() == Some("v")));
+        assert!(
+            ms.iter()
+                .any(|m| m.via_pipe && m.pipe_value.as_deref() == Some("v"))
+        );
     }
 
     /// The load-bearing property: a plugin that declares no streaming hook must
@@ -1449,12 +1469,22 @@ mod tests {
             let meta = pipe::PipeMeta::default();
             // `stamp` has a response hook but no streaming one.
             let out = p
-                .pipe("stamp", pipe::Dir::Response, &meta, crate::proxy::body::full("as-is"))
+                .pipe(
+                    "stamp",
+                    pipe::Dir::Response,
+                    &meta,
+                    crate::proxy::body::full("as-is"),
+                )
                 .await;
             assert_eq!(collect(out).await, b"as-is");
             // An unregistered name is equally harmless.
             let out = p
-                .pipe("nope", pipe::Dir::Response, &meta, crate::proxy::body::full("as-is"))
+                .pipe(
+                    "nope",
+                    pipe::Dir::Response,
+                    &meta,
+                    crate::proxy::body::full("as-is"),
+                )
                 .await;
             assert_eq!(collect(out).await, b"as-is");
         });
@@ -1475,7 +1505,9 @@ mod tests {
             let out = p.pipe("upper", pipe::Dir::Response, &meta, source).await;
             tokio::spawn(async move {
                 for part in ["ab", "cd"] {
-                    tx.send(Ok(bytes::Bytes::from_static(part.as_bytes()))).await.ok();
+                    tx.send(Ok(bytes::Bytes::from_static(part.as_bytes())))
+                        .await
+                        .ok();
                 }
             });
             // Two frames in, two frames out — a transform, not a collect.
@@ -1493,7 +1525,10 @@ mod tests {
     /// Drain a body into bytes (test helper).
     async fn collect(body: DynBody) -> Vec<u8> {
         use http_body_util::BodyExt;
-        body.collect().await.map(|c| c.to_bytes().to_vec()).unwrap_or_default()
+        body.collect()
+            .await
+            .map(|c| c.to_bytes().to_vec())
+            .unwrap_or_default()
     }
 
     // -- the auth gate, the stats pings and the UI hook ----------------------
@@ -1540,11 +1575,7 @@ mod tests {
                         }
                     }
                     let head = String::from_utf8_lossy(&buf).into_owned();
-                    let path = head
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("/")
-                        .to_string();
+                    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
                     recorder.lock().unwrap().push(path.clone());
                     let (status, body) = routes
                         .iter()
@@ -1651,7 +1682,11 @@ mod tests {
                     r#"{"allow":true,"setHeaders":{"x-whistle-user":"bob","cookie":"stolen"}}"#
                         .into(),
                 ),
-                ("/request", 200, r#"{"setHeaders":{"x-from-hook":"1"}}"#.into()),
+                (
+                    "/request",
+                    200,
+                    r#"{"setHeaders":{"x-from-hook":"1"}}"#.into(),
+                ),
             ])
             .await;
             let mut p = Plugins::new();
@@ -1711,10 +1746,11 @@ mod tests {
                 .expect("refused");
             assert_eq!(resp.status, 403);
             assert_eq!(resp.body, b"<b>no</b>");
-            assert!(resp
-                .headers
-                .iter()
-                .any(|(k, v)| k == auth::AUTH_HEADER && v == "p"));
+            assert!(
+                resp.headers
+                    .iter()
+                    .any(|(k, v)| k == auth::AUTH_HEADER && v == "p")
+            );
             assert!(!fake.paths().iter().any(|p| p == "/request"));
         });
     }
@@ -1734,8 +1770,14 @@ mod tests {
             p.register_remote("p", &fake.url);
 
             let m = p.manifest("p").await.expect("manifest");
-            assert!(m.on_request && m.on_response, "both phases must be dispatched");
-            assert!(!m.request_hook && !m.response_hook, "but neither hook is served");
+            assert!(
+                m.on_request && m.on_response,
+                "both phases must be dispatched"
+            );
+            assert!(
+                !m.request_hook && !m.response_hook,
+                "but neither hook is served"
+            );
 
             p.on_request("p", &req()).await.expect("registered");
             let res = PluginRes {
@@ -1755,7 +1797,12 @@ mod tests {
             }
             assert_eq!(fake.paths().iter().filter(|p| *p == "/stats").count(), 2);
             // Nothing else was called: a stats plugin serves no buffered hook.
-            assert!(!fake.paths().iter().any(|p| p == "/request" || p == "/response"));
+            assert!(
+                !fake
+                    .paths()
+                    .iter()
+                    .any(|p| p == "/request" || p == "/response")
+            );
         });
     }
 

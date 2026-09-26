@@ -14,8 +14,8 @@ use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::Config;
@@ -227,10 +227,7 @@ impl CertAuthority {
             return Ok(acc);
         }
         let acc = self.build_acceptor(&key)?;
-        self.acceptors
-            .lock()
-            .unwrap()
-            .insert(key, acc.clone());
+        self.acceptors.lock().unwrap().insert(key, acc.clone());
         Ok(acc)
     }
 
@@ -311,11 +308,8 @@ impl CertAuthority {
         host: &str,
     ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
         let leaf_key = KeyPair::generate().context("generating leaf key")?;
-        let mut params =
-            CertificateParams::new(vec![host.to_string()]).context("leaf params")?;
-        params
-            .distinguished_name
-            .push(DnType::CommonName, host);
+        let mut params = CertificateParams::new(vec![host.to_string()]).context("leaf params")?;
+        params.distinguished_name.push(DnType::CommonName, host);
         // Validity is relative to now, as upstream's `createCert(…, isShortPeriod)`
         // is (`ca.js:552-568`): backdated 20 days so a client with a slow clock
         // still accepts it, and valid for a year. A fixed window would quietly
@@ -335,10 +329,7 @@ impl CertAuthority {
             .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
             .context("signing leaf cert")?;
 
-        let chain = vec![
-            leaf_cert.der().clone(),
-            self.ca_cert.der().clone(),
-        ];
+        let chain = vec![leaf_cert.der().clone(), self.ca_cert.der().clone()];
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
         Ok((chain, key))
     }
@@ -419,7 +410,10 @@ fn load_custom_certs(dir: &std::path::Path) -> std::collections::HashMap<String,
     use std::collections::HashMap;
 
     let Ok(entries) = std::fs::read_dir(dir) else {
-        tracing::warn!("cert dir {}: cannot be read, so nothing is loaded", dir.display());
+        tracing::warn!(
+            "cert dir {}: cannot be read, so nothing is loaded",
+            dir.display()
+        );
         return HashMap::new();
     };
     // Stem → (cert path, key path, mtime of the certificate).
@@ -428,7 +422,9 @@ fn load_custom_certs(dir: &std::path::Path) -> std::collections::HashMap<String,
     for entry in entries.flatten() {
         let path = entry.path();
         let (Some(stem), Some(ext)) = (
-            path.file_stem().and_then(|s| s.to_str()).map(str::to_string),
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string),
             path.extension().and_then(|s| s.to_str()),
         ) else {
             continue;
@@ -593,7 +589,9 @@ fn generate_root_ca() -> Result<(Certificate, KeyPair)> {
     // (`createCert`, `_original/lib/https/ca.js:558-568`).
     params.not_before = (SystemTime::now() - Duration::from_secs(365 * ONE_DAY)).into();
     params.not_after = (SystemTime::now() + Duration::from_secs(10 * 365 * ONE_DAY)).into();
-    let ca_cert = params.self_signed(&ca_key).context("self-signing root CA")?;
+    let ca_cert = params
+        .self_signed(&ca_key)
+        .context("self-signing root CA")?;
     Ok((ca_cert, ca_key))
 }
 
@@ -646,7 +644,10 @@ mod tests {
     /// that was signed exactly keeps being served exactly (`ca.js:132-141`).
     #[test]
     fn an_existing_certificate_wins_over_the_rule() {
-        assert_eq!(cert_host("www.example.com", |n| n == "www.example.com"), "www.example.com");
+        assert_eq!(
+            cert_host("www.example.com", |n| n == "www.example.com"),
+            "www.example.com"
+        );
         // And a cached wildcard captures a name the rule would have left exact.
         assert_eq!(cert_host("a.qq.cn", |n| n == "*.qq.cn"), "*.qq.cn");
     }
@@ -656,7 +657,8 @@ mod tests {
         let ca = ca("share");
         ca.acceptor_for("www.example.com").expect("first host");
         ca.acceptor_for("static.example.com").expect("sibling host");
-        ca.acceptor_for("shop.example.com").expect("another sibling");
+        ca.acceptor_for("shop.example.com")
+            .expect("another sibling");
         let cache = ca.acceptors.lock().unwrap();
         assert_eq!(cache.by_host.len(), 1, "siblings share `*.example.com`");
         assert!(cache.by_host.contains_key("*.example.com"));
@@ -672,8 +674,14 @@ mod tests {
         }
         assert_eq!(cache.by_host.len(), MAX_CACHED_HOSTS);
         assert_eq!(cache.inserted.len(), MAX_CACHED_HOSTS);
-        assert!(cache.get("h0.test").is_none(), "the oldest entry was evicted");
-        assert!(cache.get("h5129.test").is_some(), "the newest entry survives");
+        assert!(
+            cache.get("h0.test").is_none(),
+            "the oldest entry was evicted"
+        );
+        assert!(
+            cache.get("h5129.test").is_some(),
+            "the newest entry survives"
+        );
     }
 
     /// An IP-address host gets a certificate with an `iPAddress` SAN, which is
@@ -743,7 +751,11 @@ mod tests {
         let cache = ca.acceptors.lock().unwrap();
         assert!(cache.by_host.contains_key("*.example.com"));
         assert!(cache.by_host.contains_key("*.evil.com"));
-        assert_eq!(cache.by_host.len(), 2, "each domain has its own certificate");
+        assert_eq!(
+            cache.by_host.len(),
+            2,
+            "each domain has its own certificate"
+        );
     }
 
     /// A certificate somebody put in `--cert-dir` is served instead of a forged
@@ -757,12 +769,12 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("one.crt"));
 
         // A leaf with two names, written the way somebody would put it there.
-        let mut params = CertificateParams::new(vec![
-            "pinned.test".to_string(),
-            "*.wild.test".to_string(),
-        ])
-        .expect("params");
-        params.distinguished_name.push(DnType::CommonName, "pinned.test");
+        let mut params =
+            CertificateParams::new(vec!["pinned.test".to_string(), "*.wild.test".to_string()])
+                .expect("params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "pinned.test");
         let key = KeyPair::generate().expect("key");
         let cert = params.self_signed(&key).expect("self-signed");
         std::fs::write(dir.join("one.crt"), cert.pem()).expect("write cert");
@@ -829,14 +841,19 @@ mod tests {
 
         let mut params = CertificateParams::new(vec!["ignored.test".to_string()]).expect("params");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.distinguished_name.push(DnType::CommonName, "Somebody Else's Root");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Somebody Else's Root");
         let key = KeyPair::generate().expect("key");
         let root = params.self_signed(&key).expect("self-signed");
         std::fs::write(dir.join("root.crt"), root.pem()).expect("write cert");
         std::fs::write(dir.join("root.key"), key.serialize_pem()).expect("write key");
 
         // Not loaded as a leaf, even though it carries a name.
-        assert!(load_custom_certs(&dir).is_empty(), "`root` is the CA, not a leaf");
+        assert!(
+            load_custom_certs(&dir).is_empty(),
+            "`root` is the CA, not a leaf"
+        );
 
         let ca = CertAuthority::load_or_create(&crate::config::Config {
             storage_dir: dir.join("store"),
