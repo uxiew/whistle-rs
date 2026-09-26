@@ -980,7 +980,7 @@ fn ws_status(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody
 async fn ws_release(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Some(id) = payload.get("id").and_then(|v| v.as_u64()) else {
         return json_error("id is required");
@@ -1014,7 +1014,7 @@ async fn ws_release(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
 async fn ws_send(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Some(id) = payload.get("id").and_then(|v| v.as_u64()) else {
         return json_error("id is required");
@@ -1221,7 +1221,7 @@ fn bundle_export(state: &Arc<AppState>) -> Response<DynBody> {
 async fn bundle_import(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let bundle = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if bundle.get(BUNDLE_MARKER).is_none() {
         return json_error("not an exported bundle");
@@ -1296,7 +1296,7 @@ fn rule_group_get(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<Dy
 async fn rule_groups_add(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let name = payload
         .get("name")
@@ -1330,7 +1330,7 @@ async fn rule_groups_add(state: &Arc<AppState>, req: Request<Incoming>) -> Respo
 async fn rule_group_toggle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let name = payload
         .get("name")
@@ -1374,7 +1374,7 @@ async fn rule_group_toggle(state: &Arc<AppState>, req: Request<Incoming>) -> Res
 async fn rule_group_update(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let name = payload
         .get("name")
@@ -1403,7 +1403,7 @@ async fn rule_group_update(state: &Arc<AppState>, req: Request<Incoming>) -> Res
 async fn rule_group_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let name = payload
         .get("name")
@@ -1431,25 +1431,33 @@ async fn rule_group_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Res
 }
 
 /// Helper: read request body as JSON.
+///
+/// The error is the ready-made 400 to send back, boxed: a bare
+/// `Response<DynBody>` is 128+ bytes, and it would ride along in every `Ok`
+/// too. Only a malformed request pays for the allocation.
 async fn read_json_body(
     req: Request<Incoming>,
-) -> Result<serde_json::Value, Response<DynBody>> {
+) -> Result<serde_json::Value, Box<Response<DynBody>>> {
     let body = req
         .into_body()
         .collect()
         .await
         .map_err(|_| {
-            Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(body::full(Bytes::from_static(b"could not read body")))
-                .unwrap()
+            Box::new(
+                Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(body::full(Bytes::from_static(b"could not read body")))
+                    .unwrap(),
+            )
         })?
         .to_bytes();
     serde_json::from_slice(&body).map_err(|_| {
-        Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(body::full(Bytes::from_static(b"invalid JSON")))
-            .unwrap()
+        Box::new(
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(body::full(Bytes::from_static(b"invalid JSON")))
+                .unwrap(),
+        )
     })
 }
 
@@ -1729,7 +1737,7 @@ fn value_name(payload: &serde_json::Value, key: &str) -> Option<String> {
 async fn value_set(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Some(name) = value_name(&payload, "name") else {
         return json_error("name is required");
@@ -1750,7 +1758,7 @@ async fn value_set(state: &Arc<AppState>, req: Request<Incoming>) -> Response<Dy
 async fn value_rename(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let (Some(from), Some(to)) = (value_name(&payload, "name"), value_name(&payload, "to")) else {
         return json_error("name is required");
@@ -1773,7 +1781,7 @@ async fn value_rename(state: &Arc<AppState>, req: Request<Incoming>) -> Response
 async fn value_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
     let payload = match read_json_body(req).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Some(name) = value_name(&payload, "name") else {
         return json_error("name is required");
