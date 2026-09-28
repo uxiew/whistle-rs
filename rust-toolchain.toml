@@ -1,0 +1,14 @@
+# The toolchain the quality gates are measured on. rustup reads this file and
+# installs the version on first use in this directory.
+#
+# Pinned because Clippy gains lints between releases: the same tree passed
+# `cargo clippy --all-targets -- -D warnings` on 1.96.1 and failed on 1.98.1.
+# Without a pin, "the gate passed" depends on whose laptop ran it. Move it on
+# purpose, in its own commit, together with whatever the new lints turn up.
+#
+# This is not the minimum supported version — that is `rust-version` in
+# Cargo.toml, and checking it needs an explicit `cargo +<version>`.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
