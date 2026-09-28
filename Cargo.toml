@@ -2,6 +2,14 @@
 name = "whistle-rs"
 version = "0.1.0"
 edition = "2024"
+# The oldest Rust that builds and passes the tests, found by trying: 1.94
+# rejects the `if let` match guards in src/proxy/apply.rs (stable from 1.95),
+# and the locked dependencies need 1.88 (boa, time). An older rustc now stops
+# at once with "rustc 1.94.0 is not supported by the following packages:
+# whistle-rs@0.1.0 requires rustc 1.95" instead of a screen of E0658 after
+# compiling every dependency. It also makes `cargo update` prefer dependency
+# releases that still build on 1.95. Raise it deliberately, never by accident.
+rust-version = "1.95"
 
 # `cargo clippy --all-targets` is expected to be silent, and a regression should
 # fail rather than scroll past. This table covers every target in the package
