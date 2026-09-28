@@ -500,7 +500,14 @@ async function finish(code) {
   fs.writeFileSync(path.join(OUT, 'manifest.json'), JSON.stringify(m, null, 2) + '\n');
   if (!flag('--keep')) fs.rmSync(SCRATCH, { recursive: true, force: true });
   const failed = results.filter((r) => !r.passed).map((r) => r.name);
-  console.log(`\n${suite}: ${results.length} step(s), ${failed.length ? `FAILED: ${failed.join(', ')}` : 'all passed'}`);
+  // An interrupted run must not end on "all passed": the steps it never got
+  // to are exactly the ones nobody knows about. It said so, once, after being
+  // stopped two steps short.
+  const verdict = interrupted
+    ? `INTERRUPTED by ${interrupted}; not completed: ${steps.slice(results.length).map((s) => s.name).join(', ') || 'none'}`
+      + (failed.length ? `; FAILED: ${failed.join(', ')}` : '')
+    : failed.length ? `FAILED: ${failed.join(', ')}` : 'all passed';
+  console.log(`\n${suite}: ${results.length} of ${steps.length} step(s) run, ${verdict}`);
   console.log(`archive: ${path.relative(process.cwd(), OUT) || OUT}${flag('--keep') ? `\nscratch kept: ${SCRATCH}` : ''}`);
   process.exit(code);
 }
