@@ -407,6 +407,9 @@ pub(super) async fn handle_proxied(
     handle(state, req).await
 }
 
+/// Headers carrying the console's login, withheld from plugin pages.
+const CONSOLE_CREDENTIALS: [&str; 2] = ["authorization", "proxy-authorization"];
+
 /// Paths that answer before the login does.
 ///
 /// A device that cannot reach the root certificate cannot trust the proxy, and
@@ -619,6 +622,13 @@ async fn plugin_ui(state: &Arc<AppState>, req: Request<Incoming>) -> Response<Dy
 
     let mut forwarded = Request::builder().method(parts.method).uri(uri);
     for (k, v) in parts.headers.iter() {
+        // The console's own login stops here. The console has already checked
+        // it; a plugin page is served *behind* that check and has no use for
+        // it — but it used to receive it, so every plugin with a UI could read
+        // the admin password off its first request.
+        if CONSOLE_CREDENTIALS.contains(&k.as_str()) {
+            continue;
+        }
         forwarded = forwarded.header(k, v);
     }
     let Ok(forwarded) = forwarded.body(body::from_incoming(incoming)) else {

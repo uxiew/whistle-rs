@@ -442,3 +442,60 @@ async fn an_oversized_body_is_refused_and_changes_nothing() {
 
     proxy.shutdown().await;
 }
+
+/// A plugin page is served behind the console's login and never sees it: the
+/// console checked the credentials, and a plugin that received them could read
+/// the admin password off its first request.
+#[tokio::test]
+async fn a_plugin_page_does_not_receive_the_console_login() {
+    use whistle_rs::plugins::{PluginManifest, PluginReq, PluginResult, RustPlugin, ui};
+
+    struct Echo;
+    impl RustPlugin for Echo {
+        fn name(&self) -> &str {
+            "echo-ui"
+        }
+        fn on_request(&self, _req: &PluginReq) -> PluginResult {
+            PluginResult::default()
+        }
+        fn manifest(&self) -> PluginManifest {
+            let mut m = PluginManifest::v1_fallback(self.name());
+            m.ui = true;
+            m
+        }
+        fn ui(&self, req: &ui::UiReq) -> ui::UiResp {
+            let names: Vec<&str> = req.headers.iter().map(|(k, _)| k.as_str()).collect();
+            ui::UiResp::html(names.join(","))
+        }
+    }
+
+    let proxy = whistle_rs::embed::Proxy::builder()
+        .port(0)
+        .persist_sessions(false)
+        .storage_dir(
+            std::env::temp_dir().join(format!("whistle-rs-plugin-ui-login-{}", std::process::id())),
+        )
+        .plugin(Echo)
+        .start()
+        .await
+        .expect("proxy starts");
+    let addr = proxy.addr();
+    let (status, body) = raw(
+        addr,
+        &format!(
+            "GET /plugin/echo-ui/ HTTP/1.1\r\nHost: {addr}\r\n\
+             Authorization: Basic YWRtaW46czNjcmV0\r\n\
+             Proxy-Authorization: Basic YWRtaW46czNjcmV0\r\nx-probe: 1\r\n"
+        ),
+        "",
+    )
+    .await;
+    assert!(status.contains(" 200 "), "{status}");
+    assert!(
+        body.contains("x-probe"),
+        "the plugin saw the request: {body}"
+    );
+    assert!(!body.contains("authorization"), "{body}");
+
+    proxy.shutdown().await;
+}
