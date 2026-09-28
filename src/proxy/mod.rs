@@ -1966,13 +1966,7 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
 /// starts means the embedder can hand the address to whatever it is configuring
 /// without racing the first connection. See [`crate::embed`].
 pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
-    let requested = SocketAddr::new(
-        state
-            .config
-            .host
-            .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
-        state.config.port,
-    );
+    let requested = SocketAddr::new(state.config.bind_ip(), state.config.port);
     let listener = TcpListener::bind(requested).await?;
     let addr = listener.local_addr().unwrap_or(requested);
     tracing::info!("whistle-rs listening on http://{addr}");
@@ -1984,7 +1978,7 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
     let mut own_ports = vec![addr.port()];
     own_ports.extend(state.config.socks_port);
     own_ports.extend(state.config.ui_port);
-    upstream::register_listen(state.config.host, &own_ports);
+    upstream::register_listen(Some(state.config.bind_ip()), &own_ports);
 
     // The same fact the include layer needs for a `${port}` in a backticked
     // `@` source: `--port 0` means the operating system chose, and this is the
@@ -2001,6 +1995,21 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
     // typing exactly that in — whistle's own `w2 status` prints the reachable
     // URLs for the same reason. This prints the one a device on the same network
     // should use, when it is not the address that was bound anyway.
+    // Who else can reach it, said once, where the operator is looking.
+    if addr.ip().is_loopback() {
+        tracing::info!(
+            "only this machine can use the proxy (bound to {}); to use it from a phone \
+             or another machine, restart with -H 0.0.0.0 — and set a console login \
+             (-n/-w) first",
+            addr.ip()
+        );
+    } else if state.config.ui_username.is_none() && state.config.ui_password.is_none() {
+        tracing::warn!(
+            "listening on {addr} with no console login: anyone who can reach this port \
+             can use the proxy and rewrite its rules, which read and write files on this \
+             machine. Set -n/-w, or bind 127.0.0.1"
+        );
+    }
     if addr.ip().is_unspecified() {
         let candidates = lan_addresses();
         if !candidates.is_empty() {
@@ -2198,13 +2207,7 @@ pub async fn accept_loop(
 /// web UI's own handler on it and nothing of the proxy attached
 /// (`_original/biz/init.js:8-19`).
 async fn run_console(state: Arc<AppState>, port: u16) -> Result<()> {
-    let addr = SocketAddr::new(
-        state
-            .config
-            .host
-            .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
-        port,
-    );
+    let addr = SocketAddr::new(state.config.bind_ip(), port);
     serve_console(state, TcpListener::bind(addr).await?).await
 }
 
@@ -2372,6 +2375,24 @@ mod console_port_tests {
         };
         let ca = crate::ca::CertAuthority::load_or_create(&config).expect("ca");
         Arc::new(AppState::new(config, RuleManager::new(), ca))
+    }
+
+    /// No `-H`: this machine only. It used to be every interface, which made a
+    /// fresh start an open proxy — and an open console — for the whole network.
+    #[tokio::test]
+    async fn with_no_host_it_listens_on_loopback() {
+        let config = Config {
+            port: 0,
+            storage_dir: std::env::temp_dir()
+                .join(format!("whistle-rs-bind-default-{}", std::process::id())),
+            persist_sessions: false,
+            ..Config::default()
+        };
+        let ca = crate::ca::CertAuthority::load_or_create(&config).expect("ca");
+        let s = Arc::new(AppState::new(config, RuleManager::new(), ca));
+        let (_listener, addr) = bind(&s).await.expect("bind");
+        assert!(addr.ip().is_loopback(), "bound {addr}");
+        assert!(!s.config.listens_beyond_loopback());
     }
 
     /// `-P/--uiport` serves the console, and only the console: the page and the

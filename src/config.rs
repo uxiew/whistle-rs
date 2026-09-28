@@ -19,7 +19,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Config {
     /// Main proxy port (HTTP proxy + CONNECT). whistle default: 8899.
     pub port: u16,
-    /// Bind address. `None` => all interfaces (INADDR_ANY).
+    /// Bind address, as given with `-H`. `None` binds loopback — see
+    /// [`Config::bind_ip`]; every interface has to be asked for.
     pub host: Option<IpAddr>,
     /// Socket idle timeout.
     pub timeout_ms: u64,
@@ -155,6 +156,24 @@ pub struct Config {
 }
 
 impl Config {
+    /// The address every listener binds: `-H` if given, else `127.0.0.1`.
+    ///
+    /// It used to be every interface, which is upstream's default and meant a
+    /// fresh start was an open proxy to the whole network, with a console any
+    /// device on it could rewrite — and rules read and write files. A proxy
+    /// for this machine's own debugging needs nothing more than loopback; a
+    /// phone or a second machine is a decision, made with `-H 0.0.0.0` (or an
+    /// address), and startup says how. A deliberate divergence from whistle.
+    pub fn bind_ip(&self) -> IpAddr {
+        self.host
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    }
+
+    /// Can anything but this machine reach the listeners?
+    pub fn listens_beyond_loopback(&self) -> bool {
+        !self.bind_ip().is_loopback()
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.storage_dir
     }
@@ -888,5 +907,27 @@ mod tests {
         assert!(AllowedOrigins::parse("").is_empty());
         assert!(AllowedOrigins::parse("  |  ,").is_empty());
         assert!(!AllowedOrigins::default().allows("good.test"));
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_unless_told_otherwise() {
+        let c = Config::default();
+        assert_eq!(c.bind_ip(), IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert!(!c.listens_beyond_loopback());
+        let lan = Config {
+            host: Some("0.0.0.0".parse().unwrap()),
+            ..Config::default()
+        };
+        assert!(lan.listens_beyond_loopback());
+        let v6 = Config {
+            host: Some("::1".parse().unwrap()),
+            ..Config::default()
+        };
+        assert!(!v6.listens_beyond_loopback());
     }
 }

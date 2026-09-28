@@ -20,10 +20,7 @@ use super::AppState;
 
 /// Bind the SOCKS5 port and serve until the process exits.
 pub async fn run(state: Arc<AppState>, port: u16) -> Result<()> {
-    let host = state
-        .config
-        .host
-        .unwrap_or_else(|| "0.0.0.0".parse().unwrap());
+    let host = state.config.bind_ip();
     let listener = TcpListener::bind((host, port)).await?;
     tracing::info!("whistle-rs SOCKS5 listening on {host}:{port}");
 

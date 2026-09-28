@@ -20,7 +20,8 @@ struct Cli {
     #[arg(short = 'p', long, default_value_t = whistle_rs::config::DEFAULT_PORT)]
     port: u16,
 
-    /// Bind address (default: all interfaces).
+    /// Bind address (default: 127.0.0.1, this machine only). `-H 0.0.0.0` lets
+    /// phones and other machines in — set a console login (-n/-w) first.
     #[arg(short = 'H', long)]
     host: Option<IpAddr>,
 

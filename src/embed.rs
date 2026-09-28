@@ -140,9 +140,10 @@ impl Builder {
         self
     }
 
-    /// Bind to this address instead of all interfaces. `127.0.0.1` keeps an
-    /// embedded proxy off the network, which is usually what an application
-    /// wants.
+    /// Bind to this address. Without it the proxy binds `127.0.0.1`, which
+    /// keeps an embedded proxy — and its console, which has no login here —
+    /// off the network. `0.0.0.0` exposes both to every device that can reach
+    /// the machine.
     pub fn host(mut self, host: IpAddr) -> Self {
         self.host = Some(host);
         self
