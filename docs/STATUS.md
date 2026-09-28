@@ -4,6 +4,8 @@
 
 本轮修改限于文档；没有为通过检查而改动 Rust、前端、依赖声明或锁文件。初始工作区已有未跟踪的 `_original/`，未纳入提交、删除或覆盖。
 
+**2026-09-28 更新：** Q1 已完成，质量门禁在钉住的工具链上全部通过，见 [Q1 门禁复验](#2026-09-28-q1-门禁复验)。下文「2026-09-25 审查时的验证」保留为当时的记录，其中 Clippy/格式失败已不是现状。
+
 ## 结论
 
 **方向与 Whistle 的代理/规则核心对齐，已有较完整的可用实现和较强的测试基础；不等于原项目全量兼容，也尚未达到可宣称稳定发布的交付状态。**
@@ -37,7 +39,7 @@
 | 持久化 | JSONL 会话历史与按天保留；内存/体预览有界。UI 隐藏不等于后端未采集，预览/HAR/重放不能保证任意大报文完整 | `src/proxy/{persist,body,webui}.rs`、`src/config.rs` |
 | 插件生态 | 自有 Rust/HTTP/Node 插件协议与 SDK；**不直接运行现成 `whistle.*` npm 插件** | `src/plugins/`、`sdk/`、[PLUGINS.md](PLUGINS.md) |
 | CLI / Agent 接口 | `explain`、`qr` 及自有 HTTP API；没有 `w2 start/stop` 兼容层，`-r` 是可编辑的 Default 规则组而不是上游隐藏 shadowRules | `src/main.rs`；`src/proxy/webui.rs` |
-| 工程与发布 | 单元/集成测试可跑，前端能构建；当前 Clippy/格式门禁未通过，未找到受版本控制的 CI、根 LICENSE 或差分依赖锁文件 | 本文验证记录；`git ls-files` |
+| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；仍没有受版本控制的 CI、根 LICENSE 或差分依赖锁文件 | 本文 Q1 复验；`rust-toolchain.toml`、`Cargo.toml`；`git ls-files` |
 
 上游插件契约见[官方插件开发](https://wproxy.org/docs/extensions/dev.html)；上游 Local Agent API 见[官方接口文档](https://wproxy.org/docs/extensions/api.html)。同名能力不意味着 URL、数据模型或插件对象兼容。
 
@@ -47,7 +49,7 @@
 
 `src/proxy/ciphers.rs` 已实现针对当前后端可用套件的 OpenSSL 风格选择表达式求值，不能再计划「从零实现 cipher 字符串」。真实边界是 rustls 可用算法与 TLS 版本；当前选不到套件时会记录日志并放弃该 pin，**不能把这条规则当成强制安全策略**。该行为应进入可见诊断与明确的降级契约。
 
-## 本轮实际验证
+## 2026-09-25 审查时的验证
 
 环境：macOS / ARM64，Node.js **v24.9.0**，实际 Vite **8.2.0**。Clippy 输出指向 Rust **1.98.0** lint 文档；`rustc -vV` 被工具命令白名单阻止，未据此声称已完整采集 Rust 工具链元数据。前端使用现有 `node_modules`；本轮没有做全新机器安装试验。
 
@@ -70,11 +72,53 @@
 
 `rules-oracle.js` 比较解析结果并做显式归一化，不能证明转发后的字节、响应阶段、动态 include 或插件行为。网络 `harness.js` 同时看客户端和源站，但含 `IGNORE`、`EXPECTED` 归一化与例外。因此必须同时报告有效命中、`inert`、具名偏离和未知差异；**退出 0 不等于未归一化的全量字节一致**。
 
+## 2026-09-28 Q1 门禁复验
+
+代码提交：`b2211dc941f6360c54c59ccd76909a8a412d3d66`（Q1 最后一个代码提交；此后只有文档提交）。环境：macOS / Apple M4 / Darwin 25.3.0 arm64；门禁工具链 `rustc 1.98.1 (48a229cea 2026-09-01)`、LLVM 22.1.8；MSRV 验证用 `rustc 1.95.0`；Node.js **v26.4.0**、npm 11.17.0、Vite 8.2.0。
+
+Q1 做了什么（每项一个提交，可单独回退）：
+
+| 提交 | 内容 |
+| --- | --- |
+| `a9e3b84` | `ciphers.rs` 的 `question_mark`：改用 `?`，语义不变 |
+| `140d743` | `webui.rs` 的 `result_large_err`：`read_json_body` 的错误返回改为 `Box<Response>`，400 响应字节不变 |
+| `05c4186` | 全树 rustfmt，纯格式；1.96.1 与 1.98.1 结果一致。`d0aa96a` 把它记入 `.git-blame-ignore-revs` |
+| `ba5ab71` | 控制台声明 Node `engines` 并开 `engine-strict` |
+| `8b1caed` | 修掉一个不稳定测试（见下） |
+| `86e3670` | `rust-toolchain.toml` 钉住 1.98.1 |
+| `b2211dc` | `Cargo.toml` 声明 `rust-version = "1.95"` |
+
+没有用全局 `allow`、没有降低 lint 级别，`Cargo.lock` 未变。
+
+| 命令 | 结果 | 说明 |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | **通过** | |
+| `cargo clippy --locked --all-targets -- -D warnings` | **通过** | 1.98.1；1.96.1 也通过 |
+| `cargo test --locked --all-targets` | **通过：939 单元 + 20 集成，8 ignored** | 集成为 console 6、forwarded 7、header-rules 7；ignored 是基准，未执行 |
+| `cargo test --locked --doc` | **通过：2** | |
+| `cargo +1.95.0 test --locked --all-targets` 与 `--doc` | **通过**，计数同上 | MSRV 实测 |
+| `cargo +1.94.0 check --locked` | **按预期拒绝** | `whistle-rs@0.1.0 requires rustc 1.95`；去掉 `rust-version` 时报 E0658（`if let` 守卫） |
+| 全新目录 `npm ci` → `typecheck` → `build` | **通过** | 在不含 `node_modules`/`dist` 的副本里；`dist/index.html` sha256 `6d02b4be…c47c516`，与仓库内现有依赖构建的字节一致 |
+| `engine-strict` 反向验证 | **生效** | 把 `engines` 改成不可能满足：`npm ci` 以 `EBADENGINE` 退出 1；去掉 `.npmrc` 同一安装退出 0、只有警告 |
+| 前端构建后 `cargo build --locked` | **通过** | 嵌入的 `console.html` 哈希同上，二进制中不含占位页文案 |
+| `cd tests/differential && node rules-oracle.js --values` | **通过：17,462 问题，4,730 命中，差异 0，取值差异 0** | host 大小写归一 51 次；与 09-25 结果完全一致；本机 whistle 2.10.8 |
+| `git diff --check 702486d HEAD` | **通过** | |
+
+**不稳定测试。** `proxy::console_port_tests::the_console_answers_on_its_own_port` 在 1.95 和 1.98 上都会偶发失败：修复前连续跑 60 次全量 lib 测试挂 3 次。给测试加诊断后确认原因是测试先绑 0 端口、释放、再让服务重新绑这个端口号，中间被并行测试占走，服务任务以 `EADDRINUSE` 退出，而这个错误被丢弃的 `JoinHandle` 吞掉，只剩一句 "the console never came up"。改为把已绑定的 listener 直接交给服务后，连续 100 次 0 失败。
+
+**没有执行：** 真代理网络差分（`harness.js` 及各 `*-bench.js`）、`#[ignore]` 基准、`--release` 构建、浏览器交互、`npm run dev`、Linux/Windows、任何 CI（仓库仍没有，属 Q2）。差分依赖仍没有锁文件，本次读到的 2.10.8 是本机现有安装。
+
+**剩余风险：**
+
+- `rust-toolchain.toml` 只对 rustup 用户生效；CI 必须经 rustup 安装，否则会用别的版本跑 Clippy（Q2 落实）。
+- MSRV 1.95 与 Node 版本只在 macOS arm64 上实测；Node 下限 20.19 是按依赖声明推出的，未真机验证。
+- `src/proxy/bench.rs:454` 有同样的"释放再重绑"写法。它在 `#[ignore]` 基准里，普通门禁不跑，但单独跑基准时可能偶发同类失败。
+
 ## 真实缺口与风险
 
 | 优先级 | 发现 | 后续任务 |
 | --- | --- | --- |
-| P0 | 质量状态漂移：Clippy 两处错误、格式未统一，历史“全绿”已不适用；未固定工具链/最低支持版本 | Q1 |
+| ~~P0~~ | ~~质量状态漂移：Clippy 两处错误、格式未统一；未固定工具链/最低支持版本~~ 2026-09-28 已解决，见 Q1 复验 | Q1 ✓ |
 | P0 | 可复现交付不足：无跟踪中的 CI，差分依赖仅固定顶层版本、没有跟踪锁文件，缺少统一网络差分入口 | Q2 |
 | P0 | 发布许可不完整：根 LICENSE 缺失，Cargo 包元数据缺少 license 等字段；旧 README 的 MIT 声明不足以完成分发准备 | Q3 |
 | P0 | 默认全接口、无 UI 口令、会话落盘；UI 认证不保护代理转发，分 UI 端口不是自动的网络隔离 | S1 |
