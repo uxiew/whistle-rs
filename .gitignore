@@ -10,3 +10,7 @@ requests.png
 
 # Generated per release by scripts/third-party-licenses.mjs; changes with every dependency bump.
 THIRD-PARTY-LICENSES.md
+
+# A local checkout of upstream whistle, cited as `_original/…` in comments and docs.
+# Never repository content, and never part of a package: see Cargo.toml `include`.
+/_original/

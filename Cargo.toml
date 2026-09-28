@@ -8,6 +8,23 @@ repository = "https://github.com/uxiew/whistle-rs"
 # No `authors`: the field is optional, and there is no list of people who have
 # agreed to be named in it. LICENSE says "whistle-rs contributors" for the same
 # reason.
+#
+# What a crate package holds, named rather than left to discovery. Without the
+# list, `cargo package` took every file git does not ignore — 1,119 of them,
+# 940 from a local `_original/` checkout of whistle's own source, plus the
+# console's source and the differential corpora — and `cargo publish` would have
+# shipped them.
+include = [
+    "/src/**",
+    "/build.rs",
+    "/examples/**",
+    "/tests/*.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/NOTICE.md",
+    "/README.md",
+]
 # The oldest Rust that builds and passes the tests, found by trying: 1.94
 # rejects the `if let` match guards in src/proxy/apply.rs (stable from 1.95),
 # and the locked dependencies need 1.88 (boa, time). An older rustc now stops
