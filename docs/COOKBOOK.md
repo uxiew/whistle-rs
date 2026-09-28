@@ -1,6 +1,10 @@
 # Cookbook
 
-[English README](../README.md) · [简体中文 README](../README.zh-CN.md) · [中文版本](COOKBOOK.zh-CN.md) · [规则参考 / Rules reference](RULES.md)
+[项目说明](../README.md) · [中文版本](COOKBOOK.zh-CN.md) · [规则参考 / Rules reference](RULES.md)
+
+Current verification: [STATUS.md](STATUS.md). For local-only debugging add
+`-H 127.0.0.1 --no-persist` to startup commands unless a recipe explicitly needs
+LAN access or history. See [OPERATIONS.md](OPERATIONS.md) before sharing the proxy.
 
 Task-oriented recipes. Each one is a problem you actually have, the rules that
 solve it, and the reason it is written that way. [`RULES.md`](RULES.md) is the
@@ -432,10 +436,10 @@ slow.example.com     reqDelay://500      # wait before forwarding
 slow.example.com     resDelay://2000     # wait before answering
 ```
 
-**Always milliseconds.** A unit suffix is parsed off and thrown away, not
-converted: `resDelay://500ms` is 500 ms as you would hope, but `resDelay://1s`
-is **1 millisecond**, because the number is read with `parseInt` semantics and
-the `s` is ignored. Write `resDelay://1000`.
+**Always milliseconds.** Delays use whole-value numeric conversion, not
+`parseInt`/`parseFloat`: `resDelay://500ms` and `resDelay://1s` do not delay.
+Write `resDelay://500` or `resDelay://1000`. Speed values have different parsing
+rules; do not infer delay behaviour from `resSpeed`.
 
 `reqDelay://` runs before every short-circuit, so it delays a `file://` mock too
 — which is the whole point of pairing them.
@@ -502,28 +506,18 @@ To make a *particular* request slow rather than the whole proxy patient, use
 
 ### What throttling will not do
 
-A body operator and a streaming response do not mix, and what happens depends
-on whether the response is an **event stream**.
+Streaming behaviour is operator-specific, not a blanket refusal of all SSE
+rewrites. `src/proxy/restream.rs` provides incremental text replacement, including
+`resReplace` on event streams; whole-body transformations still need different
+handling. See the operator's entry in [RULES.md](RULES.md) for its scope.
 
-**`text/event-stream` — the operator is skipped, the stream keeps flowing.** A
-body operator (`resBody`, `resAppend`, `resReplace`, `resMerge`, the html/js/css
-families), a forced `enable://gzip`, and a plugin's `responseBody` hook are all
-dropped on an event stream, and the events pass through untouched. You get no
-rewriting, and the console logs a line when a plugin hook is skipped so it does
-not look like the hook silently failed.
-
-This is not the operator working — it is the operator declining. Upstream *does*
-rewrite event streams, because its body layer is streaming end to end. Ours
-collects and then transforms, and collecting a stream that ends when the server
-says so — which for SSE is typically never — does not delay the response, it
-withholds it entirely. Skipping is the honest behaviour of the two.
-
-**Chunked, but not an event stream — the whole body is buffered.** A long poll
-or a slow chunked download with a body operator on it is held until the last
-byte. Measured on a 600 ms stream: 3 ms to first byte without a body operator,
-621 ms with one. Delays and speed caps are fine; body rewriting is not.
-
-Both are the same structural gap — [`ROADMAP.md`](ROADMAP.md) has the reason.
+Non-event-stream rewrites that use the buffered path can delay the first byte
+until enough input arrives or the rewrite cap is reached. `--body-rewrite-limit`
+and `--body-preview-limit` are separate limits; exceeding a rewrite limit can
+result in unchanged forwarding rather than a successful rewrite. Delay and
+speed rules do not make a whole-body transformation streaming. Validate the
+actual operator, charset, compression and cancellation combination; R1 in
+[ROADMAP.md](ROADMAP.md) tracks visible diagnostics and boundary coverage.
 
 ---
 
@@ -1046,14 +1040,14 @@ Then work down this list:
 | a mock, redirect or forward is ignored | another line of the [shared slot](#a-mock-has-to-be-written-above-the-forward) was written first. Move it up, or mark it `$` |
 | an operator value arrives truncated | it contained a space. Use `${name}` and a value — see [Headers](#headers) |
 | `502` on a self-signed or private-CA origin | whistle-rs **verifies** origin certificates, unlike upstream. `--insecure-upstream` opts out |
-| a delay of `1s` is instant | delays are milliseconds; the suffix is discarded, not converted. Write `1000` |
+| a delay of `1s` is instant | delays require a numeric millisecond value; a suffix makes the delay invalid. Write `1000` |
 | a throttle is 8× faster than expected | `resSpeed://` is **kilobits**, not kilobytes |
 | a body rewrite works sometimes | it does not, any more — a response-body operator now busts the request cache, so a `304` cannot swallow it. If you are on an older build, add `disable://cache` |
 | a chunked response stops streaming | a body operator on it buffers the whole body. Remove it, or scope it away with a filter |
 | a body operator does nothing to an SSE stream | it is skipped there on purpose, so the stream keeps flowing — see [What throttling will not do](#what-throttling-will-not-do) |
 | the console shows `CONNECT` and nothing inside it | the client does not trust the root CA — see [`CERTIFICATES.md`](CERTIFICATES.md) |
 | a direct request to the console returns `502` with `Proxy-Connection` | your shell has `http_proxy` set. `curl --noproxy '*'` |
-| a rule you can see in `/api/rules` does not fire, and the capture is **empty** | the request never reached the proxy. `curl --noproxy '*' -x http://127.0.0.1:8899 …` silently wins over the `-x` and goes direct, so the origin answers unmodified and nothing is recorded. Use `-x` alone for a proxied request, and `--noproxy '*'` alone for a direct one — never both. An empty `/sessions.json` is the tell: the proxy cannot fail to record a request it handled |
+| a rule does not fire and the capture is empty | first check whether curl bypassed the proxy: use `--noproxy '' -x http://127.0.0.1:8899` to force this route. An empty capture is not proof of bypass; early connection/TLS errors and capture settings can also explain it |
 | a request that failed is missing from the console entirely | a request that never got a response — connection refused, DNS failure, TLS handshake failure — is **not** recorded as a session. The proxy log is the only place it appears, which is the other reason to keep `-v` on while debugging |
 | the editor highlights the wrong token as the pattern | it is telling you the truth. `example.com http://localhost:5173` is pattern + destination; `http://a.com/x host://1.2.3.4` is pattern + operator. Whichever token it marks is what the proxy will match on |
 

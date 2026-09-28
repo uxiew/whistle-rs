@@ -1,5 +1,10 @@
 # Architecture & development
 
+> Current verification and limits: [STATUS.md](STATUS.md). Build/test commands:
+> [DEVELOPMENT.md](DEVELOPMENT.md). Historical benchmarks below are not a fresh
+> measurement of every later commit. The console is the Vue application in
+> `ui-src/`; `build.rs` embeds its built HTML, or a placeholder when absent.
+
 How whistle-rs is put together, how it maps onto the original whistle source, and how
 to extend it.
 
@@ -236,8 +241,9 @@ that nothing is retained.
 | `clap` | CLI |
 | `tracing` / `tracing-subscriber` | logging |
 
-The `ring` crypto provider is pinned (`default-features = false`) so no C toolchain is
-needed to build. It is installed at startup in `main.rs`.
+The `ring` crypto provider is pinned (`default-features = false`) and installed
+at startup in `main.rs`. This does not remove its native build requirements or
+guarantee fully static binaries on every target; use the platform build toolchain.
 
 ## Extending: add a rule operator
 

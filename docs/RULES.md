@@ -1,5 +1,10 @@
 # Rules reference
 
+> Current compatibility scope and executed checks: [STATUS.md](STATUS.md).
+> Operator entries describe semantics and limitations; their presence is not
+> a claim of whole-product compatibility. Historical audits are preserved in
+> [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md).
+
 whistle-rs uses whistle's rule syntax. This document is the complete reference for
 the subset the Rust core understands. For the original, exhaustive whistle rule
 documentation see <https://wproxy.org>.
@@ -1825,9 +1830,11 @@ Three consequences worth knowing:
 - **The port is part of the pattern**, because the URL the rule matches carries
   it: `localhost:9443 sniCallback://certs` and `localhost:9444 …` are different
   rules, even though the ClientHello is identical.
-- **A declined connection is not proxied by any rule.** whistle-rs has no
-  rule pipeline for an opaque tunnel, so the relay goes straight to the address
-  the tunnel was opened to — a `proxy://` or `host://` line does not apply to it.
+- **A declined connection still follows tunnel routing rules.** The SNI path
+  retains the resolved target and applies `host://` and the upstream proxy
+  family; an unusable required route is not silently replaced with a direct
+  connection. Its opaque payload is not captured or processed by HTTP body
+  operators, because TLS remains between the client and origin.
 - **A failing plugin does not decline.** Unreachable, slow or incomprehensible
   all mean "the certificate whistle-rs would have generated anyway", with a
   `WARN` naming the plugin. See
@@ -3256,7 +3263,7 @@ them, and what to reach for when they do not fire — are in
 | Fail a fraction of calls | `api.example.com  statusCode://503  includeFilter://chance:5%` |
 | Narrow a rule to one method | `api.example.com  host://10.0.0.1  includeFilter://m:POST` |
 | Carve one path out of a broad rule | `example.com/health  ignore://all` |
-| Win against an earlier line | `$example.com  host://2.2.2.2` |
+| Win against an earlier ordinary line | `example.com  host://2.2.2.2 lineProps://important` (`$` means exact matching, not importance) |
 | Leave a pinned host alone | `pinned.example.com  sniCallback://no-mitm` |
 | Tag every intercepted response (confirms MITM is active) | `/^https:/i  resHeaders://x-via=whistle-rs` |
 
@@ -3264,9 +3271,10 @@ them, and what to reach for when they do not fire — are in
 
 ## Operator coverage
 
-Every operator in whistle's registry (`_original/lib/rules/protocols.js`) and its
-status in whistle-rs. **70 of 73 are applied at runtime**; the remaining 3 parse and
-resolve (so mixed rule files load) but have no distinct effect.
+The following groups describe implemented runtime paths and their limits.
+Do not interpret the old registry-name ratio as semantic coverage: aliases,
+metadata, plugin infrastructure and per-request effects need different tests.
+The current evidence and deliberate divergences are recorded in STATUS.
 
 ### Applied at runtime
 
@@ -3509,12 +3517,12 @@ This mirrors upstream exactly, including its sharp edge: a `#` inside a URL
 fragment is also treated as a comment, so `example.com/a#b file:///x` loses the
 `#b`.
 
-### Parsed but not applied (2)
+### Metadata and upstream-only infrastructure
 
 | Operator(s) | Why / note |
 |-------------|-----------|
-| `G` | Global-rule marker (a rule-precedence concept, not a per-request traffic effect) |
-| `style` | Rule colour in whistle's rule list — the console's rule editor is plain text with no per-rule rendering |
+| `G` | Upstream global plugin infrastructure has no equivalent in this port; it is not a request body/header operator or an importance marker |
+| `style` | Metadata with no traffic rewrite; retained for console `style:` filtering. This does not promise identical visual rendering to the upstream UI |
 
 ### Simplified vs. upstream
 

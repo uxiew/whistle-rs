@@ -1,19 +1,19 @@
 # The command line
 
-[English README](../README.md) · [简体中文 README](../README.zh-CN.md) · [Rules](RULES.md) · [Roadmap](ROADMAP.md)
+[项目说明](../README.md) · [Rules](RULES.md) · [Current status](STATUS.md) · [Roadmap](ROADMAP.md)
 
 whistle-rs is one foreground process. There is no `w2 start`, no daemon to stop,
 no instance registry — you run the binary, and you stop it with `Ctrl-C`.
 
 ```sh
-whistle-rs -p 8899 -r rules.txt
+whistle-rs -H 127.0.0.1 -p 8899 -r rules.txt --no-persist
 ```
 
-That difference aside, the flags are whistle's flags, and a command line copied
-from whistle's docs mostly works. This page says exactly where "mostly" ends:
-every flag whistle documents, what it does here, and what to do instead when it
-does nothing. Everything below was **measured against whistle 2.10.8**, not read
-off its help text.
+Some flags intentionally resemble upstream, but commands are not drop-in
+compatible. This reference combines implementation details and historical
+measurements against Whistle 2.10.8; current verification is recorded in
+[STATUS.md](STATUS.md). Use this binary's `--help` as the accepted-flag list.
+UI credentials do not authenticate proxy forwarding; see [OPERATIONS.md](OPERATIONS.md).
 
 - [Flags](#flags)
 - [`-M/--mode`](#-m--mode)
@@ -32,7 +32,7 @@ nothing to apply it to.
 | `-P, --uiport` | `-P, --uiport` | ✅ console on a port of its own |
 | `-n/-w`, `-N/-W` | same | ✅ console login, and the read-only account |
 | `-l, --localUIHost` | `-l, --local-ui-host` | ✅ adds to the built-in three, as upstream does |
-| `-M, --mode` | `-M, --mode` | ⚠️ four of the fifty-six tokens mean something here — [see below](#-m--mode) |
+| `-M, --mode` | `-M, --mode` | ⚠️ support depends on the mode and its combinations — see the mode table below |
 | `-t, --timeout` | `-t, --timeout` | ✅ same default, 360000 ms |
 | `-R, --reqCacheSize` | `-R, --req-cache-size` | ✅ |
 | `-F, --frameCacheSize` | `-F, --frame-cache-size` | ✅ |
@@ -78,9 +78,9 @@ defaults, and a sixteenth that only shows once HTTPS interception is on), and
 they collapse into six behaviours — **all six of which are honoured here**. The
 other forty tokens are console options, deployment shapes and Node concerns.
 
-As of the last full run, that bench reports **`ran: 57, differing: 0,
-declared: 0`** — every token in the vocabulary, and no declared divergence left
-in the mode table.
+The historical full run reported `ran: 57, differing: 0, declared: 0`.
+It was not repeated in the 2026-09-25 documentation audit and is not a fresh
+compatibility certificate for every current upstream version.
 
 | mode (and its spellings) | what it does | |
 | --- | --- | --- |
@@ -141,12 +141,10 @@ The tokens this port has nothing to do with are not silently swallowed: a mode w
 named at startup, and one **neither** program knows is reported as a probable
 typo.
 
-```
-$ whistle-rs -M "pureProxy|nohost|x-forwarded-proto|notAThing"
-INFO mode: pureProxy, nohost
-INFO mode: x-forwarded-proto — whistle has these and this port has nothing to apply them to; see docs/ROADMAP.md
-WARN mode: notAThing — no such mode in whistle either, so probably a typo
-```
+`x-forwarded-proto` is implemented and must not be used as an example of an
+unsupported token. An unknown spelling such as `notAThing` produces a warning;
+consult the mode table and the actual startup output rather than copying old
+log transcripts.
 
 With named rule groups on disk, `nohost` adds one more line, because a group
 that is loaded and not resolved is worth saying out loud:

@@ -1,42 +1,49 @@
-# The upstream reference
+# 上游对照基线
 
-[English README](../README.md) · [简体中文 README](../README.zh-CN.md)
+[项目说明](../README.md) · [对齐结论](STATUS.md) · [验证方法](DEVELOPMENT.md)
 
-本移植的源码与文档里有 **1079 处**形如 `_original/lib/rules/rules.js:1449` 的引用
-（834 处在 `src/**.rs`，164 处在 `docs/`，其余在 `tests/differential/` 的对比脚本里）。
-它们指向的是**原版 whistle 的源码**，是每一条对齐声明的凭据 —— 没有它，任何
-「与上游一致」的说法都无法复核。
+源码、手册与测试中形如 `_original/lib/rules/rules.js:1449` 的标记是上游源码定位线索，
+不是自动证明兼容的测试结果。引用数量随代码变化，不再维护容易过期的总数。
 
-原版**不再随本仓库分发**（它是另一个项目的代码，34 MB，且有自己的 git 历史）。
-需要复核时，按下面取回。
+上游源码不随本仓库分发。2026-09-25 检查时本地已有未跟踪的 `_original/`，
+本轮没有改动；复核时不要覆盖自己的既有副本。
 
-## 取回
+## 版本不是同一个概念
+
+| 对象 | 约束 |
+| --- | --- |
+| 可执行 oracle | `tests/differential/package.json` 固定 Whistle **2.10.8**；本轮读取已安装包确认一致 |
+| 历史源码定位 | 旧文档记录 `1df0805f09fd979e0e31fd6eab99ca97239ac1ec` / `v2.10.8`；本轮未独立确认二者及发布包的逐文件对应关系 |
+| 在线 master / 官网 | 2026-09-25 在线观察 `master/package.json` 为 **2.10.10**；官网与 master 都是浮动资料，不自动成为兼容基线 |
+
+来源：[官方仓库](https://github.com/avwo/whistle)、[package.json](https://github.com/avwo/whistle/blob/master/package.json)、[更新日志](https://github.com/avwo/whistle/blob/master/CHANGELOG.md)、[官网文档](https://wproxy.org/docs/)。
+升级基线按 ROADMAP 的 U1 做双版本复验，不直接把旧报告的版本号替换掉。
+
+## 源码复核
 
 ```sh
-# 在本仓库的**同级**目录下（引用路径是 ../_original/…）
-cd ..
-git clone https://github.com/avwo/whistle.git _original
-cd _original
+# 在自行选定的空目录克隆，不覆盖仓库内已有 _original/
+git clone https://github.com/avwo/whistle.git whistle-upstream
+cd whistle-upstream
+# 先验证旧记录的对象，再用于追溯旧行号
+git show --no-patch 1df0805f09fd979e0e31fd6eab99ca97239ac1ec
 git checkout 1df0805f09fd979e0e31fd6eab99ca97239ac1ec
 ```
 
-| | |
-|---|---|
-| 仓库 | `https://github.com/avwo/whistle.git` |
-| 提交 | `1df0805f09fd979e0e31fd6eab99ca97239ac1ec` |
-| 标签 | `v2.10.8` |
-| 本移植对齐的版本 | whistle **2.10.8** |
+引用中的 `_original/` 表示上游源码根。实际副本可以在其他位置，将前缀映射过去即可；
+不是要求用户机器必须有某个绝对路径。若对象无法获取或与标签不一致，先记录并纠正来源，
+不要拿当前 master 的同一行号冒充旧依据。
 
-也可以不用 git：`tests/differential/package.json` 把上游钉在同一个版本上，
-`cd tests/differential && npm install` 之后，`node_modules/whistle/` 就是同一棵树
-（差分对比脚本读的正是它）。
+差分脚本实际读取 `tests/differential/node_modules/whistle/`；安装方式见 DEVELOPMENT。
+**npm 发布包不应被无条件描述为 Git 仓库的“同一棵树”**：发布清单、生成物和测试资料可以不同。
+当前差分目录也没有受版本控制的依赖锁文件，仅顶层版本固定，Q2 将补齐传递依赖可复现性。
 
-**行号只对这个提交有效。** 上游后续版本会移动它们；如果你在核对时发现某个引用
-指向了明显无关的代码，先确认 checkout 的是上面这个提交，再怀疑引用写错了。
+行号是定位提示，不是稳定 API。新记录优先附版本、文件、函数名、最小用例和结果；
+Git 源码、npm 包与当前官网之间的差别必须显式说明。
 
 ## 目录对照
 
-引用集中在这几个文件，按出现频率排：
+主要模块映射：
 
 | 上游路径 | 本移植对应 |
 |---|---|
@@ -52,14 +59,10 @@ git checkout 1df0805f09fd979e0e31fd6eab99ca97239ac1ec
 
 ## 复核一条声明的做法
 
-本仓库里凡是「与上游一致」的说法，都应能这样验证：
+先确定版本、输入和要比较的可观测结果。解析问题优先直接运行现有 `rules-oracle.js`，
+网络行为则运行受控源站和两种代理，同时比较客户端与源站两端。不要默认为“抄一段函数”
+就覆盖了真实依赖、调用顺序或状态；独立摘录只能是更窄的补充证据。
 
-1. 打开引用指向的上游代码，读它**实际做了什么**（而不是它的注释说做什么）。
-2. 把那段逻辑抄成一个独立的 node 脚本 —— 上游没有 `node_modules`，
-   `require` 整个包会失败，抄出你需要的函数比装依赖快得多。
-3. 用同一批输入分别跑上游脚本与本移植，逐条比对。
-
-本仓库已经这样做过两次，两次都推翻了先前基于阅读得出的结论：
-`src/rules/wildcard.rs` 的三种通配符编译（正则源码逐字符比对），以及
-`format_shorthand` 的展开表（期望值直接来自上游函数的输出）。
-**读代码得出的结论比跑代码得出的结论弱一档**，本文件的存在就是为了让后者随时可做。
+报告关联 Rust 制品、上游版本、语料、命中数、归一化、预期偏离、未知差异和退出码。
+“已解析”“已应用”“这些用例一致”“与该版本全量兼容”不能互相替换。历史结果见
+[ROADMAP-HISTORY.md](ROADMAP-HISTORY.md)，本轮实际结果见 [STATUS.md](STATUS.md)。
