@@ -7,3 +7,6 @@ requests.png
 
 # Agent worktrees live here; they are their own checkouts, never content.
 .claude/worktrees/
+
+# Generated per release by scripts/third-party-licenses.mjs; changes with every dependency bump.
+THIRD-PARTY-LICENSES.md
