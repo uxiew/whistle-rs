@@ -44,13 +44,13 @@ struct Cli {
     #[arg(short = 'W', long)]
     guest_password: Option<String>,
 
-    /// Serve the console on its own port (whistle's `-P/--uiport`).
+    /// Also serve the console on its own port (whistle's `-P/--uiport`).
     ///
-    /// Without it the console lives on the proxy port, which is where whistle
-    /// keeps it too — `config.uiport = config.port`, and only a different value
-    /// starts a second server (`_original/biz/init.js:8-19`). A separate port
-    /// is what lets a client reach the console without going through the proxy,
-    /// and what keeps `http://<proxy>/` free for the rules to answer.
+    /// The console always answers on the proxy port — a request addressed to
+    /// the proxy itself is the console's — and this adds a second listener that
+    /// serves nothing else, which is where whistle's `config.uiport` points
+    /// (`_original/biz/init.js:8-19`). It does not take the console off the
+    /// proxy port, and it is no access control: the same login applies on both.
     #[arg(short = 'P', long = "uiport")]
     ui_port: Option<u16>,
 
