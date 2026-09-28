@@ -4,7 +4,7 @@
 
 **0.1.0，不是官方 Whistle，也不是完整的直接替代品。** 行为以 Whistle 2.10.8 为对照基线；插件协议、控制台 API 和部分 CLI 语义不同。依赖现成 `whistle.*` npm 插件、官方 `/cgi-bin/*` API 或 `w2 start/stop` 的工作流不能直接迁移。
 
-**进度：** 质量门禁与工具链（Q1）已完成；可复现差分门禁（Q2）和许可与来源（Q3）本地完成，CI 与发布构件待首次在 GitHub 上运行。详见[当前状态](docs/STATUS.md)与[计划](docs/ROADMAP.md)。
+**进度：** 质量门禁（Q1）、可复现差分门禁与 CI（Q2）、许可与来源（Q3）已完成；正在做安全运行契约（S1）。详见[当前状态](docs/STATUS.md)与[计划](docs/ROADMAP.md)。
 
 ## 构建
 

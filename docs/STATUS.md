@@ -4,7 +4,7 @@
 
 本轮修改限于文档；没有为通过检查而改动 Rust、前端、依赖声明或锁文件。初始工作区已有未跟踪的 `_original/`，未纳入提交、删除或覆盖。
 
-**2026-09-28 更新：** Q1 已完成，质量门禁在钉住的工具链上全部通过，见 [Q1 门禁复验](#2026-09-28-q1-门禁复验)。Q2 的本地部分完成，CI 待首次在 GitHub 上运行，见 [Q2 记录](#2026-09-28-q2-可复现构建与差分门禁)。Q3 完成，见 [Q3 记录](#2026-09-28-q3-许可来源与包元数据)。下文「2026-09-25 审查时的验证」保留为当时的记录，其中 Clippy/格式失败已不是现状。
+**2026-09-28 更新：** Q1 已完成，质量门禁在钉住的工具链上全部通过，见 [Q1 门禁复验](#2026-09-28-q1-门禁复验)。Q2 完成，CI 首跑全部通过，见 [Q2 记录](#2026-09-28-q2-可复现构建与差分门禁)。Q3 完成，见 [Q3 记录](#2026-09-28-q3-许可来源与包元数据)。下文「2026-09-25 审查时的验证」保留为当时的记录，其中 Clippy/格式失败已不是现状。
 
 ## 结论
 
@@ -39,7 +39,7 @@
 | 持久化 | JSONL 会话历史与按天保留；内存/体预览有界。UI 隐藏不等于后端未采集，预览/HAR/重放不能保证任意大报文完整 | `src/proxy/{persist,body,webui}.rs`、`src/config.rs` |
 | 插件生态 | 自有 Rust/HTTP/Node 插件协议与 SDK；**不直接运行现成 `whistle.*` npm 插件** | `src/plugins/`、`sdk/`、[PLUGINS.md](PLUGINS.md) |
 | CLI / Agent 接口 | `explain`、`qr` 及自有 HTTP API；没有 `w2 start/stop` 兼容层，`-r` 是可编辑的 Default 规则组而不是上游隐藏 shadowRules | `src/main.rs`；`src/proxy/webui.rs` |
-| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；差分依赖有审阅过的锁文件，`run.js` 一条命令跑全量差分并归档；CI workflow 已写好但**尚未在 GitHub 上运行过**；MIT 许可、来源说明、Cargo 元数据齐备，发布构件附带第三方许可原文 | 本文 Q1、Q2 记录；`.github/workflows/`；`tests/differential/` |
+| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；差分依赖有审阅过的锁文件，`run.js` 一条命令跑全量差分并归档；CI 首跑 8 个 job 全部通过，全量差分在 Linux 容器里通过；MIT 许可、来源说明、Cargo 元数据齐备，发布构件附带第三方许可原文 | 本文 Q1、Q2 记录；`.github/workflows/`；`tests/differential/` |
 
 上游插件契约见[官方插件开发](https://wproxy.org/docs/extensions/dev.html)；上游 Local Agent API 见[官方接口文档](https://wproxy.org/docs/extensions/api.html)。同名能力不意味着 URL、数据模型或插件对象兼容。
 
@@ -118,7 +118,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 
 环境同 Q1：macOS / Apple M4 / Darwin 25.3.0 arm64，Rust 1.98.1，Node.js **v26.4.0**，npm 11.17.0；对照组 whistle **2.10.8**，锁文件 SHA-256 `45b91b6c…6fdec`。每条测量后面写了它对应的提交。
 
-**结论：** 本地部分完成并实测——锁文件、统一入口、逐条声明、未知差异非零退出、inert 必须有解释、预设回归必被抓住、全新 clone 可重建。**CI 两个 workflow 写好了，但从没在 GitHub 上跑过**，所以 ROADMAP 里 CI 两项不勾；Linux 上的任何结果都还没有测过。
+**结论：** 完成。本地实测了锁文件、统一入口、逐条声明、未知差异非零退出、inert 必须有解释、预设回归必被抓住、全新 clone 可重建；CI 首跑（`6e28a23`）8 个 job 全部通过；全量差分在 Linux 容器里 27 步全过，没有冒出新差异。全量差分 workflow 本身还没在 GitHub 上触发过。
 
 ### 做了什么
 
@@ -146,7 +146,9 @@ Q1 做了什么（每项一个提交，可单独回退）：
 | 全新 `git clone` → `npm ci` → `cargo build` → `run.js fast` | **通过** | `77c2bc9`；clone 里除 `node_modules` 外没有多出任何文件，包括被忽略的 |
 | `scripts/check-console.sh` 四种组合 | **符合预期** | 真控制台构建：built 0、placeholder 1；无前端产物构建：placeholder 0、built 1 |
 | `node scripts/check-links.mjs` | **通过：21 个文件** | 修复前报 1 处；合成仓库里 5 个坏链接全报、8 个好链接不误报 |
-| 两个 workflow | **只验证了 YAML 能解析** | 没有在 GitHub 上运行；本机 Docker 未启动，容器 job 也没在本地跑 |
+| `ci.yml` 首跑 | **8 个 job 全部通过，3 分 19 秒** | GitHub Actions run `36438710319`，提交 `6e28a23`（推到 main 触发）；详见下文 |
+| `run.js all`，Linux | **27 步全过，854 秒** | 本机 OrbStack 里的 `node:26-trixie` 容器，arm64，Node 26.10.0，代码 `6e28a23` |
+| actionlint 1.7.12 | **两个 workflow 0 条问题** | 它会对 `run:` 块跑 shellcheck |
 
 预设回归（每条都必须让对应门禁失败，且未注入时门禁先通过）：
 
@@ -158,6 +160,22 @@ Q1 做了什么（每项一个提交，可单独回退）：
 | `statusCode://404` 回 405 | 网络：`cases` 3 例 | 解析差分只看"匹配到什么"，看不到执行效果——网络差分存在的理由 |
 | QR 第 6 种掩码取反 | `qr`，17 个码不一致 | |
 
+### CI 首跑（2026-09-28）
+
+推到 main 触发，run `36438710319`，提交 `6e28a23`，8 个 job 全部通过：
+
+| Job | 用时 | 证明了什么 |
+| --- | --- | --- |
+| Rust — fmt, clippy, tests | 2 分 28 秒 | Linux x86_64 上门禁与全部测试通过；`rust-toolchain.toml` 被 rustup 采用 |
+| Rust — the oldest supported version | 1 分 45 秒 | MSRV 1.95 在 Linux 上成立 |
+| Proxy-only build | 1 分 36 秒 | 不含 Node 的 `rust:1.98.1-trixie` 容器里能编译，二进制给出占位页 |
+| Console — Node 20.19.0 / 24 | 16 秒 / 13 秒 | **Node 下限 20.19.0 第一次真跑通过**（之前只是按依赖声明推出来的） |
+| Release binary with the real console | 3 分 15 秒 | 全新检出先建控制台再编 release，嵌入的就是这一版控制台；构件含二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md` 与校验和（10.9 MB） |
+| Docs — relative links and anchors | 11 秒 | |
+| Differential — rules oracle and QR encoder | 1 分 52 秒 | Linux + Node 26 上 fast 差分通过；运行归档作为构件上传 |
+
+缓存恢复的 `target/` 与 `run.js` 的"二进制比源码旧"检查相容（CI 里 fast 差分通过即证明）。构件内容需要登录才能下载，这里没有逐字节核对，核对的是生成它们的步骤全部成功。
+
 ### 顺带发现的问题
 
 - `rules-oracle` 取值差异不影响退出码，`--values` 印出错值照样退出 0；审查时也只跑了文档语料，`--from-cases` 从没进过验证记录。
@@ -168,7 +186,8 @@ Q1 做了什么（每项一个提交，可单独回退）：
 
 ### 没有执行 / 剩余风险
 
-- **CI 从未运行。** 以下都只有在 GitHub 上跑一次才算证实：Linux 上的差分结果（全部声明都是在 macOS + Node 26.4 上测的）、`rust:1.98.1-trixie` 容器里的纯代理构建、Node 20.19.0 下的前端构建、缓存恢复的 `target/` 与 `run.js` 的"二进制比源码旧"检查是否相容。
+- **全量差分 workflow（`differential.yml`）还没在 GitHub 上跑过**，要在 Actions 页面手动触发，之后每周一自动跑。它的内容（`run.js all`）已在 Linux 容器里通过，但那是 arm64，GitHub 是 x86_64。
+- 容器里用 `git archive` 导出的代码没有 `.git`，归档清单的提交号为空；在正常检出里（包括 CI）会记录。
 - `run.js` 用进程组清理子进程，不支持 Windows。
 - 网络套件里 auth/https/mode 会查询 `local.whistlejs.com`、`rootca.pro` 等名字，依赖 DNS；timing 按时间容差判定，在 CI 上是否稳定未知。
 - 语料仍把夹具写到固定的 `/tmp/wrs-*`（测试文件，不含密钥），不在临时目录里、也不删除。
@@ -198,8 +217,8 @@ Q1 做了什么（每项一个提交，可单独回退）：
 | 优先级 | 发现 | 后续任务 |
 | --- | --- | --- |
 | ~~P0~~ | ~~质量状态漂移：Clippy 两处错误、格式未统一；未固定工具链/最低支持版本~~ 2026-09-28 已解决，见 Q1 复验 | Q1 ✓ |
-| P0 | ~~差分依赖无锁文件、无统一网络差分入口~~ 2026-09-28 已解决；**CI 已写未跑**：两个 workflow 从未在 GitHub 上执行，Linux 上的结果没有测过 | Q2（剩 CI 首跑） |
-| ~~P0~~ | ~~发布许可不完整~~ 2026-09-28 已补齐（MIT、NOTICE、Cargo 元数据、第三方许可生成）；发布构件随 CI 首跑确认 | Q3 ✓ |
+| ~~P0~~ | ~~可复现交付不足~~ 2026-09-28 已解决：锁文件、统一入口、CI 首跑通过；全量差分 workflow 尚待在 GitHub 上首次触发 | Q2 ✓ |
+| ~~P0~~ | ~~发布许可不完整~~ 2026-09-28 已补齐（MIT、NOTICE、Cargo 元数据、第三方许可生成）；发布构件已由 CI 首跑生成 | Q3 ✓ |
 | P0 | 默认全接口、无 UI 口令、会话落盘；UI 认证不保护代理转发，分 UI 端口不是自动的网络隔离 | S1 |
 | P1 | 早期请求失败缺少统一会话结果；依赖日志/502，影响定位 DNS/连接/TLS 失败 | O1 |
 | P1 | UI 检索字段、采集/显示过滤、二进制与截断状态需要更明确的契约；不能把过滤后的画面当作隐私保证 | O2 |
