@@ -4,7 +4,7 @@
 
 本轮修改限于文档；没有为通过检查而改动 Rust、前端、依赖声明或锁文件。初始工作区已有未跟踪的 `_original/`，未纳入提交、删除或覆盖。
 
-**2026-09-28 更新：** Q1 已完成，质量门禁在钉住的工具链上全部通过，见 [Q1 门禁复验](#2026-09-28-q1-门禁复验)。Q2 的本地部分完成，CI 待首次在 GitHub 上运行，见 [Q2 记录](#2026-09-28-q2-可复现构建与差分门禁)。下文「2026-09-25 审查时的验证」保留为当时的记录，其中 Clippy/格式失败已不是现状。
+**2026-09-28 更新：** Q1 已完成，质量门禁在钉住的工具链上全部通过，见 [Q1 门禁复验](#2026-09-28-q1-门禁复验)。Q2 的本地部分完成，CI 待首次在 GitHub 上运行，见 [Q2 记录](#2026-09-28-q2-可复现构建与差分门禁)。Q3 完成，见 [Q3 记录](#2026-09-28-q3-许可来源与包元数据)。下文「2026-09-25 审查时的验证」保留为当时的记录，其中 Clippy/格式失败已不是现状。
 
 ## 结论
 
@@ -39,7 +39,7 @@
 | 持久化 | JSONL 会话历史与按天保留；内存/体预览有界。UI 隐藏不等于后端未采集，预览/HAR/重放不能保证任意大报文完整 | `src/proxy/{persist,body,webui}.rs`、`src/config.rs` |
 | 插件生态 | 自有 Rust/HTTP/Node 插件协议与 SDK；**不直接运行现成 `whistle.*` npm 插件** | `src/plugins/`、`sdk/`、[PLUGINS.md](PLUGINS.md) |
 | CLI / Agent 接口 | `explain`、`qr` 及自有 HTTP API；没有 `w2 start/stop` 兼容层，`-r` 是可编辑的 Default 规则组而不是上游隐藏 shadowRules | `src/main.rs`；`src/proxy/webui.rs` |
-| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；差分依赖有审阅过的锁文件，`run.js` 一条命令跑全量差分并归档；CI workflow 已写好但**尚未在 GitHub 上运行过**；仍无根 LICENSE | 本文 Q1、Q2 记录；`.github/workflows/`；`tests/differential/` |
+| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；差分依赖有审阅过的锁文件，`run.js` 一条命令跑全量差分并归档；CI workflow 已写好但**尚未在 GitHub 上运行过**；MIT 许可、来源说明、Cargo 元数据齐备，发布构件附带第三方许可原文 | 本文 Q1、Q2 记录；`.github/workflows/`；`tests/differential/` |
 
 上游插件契约见[官方插件开发](https://wproxy.org/docs/extensions/dev.html)；上游 Local Agent API 见[官方接口文档](https://wproxy.org/docs/extensions/api.html)。同名能力不意味着 URL、数据模型或插件对象兼容。
 
@@ -176,13 +176,30 @@ Q1 做了什么（每项一个提交，可单独回退）：
 - `tests/differential/` 下此前手动运行留下的 `.data-*`、`.mode-*` 等目录（已被 git 忽略）没有动。
 - 对照组结果随 Node 版本变化；换 Node 需重新测量。
 
+## 2026-09-28 Q3 许可、来源与包元数据
+
+许可由维护者选定为 **MIT**。提交：`865debb` LICENSE、`9bc9713` 第三方许可生成脚本、`2905f2d` NOTICE.md、`b9b75f8` Cargo 元数据、`a9941ea` crate 包内容与忽略 `_original/`、`8722f32` SDK 的 LICENSE、`7379280` CI 发布构件附带许可、`8e9ac50` 上游对应关系。
+
+| 事项 | 结果 | 怎么核实的 |
+| --- | --- | --- |
+| 根 `LICENSE` | MIT，版权人写"whistle-rs contributors"，不虚构个人作者 | 许可正文与上游 LICENSE 逐字相同 |
+| `NOTICE.md` | 写明来自上游的内容（规则语言与设计、按上游翻译的逻辑——`src/` 下 866 处 `_original/…:行号` 注释、测试语料里逐字取自上游文档的规则行）和不来自上游的内容；附上游 MIT 原文 | 上游 LICENSE 在 v2.10.4、v2.10.8 与 npm 包里完全相同 |
+| 上游 tag / 提交 / npm 包 | `v2.10.8` 是指向 `1df0805` 的轻量 tag；npm 包 228 个文件中 227 个与该提交逐字节相同，唯一多出的是上游控制台的构建产物 | `git ls-remote`；部分克隆上游后逐文件比对 |
+| Cargo 元数据 | `description`、`license = "MIT"`、`repository`；不写 `authors` | `cargo metadata` |
+| crate 包内容 | 原先会打包 1,119 个文件，其中 940 个是本地 `_original/` 里的上游源码；现在按白名单只有 62 个，能从包内容独立编译 | `cargo package --list`；`cargo package` |
+| 第三方许可 | 生成脚本在 x86_64-linux 上列出 223 个 crate、36 个 npm 包、164 段不同的许可原文；12 个 crate 声明了许可但包里没带原文，按 SPDX 标识列出 | 本地对 aarch64-darwin 与 x86_64-linux 两个目标各生成一次 |
+| SDK | 补 `sdk/LICENSE`，`npm pack --dry-run` 显示随包发出 | npm pack 清单 |
+| 发布构件 | CI release job 把 LICENSE、NOTICE.md、THIRD-PARTY-LICENSES.md 与二进制放在一起并算校验和 | 本地按同样步骤手动走过一遍；**CI 本身未运行** |
+
+**剩余风险：** `Cargo.lock` 里的 `num-bigint 0.4.7` 已在 crates.io 被撤回（`cargo package` 报出），未处理；crate 包不含 `ui-src/dist`，从 crates.io 构建得到的是占位控制台；许可判断基于各包声明的 SPDX 标识与自带的许可文件，没有逐个核对声明是否与源码实际许可一致。
+
 ## 真实缺口与风险
 
 | 优先级 | 发现 | 后续任务 |
 | --- | --- | --- |
 | ~~P0~~ | ~~质量状态漂移：Clippy 两处错误、格式未统一；未固定工具链/最低支持版本~~ 2026-09-28 已解决，见 Q1 复验 | Q1 ✓ |
 | P0 | ~~差分依赖无锁文件、无统一网络差分入口~~ 2026-09-28 已解决；**CI 已写未跑**：两个 workflow 从未在 GitHub 上执行，Linux 上的结果没有测过 | Q2（剩 CI 首跑） |
-| P0 | 发布许可不完整：根 LICENSE 缺失，Cargo 包元数据缺少 license 等字段；旧 README 的 MIT 声明不足以完成分发准备 | Q3 |
+| ~~P0~~ | ~~发布许可不完整~~ 2026-09-28 已补齐（MIT、NOTICE、Cargo 元数据、第三方许可生成）；发布构件随 CI 首跑确认 | Q3 ✓ |
 | P0 | 默认全接口、无 UI 口令、会话落盘；UI 认证不保护代理转发，分 UI 端口不是自动的网络隔离 | S1 |
 | P1 | 早期请求失败缺少统一会话结果；依赖日志/502，影响定位 DNS/连接/TLS 失败 | O1 |
 | P1 | UI 检索字段、采集/显示过滤、二进制与截断状态需要更明确的契约；不能把过滤后的画面当作隐私保证 | O2 |
