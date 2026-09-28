@@ -137,9 +137,12 @@ module.exports = [
   // The home shorthand, in both spellings.
   { name: 'paths: ~/ home', rules: `${A} file://~/wrs-nonexistent.json` },
   { name: 'paths: ~\\ home, windows-style', rules: `${A} file://~\\wrs-nonexistent.json` },
-  // And on the pattern side, where a drive letter is simply not a URL.
-  { name: 'paths: a drive path as the pattern', rules: `C:\\Users\\john reqHeaders://x-hit=1` },
-  { name: 'paths: a UNC path as the pattern', rules: `\\\\server\\share reqHeaders://x-hit=1` },
+  // And on the pattern side, where a drive letter is simply not a URL. Inert on
+  // purpose: the claim is that neither proxy reads `C:` as a host and port, or
+  // `\\server` as a protocol-relative host, and so neither matches this request.
+  // A proxy that did would set `x-hit` and the case would stop being inert.
+  { name: 'paths: a drive path as the pattern', inert: true, rules: `C:\\Users\\john reqHeaders://x-hit=1` },
+  { name: 'paths: a UNC path as the pattern', inert: true, rules: `\\\\server\\share reqHeaders://x-hit=1` },
 
   // ── real files, spelled awkwardly ──────────────────────────────────────
   //
@@ -195,7 +198,9 @@ module.exports = [
     rules: '', request: { path: '/echo?q=a%20b%25c' } },
   { name: 'paths: a rule beside an untouched escaped query',
     rules: `${P} reqHeaders://x-hit=1`, request: { path: '/echo?q=a%20b%25c' } },
-  { name: 'paths: a cjk pattern that matches nothing', rules: `http://例子.测试/ reqHeaders://x-hit=1` },
+  // Inert on purpose, as its name says: an IDN pattern must not match the
+  // origin's plain `127.0.0.1` because of how either side encodes it.
+  { name: 'paths: a cjk pattern that matches nothing', inert: true, rules: `http://例子.测试/ reqHeaders://x-hit=1` },
   { name: 'paths: a cjk value in a body', rules: `${A} resBody://(中文)` },
   { name: 'paths: a cjk replacement into a body that is not utf-8',
     rules: `${P} resReplace://ORIG=中文`, request: { path: '/notutf8' } },
