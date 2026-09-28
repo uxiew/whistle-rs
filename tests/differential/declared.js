@@ -154,6 +154,8 @@ const DECLARED = {
       'upstream unions the two passes for three enable:// flags only. Header, divergence 6b'),
     d('fail: xhttps-proxy falls back to a direct connection', ['status', 'res.header.content-type', 'res.header.x-origin', 'res.body'],
       'xhttps-proxy:// at a dead hop hangs upstream; this port falls back as the x prefix documents. Header, divergence 7'),
+    d('direct: the client\'s Proxy-Authorization stops at this proxy', ['req.header.proxy-authorization'],
+      'the client\'s credential for this proxy; whistle forwards it to the origin, this port only to an upstream proxy. Header, divergence 8'),
   ],
 
   'cases-values.js': [

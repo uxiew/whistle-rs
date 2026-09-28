@@ -121,6 +121,12 @@
 //      `https-proxy://` answers 502 promptly, and `xhttps-proxy://` returns
 //      nothing at all until the client gives up. This port falls back, which is
 //      what the `x` prefix documents and what its three siblings do.
+//   8. **The client's `Proxy-Authorization` stops at this proxy** (1 case).
+//      It is the client's credential for *this* proxy; whistle forwards it to
+//      the origin as well, so a proxy password configured in a browser reached
+//      every site. This port offers it only to an upstream proxy (the two
+//      `credentials on the hop` cases, which agree) and never to an origin. A
+//      `Proxy-Authorization` a rule sets on purpose still goes out.
 //
 // **How much of this corpus does anything.** 98 of the 111 cases change what
 // real whistle answers, measured against the same request with no rule at all —
@@ -249,6 +255,12 @@ module.exports = [
   {
     name: 'proxy: the rule\'s credential beats the client\'s',
     rules: `${P} proxy://user:pass@${HOP}`,
+    request: { headers: { 'proxy-authorization': 'Basic Y2xpZW50OnNlY3JldA==' } },
+  },
+  // No rule at all: straight to the origin, carrying a credential meant for us.
+  {
+    name: 'direct: the client\'s Proxy-Authorization stops at this proxy',
+    rules: '',
     request: { headers: { 'proxy-authorization': 'Basic Y2xpZW50OnNlY3JldA==' } },
   },
   { name: 'proxy: credentials on a socks hop', rules: `${P} socks://user:pass@${SOCKS}` },
