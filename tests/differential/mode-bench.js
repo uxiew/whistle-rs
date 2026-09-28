@@ -315,5 +315,6 @@ async function main() {
     moves: agreed.moves,
     inert: agreed.inert,
   }, null, 2));
+  process.exitCode = differing.length ? 1 : 0;
 }
 main().catch((e) => { console.error(e); process.exit(1); });

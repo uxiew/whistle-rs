@@ -353,6 +353,8 @@ async function main() {
 
   origin.close();
   console.log(JSON.stringify({ ran, differing, declared, report, excused }, null, 2));
+  // Declared rows are already out of `differing`; anything left is news.
+  process.exitCode = differing ? 1 : 0;
 }
 
 main().catch((e) => {

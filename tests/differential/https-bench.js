@@ -673,6 +673,7 @@ async function main() {
 
   origin.close();
   console.log(JSON.stringify({ ran, differing, report }, null, 2));
+  process.exitCode = differing ? 1 : 0;
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
