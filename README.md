@@ -20,7 +20,7 @@ cargo build --locked --release                            # 产物 target/releas
 ## 使用
 
 ```sh
-./target/release/whistle-rs -H 127.0.0.1 -p 8899 --no-persist   # 只监听本机，不保存历史
+./target/release/whistle-rs -p 8899 --no-persist   # 默认只监听本机；--no-persist 不保存历史
 ```
 
 控制台在 `http://127.0.0.1:8899/`；把客户端的 HTTP/HTTPS 代理设为 `127.0.0.1:8899`（根证书在首次启动时生成）：
@@ -42,7 +42,7 @@ example.com resHeaders://x-debug=1
 
 ## 注意
 
-**默认监听 `0.0.0.0`、控制台无口令、开启 HTTPS 拦截、会话保存 7 天。** 上面的命令收紧了监听和持久化；`--no-persist` 不会删除以前的历史。不要暴露到公网，控制台口令也不等于代理访问控制。HTTPS 拦截要求客户端信任代理 CA，只用于获授权的流量，不用时撤销信任；`--insecure-upstream` 会关闭源站证书校验。详见[安全运行](docs/OPERATIONS.md)。
+**默认只监听 `127.0.0.1`、控制台无口令、开启 HTTPS 拦截、会话保存 7 天。** 给手机或别的机器用要显式 `-H 0.0.0.0`，而且先用 `-n/-w` 设控制台口令——能改规则的人就能让代理读写本机文件；本项目也不提供代理本身的访问控制，局域网里要靠防火墙限制谁能连。HTTPS 拦截要求客户端信任代理 CA，只用于获授权的流量，不用时撤销信任。完整的安全契约见[安全运行](docs/OPERATIONS.md)。
 
 ## 文档
 
