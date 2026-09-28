@@ -14,7 +14,7 @@
 
 ## 构建
 
-需要 Rust 工具链及平台编译工具；构建控制台另需 Node.js（Vite 要求 `^20.19.0 || >=22.12.0`）和 npm。在仓库根目录执行：
+需要 rustup 及平台编译工具（仓库里的 `rust-toolchain.toml` 会自动装好 Rust 1.98.1，最低可编译版本为 1.95）；构建控制台另需 Node.js `^20.19.0 || >=22.12.0` 和 npm，版本不符时 `npm ci` 直接报 `EBADENGINE`。版本细节见[开发与验证](docs/DEVELOPMENT.md#工具链)。在仓库根目录执行：
 
 ```sh
 npm ci --prefix ui-src

@@ -293,6 +293,10 @@ cargo clippy --all-targets  # expected to be silent; `[lints.clippy]` denies the
 cargo build --release
 ```
 
+"Silent" holds on the toolchain `rust-toolchain.toml` pins; a newer Clippy may
+find more. The full gate and the version rules are in
+[DEVELOPMENT.md](DEVELOPMENT.md#工具链).
+
 The capture benchmarks are `#[ignore]`d — they are measurements rather than
 assertions, and mean nothing in a debug build. Run them on their own:
 

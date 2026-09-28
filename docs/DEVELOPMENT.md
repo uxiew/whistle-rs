@@ -2,9 +2,31 @@
 
 [文档导航](README.md) · [架构](ARCHITECTURE.md) · [上游基线](UPSTREAM.md) · [本轮结果](STATUS.md)
 
-## 构建顺序
+## 工具链
 
-本项目使用 Rust edition 2024；目前尚未提交固定工具链与明确 MSRV。前端为 Vue 3/Vite，Vite 8.2.0 的 Node 要求是 `^20.19.0 || >=22.12.0`，本轮使用 Node 24.9.0。需要平台正常的编译工具；`ring` 不意味着“无需 C 工具链”或任意平台的全静态制品。
+| 用途 | 版本 | 定义在 | 版本不对会怎样 |
+| --- | --- | --- | --- |
+| Rust，跑门禁和日常开发 | **1.98.1**，含 clippy、rustfmt | `rust-toolchain.toml` | 装了 rustup 的机器，在仓库里第一次执行 `cargo` 时自动下载，无需手动切换 |
+| Rust 最低可编译版本（MSRV） | **1.95** | `Cargo.toml` 的 `rust-version` | 1.94 及更早立刻报 `rustc 1.94.0 is not supported by the following packages: whistle-rs@0.1.0 requires rustc 1.95`，不会先编译一堆依赖 |
+| Node.js，只在构建控制台时需要 | **`^20.19.0 \|\| >=22.12.0`** | `ui-src/package.json` 的 `engines`，由 `ui-src/.npmrc` 的 `engine-strict` 强制 | `npm ci` 直接以 `EBADENGINE` 失败。运行代理本身不需要 Node |
+
+两个 Rust 版本是两件事：`rust-toolchain.toml` 决定**用哪个版本做检查**，`rust-version` 声明**最老能用哪个版本编译**。门禁版本必须钉死，因为 Clippy 每个版本都会加新检查：同一份代码在 1.96.1 上 `clippy -D warnings` 通过，在 1.98.1 上报两处错误。不钉版本，"门禁通过"就取决于谁的电脑跑的。升级门禁版本要单独提交，并在同一提交里修掉新 lint。
+
+- 用发行版自带、不经 rustup 的 Rust 时，`rust-toolchain.toml` 不生效，Clippy 结果可能和门禁不一致；以 1.98.1 的结果为准。
+- 1.95 的来历：1.94 不认识 `src/proxy/apply.rs` 里的 `if let` 匹配守卫（E0658），锁定的依赖本身只要求 1.88。验证 MSRV 需要显式指定版本，因为 `+版本` 会覆盖 `rust-toolchain.toml`：
+
+  ```sh
+  rustup toolchain install 1.95.0 --profile minimal
+  cargo +1.95.0 test --locked --all-targets
+  cargo +1.95.0 test --locked --doc
+  ```
+
+- Node 下限来自 Vite 8.2.0、rolldown 和 `@vitejs/plugin-vue` 三者的 `engines`，锁文件里没有更严的要求。实测过 24.9.0 和 26.4.0；20.19 这个下限是按依赖声明推出来的，没有真机跑过。
+- npm 11 的 `npm ci` 会对 `fsevents`（macOS 文件监听的可选依赖）打印 `allow-scripts` 警告。已实测 `typecheck`、`build` 不受影响；`npm run dev` 的热更新监听没有验证。
+
+还需要平台正常的编译工具；`ring` 不意味着“无需 C 工具链”或任意平台的全静态制品。
+
+## 构建顺序
 
 仓库根目录执行：
 
@@ -31,7 +53,9 @@ npm run build --prefix ui-src
 git diff --check
 ```
 
-这些是应通过的门禁，**不是当前都已通过的声明**。2026-09-25 的 Clippy/格式问题及实测数字集中记录在 STATUS，不在每份手册重复维护计数。普通测试不会执行 `#[ignore]` 基准；`--all-targets` 也不能替代单独的 doc tests。
+在 `rust-toolchain.toml` 钉住的工具链上，这些命令都应通过；任何一条失败都算门禁失败，不要用全局 `allow` 或降低 lint 级别绕过。最近一次实测的提交、环境和计数只记在 [STATUS](STATUS.md)，手册里不抄数字。普通测试不会执行 `#[ignore]` 基准；`--all-targets` 也不能替代单独的 doc tests。
+
+格式化只用 rustfmt 默认配置（仓库里没有 `rustfmt.toml`）。整树重排这类纯格式提交要记进 `.git-blame-ignore-revs`，本地执行一次 `git config blame.ignoreRevsFile .git-blame-ignore-revs`，`git blame` 就会跳过它们。
 
 首次安装允许 Cargo 下载 Cargo.lock 固定依赖，缓存齐备后才考虑 `--offline`。不要把离线缓存不完整当成源码错误，也不要为通过测试擅自更新锁文件。
 
