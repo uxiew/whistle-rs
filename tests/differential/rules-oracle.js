@@ -586,6 +586,22 @@ function isBracketQuirk(theirs, ours) {
   );
 }
 
+// A local path the request's tail is joined onto, where the only difference is
+// which separator did the joining: `file://D:\dir\` asked for `/echo` resolves
+// to `D:\dir\echo` upstream and `D:\dir/echo` here. Neither is what gets opened.
+// Upstream runs every local path through `convertSlash` first
+// (`lib/util/file-mgr.js:13-16`, `formatPathSep` off Windows), and so does this
+// port's file layer, so both open `D:/dir/echo`; on Windows both separators are
+// separators. Scoped to the file family — a `\` anywhere else is text.
+function isSeparatorOnly(key, theirs, ours) {
+  const slashes = (list) => JSON.stringify(list.map((v) => v.replace(/\\/g, '/')));
+  return (
+    /^rule:(?:|x|xs)(?:file|rawfile|tpl|dust|jsonp)$/.test(key) &&
+    theirs.length === ours.length &&
+    slashes(theirs) === slashes(ours)
+  );
+}
+
 // A `{name}` the values store did not answer. Upstream extends the literal with
 // the request's tail, having no reason to treat it differently from a path;
 // this port leaves it alone, which is the declared choice `docs/RULES.md`
@@ -835,6 +851,7 @@ function main() {
   let matched = 0;
   let folded = 0;
   let declaredCount = 0;
+  let declaredValues = 0;
 
   for (let i = 0; i < queries.length; i++) {
     const query = queries[i];
@@ -898,12 +915,17 @@ function main() {
       const leftValues = valuesOf(theirs, true, scheme);
       const rightValues = valuesOf(ours, false, scheme);
       const bad = [];
+      let excused = false;
       for (const [key, list] of leftValues) {
         const other = rightValues.get(key) || [];
-        if (JSON.stringify(list) !== JSON.stringify(other) && !isBracketQuirk(list, other)) {
-          bad.push(`${key}: ${JSON.stringify(list)} vs ${JSON.stringify(other)}`);
+        if (JSON.stringify(list) === JSON.stringify(other) || isBracketQuirk(list, other)) continue;
+        if (isSeparatorOnly(key, list, other)) {
+          excused = true;
+          continue;
         }
+        bad.push(`${key}: ${JSON.stringify(list)} vs ${JSON.stringify(other)}`);
       }
+      if (excused && !bad.length) declaredValues++;
       if (bad.length) {
         valueDiffs++;
         record(classes, 'value ' + bad[0].split(':')[0], query, bad.join('; '), '');
@@ -930,9 +952,12 @@ function main() {
     `\nquestions: ${queries.length}, answered by a rule: ${matched}, ` +
       `differing: ${differing}, value differences: ${valueDiffs}, ` +
       `host-case folds: ${folded}, declared: ${declaredCount}, ` +
-      `classes: ${classList.length}`
+      `declared values: ${declaredValues}, classes: ${classList.length}`
   );
-  return differing;
+  // A value difference is as much a failure as a matcher difference. This used
+  // to return `differing` alone, so `--values` printed a wrong value and still
+  // exited 0 — one sat in `--from-cases` unnoticed until the gate read the code.
+  return differing + valueDiffs;
 }
 
 // Divergences this port has **declared**, each with the reason and each scoped
