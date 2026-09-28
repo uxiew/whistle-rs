@@ -2205,7 +2205,13 @@ async fn run_console(state: Arc<AppState>, port: u16) -> Result<()> {
             .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
         port,
     );
-    let listener = TcpListener::bind(addr).await?;
+    serve_console(state, TcpListener::bind(addr).await?).await
+}
+
+/// [`run_console`] on a socket that is already bound. Split out so a test can
+/// bind port 0 and keep holding it: dropping a probe listener and re-binding
+/// its number lost the port to a parallel test about one run in twenty.
+async fn serve_console(state: Arc<AppState>, listener: TcpListener) -> Result<()> {
     tracing::info!("console listening on http://{}", listener.local_addr()?);
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -2373,26 +2379,17 @@ mod console_port_tests {
     /// other port is not one here.
     #[tokio::test]
     async fn the_console_answers_on_its_own_port() {
+        // Bound here and handed over, never dropped and re-bound: the port is
+        // ours from this line on, and connects queue in the backlog until the
+        // server task first polls `accept`.
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        drop(listener);
         let state = state(Some(port));
         let server = state.clone();
-        tokio::spawn(async move { run_console(server, port).await });
+        tokio::spawn(async move { serve_console(server, listener).await });
 
-        // The port is bound asynchronously; give the spawn a moment to land.
         let url = format!("http://127.0.0.1:{port}");
-        let mut page = None;
-        for _ in 0..50 {
-            match reqwest_get(&format!("{url}/")).await {
-                Ok(body) => {
-                    page = Some(body);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
-            }
-        }
-        let page = page.expect("the console never came up");
+        let page = reqwest_get(&format!("{url}/")).await.expect("index");
         assert!(
             page.starts_with("HTTP/1.1 200"),
             "index: {}",
