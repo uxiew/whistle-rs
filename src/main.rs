@@ -353,7 +353,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| PathBuf::from("."))
             .join(DATA_DIRNAME)
     });
-    std::fs::create_dir_all(&storage_dir)
+    whistle_rs::private_fs::create_dir(&storage_dir)
         .with_context(|| format!("creating storage dir {}", storage_dir.display()))?;
 
     let mut plugins = std::collections::HashMap::new();

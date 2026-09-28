@@ -33,6 +33,8 @@ pub mod config;
 pub mod embed;
 pub mod explain;
 pub mod plugins;
+#[doc(hidden)]
+pub mod private_fs;
 pub mod proxy;
 pub mod qr;
 pub mod rules;

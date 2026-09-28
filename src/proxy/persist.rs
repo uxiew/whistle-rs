@@ -5,7 +5,7 @@
 //! under `storage_dir/sessions/`. On startup the most recent files are loaded
 //! back into memory so the Network view survives restarts.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -174,7 +174,9 @@ impl SessionStore {
     /// Create a new store writing to `dir`, retaining `retain_days` days of
     /// files. Spawns a background tokio task for writes.
     pub fn new(dir: PathBuf, retain_days: u32) -> Self {
-        fs::create_dir_all(&dir).ok();
+        // Sessions hold cookies and `Authorization` headers verbatim.
+        crate::private_fs::create_dir(&dir).ok();
+        crate::private_fs::tighten(&dir);
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(writer_task(dir, retain_days, rx));
         SessionStore { tx }
@@ -250,7 +252,7 @@ async fn writer_task(
 
 /// Open (or create) a file for appending.
 fn open_append(path: &Path) -> Option<File> {
-    OpenOptions::new().create(true).append(true).open(path).ok()
+    crate::private_fs::open_append(path).ok()
 }
 
 /// List all `sessions-*.jsonl` files in `dir`.

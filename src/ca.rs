@@ -149,6 +149,13 @@ impl CertAuthority {
             let key_pem = std::fs::read_to_string(&key_path)
                 .with_context(|| format!("reading {}", key_path.display()))?;
             let ca_key = KeyPair::from_pem(&key_pem).context("parsing root CA key")?;
+            // Written world-readable by versions before the key was protected;
+            // anyone who can read it can mint certificates every client of
+            // this proxy trusts.
+            crate::private_fs::tighten(&key_path);
+            if let Some(dir) = key_path.parent() {
+                crate::private_fs::tighten(dir);
+            }
             let params =
                 CertificateParams::from_ca_cert_pem(&cert_pem).context("parsing root CA cert")?;
             let ca_cert = params
@@ -159,11 +166,13 @@ impl CertAuthority {
             let (ca_cert, ca_key) = generate_root_ca()?;
             let cert_pem = ca_cert.pem();
             if let Some(dir) = cert_path.parent() {
-                std::fs::create_dir_all(dir).ok();
+                crate::private_fs::create_dir(dir).ok();
             }
+            // The certificate is public — it is what clients are asked to
+            // trust. The key is not.
             std::fs::write(&cert_path, cert_pem.as_bytes())
                 .with_context(|| format!("writing {}", cert_path.display()))?;
-            std::fs::write(&key_path, ca_key.serialize_pem().as_bytes())
+            crate::private_fs::write(&key_path, ca_key.serialize_pem().as_bytes())
                 .with_context(|| format!("writing {}", key_path.display()))?;
             (ca_cert, ca_key, cert_pem)
         };
@@ -593,6 +602,58 @@ fn generate_root_ca() -> Result<(Certificate, KeyPair)> {
         .self_signed(&ca_key)
         .context("self-signing root CA")?;
     Ok((ca_cert, ca_key))
+}
+
+#[cfg(all(test, unix))]
+mod key_permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn config(label: &str) -> Config {
+        let dir =
+            std::env::temp_dir().join(format!("whistle-rs-keyperm-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Config {
+            storage_dir: dir,
+            persist_sessions: false,
+            ..Config::default()
+        }
+    }
+
+    /// A new root key is its owner's alone, in a directory only its owner can
+    /// enter. The certificate is public and may stay readable.
+    #[test]
+    fn a_new_root_key_is_owner_only() {
+        let config = config("new");
+        CertAuthority::load_or_create(&config).expect("ca");
+        assert_eq!(mode(&config.root_ca_key_path()), 0o600);
+        assert_eq!(
+            mode(config.root_ca_key_path().parent().expect("dir")),
+            0o700
+        );
+    }
+
+    /// Installs made before this wrote the key `0644`; loading it narrows it.
+    #[test]
+    fn a_world_readable_key_from_before_is_narrowed_on_load() {
+        let config = config("old");
+        CertAuthority::load_or_create(&config).expect("first start");
+        let key = config.root_ca_key_path();
+        let dir = key.parent().expect("dir").to_path_buf();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        CertAuthority::load_or_create(&config).expect("second start");
+        assert_eq!(mode(&key), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+    }
 }
 
 #[cfg(test)]

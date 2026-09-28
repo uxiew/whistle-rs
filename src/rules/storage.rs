@@ -64,7 +64,10 @@ pub fn load_groups(dir: &Path, manager: &mut RuleManager) {
 
 /// Save all rule groups from `manager` to `dir`.
 pub fn save_groups(dir: &Path, manager: &RuleManager) {
-    fs::create_dir_all(dir).ok();
+    // Owner-only: rules carry hostnames, credentials in proxy:// URLs, file
+    // paths. See `crate::private_fs`.
+    crate::private_fs::create_dir(dir).ok();
+    crate::private_fs::tighten(dir);
 
     let config = GroupsConfig {
         groups: manager
@@ -79,13 +82,13 @@ pub fn save_groups(dir: &Path, manager: &RuleManager) {
 
     // Write groups.json.
     if let Ok(json) = serde_json::to_string_pretty(&config) {
-        fs::write(dir.join("groups.json"), json).ok();
+        crate::private_fs::write(&dir.join("groups.json"), json.as_bytes()).ok();
     }
 
     // Write each group's text.
     for g in manager.groups() {
         let file = dir.join(format!("{}.rules", safe_filename(&g.name)));
-        fs::write(&file, &g.text).ok();
+        crate::private_fs::write(&file, g.text.as_bytes()).ok();
     }
 }
 
@@ -102,7 +105,7 @@ pub fn save_meta(dir: &Path, manager: &RuleManager) {
             .collect(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&config) {
-        fs::write(dir.join("groups.json"), json).ok();
+        crate::private_fs::write(&dir.join("groups.json"), json.as_bytes()).ok();
     }
 }
 
@@ -126,9 +129,12 @@ pub fn load_values(dir: &Path) -> std::collections::HashMap<String, String> {
 
 /// Write the values store to disk.
 pub fn save_values(dir: &Path, values: &std::collections::HashMap<String, String>) {
-    fs::create_dir_all(dir).ok();
+    // `dir` is the storage root, which may be a directory the operator chose
+    // and already had: created owner-only if new, otherwise left alone. The
+    // file itself — values often hold tokens — is always owner-only.
+    crate::private_fs::create_dir(dir).ok();
     if let Ok(json) = serde_json::to_string_pretty(values) {
-        fs::write(values_path(dir), json).ok();
+        crate::private_fs::write(&values_path(dir), json.as_bytes()).ok();
     }
 }
 
