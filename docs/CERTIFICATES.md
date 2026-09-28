@@ -27,7 +27,7 @@ On first start whistle-rs generates and persists the root CA under the storage d
 
 ```
 ~/.whistle-rs/certs/root.crt   # the root certificate (install this)
-~/.whistle-rs/certs/root.key   # its private key (keep secret)
+~/.whistle-rs/certs/root.key   # its private key (keep secret; created 0600 on Unix)
 ```
 
 Delete both files to regenerate a fresh CA on the next start (you'll need to
@@ -94,7 +94,9 @@ sudo cp ~/.whistle-rs/certs/root.crt /etc/pki/ca-trust/source/anchors/whistle-rs
 sudo update-ca-trust
 ```
 
-> **Which IP?** whistle-rs prints the addresses a device on the same network can
+> **Which IP?** A phone can reach the proxy only if it was started with
+> `-H 0.0.0.0` (or a LAN address) — the default is `127.0.0.1`, this machine
+> only. Then whistle-rs prints the addresses a device on the same network can
 > reach it at, at startup and in `GET /api/status`. `0.0.0.0` in the listen line
 > is not one of them — it means "every interface", and a phone needs a specific
 > one. If nothing is printed, this machine has no private address the kernel will

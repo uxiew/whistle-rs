@@ -662,17 +662,24 @@ example.com   rule://{teamRules}
 
 ### 1. Make the proxy reachable
 
-whistle-rs binds **all interfaces** by default, so it is already listening on
-your LAN address. Find it:
+whistle-rs listens on `127.0.0.1` by default — this machine only — so a phone
+has to be let in. Set a console login first: anyone who can reach the port can
+open the console, and the rules it edits read and write files on this machine.
+
+```bash
+whistle-rs -H 0.0.0.0 -n admin -w "$PASSWORD"
+```
+
+Then find your LAN address:
 
 ```bash
 ipconfig getifaddr en0        # macOS
 ip -4 addr show scope global  # Linux
 ```
 
-Everything below assumes `192.168.1.5:8899`. If you would rather bind
-explicitly, `-H 0.0.0.0`; to keep the proxy off the network entirely,
-`-H 127.0.0.1`.
+Everything below assumes `192.168.1.5:8899`. There is no proxy authentication
+or IP allow-list: on a network you do not control, a firewall decides who may
+use it ([`OPERATIONS.md`](OPERATIONS.md)).
 
 ### 2. Point the device at it
 
@@ -791,7 +798,8 @@ are **direct** requests, not through the proxy:
 | `GET /frames.json?id=N` | the WebSocket frames of connection `N`, both directions |
 | `GET /sessions.har` | everything as a HAR 1.2 file |
 | `GET /api/status` | ports, TLS posture, root CA path, rule count, registered plugins. A cross-origin browser fetch from an origin not on `--allow-origin` gets `version` and `port` only — see [`CLI.md`](CLI.md#calling-the-console-from-another-page) |
-| `POST /api/sessions/clear` | drop the capture |
+| `POST /api/sessions/clear` | drop the capture from memory (persisted history returns after a restart) |
+| `POST /api/sessions/purge` | drop the capture and delete the persisted history |
 
 ```bash
 # a table of what has been seen
@@ -855,6 +863,8 @@ Everything the console does is an HTTP endpoint taking plain text or JSON, so a
 script — or a model with a shell — can run the whole loop without a browser:
 **see what an interface does, change it, check the change, and ask why a rule
 did or did not fire.** No SDK, no session, no CSRF token; a `curl` is enough.
+(A *browser* page on another site is refused when it tries to change things —
+a request with no `Origin` header, which is what curl sends, is not.)
 
 The four calls, in the order that loop uses them:
 

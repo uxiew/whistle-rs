@@ -604,15 +604,22 @@ example.com   rule://{teamRules}
 
 ### 1. 让代理可达
 
-whistle-rs 默认绑定**所有网卡**，所以它已经在你的局域网地址上监听了。找出这个地址：
+whistle-rs 默认只监听 `127.0.0.1`，也就是只有本机能用，所以要显式放手机进来。先设控制台口令：
+能连上端口的人都能打开控制台，而它编辑的规则能读写本机文件。
+
+```bash
+whistle-rs -H 0.0.0.0 -n admin -w "$PASSWORD"
+```
+
+然后找出局域网地址：
 
 ```bash
 ipconfig getifaddr en0        # macOS
 ip -4 addr show scope global  # Linux
 ```
 
-下文都假设是 `192.168.1.5:8899`。想显式绑定就 `-H 0.0.0.0`；想让代理完全不上网络，
-用 `-H 127.0.0.1`。
+下文都假设是 `192.168.1.5:8899`。本项目没有代理认证也没有 IP 白名单：在你不能控制的网络里，
+要靠防火墙决定谁能用它（见 [OPERATIONS.md](OPERATIONS.md)）。
 
 ### 2. 把设备指过来
 
@@ -718,7 +725,8 @@ TLS 会话是客户端与源站之间的，代理只搬字节。
 | `GET /frames.json?id=N` | 第 `N` 条连接的 WebSocket 帧，双向 |
 | `GET /sessions.har` | 全部导出为 HAR 1.2 文件 |
 | `GET /api/status` | 端口、TLS 姿态、根证书路径、规则数、已注册插件。跨域调用时，若来源不在 `--allow-origin` 列表里，只返回 `version` 与 `port` —— 见 [`CLI.md`](CLI.md#calling-the-console-from-another-page) |
-| `POST /api/sessions/clear` | 清空抓包 |
+| `POST /api/sessions/clear` | 清空列表（只清内存，落盘的历史重启后会回来） |
+| `POST /api/sessions/purge` | 清空列表并删除落盘的历史 |
 
 ```bash
 # 看一眼都抓到了什么
@@ -773,7 +781,7 @@ api.example.com   resHeaders://x-replayed=1   includeFilter://from:composer
 控制台做的每一件事都是一个 HTTP 端点，收的是纯文本或 JSON。所以一个脚本 ——
 或者一个能敲 shell 的模型 —— 不用浏览器就能跑完整个回路：**看一个接口现在是什么样、
 把它改掉、验证改动、再问「这条规则到底匹没匹上」**。没有 SDK，没有会话，
-没有 CSRF token，一条 `curl` 就够。
+没有 CSRF token，一条 `curl` 就够。（别的网站上的**浏览器**页面想改东西会被拒绝；curl 不带 `Origin` 头，不受影响。）
 
 回路用到的四个调用，按顺序：
 
