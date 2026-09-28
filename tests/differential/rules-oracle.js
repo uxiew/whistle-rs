@@ -51,13 +51,18 @@ const path = require('path');
 const Module = require('module');
 const { execFileSync } = require('child_process');
 
-const WHISTLE_RULES = path.join(
+// The real path, not the spelled one: `loadUpstreamRules` plants a stub in
+// `require.cache`, and Node keys that cache by real path. Through a symlinked
+// `node_modules` (mutations.js's scratch worktree) the stub landed under a key
+// nothing looked up, upstream's circular require ran for real, and every run
+// died on "Rules is not a constructor".
+const WHISTLE_RULES = require('fs').realpathSync(path.join(
   __dirname,
   'node_modules',
   'whistle',
   'lib',
   'rules'
-);
+));
 // `RS_BIN` as in the benches that start a proxy, so every tool here can be
 // pointed at the same binary — a release build, or one under test elsewhere.
 const BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
