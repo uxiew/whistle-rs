@@ -44,6 +44,9 @@ const { spawn } = require('child_process');
 
 const BASE = Number(process.env.PORT_BASE || 20900);
 const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+// Set by `run.js`; see mode-bench.js.
+const STATE = process.env.DIFF_STATE || __dirname;
+const HOST = process.env.DIFF_HOST;
 const W = BASE, A = BASE + 2, B = BASE + 3;
 
 const MODES = process.env.FMODES ? process.env.FMODES.split(',') : [
@@ -98,14 +101,15 @@ function origin(port, name) {
 
 function start(which, mode) {
   return new Promise((resolve, reject) => {
-    const dir = path.join(__dirname, `.fwd-${which}-${(mode || 'none').replace(/\W/g, '_')}`);
+    const dir = path.join(STATE, `.fwd-${which}-${(mode || 'none').replace(/\W/g, '_')}`);
     const child = which === 'whistle'
       ? spawn('node', ['-e', `
           const whistle = require('whistle');
-          whistle({ port: ${W}, baseDir: ${JSON.stringify(dir)}${mode ? `, mode: ${JSON.stringify(mode)}` : ''} },
+          whistle({ port: ${W}, baseDir: ${JSON.stringify(dir)}${HOST ? `, host: ${JSON.stringify(HOST)}` : ''}${mode ? `, mode: ${JSON.stringify(mode)}` : ''} },
             () => console.log('READY'));
         `], { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] })
-      : spawn(RS_BIN, ['--port', String(W), '--no-persist', '--dir', dir, ...(mode ? ['-M', mode] : [])],
+      : spawn(RS_BIN, ['--port', String(W), '--no-persist', '--dir', dir,
+        ...(HOST ? ['-H', HOST] : []), ...(mode ? ['-M', mode] : [])],
         { stdio: ['ignore', 'pipe', 'pipe'] });
     let done = false;
     const t = setTimeout(() => { if (!done) { done = true; child.kill('SIGKILL'); reject(new Error('start timeout')); } }, 25000);

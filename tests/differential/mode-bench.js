@@ -34,6 +34,11 @@ const { spawn } = require('child_process');
 const BASE = Number(process.env.PORT_BASE || 20100);
 /** The binary under test; built by `cargo build` from the repo root. */
 const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+// `run.js` sets both: a scratch directory for every proxy's state, and a
+// loopback listener. Unset, the state lands beside this file and the proxies
+// listen on every interface, as they always did.
+const STATE = process.env.DIFF_STATE || __dirname;
+const HOST = process.env.DIFF_HOST;
 const W = BASE, ORIGIN = BASE + 2;
 
 const MODES = process.env.MODES ? process.env.MODES.split(',') : [
@@ -160,7 +165,7 @@ async function battery(port, which) {
  */
 function start(which, mode, port) {
   return new Promise((resolve, reject) => {
-    const dir = path.join(__dirname, `.mode-${which}-${mode || 'none'}`);
+    const dir = path.join(STATE, `.mode-${which}-${mode || 'none'}`);
     // **whistle is started with `capture` in front of every list.** The two
     // proxies' defaults differ on purpose — whistle does not decrypt HTTPS in a
     // fresh data directory (`_original/lib/tunnel.js:187-199`) and this port
@@ -173,11 +178,12 @@ function start(which, mode, port) {
     const child = which === 'whistle'
       ? spawn('node', ['-e', `
           const whistle = require('whistle');
-          whistle({ port: ${port}, baseDir: ${JSON.stringify(dir)},
+          whistle({ port: ${port}, baseDir: ${JSON.stringify(dir)},${HOST ? ` host: ${JSON.stringify(HOST)},` : ''}
             mode: ${JSON.stringify(wMode)} }, () => console.log('READY'));
         `], { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] })
       : spawn(RS_BIN, [
           '--port', String(port), '--no-persist', '--dir', dir,
+          ...(HOST ? ['-H', HOST] : []),
           ...(mode ? ['-M', mode] : []),
         ], { stdio: ['ignore', 'pipe', 'pipe'] });
     let done = false;

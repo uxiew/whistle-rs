@@ -34,11 +34,20 @@ if (process.env.W2_PASS) auth.password = process.env.W2_PASS;
 if (process.env.W2_GUEST) auth.guestName = process.env.W2_GUEST;
 if (process.env.W2_GUEST_PASS) auth.guestPassword = process.env.W2_GUEST_PASS;
 
+// `run.js` points both of these somewhere of its own: the data directory at a
+// scratch directory it deletes afterwards, so no run inherits another's rules
+// or root CA, and the listener at loopback. Unset, they are what they always
+// were — a directory beside this file, and every interface.
+const baseDir = process.env.WHISTLE_DIFF_DATA
+  || path.join(__dirname, `.data-${process.env.PORT_BASE || 18700}${tag}`);
+const host = process.env.WHISTLE_DIFF_HOST ? { host: process.env.WHISTLE_DIFF_HOST } : {};
+
 whistle(
   {
     port: Number(process.env.PORT_BASE || 18700),
     // A directory per port, so several oracles can run side by side.
-    baseDir: path.join(__dirname, `.data-${process.env.PORT_BASE || 18700}${tag}`),
+    baseDir,
+    ...host,
     ...auth,
   },
   () => console.log('whistle listening on', process.env.PORT_BASE || 18700),

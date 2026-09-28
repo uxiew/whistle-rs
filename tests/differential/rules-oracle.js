@@ -58,7 +58,9 @@ const WHISTLE_RULES = path.join(
   'lib',
   'rules'
 );
-const BIN = path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+// `RS_BIN` as in the benches that start a proxy, so every tool here can be
+// pointed at the same binary — a release build, or one under test elsewhere.
+const BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
 
 // `rules.js` requires `util.js`, which requires `index.js`, which requires
 // `rules.js` back — and `index.js` also builds the singletons a running proxy

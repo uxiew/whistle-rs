@@ -20,12 +20,23 @@ const { execSync } = require('child_process');
 
 const BASE = Number(process.env.PORT_BASE || 19600);
 const [W, RS, ORIGIN] = [BASE, BASE + 1, BASE + 2];
-const KEY = '/tmp/diff-https-key.pem';
-const CRT = '/tmp/diff-https-crt.pem';
+// In `run.js`'s scratch directory when it sets one, so the key goes with the run.
+const CERT_DIR = process.env.DIFF_STATE || '/tmp';
+const KEY = `${CERT_DIR}/diff-https-key.pem`;
+const CRT = `${CERT_DIR}/diff-https-crt.pem`;
 
-/** A self-signed certificate for `localhost`, made once. */
+/**
+ * A self-signed certificate for `localhost`, reused while it is under a day old.
+ *
+ * It is valid for two days, and this used to check only that the files existed,
+ * so a `/tmp` left from last week served an expired one. Neither proxy verifies
+ * this origin today (whistle by default, whistle-rs under `--insecure-upstream`),
+ * so nothing failed — but that is a launch flag away from every case failing on
+ * the handshake for a reason that has nothing to do with the case.
+ */
 function ensureCert() {
-  if (fs.existsSync(KEY) && fs.existsSync(CRT)) return;
+  const fresh = (file) => fs.existsSync(file) && Date.now() - fs.statSync(file).mtimeMs < 24 * 3600 * 1000;
+  if (fresh(KEY) && fresh(CRT)) return;
   execSync(
     `openssl req -x509 -newkey rsa:2048 -keyout ${KEY} -out ${CRT} -days 2 -nodes ` +
       `-subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" 2>/dev/null`,
