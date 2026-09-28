@@ -4,6 +4,9 @@
   "private": true,
   "description": "The whistle-rs web console: a Vue 3 app that builds to one self-contained HTML file.",
   "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
