@@ -28,9 +28,9 @@ nothing to apply it to.
 | whistle | whistle-rs | |
 | --- | --- | --- |
 | `-p, --port` | `-p, --port` | ✅ |
-| `-H, --host` | `-H, --host` | ✅ |
-| `-P, --uiport` | `-P, --uiport` | ✅ console on a port of its own |
-| `-n/-w`, `-N/-W` | same | ✅ console login, and the read-only account |
+| `-H, --host` | `-H, --host` | ⚠️ defaults to `127.0.0.1`, not every interface — [see below](#listening-beyond-this-machine) |
+| `-P, --uiport` | `-P, --uiport` | ✅ a second port that serves only the console (it stays on the proxy port too) |
+| `-n/-w`, `-N/-W` | same | ⚠️ console login and the read-only account; `-N/-W` without `-n/-w` is refused rather than left open |
 | `-l, --localUIHost` | `-l, --local-ui-host` | ✅ adds to the built-in three, as upstream does |
 | `-M, --mode` | `-M, --mode` | ⚠️ support depends on the mode and its combinations — see the mode table below |
 | `-t, --timeout` | `-t, --timeout` | ✅ same default, 360000 ms |
@@ -157,10 +157,29 @@ INFO -M multiEnv: 2 named rule group(s) loaded but not resolved; the default gro
 expands them, so `-M multiple` really does bring `keepXFF` **and** `multiEnv`
 with it, and `-M admin` brings `strict`.
 
+## Listening beyond this machine
+
+whistle-rs binds `127.0.0.1` unless `-H` says otherwise, so a fresh start is a
+proxy — and a console — for this machine only. Upstream binds every interface
+by default; that made a new instance an open proxy for the whole network, with
+a console anyone on it could rewrite, and rules can read and write files. To let
+a phone or another machine in, ask for it, and set a login first:
+
+```sh
+whistle-rs -H 0.0.0.0 -n admin -w "$PASSWORD"
+```
+
+Startup says which it is: on loopback, an INFO line with that command; bound
+beyond loopback with no `-n/-w`, a WARN. The console's Status pane shows the
+phone QR codes only when the proxy is reachable from the network. There is no
+proxy authentication or IP allow-list here, so on a shared network a firewall
+decides who may connect — [`OPERATIONS.md`](OPERATIONS.md).
+
 ## A QR code for a phone
 
 `gui/mobile.md` is a page about typing a proxy address into a phone. Both
-consoles shorten it with a QR code per LAN address; this one is also a command:
+consoles shorten it with a QR code per LAN address (shown when started with
+`-H 0.0.0.0`); this one is also a command:
 
 ```sh
 whistle-rs qr "http://192.168.1.5:8899/rootCA.crt"   # drawn in the terminal
@@ -206,7 +225,7 @@ install:
 
 ```
 INFO root CA supplied by hand: /path/to/certs/root.crt
-INFO root CA: /path/to/certs/root.crt (download at http://0.0.0.0:8899/rootCA.crt)
+INFO root CA: /path/to/certs/root.crt (download at http://127.0.0.1:8899/rootCA.crt)
 INFO certificates supplied by hand for: *.wild.example, api.example.com
 ```
 
@@ -257,11 +276,25 @@ the same two.
 > the body shrinks.
 
 > **A preflight is not covered**, here or upstream: neither sends
-> `Access-Control-Allow-Methods` or `-Allow-Headers`, so anything the browser
-> preflights — a JSON body, a custom header — is refused whatever the list says.
-> Simple `GET`s work, which is what the two open paths are. Widening that would
-> hand a named origin the whole API, on a console whose only other gate may be a
-> password.
+> `Access-Control-Allow-Methods` or `-Allow-Headers`, so a request the browser
+> preflights — a custom header, a `Content-Type: application/json` — is refused
+> whatever the list says. Widening that would hand a named origin the whole API,
+> on a console whose only other gate may be a password.
+
+**Reading is what CORS decides; writing is decided before the request runs.**
+A `POST` with a `text/plain` body is a *simple* request, sent without asking,
+and CORS only hides the answer afterwards — by which time the rules had
+changed. So a `POST` or `DELETE` that carries an `Origin` must come from the
+console's own page or an origin on this list, and anything else is a `403`
+before the route runs. A request with no `Origin` — curl, a script — is not a
+browser acting for a site and is unaffected. Upstream checks nothing here. The
+list therefore grants **writes** to the origins it names, and `'*'` grants them
+to every site: use names.
+
+The console also refuses a request whose `Host` is not one of its names — an IP
+address, `localhost`, or a console hostname (the built-in ones and any added
+with `-l`) — which is what stops DNS rebinding. To open the console under
+another name, add it with `-l`.
 
 ## Coming from `w2`
 
@@ -294,11 +327,15 @@ the process is alive — and everything else on the console port is a 404.
 **A shared proxy on the network, read-only for everyone but you.**
 
 ```sh
-whistle-rs -p 8899 -n admin -w "$PASSWORD" -N guest -W look
+whistle-rs -H 0.0.0.0 -p 8899 -n admin -w "$PASSWORD" -N guest -W look
 ```
 
 The login gates the console and **not** the traffic — proxying keeps working for
-clients that know nothing about it. The guest account may `GET` and nothing else.
+clients that know nothing about it, and any device that can connect may use it,
+so the network or a firewall decides who that is. The guest account may `GET`
+and nothing else — which includes every captured request's headers, cookies
+and `Authorization` among them. `-N/-W` without `-n/-w` is refused at startup:
+with no admin account nobody would be asked to log in, guest included.
 
 **Watching a streamed body arrive** (an LLM's tokens, a chunked JSON feed):
 
