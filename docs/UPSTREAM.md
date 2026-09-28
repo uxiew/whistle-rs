@@ -5,16 +5,20 @@
 源码、手册与测试中形如 `_original/lib/rules/rules.js:1449` 的标记是上游源码定位线索，
 不是自动证明兼容的测试结果。引用数量随代码变化，不再维护容易过期的总数。
 
-上游源码不随本仓库分发。2026-09-25 检查时本地已有未跟踪的 `_original/`，
-本轮没有改动；复核时不要覆盖自己的既有副本。
+上游源码不随本仓库分发（许可与来源说明见 [NOTICE.md](../NOTICE.md)）。`_original/` 已被 `.gitignore` 忽略，
+也不会进 crate 包；复核时不要覆盖自己的既有副本。
 
 ## 版本不是同一个概念
 
 | 对象 | 约束 |
 | --- | --- |
-| 可执行 oracle | `tests/differential/package.json` 固定 Whistle **2.10.8**；本轮读取已安装包确认一致 |
-| 历史源码定位 | 旧文档记录 `1df0805f09fd979e0e31fd6eab99ca97239ac1ec` / `v2.10.8`；本轮未独立确认二者及发布包的逐文件对应关系 |
-| 在线 master / 官网 | 2026-09-25 在线观察 `master/package.json` 为 **2.10.10**；官网与 master 都是浮动资料，不自动成为兼容基线 |
+| 可执行 oracle | npm 包 whistle **2.10.8**，连同全部传递依赖由 `tests/differential/package-lock.json` 固定 |
+| 源码定位 | 注释和文档里的 `_original/…:行号` 对应 tag **`v2.10.8` = 提交 `1df0805f09fd979e0e31fd6eab99ca97239ac1ec`** |
+| 在线 master / 官网 | 2026-09-25 在线观察 `master/package.json` 为 **2.10.10**（tag `v2.10.10` = `a1e4751`）；浮动资料，不自动成为兼容基线 |
+
+2026-09-28 核实过这三者的对应关系：`git ls-remote` 显示 `v2.10.8` 是指向 `1df0805` 的轻量 tag；npm 包 whistle@2.10.8 的 228 个文件里，227 个（含 `package.json`）与该提交的源码树逐字节相同，唯一多出的 `biz/webui/htdocs/js/index.js` 是发布时构建的上游控制台产物。所以差分测的对照组就是 `1df0805` 的源码，按行号查引用时应检出这个提交。
+
+**本机 `_original/` 未必是这个版本。** 这台机器上的是 `v2.10.4`（`6da6e6c`），行号会对不上几行甚至整段；跟引用前先 `git -C _original checkout 1df0805`，或按下面的方法另外克隆。
 
 来源：[官方仓库](https://github.com/avwo/whistle)、[package.json](https://github.com/avwo/whistle/blob/master/package.json)、[更新日志](https://github.com/avwo/whistle/blob/master/CHANGELOG.md)、[官网文档](https://wproxy.org/docs/)。
 升级基线按 ROADMAP 的 U1 做双版本复验，不直接把旧报告的版本号替换掉。
@@ -34,9 +38,8 @@ git checkout 1df0805f09fd979e0e31fd6eab99ca97239ac1ec
 不是要求用户机器必须有某个绝对路径。若对象无法获取或与标签不一致，先记录并纠正来源，
 不要拿当前 master 的同一行号冒充旧依据。
 
-差分脚本实际读取 `tests/differential/node_modules/whistle/`；安装方式见 DEVELOPMENT。
-**npm 发布包不应被无条件描述为 Git 仓库的“同一棵树”**：发布清单、生成物和测试资料可以不同。
-当前差分目录也没有受版本控制的依赖锁文件，仅顶层版本固定，Q2 将补齐传递依赖可复现性。
+差分脚本实际读取 `tests/differential/node_modules/whistle/`，按锁文件用 `npm ci` 安装，见 DEVELOPMENT。
+**npm 发布包不应被无条件描述为 Git 仓库的“同一棵树”**：2.10.8 恰好只差一个构建产物（见上），换版本要重新比对。
 
 行号是定位提示，不是稳定 API。新记录优先附版本、文件、函数名、最小用例和结果；
 Git 源码、npm 包与当前官网之间的差别必须显式说明。
