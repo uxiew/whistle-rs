@@ -4,7 +4,7 @@
 
 本轮修改限于文档；没有为通过检查而改动 Rust、前端、依赖声明或锁文件。初始工作区已有未跟踪的 `_original/`，未纳入提交、删除或覆盖。
 
-**2026-09-28 更新：** Q1 已完成，质量门禁在钉住的工具链上全部通过，见 [Q1 门禁复验](#2026-09-28-q1-门禁复验)。下文「2026-09-25 审查时的验证」保留为当时的记录，其中 Clippy/格式失败已不是现状。
+**2026-09-28 更新：** Q1 已完成，质量门禁在钉住的工具链上全部通过，见 [Q1 门禁复验](#2026-09-28-q1-门禁复验)。Q2 的本地部分完成，CI 待首次在 GitHub 上运行，见 [Q2 记录](#2026-09-28-q2-可复现构建与差分门禁)。下文「2026-09-25 审查时的验证」保留为当时的记录，其中 Clippy/格式失败已不是现状。
 
 ## 结论
 
@@ -39,7 +39,7 @@
 | 持久化 | JSONL 会话历史与按天保留；内存/体预览有界。UI 隐藏不等于后端未采集，预览/HAR/重放不能保证任意大报文完整 | `src/proxy/{persist,body,webui}.rs`、`src/config.rs` |
 | 插件生态 | 自有 Rust/HTTP/Node 插件协议与 SDK；**不直接运行现成 `whistle.*` npm 插件** | `src/plugins/`、`sdk/`、[PLUGINS.md](PLUGINS.md) |
 | CLI / Agent 接口 | `explain`、`qr` 及自有 HTTP API；没有 `w2 start/stop` 兼容层，`-r` 是可编辑的 Default 规则组而不是上游隐藏 shadowRules | `src/main.rs`；`src/proxy/webui.rs` |
-| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；仍没有受版本控制的 CI、根 LICENSE 或差分依赖锁文件 | 本文 Q1 复验；`rust-toolchain.toml`、`Cargo.toml`；`git ls-files` |
+| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；差分依赖有审阅过的锁文件，`run.js` 一条命令跑全量差分并归档；CI workflow 已写好但**尚未在 GitHub 上运行过**；仍无根 LICENSE | 本文 Q1、Q2 记录；`.github/workflows/`；`tests/differential/` |
 
 上游插件契约见[官方插件开发](https://wproxy.org/docs/extensions/dev.html)；上游 Local Agent API 见[官方接口文档](https://wproxy.org/docs/extensions/api.html)。同名能力不意味着 URL、数据模型或插件对象兼容。
 
@@ -114,12 +114,74 @@ Q1 做了什么（每项一个提交，可单独回退）：
 - MSRV 1.95 与 Node 版本只在 macOS arm64 上实测；Node 下限 20.19 是按依赖声明推出的，未真机验证。
 - `src/proxy/bench.rs:454` 有同样的"释放再重绑"写法。它在 `#[ignore]` 基准里，普通门禁不跑，但单独跑基准时可能偶发同类失败。
 
+## 2026-09-28 Q2 可复现构建与差分门禁
+
+环境同 Q1：macOS / Apple M4 / Darwin 25.3.0 arm64，Rust 1.98.1，Node.js **v26.4.0**，npm 11.17.0；对照组 whistle **2.10.8**，锁文件 SHA-256 `45b91b6c…6fdec`。每条测量后面写了它对应的提交。
+
+**结论：** 本地部分完成并实测——锁文件、统一入口、逐条声明、未知差异非零退出、inert 必须有解释、预设回归必被抓住、全新 clone 可重建。**CI 两个 workflow 写好了，但从没在 GitHub 上跑过**，所以 ROADMAP 里 CI 两项不勾；Linux 上的任何结果都还没有测过。
+
+### 做了什么
+
+| 提交 | 内容 |
+| --- | --- |
+| `a33369e` | 差分依赖锁文件：196 个包钉在历次测量用的那棵树上；`resolved`/`integrity` 取自 registry.npmjs.org，并与 npmmirror 逐个核对一致 |
+| `bdd07b0` | `rules-oracle` 的取值差异计入退出码（原来只算匹配差异）；借此发现一个藏着的取值差异（`file://D:\dir\` 的分隔符），核实后声明 |
+| `f55fddb` | oracle 与三个自起代理的 bench 可由外部指定状态目录、监听地址和二进制；https-bench 的证书超过一天就重建 |
+| `223915a` | `declared.js`：82 条已知差异逐条写明用例、字段、上游版本、理由；`EXPECTED` 每条限定字段和范围，两条收窄；`IGNORE` 每个头写明理由；未声明差异和过期声明都让 harness 退出 1 |
+| `624669e` | auth/frames/https/timing/mode 五个 bench 按未声明差异数决定退出码（原来永远 0） |
+| `3c09405` | cases-paths 三个本就不该命中的用例标 `inert: true`（此前从未过 inert 分诊） |
+| `9a9832f` | `run.js`：fast / network / all 三个套件，临时目录、回环监听、端口预检、进程组清理、归档 |
+| `f3bdd69` `ea45090` `3608371` `77c2bc9` | `mutations.js` 预设回归检查；修 `require.cache` 桩按真实路径做键；修中断处理；换掉一个等价变异 |
+| `c4255ac` `02663b8` | Markdown 相对链接与锚点检查；修一处审查时改名留下的坏链接 |
+| `66df8e2` `f1bae57` | 控制台检查脚本；CI（`ci.yml` 每个 PR，`differential.yml` 手动+每周） |
+
+### 实测
+
+| 命令 | 结果 | 说明 |
+| --- | --- | --- |
+| 全新目录按锁文件 `npm ci` | **通过** | 装出的 `node_modules` 与原树逐文件一致（`diff -rq` 无输出） |
+| `node run.js all` | **27 步全过，851 秒** | 归档 `second-all`：whistle-rs SHA-256 `7101639b…`；跑完无残留进程、无残留临时目录（代码 ≈ `9a9832f`，差别见该提交说明） |
+| 同上，在写 `declared.js` 之前 | **按预期失败** | 恰好是有已知差异的 10 个语料，加 cases-paths 的 inert 分诊 |
+| `node mutations.js` | **5/5 被抓住**，5 个基线先通过 | `3608371`（4 条）与 `77c2bc9`（改过的 1 条）；见下表 |
+| 全新 `git clone` → `npm ci` → `cargo build` → `run.js fast` | **通过** | `77c2bc9`；clone 里除 `node_modules` 外没有多出任何文件，包括被忽略的 |
+| `scripts/check-console.sh` 四种组合 | **符合预期** | 真控制台构建：built 0、placeholder 1；无前端产物构建：placeholder 0、built 1 |
+| `node scripts/check-links.mjs` | **通过：21 个文件** | 修复前报 1 处；合成仓库里 5 个坏链接全报、8 个好链接不误报 |
+| 两个 workflow | **只验证了 YAML 能解析** | 没有在 GitHub 上运行；本机 Docker 未启动，容器 job 也没在本地跑 |
+
+预设回归（每条都必须让对应门禁失败，且未注入时门禁先通过）：
+
+| 回归 | 由谁抓到 | 备注 |
+| --- | --- | --- |
+| 重要规则失去优先级 | `oracle-cases` | **文档语料 `oracle-docs` 抓不到**，只有手写语料能 |
+| `{name}` 取值多一个空格 | `oracle-cases`，157 处取值差异 | 用 `bdd07b0` 之前的脚本复测同一变异：158 处取值差异，**退出码 0** |
+| `$1` 取错捕获组 | 网络：`cases` 4 例、`cases-patterns` 8 例 | 文档语料的解析差分看不到 |
+| `statusCode://404` 回 405 | 网络：`cases` 3 例 | 解析差分只看"匹配到什么"，看不到执行效果——网络差分存在的理由 |
+| QR 第 6 种掩码取反 | `qr`，17 个码不一致 | |
+
+### 顺带发现的问题
+
+- `rules-oracle` 取值差异不影响退出码，`--values` 印出错值照样退出 0；审查时也只跑了文档语料，`--from-cases` 从没进过验证记录。
+- `harness.js` 与 6 个专项 bench 无论多少差异都退出 0，"已知差异数"靠人对照 README——而 README 的数字有两处和语料对不上（compose 写 7 实为 9；paths 列了两个语料里已不存在的用例、漏了实际有差异的两个）。
+- `require.cache` 桩按拼写路径做键，经符号链接的 `node_modules` 必崩；`mutations.js` 用 `spawnSync` 导致中断后留下已注册的 worktree——两者都已修并实测。
+- 本机设了 `http_proxy` 且无 `no_proxy`，curl 访问 127.0.0.1 也走代理，控制台检查会一直卡住；脚本已加 `--noproxy '*'`。
+- `short_circuit` 里对 `statusCode` 的解析结果总被 `apply_response_for` 覆盖，是死代码（第一版变异因此"存活"）。未改，留给 M1。
+
+### 没有执行 / 剩余风险
+
+- **CI 从未运行。** 以下都只有在 GitHub 上跑一次才算证实：Linux 上的差分结果（全部声明都是在 macOS + Node 26.4 上测的）、`rust:1.98.1-trixie` 容器里的纯代理构建、Node 20.19.0 下的前端构建、缓存恢复的 `target/` 与 `run.js` 的"二进制比源码旧"检查是否相容。
+- `run.js` 用进程组清理子进程，不支持 Windows。
+- 网络套件里 auth/https/mode 会查询 `local.whistlejs.com`、`rootca.pro` 等名字，依赖 DNS；timing 按时间容差判定，在 CI 上是否稳定未知。
+- 语料仍把夹具写到固定的 `/tmp/wrs-*`（测试文件，不含密钥），不在临时目录里、也不删除。
+- auth/https/mode/forwarded 各自的内联声明表已按用例限定，但没有迁进 `declared.js`、也没有写上游版本字段。
+- `tests/differential/` 下此前手动运行留下的 `.data-*`、`.mode-*` 等目录（已被 git 忽略）没有动。
+- 对照组结果随 Node 版本变化；换 Node 需重新测量。
+
 ## 真实缺口与风险
 
 | 优先级 | 发现 | 后续任务 |
 | --- | --- | --- |
 | ~~P0~~ | ~~质量状态漂移：Clippy 两处错误、格式未统一；未固定工具链/最低支持版本~~ 2026-09-28 已解决，见 Q1 复验 | Q1 ✓ |
-| P0 | 可复现交付不足：无跟踪中的 CI，差分依赖仅固定顶层版本、没有跟踪锁文件，缺少统一网络差分入口 | Q2 |
+| P0 | ~~差分依赖无锁文件、无统一网络差分入口~~ 2026-09-28 已解决；**CI 已写未跑**：两个 workflow 从未在 GitHub 上执行，Linux 上的结果没有测过 | Q2（剩 CI 首跑） |
 | P0 | 发布许可不完整：根 LICENSE 缺失，Cargo 包元数据缺少 license 等字段；旧 README 的 MIT 声明不足以完成分发准备 | Q3 |
 | P0 | 默认全接口、无 UI 口令、会话落盘；UI 认证不保护代理转发，分 UI 端口不是自动的网络隔离 | S1 |
 | P1 | 早期请求失败缺少统一会话结果；依赖日志/502，影响定位 DNS/连接/TLS 失败 | O1 |
