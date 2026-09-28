@@ -14,6 +14,7 @@ import { state } from '../store';
 const yesNo = (v: boolean) => (v ? 'yes' : 'no');
 const st = computed(() => state.status);
 const host = computed(() => st.value?.host || '127.0.0.1');
+const onLan = computed(() => !!st.value?.listening_on_lan);
 
 const proxy = computed<Pair[]>(() => [
   ['Version', st.value?.version],
@@ -83,7 +84,16 @@ const rules = computed<Pair[]>(() => [
           PAC: <a href="/proxy.pac">/proxy.pac</a> ·
           Export: <a href="/sessions.har" download>HAR</a>
         </p>
-        <section v-if="lan.length" class="lan">
+        <section v-if="!onLan" class="lan">
+          <h3>Only this machine</h3>
+          <p class="hint">
+            The proxy listens on <code>{{ host }}</code>, so a phone or another machine
+            cannot reach it. To let them in, restart with <code>-H 0.0.0.0</code> — and
+            set a console login with <code>-n</code>/<code>-w</code> first, or anyone on
+            the network can change the rules.
+          </p>
+        </section>
+        <section v-else-if="lan.length" class="lan">
           <h3>On this network</h3>
           <p class="hint">
             Set one of these as the proxy on a phone — try each if unsure — then

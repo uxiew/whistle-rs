@@ -632,13 +632,14 @@ export function mockApi(): Plugin {
         return reply({
           version: '0.1.0-mock',
           port: 8899,
-          host: null,
+          host: '0.0.0.0',
           socks_port: 1080,
           intercept_https: true,
           capture_locked_off: false,
           header_rules: 'off',
           // Two, because the pane's whole point is "try each if unsure" — one
           // address would not show the layout the real thing has.
+          listening_on_lan: true,
           lan_addresses: ['192.168.1.42', '10.0.0.7'],
           insecure_upstream: false,
           storage_dir: '/Users/you/.whistle-rs',

@@ -164,7 +164,10 @@ export interface PluginInfo {
 export interface ProxyStatus {
   version: string;
   port: number;
-  host: string | null;
+  /** The address actually bound — `127.0.0.1` unless started with `-H`. */
+  host: string;
+  /** Whether anything but this machine can reach it; phone QR codes need it. */
+  listening_on_lan: boolean;
   socks_port: number | null;
   intercept_https: boolean;
   /** A `-M` mode has taken the HTTPS switch away — `multiEnv`, `notAllowedEnableHTTPS`. */

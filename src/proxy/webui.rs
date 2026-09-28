@@ -1685,7 +1685,10 @@ async fn status_json(state: &Arc<AppState>, restricted: bool) -> Response<DynBod
     let body = serde_json::json!({
         "version": crate::config::VERSION,
         "port": cfg.port,
-        "host": cfg.host.map(|h| h.to_string()),
+        // The address actually bound, and whether that lets anything but this
+        // machine in: the console offers phone QR codes only when it does.
+        "host": cfg.bind_ip().to_string(),
+        "listening_on_lan": cfg.listens_beyond_loopback(),
         // The addresses a device on the same network can reach this at — the
         // thing `mobile.md` is an entire page about typing into a phone, and
         // which `0.0.0.0` does not answer. See `proxy::lan_addresses`.
