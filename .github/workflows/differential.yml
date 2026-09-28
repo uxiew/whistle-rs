@@ -1,0 +1,52 @@
+# The whole differential: real whistle 2.10.8 and whistle-rs side by side,
+# every hand-written corpus, the HTTPS/frames/timing/write/auth benches, and the
+# benches that start one proxy per mode. Around ten minutes, so not on every
+# pull request (ci.yml runs the fast half there): by hand, and weekly, so a
+# regression is at most a week old when it is found.
+#
+# Everything it saw is uploaded, pass or fail: the manifest (commit, binary
+# hash, whistle version, lockfile and corpus hashes), each step's output and
+# each proxy's log.
+
+name: Differential
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  network:
+    name: Differential — every corpus and bench, both proxies live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # 26: the Node the declared differences were measured on; see ci.yml.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - run: npm ci --prefix tests/differential
+      - run: cargo build --locked
+      - run: node tests/differential/run.js all --out target/differential/all
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: differential-all
+          path: target/differential/all/
+          retention-days: 90
