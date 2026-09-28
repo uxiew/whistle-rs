@@ -105,7 +105,7 @@ The operators worth knowing before the rest are
 - [Precedence](#precedence) — [how several lines of one operator combine](#how-several-lines-of-one-operator-combine)
 - [Quick reference](#quick-reference)
 - [Operator coverage](#operator-coverage) — [applied at runtime](#applied-at-runtime) ·
-  [parsed but not applied](#parsed-but-not-applied-2) ·
+  [metadata and upstream-only infrastructure](#metadata-and-upstream-only-infrastructure) ·
   [simplified vs. upstream](#simplified-vs-upstream) ·
   [where wproxy.org and whistle disagree](#where-wproxyorg-and-whistle-disagree)
 - [Origin certificate verification](#origin-certificate-verification)
