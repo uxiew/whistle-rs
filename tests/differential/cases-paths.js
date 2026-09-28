@@ -39,8 +39,8 @@
 //     did not fail to apply, it took the request down. Three encodings, each
 //     measured separately — see `request_target` and `merge_query`.
 //
-// The nine that remain are declared, and every one of them is upstream doing
-// less than this port rather than differently:
+// The nine that remain are declared case by case in `declared.js`, and every one
+// of them is upstream doing less than this port rather than differently:
 //
 //   1. **two UNC paths** — `\\server\share\x` is a *destination* in both, both
 //      fail to reach it, and only the wording of the failure differs. The same
@@ -48,7 +48,8 @@
 //   2. **a file whose name contains a `%`** — upstream percent-decodes the path,
 //      so `per%cent.txt` becomes an invalid escape and is not found. This port
 //      opens the file the rule named.
-//   3–5. **a header value above ASCII** — `reqHeaders://x-cjk=中文` reaches the
+//   3–6. **a header value above ASCII** (cjk, emoji, latin-1, and cjk on a
+//      response) — `reqHeaders://x-cjk=中文` reaches the
 //      origin from here as UTF-8 and does not reach it at all from whistle: a
 //      JavaScript string of code points above `U+00FF` cannot be written into a
 //      Node header, and the throw takes the header with it. `resHeaders://` is
@@ -56,14 +57,14 @@
 //      behaviour to copy. `café` differs more quietly: Node writes a header as
 //      latin-1, so whistle sends one byte where this sends the two of UTF-8, and
 //      UTF-8 is what an origin reading a header today expects.
-//   6. **`pathReplace://echo=中文`** — whistle drops the segment and asks for
+//   7. **`pathReplace://echo=中文`** — whistle drops the segment and asks for
 //      `/`; this port asks for `/%E4%B8%AD%E6%96%87`, which is the rule applied.
-//   7. **`urlReplace://` with a backtick** — whistle puts it on the wire raw.
-//      hyper will not, so this sends `%60`; the alternative was the rewrite
-//      silently not happening, which is what it used to do.
-//   8. **`urlReplace://` with cjk** — whistle declines to apply the rule at all.
-//   9. **a cjk replacement into a body that is not UTF-8** — both mangle it,
+//   8. **a cjk replacement into a body that is not UTF-8** — both mangle it,
 //      each in its own encoding.
+//
+// (This list used to name two `urlReplace://` cases — a backtick, and cjk —
+// that are no longer in the corpus, and to leave out the emoji header, which is.
+// The two `urlReplace://` cases that are here agree.)
 //
 // Run it like any other corpus, and through the resolver too, where the
 // question costs nothing:

@@ -29,7 +29,7 @@
 // ones are the header cases — a header the origin sent and the client must not
 // see is a difference the unruled baseline shows too.
 //
-// **A clean run of this file is `differing: 6`, and all six are one fact:
+// **Six cases differ, declared in `declared.js`, and all six are one fact:
 // upstream leaks its own control header whenever it does not get as far as
 // deleting it.** `parseFrameSep` deletes from inside itself, so every branch
 // that skips the call also skips the delete:

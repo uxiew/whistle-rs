@@ -22,7 +22,7 @@
 //
 // **Divergences this file declares rather than pins**, named here instead of in
 // `harness.js`'s `EXPECTED` so a wide matcher there cannot swallow news in
-// another corpus. A clean run of this file is `differing: 1`.
+// another corpus. The one below is declared in `declared.js`.
 //
 //   `enable://responseWithMatchedRules` used to be three of the four and is now
 //   implemented, byte for byte including the order. The order was the part worth

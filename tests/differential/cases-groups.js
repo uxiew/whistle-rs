@@ -36,7 +36,7 @@
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// A clean run of this file is **`differing: 3`**, from two causes, both named
+// Three cases differ, declared in `declared.js`, from two causes, both named
 // here.
 //
 //  1. `two groups with the same name` — upstream's `add` is a file write, so the

@@ -14,7 +14,7 @@
 // They are not in `harness.js`'s `EXPECTED` because a matcher wide enough to
 // catch them would also hide real news in another corpus — what makes them
 // expected is the rule, which the matcher cannot see. A clean run of this file
-// is therefore `differing: 8`, and these are they:
+// has these eight as `declared` (in `declared.js`) and `differing: 0`:
 //
 //   * `delete bare body on a post`, `delete req.body …` (×3),
 //     `delete res.body …` (×3) — all one defect. `EMPTY_BUFFER` is

@@ -18,6 +18,7 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { judge } = require('./declared.js');
 
 const BASE = Number(process.env.PORT_BASE || 18700);
 const [W, RS, ORIGIN] = [BASE, BASE + 1, BASE + 2];
@@ -305,7 +306,14 @@ async function main() {
 
   origin.close();
   fs.rmSync(DIR, { recursive: true, force: true });
-  console.log(JSON.stringify({ ran, differing, wroteNothing, report }, null, 2));
+  // The empty write path differs on purpose; `declared.js` names it, and
+  // anything else — or that one no longer differing — fails the run.
+  const verdict = judge('write-bench.js', report, CASES.map((c) => c.name));
+  differing = verdict.news.length;
+  console.log(JSON.stringify({
+    ran, differing, declared: verdict.declared, stale: verdict.stale, wroteNothing, report: verdict.news,
+  }, null, 2));
+  process.exitCode = differing || verdict.stale.length ? 1 : 0;
 }
 
 main().catch((e) => { console.error(e); fs.rmSync(DIR, { recursive: true, force: true }); process.exit(1); });

@@ -5,7 +5,7 @@
 // on load. Both proxies run as the same user and are given the same rules text,
 // so the paths below are absolute and shared.
 //
-// It ends at `differing: 2`, both named where they are written: a URL source
+// Two cases differ, declared in `declared.js` and named where they are written: a URL source
 // spelled `https://` against a plaintext origin, and `<…>`, which names a path
 // here and is fetched by upstream against a pattern that leaves nothing to
 // append.

@@ -34,7 +34,7 @@
 //     `x-whistle-response-for: svc-a` from both. The cases stay because they
 //     still prove `responseFor://` does not disturb the request.
 //
-// **This corpus ends at `differing: 9`** — six `weinre://`, one `intercept://`,
+// **Nine cases here differ, declared in `declared.js`** — six `weinre://`, one `intercept://`,
 // and two about the script context, each named below or beside its case.
 //
 // It said eight until the eighth stopped differing on its own. That one was

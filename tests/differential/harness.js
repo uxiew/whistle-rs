@@ -11,7 +11,9 @@
 // A rule that rewrites a request is invisible in the response alone.
 
 const http = require('http');
+const path = require('path');
 const zlib = require('zlib');
+const { judge, fieldOf } = require('./declared.js');
 
 // Ports and corpus come from the environment so several benches can run at
 // once — one per area under audit — without colliding on a port or on a file.
@@ -22,47 +24,76 @@ const RS = BASE + 1;     // whistle-rs
 const ORIGIN = BASE + 2; // the echo origin
 const CASES_FILE = process.env.CASES || './cases.js';
 
-/** Headers neither proxy is expected to agree on, and why. */
-const IGNORE = new Set([
-  'date',                       // wall clock
-  'connection', 'keep-alive', 'proxy-connection', // hop-by-hop
-  'transfer-encoding', 'content-length',          // framing, compared via body
-  'host',                       // compared explicitly where it matters
+/**
+ * Headers never compared, in either direction, in any case, and why. These are
+ * facts about the two transports and about this bench, not about any whistle
+ * version, so unlike `EXPECTED` they carry no `upstream`.
+ *
+ * `user-agent` and `accept` used to be here, from when this bench drove one
+ * side with curl and the other with node. It drives both with node now, which
+ * sends neither header unless a case asks for it — and the exemption was doing
+ * real damage, because these are headers *rules are written about*. Six cases
+ * could not fail while it stood: `ua://`, `disable://ua`, the two that pin which
+ * of two `ua://` lines wins (the whole of `lineProps://important` in this
+ * corpus), and both `headerReplace://` doc forms, which rewrite `accept`.
+ * Removing them was measured across all thirteen corpora and introduced no
+ * difference anywhere.
+ */
+const IGNORE = new Map([
+  ['date', 'the wall clock'],
+  ['connection', 'hop-by-hop'],
+  ['keep-alive', 'hop-by-hop'],
+  ['proxy-connection', 'hop-by-hop'],
+  ['transfer-encoding', 'framing; the body itself is compared'],
+  ['content-length', 'framing; the body itself is compared'],
+  ['host', 'compared explicitly by the cases where it matters'],
   // whistle's own bookkeeping, named one at a time rather than by prefix. A
   // blanket `x-whistle*` also hid `x-whistle-matched-rules`, which is the whole
   // observable effect of `enable://requestWithMatchedRules` — a case about that
   // header could not fail. Removing the blanket was measured across six corpora
   // and introduced no difference anywhere, so it was suppressing nothing these
   // four do not already cover.
-  'x-whistle-request-id', 'x-whistle-client-id', 'x-whistle-real-host',
-  'x-forwarded-from-whistle-uid',
-  'accept-encoding',            // each proxy narrows this its own way
-  // `user-agent` and `accept` used to be here, from when this bench drove one
-  // side with curl and the other with node. It drives both with node now, which
-  // sends neither header unless a case asks for it — and the exemption was
-  // doing real damage, because these are headers *rules are written about*.
-  // Six cases could not fail while it stood: `ua://`, `disable://ua`, the two
-  // that pin which of two `ua://` lines wins (the whole of `lineProps://important`
-  // in this corpus), and both `headerReplace://` doc forms, which rewrite
-  // `accept`. Removing them was measured across all thirteen corpora and
-  // introduced no difference anywhere.
+  ['x-whistle-request-id', "whistle's per-request bookkeeping"],
+  ['x-whistle-client-id', "whistle's per-client bookkeeping"],
+  ['x-whistle-real-host', "whistle's bookkeeping; the destination is compared through the echo"],
+  ['x-forwarded-from-whistle-uid', "whistle's loop guard"],
+  ['accept-encoding', 'each proxy narrows it its own way; the decoded body is compared'],
 ]);
 
 /**
- * Divergences that are deliberate, each with the reason. A run is clean when
- * every difference it finds is one of these — anything else is news.
+ * Divergences that are deliberate and can turn up in **many** cases, each with
+ * its reason. Differences that belong to one case are declared by name in
+ * `declared.js` instead; a run is clean when every difference is excused by one
+ * or the other.
  *
- * `match` is given the difference and the case that produced it. The second
- * argument matters where a single answer shows up as several differences at
- * once: a proxy that never replied differs in its status, its body and every
- * header it did not send, and pinning those one by one would excuse them
- * everywhere rather than in the one case that earns it.
+ * Every entry says four things, and the loader below refuses one that does not:
+ *
+ *   * `fields`   — which differing fields it may excuse (a RegExp over the
+ *                  field, e.g. `res.body` or `req.header.pragma`);
+ *   * its scope  — `cases` (a RegExp over the case name) and/or `rules` (over
+ *                  the case's rules text), or `anyCase`, a sentence saying why
+ *                  it is safe to apply to every case;
+ *   * `upstream` — the whistle version the divergence was measured against;
+ *   * `why`.
+ *
+ * `match` then checks the *shape* of the difference — which side said what.
+ * It is given the case too, because a single answer can show up as several
+ * differences at once: a proxy that never replied differs in its status, its
+ * body and every header it did not send, and pinning those one by one would
+ * excuse them everywhere rather than in the one case that earns it.
+ *
+ * The run reports how often each entry was used (`expected`), so one that has
+ * stopped matching anything shows up as a zero instead of lingering.
  */
 const EXPECTED = [
   {
     // whistle has `notAllowCache` and never reaches it: it reads `req.rules`,
     // and all seventeen body operators are in `pureResProtocols`, which the
     // request pass skips. So its own rewrite vanishes on a browser reload.
+    id: 'cache-bust',
+    upstream: '2.10.8',
+    fields: /^req\.header\.(pragma|cache-control|if-none-match)$/,
+    anyCase: 'every response-body operator busts the request cache here, in whichever corpus it appears',
     match: (p) => /req\.header\.(pragma|cache-control): whistle=undefined rs="no-cache"/.test(p)
       || /req\.header\.if-none-match: whistle="/.test(p),
     why: 'busting the request cache: deliberate, and better than upstream',
@@ -74,18 +105,30 @@ const EXPECTED = [
     // upstream's most common mock is the one response it leaves unmarked.
     // whistle-rs marks every response it made itself, which is the whole point
     // of the header.
+    id: 'x-server',
+    upstream: '2.10.8',
+    fields: /^res\.header\.x-server$/,
+    anyCase: 'every answer this port makes itself carries the header, whatever the rule',
     match: (p) => /res\.header\.x-server: whistle=("Whistle"|undefined) rs="whistle-rs"/.test(p),
     why: 'x-server names the proxy that actually answered, on every answer',
   },
   {
     // The `Server` header a served local file carries (`file-proxy.js:315-318`).
     // Same header, same reason as above: naming whistle would be a lie.
+    id: 'server',
+    upstream: '2.10.8',
+    fields: /^res\.header\.server$/,
+    anyCase: 'any case that serves a local file',
     match: (p) => /res\.header\.server: whistle="Whistle" rs="whistle-rs"/.test(p),
     why: 'a mocked file names the proxy that served it',
   },
   {
     // Both fail to find the file and say so; only the wording differs, and
     // matching another program's error prose is not worth pinning.
+    id: 'not-found-prose',
+    upstream: '2.10.8',
+    fields: /^res\.body$/,
+    anyCase: 'any file-family or value case can end in this 404; the match requires whistle\'s own wording',
     match: (p) => /res\.body: whistle="Not found (file|key) /.test(p),
     why: 'the same 404, phrased in each proxy\'s own words',
   },
@@ -95,6 +138,10 @@ const EXPECTED = [
     // `src/proto/h1/conn.rs:729-733`, from the `TE` read at `conn.rs:328-332`).
     // Node sends them regardless. With `TE: trailers` the two agree exactly —
     // origin trailers forwarded, `trailers://` merged over the top.
+    id: 'trailers-need-te',
+    upstream: '2.10.8',
+    fields: /^res\.trailer\./,
+    anyCase: 'a property of the two HTTP servers, not of any rule; a case that sends TE: trailers compares them',
     match: (p) => /^res\.trailer\./.test(p),
     why: 'hyper sends trailers only to a client that asked for them; see docs/RULES.md',
   },
@@ -103,7 +150,11 @@ const EXPECTED = [
     // whistle's decoder error out and the response never arrives — no status,
     // no headers, no body. This port tries zlib first and raw second, and
     // answers.
-    match: (p, c) => /raw-deflate/.test(c.name) && /whistle=(0|undefined|"ERR HUNG")/.test(p),
+    id: 'raw-deflate',
+    upstream: '2.10.8',
+    fields: /./,
+    cases: /raw-deflate/,
+    match: (p) => /whistle=(0|undefined|"ERR HUNG")/.test(p),
     why: 'a raw-deflate body: whistle never answers, this port decodes it',
   },
   {
@@ -113,6 +164,10 @@ const EXPECTED = [
     // gunzipped (`inspectors/rules.js:117-121`). The client is handed bytes the
     // header misdescribes. This port refuses the force instead — see
     // `coding::reencode`.
+    id: 'forced-coding-undecodable',
+    upstream: '2.10.8',
+    fields: /^res\.(body|header\.content-encoding)$/,
+    rules: /enable:\/\/(gzip|br|deflate)/,
     match: (p) => /res\.body: whistle="<undecodable (gzip|br|deflate)>"/.test(p)
       || /res\.header\.content-encoding: whistle="gzip" rs="zstd"/.test(p),
     why: 'enable:// on a body that cannot be decoded: whistle labels it without encoding it',
@@ -121,6 +176,10 @@ const EXPECTED = [
     // Same line, the bodiless case: whistle stamps `content-encoding` on a 204,
     // which has no body to encode. This port sets the header from the bytes
     // that actually went out.
+    id: 'forced-coding-no-body',
+    upstream: '2.10.8',
+    fields: /^res\.header\.content-encoding$/,
+    rules: /enable:\/\/(gzip|br|deflate)/,
     match: (p) => /res\.header\.content-encoding: whistle="(gzip|br|deflate)" rs=undefined/.test(p),
     why: 'enable:// on an answer with no body: a coding describing nothing',
   },
@@ -130,6 +189,10 @@ const EXPECTED = [
     // which rewrites bytes it guessed at. This port honours a *declared*
     // `charset=` and leaves an undeclared non-UTF-8 body alone. Documented in
     // docs/RULES.md.
+    id: 'charset-guess',
+    upstream: '2.10.8',
+    fields: /^res\.body$/,
+    anyCase: 'any text rewrite of the one origin body that is not UTF-8 (/notutf8); the match requires its bytes',
     match: (p) => /res\.body: whistle="X.*INAL"/.test(p),
     why: 'an undeclared charset is guessed by whistle and not by this port',
   },
@@ -139,6 +202,10 @@ const EXPECTED = [
     // and its text transform then runs a lossy UTF-8 round trip over the gzip
     // bytes, corrupting a body it could not read. This port decodes it, rewrites
     // it, and puts the origin's own spelling of the header back.
+    id: 'x-gzip',
+    upstream: '2.10.8',
+    fields: /^res\.body$/,
+    anyCase: 'any rewrite of the x-gzip origin body; the match requires whistle to have failed to decode it',
     match: (p) => /res\.body: whistle="<undecodable x-gzip>"/.test(p),
     why: 'x-gzip is gzip: whistle corrupts such a body, this port rewrites it',
   },
@@ -147,7 +214,11 @@ const EXPECTED = [
     // this port buffers and stops at `--body-rewrite-limit` (16 MiB), past which
     // the response is forwarded byte-complete but unrewritten. Measured at the
     // boundary: identical at 16,777,199 bytes, diverging at 16,777,299.
-    match: (p, c) => /over the rewrite ceiling/.test(c.name) && /^res\.body:/.test(p),
+    id: 'rewrite-ceiling',
+    upstream: '2.10.8',
+    fields: /^res\.body$/,
+    cases: /over the rewrite ceiling/,
+    match: () => true,
     why: 'past --body-rewrite-limit the body streams through untouched; see src/config.rs',
   },
   {
@@ -155,6 +226,14 @@ const EXPECTED = [
     // word of the first line as the status code and throws while writing it,
     // which reaches the client as a reset connection. whistle-rs falls back to
     // 200 and serves the body.
+    //
+    // Scoped to rules that use `rawfile://`. It used to match the shape alone,
+    // and "whistle reset the connection, this port said 200" anywhere else is
+    // exactly the difference a real regression would make.
+    id: 'rawfile-no-status-line',
+    upstream: '2.10.8',
+    fields: /^(status|res\.body)$/,
+    rules: /rawfile:\/\//,
     match: (p) => /status: whistle=0 rs=200/.test(p)
       || /res\.body: whistle="ERR ECONNRESET"/.test(p),
     why: 'a rawfile with no status line: upstream crashes, this serves it',
@@ -166,7 +245,11 @@ const EXPECTED = [
     // IPv6 literal survives the port-stripped comparison upstream's `removePort`
     // mangles. The cases that exercise them carry this header and no other case
     // uses it; `cases-patterns.js` names all three at the top.
-    match: (p) => /req\.header\.x-pattern-dev:/.test(p),
+    id: 'pattern-deviations',
+    upstream: '2.10.8',
+    fields: /^req\.header\.x-pattern-dev$/,
+    rules: /x-pattern-dev/,
+    match: () => true,
     why: 'declared pattern deviations: host case, :80, and IPv6 literals',
   },
   {
@@ -175,7 +258,11 @@ const EXPECTED = [
     // for, never whether a rule applies. whistle-rs matches the request's host
     // with it. Declared in `docs/RULES.md`; the cases that exercise it carry
     // this header and no other case uses it.
-    match: (p) => /req\.header\.x-host-filter:/.test(p),
+    id: 'host-filter',
+    upstream: '2.10.8',
+    fields: /^req\.header\.x-host-filter$/,
+    rules: /x-host-filter/,
+    match: () => true,
     why: 'host: and host= match the request host here, by design',
   },
   {
@@ -187,10 +274,11 @@ const EXPECTED = [
     // Node stack trace (`wrapGatewayError`, `_original/lib/util/index.js:1096-1109`)
     // and this port's is the error chain as plain text, the same pair
     // `cases-proxy.js` declares for every other gateway error.
-    //
-    // Scoped by **case name**, so this cannot excuse a 502 anywhere else.
-    match: (p, c) => /^doc: (ws|wss|tunnel|location):\/\/ is not a transport/.test(c.name)
-      && /^(res\.body|res\.header\.content-type):/.test(p),
+    id: 'not-a-transport',
+    upstream: '2.10.8',
+    fields: /^(res\.body|res\.header\.content-type)$/,
+    cases: /^doc: (ws|wss|tunnel|location):\/\/ is not a transport/,
+    match: () => true,
     why: 'a 502 on both sides; only each proxy\'s error page differs',
   },
   {
@@ -200,10 +288,11 @@ const EXPECTED = [
     // answer. This port keeps the answer an *empty* value gets — `200` for a
     // mock, no replacement for `replaceStatus://` — which is upstream's own
     // `rule || 200` applied to a case upstream never reaches.
-    //
-    // Scoped by **case name**, so it excuses nothing else: a reset anywhere
-    // else is still news.
-    match: (p, c) => /^unusable status value:/.test(c.name),
+    id: 'unusable-status',
+    upstream: '2.10.8',
+    fields: /./,
+    cases: /^unusable status value:/,
+    match: () => true,
     why: 'whistle drops the connection on a status it cannot write; this port answers',
   },
   {
@@ -212,7 +301,11 @@ const EXPECTED = [
     // whistle answers its `502` page; this port leaves the method alone.
     // Measured for `GET;`, a JSON object and a block of lines; a value that
     // *is* a token — including an unknown verb and digits — agrees.
-    match: (p, c) => /^unusable method value:/.test(c.name),
+    id: 'unusable-method',
+    upstream: '2.10.8',
+    fields: /./,
+    cases: /^unusable method value:/,
+    match: () => true,
     why: 'whistle fails the request on a method it cannot send; this port ignores the value',
   },
   {
@@ -228,10 +321,33 @@ const EXPECTED = [
     // Scoped to **one second**: a real difference in either header, of any
     // other size, still reports. Nothing here excuses a header that one proxy
     // sent and the other did not — `oneSecondApart` needs two parseable dates.
+    id: 'one-second-apart',
+    upstream: 'any',
+    fields: /^res\.header\.(expires|set-cookie)$/,
+    anyCase: 'a property of this bench asking the two proxies one after the other',
     match: (p) => oneSecondApart(p),
     why: 'an HTTP date rendered from the clock, one second apart: the bench, not the port',
   },
 ];
+
+for (const e of EXPECTED) {
+  const scoped = e.cases || e.rules || e.anyCase;
+  if (!e.id || !e.upstream || !(e.fields instanceof RegExp) || !scoped || !e.why || !e.match) {
+    throw new Error(`EXPECTED entry ${e.id || '(no id)'} is missing id, upstream, fields, a scope or why`);
+  }
+}
+
+/** The `EXPECTED` entry that excuses this difference in this case, if any. */
+function expectedFor(problem, c) {
+  const field = fieldOf(problem);
+  return EXPECTED.find((e) => e.fields.test(field)
+    && (!e.cases || e.cases.test(c.name))
+    && (!e.rules || e.rules.test(allRules(c)))
+    && e.match(problem, c));
+}
+
+/** Every rules text a case installs, so a `rules` scope sees groups too. */
+const allRules = (c) => [c.rules || '', ...(c.groups || []).map((g) => g.value || '')].join('\n');
 
 /**
  * True when a difference is two HTTP dates at most a second apart.
@@ -735,6 +851,8 @@ async function main() {
   let ran = 0, differing = 0;
   const report = [];
   const inert = [];
+  /** How many differences each `EXPECTED` entry excused, by id. */
+  const expected = {};
 
   // Upstream selects **one** rule file at a time unless `allowMultipleChoice`
   // is on: `selectRulesFile` starts from an empty list when it is off
@@ -768,15 +886,34 @@ async function main() {
     const bare = unruled.get(JSON.stringify(c.request || {}));
     if (bare && problemsBetween(bare, rs).length === 0) inert.push(c.name);
 
-    const news = problems.filter((p) => !EXPECTED.some((e) => e.match(p, c)));
-    if (news.length) {
-      differing++;
-      report.push({ name: c.name, rules: c.rules, groups: c.groups, problems: news });
+    const left = [];
+    for (const p of problems) {
+      const e = expectedFor(p, c);
+      if (e) expected[e.id] = (expected[e.id] || 0) + 1;
+      else left.push(p);
     }
+    if (left.length) report.push({ name: c.name, rules: c.rules, groups: c.groups, problems: left });
   }
 
   origin.close();
-  console.log(JSON.stringify({ ran, differing, report, inert: inert.length, inertCases: inert }, null, 2));
+  // What `EXPECTED` left is either declared for this case in `declared.js` or
+  // news. `differing` counts the news — the cases nothing explains.
+  const verdict = judge(path.basename(CASES_FILE), report, CASES.map((c) => c.name));
+  differing = verdict.news.length;
+  console.log(JSON.stringify({
+    ran,
+    differing,
+    declared: verdict.declared,
+    stale: verdict.stale,
+    report: verdict.news,
+    expected,
+    inert: inert.length,
+    inertCases: inert,
+  }, null, 2));
+  // A difference nothing explains fails the run, and so does a declaration
+  // that no longer describes anything: left in place, it would go on excusing
+  // that field in that case whatever the proxy did next.
+  process.exitCode = differing || verdict.stale.length ? 1 : 0;
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

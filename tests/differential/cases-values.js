@@ -31,7 +31,7 @@
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// A clean run of this file is **`differing: 13`**. They are not in `harness.js`'s
+// Thirteen cases differ, declared case by case in `declared.js`. They are not in `harness.js`'s
 // `EXPECTED` because a matcher wide enough to catch them would hide real news in
 // another corpus; what makes them expected is the rule, which a matcher on the
 // output cannot see. Two deliberate divergences, already declared in the code:

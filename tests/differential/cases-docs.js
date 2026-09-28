@@ -51,7 +51,7 @@
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// A clean run of this file is **`differing: 5`**, from three causes:
+// Five cases differ, declared in `declared.js`, from three causes:
 //
 //   1. **The gateway error's prose and type** (3 cases: `proxy://`,
 //      `https-proxy://` and `socks://` at a dead local port). The same
