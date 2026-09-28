@@ -24,6 +24,6 @@
 
 ## 状态与维护
 
-[STATUS.md](STATUS.md) 是有日期、版本和证据范围的对齐快照；[ROADMAP.md](ROADMAP.md) 是唯一活动计划；[UPSTREAM.md](UPSTREAM.md) 定义上游基线与复核方法。
+[STATUS.md](STATUS.md) 是有日期、版本和证据范围的对齐快照；[ROADMAP.md](ROADMAP.md) 是唯一活动计划；[UPSTREAM.md](UPSTREAM.md) 定义上游基线与复核方法；许可与来源见仓库根的 [LICENSE](../LICENSE) 和 [NOTICE.md](../NOTICE.md)。
 
 [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md) 只保存历史调查。不要把它的勾选项、旧计数和「本轮全绿」复制成当前承诺。其余长篇参考手册保留详细技术说明，但不能单独证明某个提交已经通过验证；冲突先核对实现与测试，再同步本页链接的状态文档。

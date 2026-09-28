@@ -94,7 +94,7 @@ node run.js network --only cases-delete,https   # 只跑几步；--list 列出�
 
 ## CI
 
-`.github/workflows/ci.yml` 在每个 PR 和推到 main 时运行：钉住工具链上的 fmt/Clippy/全部测试、MSRV 版本上的全部测试、在不含 Node 的 `rust:1.98.1-trixie` 容器里构建纯代理并检查占位页、Node 20.19.0 和 24 两个版本下的前端 typecheck/build、先构建控制台再构建 release 并断言嵌入的是真控制台（附带二进制和 SHA-256 作为构件）、文档链接检查、`run.js fast`。`.github/workflows/differential.yml` 跑全量网络差分（`run.js all`），手动触发或每周一凌晨，结果归档上传。所有 action 都按提交哈希钉住版本，注释里写了对应的 tag。
+`.github/workflows/ci.yml` 在每个 PR 和推到 main 时运行：钉住工具链上的 fmt/Clippy/全部测试、MSRV 版本上的全部测试、在不含 Node 的 `rust:1.98.1-trixie` 容器里构建纯代理并检查占位页、Node 20.19.0 和 24 两个版本下的前端 typecheck/build、先构建控制台再构建 release 并断言嵌入的是真控制台（构件是二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md` 和它们的 SHA-256）、文档链接检查、`run.js fast`。`.github/workflows/differential.yml` 跑全量网络差分（`run.js all`），手动触发或每周一凌晨，结果归档上传。所有 action 都按提交哈希钉住版本，注释里写了对应的 tag。
 
 性能基准与长连接稳定性另行记录配置、硬件、制品和资源曲线。macOS 测试不能代替 Linux/Windows 真机，编译成功不能替代证书、网络和 UI 工作流测试。
 
@@ -103,3 +103,13 @@ node run.js network --only cases-delete,https   # 只跑几步；--list 列出�
 先记录 git 状态和既有未提交内容；不要覆盖用户的 `_original/` 或其他工作。规则变更同时更新最小反例、差分语料和对应手册；行为变化写入 STATUS 的下一次快照。每次验收关联具体提交/制品与命令，标明 skipped/未运行项，禁止从历史路线图复制“全绿”。
 
 文档分层保持稳定：根 README 是入口，操作细节放本文/OPERATIONS/参考手册，当前状态放 STATUS，活动任务放 ROADMAP，过程证据放历史记录。
+
+## 发布与许可
+
+发布物带三份许可文件：`LICENSE`（本项目，MIT）、`NOTICE.md`（哪些来自上游 whistle，附其 MIT 原文）、`THIRD-PARTY-LICENSES.md`（编进二进制的全部 crate 和控制台 npm 包的许可原文）。最后一份每次发布现生成，不入库：
+
+```sh
+node scripts/third-party-licenses.mjs --target x86_64-unknown-linux-gnu   # 需先 cargo fetch 和 npm ci --prefix ui-src
+```
+
+有包完全没声明许可时脚本失败；声明了却没带原文的只列 SPDX 标识并在 stderr 点名。crate 包的内容由 `Cargo.toml` 的 `include` 白名单决定——没有它，`cargo package` 会把本地未忽略的一切打进去，包括 `_original/` 里的上游源码。加新的顶层文件时，想让它进包就加进白名单。
