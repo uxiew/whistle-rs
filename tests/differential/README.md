@@ -15,14 +15,57 @@ none of it by reading:
   `notAllowCache`, when upstream never reaches that code and its own `resBody://`
   therefore vanishes on a browser reload.
 
-It is **not** part of `cargo test`: it needs two live proxies, a live origin, and
-an npm install of whistle. It is a tool you reach for, not a gate you pass.
+It is **not** part of `cargo test`: it needs real whistle from npm, and most of
+it needs both proxies live. It is a gate all the same — `run.js` below is what CI
+runs, and it fails on any difference nobody has explained.
 
 ## Running it
 
 ```sh
+cargo build --locked            # from the repo root; run.js refuses a binary older than src/
 cd tests/differential
-npm ci                                       # once — real whistle, from the lockfile
+npm ci                          # once — real whistle, from the lockfile
+node run.js fast                # ~5 s: the rules oracle over both corpora, the QR encoder
+node run.js network             # ~10 min: both proxies, every corpus and every bench
+node run.js network --only cases-delete,https   # a few steps; --list names them
+```
+
+`run.js` starts whatever the steps need — the oracle and whistle-rs with the
+flags each corpus expects, a separate pair with a console login for
+`auth-bench.js` — and stops it again. Every proxy listens on `127.0.0.1` and
+keeps its data directory, root CA and sessions in a scratch directory that is
+deleted afterwards (`--keep` keeps it). Every port a step needs is checked
+before it starts; one that is already taken stops the run with the port number
+and, where `lsof` can tell, what holds it. Every child runs in its own process
+group and the whole group is killed afterwards, including when you press
+Ctrl-C, so a bench that starts its own proxies cannot leave one listening.
+
+It exits **0** when every step passed, **1** when a step failed, **2** when it
+could not start (a port taken, no binary or one older than `src/`, `npm ci`
+not run). The archive — `target/differential/<time>-<suite>/`, or `--out` —
+holds `manifest.json` (commit and dirty files, whistle-rs version and SHA-256,
+whistle version and lockfile hash, the SHA-256 of every script and corpus here,
+Node and platform, port block, and each step's command, exit status and
+numbers), each step's output, and each proxy's log.
+
+**A step fails on anything unexplained.** Each bench exits 1 on a difference
+nothing declares. The differences that are known and accepted are listed case by
+case in [`declared.js`](declared.js) — the case, the fields, the whistle version
+it was measured against, and the reason — and a declaration that no longer
+matches anything fails the run too, so it cannot linger and excuse that field
+later. Patterns that recur across corpora stay in `harness.js`'s `EXPECTED`,
+each scoped to the fields and cases it may excuse. Every corpus step is followed
+by `triage-inert.js`, which fails on an inert case with no reason
+([below](#inert-which-cases-prove-nothing)).
+
+**The Node version matters.** Real whistle runs on whatever Node runs the
+oracle, and some of its answers depend on it — `cases-compose.js` records a gzip
+header byte that changed between Node releases. The manifest records the
+version; compare runs made on the same one.
+
+To drive one bench by hand instead, start the pair yourself:
+
+```sh
 PORT_BASE=18700 node oracle.js &             # real whistle on :18700
 cargo run -- --port 18701 --no-persist --dir /tmp/rs-diff &   # from the repo root
 PORT_BASE=18700 npm run bench
@@ -75,13 +118,11 @@ at the same recording proxy and their two recordings are compared. It needs
 `--insecure-upstream` for the TLS hop's self-signed certificate; the corpus header
 says which port is which.
 
-It prints the cases it ran and every difference it could not explain. A clean
-run says `differing: 0` — except for the corpora whose own header declares a
-number, because the reason those cases differ is a rule the harness cannot see:
-`cases-delete.js` at 8, `cases-values.js` at 13, `cases-compose.js` at 9,
-`cases-docs.js` at 5, `cases-groups.js` at 3, `cases-file.js` at 2,
-`cases-flags.js` at 1, `cases-proxy.js` at 25, `cases-frames.js` at 6 and
-`cases-paths.js` at 9.
+It prints the cases it ran and every difference it could not explain, and a
+clean run says `differing: 0` for every corpus. The corpora whose cases differ
+on purpose — delete, values, compose, docs, groups, file, flags, proxy, frames
+and paths — carry those cases in `declared.js`, where they count as `declared`;
+each corpus header explains its own.
 
 **`cases-generated.js` is not for this harness.** It is the cross product — 2270
 questions — and it is answered by `rules-oracle.js`, which resolves rather than
@@ -106,49 +147,16 @@ One corpus claims a fourth port. `cases-includes.js` is about `@` includes, and
 half of them name a **URL**, so it stands up a rules-serving HTTP server at
 `PORT_BASE+10`. It runs clean at `differing: 0`.
 
-Eight corpora are not clean on a bare run, by design:
+`cases-filters.js` asks about `env:`, which reads the **proxy's** environment, so
+both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle *and*
+whistle-rs. `run.js` does; by hand, starting only the oracle that way reports
+five differences that are the launch, not the port.
 
-* `cases-filters.js` asks about `env:`, which reads the **proxy's** environment.
-  Both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle
-  *and* whistle-rs. Starting only the oracle reports five differences that are
-  the launch, not the port.
-* `cases-delete.js` ends at `differing: 8`. All eight come from one fact:
-  `EMPTY_BUFFER` is `undefined` in whistle 2.10.8, so upstream's "empty the
-  body" paths forward the real body instead. Two more used to be on that list —
-  `reqBody with an empty value` and `resBody with an empty value` — and closed
-  when the bodies audit matched upstream: an operator written with *no value*
-  now does nothing here either. That is a different question from
-  `delete://body`, where this port still empties the body on purpose.
-* `cases-compose.js` ends at `differing: 7`, also named at the top of the file:
-  six are `weinre://`, which appends whistle's own bundled debug agent and points
-  it at a weinre server whistle runs — neither of which this port has; one is
-  `intercept://`, which is not a protocol in either proxy and fails in each one's
-  own words; and one is the OS byte of a gzip header.
-* `cases-file.js` ends at `differing: 2`, named at the top of the file: a URL
-  file source spelled `https://` against a plaintext origin, which whistle
-  answers anyway and this port refuses; and `<…>`, which names a path here and
-  is fetched by upstream when the pattern leaves nothing to append.
-* `cases-docs.js` ends at `differing: 5`, named at the top of the file: three
-  are the gateway error's prose, one is this port's deliberate cache-busting
-  showing through the only body operator that leaves the origin's echo intact,
-  and one is `temp/…`, whistle's console-editable temp file, which this port has
-  no directory or editor for.
-* `cases-groups.js` ends at `differing: 3`, named at the top of the file: one is
-  the two APIs' answer to adding a group twice. A fenced ``` block is private to
-  the rule group that declared it in both proxies now; what is left in the other
-  two is the older "a bare value stays the literal" divergence, reached because
-  a reference that is out of scope is a reference nothing answers.
-* `cases-frames.js` ends at `differing: 6`, and all six are one fact:
-  `parseFrameSep` deletes the `x-whistle-custom-frame-separator` header from
-  inside itself, so every branch that skips the call leaks the proxy's own
-  control header to the origin or the client — a gzipped body,
-  `disable://captureStream`, `enable://hide`, and an empty value. This port
-  removes it first and decides afterwards.
-* `cases-paths.js` ends at `differing: 9`, named at the top of the file: two are
-  a UNC path failing in each proxy's own words, one is a filename containing a
-  `%`, four are a header value above ASCII (which Node cannot write and whistle
-  therefore drops — for a *response* header it loses the whole response), and
-  two are `urlReplace://` values whistle declines to apply at all.
+The numbers these corpora used to be summed up by here disagreed with the
+corpora and with each other — one place said compose ends at 7, its header 9, and
+a run says 9; paths listed two `urlReplace://` cases the corpus no longer has
+and missed the emoji header and the non-UTF-8 body that do differ. That is why the
+declarations are per case now: a count cannot say *which* differences it means.
 
 ## The console's front door
 
