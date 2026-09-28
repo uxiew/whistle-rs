@@ -79,6 +79,8 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/ws/send") => ws_send(state, req).await,
         // Takes a body now: the console can forget just the rows it selected.
         ("POST", "/api/sessions/clear") => sessions_clear(state, req).await,
+        // Clear only tidies memory; this deletes what persistence wrote too.
+        ("POST", "/api/sessions/purge") => sessions_purge(state).await,
         ("GET", "/api/status") => status_json(state, status_body_restricted(state, &req)).await,
         ("GET", "/plugin") => redirect_to("/plugin/"),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),
@@ -1778,6 +1780,19 @@ async fn sessions_clear(state: &Arc<AppState>, req: Request<Incoming>) -> Respon
         .retain(|f| !ids.contains(&f.session));
     tracing::info!("{} sessions cleared via UI", ids.len());
     json_ok()
+}
+
+/// Delete the session history: memory and every persisted file.
+async fn sessions_purge(state: &Arc<AppState>) -> Response<DynBody> {
+    let files = state.purge_sessions().await;
+    tracing::info!("session history deleted via the console ({files} file(s))");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(format!(
+            "{{\"ok\":true,\"files_deleted\":{files}}}"
+        ))))
+        .unwrap()
 }
 
 fn values_get(state: &Arc<AppState>) -> Response<DynBody> {

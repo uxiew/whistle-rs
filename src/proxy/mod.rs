@@ -332,9 +332,23 @@ impl AppState {
     }
 
     /// Clear all in-memory sessions and WebSocket frames.
+    ///
+    /// Memory only: what persistence wrote to disk stays there and comes back
+    /// on the next start. That is the console's "clear" — tidying the view —
+    /// and [`Self::purge_sessions`] is the one that deletes.
     pub fn clear_sessions(&self) {
         self.sessions.lock().unwrap().clear();
         self.ws_frames.lock().unwrap().clear();
+    }
+
+    /// Forget every session, in memory and on disk. Returns how many session
+    /// files were deleted (0 when nothing is persisted).
+    pub async fn purge_sessions(&self) -> usize {
+        self.clear_sessions();
+        match &self.session_store {
+            Some(store) => store.purge().await,
+            None => 0,
+        }
     }
 
     /// Record one captured WebSocket frame in the bounded ring buffer.

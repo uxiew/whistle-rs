@@ -165,9 +165,17 @@ fn jsonl_path(dir: &Path, tag: &str) -> PathBuf {
     dir.join(format!("sessions-{tag}.jsonl"))
 }
 
+/// What the writer task is asked to do.
+enum Msg {
+    /// Boxed: a session is hundreds of bytes and a purge is one pointer.
+    Save(Box<PersistedSession>),
+    /// Delete every session file; answers with how many there were.
+    Purge(tokio::sync::oneshot::Sender<usize>),
+}
+
 /// Handles for the persist background task.
 pub struct SessionStore {
-    tx: mpsc::UnboundedSender<PersistedSession>,
+    tx: mpsc::UnboundedSender<Msg>,
 }
 
 impl SessionStore {
@@ -177,6 +185,10 @@ impl SessionStore {
         // Sessions hold cookies and `Authorization` headers verbatim.
         crate::private_fs::create_dir(&dir).ok();
         crate::private_fs::tighten(&dir);
+        // The retention promise is kept at startup too, not only when a run
+        // happens to cross midnight UTC: a proxy started for an hour a week
+        // never pruned anything.
+        prune_old_files(&dir, retain_days);
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(writer_task(dir, retain_days, rx));
         SessionStore { tx }
@@ -186,12 +198,31 @@ impl SessionStore {
     pub fn persist(&self, session: &Session) {
         let snap = PersistedSession::from_session(session);
         // Ignore send errors (task shutdown).
-        let _ = self.tx.send(snap);
+        let _ = self.tx.send(Msg::Save(Box::new(snap)));
+    }
+
+    /// Delete every persisted session file; returns how many there were.
+    ///
+    /// Done by the writer task, not here: it holds today's file open, and a
+    /// file unlinked under an open handle keeps being written — to an inode
+    /// nothing can find, so "deleted" history would have quietly gone on
+    /// being recorded.
+    pub async fn purge(&self) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Msg::Purge(tx)).is_err() {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
     }
 
     /// Load historical sessions from the most recent JSONL files in `dir`,
     /// returning up to `max` entries (newest last).
-    pub fn load(dir: &Path, max: usize) -> Vec<Session> {
+    ///
+    /// Files past `retain_days` are deleted first rather than read: loading
+    /// read every file of any age, so the history on screen after a restart
+    /// could be months old while the documentation said seven days.
+    pub fn load(dir: &Path, max: usize, retain_days: u32) -> Vec<Session> {
+        prune_old_files(dir, retain_days);
         let mut files = list_jsonl_files(dir);
         // Sort by name ascending (date order).
         files.sort();
@@ -220,16 +251,32 @@ impl SessionStore {
 
 /// Background task: receives snapshots via channel, appends to today's JSONL,
 /// and periodically prunes old files.
-async fn writer_task(
-    dir: PathBuf,
-    retain_days: u32,
-    mut rx: mpsc::UnboundedReceiver<PersistedSession>,
-) {
+async fn writer_task(dir: PathBuf, retain_days: u32, mut rx: mpsc::UnboundedReceiver<Msg>) {
     let mut current_tag = today_tag();
     let mut file = open_append(&jsonl_path(&dir, &current_tag));
     let mut write_count: u64 = 0;
 
-    while let Some(snap) = rx.recv().await {
+    while let Some(msg) = rx.recv().await {
+        let snap = match msg {
+            Msg::Save(snap) => snap,
+            Msg::Purge(done) => {
+                // Close today's file before deleting it, then start afresh.
+                if let Some(mut f) = file.take() {
+                    let _ = f.flush();
+                }
+                let files = list_jsonl_files(&dir);
+                let mut removed = 0;
+                for path in &files {
+                    if fs::remove_file(path).is_ok() {
+                        removed += 1;
+                    }
+                }
+                tracing::info!("deleted {removed} persisted session file(s)");
+                file = open_append(&jsonl_path(&dir, &current_tag));
+                let _ = done.send(removed);
+                continue;
+            }
+        };
         let tag = today_tag();
         if tag != current_tag {
             // Day rolled over: open a new file and prune old ones.
@@ -358,5 +405,49 @@ mod tests {
             "client_ip":null,"target":"a:80","duration_ms":1}"#;
         let back: PersistedSession = serde_json::from_str(line).expect("an older session");
         assert!(back.rules.is_empty());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("whistle-rs-persist-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    const LINE: &str = r#"{"id":1,"time_ms":0,"method":"GET","url":"http://a/","status":200,"client_ip":null,"target":"a:80","duration_ms":1}"#;
+
+    /// Loading keeps the retention promise instead of reading every file ever
+    /// written: a file from 2000 is deleted, not shown.
+    #[test]
+    fn loading_deletes_history_past_retention_instead_of_reading_it() {
+        let dir = scratch("retain");
+        fs::write(dir.join("sessions-2000-01-01.jsonl"), format!("{LINE}\n")).expect("old");
+        fs::write(jsonl_path(&dir, &today_tag()), format!("{LINE}\n")).expect("today");
+        let loaded = SessionStore::load(&dir, 100, 7);
+        assert_eq!(loaded.len(), 1, "only today's session");
+        assert!(!dir.join("sessions-2000-01-01.jsonl").exists());
+    }
+
+    /// Purge deletes the files, including the one the writer holds open — and
+    /// later sessions still land in a file that exists.
+    #[tokio::test]
+    async fn purge_deletes_the_files_and_writing_carries_on() {
+        let dir = scratch("purge");
+        fs::write(dir.join("sessions-2026-01-01.jsonl"), format!("{LINE}\n")).expect("older");
+        let store = SessionStore::new(dir.clone(), 36_500);
+        let session: PersistedSession = serde_json::from_str(LINE).expect("line");
+        store.persist(&session.clone().into_session());
+        // Round-trip through the writer, so the save is on disk before purge.
+        assert!(store.purge().await >= 1);
+        assert!(
+            list_jsonl_files(&dir)
+                .iter()
+                .all(|p| fs::metadata(p).map(|m| m.len() == 0).unwrap_or(true))
+        );
+        assert!(!dir.join("sessions-2026-01-01.jsonl").exists());
+        store.persist(&session.into_session());
+        // A second purge reports the file the new session went to.
+        assert_eq!(store.purge().await, 1);
     }
 }

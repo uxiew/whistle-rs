@@ -551,6 +551,7 @@ async fn main() -> Result<()> {
         let loaded = whistle_rs::proxy::persist::SessionStore::load(
             &sessions_dir,
             state.config.req_cache_size,
+            state.config.persist_days,
         );
         if !loaded.is_empty() {
             let max_id = loaded.iter().map(|s| s.id).max().unwrap_or(0);
