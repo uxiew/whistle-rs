@@ -63,10 +63,15 @@ const MUTATIONS = [
     only: ['cases', 'cases-patterns'],
   },
   {
+    // In `apply_response_for`, which sets the status the client finally sees.
+    // The first version of this mutated the same parse in `short_circuit` and
+    // survived — correctly: `apply_response_for` re-reads the operator and
+    // overwrites that status, so the change was invisible. An equivalent
+    // mutant, not a blind gate.
     name: 'mocked-status-off-by-one',
     file: 'src/proxy/apply.rs',
-    from: '.and_then(|c| StatusCode::from_u16(c).ok())\n                .unwrap_or(StatusCode::OK);',
-    to: '.and_then(|c| StatusCode::from_u16(c + 1).ok())\n                .unwrap_or(StatusCode::OK);',
+    from: '.and_then(|c| StatusCode::from_u16(c).ok())\n        // `replaceStatus != _res.statusCode`',
+    to: '.and_then(|c| StatusCode::from_u16(c + 1).ok())\n        // `replaceStatus != _res.statusCode`',
     why: 'statusCode://404 answers 405 — resolution is unchanged, only the effect',
     suite: 'network',
     only: ['cases'],
