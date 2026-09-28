@@ -129,11 +129,15 @@ jobs:
       - run: cargo build --locked --release
       - name: The binary serves this console build, not the placeholder
         run: scripts/check-console.sh target/release/whistle-rs built
-      - name: Checksums
+      # The binary travels with its terms: our LICENSE, where things come from
+      # (NOTICE.md), and the license texts of every crate and npm package
+      # built into it, generated from the lockfiles for this target.
+      - name: Binary, license texts and checksums
         run: |
           mkdir -p dist-ci
-          cp target/release/whistle-rs dist-ci/
-          (cd dist-ci && sha256sum whistle-rs > SHA256SUMS)
+          cp target/release/whistle-rs LICENSE NOTICE.md dist-ci/
+          node scripts/third-party-licenses.mjs --target x86_64-unknown-linux-gnu --out dist-ci/THIRD-PARTY-LICENSES.md
+          (cd dist-ci && sha256sum whistle-rs LICENSE NOTICE.md THIRD-PARTY-LICENSES.md > SHA256SUMS)
           sha256sum ui-src/dist/index.html | sed 's#ui-src/dist/##' >> dist-ci/SHA256SUMS
           cat dist-ci/SHA256SUMS
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
