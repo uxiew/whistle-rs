@@ -25,7 +25,7 @@
 // or the baseline failed. 2: a mutation no longer applies — the text it replaces
 // has changed, and the mutation has to be rewritten to still mean something.
 
-const { execFileSync, spawnSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -112,33 +112,59 @@ function cleanup() {
   }
   fs.rmSync(WORK, { recursive: true, force: true });
 }
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { cleanup(); process.exit(130); });
 
-function build() {
-  const r = spawnSync('cargo', ['build', '--locked'], {
+// Children are started asynchronously on purpose. This used spawnSync, and a
+// signal handler cannot run while spawnSync holds the event loop: Ctrl-C
+// waited for the current gate, and the loop then went straight into the next
+// one, so the handler never ran and the worktree stayed behind. Now a signal
+// is passed to the running child — run.js cleans up its own proxies — and the
+// loop stops as soon as that child has gone.
+let current = null;
+let interrupted = false;
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    interrupted = true;
+    if (current) current.kill('SIGTERM');
+  });
+}
+
+/** Run a command to completion; resolves to its exit status and the tail of stderr. */
+function run(command, args, opts) {
+  if (interrupted) return Promise.reject(new Error('interrupted'));
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { ...opts, stdio: ['ignore', 'ignore', 'pipe'] });
+    current = child;
+    let err = '';
+    child.stderr.on('data', (d) => { err = (err + d).slice(-8000); });
+    child.on('error', reject);
+    child.on('close', (code, signal) => {
+      current = null;
+      if (interrupted) reject(new Error('interrupted'));
+      else resolve({ code: code ?? (signal ? 128 : 1), log: err });
+    });
+  });
+}
+
+async function build() {
+  const r = await run('cargo', ['build', '--locked'], {
     cwd: WORK,
     env: { ...process.env, CARGO_TARGET_DIR: TARGET },
-    stdio: ['ignore', 'ignore', 'pipe'],
-    encoding: 'utf8',
   });
-  if (r.status !== 0) throw new Error(`cargo build failed:\n${r.stderr.split('\n').slice(-20).join('\n')}`);
+  if (r.code !== 0) throw new Error(`cargo build failed:\n${r.log.split('\n').slice(-20).join('\n')}`);
 }
 
 /** Run a gate against the build in TARGET; resolves to run.js's exit status. */
 function gate(suite, only, label) {
-  const r = spawnSync(process.execPath, [
+  return run(process.execPath, [
     path.join(WORK, 'tests', 'differential', 'run.js'), suite, '--only', only.join(','),
     '--out', path.join(TARGET, 'runs', label),
   ], {
     cwd: path.join(WORK, 'tests', 'differential'),
     env: { ...process.env, RS_BIN: path.join(TARGET, 'debug', 'whistle-rs') },
-    stdio: ['ignore', 'ignore', 'pipe'],
-    encoding: 'utf8',
   });
-  return { code: r.status, log: r.stderr };
 }
 
-function main() {
+async function main() {
   git('worktree', 'add', '--detach', WORK, 'HEAD');
   added = true;
   // The oracle's dependencies, exactly as installed here; same lockfile.
@@ -146,13 +172,19 @@ function main() {
 
   const rows = [];
   console.log(`HEAD ${git('rev-parse', '--short', 'HEAD')}; building the unmutated baseline…`);
-  build();
+  await build();
   const gates = new Map();
   for (const m of chosen) gates.set(`${m.suite}:${m.only.join(',')}`, m);
   for (const [key, m] of gates) {
-    const r = gate(m.suite, m.only, `baseline-${m.suite}-${m.only.join('+')}`);
+    const r = await gate(m.suite, m.only, `baseline-${m.suite}-${m.only.join('+')}`);
     rows.push({ name: `(baseline) ${key}`, expect: 'pass', got: r.code === 0 ? 'pass' : `exit ${r.code}`, ok: r.code === 0 });
     if (r.code !== 0) console.error(r.log.split('\n').slice(-15).join('\n'));
+  }
+  // A gate that already fails would "catch" every mutation; say so and stop.
+  if (rows.some((r) => !r.ok)) {
+    for (const r of rows) console.log(`${r.ok ? 'ok  ' : 'FAIL'}  ${r.name}  ${r.got}`);
+    console.log('\nthe unmutated build fails its own gates; nothing a mutation does can be measured');
+    return 1;
   }
 
   let stale = false;
@@ -167,8 +199,8 @@ function main() {
     }
     fs.writeFileSync(file, original.replace(m.from, m.to));
     try {
-      build();
-      const r = gate(m.suite, m.only, m.name);
+      await build();
+      const r = await gate(m.suite, m.only, m.name);
       const caught = r.code === 1;
       rows.push({
         name: m.name,
@@ -180,7 +212,7 @@ function main() {
       fs.writeFileSync(file, original);
     }
   }
-  build(); // leave TARGET holding the unmutated build, not the last mutation
+  await build(); // leave TARGET holding the unmutated build, not the last mutation
 
   console.log('');
   for (const r of rows) console.log(`${r.ok ? 'ok  ' : 'FAIL'}  ${r.name.padEnd(34)} ${r.got.padEnd(12)} (${r.expect})`);
@@ -188,12 +220,10 @@ function main() {
   return stale ? 2 : rows.every((r) => r.ok) ? 0 : 1;
 }
 
-let code = 1;
-try {
-  code = main();
-} catch (e) {
-  console.error(e.message || e);
-} finally {
-  cleanup();
-}
-process.exit(code);
+main()
+  .then((code) => { cleanup(); process.exit(code); })
+  .catch((e) => {
+    console.error(e.message || e);
+    cleanup();
+    process.exit(interrupted ? 130 : 1);
+  });
