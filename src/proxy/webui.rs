@@ -1206,14 +1206,9 @@ fn rules_get(state: &Arc<AppState>) -> Response<DynBody> {
 }
 
 async fn rules_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
-    let body = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(body::full(Bytes::from_static(b"could not read body")))
-                .unwrap();
-        }
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(r) => return *r,
     };
     let text = String::from_utf8_lossy(&body).into_owned();
     let count = {
@@ -1580,6 +1575,43 @@ async fn rule_group_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Res
     }
 }
 
+/// A console request's body, at most [`crate::config::CONSOLE_BODY_LIMIT`];
+/// the error is the response to send, `413` when it is too big. Boxed for the
+/// same reason as [`read_json_body`]'s.
+async fn read_body(req: Request<Incoming>) -> Result<Bytes, Box<Response<DynBody>>> {
+    let limit = crate::config::CONSOLE_BODY_LIMIT;
+    // Read frame by frame rather than through `http_body_util::Limited`: its
+    // boxed `dyn Error` made every future holding this one fail rustc's
+    // `Send` check ("implementation of `Send` is not general enough").
+    let mut body = req.into_body();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            return Err(Box::new(
+                Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(body::full(Bytes::from_static(b"could not read body")))
+                    .unwrap(),
+            ));
+        };
+        if let Some(data) = frame.data_ref() {
+            if buf.len() + data.len() > limit {
+                return Err(Box::new(
+                    Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(body::full(Bytes::from(format!(
+                            "request body over the console's {} MiB limit\n",
+                            limit / (1024 * 1024)
+                        ))))
+                        .unwrap(),
+                ));
+            }
+            buf.extend_from_slice(data);
+        }
+    }
+    Ok(buf.freeze())
+}
+
 /// Helper: read request body as JSON.
 ///
 /// The error is the ready-made 400 to send back, boxed: a bare
@@ -1588,19 +1620,7 @@ async fn rule_group_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Res
 async fn read_json_body(
     req: Request<Incoming>,
 ) -> Result<serde_json::Value, Box<Response<DynBody>>> {
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map_err(|_| {
-            Box::new(
-                Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(body::full(Bytes::from_static(b"could not read body")))
-                    .unwrap(),
-            )
-        })?
-        .to_bytes();
+    let body = read_body(req).await?;
     serde_json::from_slice(&body).map_err(|_| {
         Box::new(
             Response::builder()
@@ -1771,14 +1791,9 @@ fn values_get(state: &Arc<AppState>) -> Response<DynBody> {
 }
 
 async fn values_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
-    let body = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(body::full(Bytes::from_static(b"could not read body")))
-                .unwrap();
-        }
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(r) => return *r,
     };
     match serde_json::from_slice::<std::collections::HashMap<String, String>>(&body) {
         Ok(map) => {
@@ -1958,14 +1973,9 @@ async fn value_delete(state: &Arc<AppState>, req: Request<Incoming>) -> Response
 /// but it is untested by use, and the answer's `sessions` array is per-id
 /// precisely so a batch could report which of its members lost their bodies.
 async fn replay_session(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
-    let body = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(body::full(Bytes::from_static(b"could not read body")))
-                .unwrap();
-        }
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(r) => return *r,
     };
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -2173,9 +2183,9 @@ struct Composed {
 /// went out. Like Replay it is fire-and-forget: the transaction lands in the
 /// session list a moment later, which is where the console reads its result.
 async fn compose_request(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
-    let body = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return refused("could not read body"),
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(r) => return *r,
     };
     let composed: Composed = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -2213,9 +2223,9 @@ async fn compose_request(state: &Arc<AppState>, req: Request<Incoming>) -> Respo
 /// The values store is filled in from the proxy's own when the caller sends
 /// none, so a `{name}` in the rules under test means what it means at runtime.
 async fn explain_rules(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
-    let body = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return refused("could not read body"),
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(r) => return *r,
     };
     let mut query: crate::explain::Query = match serde_json::from_slice(&body) {
         Ok(v) => v,

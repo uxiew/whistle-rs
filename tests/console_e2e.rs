@@ -411,3 +411,34 @@ async fn a_rebound_hostname_cannot_read_the_console() {
 
     proxy.shutdown().await;
 }
+
+/// A body over the console's limit is refused whole, and changes nothing. Every
+/// console route used to read its body with no limit, so one request could
+/// make the proxy hold as much memory as it cared to send.
+#[tokio::test]
+async fn an_oversized_body_is_refused_and_changes_nothing() {
+    let proxy = proxy_with("keep.test statusCode://204\n").await;
+    let addr = proxy.addr();
+    let huge = "x".repeat(whistle_rs::config::CONSOLE_BODY_LIMIT + 1);
+    let (status, body) = raw(
+        addr,
+        &format!("POST /api/rules HTTP/1.1\r\nHost: {addr}\r\ncontent-type: text/plain\r\n"),
+        &huge,
+    )
+    .await;
+    assert!(status.contains(" 413 "), "{status}");
+    assert!(body.contains("limit"), "{body}");
+    let rules = console(addr, "GET", "/api/rules", None).await;
+    assert!(rules.contains("keep.test statusCode://204"), "{rules}");
+
+    // The JSON routes share the reader.
+    let (status, _) = raw(
+        addr,
+        &format!("POST /api/values HTTP/1.1\r\nHost: {addr}\r\ncontent-type: application/json\r\n"),
+        &huge,
+    )
+    .await;
+    assert!(status.contains(" 413 "), "{status}");
+
+    proxy.shutdown().await;
+}

@@ -651,6 +651,13 @@ pub const DEFAULT_BODY_REWRITE_CAP: usize = 16 * 1024 * 1024;
 /// Default number of days to retain persisted session files.
 pub const DEFAULT_PERSIST_DAYS: u32 = 7;
 
+/// The largest request body the console reads, 16 MiB: far above any rules
+/// text, values store or bundle a person writes, and a ceiling on what one
+/// request can make the proxy hold. Every console route used to read its body
+/// with no limit at all, so one request could exhaust memory. Over it is a
+/// `413`.
+pub const CONSOLE_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
 /// Captured transactions kept in memory, and whistle's own default and floor
 /// (`-R/--reqCacheSize`, `_original/lib/util/data-server.js:10-12`). This port
 /// used to keep 500, so the console showed a shorter history than whistle's for

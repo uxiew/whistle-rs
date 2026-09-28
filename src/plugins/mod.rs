@@ -1092,11 +1092,25 @@ impl Plugins {
                 if !p.manifest().ui {
                     return None;
                 }
-                let (parts, body) = req.into_parts();
-                let bytes = http_body_util::BodyExt::collect(body)
-                    .await
-                    .map(|c| c.to_bytes().to_vec())
-                    .unwrap_or_default();
+                let (parts, mut body) = req.into_parts();
+                // Bounded like every console body, read frame by frame (see
+                // `webui::read_body` for why not `Limited`). Over the limit is
+                // a 413; it used to be read whole, however large.
+                let mut bytes = Vec::new();
+                while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+                    // A read error ends the body; a trailers frame is skipped.
+                    let Ok(frame) = frame else { break };
+                    let Ok(data) = frame.into_data() else {
+                        continue;
+                    };
+                    if bytes.len() + data.len() > crate::config::CONSOLE_BODY_LIMIT {
+                        return Some(ui::error_page(
+                            hyper::StatusCode::PAYLOAD_TOO_LARGE,
+                            &format!("plugin {name}: request body over the console's limit"),
+                        ));
+                    }
+                    bytes.extend_from_slice(&data);
+                }
                 let ureq = ui::UiReq {
                     method: parts.method.as_str().to_string(),
                     path: parts.uri.path().to_string(),
