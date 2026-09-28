@@ -30,6 +30,12 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
     {
         return not_found();
     }
+    // A browser acting for another site, or reached through a hostname that is
+    // not ours. Before the login: a request that is refused for where it came
+    // from learns nothing about the credentials either.
+    if let Some(refused) = cross_site_refused(state, &req, &path) {
+        return refused;
+    }
     // The login, when one is configured. Before the route table, and before the
     // plugin subtree: a plugin's own pages are part of the console.
     if let Some(denied) = login_required(state, &req, &path) {
@@ -138,6 +144,134 @@ fn allowed_origin<B>(state: &Arc<AppState>, req: &Request<B>, path: &str) -> Opt
         return None;
     }
     origin_on_allow_list(state, &origin).then_some(origin)
+}
+
+/// `None` when the request may reach the console; the `403` to send when it
+/// must not.
+///
+/// Two attacks a CORS header does nothing about, because the browser has
+/// already *sent* the request by the time it reads the response:
+///
+/// * **Cross-site writes.** A page on any site could `POST` a `text/plain` body
+///   to `http://127.0.0.1:8899/api/rules` — a simple request, never preflighted
+///   — and the rules changed. Rules read and write files (`file://`,
+///   `resWrite://`), so that was a web page writing to the user's disk. A
+///   state-changing request that carries an `Origin` must now come from the
+///   console's own origin, or from one on `--allow-origin`. One without an
+///   `Origin` is not a browser acting for a site (browsers send it on every
+///   `POST` and `DELETE`), so curl, scripts and the differential benches are
+///   unaffected. `Origin: null` — a sandboxed frame, a `file://` page — is
+///   never the console.
+/// * **DNS rebinding.** A page on `evil.example` re-resolves its own name to
+///   `127.0.0.1` and is then same-origin with the console: it can read and
+///   write everything. The request still says `Host: evil.example`, so a
+///   request reaching the console directly must name it by an IP literal,
+///   `localhost`, or one of its hostnames — the built-in ones and any added
+///   with `-l`, which is also how to open it under another name.
+///
+/// Upstream checks neither. The certificate and the PAC file stay open to any
+/// host and any origin: they are public by design (see [`open_without_login`]).
+fn cross_site_refused<B>(
+    state: &Arc<AppState>,
+    req: &Request<B>,
+    path: &str,
+) -> Option<Response<DynBody>> {
+    if open_without_login(path) {
+        return None;
+    }
+    let host = request_host(req);
+    if let Some(host) = &host
+        && !host_names_console(state, host)
+    {
+        return Some(forbidden(&format!(
+            "Host {host} is not a name for this console. Open it by IP address or localhost, \
+             or add the name with -l."
+        )));
+    }
+    if matches!(*req.method(), hyper::Method::GET | hyper::Method::HEAD) {
+        return None;
+    }
+    let origin = req
+        .headers()
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())?;
+    let trusted = origin != "null"
+        && (host.as_deref().is_some_and(|h| same_origin(origin, h))
+            || state.config.allow_origins.all
+            || origin_on_allow_list(state, origin));
+    (!trusted).then(|| {
+        forbidden(&format!(
+            "cross-site request refused: Origin {origin} is not this console. \
+             Allow it with --allow-origin if it should be able to change things here."
+        ))
+    })
+}
+
+/// The authority the request was addressed to: `Host`, or the URI's authority
+/// for HTTP/2 and absolute-form requests.
+fn request_host<B>(req: &Request<B>) -> Option<String> {
+    req.headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
+        .filter(|h| !h.is_empty())
+}
+
+/// `host[:port]` → (`host`, `port`), brackets off an IPv6 literal.
+fn split_authority(authority: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (ip, tail) = rest.split_once(']').unwrap_or((rest, ""));
+        return (ip, tail.strip_prefix(':').and_then(|p| p.parse().ok()));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => (host, port.parse().ok()),
+        _ => (authority, None),
+    }
+}
+
+/// Is this a name the console answers to? An IP literal is — rebinding needs a
+/// name the attacker controls — and so are `localhost` and the console's own
+/// hostnames, whether or not `-M pureProxy` has stopped routing them.
+fn host_names_console(state: &Arc<AppState>, authority: &str) -> bool {
+    let (host, _) = split_authority(authority);
+    host.parse::<std::net::IpAddr>().is_ok()
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || BUILTIN_UI_HOSTS
+            .iter()
+            .any(|h| host.eq_ignore_ascii_case(h))
+        || host.eq_ignore_ascii_case(ROOT_CA_HOST)
+        || state
+            .config
+            .local_ui_hosts
+            .iter()
+            .any(|h| host.eq_ignore_ascii_case(h))
+}
+
+/// Does `origin` (`scheme://host[:port]`) name the same host and port as the
+/// `Host` the request arrived with? A side with no port takes the origin
+/// scheme's default, which is how a browser forms both.
+fn same_origin(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    let default = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    let (oh, op) = split_authority(authority);
+    let (hh, hp) = split_authority(host);
+    oh.eq_ignore_ascii_case(hh) && op.unwrap_or(default) == hp.unwrap_or(default)
+}
+
+fn forbidden(message: &str) -> Response<DynBody> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(body::full(Bytes::from(format!("{message}\n"))))
+        .unwrap()
 }
 
 /// Is `origin`'s host on the `--allow-origin` list — the origin dropped to its
@@ -3564,5 +3698,246 @@ mod tests {
         }
         assert!(!crate::rules::is_filter_spelling("host://1.2.3.4"));
         assert!(protocols::is_protocol(protocols::URL_REPLACE));
+    }
+}
+
+#[cfg(test)]
+mod cross_site_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn state(allow: &str, extra_hosts: &[&str]) -> Arc<AppState> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut c = crate::config::Config {
+            storage_dir: std::env::temp_dir().join(format!(
+                "whistle-rs-cross-site-{}-{unique}",
+                std::process::id()
+            )),
+            persist_sessions: false,
+            local_ui_hosts: extra_hosts.iter().map(|h| h.to_string()).collect(),
+            ..crate::config::Config::default()
+        };
+        c.allow_origins = crate::config::AllowedOrigins::parse(allow);
+        let ca = crate::ca::CertAuthority::load_or_create(&c).expect("ca");
+        Arc::new(AppState::new(c, crate::rules::RuleManager::new(), ca))
+    }
+
+    /// Is the request let through? `origin` is sent only when given.
+    fn passes(
+        state: &Arc<AppState>,
+        method: &str,
+        path: &str,
+        host: &str,
+        origin: Option<&str>,
+    ) -> bool {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(hyper::header::HOST, host);
+        if let Some(o) = origin {
+            b = b.header(hyper::header::ORIGIN, o);
+        }
+        let r = b.body(()).expect("request");
+        cross_site_refused(state, &r, path).is_none()
+    }
+
+    /// The attack itself: a page elsewhere posting rules as `text/plain`.
+    #[test]
+    fn a_page_on_another_site_cannot_change_the_rules() {
+        let s = state("", &[]);
+        let host = "127.0.0.1:8899";
+        assert!(!passes(
+            &s,
+            "POST",
+            "/api/rules",
+            host,
+            Some("http://evil.example")
+        ));
+        assert!(!passes(
+            &s,
+            "DELETE",
+            "/api/rule-group",
+            host,
+            Some("https://evil.example")
+        ));
+        assert!(!passes(
+            &s,
+            "POST",
+            "/plugin/x/save",
+            host,
+            Some("http://evil.example")
+        ));
+        // Same host, another port, is another origin — another local app.
+        assert!(!passes(
+            &s,
+            "POST",
+            "/api/rules",
+            host,
+            Some("http://127.0.0.1:3000")
+        ));
+        // A sandboxed frame or a file:// page says `null`.
+        assert!(!passes(&s, "POST", "/api/rules", host, Some("null")));
+    }
+
+    /// What must keep working: the console itself, and clients that are not a
+    /// browser acting for a site.
+    #[test]
+    fn the_console_and_non_browser_clients_still_write() {
+        let s = state("", &[]);
+        assert!(passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "127.0.0.1:8899",
+            Some("http://127.0.0.1:8899")
+        ));
+        assert!(passes(&s, "POST", "/api/rules", "127.0.0.1:8899", None));
+        assert!(passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "localhost:8899",
+            Some("http://localhost:8899")
+        ));
+        assert!(passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "[::1]:8899",
+            Some("http://[::1]:8899")
+        ));
+        // Through the proxy, by console hostname, plain and intercepted.
+        assert!(passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "local.whistlejs.com",
+            Some("http://local.whistlejs.com")
+        ));
+        assert!(passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "local.whistlejs.com",
+            Some("https://local.whistlejs.com")
+        ));
+        assert!(passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "local.whistlejs.com:80",
+            Some("http://local.whistlejs.com")
+        ));
+    }
+
+    /// Reads stay the browser's CORS business: a foreign page can send a GET
+    /// but cannot read the answer, and refusing it would break nothing it could
+    /// not already do.
+    #[test]
+    fn a_read_from_another_site_is_left_to_cors() {
+        let s = state("", &[]);
+        assert!(passes(
+            &s,
+            "GET",
+            "/sessions.json",
+            "127.0.0.1:8899",
+            Some("http://evil.example")
+        ));
+    }
+
+    /// `--allow-origin` still means what it says, for writes too.
+    #[test]
+    fn an_allowed_origin_may_write() {
+        let s = state("tools.example", &[]);
+        assert!(passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "127.0.0.1:8899",
+            Some("https://tools.example:4443")
+        ));
+        assert!(!passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "127.0.0.1:8899",
+            Some("https://evil.example")
+        ));
+        let all = state("*", &[]);
+        assert!(passes(
+            &all,
+            "POST",
+            "/api/rules",
+            "127.0.0.1:8899",
+            Some("https://evil.example")
+        ));
+    }
+
+    /// DNS rebinding: the page is same-origin by then, and only `Host` gives it
+    /// away — for reads as much as writes.
+    #[test]
+    fn a_rebound_name_is_refused_for_reads_and_writes() {
+        let s = state("", &[]);
+        assert!(!passes(
+            &s,
+            "GET",
+            "/sessions.json",
+            "evil.example:8899",
+            None
+        ));
+        assert!(!passes(&s, "GET", "/", "evil.example:8899", None));
+        assert!(!passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "evil.example:8899",
+            Some("http://evil.example:8899")
+        ));
+        // By address, or by the names the console answers to, it opens.
+        assert!(passes(&s, "GET", "/", "192.168.1.20:8899", None));
+        assert!(passes(&s, "GET", "/", "localhost", None));
+        assert!(passes(&s, "GET", "/", "app.localhost:8899", None));
+    }
+
+    /// `-l` is how to reach the console under another name.
+    #[test]
+    fn a_name_added_with_dash_l_is_the_console() {
+        let s = state("", &["proxy.lan"]);
+        assert!(passes(&s, "GET", "/", "proxy.lan:8899", None));
+        assert!(passes(
+            &s,
+            "POST",
+            "/api/rules",
+            "proxy.lan:8899",
+            Some("http://proxy.lan:8899")
+        ));
+    }
+
+    /// The certificate and the PAC file are public, from anywhere.
+    #[test]
+    fn the_certificate_and_pac_answer_any_host() {
+        let s = state("", &[]);
+        assert!(passes(
+            &s,
+            "GET",
+            "/rootCA.crt",
+            "evil.example",
+            Some("http://evil.example")
+        ));
+        assert!(passes(&s, "GET", "/proxy.pac", "evil.example", None));
+    }
+
+    #[test]
+    fn authorities_split_the_way_browsers_write_them() {
+        assert_eq!(split_authority("127.0.0.1:8899"), ("127.0.0.1", Some(8899)));
+        assert_eq!(split_authority("[::1]:8899"), ("::1", Some(8899)));
+        assert_eq!(split_authority("[::1]"), ("::1", None));
+        assert_eq!(split_authority("::1"), ("::1", None));
+        assert_eq!(split_authority("example.com"), ("example.com", None));
+        assert!(same_origin("http://a.test", "a.test:80"));
+        assert!(same_origin("https://a.test", "a.test"));
+        assert!(!same_origin("https://a.test", "a.test:80"));
+        assert!(!same_origin("not an origin", "a.test"));
     }
 }

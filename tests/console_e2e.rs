@@ -70,7 +70,10 @@ async fn through_proxy(proxy: std::net::SocketAddr, url: &str, extra_headers: &s
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A request to the console's own API on the proxy port.
+/// A request to the console's own API on the proxy port, addressed the way a
+/// client that dialled it would address it — by the address it dialled. The
+/// console refuses a `Host` that is not one of its names, which is what stops
+/// DNS rebinding; a made-up name here used to be accepted.
 async fn console(
     proxy: std::net::SocketAddr,
     method: &str,
@@ -80,12 +83,12 @@ async fn console(
     let mut sock = TcpStream::connect(proxy).await.expect("connect console");
     let head = match body {
         Some(b) => format!(
-            "{method} {path} HTTP/1.1\r\nHost: console.test\r\ncontent-type: application/json\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: {proxy}\r\ncontent-type: application/json\r\n\
              content-length: {}\r\nConnection: close\r\n\r\n{b}",
             b.len()
         ),
         None => {
-            format!("{method} {path} HTTP/1.1\r\nHost: console.test\r\nConnection: close\r\n\r\n")
+            format!("{method} {path} HTTP/1.1\r\nHost: {proxy}\r\nConnection: close\r\n\r\n")
         }
     };
     sock.write_all(head.as_bytes()).await.expect("write");
@@ -322,6 +325,89 @@ async fn sending_a_frame_into_nothing_is_refused() {
         let body = console(proxy.addr(), "POST", "/api/ws/send", Some(payload)).await;
         assert!(body.contains(expect), "for {payload}: {body}");
     }
+
+    proxy.shutdown().await;
+}
+
+/// One raw request with exactly the head given, answered as (status line, body).
+async fn raw(proxy: std::net::SocketAddr, head: &str, body: &str) -> (String, String) {
+    let mut sock = TcpStream::connect(proxy).await.expect("connect console");
+    let request = format!(
+        "{head}content-length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    sock.write_all(request.as_bytes()).await.expect("write");
+    let mut out = Vec::new();
+    sock.read_to_end(&mut out).await.expect("read");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    let status = text.lines().next().unwrap_or("").to_string();
+    let body = text
+        .split_once("\r\n\r\n")
+        .map_or(String::new(), |(_, b)| b.to_string());
+    (status, body)
+}
+
+/// The cross-site write, end to end: what a `<form enctype="text/plain">` or a
+/// `fetch(…, {mode: "no-cors"})` on another site sends. It is refused, and the
+/// rules are what they were — the refusal is not just a status code.
+#[tokio::test]
+async fn a_page_on_another_site_cannot_rewrite_the_rules() {
+    let proxy = proxy_with("keep.test statusCode://204\n").await;
+    let addr = proxy.addr();
+    let (status, body) = raw(
+        addr,
+        &format!(
+            "POST /api/rules HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://evil.example\r\n\
+             content-type: text/plain\r\n"
+        ),
+        "* resWrite:///tmp/owned",
+    )
+    .await;
+    assert!(status.contains(" 403 "), "{status}");
+    assert!(body.contains("cross-site"), "{body}");
+    let rules = console(addr, "GET", "/api/rules", None).await;
+    assert!(rules.contains("keep.test statusCode://204"), "{rules}");
+    assert!(!rules.contains("resWrite"), "{rules}");
+
+    // The same write from the console's own page goes through.
+    let (status, _) = raw(
+        addr,
+        &format!(
+            "POST /api/rules HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n\
+             content-type: text/plain\r\n"
+        ),
+        "changed.test statusCode://204",
+    )
+    .await;
+    assert!(status.contains(" 200 "), "{status}");
+    let rules = console(addr, "GET", "/api/rules", None).await;
+    assert!(rules.contains("changed.test"), "{rules}");
+
+    proxy.shutdown().await;
+}
+
+/// DNS rebinding, end to end: a page whose own name now resolves to the proxy
+/// is same-origin with it, but its requests still say which name they used.
+#[tokio::test]
+async fn a_rebound_hostname_cannot_read_the_console() {
+    let proxy = proxy_with("").await;
+    let addr = proxy.addr();
+    let port = addr.port();
+    let (status, body) = raw(
+        addr,
+        &format!("GET /sessions.json HTTP/1.1\r\nHost: evil.example:{port}\r\n"),
+        "",
+    )
+    .await;
+    assert!(status.contains(" 403 "), "{status}");
+    assert!(body.contains("not a name for this console"), "{body}");
+    let (status, _) = raw(
+        addr,
+        &format!("GET /sessions.json HTTP/1.1\r\nHost: localhost:{port}\r\n"),
+        "",
+    )
+    .await;
+    assert!(status.contains(" 200 "), "{status}");
 
     proxy.shutdown().await;
 }
