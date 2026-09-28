@@ -10,7 +10,7 @@ rewritten end to end by every build, which makes every console change an
 unreadable diff. Build it here, and the Rust build inlines it.
 
 ```sh
-npm install     # once
+npm ci          # once; installs exactly what package-lock.json pins
 npm run build   # writes dist/index.html
 ```
 

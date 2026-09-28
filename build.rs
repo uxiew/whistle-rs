@@ -50,7 +50,7 @@ const PLACEHOLDER: &str = r#"<!doctype html>
      a placeholder: the web console is a separate Vite build, and its output was
      not present when this binary was compiled.</p>
   <p>Build it, then rebuild the proxy:</p>
-  <pre><code>cd ui-src &amp;&amp; npm install &amp;&amp; npm run build
+  <pre><code>cd ui-src &amp;&amp; npm ci &amp;&amp; npm run build
 cargo build --release</code></pre>
   <p>Nothing else is missing. The proxy itself is complete, and its API answers
      on this same port — for example:</p>
@@ -78,7 +78,7 @@ fn main() {
         Err(_) => {
             println!(
                 "cargo::warning=ui-src/dist/index.html not found — serving a placeholder console. \
-                 Run `cd ui-src && npm install && npm run build` to build it."
+                 Run `cd ui-src && npm ci && npm run build` to build it."
             );
             fs::write(&out, PLACEHOLDER).expect("write console.html");
         }

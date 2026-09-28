@@ -510,7 +510,7 @@ it by drawing a QR code per LAN address. whistle gets that from `qrcode@1.2.0`;
 this port has its own encoder, so the encoder is what gets compared.
 
 ```sh
-npm install                            # brings in qrcode@1.2.0, whistle's own version
+npm ci                                 # brings in qrcode@1.2.0, whistle's own version
 npm run qr
 ```
 

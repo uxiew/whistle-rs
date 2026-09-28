@@ -11,7 +11,7 @@
 // against `qrcode@1.2.0` at the same error-correction level, over the payloads
 // the console actually draws and a few hundred it never will.
 //
-//   npm install                            # brings in qrcode@1.2.0, whistle's own version
+//   npm ci                                 # brings in qrcode@1.2.0, whistle's own version
 //   npm run qr
 //
 // Nothing is started and no port is claimed: `whistle-rs qr` prints the matrix
@@ -30,7 +30,7 @@ let QRCode;
 try {
   QRCode = require('qrcode');
 } catch (e) {
-  console.error('qr-bench needs the reference encoder:\n  npm install qrcode@1.2.0 --no-save');
+  console.error('qr-bench needs the reference encoder, qrcode@1.2.0 from the lockfile:\n  npm ci');
   process.exit(2);
 }
 
