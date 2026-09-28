@@ -58,6 +58,13 @@ each scoped to the fields and cases it may excuse. Every corpus step is followed
 by `triage-inert.js`, which fails on an inert case with no reason
 ([below](#inert-which-cases-prove-nothing)).
 
+**Does the gate catch anything?** `node mutations.js` builds whistle-rs with each
+of a few preset regressions put in — the important-rule order reversed, a
+`{name}` value gaining a space, `$1` off by one, `statusCode://404` answering 405,
+a QR mask inverted — and runs the gate that should catch each. Every one has to
+fail it; the unmutated build has to pass it first. It works in a scratch git
+worktree of HEAD, so commit before measuring.
+
 **The Node version matters.** Real whistle runs on whatever Node runs the
 oracle, and some of its answers depend on it — `cases-compose.js` records a gzip
 header byte that changed between Node releases. The manifest records the
