@@ -26,6 +26,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 port=${PORT:-18999}
 work=$(mktemp -d "${TMPDIR:-/tmp}/check-console.XXXXXX")
 pid=
+# shellcheck disable=SC2329 # called by the trap below, which shellcheck cannot see
 cleanup() {
   [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   rm -rf "$work"
