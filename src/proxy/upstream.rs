@@ -646,6 +646,30 @@ impl AsyncWrite for BoxedIo {
     }
 }
 
+/// The client's own `Proxy-Authorization`, taken off the request as it arrives
+/// and kept here — in the request's extensions — instead of in its headers.
+///
+/// It is the client's credential **for this proxy**. Left in the headers it went
+/// on to every origin the client visited: whistle 2.10.8 forwards it too,
+/// measured, and a corporate proxy password configured in a browser reached
+/// every site browsed through here. RFC 9110 lets a proxy pass it to the *next
+/// proxy* when proxies authenticate cooperatively, which is the one use kept:
+/// [`Hop`] offers it to an upstream proxy that has no credentials of its own. A
+/// `Proxy-Authorization` a rule sets (`auth://{"proxy":true,…}`) is the
+/// operator's choice and stays in the headers.
+#[derive(Clone)]
+pub struct ClientProxyAuth(pub String);
+
+/// Take the client's `Proxy-Authorization` out of the headers; see
+/// [`ClientProxyAuth`]. Call before the request-side rules run.
+pub fn take_client_proxy_auth(parts: &mut hyper::http::request::Parts) {
+    if let Some(value) = parts.headers.remove(hyper::header::PROXY_AUTHORIZATION)
+        && let Ok(text) = value.to_str()
+    {
+        parts.extensions.insert(ClientProxyAuth(text.to_string()));
+    }
+}
+
 /// What the client request contributes to the hop between us and an upstream
 /// proxy. whistle builds the CONNECT's headers from the client's rather than
 /// sending a bare CONNECT (`_original/lib/inspectors/res.js:317-354`).
@@ -672,7 +696,12 @@ impl Hop {
         };
         Hop {
             user_agent: get(hyper::header::USER_AGENT),
-            client_proxy_auth: get(hyper::header::PROXY_AUTHORIZATION),
+            // A rule's `Proxy-Authorization` if it set one, else the client's.
+            client_proxy_auth: get(hyper::header::PROXY_AUTHORIZATION).or_else(|| {
+                req.extensions()
+                    .get::<ClientProxyAuth>()
+                    .map(|a| a.0.clone())
+            }),
             ..Hop::default()
         }
     }

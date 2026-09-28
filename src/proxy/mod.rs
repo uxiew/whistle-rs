@@ -4761,6 +4761,7 @@ async fn serve(
     // is the whole difference between a URL replacement and `host://`.
     ensure_host_header(&mut parts.headers, &dest.host, dest.port, &dest.scheme);
     parts.headers.remove("proxy-connection");
+    upstream::take_client_proxy_auth(&mut parts);
     mark_stripped_tls(&mut parts.headers, &target);
     apply::apply_request(&mut parts, &resolved);
     // Plugin header rewrites land after the rule operators, so a plugin can
@@ -5481,6 +5482,7 @@ async fn serve_upgrade(
     parts.uri = apply::request_target(&new_path).unwrap_or(parts.uri);
     ensure_host_header(&mut parts.headers, &dest.host, dest.port, &dest.scheme);
     parts.headers.remove("proxy-connection");
+    upstream::take_client_proxy_auth(&mut parts);
     mark_stripped_tls(&mut parts.headers, &target);
     apply::apply_request(&mut parts, resolved);
     let out_req = Request::from_parts(parts, body::empty());

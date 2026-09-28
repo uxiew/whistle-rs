@@ -322,3 +322,40 @@ async fn an_unusable_claim_fails_visibly() {
     );
     assert!(seen.contains("502"), "{seen}");
 }
+
+/// The client's `Proxy-Authorization` is its credential for *this* proxy and
+/// stops here: an origin reached directly never sees it (whistle 2.10.8
+/// forwards it, measured — a proxy password configured in a browser reached
+/// every site). A `Proxy-Authorization` a rule sets on purpose still goes out.
+#[tokio::test]
+async fn the_clients_proxy_credential_does_not_reach_the_origin() {
+    let a = echo_origin("A").await;
+    let p = proxy(
+        format!(
+            "{a}/by-rule auth://{{\"proxy\":true,\"username\":\"admin\",\"password\":\"secret\"}}"
+        ),
+        "",
+    )
+    .await;
+    let direct = through(
+        p.addr(),
+        &format!("http://{a}/direct"),
+        &a.to_string(),
+        &[("proxy-authorization", "Basic dXNlcjpwYXNz")],
+    )
+    .await;
+    assert!(direct.starts_with("who=A"), "{direct}");
+    assert!(!direct.contains("proxy-authorization"), "{direct}");
+
+    let by_rule = through(
+        p.addr(),
+        &format!("http://{a}/by-rule"),
+        &a.to_string(),
+        &[],
+    )
+    .await;
+    assert!(
+        by_rule.contains("proxy-authorization=Basic YWRtaW46c2VjcmV0"),
+        "{by_rule}"
+    );
+}
