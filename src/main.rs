@@ -357,6 +357,22 @@ async fn main() -> Result<()> {
     whistle_rs::private_fs::create_dir(&storage_dir)
         .with_context(|| format!("creating storage dir {}", storage_dir.display()))?;
 
+    // `-N/-W` alone looks like a protected console and is an open one: the
+    // read-only account only restricts anything beside an admin account, and
+    // with no `-n/-w` nobody is asked to log in at all (upstream's
+    // `if (!username && !password) return true`, which it shares). Refused
+    // rather than started in a state the operator did not mean.
+    if (cli.guest_name.is_some() || cli.guest_password.is_some())
+        && cli.username.is_none()
+        && cli.password.is_none()
+    {
+        anyhow::bail!(
+            "-N/-W set a read-only account, but without an admin account (-n/-w) \
+             nobody is asked to log in and the console stays open to everyone, \
+             writes included. Add -n and -w."
+        );
+    }
+
     let mut plugins = std::collections::HashMap::new();
     for spec in &cli.plugins {
         if let Some((name, addr)) = spec.split_once('=') {
