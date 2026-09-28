@@ -1,12 +1,22 @@
 # 自有 HTTP API
 
-基线：`702486d` / 2026-09-25。接口来自 `src/proxy/webui.rs`，现有调用与类型见 `ui-src/src/api.ts`。
+基线：`702486d` / 2026-09-25，2026-09-28 按 S1 更新访问规则。接口来自 `src/proxy/webui.rs`，现有调用与类型见 `ui-src/src/api.ts`。
 
 这是 whistle-rs 的控制接口，**不是官方 `/cgi-bin/*` 或 Node Local Agent API 的兼容层**。以下是现有路由与主要参数，不代表已承诺独立稳定的版本化 API；错误模型、分页和诊断补强见 [ROADMAP.md](ROADMAP.md) 的 O1/O2。
 
 ## 地址与认证
 
-默认与代理共用端口；`-P/--uiport` 可指定 UI 端口。按 [OPERATIONS.md](OPERATIONS.md) 限制访问。配置账户时使用 HTTP Basic；访客账户只读。不要把 CORS 白名单当身份认证，也不要把 UI 认证当代理转发认证。
+默认与代理共用端口，只监听 `127.0.0.1`；`-P/--uiport` 另开一个只服务控制台的端口。按 [OPERATIONS.md](OPERATIONS.md) 限制访问。配置账户时使用 HTTP Basic；访客账户只读。不要把 CORS 白名单当身份认证，也不要把 UI 认证当代理转发认证。
+
+每个请求先过两道检查，再验登录：
+
+| 检查 | 不通过时 |
+| --- | --- |
+| `Host` 必须是 IP 地址、`localhost` 或控制台主机名（内置的和 `-l` 加的） | `403`，正文说明原因；防 DNS rebinding |
+| POST/DELETE 若带 `Origin`，须是控制台自己或 `--allow-origin` 名单上的来源；`Origin: null` 一律不行 | `403 cross-site request refused`；不带 `Origin` 的脚本和 curl 不受影响 |
+| 请求体不超过 16 MiB | `413` |
+
+根证书和 PAC 不受前两道检查限制。
 
 直连接口不要经过调试代理本身，例如：
 
@@ -33,7 +43,7 @@ Body 详情包含 `len`、`truncated`、`text`、`binary`。`len` 不是可下�
 
 ## 规则与 Values
 
-除特别注明外，写接口传 JSON 并设置 `Content-Type: application/json`。
+除特别注明外，写接口的请求体是 JSON。服务端不检查 `Content-Type`；防跨站靠的是上面的 `Origin` 检查，不是内容类型。
 
 | 方法 / 路径 | 输入或用途 |
 | --- | --- |
@@ -62,7 +72,8 @@ Body 详情包含 `len`、`truncated`、`text`、`binary`。`len` 不是可下�
 | `POST /api/explain` | `{ "rules": "...", "url": "http://example.com/", "method": "GET" }`；可选 headers/body/response；只解释，不发请求 |
 | `POST /api/composer` | `{ "method": "GET", "url": "http://example.com/", "headers": "", "body": "" }`；headers 是逐行原始头文本 |
 | `POST /api/replay` | `{ "ids": [1, 2] }`；使用捕获数据，检查结果中的 body 状态 `whole/partial/empty/undecodable` |
-| `POST /api/sessions/clear` | `{ "ids": [1, 2] }` 清除指定会话；`{}` 清除当前会话列表，不代表已安全擦除全部历史文件 |
+| `POST /api/sessions/clear` | `{ "ids": [1, 2] }` 清除指定会话；`{}` 清空列表。**只清内存**，已落盘的历史重启后会回来 |
+| `POST /api/sessions/purge` | 清空内存并删除全部会话文件；返回 `{ "ok": true, "files_deleted": N }` |
 | `GET /api/ws/status?id=N` | 当前连接的扣留/放行状态 |
 | `POST /api/ws/release` | `{ "id": 1, "dir": "send" }`；方向为 send/receive，按该方向批量放行 |
 | `POST /api/ws/send` | `{ "id": 1, "dir": "send", "data": "hello" }`；确实向活动连接发送数据 |
@@ -71,6 +82,6 @@ Composer/Replay 的调用会产生网络请求并经过代理规则；不能当�
 
 ## 启动辅助与插件页面
 
-`GET /rootCA.crt`（另有 `/rootca.crt`）下载公钥证书；`GET /proxy.pac`（另有 `/pac`）读取 PAC。它们有免登录配置用途，不能返回 CA 私钥。`GET /api/qr?text=...&scale=...` 返回 SVG。`/plugin/<name>/...` 交给本项目插件处理，并经过控制台入口的认证检查。
+`GET /rootCA.crt`（另有 `/rootca.crt`）下载公钥证书；`GET /proxy.pac`（另有 `/pac`）读取 PAC。它们有免登录配置用途，不能返回 CA 私钥。`GET /api/qr?text=...&scale=...` 返回 SVG。`/plugin/<name>/...` 交给本项目插件处理，经过控制台入口的全部检查；转交给插件时去掉 `Authorization` 和 `Proxy-Authorization`，插件拿不到控制台的登录凭据。
 
 这些端点的可用性还受 `headless` 等启动模式影响；不要靠一个首页状态推断所有读写能力均已开放。
