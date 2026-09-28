@@ -22,11 +22,42 @@ an npm install of whistle. It is a tool you reach for, not a gate you pass.
 
 ```sh
 cd tests/differential
-npm install                                  # once — pulls real whistle
+npm ci                                       # once — real whistle, from the lockfile
 PORT_BASE=18700 node oracle.js &             # real whistle on :18700
 cargo run -- --port 18701 --no-persist --dir /tmp/rs-diff &   # from the repo root
 PORT_BASE=18700 npm run bench
 ```
+
+### The oracle's dependencies
+
+`package-lock.json` pins the whole tree, not just `whistle@2.10.8`: every number
+in this directory was measured against one particular set of transitive
+dependencies, and `express`, `iconv-lite` or `node-forge` moving underneath
+whistle would change the oracle without anyone touching it. Use `npm ci`, never
+`npm install`, which may re-resolve and rewrite the lock.
+
+How the lock was made and checked (2026-09-28): the versions are exactly the
+tree every earlier measurement ran on — 196 packages, none moved. Each entry's
+`resolved` and `integrity` come from registry.npmjs.org, and each integrity was
+compared with registry.npmmirror.com's for the same version: all 196 agree, all
+are sha512, none has an install script. A fresh `npm ci` from the lock produced
+a `node_modules` byte-identical to the one it was taken from. npm replaces the
+registry.npmjs.org host with whatever registry you have configured, so a mirror
+works unchanged and the integrity check still applies.
+
+`npm audit` reports 11 advisories (4 high, 7 moderate: `adm-zip`, `qs` via
+`express`/`body-parser`, and `cross-spawn`/`mem`/`yargs-parser` via
+`qrcode@1.2.0`). They are **accepted, not fixed**: the oracle has to be the
+whistle upstream shipped, with the dependencies it shipped with, and `qrcode`
+is held at the version whistle itself uses. None of it is distributed, and it
+only ever handles this bench's own requests on loopback. Do not run
+`npm audit fix` here — it would silently swap the reference being measured
+against.
+
+To move to a new whistle, change the version in `package.json`, run
+`npm install --package-lock-only --registry=https://registry.npmjs.org/` (a
+mirror's own URLs must not end up in the lock), and review the lock diff the
+same way before committing it; see ROADMAP task U1.
 
 `PORT_BASE` claims three consecutive ports — whistle, whistle-rs, and the echo
 origin — so several benches can run at once, one per area under audit:
