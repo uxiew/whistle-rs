@@ -500,6 +500,11 @@ export function mockApi(): Plugin {
         sessions = ids ? sessions.filter((s) => !ids.includes(s.id)) : [];
         return reply({ ok: true });
       }
+      case '/api/sessions/purge': {
+        await readBody(req);
+        sessions = [];
+        return reply({ ok: true, files_deleted: 2 });
+      }
       case '/api/replay': {
         const body = JSON.parse((await readBody(req)) || '{}');
         const want: number[] = body.ids ?? (body.id === undefined ? [] : [body.id]);

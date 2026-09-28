@@ -663,6 +663,15 @@ export async function clearSessions(): Promise<void> {
   await loadSessions();
 }
 
+/** Clear, and delete the saved history on disk — the one that does not come back. */
+export async function purgeSessions(): Promise<void> {
+  const res = await reach(api.purgeSessions);
+  if (!res) return;
+  clearSelection();
+  await loadSessions();
+  flashNote(`Deleted the session history (${res.files_deleted ?? 0} file(s) on disk)`);
+}
+
 export async function replaySelected(): Promise<void> {
   const ids = actingOn.value.slice();
   if (!ids.length) return;

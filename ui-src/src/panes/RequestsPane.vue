@@ -8,6 +8,7 @@ import {
   captureFiltering,
   captureRefused,
   clearSessions,
+  purgeSessions,
   countLabel,
   loadSessions,
   replaySelected,
@@ -66,8 +67,15 @@ function startDrag(e: MouseEvent): void {
 }
 
 function onClear(): void {
-  if (!confirm('Clear all captured sessions?')) return;
+  // Clear tidies the list. What persistence saved stays on disk and is back
+  // after a restart, which a plain "clear all?" did not say.
+  if (!confirm('Clear the list? History saved on disk is kept and comes back on the next start — Delete history removes it.')) return;
   void clearSessions();
+}
+
+function onPurge(): void {
+  if (!confirm('Delete every captured session, including the history saved on disk? This cannot be undone.')) return;
+  void purgeSessions();
 }
 </script>
 
@@ -77,6 +85,7 @@ function onClear(): void {
 
     <div class="actions">
       <button class="btn" @click="onClear">Clear</button>
+      <button class="btn" @click="onPurge">Delete history</button>
       <button class="btn" @click="loadSessions()">Reload</button>
       <button class="btn" :disabled="state.selected === null" @click="replaySelected()">Replay</button>
       <label class="check"><input v-model="state.autoRefresh" type="checkbox" /> Auto refresh</label>

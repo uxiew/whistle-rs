@@ -342,6 +342,8 @@ export const api = {
     postJson<OkResult & { released?: number }>('/api/ws/release', { id, dir }),
   /** No ids forgets everything; a list forgets exactly those sessions. */
   clearSessions: (ids?: number[]) => postJson<OkResult>('/api/sessions/clear', ids ? { ids } : {}),
+  /** Clear, and delete the history persistence wrote to disk. */
+  purgeSessions: () => postJson<OkResult & { files_deleted?: number }>('/api/sessions/purge', {}),
   replay: (ids: number[]) => postJson<ReplayResult>('/api/replay', { ids }),
   /** A HAR of the given sessions, as a link the browser downloads. */
   harUrl: (ids: number[]) => `/sessions.har?ids=${ids.join(',')}`,
