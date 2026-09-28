@@ -113,3 +113,5 @@ node scripts/third-party-licenses.mjs --target x86_64-unknown-linux-gnu   # 需�
 ```
 
 有包完全没声明许可时脚本失败；声明了却没带原文的只列 SPDX 标识并在 stderr 点名。crate 包的内容由 `Cargo.toml` 的 `include` 白名单决定——没有它，`cargo package` 会把本地未忽略的一切打进去，包括 `_original/` 里的上游源码。加新的顶层文件时，想让它进包就加进白名单。
+
+检查包时用独立的 target 目录：`cargo package --locked --target-dir target/package-check`。不加的话，`cargo package` 会用解包后的源码（里面没有 `ui-src/dist`）重新编译，结果写进同一个 `target/debug/`，把本机带真控制台的二进制换成占位页版本；而且之后普通的 `cargo build` 也不会自己恢复——构建脚本以为前端产物没变，一直沿用那份占位页，要 `touch ui-src/dist/index.html` 再编译才回来。
