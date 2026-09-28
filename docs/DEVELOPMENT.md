@@ -50,6 +50,8 @@ cargo test --locked --all-targets
 cargo test --locked --doc
 npm run typecheck --prefix ui-src
 npm run build --prefix ui-src
+node scripts/check-links.mjs
+node tests/differential/run.js fast   # 需先在 tests/differential 里 npm ci
 git diff --check
 ```
 
@@ -59,28 +61,40 @@ git diff --check
 
 首次安装允许 Cargo 下载 Cargo.lock 固定依赖，缓存齐备后才考虑 `--offline`。不要把离线缓存不完整当成源码错误，也不要为通过测试擅自更新锁文件。
 
-## 解析差分
+## 文档链接与控制台检查
 
 ```sh
-# 在根目录生成 oracle 固定读取的 debug 二进制
-cargo build --locked
-cd tests/differential
-# 此目录当前没有受版本控制的锁文件；不能假定 npm ci 可用
-npm install
-node rules-oracle.js --values
+node scripts/check-links.mjs                                  # 所有受版本控制的 Markdown 的相对链接和 #锚点
+scripts/check-console.sh target/release/whistle-rs built      # 二进制嵌入的就是 ui-src/dist 这一版控制台
+scripts/check-console.sh target/debug/whistle-rs placeholder  # 没有前端产物时，二进制能跑且给出占位页
 ```
 
-`package.json` 固定直接依赖 Whistle 2.10.8，但未锁定全部传递依赖。Q2 要把安装改成锁文件驱动；在该任务完成前，报告需记录实际安装版本，不能写成完全可复现的依赖树。
+链接检查只认 git 跟踪的文件：`_original/` 在本机存在，但在 GitHub 上是 404，指向它的链接会被报出来。外链不联网检查。`check-console.sh` 只用 sh 和 curl，所以也能在没装 Node 的环境里跑；它对 curl 加了 `--noproxy '*'`——本机设了 `http_proxy` 又没设 `no_proxy` 时，curl 连 127.0.0.1 也会走代理，检查会一直卡住。
 
-`rules-oracle.js` 直接调用上游解析器，并询问 `target/debug/whistle-rs explain --batch`。它不打开代理端口，适合语法/匹配/取值回归；不覆盖真实网络、响应阶段、动态 includes 或插件。报告同时保存 questions、answered、differing、value differences 和归一化信息，不能只抄退出码。
+## 与上游的差分
 
-## 真代理、流和专项差分
+```sh
+cargo build --locked              # 仓库根目录；比源码旧的二进制会被拒绝
+cd tests/differential
+npm ci                            # 按锁文件装 whistle 2.10.8 全套依赖；不要用 npm install
+node run.js fast                  # 约 5 秒：规则解析差分（文档语料 + 手写语料）和二维码，不开端口代理
+node run.js network               # 约 14 分钟（本机实测 851 秒）：两边代理都起来，所有语料和专项 bench
+node run.js network --only cases-delete,https   # 只跑几步；--list 列出全部步骤
+```
 
-`harness.js` 比较客户端与源站两端结果，语料由 `CASES` 选择、端口基址由 `PORT_BASE` 指定。`https-bench.js`、`timing-bench.js`、`write-bench.js`、`frames-bench.js`、`header-rules-bench.js` 等覆盖不同边界，启动/清理安排须先读各脚本；当前没有一个经本轮验证的“跑一条命令即全套验收”入口。
+`run.js` 自己起停需要的代理，数据目录、根证书和会话都放在用完即删的临时目录里，只监听 127.0.0.1；开跑前逐个检查要用的端口，被占用就直接退出并报端口号和占用者；每个子进程单独一个进程组，结束或 Ctrl-C 时整组杀掉，不会留下还在监听的代理。退出码：0 全部通过，1 有步骤失败，2 没法开始（端口被占、二进制缺失或比源码旧、没跑 `npm ci`）。归档在 `target/differential/<时间>-<套件>/`：`manifest.json` 记录提交与未提交文件、whistle-rs 版本和 SHA-256、whistle 版本和锁文件哈希、每个脚本和语料的哈希、Node 版本、每一步的命令和结果，外加每一步的输出和每个代理的日志。
 
-只在专用临时目录、回环地址和自有夹具上跑网络差分；不要把官网所有示例直接当网络用例执行，其中的真实 URL 或文件路径可能产生外部请求和副作用。测试 CA 只供测试客户端信任，不自动导入系统。
+判定规则只有一条：**没人解释过的差异就失败。** 已知且接受的差异逐条写在 `tests/differential/declared.js`（用例、字段、测量时的上游版本、理由）；跨语料反复出现的模式在 `harness.js` 的 `EXPECTED`，每条都限定了能豁免的字段和用例范围。声明了却不再出现的差异同样算失败——留着它，以后这个字段在这个用例上出什么问题都会被放过。每个语料跑完还会跑 `triage-inert.js`：规则一条都没命中、又没说明原因的用例算失败。
 
-`IGNORE`/`EXPECTED` 是有限的归一化与已知偏离，而不是掩盖回归的工具。每项新增例外要绑定用例、字段、上游版本和理由；无法区分“实现了”和“根本没实现”的 `inert` 用例须解释或加强。
+新增例外时照这个格式写进 `declared.js`，别加宽 `EXPECTED` 的匹配范围，也别往 `IGNORE` 里加头。门禁到底能不能抓到回归，用 `node mutations.js` 验证：它在 HEAD 的临时 worktree 里逐条注入几个预设的语义回归，每条都必须让对应门禁失败（所以跑之前先提交）。
+
+**Node 版本会影响结果。** 对照组是跑在 Node 上的 whistle，有些答案随 Node 版本变（`cases-compose.js` 记录过 gzip 头的一个字节）。当前声明是在 Node 26 上测的，CI 的差分任务也用 26；换版本要重新测量。
+
+几条不要做的事：不要把官网示例直接当网络用例跑（真实 URL 会产生外部请求）；测试 CA 只给测试客户端信任，不导入系统；`npm audit fix` 会悄悄换掉对照组，别跑（原因见差分 README）。各语料、专项 bench 和锁文件审阅的细节只写在 [tests/differential/README.md](../tests/differential/README.md)。
+
+## CI
+
+`.github/workflows/ci.yml` 在每个 PR 和推到 main 时运行：钉住工具链上的 fmt/Clippy/全部测试、MSRV 版本上的全部测试、在不含 Node 的 `rust:1.98.1-trixie` 容器里构建纯代理并检查占位页、Node 20.19.0 和 24 两个版本下的前端 typecheck/build、先构建控制台再构建 release 并断言嵌入的是真控制台（附带二进制和 SHA-256 作为构件）、文档链接检查、`run.js fast`。`.github/workflows/differential.yml` 跑全量网络差分（`run.js all`），手动触发或每周一凌晨，结果归档上传。所有 action 都按提交哈希钉住版本，注释里写了对应的 tag。
 
 性能基准与长连接稳定性另行记录配置、硬件、制品和资源曲线。macOS 测试不能代替 Linux/Windows 真机，编译成功不能替代证书、网络和 UI 工作流测试。
 

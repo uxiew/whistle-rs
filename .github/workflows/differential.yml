@@ -1,8 +1,8 @@
 # The whole differential: real whistle 2.10.8 and whistle-rs side by side,
 # every hand-written corpus, the HTTPS/frames/timing/write/auth benches, and the
-# benches that start one proxy per mode. Around ten minutes, so not on every
-# pull request (ci.yml runs the fast half there): by hand, and weekly, so a
-# regression is at most a week old when it is found.
+# benches that start one proxy per mode. About fourteen minutes on a laptop,
+# so not on every pull request (ci.yml runs the fast half there): by hand, and
+# weekly, so a regression is at most a week old when it is found.
 #
 # Everything it saw is uploaded, pass or fail: the manifest (commit, binary
 # hash, whistle version, lockfile and corpus hashes), each step's output and
