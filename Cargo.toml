@@ -2,6 +2,12 @@
 name = "whistle-rs"
 version = "0.1.0"
 edition = "2024"
+description = "The core of the whistle debugging proxy in Rust: rules, HTTP/HTTPS capture, WebSocket inspection and an embedded web console"
+license = "MIT"
+repository = "https://github.com/uxiew/whistle-rs"
+# No `authors`: the field is optional, and there is no list of people who have
+# agreed to be named in it. LICENSE says "whistle-rs contributors" for the same
+# reason.
 # The oldest Rust that builds and passes the tests, found by trying: 1.94
 # rejects the `if let` match guards in src/proxy/apply.rs (stable from 1.95),
 # and the locked dependencies need 1.88 (boa, time). An older rustc now stops
