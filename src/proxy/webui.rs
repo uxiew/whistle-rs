@@ -169,7 +169,10 @@ fn allowed_origin<B>(state: &Arc<AppState>, req: &Request<B>, path: &str) -> Opt
 ///   write everything. The request still says `Host: evil.example`, so a
 ///   request reaching the console directly must name it by an IP literal,
 ///   `localhost`, or one of its hostnames — the built-in ones and any added
-///   with `-l`, which is also how to open it under another name.
+///   with `-l`, which is also how to open it under another name. On the proxy
+///   port such a request never gets here: it is forwarded to the name it gave,
+///   which redirects to the console's address (`top_level`, `serve`). This
+///   check is what answers on the `-P` console port, which forwards nothing.
 ///
 /// Upstream checks neither. The certificate and the PAC file stay open to any
 /// host and any origin: they are public by design (see [`open_without_login`]).
@@ -235,7 +238,7 @@ fn split_authority(authority: &str) -> (&str, Option<u16>) {
 /// Is this a name the console answers to? An IP literal is — rebinding needs a
 /// name the attacker controls — and so are `localhost` and the console's own
 /// hostnames, whether or not `-M pureProxy` has stopped routing them.
-fn host_names_console(state: &Arc<AppState>, authority: &str) -> bool {
+pub(super) fn host_names_console(state: &Arc<AppState>, authority: &str) -> bool {
     let (host, _) = split_authority(authority);
     host.parse::<std::net::IpAddr>().is_ok()
         || host.eq_ignore_ascii_case("localhost")

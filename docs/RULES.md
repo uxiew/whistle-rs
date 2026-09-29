@@ -3175,10 +3175,25 @@ the method alone. A value that *is* a token agrees, including an unknown verb
 
 ### Reaching a rule without a proxy configured
 
-Everything addressed to the proxy's own port **origin-form** — a request with a
-path rather than a whole URL — is the console. That is what makes
-`http://127.0.0.1:8899/api` fetch a page of this program rather than anything a
-rule could touch.
+A request sent straight to the proxy's port **origin-form** — a path rather than
+a whole URL — is decided by its `Host`:
+
+- **a name for the console** — an IP address, `localhost`, a console hostname
+  (built in or added with `-l`): the console answers. That is what makes
+  `http://127.0.0.1:8899/api` fetch a page of this program rather than anything
+  a rule could touch;
+- **any other name**: an ordinary request to that name, rules and all — how a
+  client with no proxy setting still reaches the rules, say through a hosts-file
+  line pointing `api.example.com` at this machine with `-p 80`. Upstream does
+  the same (`_original/biz/index.js:98-106`, `lib/upgrade.js:23-24`).
+
+```console
+$ curl -H 'Host: api.example.com' http://127.0.0.1:8899/v1   # → api.example.com/v1, by the rules
+```
+
+A name that resolves back to this proxy is not served the console under it — a
+page could rebind its own name to `127.0.0.1` and read everything — but answered
+with a `302` to the console's address, as upstream answers it.
 
 `/-/` (or `/_/`) in front of the path says the opposite: strip the prefix and
 treat what is left as an ordinary request (`_original/biz/index.js:114-129`,

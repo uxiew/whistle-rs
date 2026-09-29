@@ -387,12 +387,9 @@ pub(crate) fn is_local_ip(ip: IpAddr) -> bool {
 /// The address a hop would loop back to, if routing `target` would hand the
 /// request to this very proxy.
 ///
-/// Only the **proxy hop** is examined. A direct connection to our own port
-/// cannot recurse in this port: the request we send is origin-form, so the
-/// copy that arrives is not a proxy request and is answered by the web UI.
-/// whistle 302s that case as well (`res.js:409-420`); reproducing the redirect
-/// would turn `curl -x localhost:8899 http://localhost:8899/rootCA.crt` into a
-/// redirect loop here, since we would send the client back through the proxy.
+/// Only the **proxy hop** is examined here; a direct connection to our own port
+/// is [`direct_self_loop`]'s, because whether *that* recurses depends on the
+/// name the request carries, which only the caller knows.
 pub async fn self_loop(target: &Target) -> Option<SocketAddr> {
     let proxy = target.proxy.as_ref()?;
     // The port check is first and needs no I/O, so the common request pays
@@ -405,6 +402,51 @@ pub async fn self_loop(target: &Target) -> Option<SocketAddr> {
         .into_iter()
         .find(|ip| is_local_ip(*ip))
         .map(|ip| SocketAddr::new(ip, proxy.port))
+}
+
+/// The address a **direct** connection would reach this proxy at, if it would.
+///
+/// Whether that loops is the caller's to decide. The copy that arrives is
+/// origin-form, and the proxy answers it from the console when its `Host` is a
+/// name for the console — `curl -x localhost:8899 http://127.0.0.1:8899/rootCA.crt`
+/// is how that is reached, and it must not be refused. Under any other name the
+/// arrival is forwarded again (`top_level`), to the same place. whistle answers
+/// a direct hop to its own port with a 302 to its UI by address
+/// (`_original/lib/inspectors/res.js:409-424`), and so does the caller.
+pub async fn direct_self_loop(target: &Target) -> Option<SocketAddr> {
+    if target.proxy.is_some() || !is_own_port(target.connect_port) {
+        return None;
+    }
+    resolve_ips(&target.connect_host, target.connect_port)
+        .await
+        .into_iter()
+        .find(|ip| is_local_ip(*ip))
+        .map(|ip| SocketAddr::new(ip, target.connect_port))
+}
+
+/// A header on every request this process sends **directly** to a port it
+/// serves on itself, carrying [`loop_nonce`].
+///
+/// The backstop for [`direct_self_loop`], which only knows the addresses
+/// [`is_local_ip`] knows — loopback, the bound ones, the primary one. A name
+/// that resolves to this machine by another interface would otherwise be
+/// forwarded to itself until the sockets ran out. Seeing its own nonce come
+/// back is proof, whatever the address. Only on requests to our port number:
+/// an origin elsewhere never sees it.
+pub const LOOP_HEADER: &str = "x-whistle-rs-loop";
+
+static LOOP_NONCE: Lazy<String> = Lazy::new(|| {
+    use std::hash::{BuildHasher, Hasher};
+    // `RandomState` is seeded from the OS once per process: random enough to be
+    // this process's, without a dependency for it.
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(std::process::id().into());
+    format!("{:016x}", h.finish())
+});
+
+/// This process's value for [`LOOP_HEADER`].
+pub fn loop_nonce() -> &'static str {
+    &LOOP_NONCE
 }
 
 /// Resolve a proxy host to the addresses it would connect to. A hostname is
@@ -917,6 +959,12 @@ async fn forward_once(
             error: anyhow!("Self loop ({addr})"),
             request: req,
         })));
+    }
+    if target.proxy.is_none() && is_own_port(target.connect_port) {
+        req.headers_mut().insert(
+            LOOP_HEADER,
+            hyper::header::HeaderValue::from_static(loop_nonce()),
+        );
     }
     let hop = Hop::from_request(&req).with_target(target);
 

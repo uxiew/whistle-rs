@@ -12,7 +12,7 @@
 
 | 检查 | 不通过时 |
 | --- | --- |
-| `Host` 必须是 IP 地址、`localhost` 或控制台主机名（内置的和 `-l` 加的） | `403`，正文说明原因；防 DNS rebinding |
+| `Host` 必须是 IP 地址、`localhost` 或控制台主机名（内置的和 `-l` 加的） | 代理端口上：当普通请求转发给那个域名，解析回本机则 `302` 到控制台地址；`-P` 端口上：`403`，正文说明原因。都是为了防 DNS rebinding |
 | POST/DELETE 若带 `Origin`，须是控制台自己或 `--allow-origin` 名单上的来源；`Origin: null` 一律不行 | `403 cross-site request refused`；不带 `Origin` 的脚本和 curl 不受影响 |
 | 请求体不超过 16 MiB | `413` |
 

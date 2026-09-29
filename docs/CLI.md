@@ -291,10 +291,13 @@ browser acting for a site and is unaffected. Upstream checks nothing here. The
 list therefore grants **writes** to the origins it names, and `'*'` grants them
 to every site: use names.
 
-The console also refuses a request whose `Host` is not one of its names — an IP
-address, `localhost`, or a console hostname (the built-in ones and any added
-with `-l`) — which is what stops DNS rebinding. To open the console under
-another name, add it with `-l`.
+The console answers only under one of its names — an IP address, `localhost`, or
+a console hostname (the built-in ones and any added with `-l`) — which is what
+stops DNS rebinding. On the proxy port a request under any other name is
+forwarded to that name like proxied traffic, as upstream does, and a name that
+resolves back to this machine gets a `302` to the console's address; on a `-P`
+console port it gets `403`. To open the console under another name, add it with
+`-l`.
 
 ## Coming from `w2`
 

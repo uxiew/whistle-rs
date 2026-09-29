@@ -2500,7 +2500,57 @@ async fn top_level(
         *req.uri_mut() = uri;
         return guard(serve(state, req, Origin::Forward, peer).await);
     }
+    // …and unless it names somebody else. "Addressed to the proxy's own port"
+    // is what the `Host` says, not where the socket went: an origin-form
+    // request for `api.example.com` is a client with no proxy configured — a
+    // hosts-file entry, a WebSocket library pointed at the proxy — and whistle
+    // forwards it like any other (`_original/biz/index.js:98-106`,
+    // `lib/upgrade.js:23-24`: the console only under one of its names, or this
+    // machine's address on the proxy port). This port sent every such request
+    // to the console, which after the rebinding check answered 403.
+    //
+    // A name that resolves back to this proxy is not served the console under
+    // it — that is the rebinding attack — but redirected to the console's
+    // address, in `serve`.
+    if let Some(uri) = forwarded_by_name(&state, &req) {
+        // This proxy sent the request here itself: `serve` did not know the
+        // name for one of its own addresses. Refused rather than sent round
+        // again — see `upstream::LOOP_HEADER`.
+        if req
+            .headers()
+            .get(upstream::LOOP_HEADER)
+            .is_some_and(|v| v == upstream::loop_nonce())
+        {
+            return Ok(loop_detected(&uri));
+        }
+        *req.uri_mut() = uri;
+        return guard(serve(state, req, Origin::Forward, peer).await);
+    }
+    req.headers_mut().remove(upstream::LOOP_HEADER);
     Ok(webui::handle(&state, req).await)
+}
+
+/// The absolute-form URI of an origin-form request whose `Host` is not a name
+/// for the console, or `None` when it is one (or says nothing).
+fn forwarded_by_name<B>(state: &Arc<AppState>, req: &Request<B>) -> Option<hyper::Uri> {
+    let host = req.headers().get(hyper::header::HOST)?.to_str().ok()?;
+    if host.is_empty() || webui::host_names_console(state, host) {
+        return None;
+    }
+    let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+    format!("http://{host}{path}").parse().ok()
+}
+
+/// `508 Loop Detected` for a request this proxy forwarded to itself.
+fn loop_detected(uri: &hyper::Uri) -> Response<DynBody> {
+    tracing::warn!("{uri} came back to this proxy after it forwarded it; refusing");
+    Response::builder()
+        .status(StatusCode::LOOP_DETECTED)
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(body::full(Bytes::from(format!(
+            "whistle-rs: {uri} resolves to this proxy, which forwarded it to itself\n"
+        ))))
+        .expect("static 508")
 }
 
 /// `/-/…` and `/_/…` on the proxy's own port: the absolute-form URI the request
@@ -4730,7 +4780,17 @@ async fn serve(
     // answers the request from its own UI port instead of making the hop
     // (`_original/lib/inspectors/res.js:302-316`); `upstream::forward` refuses
     // the same hop with a "Self loop" error for every path that reaches it.
-    if let Some(addr) = upstream::self_loop(&target).await {
+    // A direct hop to our own port under a name that is not the console's
+    // would be forwarded again on arrival (`top_level`); whistle redirects it
+    // to its UI by address instead (`_original/lib/inspectors/res.js:409-424`).
+    // Under a console name it is simply the console, reached through the proxy.
+    let looped = match upstream::self_loop(&target).await {
+        Some(addr) => Some(addr),
+        None => upstream::direct_self_loop(&target)
+            .await
+            .filter(|_| !webui::host_names_console(&state, &dest.host)),
+    };
+    if let Some(addr) = looped {
         let location = format!(
             "http://{}{}",
             SocketAddr::new(addr.ip(), state.config.port),

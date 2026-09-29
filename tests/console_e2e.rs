@@ -388,9 +388,15 @@ async fn a_page_on_another_site_cannot_rewrite_the_rules() {
 
 /// DNS rebinding, end to end: a page whose own name now resolves to the proxy
 /// is same-origin with it, but its requests still say which name they used.
+///
+/// The name is not the console's, so the request is an ordinary one to be
+/// forwarded — and forwarded, it would reach this proxy again. It is sent to
+/// the console's own address with a 302 instead, which is a different origin
+/// to the page: it cannot read what is there. The rebinding is simulated with
+/// a rule, so the test does not depend on a resolver.
 #[tokio::test]
 async fn a_rebound_hostname_cannot_read_the_console() {
-    let proxy = proxy_with("").await;
+    let proxy = proxy_with("evil.example 127.0.0.1\n").await;
     let addr = proxy.addr();
     let port = addr.port();
     let (status, body) = raw(
@@ -399,8 +405,8 @@ async fn a_rebound_hostname_cannot_read_the_console() {
         "",
     )
     .await;
-    assert!(status.contains(" 403 "), "{status}");
-    assert!(body.contains("not a name for this console"), "{body}");
+    assert!(status.contains(" 302 "), "{status}");
+    assert!(!body.contains('['), "a capture was served: {body}");
     let (status, _) = raw(
         addr,
         &format!("GET /sessions.json HTTP/1.1\r\nHost: localhost:{port}\r\n"),
@@ -408,6 +414,42 @@ async fn a_rebound_hostname_cannot_read_the_console() {
     )
     .await;
     assert!(status.contains(" 200 "), "{status}");
+
+    proxy.shutdown().await;
+}
+
+/// A request that reaches the proxy port without a proxy configured — its
+/// `Host` names somebody else — is forwarded, as upstream forwards it
+/// (`biz/index.js:98-106`). It used to be the console's, and after the
+/// rebinding check a 403; upstream's own suite sends WebSockets this way.
+#[tokio::test]
+async fn a_request_for_another_name_is_forwarded_not_answered() {
+    let origin = origin(b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nfrom origin").await;
+    let proxy = proxy_with(&format!("named.test {origin}\n")).await;
+    let (status, body) = raw(proxy.addr(), "GET /x HTTP/1.1\r\nHost: named.test\r\n", "").await;
+    assert!(status.contains(" 200 "), "{status}");
+    assert_eq!(body, "from origin");
+
+    proxy.shutdown().await;
+}
+
+/// The backstop: a request this proxy forwarded to itself comes back carrying
+/// its own marker, and is refused rather than forwarded round again — for the
+/// name that resolves here by an address the proxy did not know as its own.
+#[tokio::test]
+async fn a_request_that_comes_back_is_refused() {
+    let proxy = proxy_with("").await;
+    let (status, _) = raw(
+        proxy.addr(),
+        &format!(
+            "GET /x HTTP/1.1\r\nHost: came-back.test\r\n{}: {}\r\n",
+            whistle_rs::proxy::upstream::LOOP_HEADER,
+            whistle_rs::proxy::upstream::loop_nonce()
+        ),
+        "",
+    )
+    .await;
+    assert!(status.contains(" 508 "), "{status}");
 
     proxy.shutdown().await;
 }
