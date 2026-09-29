@@ -347,6 +347,16 @@ impl AppState {
         id
     }
 
+    /// [`Self::record`], saying whether there is now a session to look up:
+    /// `None` for a hidden one. Its id names nothing, so a 502 or a log line
+    /// that quoted it would send someone looking for a session that was
+    /// never kept.
+    fn record_visible(&self, session: Session) -> Option<u64> {
+        let hidden = is_hidden(&session);
+        let id = self.record(session);
+        (!hidden).then_some(id)
+    }
+
     /// Record a transaction whose response is still arriving: it is in the
     /// console from now on, and [`Self::complete`] is owed the session
     /// returned once it is over — the observer and the history on disk get it
@@ -3287,7 +3297,7 @@ impl Tunnel<'_> {
 
     fn fail_at(self, target: &str, failure: outcome::Failure) {
         let url = self.session.url.clone();
-        let id = self.state.record(Session {
+        let id = self.state.record_visible(Session {
             target: target.to_string(),
             duration_ms: self.started.elapsed().as_millis(),
             error: outcome::Outcome::failed(failure.clone()),
@@ -4527,7 +4537,7 @@ impl Ledger {
         let state = self.state.clone();
         let body = outcome::settle(body, expected, move |failure| {
             if let Some(failure) = failure {
-                log_failure(session.id, &session.method, &session.url, &failure);
+                log_failure(Some(session.id), &session.method, &session.url, &failure);
                 session.error.fail(failure);
             }
             state.complete(&session);
@@ -4535,32 +4545,42 @@ impl Ledger {
         (id, body)
     }
 
+    /// Record `session` as this request's one session, and say whether there is
+    /// one to look up — see [`AppState::record_visible`].
+    fn record_visible(&mut self, session: Session) -> Option<u64> {
+        self.settled = true;
+        self.state.record_visible(session)
+    }
+
     /// Record the draft as a request that failed with `failure`, the client
-    /// having been answered with `status` (0: nothing at all). `None` when
-    /// there is nothing to record — no draft, or a session already recorded.
+    /// having been answered with `status` (0: nothing at all), and return the
+    /// session id to name. `None` when there is none: no draft, a session
+    /// already recorded, or a request a rule hides.
     fn fail(&mut self, failure: outcome::Failure, status: u16) -> Option<u64> {
         if self.settled {
             return None;
         }
         let draft = self.draft.take()?;
         let (method, url) = (draft.method.clone(), draft.url.clone());
-        let id = self.record(Session {
+        let id = self.record_visible(Session {
             status,
             duration_ms: self.started.elapsed().as_millis(),
             error: outcome::Outcome::failed(failure.clone()),
             ..draft
         });
         log_failure(id, &method, &url, &failure);
-        Some(id)
+        id
     }
 }
 
 /// The log line for a request that did not complete. It leads with the session
 /// id — the one the console lists and a failed request's 502 carries in
-/// [`SESSION_HEADER`] — so the three can be matched up.
-fn log_failure(id: u64, method: &str, url: &str, failure: &outcome::Failure) {
+/// [`SESSION_HEADER`] — so the three can be matched up. A hidden request has no
+/// session to match, and says so rather than quoting an id that names nothing.
+fn log_failure(id: Option<u64>, method: &str, url: &str, failure: &outcome::Failure) {
+    let id = id.map_or_else(|| "(hidden)".to_string(), |id| format!("#{id}"));
     tracing::info!(
-        "#{id} {method} {url} -> failed at {}: {}",
+        "{id} {method} {url} -> failed at {}: {}",
         failure.phase,
         failure.message
     );
@@ -5136,7 +5156,7 @@ async fn serve(
                         .headers_mut()
                         .insert(ERROR_HEADER, failure.phase.as_str().parse().unwrap());
                 }
-                let id = ledger.record(Session {
+                let id = ledger.record_visible(Session {
                     id: 0,
                     time_ms,
                     method: info.method.clone(),
@@ -5161,7 +5181,9 @@ async fn serve(
                 });
                 if let Some(failure) = &failure {
                     log_failure(id, &info.method, &info.full_url, failure);
-                    response.headers_mut().insert(SESSION_HEADER, id.into());
+                    if let Some(id) = id {
+                        response.headers_mut().insert(SESSION_HEADER, id.into());
+                    }
                 }
                 return Ok(response);
             }
