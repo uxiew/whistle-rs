@@ -164,6 +164,39 @@ would send SNI/Host for the destination IP. Instead `upstream::forward` connects
 socket to the (possibly overridden) destination itself, but sets the TLS SNI and the
 `Host` header from the **original** hostname. See `src/proxy/upstream.rs`.
 
+### Reusing origin connections
+
+An origin connection outlives its request only for the **client connection** that
+opened it: every connection a client makes to the proxy (a keep-alive HTTP
+connection, a CONNECT tunnel, an h2 connection) carries a `ConnPool` in its
+requests' extensions, and a later request on it to the same place reuses what an
+earlier one left open (`src/proxy/pool.rs`). Nothing is shared between clients,
+so a credential bound to a connection rather than to a request (NTLM, Negotiate)
+cannot leak from one client to another — the same line upstream draws for the h2
+sessions it caches.
+
+The key is everything a fresh connection would have been made from: the address,
+the requested host and port, TLS on or off with the `cipher://` versions and
+suites, the stripped-TLS marker, and the whole proxy route — kind, address,
+`?host=`, `proxyTunnel`, the `Proxy-Authorization` presented and the `User-Agent`
+echoed on CONNECT. `pool_tests::every_part_of_the_route_is_in_the_key` changes each
+one and checks the key changes with it.
+
+Not pooled: upgrades, CONNECT, anything whose response did not finish cleanly
+(hyper closes those), and any request that said `Connection: close` or was HTTP/1.0
+without `keep-alive` — hyper only looks at the response for that, so
+`upstream::asks_to_close` does. Idle connections close after 15 s; at most 16 per
+key and 32 per client connection are kept, the oldest going first — one keep-alive
+connection asking for a new host every request would otherwise hold a socket per
+host. A connection the origin closes just as a request goes out is the one
+failure reuse adds: a body-less request with an idempotent method is sent again on
+a fresh connection; any other request only takes a connection idle for under 2 s,
+well inside the shortest common server idle timeout (5 s, Node and Apache).
+
+Sessions number the origin connection (`timings.connection`, `timings.reused`;
+HAR's `connection`), because a reused one has no DNS, connect or TLS phase and the
+console would otherwise only be able to call those "not measured".
+
 ## What the capture costs
 
 Every proxied body streams through `body::tee`, which copies a bounded prefix into
@@ -236,10 +269,10 @@ gzip decoding cannot be recovered from end-to-end timings. `cap 1 MiB` is the on
 column that sits outside the noise, and it does so consistently in both runs —
 removing the bound is what would cost something.
 
-For scale, the harness counts **1.00 upstream connections per request**: whistle-rs
-opens its own connection per request and does not pool (above). A local TCP
+For scale, the harness counted **1.00 upstream connections per request** when
+these rows were taken, before origin connections were reused (above). A local TCP
 handshake is tens of microseconds and a real one is milliseconds, so the tee is
-orders of magnitude below the cheapest thing a proxied request already has to do.
+orders of magnitude below the cheapest thing a proxied request had to do.
 
 **So: nothing to act on for throughput.** The preview cap — `--body-preview-limit`,
 default 16 KiB — is what keeps it that way, and lifting it is the one change that

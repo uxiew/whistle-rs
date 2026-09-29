@@ -576,11 +576,11 @@ fn proxied_request_latency() {
             let accepted = Arc::new(AtomicUsize::new(0));
             let origin_port = origin(canned_response(size, gzip), accepted.clone()).await;
             for &concurrency in &[1usize, 32] {
-                // whistle-rs opens a fresh upstream connection per request (no
-                // pooling — `upstream.rs:3`), so every request costs an
-                // ephemeral port for the length of TIME_WAIT. The counts here
-                // are what a 16 K port range will bear for one run; they are
-                // the reason this sweep is not larger.
+                // Sized for when every request opened an upstream connection
+                // of its own and held an ephemeral port through TIME_WAIT. Each
+                // client here keeps one connection per proxy, so the pool now
+                // reuses one upstream connection per client and the line
+                // printed below says so.
                 let requests = if concurrency == 1 { 150 } else { 25 };
                 let before = accepted.load(Ordering::Relaxed);
                 let mut workers = Vec::new();
