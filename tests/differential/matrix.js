@@ -22,7 +22,8 @@
 // SHA-256 disagree. Same for the port block: several answers carry a port.
 //
 // Each (step, case, field) lands in one of:
-//   same        differs in both runs, with the same text
+//   same        differs in both runs, with the same text once the release's
+//               name and the clock are taken out of it (`normalise`)
 //   closer      differed against A, agrees against B — upstream moved to this port
 //   away        agreed against A, differs against B — upstream moved away, or
 //               B has something new
@@ -130,10 +131,49 @@ function fromProse(out) {
   return { cases, prose: true };
 }
 
-/** The whistle half of a problem's text, for telling which side moved. */
+/** The two halves of a problem's text, for telling which side moved. */
 function sides(problem) {
   const m = /: whistle=([\s\S]*?) rs=([\s\S]*)$/.exec(problem);
   return m ? { w: m[1], rs: m[2] } : { w: problem, rs: '' };
+}
+
+/**
+ * What in an answer is the release's name or the clock rather than behaviour.
+ * Without this, every error page upstream renders differs between two runs —
+ * it prints `From: Whistle@2.10.8` and the time — and so does every `Expires`
+ * a cache-busting operator stamps, and the moves that matter drown in them.
+ */
+function normalise(text) {
+  return text
+    .replace(/Whistle@\d+\.\d+\.\d+/g, 'Whistle@<version>')
+    .replace(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT/g, '<http-date>')
+    .replace(/Date: \d{1,2}\/\d{1,2}\/\d{4}, \d{1,2}:\d{2}:\d{2} [AP]M/g, 'Date: <date>');
+}
+
+/** harness.js cuts a body to this many characters before printing it. */
+const CUT = 120;
+
+/**
+ * One side's value in two runs: the same, once the release and the clock are
+ * taken out. A value the bench cut short is compared as far as the shorter
+ * cut goes — the release's name is a character longer in one run, so the two
+ * cuts end in different places. A value that was not cut must match whole.
+ */
+function sameValue(x, y) {
+  if (x === y) return true;
+  const parsed = [x, y].map((v) => { try { return JSON.parse(v); } catch { return null; } });
+  if (parsed.some((v) => typeof v !== 'string')) return normalise(x) === normalise(y);
+  const cut = parsed.some((v) => v.length === CUT);
+  const [s, t] = parsed.map(normalise);
+  if (!cut) return s === t;
+  const n = Math.min(s.length, t.length);
+  return s.slice(0, n) === t.slice(0, n);
+}
+
+function sameProblem(p, q) {
+  if (p === q) return true;
+  const [a, b] = [sides(p), sides(q)];
+  return sameValue(a.w, b.w) && sameValue(a.rs, b.rs);
 }
 
 function compare(a, b) {
@@ -157,11 +197,11 @@ function compare(a, b) {
       const fy = y.cases.get(c) || new Map();
       for (const f of new Set([...fx.keys(), ...fy.keys()])) {
         const [p, q] = [fx.get(f), fy.get(f)];
-        if (p === q) { row.same++; continue; }
+        if (p && q && sameProblem(p, q)) { row.same++; continue; }
         const item = { case: c, field: f, [a.version]: p || null, [b.version]: q || null };
         if (p && !q) row.closer.push(item);
         else if (!p && q) row.away.push(item);
-        else if (sides(p).w === sides(q).w) row.rsMoved.push(item);
+        else if (sameValue(sides(p).w, sides(q).w)) row.rsMoved.push(item);
         else row.changed.push(item);
       }
     }
