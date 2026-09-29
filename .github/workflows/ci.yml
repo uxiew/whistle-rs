@@ -156,13 +156,18 @@ jobs:
             ~/.cargo/git
             target
           key: platform-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/config.toml') }}
-      - run: cargo build --locked --release
+      - id: build
+        run: cargo build --locked --release
       # --release, to reuse the dependencies just built rather than compile
       # everything a second time for the debug profile.
       - name: Tests on this platform
         if: matrix.test
         run: cargo test --locked --release --all-targets
+      # This and the smoke test run even when a test failed, so one run shows
+      # both; packaging below still needs every step to have passed.
       - name: Where the binary is, and what it needs from the system
+        id: info
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           exe=target/release/whistle-rs
           if [ "$RUNNER_OS" = Windows ]; then exe=$exe.exe; fi
@@ -195,6 +200,7 @@ jobs:
             echo "console: ui-src/dist/index.html sha256 $($sum ui-src/dist/index.html | cut -d' ' -f1)"
           } | tee BUILD-INFO.txt
       - name: Smoke test — use it as a person would
+        if: ${{ !cancelled() && steps.info.outcome == 'success' }}
         run: node scripts/smoke.mjs "$EXE" --console built --json smoke-${{ matrix.target }}.json
       # The binary travels with its terms: our LICENSE, where things come from
       # (NOTICE.md), and the license texts of every crate and npm package
