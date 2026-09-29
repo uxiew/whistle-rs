@@ -81,7 +81,11 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 client ── TCP ──▶ hyper http1 serve_connection ──▶ top_level(req)
                        │
    ┌───────────────────┼────────────────────────────────────────────┐
-   │ CONNECT           │ absolute-form URI            │ origin-form   │
+   │ CONNECT           │ absolute-form URI            │ origin-form:  │ origin-form:
+   │                   │                              │ /-/, or a     │ Host is a
+   │                   │                              │ Host that is  │ console name
+   │                   │                              │ not a console │
+   │                   │                              │ name          │
    ▼                   ▼                              ▼               ▼
 handle_connect     serve(Forward)                serve(Forward)   local_ui
    │ 200 + upgrade     │                              │            (status page,
