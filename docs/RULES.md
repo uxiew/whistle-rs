@@ -1929,7 +1929,8 @@ The context is upstream's `getScriptContext`
 and — in a `resScript` — `statusCode`, `serverIp` and `resHeaders`, which are
 empty strings in the request pass. `render` is whistle's own `<% … %>` /
 `<%= … %>` micro-template (`rules/index.js:304-347`), ported as the same source
-transformation.
+transformation. `reqScriptData` is one object for the whole request: what a
+`reqScript` puts there, the same request's `resScript` reads.
 
 What the script writes to `values` answers the `{name}` references in the rules
 it pushed — see [Values declared in the rules text](#values-declared-in-the-rules-text).

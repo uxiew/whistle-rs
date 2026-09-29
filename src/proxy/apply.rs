@@ -67,6 +67,7 @@ pub fn build_req_info(
         from: Default::default(),
         res: None,
         req_body: None,
+        script_data: Default::default(),
     }
 }
 
@@ -712,6 +713,7 @@ pub fn merge_included_rules(
                         client_port: info.client_port,
                         res: None,
                         values,
+                        script_data: &info.script_data,
                     },
                 )?;
                 script_values.extend(produced.values);
@@ -847,6 +849,7 @@ pub fn merge_res_rules(
                         client_port: info.client_port,
                         res,
                         values,
+                        script_data: &info.script_data,
                     },
                 )?;
                 return Some((produced.rules, produced.values));

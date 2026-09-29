@@ -837,6 +837,13 @@ pub struct ReqInfo {
     /// Where the request came from, for the `from:` condition — see
     /// [`ReqOrigin`].
     pub from: ReqOrigin,
+    /// `reqScriptData`: one object for every script this request runs, so
+    /// what a `reqScript` leaves there its `resScript` reads. Upstream builds
+    /// the script context once per request and reuses it
+    /// (`req.scriptContenxt`, `_original/lib/rules/index.js:349-386`); its
+    /// suite's `script.test.js` passes a value across. Shared, not copied, by
+    /// the clones the proxy makes of these facts; `Null` until a script runs.
+    pub script_data: Arc<std::sync::Mutex<serde_json::Value>>,
 }
 
 /// The origin markers `from:` tests (`_original/lib/rules/rules.js:1834-1859`).

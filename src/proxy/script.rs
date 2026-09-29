@@ -203,6 +203,8 @@ pub struct RulesScriptCtx<'a> {
     /// Values pane both, which is the pair upstream's own `getValue` asks
     /// (`_original/lib/rules/index.js:398-401`).
     pub values: &'a std::collections::HashMap<String, String>,
+    /// The request's `reqScriptData` — see [`crate::rules::ReqInfo::script_data`].
+    pub script_data: &'a Mutex<serde_json::Value>,
 }
 
 /// The response third of the context, present only in the `resScript` pass.
@@ -278,6 +280,10 @@ pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> 
         None => (json!(""), json!(""), json!("")),
     };
     let ip = input.client_ip.unwrap_or("127.0.0.1");
+    let script_data = match input.script_data.lock().map(|d| d.clone()) {
+        Ok(data @ serde_json::Value::Object(_)) => data,
+        _ => json!({}),
+    };
     let globals = json!({
         "url": input.full_url,
         "fullUrl": input.full_url,
@@ -295,7 +301,7 @@ pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> 
         "uiPort": 0,
         "uiHost": "local.wproxy.org",
         "value": "",
-        "reqScriptData": {},
+        "reqScriptData": script_data,
         "statusCode": status,
         "serverIp": server_ip,
         "resHeaders": res_headers,
@@ -423,7 +429,19 @@ pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> 
     "#;
     ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).ok()?;
 
-    if let Err(err) = ctx.eval(Source::from_bytes(src.as_bytes())) {
+    let ran = ctx.eval(Source::from_bytes(src.as_bytes()));
+    // Kept whether or not the script finished: upstream's context is the same
+    // object before and after, so a write that happened before a throw stays.
+    if let Some(data @ serde_json::Value::Object(_)) = ctx
+        .global_object()
+        .get(js_string!("reqScriptData"), &mut ctx)
+        .ok()
+        .and_then(|v| v.to_json(&mut ctx).ok().flatten())
+        && let Ok(mut shared) = input.script_data.lock()
+    {
+        *shared = data;
+    }
+    if let Err(err) = ran {
         tracing::debug!("rules script error: {err}");
         return None;
     }
@@ -1029,6 +1047,8 @@ mod tests {
     /// No values store, for the cases that are not about one.
     static NO_VALUES: std::sync::LazyLock<std::collections::HashMap<String, String>> =
         std::sync::LazyLock::new(std::collections::HashMap::new);
+    /// No script has run yet.
+    static NO_DATA: Mutex<serde_json::Value> = Mutex::new(serde_json::Value::Null);
 
     /// A rules script pushes lines; an error discards them; `values` set by the
     /// script does not resolve a `{name}` reference. All measured against
@@ -1045,6 +1065,7 @@ mod tests {
                 client_port: None,
                 res: None,
                 values: &NO_VALUES,
+                script_data: &NO_DATA,
             }
         }
         assert_eq!(
@@ -1084,6 +1105,40 @@ mod tests {
         );
     }
 
+    /// `reqScriptData` outlives the script that wrote it: the `resScript` of a
+    /// request reads what its `reqScript` left, as upstream's suite asks
+    /// (`test/units/script.test.js`, the `x-test` header). Another request
+    /// starts empty.
+    #[test]
+    fn script_data_carries_from_one_script_to_the_next() {
+        let ctx = |data| RulesScriptCtx {
+            method: "GET",
+            full_url: "http://a.com/",
+            headers: &[],
+            body: "",
+            client_ip: None,
+            client_port: None,
+            res: None,
+            values: &NO_VALUES,
+            script_data: data,
+        };
+        let this_request = Mutex::new(serde_json::Value::Null);
+        run_rules_script(
+            "reqScriptData.test = 123; rules.push('a')",
+            &ctx(&this_request),
+        );
+        let read = "rules.push('a.com reqHeaders://x=' + reqScriptData.test)";
+        assert_eq!(
+            run_rules_script(read, &ctx(&this_request)).as_deref(),
+            Some("a.com reqHeaders://x=123")
+        );
+        let next_request = Mutex::new(serde_json::Value::Null);
+        assert_eq!(
+            run_rules_script(read, &ctx(&next_request)).as_deref(),
+            Some("a.com reqHeaders://x=undefined")
+        );
+    }
+
     /// The context `reqScript.md` prints, in the three pieces this port had to
     /// build: `render`/`tpl`, `getValue`, and `isLocalAddress`.
     #[test]
@@ -1103,6 +1158,7 @@ mod tests {
             client_port: None,
             res: None,
             values: &store,
+            script_data: &NO_DATA,
         };
         let push = |expr: &str| {
             run_rules_script(
@@ -1176,6 +1232,7 @@ mod tests {
             client_port: None,
             res: Some(res),
             values: &NO_VALUES,
+            script_data: &NO_DATA,
         };
         assert_eq!(
             run_rules_script(
@@ -1194,6 +1251,7 @@ mod tests {
             client_port: None,
             res: None,
             values: &NO_VALUES,
+            script_data: &NO_DATA,
         };
         assert_eq!(
             run_rules_script(
