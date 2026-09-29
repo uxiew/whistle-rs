@@ -730,8 +730,9 @@ reliable way to get it right.
 
 ### 3. Install the root CA, or you will only see `CONNECT`
 
-Without a trusted CA, HTTPS is a tunnel: you get a `CONNECT` line and no
-contents. Open this on the device:
+Without a trusted CA the device refuses the certificate whistle-rs shows it,
+and all you get is a `CONNECT` row tagged `client-tls` — "the client refused
+this proxy's certificate" — with nothing inside it. Open this on the device:
 
 ```
 http://192.168.1.5:8899/rootCA.crt
@@ -775,7 +776,8 @@ pinned.example.com    sniCallback://no-mitm
 
 `no-mitm` is a built-in plugin that declines interception; the connection is
 relayed byte-for-byte. It is still *routed* by its rules — `host://` and the
-proxy family apply — but nothing inside it is read.
+proxy family apply — but nothing inside it is read: the capture has one
+`CONNECT` row for it, with `(tunnel)` in the Policy column, and no requests.
 
 ### Route HTTPS without decrypting it, and skip the certificate entirely
 
@@ -800,7 +802,7 @@ What you keep and what you give up, both measured against a self-signed origin:
 | certificate the client sees | whistle-rs's, signed by its root CA | **the origin's own** |
 | root CA must be installed | yes | **no** |
 | `resHeaders://` and every other content operator | applied | **not applied** |
-| appears in the capture | yes | **no** |
+| appears in the capture | every request | **one `CONNECT` row per connection**: the host, where it was routed, how long it stayed open — nothing inside it |
 | a self-signed origin | `502` unless `--insecure-upstream` | fine — the *client* decides whether to trust it |
 
 The last row is the one that catches people out in the other direction. With
@@ -988,7 +990,9 @@ proxy.shutdown().await;
 ```
 
 `.port(0)` and `addr()` are the pair that makes this usable in tests: no port to
-reserve, no collision between concurrent test binaries.
+reserve, no collision between concurrent test binaries. `on_session` is called
+once per request, when it is over — its body delivered, or failed, or abandoned
+by the client — and a failed one says where in `s.error`.
 
 To *change* traffic rather than watch it, register an in-process hook. It is the
 same `RustPlugin` trait the built-in plugins use, so it can rewrite request
@@ -1061,15 +1065,49 @@ INFO GET http://seg.test/path/toxxx   -> seg.test:80    (http)   # it did not
 INFO OPTIONS http://api.test/users    -> short-circuit           # answered locally
 ```
 
-Those lines are `INFO`, so they are there without any flag. `-v` adds the
-**reason** behind a failure, which a `502` alone will not tell you:
+Those lines are `INFO`, so they are there without any flag. A request that
+fails gets a second line: the session it was recorded as, the step it stopped
+at, and why:
 
 ```
-INFO  GET http://dead.test/ -> 127.0.0.1:9 (http)
-DEBUG request failed: connecting to 127.0.0.1:9: Connection refused (os error 61)
-INFO  GET https://sec.test/ -> 127.0.0.1:5443 (https)
-DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
+INFO GET http://dead.test/ -> 127.0.0.1:9 (http)
+INFO #12 GET http://dead.test/ -> failed at connect: connecting to 127.0.0.1:9: Connection refused (os error 61)
+INFO GET https://sec.test/ -> 127.0.0.1:5443 (https)
+INFO #13 GET https://sec.test/ -> failed at tls: upstream TLS handshake: invalid peer certificate: …
 ```
+
+The same failure is session #12 in the console — a red tag on its row naming
+the step, and a "Did not complete" card with the reason — and `error` in
+`/sessions.json`. The client's `502` carries it too:
+
+```
+HTTP/1.1 502 Bad Gateway
+x-whistle-rs-error: connect
+x-whistle-rs-session: 12
+x-server: whistle-rs
+
+whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
+```
+
+**A `502` without `x-whistle-rs-error` came from the server**, not from here.
+The steps, in the order a request meets them:
+
+| `error.phase` | Where it stopped |
+|---------------|------------------|
+| `client-tls` | the TLS handshake between the client and this proxy: the client refused the certificate it was shown (see the table below) |
+| `request` | reading the request from the client: its upload broke off |
+| `rules` | a rule could not be carried out: a destination scheme nothing routes (`ws://` on a plain request), a proxy rule with no usable address, a PAC file that failed |
+| `plugin` | a plugin's `auth` gate failed (unreachable, too slow, nonsense), as opposed to refusing |
+| `dns` | looking up the server's name — or the upstream proxy's |
+| `connect` | opening the connection: refused, unreachable, or no answer within 16 s (less with `--timeout`) |
+| `proxy` | the upstream proxy would not open the way (its TLS, its CONNECT, its SOCKS handshake) |
+| `tls` | the TLS handshake with the server |
+| `response` | the server was reached and did not answer properly: it closed before a response, or cut the body short |
+| `client` | the client left before the response ended — its own timeout, or a page navigated away |
+| `abort` | a rule dropped it on purpose: `enable://abort`, `abortReq`, `abortRes`, `disable://tunnel` |
+
+`response` and `client` can happen after the status line went out, so a row
+can say `200` and still be failed: the client got a `200` and half a body.
 
 Then work down this list:
 
@@ -1085,10 +1123,11 @@ Then work down this list:
 | a body rewrite works sometimes | it does not, any more — a response-body operator now busts the request cache, so a `304` cannot swallow it. If you are on an older build, add `disable://cache` |
 | a chunked response stops streaming | a body operator on it buffers the whole body. Remove it, or scope it away with a filter |
 | a body operator does nothing to an SSE stream | it is skipped there on purpose, so the stream keeps flowing — see [What throttling will not do](#what-throttling-will-not-do) |
-| the console shows `CONNECT` and nothing inside it | the client does not trust the root CA — see [`CERTIFICATES.md`](CERTIFICATES.md) |
+| a `CONNECT` row tagged `client-tls`, and nothing inside it | the client refused this proxy's certificate: it does not trust the root CA — see [`CERTIFICATES.md`](CERTIFICATES.md) — or it is an app that pins its server's certificate, which no CA fixes. For the second, relay that host unread: `pinned.example.com disable://intercept` |
+| a `CONNECT` row with `(tunnel)` in its Policy column | the tunnel was relayed without being decrypted — a `disable://intercept` rule, `--no-intercept-https`, or traffic that is not HTTP. The row is the whole record: nothing inside a relayed tunnel is read |
 | a direct request to the console returns `502` with `Proxy-Connection` | your shell has `http_proxy` set. `curl --noproxy '*'` |
-| a rule does not fire and the capture is empty | first check whether curl bypassed the proxy: use `--noproxy '' -x http://127.0.0.1:8899` to force this route. An empty capture is not proof of bypass; early connection/TLS errors and capture settings can also explain it |
-| a request that failed is missing from the console entirely | a request that never got a response — connection refused, DNS failure, TLS handshake failure — is **not** recorded as a session. The proxy log is the only place it appears, which is the other reason to keep `-v` on while debugging |
+| a rule does not fire and the capture is empty | first check whether curl bypassed the proxy: use `--noproxy '' -x http://127.0.0.1:8899` to force this route. A request that reached the proxy is in the capture even when it failed, so an empty one means it did not arrive — or that `enable://hide` or the capture filter kept it out |
+| a `502` and you cannot tell who sent it | look for `x-whistle-rs-error` on it: present, this proxy made it up and names the step (`dns`, `connect`, `tls`, …); absent, the server answered `502` itself |
 | the editor highlights the wrong token as the pattern | it is telling you the truth. `example.com http://localhost:5173` is pattern + destination; `http://a.com/x host://1.2.3.4` is pattern + operator. Whichever token it marks is what the proxy will match on |
 
 More failure modes, and the ones that are structural rather than fixable, are in

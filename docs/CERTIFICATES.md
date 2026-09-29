@@ -143,6 +143,16 @@ curl -x http://127.0.0.1:8899 \
 You should get `HTTP/1.1 200 OK`. Add a rule like `example.com resHeaders://x-mitm=1`
 and you'll see the injected header appear — proof the tunnel was decrypted.
 
+**If a client does not trust it**, curl fails with `curl: (60) SSL certificate
+problem: self signed certificate in certificate chain` (macOS's curl, measured;
+other TLS libraries word it differently, and a browser shows its own warning page),
+and the console gets a `CONNECT` row tagged `client-tls` whose reason reads "the
+client refused this proxy's certificate … it does not trust the whistle-rs root
+certificate, or it pins the server's own". The first half is fixed by installing
+the CA on that client; the second — an app that pins — by not intercepting that
+host at all (next section). A client that hangs up mid-handshake without saying
+why gets the same tag, with "hung up during the TLS handshake".
+
 ---
 
 ## Serving a real certificate instead
@@ -227,7 +237,8 @@ read as HTTP.
 
 Not every tunnel is opened. Before step 3, three questions are asked of the
 connection, and any one of them can send it through untouched — routed by its
-rules, but never decrypted:
+rules, but never decrypted. Such a tunnel is one `CONNECT` row in the console,
+with `(tunnel)` after its destination, and nothing inside it:
 
 | The connection | Read? | Say otherwise with |
 |---|---|---|

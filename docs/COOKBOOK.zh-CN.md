@@ -660,7 +660,8 @@ PAC 是**按取回它的那个请求的 `Host` 头**生成的 —— 设备用�
 
 ### 3. 装根证书，否则你只能看到 `CONNECT`
 
-没有被信任的 CA，HTTPS 就只是一条隧道：你只会看到一行 `CONNECT`，看不到内容。
+没有被信任的 CA，设备会拒绝 whistle-rs 出示的证书：你只会看到一行带 `client-tls` 标签的
+`CONNECT`（原因写着 "the client refused this proxy's certificate"），里面什么都没有。
 在设备上打开：
 
 ```
@@ -700,7 +701,8 @@ pinned.example.com    sniCallback://no-mitm
 ```
 
 `no-mitm` 是一个内建插件，它拒绝拦截；该连接被逐字节中继。它**仍然按规则路由** ——
-`host://` 与代理家族照常生效 —— 只是里面的内容不被读取，因此也不抓包。
+`host://` 与代理家族照常生效 —— 只是里面的内容不被读取：抓包里只有它的一行 `CONNECT`，
+Policy 列带 `(tunnel)`，没有里面的请求。
 
 ### 只路由 HTTPS 而不解密它 —— 连证书都不用装
 
@@ -724,7 +726,7 @@ secure.example.com   host://10.0.0.9
 | 客户端看到的证书 | whistle-rs 用自己根 CA 签的 | **源站自己的** |
 | 必须安装根证书 | 是 | **否** |
 | `resHeaders://` 等所有内容算子 | 生效 | **不生效** |
-| 出现在抓包里 | 是 | **否** |
+| 出现在抓包里 | 每个请求一条 | **每条连接一行 `CONNECT`**：连的哪个域名、转到了哪、连了多久 —— 里面的内容没有 |
 | 自签名源站 | `502`，除非加 `--insecure-upstream` | 没问题 —— 由**客户端**自己决定信不信 |
 
 最后一行是反方向最容易踩的：开着拦截时，源站证书是由 whistle-rs 自己校验的，
@@ -893,7 +895,8 @@ proxy.shutdown().await;
 ```
 
 `.port(0)` 与 `addr()` 这一对是它在测试里好用的关键：不用预留端口，并发跑的测试二进制之间
-也不会撞。
+也不会撞。`on_session` 每个请求只调一次，在请求结束时调 —— body 送完、失败，或者客户端
+中途离开；失败的请求用 `s.error` 说明停在哪。
 
 要**改**流量而不只是看，就注册一个进程内钩子。它就是内建插件用的那个 `RustPlugin` trait，
 因此可以改写请求头、注入规则、直接应答请求、做鉴权拦截、变换响应，或在握手期挑证书：
@@ -960,14 +963,46 @@ INFO GET http://seg.test/path/toxxx   -> seg.test:80    (http)   # 没命中
 INFO OPTIONS http://api.test/users    -> short-circuit           # 本地应答
 ```
 
-这几行是 `INFO`，不加任何参数就有。`-v` 补上失败的**原因** —— 这是光看 `502` 得不到的：
+这几行是 `INFO`，不加任何参数就有。请求失败时会再多一行：记成了哪条会话、停在哪一步、原因是什么：
 
 ```
-INFO  GET http://dead.test/ -> 127.0.0.1:9 (http)
-DEBUG request failed: connecting to 127.0.0.1:9: Connection refused (os error 61)
-INFO  GET https://sec.test/ -> 127.0.0.1:5443 (https)
-DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
+INFO GET http://dead.test/ -> 127.0.0.1:9 (http)
+INFO #12 GET http://dead.test/ -> failed at connect: connecting to 127.0.0.1:9: Connection refused (os error 61)
+INFO GET https://sec.test/ -> 127.0.0.1:5443 (https)
+INFO #13 GET https://sec.test/ -> failed at tls: upstream TLS handshake: invalid peer certificate: …
 ```
+
+同一个失败在控制台里就是第 12 条会话：行上有个红色标签写着停在哪一步，详情里第一张卡片
+「Did not complete」写着原因；`/sessions.json` 里是 `error` 字段。客户端收到的 `502`
+也带着它：
+
+```
+HTTP/1.1 502 Bad Gateway
+x-whistle-rs-error: connect
+x-whistle-rs-session: 12
+x-server: whistle-rs
+
+whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
+```
+
+**没有 `x-whistle-rs-error` 的 `502` 是源站自己回的**，不是本代理。各个阶段按请求经过的顺序：
+
+| `error.phase` | 停在哪 |
+|---------------|--------|
+| `client-tls` | 客户端和本代理之间的 TLS 握手：客户端不接受代理出示的证书（见下表） |
+| `request` | 读客户端的请求：上传到一半断了 |
+| `rules` | 规则没法执行：目标写了普通请求走不了的协议（比如普通请求配 `ws://`）、代理规则里没有能用的地址、PAC 文件出错 |
+| `plugin` | 插件的 `auth` 鉴权**出错**（连不上、超时、回的内容看不懂），而不是插件拒绝 |
+| `dns` | 解析源站域名 —— 或上游代理的域名 |
+| `connect` | 建立连接：被拒、不可达，或 16 秒内没响应（`--timeout` 可以调得更短） |
+| `proxy` | 上游代理没把路打通（它的 TLS、CONNECT 或 SOCKS 握手） |
+| `tls` | 和源站的 TLS 握手 |
+| `response` | 连上了源站但它没好好回：没回响应就断开，或者 body 发到一半断了 |
+| `client` | 响应还没结束客户端就走了 —— 客户端自己超时，或者页面跳走了 |
+| `abort` | 规则故意丢掉的：`enable://abort`、`abortReq`、`abortRes`、`disable://tunnel` |
+
+`response` 和 `client` 可能发生在状态行已经发出之后，所以一行可以显示 `200` 却仍是失败：
+客户端拿到了 `200` 和半截 body。
 
 然后按这张表往下排查：
 
@@ -983,10 +1018,11 @@ DEBUG request failed: upstream TLS handshake: invalid peer certificate: …
 | body 改写时灵时不灵 | 现在不会了 —— 响应体算子会顺带禁掉请求缓存，`304` 吞不掉它。如果你用的是旧版本，加 `disable://cache` |
 | chunked 响应不再流式 | 上面挂了 body 算子，它会把整个 body 缓冲完。去掉它，或者用筛选器把它避开 |
 | body 算子对 SSE 流毫无作用 | 那是刻意跳过的，为的是让流继续走 —— 见[限速做不到的事](#限速做不到的事) |
-| 控制台只显示 `CONNECT`，里面什么都没有 | 客户端不信任根证书 —— 见 [`CERTIFICATES.md`](CERTIFICATES.md) |
+| 一条带 `client-tls` 标签的 `CONNECT`，里面什么都没有 | 客户端不接受本代理的证书：要么没信任根证书 —— 见 [`CERTIFICATES.md`](CERTIFICATES.md) —— 要么是做了证书固定（pinning）的 App，装什么 CA 都没用。后一种就让这个域名不解密直接转发：`pinned.example.com disable://intercept` |
+| `CONNECT` 行的 Policy 列带 `(tunnel)` | 这条隧道没解密就转发了 —— `disable://intercept` 规则、`--no-intercept-https`，或者里面跑的不是 HTTP。这一行就是全部记录：转发的隧道里面什么都不读 |
 | 直连控制台却返回带 `Proxy-Connection` 的 `502` | 你的 shell 设了 `http_proxy`。`curl --noproxy '*'` |
-| `/api/rules` 里有规则却不生效，而且抓包为空 | 先检查 curl 是否绕过代理；用 `--noproxy '' -x http://127.0.0.1:8899` 明确走代理。空列表不是绕过代理的充分证据，早期连接/TLS 失败及采集设置也可能造成缺失 |
-| 失败的请求在控制台里根本找不到 | **没有拿到响应**的请求 —— 连接被拒、DNS 失败、TLS 握手失败 —— 不会被记为会话。它只出现在代理日志里，这也是调试期间该一直开着 `-v` 的另一个理由 |
+| `/api/rules` 里有规则却不生效，而且抓包为空 | 先检查 curl 是否绕过代理；用 `--noproxy '' -x http://127.0.0.1:8899` 明确走代理。到过代理的请求哪怕失败了也在抓包里，所以列表为空说明请求没到 —— 或者被 `enable://hide`、抓包筛选挡在外面了 |
+| 拿到一个 `502`，分不清是谁回的 | 看它有没有 `x-whistle-rs-error` 头：有，就是本代理生成的，头的值就是停在哪一步（`dns`、`connect`、`tls`……）；没有，就是源站自己回的 `502` |
 | 编辑器把「不该是 pattern 的 token」标成了 pattern | 它说的是实话。`example.com http://localhost:5173` 是 pattern + 目标；`http://a.com/x host://1.2.3.4` 是 pattern + 算子。它标出来的那个，就是代理真正会拿去匹配的 |
 
 更多失败形态、以及哪些是结构性而非可修的，见两份 README 的故障排查段落与
