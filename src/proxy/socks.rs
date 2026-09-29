@@ -282,6 +282,46 @@ mod tests {
         assert!(state.sessions.lock().unwrap().is_empty());
     }
 
+    /// A SOCKS tunnel is served by the same code as a CONNECT one, so it fails
+    /// the same way and leaves the same session: here, a client that will not
+    /// take the proxy's certificate.
+    #[tokio::test]
+    async fn a_socks_client_that_refuses_the_certificate_is_recorded() {
+        let state = crate::proxy::tunnel_abort_tests::state_with("");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let mut greeting = vec![0x05, 0x01, 0x00, 0x05, 0x01, 0x00, 0x03, 10];
+            greeting.extend_from_slice(b"socks.test");
+            greeting.extend_from_slice(&443u16.to_be_bytes());
+            s.write_all(&greeting).await.unwrap();
+            let mut buf = vec![0u8; 12];
+            s.read_exact(&mut buf).await.expect("server reply");
+            assert_eq!(buf[3], REP_SUCCESS);
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            let name = rustls::pki_types::ServerName::try_from("socks.test").unwrap();
+            tokio_rustls::TlsConnector::from(Arc::new(config))
+                .connect(name, s)
+                .await
+                .is_err()
+        });
+        let (server, peer) = listener.accept().await.unwrap();
+        let served = tokio::spawn(handle(state.clone(), server, peer));
+        assert!(
+            client.await.unwrap(),
+            "a client that trusts nothing refuses"
+        );
+        served.await.unwrap().ok();
+        let sessions = state.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let failure = sessions[0].error.get().expect("recorded as a failure");
+        assert_eq!(failure.phase, crate::proxy::outcome::Phase::ClientTls);
+        assert_eq!(sessions[0].url, "https://socks.test/");
+    }
+
     #[test]
     fn only_connect_is_offered() {
         // UDP ASSOCIATE (0x03) — upstream's SOCKS server has no UDP path either.

@@ -877,12 +877,15 @@ pub async fn forward_with_addr(
 /// The `x`-prefixed rules keep their forgiveness: a connection that cannot be
 /// *established* is retried once against [`Target::fallback_target`], which is
 /// what whistle's tunnel path does too (`retryXHost`, `lib/tunnel.js:570-617`).
-pub(crate) async fn tunnel_stream(target: &Target) -> Result<BoxedIo> {
+///
+/// `timings` gets the phases of the attempt that was used — or of the one that
+/// failed last, which is how a relayed tunnel's session shows how far it got.
+pub(crate) async fn tunnel_stream(target: &Target, timings: &Timings) -> Result<BoxedIo> {
     let mut target = target.clone();
     target.tls = false;
     target.origin_tls_stripped = false;
     let fallback = target.fallback_target();
-    match tunnel_once(&target).await {
+    match tunnel_once(&target, timings).await {
         Ok(io) => Ok(io),
         Err(err) => match fallback {
             None => Err(err),
@@ -894,7 +897,15 @@ pub(crate) async fn tunnel_stream(target: &Target) -> Result<BoxedIo> {
                     next.connect_host,
                     next.connect_port
                 );
-                tunnel_once(&next).await
+                tunnel_once(&next, timings).await.map_err(|retry| {
+                    retry.context(format!(
+                        "falling back to {}:{} after {}:{} failed ({err:#})",
+                        next.connect_host,
+                        next.connect_port,
+                        target.connect_host,
+                        target.connect_port
+                    ))
+                })
             }
         },
     }
@@ -904,16 +915,14 @@ pub(crate) async fn tunnel_stream(target: &Target) -> Result<BoxedIo> {
 ///
 /// Nothing is ever written on this path, so unlike [`forward_once`] there is no
 /// request to hand back: every failure here is a failure to connect.
-async fn tunnel_once(target: &Target) -> Result<BoxedIo> {
+async fn tunnel_once(target: &Target, timings: &Timings) -> Result<BoxedIo> {
     if let Some(addr) = self_loop(target).await {
         return Err(stopped(Phase::Rules, anyhow!("Self loop ({addr})")));
     }
     // No request exists on this path, so the CONNECT to an upstream proxy carries
     // no `User-Agent` or client `Proxy-Authorization` to echo. The proxy URL's own
     // credentials still apply, which is how a proxy rule normally carries them.
-    // A tunnel has no session to report phases to; they are measured and
-    // dropped rather than threaded through a path with nowhere to put them.
-    origin_stream(target, &Hop::default().with_target(target), &Timings::new())
+    origin_stream(target, &Hop::default().with_target(target), timings)
         .await
         .map(|(io, _)| io)
 }

@@ -3055,6 +3055,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if tls {
+        let started = Instant::now();
+        let time_ms = now_ms();
         // Read the ClientHello before deciding anything, because two decisions
         // depend on it: which name the certificate has to be for, and what an
         // `sniCallback://` plugin is being asked about. The bytes are replayed
@@ -3069,12 +3071,35 @@ where
         // assume TLS and hand every one of them to the acceptor, which turns a
         // tunnel carrying anything else into a TLS alert — see [`sni::Carried`].
         let carried = sni::carried_protocol(&hello.prefix);
+        // A client that closed the tunnel without sending a byte asked for
+        // nothing, and leaves no session: that is a connection opened and
+        // abandoned, which clients do all the time.
+        let asked = !hello.prefix.is_empty();
         let stream = sni::Prefixed::new(hello.prefix, stream);
+        // The session a tunnel leaves when nothing inside it is read — relayed,
+        // refused, or turned away at the handshake. Built only then: it costs a
+        // second rule resolution, which an intercepted tunnel never pays.
+        let session = || Tunnel {
+            state: &state,
+            session: tunnel_session(&state, &servername, port, peer, has_sni, time_ms),
+            started,
+        };
         let acceptor =
             match sni::decide(&state, &servername, &host, port, peer, has_sni, carried).await {
-                sni::Decision::Generated => state.ca.acceptor_for(&servername)?,
+                sni::Decision::Generated => match state.ca.acceptor_for(&servername) {
+                    Ok(acceptor) => acceptor,
+                    Err(err) => {
+                        let err = err.context(format!("a certificate for {servername}"));
+                        if asked {
+                            session().fail("intercept", outcome::Phase::Internal, &err);
+                        }
+                        return Err(err);
+                    }
+                },
                 sni::Decision::Plugin(acceptor) => acceptor,
-                sni::Decision::Bypass(target) => return sni::relay(stream, &target).await,
+                sni::Decision::Bypass(target) => {
+                    return relay_recorded(stream, &target, asked.then(session)).await;
+                }
                 // Cleartext inside the tunnel: no handshake to make, and the
                 // same two servers the SOCKS path already reaches for.
                 sni::Decision::Cleartext(sni::Carried::H2c) => {
@@ -3110,12 +3135,25 @@ where
                 // rather than quietly sending the bytes direct — the same call
                 // the request path makes, where it answers 502.
                 sni::Decision::Unroutable(why) => {
-                    return Err(anyhow::anyhow!(
-                        "tunnel to {host}:{port} not routable: {why}"
-                    ));
+                    let err = anyhow::anyhow!("tunnel to {host}:{port} not routable: {why}");
+                    if asked {
+                        session().fail("", outcome::Phase::Rules, &err);
+                    }
+                    return Err(err);
                 }
             };
-        let tls_stream = acceptor.accept(stream).await?;
+        let tls_stream = match acceptor.accept(stream).await {
+            Ok(tls_stream) => tls_stream,
+            Err(err) => {
+                if asked {
+                    session().fail_at(
+                        "intercept",
+                        outcome::Failure::new(outcome::Phase::ClientTls, client_tls_failure(&err)),
+                    );
+                }
+                return Err(err.into());
+            }
+        };
         let conn = tls_stream.get_ref().1;
         let is_h2 = conn.alpn_protocol() == Some(b"h2");
         // Read once, off the completed handshake: whether the client named a
@@ -3133,6 +3171,158 @@ where
         // No handshake, so no SNI — a plain-HTTP tunnel is `from:tunnel` but
         // never `from:sni`.
         serve_intercepted(state, TokioIo::new(stream), host, port, peer, false, false).await
+    }
+}
+
+/// A tunnel whose contents are not read, on its way to becoming its one
+/// session. An intercepted tunnel has none of its own — each request inside it
+/// is one — but a tunnel that is relayed, refused, or turned away at the
+/// handshake has nothing else to show for it.
+struct Tunnel<'a> {
+    state: &'a Arc<AppState>,
+    session: Session,
+    started: Instant,
+}
+
+impl Tunnel<'_> {
+    /// Record the tunnel as failed with `err`: at the phase the error was
+    /// tagged with where it happened, or at `phase`.
+    fn fail(self, target: &str, phase: outcome::Phase, err: &anyhow::Error) {
+        let phase = outcome::phase_of(err).unwrap_or(phase);
+        self.fail_at(target, outcome::Failure::new(phase, format!("{err:#}")));
+    }
+
+    fn fail_at(self, target: &str, failure: outcome::Failure) {
+        tracing::info!(
+            "CONNECT {} -> failed at {}: {}",
+            self.session.url,
+            failure.phase,
+            failure.message
+        );
+        self.state.record(Session {
+            target: target.to_string(),
+            duration_ms: self.started.elapsed().as_millis(),
+            error: outcome::Outcome::failed(failure),
+            ..self.session
+        });
+    }
+}
+
+/// The session of a tunnel whose contents are not read: the CONNECT itself,
+/// matched exactly as the interception stage matched it.
+fn tunnel_session(
+    state: &AppState,
+    servername: &str,
+    port: u16,
+    peer: SocketAddr,
+    has_sni: bool,
+    time_ms: u128,
+) -> Session {
+    let (info, resolved) = {
+        let rules = state.rules.read().unwrap();
+        let info = sni::connection_req_info(servername, port, peer, has_sni);
+        let resolved = rules.resolve(&info);
+        (info, resolved)
+    };
+    Session {
+        time_ms,
+        method: "CONNECT".to_string(),
+        url: info.full_url,
+        // The CONNECT was answered before anything below happened: hyper hands
+        // over a tunnel's bytes only after its `200` has gone out — see
+        // [`tunnel_aborted`]. A SOCKS client was likewise told "granted".
+        status: 200,
+        client_ip: Some(peer.ip().to_string()),
+        log: log_labels(&resolved),
+        rules: matched_ops(&resolved),
+        ..Default::default()
+    }
+}
+
+/// Relay a tunnel nobody reads, and record it: where it went and whether it
+/// got there. `tunnel` is `None` for a client that asked for nothing.
+///
+/// A relayed tunnel used to leave no trace at all, succeeding or failing — so
+/// `disable://intercept`, a plugin's `sniCallback` declining, `--no-intercept-https`
+/// and every tunnel carrying something that is not HTTP were invisible in the
+/// console, and a relay that could not connect was a `warn` in the log. Upstream
+/// shows each as a tunnel row. The row appears once the far end is connected,
+/// and is complete when the tunnel closes.
+async fn relay_recorded<S>(
+    client: sni::Prefixed<S>,
+    target: &upstream::Target,
+    tunnel: Option<Tunnel<'_>>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let timings = timing::Timings::new();
+    let origin = match upstream::tunnel_stream(target, &timings).await {
+        Ok(origin) => origin,
+        Err(err) => {
+            match tunnel {
+                Some(mut t) => {
+                    t.session.timings = Some(timings);
+                    t.fail(&target_desc(target), outcome::Phase::Internal, &err);
+                }
+                None => tracing::debug!(
+                    "relaying to {}:{} failed: {err:#}",
+                    target.connect_host,
+                    target.connect_port
+                ),
+            }
+            return Err(err);
+        }
+    };
+    let open = tunnel.and_then(|t| {
+        let (_, open) = t.state.record_open(Session {
+            target: format!("{} (tunnel)", target_desc(target)),
+            duration_ms: t.started.elapsed().as_millis(),
+            timings: Some(timings),
+            ..t.session
+        });
+        open.map(|session| (t.state, session))
+    });
+    let relayed = sni::relay(client, origin).await;
+    if let Some((state, session)) = open {
+        state.complete(&session);
+    }
+    relayed
+}
+
+/// What a handshake the client broke off most likely means, in words — this is
+/// the one failure people meet on the first day, and the raw alert name does
+/// not say what to do about it.
+fn client_tls_failure(err: &std::io::Error) -> String {
+    use rustls::AlertDescription as Alert;
+    let refused = match err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<rustls::Error>())
+    {
+        Some(rustls::Error::AlertReceived(alert)) => matches!(
+            alert,
+            Alert::UnknownCA
+                | Alert::BadCertificate
+                | Alert::CertificateUnknown
+                | Alert::UnsupportedCertificate
+                | Alert::AccessDenied
+        ),
+        _ => false,
+    };
+    let hung_up = matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+    );
+    match (refused, hung_up) {
+        (true, _) => format!(
+            "the client refused this proxy's certificate ({err}): it does not trust the \
+             whistle-rs root certificate, or it pins the server's own"
+        ),
+        (false, true) => format!(
+            "the client hung up during the TLS handshake ({err}); a client that does not \
+             trust the whistle-rs root certificate often does"
+        ),
+        (false, false) => format!("the TLS handshake with the client failed: {err}"),
     }
 }
 

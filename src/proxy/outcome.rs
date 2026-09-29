@@ -24,6 +24,12 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
+    /// The TLS handshake between the client and this proxy, on a tunnel it
+    /// meant to read: the client would not take the certificate it was shown.
+    /// Almost always a client that does not trust the root certificate, or an
+    /// app that pins the server's real one.
+    #[serde(rename = "client-tls")]
+    ClientTls,
     /// Reading the request from the client: its body stopped arriving.
     Request,
     /// A rule could not be carried out — a destination scheme nothing routes, a
@@ -58,6 +64,7 @@ impl Phase {
     /// The name the API, the console and the `x-whistle-rs-error` header use.
     pub fn as_str(self) -> &'static str {
         match self {
+            Phase::ClientTls => "client-tls",
             Phase::Request => "request",
             Phase::Rules => "rules",
             Phase::Plugin => "plugin",

@@ -455,3 +455,123 @@ async fn a_completed_request_is_observed_once_with_its_whole_body() {
     let (_, _, text) = seen[0].res_body.as_ref().expect("captured").snapshot();
     assert_eq!(text, "hello world");
 }
+
+/// Opens a CONNECT tunnel to `authority` through the proxy and returns the
+/// socket once the proxy has said yes.
+async fn tunnel(proxy: SocketAddr, authority: &str) -> TcpStream {
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client
+        .write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        client.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    client
+}
+
+/// A real ClientHello naming `name`, produced by rustls itself: the proxy
+/// decides what to do with a tunnel from its first bytes, and waits until they
+/// are a whole hello.
+fn client_hello(name: &str) -> Vec<u8> {
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let mut out = Vec::new();
+    conn.write_tls(&mut out).unwrap();
+    out
+}
+
+/// A client that trusts nothing — which is every client before the root
+/// certificate is installed — refuses the certificate the proxy shows it. That
+/// tunnel carried no request, so without its own session it left nothing.
+#[tokio::test]
+async fn a_client_that_refuses_the_certificate_fails_at_client_tls() {
+    let (state, proxy) = proxy_with("").await;
+    let client = tunnel(proxy, "pinned.test:443").await;
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("pinned.test").unwrap();
+    let shake = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, client)
+        .await;
+    assert!(shake.is_err(), "a client that trusts nothing must refuse");
+    let s = one_failure(&state, "", Phase::ClientTls).await;
+    assert_eq!(s.method, "CONNECT");
+    assert_eq!(s.url, "https://pinned.test/");
+    let message = s.error.get().unwrap().message;
+    assert!(message.contains("root certificate"), "{message}");
+}
+
+/// A tunnel the rules say not to read is relayed; one whose far end will not
+/// answer fails where it failed, like any request would.
+#[tokio::test]
+async fn a_relayed_tunnel_that_cannot_connect_fails_at_connect() {
+    let dead = refused().await;
+    let (state, proxy) = proxy_with(&format!("relay.test disable://intercept host://{dead}")).await;
+    let mut client = tunnel(proxy, "relay.test:443").await;
+    client.write_all(&client_hello("relay.test")).await.unwrap();
+    let s = one_failure(&state, "", Phase::Connect).await;
+    assert_eq!(s.method, "CONNECT");
+    assert_eq!(s.status, 200, "the CONNECT itself was answered");
+    assert_eq!(s.target, dead.to_string());
+    assert_eq!(s.rules.len(), 2, "{:?}", s.rules);
+}
+
+/// A relayed tunnel that works is a session too: shown once it is connected,
+/// complete once it closes.
+#[tokio::test]
+async fn a_relayed_tunnel_is_a_session() {
+    let echo = server(|mut sock| async move {
+        let mut buf = [0u8; 64];
+        while let Ok(n) = sock.read(&mut buf).await {
+            if n == 0 || sock.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    let (state, proxy) = proxy_with(&format!("relay.test disable://intercept host://{echo}")).await;
+    let seen = observed(&state);
+    let mut client = tunnel(proxy, "relay.test:443").await;
+    let hello = client_hello("relay.test");
+    client.write_all(&hello).await.unwrap();
+    let mut back = vec![0u8; hello.len()];
+    client.read_exact(&mut back).await.unwrap();
+    assert_eq!(back, hello, "relayed byte for byte");
+    let rows = sessions(&state, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].method, "CONNECT");
+    assert_eq!(rows[0].target, format!("{echo} (tunnel)"));
+    assert!(rows[0].error.is_ok());
+    assert!(seen.lock().unwrap().is_empty(), "still open");
+    drop(client);
+    for _ in 0..200 {
+        if !seen.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1, "complete once it closed");
+}
+
+/// Opening a tunnel and closing it without a byte is something clients do all
+/// the time, and it asked for nothing: no session.
+#[tokio::test]
+async fn a_tunnel_closed_without_a_byte_leaves_nothing() {
+    let (state, proxy) = proxy_with("").await;
+    drop(tunnel(proxy, "idle.test:443").await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(state.sessions.lock().unwrap().is_empty());
+}

@@ -693,24 +693,14 @@ fn parse_rule(value: &str) -> Option<(String, String)> {
 /// never gets this far, having been turned away at the CONNECT or the SOCKS
 /// handshake, before the client was told anything was open — see
 /// [`super::tunnel_aborted`].
-pub async fn relay<S>(mut client: Prefixed<S>, target: &upstream::Target) -> Result<()>
+///
+/// `origin` is the leg [`upstream::tunnel_stream`] opened to `target`; the
+/// caller opens it, because whether it opened is what the tunnel's session
+/// records.
+pub(crate) async fn relay<S>(mut client: Prefixed<S>, mut origin: upstream::BoxedIo) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut origin = match upstream::tunnel_stream(target).await {
-        Ok(s) => s,
-        // Louder than the caller's `debug`: a plugin deliberately asked for this
-        // connection to be passed through, so failing to pass it through is not
-        // the routine "a client went away" this path otherwise sees.
-        Err(e) => {
-            tracing::warn!(
-                "sniCallback: relaying to {}:{} failed: {e:#}",
-                target.connect_host,
-                target.connect_port
-            );
-            return Err(e);
-        }
-    };
     tokio::io::copy_bidirectional(&mut client, &mut origin).await?;
     Ok(())
 }
@@ -1571,7 +1561,10 @@ mod tests {
                 host_fallback_direct: false,
                 auto2http: false,
             };
-            let relaying = tokio::spawn(async move { relay(prefixed, &target).await });
+            let relaying = tokio::spawn(async move {
+                let origin = upstream::tunnel_stream(&target, &Default::default()).await?;
+                relay(prefixed, origin).await
+            });
 
             assert_eq!(
                 seen.await.expect("origin task"),
