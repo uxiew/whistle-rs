@@ -183,6 +183,12 @@ pub struct Target {
     /// dev server over https: the origin leg's handshake fails against a server
     /// that speaks plain HTTP, and the request is sent again without TLS.
     pub auto2http: bool,
+    /// `enable://h2` / `disable://h2` (also `http2`, `httpsH2`): `Some(true)`
+    /// offers HTTP/2 to a TLS origin whatever the client spoke, `Some(false)`
+    /// never does, and `None` follows the client — h2 onward for a request
+    /// that arrived over h2, which is whistle's default (`checkH2`,
+    /// `_original/lib/inspectors/res.js:174-195`). See [`offers_h2`].
+    pub h2: Option<bool>,
 }
 
 impl Target {
@@ -585,9 +591,9 @@ fn build_client_config_with(
                 .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
                 .with_no_client_auth()
         } else {
-            let mut roots = RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            builder.with_root_certificates(roots).with_no_client_auth()
+            builder
+                .with_root_certificates(trusted_roots())
+                .with_no_client_auth()
         };
         return Arc::new(cfg);
     }
@@ -601,12 +607,56 @@ fn build_client_config_with(
             .with_no_client_auth();
         return Arc::new(cfg);
     }
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let cfg = ClientConfig::builder_with_protocol_versions(versions)
-        .with_root_certificates(roots)
+        .with_root_certificates(trusted_roots())
         .with_no_client_auth();
     Arc::new(cfg)
+}
+
+/// The roots an origin's certificate must chain to: the webpki set — and, in a
+/// test build, [`test_tls::CA`], so a test can stand up a TLS origin without
+/// turning verification off for every other test in the process.
+fn trusted_roots() -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    #[cfg(test)]
+    roots
+        .add(test_tls::CA.cert.der().clone())
+        .expect("the test CA is a valid root");
+    roots
+}
+
+/// A certificate authority that exists only in test builds; see
+/// [`trusted_roots`].
+#[cfg(test)]
+pub(crate) mod test_tls {
+    use once_cell::sync::Lazy;
+
+    pub(crate) struct Ca {
+        pub cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+    }
+
+    pub(crate) static CA: Lazy<Ca> = Lazy::new(|| {
+        let key = rcgen::KeyPair::generate().expect("CA key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "whistle-rs test CA");
+        let cert = params.self_signed(&key).expect("CA certificate");
+        Ca { cert, key }
+    });
+
+    /// A certificate for `localhost` signed by [`CA`].
+    pub(crate) static LEAF: Lazy<rcgen::CertifiedKey> = Lazy::new(|| {
+        let key_pair = rcgen::KeyPair::generate().expect("leaf key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("params")
+            .signed_by(&key_pair, &CA.cert, &CA.key)
+            .expect("leaf certificate");
+        rcgen::CertifiedKey { cert, key_pair }
+    });
 }
 
 /// Shared rustls client config trusting the webpki root store (TLS 1.2 + 1.3).
@@ -650,6 +700,36 @@ fn client_config_for(
     let built = build_client_config_with(protocol_versions(versions), Some(policy));
     SUITE_CONFIGS.write().unwrap().insert(key, built.clone());
     built
+}
+
+/// Configs that offer h2 in ALPN, by the pins they were copied from.
+type AlpnConfigCache =
+    RwLock<HashMap<(TlsVersions, Option<super::ciphers::CipherPolicy>), Arc<ClientConfig>>>;
+static H2_CONFIGS: Lazy<AlpnConfigCache> = Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// [`client_config_for`], offering `h2` and `http/1.1` in ALPN when `h2` is set.
+///
+/// Without an ALPN list the origin picks HTTP/1.1, which is what every request
+/// that did not ask for h2 should get; so the offer is a copy of the plain
+/// config rather than a change to it.
+fn origin_config(
+    versions: TlsVersions,
+    ciphers: Option<&Arc<super::ciphers::CipherPolicy>>,
+    h2: bool,
+) -> Arc<ClientConfig> {
+    let plain = client_config_for(versions, ciphers);
+    if !h2 {
+        return plain;
+    }
+    let key = (versions, ciphers.map(|p| (**p).clone()));
+    if let Some(cfg) = H2_CONFIGS.read().unwrap().get(&key) {
+        return cfg.clone();
+    }
+    let mut cfg = (*plain).clone();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let cfg = Arc::new(cfg);
+    H2_CONFIGS.write().unwrap().insert(key, cfg.clone());
+    cfg
 }
 
 /// The rustls version list a [`TlsVersions`] stands for.
@@ -935,9 +1015,9 @@ async fn tunnel_once(target: &Target, timings: &Timings) -> Result<BoxedIo> {
     // No request exists on this path, so the CONNECT to an upstream proxy carries
     // no `User-Agent` or client `Proxy-Authorization` to echo. The proxy URL's own
     // credentials still apply, which is how a proxy rule normally carries them.
-    origin_stream(target, &Hop::default().with_target(target), timings)
+    origin_stream(target, &Hop::default().with_target(target), timings, false)
         .await
-        .map(|(io, _)| io)
+        .map(|(io, _, _)| io)
 }
 
 /// A failure from [`forward_once`], tagged with whether the request survived it.
@@ -1005,7 +1085,8 @@ async fn forward_once(
         );
     }
     let hop = Hop::from_request(&req).with_target(target);
-    let pool = pool_for(&req).map(|pool| (pool, pool_key(target, &hop)));
+    let offer_h2 = offers_h2(target, &req);
+    let pool = pool_for(&req).map(|pool| (pool, pool_key(target, &hop, offer_h2)));
     let last_on_its_connection = asks_to_close(&req);
 
     // A connection this client already had open to the same place, if there is
@@ -1019,11 +1100,31 @@ async fn forward_once(
         }
     }
 
+    // The first request to an origin that may speak h2 makes the connection;
+    // the rest of its burst wait here and share it. See `ConnPool::opening`.
+    let mut opening = None;
+    if offer_h2
+        && let Some((pool, key)) = &pool
+        && !pool.speaks_http1(key)
+    {
+        use super::pool::Turn;
+        match pool.opening(key).await {
+            // Settled while this request waited, one way or the other.
+            Turn::Settled => match reuse(pool, key, target, &hop, req, timings).await {
+                Reuse::Answered(out) => return Ok(out),
+                Reuse::Failed(err) => return Err(RetryableError::Sent(err)),
+                Reuse::NotSent(back) => req = back,
+            },
+            Turn::Alone => {}
+            Turn::Open(turn) => opening = Some(turn),
+        }
+    }
+
     // Connect before touching the request. Nothing is sent yet, so a hop that
     // cannot be established hands `req` back untouched — which is what lets an
     // `xproxy://` fall back to a direct connection with the *same* request,
     // rather than one already rewritten for a proxy that is not there.
-    let (stream, peer) = match origin_stream(target, &hop, timings).await {
+    let (stream, peer, h2) = match origin_stream(target, &hop, timings, offer_h2).await {
         Ok(out) => out,
         Err(error) => {
             return Err(RetryableError::Connect(Box::new(UnsentRequest {
@@ -1032,7 +1133,6 @@ async fn forward_once(
             })));
         }
     };
-    for_the_wire(&mut req, target, &hop);
     let number = next_connection();
     timings.connection(number, false);
 
@@ -1040,6 +1140,42 @@ async fn forward_once(
     // head, with no observation point in between — so this is `send` + `wait`
     // and is reported as `wait` alone. See `timing`.
     let waiting = Instant::now();
+    if h2 {
+        let mut sender = match handshake_h2(TokioIo::new(stream)).await {
+            Ok(sender) => sender,
+            Err(error) => {
+                return Err(RetryableError::Connect(Box::new(UnsentRequest {
+                    error,
+                    request: req,
+                })));
+            }
+        };
+        if let Some((pool, key)) = &pool {
+            pool.share(
+                key.clone(),
+                super::pool::Session {
+                    sender: sender.clone(),
+                    peer,
+                    number,
+                },
+            );
+        }
+        // Whoever waited can now find the session.
+        drop(opening);
+        let resp = sender
+            .send_request(for_h2(req, target))
+            .await
+            .map_err(|err| RetryableError::Sent(send_failure(err)))?;
+        timings.wait(waiting);
+        return Ok((resp, peer));
+    }
+    // The origin answered the offer with HTTP/1.1. Nobody need wait for an h2
+    // connection to it again.
+    if offer_h2 && let Some((pool, key)) = &pool {
+        pool.mark_http1(key.clone());
+    }
+    drop(opening);
+    for_the_wire(&mut req, target, &hop);
     let (resp, sender) = send(TokioIo::new(stream), req)
         .await
         .map_err(RetryableError::Sent)?;
@@ -1141,8 +1277,22 @@ fn pool_for(req: &Request<DynBody>) -> Option<super::pool::ConnPool> {
     req.extensions().get::<super::pool::ConnPool>().cloned()
 }
 
+/// Does this request offer HTTP/2 to its origin?
+///
+/// Only over TLS — HTTP/2 without it (whistle's `httpH2`) is not implemented —
+/// and never for an upgrade, which needs the HTTP/1.1 connection it asks to take
+/// over. Otherwise a rule decides ([`Target::h2`]), and without one the client
+/// does: a request that arrived over h2 goes on over h2, which is whistle's
+/// `req.useH2 = req.isH2` (`_original/lib/inspectors/res.js:178`).
+fn offers_h2(target: &Target, req: &Request<DynBody>) -> bool {
+    target.tls
+        && req.method() != hyper::Method::CONNECT
+        && !super::asks_to_upgrade(req.headers())
+        && target.h2.unwrap_or(req.version() == hyper::Version::HTTP_2)
+}
+
 /// What this request's connection is made of — see [`super::pool::Key`].
-fn pool_key(target: &Target, hop: &Hop) -> super::pool::Key {
+fn pool_key(target: &Target, hop: &Hop, h2: bool) -> super::pool::Key {
     use super::pool::{Key, ProxyRoute, TlsPolicy};
     let (host, port) = target.hop_addr();
     Key {
@@ -1163,6 +1313,7 @@ fn pool_key(target: &Target, hop: &Hop) -> super::pool::Key {
             user_agent: (!hop.no_proxy_ua).then(|| hop.user_agent.clone()).flatten(),
             connection_close: hop.proxy_connection_close,
         }),
+        h2,
     }
 }
 
@@ -1193,6 +1344,45 @@ async fn reuse(
     use super::pool::{FRESH_ENOUGH, IDLE_LIMIT};
     let last = asks_to_close(&req);
     let replayable = replayable(&req);
+    // An h2 connection is shared rather than taken: it carries this request
+    // beside whatever else is in flight on it.
+    while key.h2
+        && let Some(session) = pool.session(key)
+    {
+        let (head, body) = req.into_parts();
+        let wire = for_h2(Request::from_parts(head.clone(), body), target);
+        let mut sender = session.sender.clone();
+        let waiting = Instant::now();
+        match sender.try_send_request(wire).await {
+            Ok(resp) => {
+                timings.wait(waiting);
+                timings.connection(session.number, true);
+                return Reuse::Answered((resp, session.peer));
+            }
+            Err(mut failed) => {
+                if let Some(back) = failed.take_message() {
+                    // The connection had gone before the request reached it.
+                    pool.forget_session(session.number);
+                    req = Request::from_parts(head, back.into_body());
+                    continue;
+                }
+                let err = failed.into_error();
+                let gone = closed_under_us(&err);
+                if gone || !sender.is_ready() {
+                    pool.forget_session(session.number);
+                }
+                if replayable && gone {
+                    tracing::debug!(
+                        "h2 connection to {}:{} would not take the request ({err}); sending on a fresh one",
+                        target.connect_host,
+                        target.connect_port
+                    );
+                    return Reuse::NotSent(Request::from_parts(head, super::body::empty()));
+                }
+                return Reuse::Failed(send_failure(err));
+            }
+        }
+    }
     let max_idle = if replayable { IDLE_LIMIT } else { FRESH_ENOUGH };
     while let Some(mut conn) = pool.take(key, max_idle) {
         // The head is kept so the request can be handed back as it was, not
@@ -1255,9 +1445,15 @@ fn replayable(req: &Request<DynBody>) -> bool {
 
 /// Did a send fail because the connection was already closing — rather than
 /// because of anything the origin said?
+///
+/// On h2 that includes a stream the origin refused, or one past the last it
+/// promised to finish when it sent GOAWAY: either way it never processed it.
 fn closed_under_us(err: &hyper::Error) -> bool {
     if err.is_incomplete_message() || err.is_canceled() || err.is_closed() {
         return true;
+    }
+    if let Some(h2) = std::error::Error::source(err).and_then(|e| e.downcast_ref::<h2::Error>()) {
+        return h2.is_go_away() || h2.reason() == Some(h2::Reason::REFUSED_STREAM);
     }
     std::error::Error::source(err)
         .and_then(|e| e.downcast_ref::<std::io::Error>())
@@ -1432,11 +1628,15 @@ where
 /// (`setHostsInfo` is fed the resolved *proxy* address when a proxy rule
 /// matched, `_original/lib/inspectors/res.js:238,:259`). It is the only place
 /// the chosen address is ever visible, so `serverIp:` gets it from here.
+///
+/// `offer_h2` puts `h2` beside `http/1.1` in the TLS handshake's ALPN; the
+/// third value says whether the origin took it. See [`offers_h2`].
 async fn origin_stream(
     target: &Target,
     hop: &Hop,
     timings: &Timings,
-) -> Result<(BoxedIo, Option<SocketAddr>)> {
+    offer_h2: bool,
+) -> Result<(BoxedIo, Option<SocketAddr>, bool)> {
     let (dst_host, dst_port) = target.hop_addr();
     // When the TCP connect began. `connect` ends when there is a byte pipe to
     // the origin, so on a proxied hop it also covers the proxy's own TLS and its
@@ -1486,7 +1686,7 @@ async fn origin_stream(
                     if uses_absolute_form(target) {
                         // Plain http via a plain proxy: absolute-form, no CONNECT.
                         timings.connect(connecting);
-                        return Ok((pstream, peer));
+                        return Ok((pstream, peer, false));
                     }
                     let tunnelled = http_connect(pstream, dst_host, dst_port, hop, proxy, false)
                         .await
@@ -1517,9 +1717,10 @@ async fn origin_stream(
 
     timings.connect(connecting);
     if target.tls {
-        let connector = TlsConnector::from(client_config_for(
+        let connector = TlsConnector::from(origin_config(
             target.tls_versions,
             target.tls_ciphers.as_ref(),
+            offer_h2,
         ));
         let server_name = ServerName::try_from(target.sni.clone())
             .map_err(|_| stopped(Phase::Tls, anyhow!("invalid SNI host {}", target.sni)))?;
@@ -1530,9 +1731,10 @@ async fn origin_stream(
             .context("upstream TLS handshake")
             .map_err(outcome::at(Phase::Tls))?;
         timings.ssl(shaking_hands);
-        Ok((BoxedIo(Box::new(tls)), peer))
+        let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+        Ok((BoxedIo(Box::new(tls)), peer, h2))
     } else {
-        Ok((base, peer))
+        Ok((base, peer, false))
     }
 }
 
@@ -1564,6 +1766,67 @@ where
     });
     let resp = sender.send_request(req).await.map_err(send_failure)?;
     Ok((resp, sender))
+}
+
+/// Start an HTTP/2 client connection over `io`, which ALPN has settled on h2.
+async fn handshake_h2<I>(io: I) -> Result<hyper::client::conn::http2::SendRequest<DynBody>>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let (sender, conn) =
+        hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+            .await
+            .context("upstream h2 handshake")
+            .map_err(outcome::at(Phase::Response))?;
+    tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            tracing::debug!("upstream h2 connection error: {err}");
+        }
+    });
+    Ok(sender)
+}
+
+/// The request as an HTTP/2 origin is sent it — whistle's `formatH2Headers`
+/// and `requestH2` (`_original/lib/util/index.js:3494-3520`,
+/// `lib/https/h2.js:262-275`): `Host` becomes `:authority`, and the headers
+/// that only mean something on one HTTP/1.1 connection are dropped.
+fn for_h2(req: Request<DynBody>, target: &Target) -> Request<DynBody> {
+    let (mut parts, body) = req.into_parts();
+    let authority = parts
+        .headers
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| join_host_port(&target.sni, target.request_port, 443));
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    if let Ok(uri) = format!("https://{authority}{path}").parse::<Uri>() {
+        parts.uri = uri;
+    }
+    parts.version = hyper::Version::HTTP_2;
+    let keeps_te = parts
+        .headers
+        .get(hyper::header::TE)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"trailers"));
+    for name in [
+        "host",
+        "connection",
+        "upgrade",
+        "http2-settings",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+    ] {
+        parts.headers.remove(name);
+    }
+    if !keeps_te {
+        parts.headers.remove(hyper::header::TE);
+    }
+    Request::from_parts(parts, body)
 }
 
 /// A failed send, tagged with whose side failed.
@@ -1818,6 +2081,7 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
         tls_versions: TlsVersions::Default,
         host_fallback_direct: false,
         auto2http: false,
+        h2: None,
     };
     Ok((target, path.to_string()))
 }
@@ -2121,6 +2385,7 @@ mod tests {
             tls_versions: TlsVersions::Default,
             host_fallback_direct: false,
             auto2http: false,
+            h2: None,
         }
     }
 
@@ -3130,3 +3395,7 @@ mod dns_order_tests {
 #[cfg(test)]
 #[path = "pool_tests.rs"]
 mod pool_tests;
+
+#[cfg(test)]
+#[path = "h2_tests.rs"]
+mod h2_tests;

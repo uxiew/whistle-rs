@@ -109,6 +109,7 @@ fn direct(port: u16) -> Target {
         tls_versions: TlsVersions::Default,
         host_fallback_direct: false,
         auto2http: false,
+        h2: None,
     }
 }
 
@@ -347,6 +348,11 @@ fn upgrades_and_tunnels_stay_out_of_the_pool() {
     assert!(pool_for(&request("GET", Some(&pool), body::empty())).is_some());
 }
 
+/// A key with no h2 offer, which is what every variant below starts from.
+fn key_of(target: &Target, hop: &Hop) -> super::super::pool::Key {
+    pool_key(target, hop, false)
+}
+
 /// Every part of a connection's identity is in its key: change any one and
 /// the request needs a connection of its own.
 #[test]
@@ -370,7 +376,7 @@ fn every_part_of_the_route_is_in_the_key() {
         client_proxy_auth: Some("Basic Y2xpZW50".into()),
         ..Hop::default()
     };
-    let base = pool_key(&tls, &hop);
+    let base = key_of(&tls, &hop);
     let with_proxy = |f: &dyn Fn(&mut ProxyConfig)| {
         let mut p = proxy.clone();
         f(&mut p);
@@ -384,7 +390,7 @@ fn every_part_of_the_route_is_in_the_key() {
     let variants: Vec<(&str, super::super::pool::Key)> = vec![
         (
             "connect address",
-            pool_key(
+            key_of(
                 &Target {
                     connect_host: "10.0.0.1".into(),
                     ..tls.clone()
@@ -394,7 +400,7 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "requested host",
-            pool_key(
+            key_of(
                 &Target {
                     sni: "other.test".into(),
                     connect_host: "other.test".into(),
@@ -405,7 +411,7 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "plain vs TLS",
-            pool_key(
+            key_of(
                 &Target {
                     tls: false,
                     ..tls.clone()
@@ -415,7 +421,7 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "TLS versions",
-            pool_key(
+            key_of(
                 &Target {
                     tls_versions: TlsVersions::Only12,
                     ..tls.clone()
@@ -425,7 +431,7 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "cipher suites",
-            pool_key(
+            key_of(
                 &Target {
                     tls_ciphers: Some(Arc::new(policy)),
                     ..tls.clone()
@@ -435,7 +441,7 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "stripped TLS",
-            pool_key(
+            key_of(
                 &Target {
                     origin_tls_stripped: true,
                     ..tls.clone()
@@ -445,7 +451,7 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "no proxy",
-            pool_key(
+            key_of(
                 &Target {
                     proxy: None,
                     ..tls.clone()
@@ -455,22 +461,22 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "proxy kind",
-            pool_key(&with_proxy(&|p| p.kind = ProxyKind::Socks), &hop),
+            key_of(&with_proxy(&|p| p.kind = ProxyKind::Socks), &hop),
         ),
         (
             "proxy address",
-            pool_key(&with_proxy(&|p| p.port = 8081), &hop),
+            key_of(&with_proxy(&|p| p.port = 8081), &hop),
         ),
         (
             "proxy credentials",
-            pool_key(
+            key_of(
                 &with_proxy(&|p| p.auth = Some(ProxyAuth("bob:secret".into()))),
                 &hop,
             ),
         ),
         (
             "proxy ?host=",
-            pool_key(
+            key_of(
                 &with_proxy(&|p| {
                     p.host_override = Some(HostOverride {
                         host: "10.0.0.2".into(),
@@ -482,11 +488,11 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "proxyTunnel",
-            pool_key(&with_proxy(&|p| p.tunnel = true), &hop),
+            key_of(&with_proxy(&|p| p.tunnel = true), &hop),
         ),
         (
             "User-Agent on CONNECT",
-            pool_key(
+            key_of(
                 &tls,
                 &Hop {
                     user_agent: Some("ua/2".into()),
@@ -496,7 +502,7 @@ fn every_part_of_the_route_is_in_the_key() {
         ),
         (
             "disable://proxyConnection",
-            pool_key(
+            key_of(
                 &Target {
                     proxy_connection_close: true,
                     ..tls.clone()
@@ -515,12 +521,18 @@ fn every_part_of_the_route_is_in_the_key() {
     for (what, key) in &variants {
         assert_ne!(key, &base, "{what} must be part of the key");
     }
+    // A connection made with an h2 offer may be h2; one made without never is.
+    assert_ne!(
+        pool_key(&tls, &hop, true),
+        base,
+        "the h2 offer must be part of the key"
+    );
 
     // With no credentials of its own, the proxy is shown the client's, and
     // two clients' credentials are two identities.
     let anonymous = with_proxy(&|p| p.auth = None);
     let as_client = |auth: &str| {
-        pool_key(
+        key_of(
             &anonymous,
             &Hop {
                 client_proxy_auth: Some(auth.into()),
@@ -535,7 +547,7 @@ fn every_part_of_the_route_is_in_the_key() {
         ..tls.clone()
     };
     assert_eq!(
-        pool_key(&direct_tls, &hop),
-        pool_key(&direct_tls, &Hop::default())
+        key_of(&direct_tls, &hop),
+        key_of(&direct_tls, &Hop::default())
     );
 }

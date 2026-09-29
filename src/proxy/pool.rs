@@ -31,12 +31,20 @@
 //! `disable://keepAlive` sends), or an origin that hung up. hyper closes those
 //! itself and [`ConnPool::park_when_ready`] only ever parks a connection hyper
 //! says can take another request.
+//!
+//! **HTTP/2 connections are shared, not taken.** One h2 connection carries
+//! every request the client connection sends to its key, concurrently — see
+//! [`ConnPool::session`]. The first request to a key that may speak h2 opens
+//! the connection while the others wait for it ([`ConnPool::opening`]), so a
+//! page's first burst is one handshake rather than fifty; an origin that
+//! answers the offer with HTTP/1.1 is remembered, and nobody waits for it again.
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use hyper::client::conn::http1::SendRequest;
+use hyper::client::conn::{http1::SendRequest, http2};
 
 use super::body::DynBody;
 use super::ciphers::CipherPolicy;
@@ -97,6 +105,10 @@ pub(crate) struct Key {
     pub tls_stripped: bool,
     /// The upstream proxy, credentials and all.
     pub proxy: Option<ProxyRoute>,
+    /// HTTP/2 was offered in the TLS handshake. A connection made with the
+    /// offer can be h2 or HTTP/1.1, whichever the origin chose; one made
+    /// without it is always HTTP/1.1.
+    pub h2: bool,
 }
 
 /// The TLS half of a [`Key`].
@@ -131,6 +143,14 @@ pub(crate) struct Conn {
     pub number: u64,
 }
 
+/// An HTTP/2 connection, which every request to its key shares.
+#[derive(Clone)]
+pub(crate) struct Session {
+    pub sender: http2::SendRequest<DynBody>,
+    pub peer: Option<SocketAddr>,
+    pub number: u64,
+}
+
 /// The origin connections one client connection is holding for reuse.
 ///
 /// Cheap to clone: every request on the client connection carries a handle in
@@ -142,6 +162,20 @@ pub struct ConnPool(Arc<Mutex<Idle>>);
 #[derive(Default)]
 struct Idle {
     parked: Vec<Parked>,
+    sessions: Vec<Shared>,
+    /// Keys whose origin answered an h2 offer with HTTP/1.1.
+    h1_only: HashSet<Key>,
+    /// One lock per key that may speak h2, held while its connection is made.
+    opening: HashMap<Key, Arc<tokio::sync::Mutex<()>>>,
+    /// Keys whose last attempt under that lock ended with neither an h2
+    /// connection nor an answer of HTTP/1.1 — it failed.
+    failed: HashSet<Key>,
+}
+
+struct Shared {
+    key: Key,
+    session: Session,
+    last_used: Instant,
 }
 
 struct Parked {
@@ -199,10 +233,160 @@ impl ConnPool {
         });
     }
 
+    /// The h2 connection for `key`, if one is open and still taking requests.
+    pub(crate) fn session(&self, key: &Key) -> Option<Session> {
+        let mut idle = self.0.lock().unwrap();
+        // A connection the origin closed, or sent GOAWAY on, takes no more.
+        idle.sessions.retain(|s| s.session.sender.is_ready());
+        let shared = idle.sessions.iter_mut().find(|s| &s.key == key)?;
+        shared.last_used = Instant::now();
+        Some(shared.session.clone())
+    }
+
+    /// Keep `session` for every later request to `key`, and close it once it has
+    /// gone [`IDLE_LIMIT`] without starting one. Requests still streaming on it
+    /// then keep it open until they finish; nothing new is sent on it.
+    pub(crate) fn share(&self, key: Key, session: Session) {
+        let number = session.number;
+        {
+            let mut idle = self.0.lock().unwrap();
+            idle.failed.remove(&key);
+            idle.sessions.retain(|s| s.key != key);
+            idle.sessions.push(Shared {
+                key,
+                session,
+                last_used: Instant::now(),
+            });
+        }
+        let pool = Arc::downgrade(&self.0);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(IDLE_LIMIT).await;
+                let Some(inner) = pool.upgrade() else {
+                    return;
+                };
+                let mut idle = inner.lock().unwrap();
+                let Some(at) = idle
+                    .sessions
+                    .iter()
+                    .position(|s| s.session.number == number)
+                else {
+                    return;
+                };
+                if idle.sessions[at].last_used.elapsed() >= IDLE_LIMIT {
+                    idle.sessions.remove(at);
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Forget the h2 connection numbered `number`: a request just failed on it.
+    pub(crate) fn forget_session(&self, number: u64) {
+        let mut idle = self.0.lock().unwrap();
+        idle.sessions.retain(|s| s.session.number != number);
+    }
+
+    /// Did this origin answer an h2 offer with HTTP/1.1 before?
+    pub(crate) fn speaks_http1(&self, key: &Key) -> bool {
+        self.0.lock().unwrap().h1_only.contains(key)
+    }
+
+    /// Remember that this origin answered an h2 offer with HTTP/1.1, so that
+    /// nobody waits in [`opening`](Self::opening) for an h2 connection to it.
+    pub(crate) fn mark_http1(&self, key: Key) {
+        let mut idle = self.0.lock().unwrap();
+        idle.failed.remove(&key);
+        idle.h1_only.insert(key);
+    }
+
+    /// Wait for the turn to open a connection to `key`, which may be h2.
+    ///
+    /// The requests of a page arrive together. Without this each would open
+    /// its own connection before any of them knew the origin speaks h2, and
+    /// the first burst — the one that decides how fast the page loads — would
+    /// cost as many handshakes as there are requests. The turn is held only
+    /// while the connection is made; whoever gets it next finds the session,
+    /// or learns that there will not be one.
+    ///
+    /// Nobody queues behind a failure. If the attempt before this one ended
+    /// with no connection at all, the rest of the burst connect side by side,
+    /// as they would with no pool: waiting in line for an origin that is not
+    /// answering would cost each of them the whole connect budget in turn.
+    pub(crate) async fn opening(&self, key: &Key) -> Turn {
+        let gate = {
+            let mut idle = self.0.lock().unwrap();
+            idle.opening.entry(key.clone()).or_default().clone()
+        };
+        let held = gate.lock_owned().await;
+        let idle = self.0.lock().unwrap();
+        if idle.h1_only.contains(key)
+            || idle
+                .sessions
+                .iter()
+                .any(|s| &s.key == key && s.session.sender.is_ready())
+        {
+            return Turn::Settled;
+        }
+        if idle.failed.contains(key) {
+            return Turn::Alone;
+        }
+        drop(idle);
+        Turn::Open(Box::new(Opening {
+            pool: self.clone(),
+            key: key.clone(),
+            _held: held,
+        }))
+    }
+
     /// How many connections are parked — for tests.
     #[cfg(test)]
     pub(crate) fn idle(&self) -> usize {
         self.0.lock().unwrap().parked.len()
+    }
+
+    /// Drop every h2 connection — for tests, standing in for an origin that
+    /// went away.
+    #[cfg(test)]
+    pub(crate) fn close_sessions(&self) {
+        self.0.lock().unwrap().sessions.clear();
+    }
+}
+
+/// What [`ConnPool::opening`] found when this request's turn came.
+pub(crate) enum Turn {
+    /// The connection was settled while it waited — an h2 session to share,
+    /// or the news that the origin speaks HTTP/1.1.
+    Settled,
+    /// The last attempt failed: connect, and hold nobody up doing it.
+    Alone,
+    /// Make the connection; the rest of the burst waits for this to drop.
+    /// Boxed: a whole [`Key`] rides in it, and the other two carry nothing.
+    Open(Box<Opening>),
+}
+
+/// The turn to make the connection a burst is waiting for.
+///
+/// Dropped once the connection is made or has failed, which lets the next
+/// waiter in. What it finds is recorded here: dropped with neither a session
+/// shared nor HTTP/1.1 marked, the attempt failed, and the waiters go
+/// [`Turn::Alone`].
+pub(crate) struct Opening {
+    pool: ConnPool,
+    key: Key,
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        let mut idle = self.pool.0.lock().unwrap();
+        let settled =
+            idle.h1_only.contains(&self.key) || idle.sessions.iter().any(|s| s.key == self.key);
+        if settled {
+            idle.failed.remove(&self.key);
+        } else {
+            idle.failed.insert(self.key.clone());
+        }
     }
 }
 
@@ -236,6 +420,7 @@ mod tests {
             tls: None,
             tls_stripped: false,
             proxy: None,
+            h2: false,
         }
     }
 
@@ -337,6 +522,26 @@ mod tests {
         );
         let newest = key(&format!("h{}", MAX_IDLE + 2));
         assert!(pool.take(&newest, IDLE_LIMIT).is_some());
+    }
+
+    /// A burst waits for the first attempt, and only for a successful one: a
+    /// turn dropped with nothing to show lets the rest connect side by side.
+    #[tokio::test]
+    async fn nobody_queues_behind_a_failed_attempt() {
+        let pool = ConnPool::new();
+        let k = Key {
+            h2: true,
+            ..key("a")
+        };
+        let Turn::Open(first) = pool.opening(&k).await else {
+            panic!("the first request makes the connection");
+        };
+        drop(first); // no session, no HTTP/1.1: it failed
+        assert!(matches!(pool.opening(&k).await, Turn::Alone));
+
+        // Succeeding clears it, and the next burst waits again.
+        pool.mark_http1(k.clone());
+        assert!(matches!(pool.opening(&k).await, Turn::Settled));
     }
 
     /// Once the client connection's last handle is gone there is nowhere to

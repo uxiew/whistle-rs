@@ -1561,6 +1561,7 @@ mod tests {
                 tls_versions: upstream::TlsVersions::Default,
                 host_fallback_direct: false,
                 auto2http: false,
+                h2: None,
             };
             let relaying = tokio::spawn(async move {
                 let origin = upstream::tunnel_stream(&target, &Default::default()).await?;

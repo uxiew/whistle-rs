@@ -7648,6 +7648,7 @@ mod internal_req_tests {
             tls_versions: upstream::TlsVersions::Default,
             host_fallback_direct: false,
             auto2http: false,
+            h2: None,
         };
 
         let mut h = hyper::HeaderMap::new();

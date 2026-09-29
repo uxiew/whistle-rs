@@ -1264,8 +1264,19 @@ pub async fn resolve_target(
                         .parse::<std::net::IpAddr>()
                         .is_ok_and(super::upstream::is_local_ip)
             });
+    // `checkH2` (`_original/lib/inspectors/res.js:174-195`): any of the three
+    // spellings, `disable` first.
+    const H2: [&str; 3] = ["h2", "http2", "httpsH2"];
+    let h2 = if H2.iter().any(|f| disabled.contains(*f)) {
+        Some(false)
+    } else if H2.iter().any(|f| enabled_flags(resolved).contains(*f)) {
+        Some(true)
+    } else {
+        None
+    };
     Ok(Target {
         auto2http,
+        h2,
         tls_ciphers,
         // Only where there is a handshake for a pin to be missing from.
         cipher_dropped: cipher_dropped.filter(|_| tls),
@@ -13425,6 +13436,32 @@ mod tests {
         // retry is not reachable.
         let plain = target("example.com host://127.0.0.1:5173", "http://example.com/");
         assert!(plain.auto2http && !plain.tls);
+    }
+
+    /// `checkH2` (`_original/lib/inspectors/res.js:174-195`): three spellings
+    /// each way, `disable` over `enable`, and no rule leaves it to the client.
+    #[test]
+    fn the_h2_flags_turn_origin_h2_either_way() {
+        let https = "https://example.com/";
+        assert_eq!(target("example.com reqHeaders://x=1", https).h2, None);
+        for flag in ["h2", "http2", "httpsH2"] {
+            assert_eq!(
+                target(&format!("example.com enable://{flag}"), https).h2,
+                Some(true)
+            );
+            assert_eq!(
+                target(&format!("example.com disable://{flag}"), https).h2,
+                Some(false)
+            );
+        }
+        assert_eq!(
+            target(
+                "example.com enable://h2\nexample.com disable://http2",
+                https
+            )
+            .h2,
+            Some(false)
+        );
     }
 
     const HOST_AND_PROXY: &str = "example.com host://1.2.3.4\nexample.com proxy://127.0.0.1:8888\n";
