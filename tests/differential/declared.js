@@ -55,6 +55,18 @@ const DECLARED = {
       'intercept:// is a protocol in neither; both answer 502 in their own words. Header, intercept://'),
   ],
 
+  'cases-bodies.js': [
+    // The fixture is plain HTML labelled `zstd`. whistle does not know zstd and
+    // treats the body as uncompressed, so the substitution finds its pattern.
+    // A real zstd body — which Chrome asks for and CDNs send — would get the
+    // operators run over compressed bytes: resReplace matching nothing,
+    // resAppend writing text after the frame. This port forwards a body under
+    // a coding it cannot undo as it arrived and records `unsupported-coding`
+    // on the session (docs/API.md, 没生效的规则; docs/RULES.md).
+    d('resReplace on a zstd page', ['res.body'],
+      'a coding this port cannot undo is forwarded untouched and the session says so; upstream rewrites it as if uncompressed'),
+  ],
+
   'cases-delete.js': [
     d('delete bare pathname keeps the query', ['req.url'],
       'upstream appends the query twice (/?a=1?a=1), a request line no origin parses. Header'),
