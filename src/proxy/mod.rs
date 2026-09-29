@@ -4661,8 +4661,11 @@ async fn serve(
     // read is not a reason to make all of it async. Costs nothing unless a file
     // rule won the slot and named a URL.
     let remote = apply::prefetch_remote_file(&resolved).await;
-    if let Some(resp) = apply::short_circuit(&info, &resolved, proxy_env, remote.as_ref()) {
+    if let Some(mut resp) = apply::short_circuit(&info, &resolved, proxy_env, remote.as_ref()) {
         tracing::info!("{} {} -> short-circuit", info.method, info.full_url);
+        if resp.status() == StatusCode::SWITCHING_PROTOCOLS && asks_to_upgrade(req.headers()) {
+            accept_upgrade_locally(&mut req, &mut resp);
+        }
         // Response-side operators apply to a mocked response too: upstream runs
         // its response inspectors over `file`/`tpl`/`redirect` responses just as
         // it does over real ones, so `resHeaders://` and friends must land here
@@ -5468,6 +5471,48 @@ fn apply_plugin_res_result(
     result.body
 }
 
+/// Complete the handshake a local `101` answers an upgrade with — what upstream
+/// does for `statusCode://101` on a WebSocket (`_original/lib/https/index.js:145-162`):
+/// the `Sec-WebSocket-Accept` the key calls for, the first subprotocol asked
+/// for, `Upgrade` as the client spelled it (or `websocket`), and
+/// `Connection: Upgrade`. Without them a client refuses the switch — the bare
+/// `101` this port sent was "unexpected server response (101)" to upstream's
+/// `ws.test.js`.
+///
+/// Then the connection is held, as upstream holds it with nobody behind it:
+/// whatever the client sends is read and dropped until it hangs up.
+fn accept_upgrade_locally<B>(req: &mut Request<B>, resp: &mut Response<DynBody>) {
+    let header = |name| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let upgrade = header(hyper::header::UPGRADE).unwrap_or_else(|| "websocket".to_string());
+    let protocol = header(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .map(|p| p.split(',').next().unwrap_or_default().trim().to_string());
+    let accept = header(hyper::header::SEC_WEBSOCKET_KEY).map(|key| ws::accept_key(&key));
+    let headers = resp.headers_mut();
+    for (name, value) in [
+        (hyper::header::SEC_WEBSOCKET_ACCEPT, accept),
+        (hyper::header::SEC_WEBSOCKET_PROTOCOL, protocol),
+        (hyper::header::UPGRADE, Some(upgrade)),
+        (hyper::header::CONNECTION, Some("Upgrade".to_string())),
+    ] {
+        if let Some(value) = value.and_then(|v| hyper::header::HeaderValue::from_str(&v).ok()) {
+            headers.insert(name, value);
+        }
+    }
+    let upgraded = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        if let Ok(io) = upgraded.await {
+            let mut io = TokioIo::new(io);
+            let _ = tokio::io::copy(&mut io, &mut tokio::io::sink()).await;
+        }
+    });
+}
+
 /// True if the request asks to upgrade the protocol (e.g. a WebSocket handshake).
 fn is_upgrade(req: &Request<DynBody>) -> bool {
     asks_to_upgrade(req.headers())
@@ -5737,6 +5782,39 @@ mod upgrade_abort_tests {
             .unwrap_or(0);
         got.truncate(read);
         got
+    }
+
+    /// `statusCode://101` on a WebSocket completes the handshake itself, as
+    /// upstream does (`lib/https/index.js:145-162`): the accept the key calls
+    /// for, and the headers a client checks before it believes the switch.
+    #[tokio::test]
+    async fn a_local_101_completes_the_websocket_handshake() {
+        let (_state, addr) = proxy_with("ws.local.test statusCode://101").await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET http://ws.local.test/ HTTP/1.1\r\nHost: ws.local.test\r\n\
+                  Connection: Upgrade\r\nUpgrade: websocket\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                  Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat, superchat\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut got = vec![0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut got))
+            .await
+            .expect("an answer")
+            .unwrap();
+        let head = String::from_utf8_lossy(&got[..n]).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 101"), "{head}");
+        // RFC 6455's own example key and accept.
+        assert!(
+            head.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="),
+            "{head}"
+        );
+        assert!(head.contains("sec-websocket-protocol: chat\r\n"), "{head}");
+        assert!(head.contains("upgrade: websocket"), "{head}");
+        assert!(head.contains("connection: upgrade"), "{head}");
     }
 
     /// No extension is negotiated through the proxy: the client's

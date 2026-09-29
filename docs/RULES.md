@@ -1655,6 +1655,12 @@ handshake failure wearing a mock's status line. `statusCode://` and `redirect://
 share the slot and are *not* passed over: both are answers a client can be given
 before it upgrades.
 
+`statusCode://101` on a WebSocket is a WebSocket endpoint with nobody behind it:
+the proxy completes the handshake itself — the `Sec-WebSocket-Accept` the key
+calls for, the first subprotocol asked for, `Upgrade`, `Connection` — and then
+keeps the connection, reading and dropping what the client sends, as upstream
+does. A client can open it and send into it; nothing answers.
+
 ```
 chat.example.com   file:///srv/mock.json       # ignored by the WebSocket…
 chat.example.com   127.0.0.1:9000              # …which this line still moves

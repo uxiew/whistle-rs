@@ -53,6 +53,17 @@ const OPCODE_PING: u8 = 0x9;
 /// The answer to one, or an unsolicited heartbeat.
 const OPCODE_PONG: u8 = 0xa;
 
+/// `Sec-WebSocket-Accept` for a client's key (RFC 6455 §4.2.2): SHA-1 of the key
+/// and the protocol's fixed GUID, base64.
+pub fn accept_key(key: &str) -> String {
+    use base64::Engine as _;
+    let digest = ring::digest::digest(
+        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+        format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
+    );
+    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+}
+
 /// A decoded WebSocket frame (control/data), payload already unmasked.
 pub struct Frame {
     pub fin: bool,
