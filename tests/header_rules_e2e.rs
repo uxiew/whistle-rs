@@ -195,6 +195,35 @@ async fn the_request_wins_under_multi_env() {
     assert_eq!(seen.get("x-who").map(String::as_str), Some("header"));
 }
 
+/// A ``` block inside the carried text is a value of that text: it answers the
+/// text's own `{name}` over the store's entry of that name (upstream's suite,
+/// `test/units/keys.test.js:106-113`) and over what `x-whistle-key-value`
+/// carried (`Rules#parse` lays the blocks last, `rules.js:2058`).
+#[tokio::test]
+async fn a_block_in_the_carried_text_answers_its_own_reference() {
+    let origin = echo_origin().await;
+    let p = proxy(origin, "multiEnv").await;
+    let text = format!("{origin} reqHeaders://{{envA}}\n``` envA\nx-mark-block: 1\n```");
+    let seen = through(
+        p.addr(),
+        origin,
+        &[
+            (RULES, &urlencode(&text)),
+            (KV, r#"{"envA":"x-mark-kv: 1"}"#),
+        ],
+    )
+    .await;
+    assert_eq!(
+        seen.get("x-mark-block").map(String::as_str),
+        Some("1"),
+        "{seen:?}"
+    );
+    assert!(
+        !seen.contains_key("x-mark-kv"),
+        "the carried JSON won: {seen:?}"
+    );
+}
+
 /// The other three readable headers: a line appended, a values entry prepended,
 /// and a `{name}` answered by JSON the same request carried.
 #[tokio::test]

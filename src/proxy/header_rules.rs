@@ -259,6 +259,26 @@ pub fn private_values(kv: Option<&str>) -> HashMap<String, String> {
     out
 }
 
+/// The ``` blocks the composed text declared, filed under the same private
+/// name as [`private_values`] — and meant to be laid over them: upstream's
+/// `Rules#parse` lifts a text's blocks and merges them *after* the values it
+/// was constructed with (`extend({}, this._orgValues, inlineValues)`,
+/// `_original/lib/rules/rules.js:2033-2059`), so a block beats what
+/// `x-whistle-key-value` carried under the same name.
+///
+/// `mgr` is what [`merge`] returned; [`RuleManager::set_text`] filed its blocks
+/// under its one group's name, which is not the name its operators now answer
+/// to.
+pub fn blocks(mgr: &RuleManager) -> HashMap<String, String> {
+    mgr.inline_values()
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let name = crate::rules::inline_key_name(&key)?;
+            Some((crate::rules::inline_key(name, FILE), value))
+        })
+        .collect()
+}
+
 /// Resolve a composed text against one request and fold it into `resolved`,
 /// with the precedence the mode asks for.
 ///

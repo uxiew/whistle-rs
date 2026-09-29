@@ -4366,17 +4366,20 @@ async fn serve(
                     |name| rules.group_text(name).map(str::to_string),
                 )?;
                 drop(rules);
-                // What the request carried is private to its rules, like a
-                // block, and yields to `--value` like one.
-                values.extend(header_rules::private_values(carried.kv.as_deref()));
-                apply::yield_to_overrides(&mut values, &state.config.value_overrides);
-                Some(header_rules::merge(
+                let mgr = header_rules::merge(
                     &mut resolved,
                     &info,
                     &text,
                     state.config.header_rules,
                     is_internal_req,
-                ))
+                );
+                // What the request carried is private to its rules, like a
+                // block — and so are the text's own blocks, laid over it — and
+                // both yield to `--value` like one.
+                values.extend(header_rules::private_values(carried.kv.as_deref()));
+                values.extend(header_rules::blocks(&mgr));
+                apply::yield_to_overrides(&mut values, &state.config.value_overrides);
+                Some(mgr)
             })
             .flatten();
         let tpl = tpl_ctx(&bind_host, state.config.port, &info);
