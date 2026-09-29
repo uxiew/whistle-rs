@@ -570,6 +570,30 @@ resolver's order, `::1` first on macOS) it reaches the dual-stack origin over
 IPv6 and the bench fails. Where `::1` cannot be bound it prints `skipped` and
 compares nothing — a container with no IPv6 is not a finding.
 
+## What a request costs the network
+
+`perf-bench.js` is a measurement, not a gate: nothing in it passes or fails,
+and `run.js` does not run it. It starts both proxies itself, puts the same
+origins behind them, and reports per scenario how many connections and TLS
+handshakes the origin saw, request latency, throughput, the proxy's peak
+resident memory, and — for a response the client abandons — how long the origin
+connection stays open afterwards.
+
+```sh
+cargo build --release                # it measures target/release, not debug
+node perf-bench.js                   # loopback, about two minutes
+RTT_MS=20 node perf-bench.js         # 20 ms round trip between proxy and origin
+ONLY=h2,cancel-h2 ROUNDS=5 node perf-bench.js --json /tmp/perf.json
+```
+
+On loopback a handshake costs well under a millisecond, so a proxy that opens a
+connection per request looks as fast as one that reuses them. `RTT_MS` puts a
+relay in front of each origin that delays every chunk by half the round trip
+each way, and the first bytes of a new connection by one more round trip (the
+TCP handshake). It does not model loss, bandwidth or slow start, and the
+32 MiB download scenarios are skipped under it. Each figure is the median of
+`ROUNDS` (3) rounds; the proxies alternate who goes first.
+
 ## The mode bench
 
 `mode-bench.js` asks a different shape of question from everything else here:
