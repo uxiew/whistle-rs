@@ -134,6 +134,10 @@ struct Cli {
 
     /// Define a named value as `name=content` (repeatable). Referenced by
     /// `{name}` in operator values and by `rule://name`.
+    ///
+    /// It overrides for this run: it beats a value of the same name saved in
+    /// the console and a ``` block of that name in the rules, where a saved
+    /// value loses to the block.
     #[arg(long = "value", value_name = "NAME=CONTENT")]
     values: Vec<String>,
 
@@ -412,6 +416,7 @@ async fn main() -> Result<()> {
         ui_port: cli.ui_port,
         socks_port: cli.socks_port,
         plugins,
+        value_overrides: values.keys().cloned().collect(),
         values,
         body_preview_cap: cli.body_preview_limit,
         body_rewrite_cap: cli.body_rewrite_limit,
@@ -479,7 +484,9 @@ async fn main() -> Result<()> {
     whistle_rs::rules::storage::load_groups(&rules_dir, &mut manager);
 
     // Values persisted by the console, with anything named on the command line
-    // laid over them: `--value` is an instruction for this run and wins.
+    // laid over them: `--value` is an instruction for this run and wins — over
+    // the store here, and over a rules file's ``` block of the same name
+    // (`config.value_overrides`), which the store alone does not beat.
     let persisted = whistle_rs::rules::storage::load_values(config.data_dir());
     if !persisted.is_empty() {
         let mut merged = persisted;
@@ -717,6 +724,7 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
 
     let query = Query {
         rules,
+        overrides: values.keys().cloned().collect(),
         values,
         url: args.url.clone().unwrap_or_default(),
         method: Some(args.method.clone()),

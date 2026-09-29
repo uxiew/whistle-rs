@@ -11,7 +11,7 @@ use hyper::http::request;
 use hyper::http::response;
 use hyper::{HeaderMap, Response, StatusCode};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -150,21 +150,47 @@ fn render_backticks(op: &crate::rules::RuleOp, tpl: TplCtx<'_>) -> Option<String
 /// reference. The private key is [`crate::rules::inline_key`]; an operator that
 /// belongs to no text of its own reads the shared store alone.
 ///
-/// **The two lookups are in this port's order, not upstream's.** There, an
-/// inline block shadows a stored entry of the same name; here the store is asked
-/// first, because `--value` and the console are run-scoped overrides that have to
-/// beat what a rules file brought with it. That divergence is older than this
-/// function and is recorded at [`crate::proxy::effective_values`] — the private
-/// key does not touch it. What it changes is only which *inline* block an
-/// operator can see: its own.
+/// The operator's own block is asked first and the store second, as upstream
+/// asks: a ``` block shadows a stored entry of the same name. upstream's own
+/// suite holds it to that (`test/units/keys.test.js:91-95,106-113`), for a
+/// block in the Default text, in a named group, and in rules a request carried.
+/// This port used to ask the store first, and served the store's entry for all
+/// three.
+///
+/// `--value` still beats a block: it is an instruction for this run, and the
+/// blocks it names are taken out of the map before anything looks — see
+/// [`yield_to_overrides`].
 pub fn value_for<'a>(
     values: &'a HashMap<String, String>,
     name: &str,
     group: Option<&str>,
 ) -> Option<&'a String> {
-    values
-        .get(name)
-        .or_else(|| values.get(&crate::rules::inline_key(name, group?)))
+    group
+        .and_then(|group| values.get(&crate::rules::inline_key(name, group)))
+        .or_else(|| values.get(name))
+}
+
+/// Take out every private entry — a ``` block, or a value a request carried —
+/// whose name `--value` gave, so that [`value_for`] falls through to the store,
+/// where the override lives.
+///
+/// Only while the store still has the name: an override the console has since
+/// deleted gives the blocks their say back rather than leaving nothing at all.
+pub fn yield_to_overrides(values: &mut HashMap<String, String>, overrides: &HashSet<String>) {
+    if overrides.is_empty() {
+        return;
+    }
+    let shadowed: Vec<String> = values
+        .keys()
+        .filter(|key| {
+            crate::rules::inline_key_name(key)
+                .is_some_and(|name| overrides.contains(name) && values.contains_key(name))
+        })
+        .cloned()
+        .collect();
+    for key in shadowed {
+        values.remove(&key);
+    }
 }
 
 /// Replace operator values of the form `{name}` with the named value's content
@@ -10264,7 +10290,7 @@ mod tests {
     /// reference below answered whatever group happened to be resolved last.
     #[test]
     fn a_fenced_block_answers_only_its_own_group() {
-        let body_of = |mgr: &RuleManager| {
+        let body_with = |mgr: &RuleManager, overrides: &[&str]| {
             let values = {
                 let mut v = mgr.inline_values();
                 // What the console and `--value` hold, laid over the top exactly
@@ -10273,6 +10299,8 @@ mod tests {
                     "stored".to_string(),
                     "FROM-STORE".to_string(),
                 )]));
+                let overrides = overrides.iter().map(|n| n.to_string()).collect();
+                yield_to_overrides(&mut v, &overrides);
                 v
             };
             let info = build_req_info("GET", "http", "a.com", 80, "/", &HeaderMap::new(), None);
@@ -10287,6 +10315,7 @@ mod tests {
             );
             resolved.value("resBody").map(str::to_string)
         };
+        let body_of = |mgr: &RuleManager| body_with(mgr, &[]);
 
         // A block and the reference in the same group: the shape that has to
         // keep working.
@@ -10309,14 +10338,33 @@ mod tests {
         shadowed.add_group("A", "```v\nFROM-A\n```\na.com resBody://{v}\n", true);
         assert_eq!(body_of(&shadowed).as_deref(), Some("FROM-A"));
 
-        // The store is shared by all of them, and still beats a block of the
-        // same name — this port's own layering, unchanged by the private key.
+        // The store is shared by all of them and loses to a block of the same
+        // name, as upstream's does (`test/units/keys.test.js:91-95`)…
         let mut stored = RuleManager::new();
         stored.set_text("```stored\nFROM-BLOCK\n```\na.com resBody://{stored}\n");
-        assert_eq!(body_of(&stored).as_deref(), Some("FROM-STORE"));
+        assert_eq!(body_of(&stored).as_deref(), Some("FROM-BLOCK"));
+        // …unless `--value` gave the name, which beats the block…
+        assert_eq!(
+            body_with(&stored, &["stored"]).as_deref(),
+            Some("FROM-STORE")
+        );
+        // …and a group with no block of its own reads the store either way.
         let mut other = RuleManager::new();
         other.add_group("A", "a.com resBody://{stored}\n", true);
         assert_eq!(body_of(&other).as_deref(), Some("FROM-STORE"));
+    }
+
+    /// An override the console has since deleted gives the blocks back: the
+    /// name alone is no reason to answer nothing.
+    #[test]
+    fn a_deleted_override_does_not_hide_the_block() {
+        let key = crate::rules::inline_key("v", "default");
+        let mut values = HashMap::from([(key.clone(), "FROM-BLOCK".to_string())]);
+        yield_to_overrides(&mut values, &HashSet::from(["v".to_string()]));
+        assert_eq!(
+            value_for(&values, "v", Some("default")).map(String::as_str),
+            Some("FROM-BLOCK")
+        );
     }
 
     /// Resolve `text` against a GET of `http://a.com/p?q=1`, substitute

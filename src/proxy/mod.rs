@@ -3602,20 +3602,17 @@ fn restore_content_encoding(
 /// remove an inline block. The cost is one map build over a handful of entries;
 /// a rules file with no ``` in it contributes an empty map without allocating.
 ///
-/// **The layering is upside down relative to upstream, on purpose.**
-/// `getValueFor` asks the inline map first and only falls back to the store
-/// (`_original/lib/rules/rules.js:785-796`), so there a ``` block shadows a
-/// stored entry of the same name. Here `--value` is a run-scoped override that
-/// has to beat what a rules file brought — see `main.rs`. Recorded rather than
-/// aligned, and exercised in `tests/differential/cases-values.js`. The private
-/// key does not touch that order: it decides *which* block an operator may see,
-/// not whether a block beats the store.
+/// Which one answers is [`apply::value_for`]'s to say: the operator's own block,
+/// then the store — upstream's order — except for a name `--value` gave, whose
+/// blocks are left out of the map here so the store's entry is the only one
+/// ([`apply::yield_to_overrides`]).
 fn effective_values(state: &AppState) -> std::collections::HashMap<String, String> {
     let mut values = state.rules.read().unwrap().inline_values();
     if values.is_empty() {
         return state.values.read().unwrap().clone();
     }
     values.extend(state.values.read().unwrap().clone());
+    apply::yield_to_overrides(&mut values, &state.config.value_overrides);
     values
 }
 
@@ -4349,9 +4346,8 @@ async fn serve(
     // response phase resolves them a second time, exactly as it does the
     // top-level rules (`apply::merge_response_phase_of`).
     let mut merged_rules: Vec<crate::rules::RuleManager> = {
-        // A ``` block in a rules file declares a value that travels with it.
-        // Configured values are laid *over* those, so a `--value` or a
-        // console-edited one of the same name wins over what a file brought.
+        // A ``` block in a rules file declares a value that travels with it,
+        // and it beats the console's store — but not a `--value`.
         let mut values = effective_values(&state);
         // The rules this request brought in its own headers, if the mode reads
         // them at all. Composed and merged **before** anything is substituted,
@@ -4370,7 +4366,10 @@ async fn serve(
                     |name| rules.group_text(name).map(str::to_string),
                 )?;
                 drop(rules);
+                // What the request carried is private to its rules, like a
+                // block, and yields to `--value` like one.
                 values.extend(header_rules::private_values(carried.kv.as_deref()));
+                apply::yield_to_overrides(&mut values, &state.config.value_overrides);
                 Some(header_rules::merge(
                     &mut resolved,
                     &info,

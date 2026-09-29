@@ -2,7 +2,7 @@
 //! the Rust core currently honours). Values mirror whistle's defaults so the CLI
 //! behaves the same way from the user's point of view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -135,6 +135,10 @@ pub struct Config {
     /// Named values (whistle's Values store): name → content. Referenced by
     /// `{name}` in operator values and by `rule://name`.
     pub values: HashMap<String, String>,
+    /// The names `--value` gave. Those beat a ``` block of the same name, where
+    /// the rest of the store loses to one — see
+    /// [`crate::proxy::apply::yield_to_overrides`].
+    pub value_overrides: HashSet<String>,
     /// Max bytes of each captured body kept for the inspection preview.
     pub body_preview_cap: usize,
     /// Max bytes of a **response** body this proxy will hold in memory in order
@@ -223,6 +227,7 @@ impl Default for Config {
             socks_port: None,
             plugins: HashMap::new(),
             values: HashMap::new(),
+            value_overrides: HashSet::new(),
             body_preview_cap: DEFAULT_BODY_PREVIEW_CAP,
             body_rewrite_cap: DEFAULT_BODY_REWRITE_CAP,
             persist_sessions: true,

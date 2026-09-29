@@ -397,6 +397,6 @@ example.com/api   file://{mock.json}
   唯一的例外是规则行整值加了反引号：那时候条目内容**会**被渲染一遍，捕获组也会
   按 `${RegExp.$1}` 这个写法代入 —— 见 [`RULES.md` 的反引号模板](RULES.md#backtick-templates)。
 
-> **围栏值与 values 存储同名时**，上游用围栏块（`getValueFor` 先查内嵌表，
-> `rules.js:785-796`），whistle-rs 用存储里的那个 —— 好让 `--value` 与控制台的
-> 编辑能盖住规则文件带来的值。这是一处**刻意偏离**。
+> **围栏值与 values 存储同名时，用围栏块**，与上游一致（`getValueFor` 先查内嵌表，
+> `rules.js:785-796`）；控制台里编辑的值就是存储。唯一能盖住围栏块的是命令行的
+> `--value`：它是这一次运行的指令。详见 [`RULES.md`](RULES.md#values-declared-in-the-rules-text)。

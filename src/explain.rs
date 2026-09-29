@@ -30,7 +30,7 @@
 //! what `tests/differential/rules-oracle.js` does with whistle's own parser on
 //! the other side.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,11 +47,15 @@ pub struct Query {
     pub rules: String,
     /// The values store — what `{name}` refers to.
     ///
-    /// ``` blocks inside `rules` are read too, and they lose to this map for
-    /// the same reason `--value` beats a block at runtime (see
-    /// `effective_values`).
+    /// ``` blocks inside `rules` are read too, and a block beats a stored entry
+    /// of the same name, as it does in the proxy.
     #[serde(default)]
     pub values: HashMap<String, String>,
+    /// Names in `values` that beat a block all the same: the ones `--value`
+    /// gave, which are an instruction for the run (see
+    /// [`crate::proxy::apply::yield_to_overrides`]).
+    #[serde(default)]
+    pub overrides: HashSet<String>,
     /// The request URL, with scheme. A bare `host/path` is read as `http://`.
     pub url: String,
     /// The request method; `GET` when absent.
@@ -195,6 +199,7 @@ pub fn explain(query: &Query) -> Result<Explanation, String> {
 
     let mut values = manager.inline_values();
     values.extend(query.values.clone());
+    apply::yield_to_overrides(&mut values, &query.overrides);
     apply::substitute_values(
         &mut resolved,
         &values,
@@ -401,6 +406,24 @@ mod tests {
             "http://example.com/",
         );
         assert_eq!(e.ops[0].value, "hi");
+    }
+
+    /// A block beats the store's entry of the same name, as upstream's
+    /// `getValueFor` has it; a name `--value` gave beats the block.
+    #[test]
+    fn a_block_beats_the_store_and_an_override_beats_the_block() {
+        let query = |overrides: &[&str]| Query {
+            rules: "example.com resBody://{mock}\n```mock\nFROM-BLOCK\n```".into(),
+            values: HashMap::from([("mock".to_string(), "FROM-STORE".to_string())]),
+            overrides: overrides.iter().map(|n| n.to_string()).collect(),
+            url: "http://example.com/".into(),
+            ..Default::default()
+        };
+        assert_eq!(explain(&query(&[])).unwrap().ops[0].value, "FROM-BLOCK");
+        assert_eq!(
+            explain(&query(&["mock"])).unwrap().ops[0].value,
+            "FROM-STORE"
+        );
     }
 
     #[test]

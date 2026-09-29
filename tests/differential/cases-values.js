@@ -68,12 +68,13 @@
 // that this file notices if the feature regresses, not enough to be the place
 // it is tested.
 //
-// One divergence in this area cannot be written as a case at all, because
-// `harness.js` sets rules and not values: when a ``` block and a **values-store**
-// entry carry the same name, upstream uses the block (`getValueFor` asks the
-// inline map first) and whistle-rs uses the store, so that `--value` can override
-// what a rules file brought. Measured through each proxy's own values API; see
-// `effective_values` in `src/proxy/mod.rs`.
+// When a ``` block and a **values-store** entry carry the same name, both
+// proxies use the block (`getValueFor` asks the inline map first). This corpus
+// cannot write that as a case — `harness.js` sets rules and not values — and
+// does not need to: upstream's own suite asks it three ways
+// (`test/units/keys.test.js`, run by `upstream-suite.js`), and it caught this
+// port asking the store first. Only `--value` beats a block here, which
+// upstream has no flag for; see `yield_to_overrides` in `src/proxy/apply.rs`.
 
 const fs = require('fs');
 const path = require('path');

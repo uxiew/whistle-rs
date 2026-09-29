@@ -2256,8 +2256,11 @@ async fn explain_rules(state: &Arc<AppState>, req: Request<Incoming>) -> Respons
         Ok(v) => v,
         Err(e) => return refused(&format!("invalid JSON: {e}")),
     };
+    // Asked without values of its own, the tester answers from the proxy's —
+    // and with the proxy's overrides, or it would disagree with the traffic.
     if query.values.is_empty() {
         query.values = state.values.read().unwrap().clone();
+        query.overrides = state.config.value_overrides.clone();
     }
     match crate::explain::explain(&query) {
         Ok(answer) => {

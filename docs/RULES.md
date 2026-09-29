@@ -760,12 +760,13 @@ live in a different one. So a block three lines above a `reqRules://` does not
 reach what that line produces. The *name* on the line itself is read where it was
 written, so `rule://more` beside a ```` ```more ```` block still finds it.
 
-> **One divergence.** When a fenced block and a values store entry carry the same
-> name, upstream uses the block — `getValueFor` asks the inline map first and
-> falls back to the store. whistle-rs asks the store first, so that a `--value`
-> given on the command line, or an edit in the console, overrides what a rules
-> file brought with it. That is about *which of the two* wins, not about which
-> block is visible; the group scoping above is upstream's either way.
+**A block beats a values store entry of the same name**, as it does upstream —
+`getValueFor` asks the inline map first and falls back to the store. Values set
+in the console are the store. The one thing that beats a block is `--value` on
+the command line: it is an instruction for this run, so
+`whistle-rs -r team.rules --value mock=local` serves `local` even where
+`team.rules` declares its own ```` ```mock ````. (Until 2026-09 the store beat
+every block; upstream's own test suite caught it — `test/units/keys.test.js`.)
 
 ### Destination
 

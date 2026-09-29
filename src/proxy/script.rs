@@ -263,24 +263,30 @@ pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String>
     let mut globals = globals;
     // `getValue` reads them by name. An inline block's key carries the group it
     // was declared in (`crate::rules::inline_key`), and a script asks by the
-    // plain name, so the mangled half is offered under both spellings — the
-    // plain one only where the store has no entry of its own for it, which is
-    // the precedence `value_for` uses everywhere else.
+    // plain name, so a block is offered under its plain name — over the
+    // store's entry, as upstream's `getValue` asks `req._inlineValues` first
+    // (`_original/lib/rules/index.js:399-402`) and as `value_for` does
+    // everywhere else. A block `--value` overrides is already gone from the map.
     let mut store = serde_json::Map::new();
     for (name, content) in input.values {
-        if !name.contains('\n') {
+        if crate::rules::inline_key_name(name).is_none() {
             store.insert(name.clone(), serde_json::Value::String(content.clone()));
         }
     }
-    for (name, content) in input.values {
-        if let Some((plain, _group)) = name.split_once("\n\r")
-            && !store.contains_key(plain)
-        {
-            store.insert(
-                plain.to_string(),
-                serde_json::Value::String(content.clone()),
-            );
-        }
+    // Sorted, so that two groups declaring the same name settle it the same
+    // way every time rather than by hash order.
+    let mut blocks: Vec<(&str, &String)> = input
+        .values
+        .iter()
+        .filter_map(|(key, content)| Some((crate::rules::inline_key_name(key)?, content)))
+        .collect();
+    blocks.sort();
+    blocks.dedup_by_key(|(name, _)| *name);
+    for (plain, content) in blocks {
+        store.insert(
+            plain.to_string(),
+            serde_json::Value::String(content.clone()),
+        );
     }
     globals["__values"] = serde_json::Value::Object(store);
     globals["__localIp"] =

@@ -291,6 +291,12 @@ pub fn inline_key(name: &str, group: &str) -> String {
     format!("{name}\n\r{group}")
 }
 
+/// The plain name inside a private key made by [`inline_key`]; `None` for a
+/// plain key.
+pub fn inline_key_name(key: &str) -> Option<&str> {
+    key.split_once("\n\r").map(|(name, _)| name)
+}
+
 /// The resolution-order key of the rule at `index`: important lines sort before
 /// normal ones, source order within each group. Both passes derive it from the
 /// same rule list, so a key means the same thing in either.
@@ -1119,8 +1125,8 @@ pub struct RuleGroup {
     pub enabled: bool,
     /// Parsed rules from `text`.
     rules: Vec<Rule>,
-    /// Values this group's own text declared in a ``` fenced block. Merged
-    /// under the configured values, so a `--value` of the same name wins.
+    /// Values this group's own text declared in a ``` fenced block. They beat
+    /// the store's entry of the same name, and lose to a `--value`.
     inline_values: HashMap<String, String>,
     /// Indices into `rules` of the lines that carry response-phase operators
     /// behind a filter that asks about the response.
