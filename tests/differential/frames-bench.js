@@ -55,6 +55,11 @@ const BODIES = {
   '/chunked': ['application/json', ['{"a":1}\n', '{"b":2}\n', '{"c":3}\n']],
   // An event stream: framed by content type alone, with no flag and no header.
   '/sse': ['text/event-stream', ['data: one\n\n', 'data: two\n\n', 'data: three\n\n']],
+  // The same stream with a parameter on its type, as many servers send it.
+  // Upstream compared the header whole until 2.10.9 ("support
+  // text/event-stream responses with a charset=utf-8 parameter"), and so did
+  // not frame this one; `trimType` compares the type alone since.
+  '/sse-charset': ['text/event-stream; charset=utf-8', ['data: one\n\n', 'data: two\n\n', 'data: three\n\n']],
   // The same three objects with nothing to split on.
   '/nosep': ['application/json', ['{"a":1}', '{"b":2}', '{"c":3}']],
 };
@@ -160,6 +165,7 @@ const SEP = 'x-whistle-custom-frame-separator';
 const CASES = [
   // ── the event stream, which needs no flag and no header ────────────────
   { name: 'an event stream is framed by its content type', rules: '', path: '/sse' },
+  { name: 'an event stream with a charset parameter', rules: '', path: '/sse-charset' },
   { name: 'an event stream under enable://captureStream',
     rules: `${P} enable://captureStream`, path: '/sse' },
   { name: 'an event stream under disable://captureStream',
