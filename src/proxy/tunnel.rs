@@ -108,7 +108,7 @@ pub(super) async fn handle_connect(
     req: Request<Incoming>,
     peer: SocketAddr,
 ) -> Result<Response<DynBody>, Destroyed> {
-    let Some((host, port)) = authority_host_port(req.uri()) else {
+    let Some((host, port)) = connect_target(&req) else {
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(body::full(Bytes::from_static(b"bad CONNECT target")))
@@ -140,6 +140,25 @@ pub(super) async fn handle_connect(
     });
 
     Ok(connect_established())
+}
+
+/// Where a CONNECT asks to go: its request target, which is `host:port` from
+/// every client that follows RFC 9110 — or, when that names nothing, its `Host`
+/// header. Upstream reads the header in that case (`isTunnelHost(req.url) ?
+/// req.url : headers.host`, `_original/lib/tunnel.js:54-57`), and its own test
+/// helper sends exactly that, `CONNECT /` with the target in `Host`
+/// (`test/util.test.js:176-188`); this port answered it `400`. No port means
+/// 443, as there (`tunnel.js:65`).
+fn connect_target(req: &Request<Incoming>) -> Option<(String, u16)> {
+    if let Some(target) = authority_host_port(req.uri()) {
+        return Some(target);
+    }
+    let host = req.headers().get(hyper::header::HOST)?.to_str().ok()?;
+    let authority: hyper::http::uri::Authority = host.parse().ok()?;
+    Some((
+        authority.host().to_string(),
+        authority.port_u16().unwrap_or(443),
+    ))
 }
 
 fn connect_established() -> Response<DynBody> {
@@ -984,6 +1003,44 @@ pub(crate) mod tunnel_abort_tests {
             .await
             .expect("a CONNECT reply");
         assert_eq!(&head, b"HTTP/1.1 200");
+    }
+
+    /// `CONNECT /` with the target in `Host` — what upstream's own test helper
+    /// sends — goes where `Host` says, rules included; with neither there is
+    /// nowhere to go.
+    #[tokio::test]
+    async fn a_connect_that_names_its_target_only_in_host_goes_there() {
+        let (state, addr) = proxy_with("blocked.test enable://abort").await;
+        let answer = |request: &'static [u8]| async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client.write_all(request).await.unwrap();
+            let mut head = [0u8; 12];
+            match client.read_exact(&mut head).await {
+                Ok(_) => String::from_utf8_lossy(&head).to_string(),
+                Err(_) => "(silence)".to_string(),
+            }
+        };
+
+        assert_eq!(
+            answer(b"CONNECT / HTTP/1.1\r\nHost: allowed.test\r\n\r\n").await,
+            "HTTP/1.1 200"
+        );
+        assert_eq!(
+            answer(b"CONNECT / HTTP/1.1\r\nHost: blocked.test\r\n\r\n").await,
+            "(silence)",
+            "the rule for the name in Host refused it"
+        );
+        let refused = state
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .url
+            .clone();
+        assert_eq!(refused, "https://blocked.test/", "and 443 was assumed");
+        assert_eq!(answer(b"CONNECT / HTTP/1.1\r\n\r\n").await, "HTTP/1.1 400");
     }
 
     /// With interception off, every tunnel is answered only once its far end
