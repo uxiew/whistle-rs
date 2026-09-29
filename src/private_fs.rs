@@ -35,16 +35,49 @@ pub fn create_dir(dir: &Path) -> io::Result<()> {
 
 /// Replace `path`'s contents; the file is `0600` afterwards, even if it existed
 /// with a wider mode.
+///
+/// The bytes go to a new file beside it, which is then renamed over it, so a
+/// process killed mid-write leaves the old contents or the new, never part of
+/// the new. Truncating in place, as this did, could leave half a `groups.json`,
+/// which reads as no rule groups at all; the console's next save then wrote
+/// that emptiness over the half that was left.
 pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path)?;
-    // `mode` applies only when the file is created; an old one keeps its bits.
-    #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(bytes)
+    // Through a symlink to the file it names: renaming over the link would
+    // replace the link itself with a plain file.
+    let path = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let tmp = beside(&path);
+    let written = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        // On disk before the name moves, or a power cut can leave the new
+        // name on an empty file.
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// A name next to `path` no other write is using: this process's id and a
+/// counter, since two saves of the same file can run at once.
+fn beside(path: &Path) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()))
 }
 
 /// Open `path` for appending, creating it `0600`.
@@ -121,6 +154,34 @@ mod tests {
         fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).expect("chmod");
         open_append(&log).expect("append");
         assert_eq!(mode(&log), 0o600);
+    }
+
+    /// The new contents arrive whole and nothing is left beside them; through
+    /// a symlink, the file it names is replaced and the link stays a link.
+    #[test]
+    fn a_write_replaces_the_file_and_leaves_nothing_behind() {
+        let dir = scratch("replace");
+        fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("groups.json");
+        write(&file, b"old").expect("first");
+        write(&file, b"new contents").expect("second");
+        assert_eq!(fs::read(&file).expect("read"), b"new contents");
+        let names: Vec<_> = fs::read_dir(&dir)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["groups.json"], "no temporary file left");
+
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink");
+        write(&link, b"via the link").expect("through the link");
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&file).expect("read"), b"via the link");
     }
 
     /// A directory the operator already had is theirs; ours are tightened.
