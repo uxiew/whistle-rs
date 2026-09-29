@@ -16,6 +16,7 @@ pub mod forwarded;
 pub mod header_rules;
 pub mod outcome;
 pub mod persist;
+pub mod pool;
 pub mod restream;
 pub mod script;
 pub mod search;
@@ -2372,8 +2373,12 @@ pub async fn accept_loop(
         let state = state.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let service = service_fn(move |req| {
+            // Origin connections this client may reuse — its own, and only
+            // for as long as it stays connected. See `pool`.
+            let pool = pool::ConnPool::new();
+            let service = service_fn(move |mut req: Request<Incoming>| {
                 let state = state.clone();
+                req.extensions_mut().insert(pool.clone());
                 async move { top_level(state, req, peer).await }
             });
             if let Err(err) = hyper::server::conn::http1::Builder::new()
@@ -3505,7 +3510,10 @@ async fn serve_intercepted_h2<I>(
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| {
+    // Every stream on this connection shares one pool; see `pool`.
+    let pool = pool::ConnPool::new();
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut().insert(pool.clone());
         let state = state.clone();
         let origin = Origin::Mitm {
             host: host.clone(),
@@ -3536,7 +3544,10 @@ async fn serve_intercepted<I>(
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let service = service_fn(move |req| {
+    // One pool for the tunnel: a tunnel is one client connection. See `pool`.
+    let pool = pool::ConnPool::new();
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut().insert(pool.clone());
         let state = state.clone();
         let origin = Origin::Mitm {
             host: host.clone(),

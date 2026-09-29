@@ -46,7 +46,7 @@ use super::timing::Timings;
 use super::body::DynBody;
 
 /// Which kind of upstream proxy to route through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProxyKind {
     /// Plain HTTP proxy (absolute-form for http, CONNECT for https).
     Http,
@@ -93,7 +93,7 @@ impl ProxyAuth {
 /// the proxy URL's own `?host=` query (`P_HOST_RE`,
 /// `_original/lib/rules/index.js:81,:243`). The `host://` rule wins when both
 /// are present, because whistle only reads the query `if (!req._phost)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HostOverride {
     pub host: String,
     /// Absent when the override named no port: the request's own port is then
@@ -1005,6 +1005,19 @@ async fn forward_once(
         );
     }
     let hop = Hop::from_request(&req).with_target(target);
+    let pool = pool_for(&req).map(|pool| (pool, pool_key(target, &hop)));
+    let last_on_its_connection = asks_to_close(&req);
+
+    // A connection this client already had open to the same place, if there is
+    // one. A reused connection has no `dns`, `connect` or `ssl` phase — HAR's
+    // spelling of reuse — and its session shows only `wait` onward.
+    if let Some((pool, key)) = &pool {
+        match reuse(pool, key, target, &hop, req, timings).await {
+            Reuse::Answered(out) => return Ok(out),
+            Reuse::Failed(err) => return Err(RetryableError::Sent(err)),
+            Reuse::NotSent(back) => req = back,
+        }
+    }
 
     // Connect before touching the request. Nothing is sent yet, so a hop that
     // cannot be established hands `req` back untouched — which is what lets an
@@ -1019,46 +1032,244 @@ async fn forward_once(
             })));
         }
     };
-
-    // A plain HTTP proxy fetching an http origin uses absolute-form + Proxy-Auth.
-    if uses_absolute_form(target) {
-        let path = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_else(|| "/".to_string());
-        // whistle names the *requested* host in the absolute URI, taken from the
-        // `Host` header so a header rule that rewrote it is honoured
-        // (`options.path = 'http://' + (headers.host || options.host) + path`,
-        // `_original/lib/inspectors/res.js:606-612`). Using the connect address
-        // instead would hand a `host://` override to the upstream proxy.
-        let authority = req
-            .headers()
-            .get(hyper::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .filter(|h| !h.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| join_host_port(&target.connect_host, target.connect_port, 80));
-        let abs = format!("http://{authority}{path}");
-        *req.uri_mut() = abs.parse::<Uri>().unwrap_or_else(|_| req.uri().clone());
-        if let Some(proxy) = &target.proxy
-            && let Some(auth) = hop.proxy_auth(proxy)
-            && let Ok(v) = hyper::header::HeaderValue::from_str(&auth)
-        {
-            req.headers_mut()
-                .insert(hyper::header::PROXY_AUTHORIZATION, v);
-        }
-    }
+    for_the_wire(&mut req, target, &hop);
+    let number = next_connection();
+    timings.connection(number, false);
 
     // `wait` from here: hyper writes the request and resolves on the response
     // head, with no observation point in between — so this is `send` + `wait`
     // and is reported as `wait` alone. See `timing`.
     let waiting = Instant::now();
-    let resp = send(TokioIo::new(stream), req)
+    let (resp, sender) = send(TokioIo::new(stream), req)
         .await
         .map_err(RetryableError::Sent)?;
     timings.wait(waiting);
+    if let Some((pool, key)) = pool
+        && !last_on_its_connection
+    {
+        pool.park_when_ready(
+            key,
+            super::pool::Conn {
+                sender,
+                peer,
+                number,
+            },
+        );
+    }
     Ok((resp, peer))
+}
+
+/// Origin connections this process has opened, for numbering them — see
+/// [`Timings::connection`].
+static CONNECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_connection() -> u64 {
+    CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Did this request tell the origin it is the last on its connection?
+///
+/// hyper keeps a connection for another request unless the *response* says
+/// otherwise; what our own request said is not its concern. An origin that
+/// honours `Connection: close` — which is what `disable://keepAlive` sends —
+/// closes the connection after answering, often without saying so in the
+/// response, and a pooled connection it is closing is a request lost. HTTP/1.0
+/// without `keep-alive` means the same thing (RFC 9112 §9.3).
+fn asks_to_close(req: &Request<DynBody>) -> bool {
+    let tokens = || {
+        req.headers()
+            .get_all(hyper::header::CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+    };
+    tokens().any(|t| t.eq_ignore_ascii_case("close"))
+        || (req.version() == hyper::Version::HTTP_10
+            && !tokens().any(|t| t.eq_ignore_ascii_case("keep-alive")))
+}
+
+/// Rewrite `req` for the hop it is about to take: a plain HTTP proxy fetching
+/// an http origin gets absolute-form and the hop's `Proxy-Authorization`;
+/// every other hop gets the request as it is.
+///
+/// Done at the last moment, on the copy that is sent — a request handed back
+/// for another attempt must not carry a proxy's credentials to wherever the
+/// next attempt goes.
+fn for_the_wire(req: &mut Request<DynBody>, target: &Target, hop: &Hop) {
+    if !uses_absolute_form(target) {
+        return;
+    }
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    // whistle names the *requested* host in the absolute URI, taken from the
+    // `Host` header so a header rule that rewrote it is honoured
+    // (`options.path = 'http://' + (headers.host || options.host) + path`,
+    // `_original/lib/inspectors/res.js:606-612`). Using the connect address
+    // instead would hand a `host://` override to the upstream proxy.
+    let authority = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| join_host_port(&target.connect_host, target.connect_port, 80));
+    let abs = format!("http://{authority}{path}");
+    *req.uri_mut() = abs.parse::<Uri>().unwrap_or_else(|_| req.uri().clone());
+    if let Some(proxy) = &target.proxy
+        && let Some(auth) = hop.proxy_auth(proxy)
+        && let Ok(v) = hyper::header::HeaderValue::from_str(&auth)
+    {
+        req.headers_mut()
+            .insert(hyper::header::PROXY_AUTHORIZATION, v);
+    }
+}
+
+/// The client connection's pool, when this request may use it.
+///
+/// An upgrade takes its connection with it — it becomes the WebSocket, or
+/// whatever else was asked for — so it neither borrows a pooled one nor leaves
+/// one behind. A request with no pool (Composer, a plugin's own fetch, a
+/// relayed tunnel) connects afresh as it always did.
+fn pool_for(req: &Request<DynBody>) -> Option<super::pool::ConnPool> {
+    if req.method() == hyper::Method::CONNECT || super::asks_to_upgrade(req.headers()) {
+        return None;
+    }
+    req.extensions().get::<super::pool::ConnPool>().cloned()
+}
+
+/// What this request's connection is made of — see [`super::pool::Key`].
+fn pool_key(target: &Target, hop: &Hop) -> super::pool::Key {
+    use super::pool::{Key, ProxyRoute, TlsPolicy};
+    let (host, port) = target.hop_addr();
+    Key {
+        addr: (host.to_string(), port),
+        requested: (target.sni.clone(), target.request_port),
+        tls: target.tls.then(|| TlsPolicy {
+            versions: target.tls_versions,
+            ciphers: target.tls_ciphers.as_deref().cloned(),
+        }),
+        tls_stripped: target.origin_tls_stripped,
+        proxy: target.proxy.as_ref().map(|p| ProxyRoute {
+            kind: p.kind,
+            host: p.host.clone(),
+            port: p.port,
+            host_override: p.host_override.clone(),
+            tunnel: p.tunnel,
+            auth: hop.proxy_auth(p),
+            user_agent: (!hop.no_proxy_ua).then(|| hop.user_agent.clone()).flatten(),
+            connection_close: hop.proxy_connection_close,
+        }),
+    }
+}
+
+/// What became of a request offered to the pool.
+enum Reuse {
+    /// A pooled connection carried it.
+    Answered((Response<Incoming>, Option<SocketAddr>)),
+    /// It went out on a pooled connection that failed, and it cannot be sent
+    /// again.
+    Failed(anyhow::Error),
+    /// No pooled connection carried it, and it is ready for a fresh one: none
+    /// was idle, or the idle ones had closed before it was written, or it can
+    /// be sent again from scratch — see [`replayable`].
+    NotSent(Request<DynBody>),
+}
+
+/// Send `req` on an idle connection from `pool`, if one takes it. A request
+/// that closes its connection — see [`asks_to_close`] — may use one but does
+/// not put it back.
+async fn reuse(
+    pool: &super::pool::ConnPool,
+    key: &super::pool::Key,
+    target: &Target,
+    hop: &Hop,
+    mut req: Request<DynBody>,
+    timings: &Timings,
+) -> Reuse {
+    use super::pool::{FRESH_ENOUGH, IDLE_LIMIT};
+    let last = asks_to_close(&req);
+    let replayable = replayable(&req);
+    let max_idle = if replayable { IDLE_LIMIT } else { FRESH_ENOUGH };
+    while let Some(mut conn) = pool.take(key, max_idle) {
+        // The head is kept so the request can be handed back as it was, not
+        // as it was rewritten for this hop.
+        let (head, body) = req.into_parts();
+        let mut wire = Request::from_parts(head.clone(), body);
+        for_the_wire(&mut wire, target, hop);
+        let waiting = Instant::now();
+        match conn.sender.try_send_request(wire).await {
+            Ok(resp) => {
+                timings.wait(waiting);
+                timings.connection(conn.number, true);
+                let peer = conn.peer;
+                if !last {
+                    pool.park_when_ready(key.clone(), conn);
+                }
+                return Reuse::Answered((resp, peer));
+            }
+            Err(mut failed) => {
+                // Never written: the connection had closed before hyper got to
+                // it. The request is whole; try the next one.
+                if let Some(back) = failed.take_message() {
+                    req = Request::from_parts(head, back.into_body());
+                    continue;
+                }
+                let err = failed.into_error();
+                // Written, and the origin had already hung up — the race every
+                // keep-alive client has with a server's idle timer. A request
+                // with nothing to lose by being sent twice goes again.
+                if replayable && closed_under_us(&err) {
+                    tracing::debug!(
+                        "reused connection to {}:{} had closed ({err}); sending on a fresh one",
+                        target.connect_host,
+                        target.connect_port
+                    );
+                    return Reuse::NotSent(Request::from_parts(head, super::body::empty()));
+                }
+                return Reuse::Failed(send_failure(err));
+            }
+        }
+    }
+    Reuse::NotSent(req)
+}
+
+/// Can this request be sent a second time if a reused connection turns out to
+/// have been closed under it?
+///
+/// Only when repeating it means the same as sending it once — an idempotent
+/// method (RFC 9110 §9.2.2), which is also the rule for retrying it
+/// automatically — and when it has no body. A body is streamed from the client
+/// as it goes out, so once a send has started there is nothing left to send
+/// again.
+fn replayable(req: &Request<DynBody>) -> bool {
+    use hyper::Method;
+    matches!(
+        *req.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE | Method::PUT | Method::DELETE
+    ) && hyper::body::Body::is_end_stream(req.body())
+}
+
+/// Did a send fail because the connection was already closing — rather than
+/// because of anything the origin said?
+fn closed_under_us(err: &hyper::Error) -> bool {
+    if err.is_incomplete_message() || err.is_canceled() || err.is_closed() {
+        return true;
+    }
+    std::error::Error::source(err)
+        .and_then(|e| e.downcast_ref::<std::io::Error>())
+        .is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
 }
 
 /// Render `host:port` for a URL authority, omitting the default port and
@@ -1325,8 +1536,18 @@ async fn origin_stream(
     }
 }
 
-/// Drive one HTTP/1.1 request/response over an established connection.
-async fn send<I>(io: I, req: Request<DynBody>) -> Result<Response<Incoming>>
+/// Drive one HTTP/1.1 request/response over a fresh connection, returning the
+/// connection's sender with the response so it can be kept for another.
+///
+/// Dropping the sender is what closes the connection once the response is
+/// done, as it always did for a request that has no pool.
+async fn send<I>(
+    io: I,
+    req: Request<DynBody>,
+) -> Result<(
+    Response<Incoming>,
+    hyper::client::conn::http1::SendRequest<DynBody>,
+)>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -1341,19 +1562,22 @@ where
             tracing::debug!("upstream connection error: {err}");
         }
     });
-    let resp = sender.send_request(req).await.map_err(|err| {
-        // hyper reports a request body that failed while it was being written
-        // as a *user* error: the client's upload broke, not the server.
-        let phase = match err.is_user() {
-            true => Phase::Request,
-            false => Phase::Response,
-        };
-        stopped(
-            phase,
-            anyhow::Error::new(err).context("sending upstream request"),
-        )
-    })?;
-    Ok(resp)
+    let resp = sender.send_request(req).await.map_err(send_failure)?;
+    Ok((resp, sender))
+}
+
+/// A failed send, tagged with whose side failed.
+fn send_failure(err: hyper::Error) -> anyhow::Error {
+    // hyper reports a request body that failed while it was being written
+    // as a *user* error: the client's upload broke, not the server.
+    let phase = match err.is_user() {
+        true => Phase::Request,
+        false => Phase::Response,
+    };
+    stopped(
+        phase,
+        anyhow::Error::new(err).context("sending upstream request"),
+    )
 }
 
 /// The header a `proxyTunnel` hop sends on its **inner** CONNECT, asking the
@@ -2902,3 +3126,7 @@ mod dns_order_tests {
         drop((v4, v6));
     }
 }
+
+#[cfg(test)]
+#[path = "pool_tests.rs"]
+mod pool_tests;

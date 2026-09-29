@@ -985,7 +985,7 @@ fn har_entry(s: &Session) -> serde_json::Value {
         "encoding": encoding(res.base64),
     });
     har_mark_short(&mut content, &res);
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "startedDateTime": super::iso8601_utc(s.time_ms),
         "time": s.duration_ms,
         "request": {
@@ -1028,7 +1028,13 @@ fn har_entry(s: &Session) -> serde_json::Value {
         // string (`net::ERR_CONNECTION_REFUSED`), and HAR viewers that show it
         // expect a string; the phase leads so it reads the same way.
         "_error": s.error.get().map(|f| format!("{}: {}", f.phase, f.message)),
-    })
+    });
+    // HAR's own field for which requests shared a connection: a string, and
+    // left out rather than null where there is none (§4.1, `entries`).
+    if let Some(n) = s.timings.as_ref().and_then(|t| t.connection_id()) {
+        entry["connection"] = n.to_string().into();
+    }
+    entry
 }
 
 /// Export captured traffic as a HAR 1.2 file (importable into DevTools etc.).
@@ -2912,6 +2918,18 @@ mod body_tests {
             har_entry(&s)["_error"],
             "connect: connecting to example.com:80: Connection refused"
         );
+    }
+
+    /// Requests that shared an origin connection say so in HAR's own field,
+    /// and a request that reached none leaves the field out rather than null.
+    #[test]
+    fn the_origin_connection_is_exported_as_har_connection() {
+        let mut s = session("https://example.com/", 1);
+        assert!(har_entry(&s).get("connection").is_none());
+        let t = crate::proxy::timing::Timings::new();
+        t.connection(42, true);
+        s.timings = Some(t);
+        assert_eq!(har_entry(&s)["connection"], "42");
     }
 }
 

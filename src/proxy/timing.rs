@@ -61,6 +61,8 @@ impl std::fmt::Debug for Timings {
             .field("ssl", &p.ssl)
             .field("wait", &p.wait)
             .field("receive", &p.receive)
+            .field("connection", &p.connection)
+            .field("reused", &p.reused)
             .finish()
     }
 }
@@ -73,6 +75,9 @@ struct Phases {
     ssl: Option<Ms>,
     wait: Option<Ms>,
     receive: Option<Ms>,
+    /// Which origin connection carried the request — see [`Timings::connection`].
+    connection: Option<u64>,
+    reused: bool,
 }
 
 impl Timings {
@@ -114,6 +119,25 @@ impl Timings {
     pub fn receive(&self, at: Instant) {
         let ms = elapsed_ms(at);
         self.set(|p| p.receive = Some(ms));
+    }
+
+    /// The request went out on origin connection `id`: one opened for it, or —
+    /// `reused` — one an earlier request from the same client left open.
+    ///
+    /// A reused connection has no `dns`, `connect` or `ssl` phase, because it
+    /// had none; without saying why, the console could only list them as not
+    /// measured. The number is also HAR's `connection`, and it is what shows
+    /// which requests shared a connection. Numbers count up from 1 per process.
+    pub fn connection(&self, id: u64, reused: bool) {
+        self.set(|p| {
+            p.connection = Some(id);
+            p.reused = reused;
+        });
+    }
+
+    /// The origin connection's number, if the request reached one.
+    pub fn connection_id(&self) -> Option<u64> {
+        self.0.lock().unwrap().connection
     }
 
     /// Has anything at all been measured? A request answered by a rule never
@@ -186,6 +210,12 @@ impl serde::Serialize for Timings {
                 m.serialize_entry(name, &v)?;
             }
         }
+        if let Some(id) = p.connection {
+            m.serialize_entry("connection", &id)?;
+        }
+        if p.reused {
+            m.serialize_entry("reused", &true)?;
+        }
         m.end()
     }
 }
@@ -202,6 +232,11 @@ impl<'de> serde::Deserialize<'de> for Timings {
             ssl: Option<Ms>,
             wait: Option<Ms>,
             receive: Option<Ms>,
+            // Absent from sessions written before connections were numbered.
+            #[serde(default)]
+            connection: Option<u64>,
+            #[serde(default)]
+            reused: bool,
         }
         let w = Wire::deserialize(d)?;
         Ok(Timings(Arc::new(Mutex::new(Phases {
@@ -210,6 +245,8 @@ impl<'de> serde::Deserialize<'de> for Timings {
             ssl: w.ssl,
             wait: w.wait,
             receive: w.receive,
+            connection: w.connection,
+            reused: w.reused,
         }))))
     }
 }
@@ -341,6 +378,36 @@ mod tests {
             seen["receive"].as_f64().expect("a number") >= 40.0,
             "the copy handed to the session sees it: {seen}"
         );
+    }
+
+    /// Which connection carried a request survives a trip to disk, and a
+    /// session written before connections were numbered still reads back.
+    #[test]
+    fn the_connection_is_written_and_read_back() {
+        let t = Timings::new();
+        t.connection(7, true);
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json, serde_json::json!({ "connection": 7, "reused": true }));
+        let back: Timings = serde_json::from_value(json).unwrap();
+        assert_eq!(back.connection_id(), Some(7));
+        assert_eq!(
+            serde_json::to_value(&back).unwrap()["reused"],
+            true,
+            "reuse is kept, not just the number"
+        );
+
+        let fresh = Timings::new();
+        fresh.connection(8, false);
+        assert!(
+            serde_json::to_value(&fresh)
+                .unwrap()
+                .get("reused")
+                .is_none(),
+            "a connection opened for the request is the ordinary case"
+        );
+
+        let old: Timings = serde_json::from_str(r#"{"wait":3.5}"#).unwrap();
+        assert_eq!(old.connection_id(), None);
     }
 
     /// Sub-millisecond phases are common against a local origin, and reporting
