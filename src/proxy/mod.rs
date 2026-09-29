@@ -1624,7 +1624,11 @@ mod forced_encoding_tests {
         ] {
             assert!(framed(ct), "{ct}");
         }
-        for ct in ["text/event-streamlike", "application/event-stream", "text/plain"] {
+        for ct in [
+            "text/event-streamlike",
+            "application/event-stream",
+            "text/plain",
+        ] {
             assert!(!framed(ct), "{ct}");
         }
     }
