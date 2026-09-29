@@ -192,8 +192,54 @@ pub async fn transform(
     // Committed. From here the plugin owns the body: pump the original into it
     // and hand its output onward.
     let label = format!("{} {name}", dir.label());
-    tokio::spawn(pump(label, body, tx));
-    body::from_incoming(resp.into_body())
+    let (ended_tx, ended) = tokio::sync::oneshot::channel();
+    tokio::spawn(pump(label, body, tx, ended));
+    Output {
+        inner: body::from_incoming(resp.into_body()),
+        ended: Some(ended_tx),
+    }
+    .boxed()
+}
+
+/// The plugin's output, which tells [`pump`] to stop when it has ended.
+///
+/// Once the plugin has finished answering, no byte it reads afterwards can
+/// change what it answered — but a plugin on Node keeps reading anyway (an
+/// ended response drains the rest of its request, `req._dump()`), so the pump
+/// would go on feeding it for as long as the source flowed. For an event stream
+/// that is forever, and the origin connection with it: upstream's "pipe may
+/// cause request hangs and memory leaks", fixed in 2.10.10 (avwo/whistle#1351),
+/// in this port's shape. The same signal covers a consumer that stops reading —
+/// a client that left — because dropping this drops the sender.
+struct Output {
+    inner: DynBody,
+    /// Dropped, and so heard by [`pump`], at the end or when nobody wants more.
+    ended: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl hyper::body::Body for Output {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BodyError>>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(polled, std::task::Poll::Ready(None | Some(Err(_)))) {
+            this.ended = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Open an HTTP/1.1 connection to a local plugin endpoint, returning the
@@ -244,15 +290,35 @@ async fn connect(
     Ok((sender, req))
 }
 
-/// Copy `body`'s frames into the plugin connection until either side ends.
+/// Copy `body`'s frames into the plugin connection until either side ends, or
+/// the plugin's output has ([`Output`]) — dropping `body` then, which is what
+/// lets go of the origin or the client behind it.
 ///
 /// Errors are forwarded rather than swallowed: once the plugin has taken over a
 /// body, silently truncating it would hand the client a plausible-looking lie.
-async fn pump(label: String, mut body: DynBody, tx: Sender<Result<Bytes, BodyError>>) {
-    while let Some(frame) = body.frame().await {
+async fn pump(
+    label: String,
+    mut body: DynBody,
+    tx: Sender<Result<Bytes, BodyError>>,
+    mut ended: tokio::sync::oneshot::Receiver<()>,
+) {
+    let stopped = || {
+        tracing::debug!(
+            "{label}: the plugin's output has ended; the rest of the input is not needed"
+        )
+    };
+    loop {
+        let frame = tokio::select! {
+            _ = &mut ended => return stopped(),
+            frame = body.frame() => frame,
+        };
+        let Some(frame) = frame else { return };
         let send = match frame {
             Ok(f) => match f.into_data() {
-                Ok(data) => tx.send(Ok(data)).await,
+                Ok(data) => tokio::select! {
+                    _ = &mut ended => return stopped(),
+                    sent = tx.send(Ok(data)) => sent,
+                },
                 // Trailers cannot be represented mid-pipe; the plugin's own
                 // output decides the final framing.
                 Err(_) => continue,
@@ -462,6 +528,88 @@ mod tests {
             let (bytes, _) = drain(out).await;
             assert_eq!(String::from_utf8_lossy(&bytes), payload);
             plugin.await.expect("plugin task");
+        });
+    }
+
+    /// An endless source (an event stream, a long upload) that sends a frame
+    /// every few milliseconds until nobody takes them, and says when that was.
+    fn endless_source() -> (DynBody, tokio::sync::oneshot::Receiver<()>) {
+        let (tx, body) = body::channel(1);
+        let (gone_tx, gone) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            while tx.send(Ok(Bytes::from_static(b"tick\n"))).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = gone_tx.send(());
+        });
+        (body, gone)
+    }
+
+    /// Once the plugin's own answer has ended, nothing more it reads can change
+    /// it — so the source is let go, rather than fed to a plugin that keeps
+    /// draining it (as Node does, `req._dump()`) for as long as it flows. An
+    /// event stream would otherwise hold its origin open for good: upstream's
+    /// "pipe may cause request hangs and memory leaks", fixed in 2.10.10
+    /// (avwo/whistle#1351), in this port's shape.
+    #[test]
+    fn the_source_is_let_go_once_the_plugin_has_answered() {
+        rt().block_on(async {
+            let (url, _plugin) = fake_plugin(|mut sock| async move {
+                read_head(&mut sock).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n4\r\nDONE\r\n0\r\n\r\n",
+                )
+                .await
+                .expect("answer");
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                Vec::new()
+            })
+            .await;
+            let (source, gone) = endless_source();
+            let out = transform("t", &url, Dir::Response, &meta(), source).await;
+            let (bytes, _) = drain(out).await;
+            assert_eq!(bytes, b"DONE");
+            tokio::time::timeout(Duration::from_secs(3), gone)
+                .await
+                .expect("the source is still being read after the plugin answered")
+                .ok();
+        });
+    }
+
+    /// A client that leaves mid-stream lets go of the source too.
+    #[test]
+    fn the_source_is_let_go_when_the_client_leaves() {
+        rt().block_on(async {
+            let (url, _plugin) = fake_plugin(|mut sock| async move {
+                read_head(&mut sock).await;
+                sock.write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+                    .await
+                    .expect("head");
+                // An echo that never ends: the request's chunks are valid
+                // response chunks.
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 || sock.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Vec::new()
+            })
+            .await;
+            let (source, gone) = endless_source();
+            let mut out = transform("t", &url, Dir::Response, &meta(), source).await;
+            let first = out.frame().await.expect("a frame").expect("ok");
+            assert!(first.is_data());
+            drop(out);
+            tokio::time::timeout(Duration::from_secs(3), gone)
+                .await
+                .expect("the source is still being read after the client left")
+                .ok();
         });
     }
 
