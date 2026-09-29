@@ -46,7 +46,7 @@ const MUTATIONS = [
   },
   {
     name: 'value-gains-a-space',
-    file: 'src/proxy/apply.rs',
+    file: 'src/proxy/apply/substitute.rs',
     from: '(false, _) => content.clone(),',
     to: '(false, _) => format!("{content} "),',
     why: 'every {name} a values entry answers comes back with a trailing space',
@@ -69,7 +69,7 @@ const MUTATIONS = [
     // overwrites that status, so the change was invisible. An equivalent
     // mutant, not a blind gate.
     name: 'mocked-status-off-by-one',
-    file: 'src/proxy/apply.rs',
+    file: 'src/proxy/apply/res_ops.rs',
     from: '.and_then(|c| StatusCode::from_u16(c).ok())\n        // `replaceStatus != _res.statusCode`',
     to: '.and_then(|c| StatusCode::from_u16(c + 1).ok())\n        // `replaceStatus != _res.statusCode`',
     why: 'statusCode://404 answers 405 — resolution is unchanged, only the effect',

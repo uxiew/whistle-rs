@@ -28,7 +28,7 @@
 //   * `responseFor://` writes `x-whistle-response-for` on the **response**, and
 //     the harness strips every `x-whistle*` header from both sides as whistle's
 //     own bookkeeping. The cases here are therefore blind to their own effect;
-//     the header itself is pinned by a unit test in `src/proxy/apply.rs`
+//     the header itself is pinned by a unit test in `src/proxy/apply/tests.rs`
 //     (`response_for_annotates_rather_than_fetches`) and was verified by hand
 //     against the oracle — `responseFor://svc-a` comes back as
 //     `x-whistle-response-for: svc-a` from both. The cases stay because they

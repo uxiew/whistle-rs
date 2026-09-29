@@ -119,7 +119,7 @@ const EXPECTED = [
   {
     // A 502 this port makes up because the request failed says where it
     // failed and which session it was recorded as (`ERROR_HEADER` and
-    // `SESSION_HEADER`, `src/proxy/mod.rs`). whistle's gateway error carries
+    // `SESSION_HEADER`, `src/proxy/ledger.rs`). whistle's gateway error carries
     // neither, and `x-server` alone cannot tell it from an origin's own 502.
     // Only ever on this port's side, and only on a failed request.
     id: 'failure-headers',

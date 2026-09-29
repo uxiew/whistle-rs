@@ -57,8 +57,8 @@ Git 源码、npm 包与当前官网之间的差别必须显式说明。
 |---|---|
 | `lib/rules/rules.js` | `src/rules/mod.rs`、`src/rules/matcher.rs`、`src/rules/wildcard.rs` |
 | `lib/util/index.js` | 散见各处；`replace-pattern-transform.js` 对应 `src/rules/replace.rs` |
-| `lib/inspectors/req.js` | `src/proxy/apply.rs` 的请求侧 |
-| `lib/inspectors/res.js` | `src/proxy/apply.rs` 的响应侧、`src/proxy/mod.rs` 的响应管线 |
+| `lib/inspectors/req.js` | `src/proxy/apply/` 的请求侧（`req_ops.rs` 及各算子族的文件） |
+| `lib/inspectors/res.js` | `src/proxy/apply/` 的响应侧（`res_ops.rs`、`body_ops.rs` 等）、`src/proxy/response.rs` 的响应管线 |
 | `lib/rules/protocols.js` | `src/rules/protocols.rs` |
 | `lib/https/index.js`、`lib/https/ca.js` | `src/proxy/sni.rs`、`src/ca.rs` |
 | `lib/socket-mgr.js` | `src/proxy/ws.rs` |

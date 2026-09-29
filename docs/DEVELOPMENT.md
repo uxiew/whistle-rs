@@ -13,7 +13,7 @@
 两个 Rust 版本是两件事：`rust-toolchain.toml` 决定**用哪个版本做检查**，`rust-version` 声明**最老能用哪个版本编译**。门禁版本必须钉死，因为 Clippy 每个版本都会加新检查：同一份代码在 1.96.1 上 `clippy -D warnings` 通过，在 1.98.1 上报两处错误。不钉版本，"门禁通过"就取决于谁的电脑跑的。升级门禁版本要单独提交，并在同一提交里修掉新 lint。
 
 - 用发行版自带、不经 rustup 的 Rust 时，`rust-toolchain.toml` 不生效，Clippy 结果可能和门禁不一致；以 1.98.1 的结果为准。
-- 1.95 的来历：1.94 不认识 `src/proxy/apply.rs` 里的 `if let` 匹配守卫（E0658），锁定的依赖本身只要求 1.88。验证 MSRV 需要显式指定版本，因为 `+版本` 会覆盖 `rust-toolchain.toml`：
+- 1.95 的来历：1.94 不认识 `src/proxy/apply/files.rs` 里的 `if let` 匹配守卫（E0658），锁定的依赖本身只要求 1.88。验证 MSRV 需要显式指定版本，因为 `+版本` 会覆盖 `rust-toolchain.toml`：
 
   ```sh
   rustup toolchain install 1.95.0 --profile minimal

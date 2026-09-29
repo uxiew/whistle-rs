@@ -38,9 +38,9 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/rules/storage.rs` | `lib/rules/util.js` (`rulesStorage`) | Rule groups and values on disk, and which of them were switched on |
 | `src/rules/include.rs` | `lib/rules/util.js` (`getRemoteRulesResolver`) | `@` lines: fetch what they name, keep it fresh, re-parse what changed |
 | `src/ca.rs` | `lib/https/ca.js` | Root CA generation/persistence, per-host leaf signing |
-| `src/proxy/mod.rs` | `lib/index.js`, `lib/tunnel.js` | Server, forward proxy, CONNECT + MITM, WebSocket, capture log, status page/PAC |
+| `src/proxy/mod.rs` and its siblings | `lib/index.js`, `lib/tunnel.js` | The server, one kind of work per file: `listen` (ports, accept loop), `tunnel` (CONNECT, MITM, h1/h2 inside a tunnel), `serve` (the request pipeline), `response` (response phase and body operators), `upgrade` (WebSocket), `ledger` (one session per request, failures included), `session`/`capture` (what the console shows), `state`, `markers`, `dumps`. `mod.rs` holds the map |
 | `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split), upstream HTTP/SOCKS proxies |
-| `src/proxy/apply.rs` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations |
+| `src/proxy/apply.rs`, `src/proxy/apply/` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations, one operator family per file (`req_ops`, `res_ops`, `header_ops`, `body_ops`, `route`, `local`, …); `apply.rs` holds the map |
 | `src/proxy/dest.rs` | `lib/inspectors/rules.js:40` | Where the request is addressed once a URL-replacement rule has spoken |
 | `src/proxy/header_rules.rs` | `lib/rules/index.js:558-657` | The five headers a request may carry its own rules in — taken from every request, read only under `-M enableRequestHeaderRules` / `-M multiEnv` |
 | `src/proxy/forwarded.rs` | `lib/util/index.js:3697-3728`, `util/common.js:1231-1266` | What a front proxy claims — `x-forwarded-host`/`-proto` behind their modes, and the two whistle spellings upstream reads with no gate |
@@ -53,7 +53,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
 | `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
 | `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks |
-| `src/proxy/webui.rs` | `biz/webui` | The console's routes + `/api/rules`, `/sessions.json`, `/session.json`, `/frames.json`, PAC |
+| `src/proxy/webui.rs`, `src/proxy/webui/` | `biz/webui` | The console: the route table (`handle`, in `webui.rs`) and its API, one area per file — `access`, `sessions`, `har`, `rules`, `values`, `bundle`, `composer`, `console_hosts`, `plugin_pages` |
 | `ui-src/` | `biz/webui/htdocs` | The console: a Vue 3 / Vite / TypeScript app built to one file and inlined at compile time; `build.rs` substitutes a placeholder when it has not been built, so no Node is needed to build the proxy |
 | `ui-src/src/editor/whistle-classify.js` | — | The rules classifier; shares `index_of_pattern` with the parser, and a Rust test holds the two together |
 | `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
@@ -340,7 +340,9 @@ Say you want `delete://header-name` to strip a request header.
 1. **Registry** — the name is likely already in `PROTOCOLS`
    (`src/rules/protocols.rs`); add it if not. If it can appear multiple times per
    request, add it to `MULTI_MATCH`.
-2. **Apply** — in `src/proxy/apply.rs`, read it from the resolved set and act:
+2. **Apply** — in the file under `src/proxy/apply/` for its family (the table
+   at the top of `apply.rs` says which; request headers are `req_ops.rs`), read
+   it from the resolved set and act:
 
    ```rust
    // in apply_request(...)
@@ -460,8 +462,11 @@ whistle-rs/
     │   └── replace.rs     # $0-$9 expansion
     ├── plugins/           # registry, hooks, `pipe://`, ws frames, auth, sni, ui
     └── proxy/
-        ├── mod.rs         # `serve()` — every request flows through it
-        ├── apply.rs       # resolved rules → request/response mutations
+        ├── mod.rs         # the map of the files below
+        ├── serve.rs       # `serve()` — every request flows through it
+        ├── tunnel.rs      # CONNECT, MITM, what arrives before a request
+        ├── response.rs    # response phase and response body operators
+        ├── apply.rs       # resolved rules → mutations; apply/ holds one file per family
         ├── dest.rs        # the URL a request is forwarded to
         ├── header_rules.rs # rules a request carries in its own headers
         ├── forwarded.rs   # what a front proxy claims, and whether to believe it
@@ -477,7 +482,7 @@ whistle-rs/
         ├── coding.rs      # gzip/deflate/brotli/zstd
         ├── ciphers.rs     # `cipher://` and the TLS options
         ├── timing.rs      # per-phase timings
-        ├── webui.rs       # console routes + API
+        ├── webui.rs       # console route table; webui/ holds the API, one area per file
         ├── bench.rs
         └── body.rs
 ```
@@ -486,10 +491,10 @@ whistle-rs/
 
 | I want to… | Start at |
 |---|---|
-| add a rule operator | `src/rules/protocols.rs` (register), then `src/proxy/apply.rs` (act on it) |
+| add a rule operator | `src/rules/protocols.rs` (register), then its family's file in `src/proxy/apply/` (act on it) |
 | change how rules match | `src/rules/matcher.rs` |
 | write a plugin | [`PLUGINS.md`](PLUGINS.md), then `sdk/whistle-rs-plugin.d.ts` |
 | add a plugin hook | `src/plugins/mod.rs` (manifest + trait), then the call site — but check first whether the existing dispatch already suffices, as `auth` did |
-| touch the request pipeline | `serve()` in `src/proxy/mod.rs` — the one place every request flows through |
-| add an endpoint | the route match at the top of `src/proxy/webui.rs` |
+| touch the request pipeline | `serve()` in `src/proxy/serve.rs` — the one place every request flows through |
+| add an endpoint | the route match in `handle`, `src/proxy/webui.rs`, and the handler in the `webui/` file for its area |
 | change the console | `ui-src/` — Vue 3 SFCs; `npm run build` writes `dist/index.html`, then `cargo build` inlines it |

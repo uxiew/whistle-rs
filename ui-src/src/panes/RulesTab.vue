@@ -6,7 +6,7 @@
 //
 // One row per operator that matched, in the order the rules resolved them:
 // important lines first, then the order they are written in (`matched_ops`,
-// `src/proxy/mod.rs`). Rendered in the rules editor's own token colours, so a
+// `src/proxy/session.rs`). Rendered in the rules editor's own token colours, so a
 // row here and the line it came from in the Rules pane look like each other.
 
 import { computed } from 'vue';

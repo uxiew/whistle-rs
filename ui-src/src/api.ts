@@ -1,6 +1,6 @@
 // The proxy's HTTP API, typed.
 //
-// Shapes follow `src/proxy/webui.rs` — every field here is one the Rust side
+// Shapes follow `src/proxy/webui/` — every field here is one the Rust side
 // actually emits. Fields the Rust side skips when empty (`skip_serializing_if`)
 // are optional here, which is why so many of them are.
 
@@ -411,7 +411,7 @@ export const api = {
   /**
    * The captured body as bytes — what the hex view, the image preview and the
    * download are all built from. Separate from `/session.json` on purpose: see
-   * `session_body_bytes` in `webui.rs`.
+   * `session_body_bytes` in `webui/sessions.rs`.
    */
   bodyBytes: async (id: number, side: 'req' | 'res'): Promise<BodyBytes> => {
     const res = await fetch(`/body.bin?id=${id}&side=${side}`);
@@ -438,7 +438,7 @@ export const api = {
   /** A HAR of the given sessions, as a link the browser downloads. */
   harUrl: (ids: number[]) => `/sessions.har?ids=${ids.join(',')}`,
   // Sent through the proxy's own port, exactly as a replay is, so the rules
-  // apply to it and it is captured — see `send_through_self` in `webui.rs`.
+  // apply to it and it is captured — see `send_through_self` in `webui/composer.rs`.
   compose: (c: Composition) => postJson<ComposeResult>('/api/composer', c),
 
   /** Send a frame into a live WebSocket session, from the console. */

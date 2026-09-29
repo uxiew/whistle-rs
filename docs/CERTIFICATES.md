@@ -196,7 +196,7 @@ at all — see `sniCallback://` in [`RULES.md`](RULES.md).
    real servers still see a valid handshake.
 
 Implementation: `src/ca.rs` (CA + signing), `src/proxy/sni.rs` (the ClientHello and
-the certificate decision) and `src/proxy/mod.rs` (`handle_connect`, `serve_tunnel`).
+the certificate decision) and `src/proxy/tunnel.rs` (`handle_connect`, `serve_tunnel`).
 
 ### Which name the certificate is for
 

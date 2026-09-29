@@ -46,7 +46,7 @@
 //     is a path (`readRuleValue`, `_original/lib/util/index.js:1189-1213`), so
 //     `resBody://{typo}` opens a file called `{typo}`, fails, and the operator
 //     does nothing. whistle-rs keeps a bare value as the literal it already is —
-//     declared in `value_source` (`src/proxy/apply.rs`). The `<…>` half is the
+//     declared in `value_source` (`src/proxy/apply/value_sources.rs`). The `<…>` half is the
 //     same decision from the other end: upstream's `getValue(matcher,'<','>')`
 //     strips the brackets off **every** operator's value, so
 //     `htmlAppend://<script>x</script>` loses its final `>` and injects nothing;
@@ -74,7 +74,7 @@
 // does not need to: upstream's own suite asks it three ways
 // (`test/units/keys.test.js`, run by `upstream-suite.js`), and it caught this
 // port asking the store first. Only `--value` beats a block here, which
-// upstream has no flag for; see `yield_to_overrides` in `src/proxy/apply.rs`.
+// upstream has no flag for; see `yield_to_overrides` in `src/proxy/apply/substitute.rs`.
 
 const fs = require('fs');
 const path = require('path');

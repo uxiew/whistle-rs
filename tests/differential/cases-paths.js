@@ -186,7 +186,7 @@ module.exports = [
   { name: 'paths: a cjk query parameter', rules: `${A} params://q=中文` },
   { name: 'paths: a cjk path segment', rules: `${A} pathReplace://echo=中文` },
   // The three encodings are separate, and each was measured on its own — see
-  // `request_target` and `merge_query` in `src/proxy/apply.rs`. These pin the
+  // `request_target` and `merge_query` in `src/proxy/apply/path_query.rs`. These pin the
   // boundaries between them.
   { name: 'paths: a params value with url punctuation', rules: `${A} params://q=a{b|c^d` },
   { name: 'paths: a params value that is already escaped', rules: `${A} params://q=a%41b` },

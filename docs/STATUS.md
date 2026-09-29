@@ -29,16 +29,16 @@
 
 | 维度 | 当前实现与边界 | 核验入口 |
 | --- | --- | --- |
-| 代理核心 | HTTP 正向代理、CONNECT、HTTPS MITM、入站 SOCKS5、HTTP/HTTPS/SOCKS 上游代理与 PAC 已有实现 | `src/proxy/{mod,upstream,socks,sni}.rs` |
+| 代理核心 | HTTP 正向代理、CONNECT、HTTPS MITM、入站 SOCKS5、HTTP/HTTPS/SOCKS 上游代理与 PAC 已有实现 | `src/proxy/{tunnel,serve,upstream,socks,sni}.rs` |
 | HTTP/2 / 连接 | 客户端到 MITM 侧支持 h2；客户端走 h2 时对 HTTPS 源站也用 h2（与 whistle 默认一致，`enable://h2`/`disable://h2` 可改），明文源站（`httpH2`）不支持。源站连接按客户端连接复用，不跨客户端 | `src/proxy/{pool,upstream}.rs`；`tests/differential/{h2,perf}-bench.js` |
 | CA / TLS | 动态 CA、自备证书和 SNI 插件钩子已实现；默认验证源站证书是有意的安全差异。证书安装仍由用户完成 | `src/ca.rs`、`src/proxy/sni.rs`、`src/main.rs` |
-| 规则语义 | 模式、优先级、Values、includes、改写与响应阶段等有广泛实现；特定语料的差分通过，不代表所有输入和上游版本一致 | `src/rules/`、`src/proxy/apply.rs`、`tests/differential/` |
+| 规则语义 | 模式、优先级、Values、includes、改写与响应阶段等有广泛实现；特定语料的差分通过，不代表所有输入和上游版本一致 | `src/rules/`、`src/proxy/apply/`、`tests/differential/` |
 | WebSocket / 流 | 有 ws/wss 帧抓取、发送、扣留/放行及自有插件钩子；不代表复刻上游全部 TCP/帧工作流 | `src/proxy/ws.rs`、`src/plugins/wsframe.rs` |
-| 控制台 | Vue 3 + CodeMirror；已有规则/Values、Composer/重放、时间线、二进制预览/下载、HAR 与配置导入导出，**不是缺失项** | `ui-src/src/panes/`；`src/proxy/webui.rs` 路由表 |
-| 检索与错误观测 | 检索框支持 `h:`、`b:`（由代理查，`b:` 只查已存的预览）、`fc:`；`app:` 明确不支持。失败的请求各有一条会话，带失败阶段和原因，本代理生成的 502 带阶段和会话号；命中了但没执行的算子记在会话的 `unapplied` 里（超上限、事件流、压缩解不开、插件钩子失败、cipher 用不了） | `ui-src/src/filter/session-filter.js`；`src/proxy/search.rs`；`src/proxy/outcome.rs`、`src/proxy/mod.rs` 的 `Ledger`/`guard` |
-| 持久化 | JSONL 会话历史与按天保留；内存/体预览有界，没存全的 body 在接口、HAR、重放里都有标记，写盘读回不变。控制台隐藏不等于没采集，只有 `enable://hide` 不记录 | `src/proxy/{persist,body,webui}.rs`、`src/config.rs` |
+| 控制台 | Vue 3 + CodeMirror；已有规则/Values、Composer/重放、时间线、二进制预览/下载、HAR 与配置导入导出，**不是缺失项** | `ui-src/src/panes/`；`src/proxy/webui.rs` 路由表、`src/proxy/webui/` |
+| 检索与错误观测 | 检索框支持 `h:`、`b:`（由代理查，`b:` 只查已存的预览）、`fc:`；`app:` 明确不支持。失败的请求各有一条会话，带失败阶段和原因，本代理生成的 502 带阶段和会话号；命中了但没执行的算子记在会话的 `unapplied` 里（超上限、事件流、压缩解不开、插件钩子失败、cipher 用不了） | `ui-src/src/filter/session-filter.js`；`src/proxy/search.rs`；`src/proxy/outcome.rs`、`src/proxy/ledger.rs` 的 `Ledger`、`src/proxy/serve.rs` 的 `guard` |
+| 持久化 | JSONL 会话历史与按天保留；内存/体预览有界，没存全的 body 在接口、HAR、重放里都有标记，写盘读回不变。控制台隐藏不等于没采集，只有 `enable://hide` 不记录 | `src/proxy/{persist,body}.rs`、`src/proxy/webui/{sessions,har}.rs`、`src/config.rs` |
 | 插件生态 | 自有 Rust/HTTP/Node 插件协议与 SDK；**不直接运行现成 `whistle.*` npm 插件** | `src/plugins/`、`sdk/`、[PLUGINS.md](PLUGINS.md) |
-| CLI / Agent 接口 | `explain`、`qr` 及自有 HTTP API；没有 `w2 start/stop` 兼容层，`-r` 是可编辑的 Default 规则组而不是上游隐藏 shadowRules | `src/main.rs`；`src/proxy/webui.rs` |
+| CLI / Agent 接口 | `explain`、`qr` 及自有 HTTP API；没有 `w2 start/stop` 兼容层，`-r` 是可编辑的 Default 规则组而不是上游隐藏 shadowRules | `src/main.rs`；`src/proxy/webui/` |
 | 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；差分依赖有审阅过的锁文件，`run.js` 一条命令跑全量差分并归档；CI 首跑 8 个 job 全部通过，全量差分在 Linux 容器里通过；MIT 许可、来源说明、Cargo 元数据齐备，发布构件附带第三方许可原文；上游自带测试已成为门禁（可评判的 180 条中 160 条通过、20 条逐条声明）；全量差分对 2.10.8、2.10.10 两个上游版本各跑一遍 | 本文 Q1、Q2、U0、U1 记录；`.github/workflows/`；`tests/differential/` |
 
 上游插件契约见[官方插件开发](https://wproxy.org/docs/extensions/dev.html)；上游 Local Agent API 见[官方接口文档](https://wproxy.org/docs/extensions/api.html)。同名能力不意味着 URL、数据模型或插件对象兼容。
