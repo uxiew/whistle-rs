@@ -827,6 +827,8 @@ are **direct** requests, not through the proxy:
 |----------|---------|
 | `GET /sessions.json` | every captured transaction: id, method, url, status, target, bytes up/down, duration, and **which rules matched it** |
 | `GET /session.json?id=N` | one transaction with its request/response headers and body previews |
+| `GET /sessions.json?after=N` | only the transactions newer than `N`; a row with `open: true` is still receiving its response |
+| `GET /api/sessions/search?c=b:…` | the ids whose headers (`h:`) or bodies (`b:`) match, searched by the proxy over everything it holds |
 | `GET /frames.json?id=N` | the WebSocket frames of connection `N`, both directions |
 | `GET /sessions.har` | everything as a HAR 1.2 file |
 | `GET /api/status` | ports, TLS posture, root CA path, rule count, registered plugins. A cross-origin browser fetch from an origin not on `--allow-origin` gets `version` and `port` only — see [`CLI.md`](CLI.md#calling-the-console-from-another-page) |
@@ -846,7 +848,11 @@ curl -s --noproxy '*' http://127.0.0.1:8899/sessions.har -o capture.har
 Body previews are bounded — 16 KB by default, `--body-preview-limit` to change
 it. `gzip`/`deflate`/`br` bodies are decoded for viewing, and the capture is a
 streaming tee, so a chunked or SSE response is inspectable without breaking the
-stream.
+stream. A preview that is not the whole body says so — `truncated`, and
+`undecodable` when the encoding broke part-way — and so does a HAR entry made
+from it, with a `comment`. A `b:` search reads only what was kept, and lists
+the bodies that were cut short. The fields, the cursor and the search are
+specified in [`API.md`](API.md#读取流量).
 
 WebSocket connections appear as a session with status `101`, and every frame in
 both directions is recorded:
@@ -1126,7 +1132,7 @@ Then work down this list:
 | a `CONNECT` row tagged `client-tls`, and nothing inside it | the client refused this proxy's certificate: it does not trust the root CA — see [`CERTIFICATES.md`](CERTIFICATES.md) — or it is an app that pins its server's certificate, which no CA fixes. For the second, relay that host unread: `pinned.example.com disable://intercept` |
 | a `CONNECT` row with `(tunnel)` in its Policy column | the tunnel was relayed without being decrypted — a `disable://intercept` rule, `--no-intercept-https`, or traffic that is not HTTP. The row is the whole record: nothing inside a relayed tunnel is read |
 | a direct request to the console returns `502` with `Proxy-Connection` | your shell has `http_proxy` set. `curl --noproxy '*'` |
-| a rule does not fire and the capture is empty | first check whether curl bypassed the proxy: use `--noproxy '' -x http://127.0.0.1:8899` to force this route. A request that reached the proxy is in the capture even when it failed, so an empty one means it did not arrive — or that `enable://hide` or the capture filter kept it out |
+| a rule does not fire and the capture is empty | first check whether curl bypassed the proxy: use `--noproxy '' -x http://127.0.0.1:8899` to force this route. A request that reached the proxy is in the capture even when it failed, so an empty one means it did not arrive — or that `enable://hide` kept it out of the record. The console's search box and Capture filter only hide rows from the list: `/sessions.json` still has them |
 | a `502` and you cannot tell who sent it | look for `x-whistle-rs-error` on it: present, this proxy made it up and names the step (`dns`, `connect`, `tls`, …); absent, the server answered `502` itself |
 | the editor highlights the wrong token as the pattern | it is telling you the truth. `example.com http://localhost:5173` is pattern + destination; `http://a.com/x host://1.2.3.4` is pattern + operator. Whichever token it marks is what the proxy will match on |
 

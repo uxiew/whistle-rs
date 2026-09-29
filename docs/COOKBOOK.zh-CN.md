@@ -747,6 +747,8 @@ TLS 会话是客户端与源站之间的，代理只搬字节。
 |------|------|
 | `GET /sessions.json` | 每一条抓到的事务：id、方法、url、状态码、目标、上下行字节、耗时，以及**命中了哪些规则** |
 | `GET /session.json?id=N` | 单条事务，含请求/响应头与 body 预览 |
+| `GET /sessions.json?after=N` | 只要比 `N` 新的事务；带 `open: true` 的行响应还在传 |
+| `GET /api/sessions/search?c=b:…` | 由代理在手里的全部事务里查请求/响应头（`h:`）或 body（`b:`），返回匹配的 id |
 | `GET /frames.json?id=N` | 第 `N` 条连接的 WebSocket 帧，双向 |
 | `GET /sessions.har` | 全部导出为 HAR 1.2 文件 |
 | `GET /api/status` | 端口、TLS 姿态、根证书路径、规则数、已注册插件。跨域调用时，若来源不在 `--allow-origin` 列表里，只返回 `version` 与 `port` —— 见 [`CLI.md`](CLI.md#calling-the-console-from-another-page) |
@@ -765,6 +767,9 @@ curl -s --noproxy '*' http://127.0.0.1:8899/sessions.har -o capture.har
 
 Body 预览是有界的 —— 默认 16 KB，`--body-preview-limit` 可调。`gzip`/`deflate`/`br`
 会为查看而解码，且抓取用的是流式 tee，所以 chunked 或 SSE 响应可以查看而不破坏流式。
+没存全的预览会写明：`truncated`，解压到一半坏了还有 `undecodable`；从它导出的 HAR
+也会用 `comment` 标出来。`b:` 检索只查存下来的部分，并列出没存全的那些。字段、游标和
+检索的细节见 [`API.md`](API.md#读取流量)。
 
 WebSocket 连接以状态码 `101` 的会话出现，双向每一帧都被记录：
 
@@ -1021,7 +1026,7 @@ whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
 | 一条带 `client-tls` 标签的 `CONNECT`，里面什么都没有 | 客户端不接受本代理的证书：要么没信任根证书 —— 见 [`CERTIFICATES.md`](CERTIFICATES.md) —— 要么是做了证书固定（pinning）的 App，装什么 CA 都没用。后一种就让这个域名不解密直接转发：`pinned.example.com disable://intercept` |
 | `CONNECT` 行的 Policy 列带 `(tunnel)` | 这条隧道没解密就转发了 —— `disable://intercept` 规则、`--no-intercept-https`，或者里面跑的不是 HTTP。这一行就是全部记录：转发的隧道里面什么都不读 |
 | 直连控制台却返回带 `Proxy-Connection` 的 `502` | 你的 shell 设了 `http_proxy`。`curl --noproxy '*'` |
-| `/api/rules` 里有规则却不生效，而且抓包为空 | 先检查 curl 是否绕过代理；用 `--noproxy '' -x http://127.0.0.1:8899` 明确走代理。到过代理的请求哪怕失败了也在抓包里，所以列表为空说明请求没到 —— 或者被 `enable://hide`、抓包筛选挡在外面了 |
+| `/api/rules` 里有规则却不生效，而且抓包为空 | 先检查 curl 是否绕过代理；用 `--noproxy '' -x http://127.0.0.1:8899` 明确走代理。到过代理的请求哪怕失败了也在抓包里，所以列表为空说明请求没到 —— 或者被 `enable://hide` 挡在记录之外。控制台的检索框和 Capture filter 只是把行从列表里藏起来，`/sessions.json` 里还在 |
 | 拿到一个 `502`，分不清是谁回的 | 看它有没有 `x-whistle-rs-error` 头：有，就是本代理生成的，头的值就是停在哪一步（`dns`、`connect`、`tls`……）；没有，就是源站自己回的 `502` |
 | 编辑器把「不该是 pattern 的 token」标成了 pattern | 它说的是实话。`example.com http://localhost:5173` 是 pattern + 目标；`http://a.com/x host://1.2.3.4` 是 pattern + 算子。它标出来的那个，就是代理真正会拿去匹配的 |
 
