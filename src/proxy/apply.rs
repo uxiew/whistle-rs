@@ -6365,7 +6365,8 @@ fn merge_params_into_multipart(
         return data;
     }
     let sep = format!("\r\n--{boundary}").into_bytes();
-    let mut params = merge_params_pairs(resolved, "params");
+    // Kept as JSON: an object is a file part, not a field (`toMultipart`).
+    let mut params = merge_params_values(resolved, "params");
 
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     let mut rest = &data[start.len()..];
@@ -6387,7 +6388,7 @@ fn merge_params_into_multipart(
             .map(|i| params.remove(i));
         if !deleted {
             match replacement {
-                Some((k, v)) => push_multipart_part(&mut out, boundary, &k, &v),
+                Some((k, v)) => push_multipart_raw(&mut out, boundary, &multipart_part(&k, &v)),
                 None => push_multipart_raw(&mut out, boundary, part),
             }
         }
@@ -6402,7 +6403,7 @@ fn merge_params_into_multipart(
         }
     }
     for (name, value) in &params {
-        push_multipart_part(&mut out, boundary, name, value);
+        push_multipart_raw(&mut out, boundary, &multipart_part(name, value));
     }
     if out.is_empty() {
         // Every part was deleted and nothing replaced them: emit an empty body
@@ -6422,11 +6423,89 @@ fn push_multipart_raw(out: &mut Vec<u8>, boundary: &str, part: &[u8]) {
     out.extend_from_slice(part);
 }
 
-/// Append a plain `name`/`value` field (`toMultipart`,
-/// `_original/lib/inspectors/req.js:61-95` — the string branch).
-fn push_multipart_part(out: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
-    let part = format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}");
-    push_multipart_raw(out, boundary, part.as_bytes());
+/// One `params://` entry as a multipart part — `toMultipart`
+/// (`_original/lib/inspectors/req.js:61-95`).
+///
+/// A scalar is a plain field. An **object** is a file: `filename` (or `name`,
+/// or else the field's own name), content from `content` or `value` — an
+/// object there is pretty-printed JSON, and `base64` supplies raw bytes
+/// instead — and a `Content-Type` from `type` (a bare extension is looked up)
+/// or from the filename. This port wrote an object as an empty plain field;
+/// upstream's `params.test.js` uploads through exactly these two shapes.
+fn multipart_part(name: &str, value: &serde_json::Value) -> Vec<u8> {
+    let serde_json::Value::Object(obj) = value else {
+        let text = json_to_param_string(value.clone());
+        return format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{text}")
+            .into_bytes();
+    };
+    let truthy = |v: &&serde_json::Value| match v {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        serde_json::Value::String(s) => !s.is_empty(),
+        _ => true,
+    };
+    // `String(v)`, near enough for what a rules file can hold.
+    let js_string = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(_) => "[object Object]".to_string(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|i| json_to_param_string(i.clone()))
+            .collect::<Vec<_>>()
+            .join(","),
+        other => other.to_string(),
+    };
+    // `value.filename || value.name`, then `filename == null ? name : filename + ''`.
+    let filename = match obj
+        .get("filename")
+        .filter(truthy)
+        .or_else(|| obj.get("name"))
+    {
+        None | Some(serde_json::Value::Null) => name.to_string(),
+        Some(v) => js_string(v),
+    };
+    // `value.content || value.value || ''`.
+    let content = obj
+        .get("content")
+        .filter(truthy)
+        .or_else(|| obj.get("value").filter(truthy));
+    let mut raw: Vec<u8> = Vec::new();
+    let text = match content {
+        Some(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+            serde_json::to_string_pretty(v).unwrap_or_default()
+        }
+        Some(v) => js_string(v),
+        None => {
+            if let Some(serde_json::Value::String(b64)) = obj.get("base64").filter(truthy) {
+                use base64::Engine as _;
+                raw = base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .unwrap_or_default();
+            }
+            String::new()
+        }
+    };
+    let content_type = match obj.get("type") {
+        Some(serde_json::Value::String(t)) if t.contains('/') => t.clone(),
+        Some(serde_json::Value::String(t)) if !t.is_empty() => {
+            content_type_of_ext(&format!("x.{t}"))
+                .map(media_type)
+                .unwrap_or(t)
+                .to_string()
+        }
+        _ => content_type_of_ext(&filename)
+            .map(media_type)
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+    };
+    let mut part = format!(
+        "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\
+         Content-Type: {content_type}\r\n\r\n{text}"
+    )
+    .into_bytes();
+    part.extend(raw);
+    part
 }
 
 /// The `name=` of a multipart part, read from the headers ahead of its blank
@@ -9478,6 +9557,34 @@ mod tests {
         // Two lines into the same array, and one that overwrites.
         assert_eq!(merged("a[0]: x\na[1]: y"), r#"{"a":["x","y"]}"#);
         assert_eq!(merged("a[0]: x\na[0]: y"), r#"{"a":["y"]}"#);
+    }
+
+    /// An object-valued param is a **file** part, in the two shapes upstream's
+    /// `params.test.js` uploads with — `{filename, content}` and a bare
+    /// `{value}`, whose filename is the field's own name — plus `base64` for
+    /// raw bytes and `type` for the content type (`toMultipart`,
+    /// `_original/lib/inspectors/req.js:61-95`).
+    #[test]
+    fn an_object_param_is_a_file_part() {
+        const CT: &str = "multipart/form-data; boundary=X";
+        let body = "--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--X--";
+        let json = r#"{"file1":{"filename":"text.txt","content":"xxx"},"file2":{"value":"1234567890"},"file3":{"base64":"AAE=","type":"png"}}"#;
+        let out = merged_body(&format!("example.com params://{json}\n"), Some(CT), body);
+        assert_eq!(
+            out,
+            "--X\r\n\
+             Content-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n\
+             --X\r\n\
+             Content-Disposition: form-data; name=\"file1\"; filename=\"text.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\nxxx\r\n\
+             --X\r\n\
+             Content-Disposition: form-data; name=\"file2\"; filename=\"file2\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n1234567890\r\n\
+             --X\r\n\
+             Content-Disposition: form-data; name=\"file3\"; filename=\"file3\"\r\n\
+             Content-Type: image/png\r\n\r\n\u{0}\u{1}\r\n\
+             --X--"
+        );
     }
 
     /// A multipart body: a part named by a param is replaced whole, one named

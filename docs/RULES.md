@@ -1219,6 +1219,19 @@ An empty body becomes the params outright — `{"a":"1"}` for JSON, `a=1` for a 
 `params://{"a":{"b":1}}` keeps its structure into a JSON body; against a form body it is
 serialised (whistle writes `a[b]=1` there instead).
 
+In a **multipart** body an object is a **file** part — upstream's `toMultipart`
+(`lib/inspectors/req.js:61-95`):
+
+```
+upload.example.com  params://{"avatar":{"filename":"a.png","base64":"iVBORw0…"},"note":{"value":"hi"}}
+```
+
+`filename` (or `name`) names the file, else the field's own name does; the content
+is `content` or `value` (an object there is sent as pretty JSON), or the bytes
+`base64` decodes to; `Content-Type` is `type` (a bare extension such as `png` is
+looked up) or follows from the filename, `application/octet-stream` when neither
+says.
+
 ```
 api.example.com   params://uid=42            # POSTed form/JSON body gains uid
 api.example.com   urlParams://trace=1        # ?trace=1, whatever the body is
