@@ -1,7 +1,7 @@
 //! The request head: `apply_request` and the request-side operators it applies
 //! that are not headers, cookies, CORS or caching — `auth://`, the client's
-//! `x-forwarded-for`, `disable://` on request properties, and the encodings a
-//! client may be told the origin can send.
+//! `x-forwarded-for`, `disable://` on request properties, and the
+//! `Accept-Encoding` narrowed to what this proxy can decode.
 
 use super::*;
 
