@@ -393,7 +393,11 @@ table.requests tbody tr:hover td { background: var(--bg-sub); }
 table.requests tbody tr.failed td { background: color-mix(in srgb, var(--err) 7%, transparent); }
 table.requests tbody tr.failed:hover td { background: color-mix(in srgb, var(--err) 12%, transparent); }
 
-table.requests tbody tr[aria-selected="true"] td {
+/* `:hover` repeated here so a selected row stays selected-looking under the
+   pointer: `tr.failed:hover` is one pseudo-class more specific than a plain
+   selection rule, and turned a selected failed row into pale text on pink. */
+table.requests tbody tr[aria-selected="true"] td,
+table.requests tbody tr[aria-selected="true"]:hover td {
   background: var(--accent);
   color: var(--accent-fg);
 }
