@@ -12,17 +12,21 @@
 
 | 对象 | 约束 |
 | --- | --- |
-| 可执行 oracle | npm 包 whistle **2.10.8**，连同全部传递依赖由 `tests/differential/package-lock.json` 固定 |
+| 可执行 oracle（基线） | npm 包 whistle **2.10.8**，连同全部传递依赖由 `tests/differential/package-lock.json` 固定 |
+| 可执行 oracle（第二个对照） | npm 包 whistle **2.10.10**，由 `tests/differential/versions/2.10.10/package-lock.json` 固定；`run.js --whistle 2.10.10` 用它 |
 | 源码定位 | 注释和文档里的 `_original/…:行号` 对应 tag **`v2.10.8` = 提交 `1df0805f09fd979e0e31fd6eab99ca97239ac1ec`** |
-| 上游自带测试 | 同一提交 `1df0805` 的 `test/`；npm 包不带它，`upstream-suite.js` 按提交号从 GitHub 取（git 逐对象校验哈希），缓存在 `target/upstream-suite/`。v2.10.4 与 v2.10.8 的 `test/` 完全相同 |
-| 在线 master / 官网 | 2026-09-25 在线观察 `master/package.json` 为 **2.10.10**（tag `v2.10.10` = `a1e4751`）；浮动资料，不自动成为兼容基线 |
+| 上游自带测试 | 所测版本那个 tag 的 `test/`（2.10.8 = `1df0805`，2.10.10 = `a1e4751`）；npm 包不带它，`upstream-suite.js` 按提交号从 GitHub 取（git 逐对象校验哈希），缓存在 `target/upstream-suite/`。v2.10.4、v2.10.8、v2.10.10 的 `test/` 完全相同 |
+| 在线 master / 官网 | 2026-09-29 npm 的 `latest` 为 **2.10.10**；官网文档是浮动资料，不自动成为兼容基线 |
+
+2026-09-29 核实 2.10.10：npm 包 whistle@2.10.10 的 `lib/`、`biz/webui/lib/`、`index.js` 与 tag `v2.10.10`（`a1e4751d157150e8fe9e6590f4b892a855664b7f`）逐字节相同。
 
 2026-09-28 核实过这三者的对应关系：`git ls-remote` 显示 `v2.10.8` 是指向 `1df0805` 的轻量 tag；npm 包 whistle@2.10.8 的 228 个文件里，227 个（含 `package.json`）与该提交的源码树逐字节相同，唯一多出的 `biz/webui/htdocs/js/index.js` 是发布时构建的上游控制台产物。所以差分测的对照组就是 `1df0805` 的源码，按行号查引用时应检出这个提交。
 
 **本机 `_original/` 未必是这个版本。** 这台机器上的是 `v2.10.4`（`6da6e6c`），行号会对不上几行甚至整段；跟引用前先 `git -C _original checkout 1df0805`，或按下面的方法另外克隆。
 
 来源：[官方仓库](https://github.com/avwo/whistle)、[package.json](https://github.com/avwo/whistle/blob/master/package.json)、[更新日志](https://github.com/avwo/whistle/blob/master/CHANGELOG.md)、[官网文档](https://wproxy.org/docs/)。
-升级基线按 ROADMAP 的 U1 做双版本复验，不直接把旧报告的版本号替换掉。
+
+**2.10.10 已按同一批语料复验（U1）。** 两版答案不同的地方、本项目各跟了哪一边、为什么，只写在 [STATUS 的 U1 记录](STATUS.md#2026-09-29-u1-上游版本矩阵)。基线仍是 2.10.8：文档里"measured against 2.10.8"的说法照旧成立，除 U1 表里列出的几处外，在 2.10.10 上也一样。以后再加版本，照[差分 README](../tests/differential/README.md#which-whistle-though)做，不要直接把旧报告里的版本号替换掉。
 
 ## 源码复核
 
@@ -39,8 +43,8 @@ git checkout 1df0805f09fd979e0e31fd6eab99ca97239ac1ec
 不是要求用户机器必须有某个绝对路径。若对象无法获取或与标签不一致，先记录并纠正来源，
 不要拿当前 master 的同一行号冒充旧依据。
 
-差分脚本实际读取 `tests/differential/node_modules/whistle/`，按锁文件用 `npm ci` 安装，见 DEVELOPMENT。
-**npm 发布包不应被无条件描述为 Git 仓库的“同一棵树”**：2.10.8 恰好只差一个构建产物（见上），换版本要重新比对。
+差分脚本经 `tests/differential/whistle-pkg.js` 读取所测版本的包：基线在 `tests/differential/node_modules/whistle/`，其他版本在 `tests/differential/versions/<版本>/node_modules/whistle/`，各自按锁文件用 `npm ci` 安装，见 DEVELOPMENT。
+**npm 发布包不应被无条件描述为 Git 仓库的“同一棵树”**：2.10.8、2.10.10 的代理代码都与 tag 相同（见上），换版本要重新比对。
 
 行号是定位提示，不是稳定 API。新记录优先附版本、文件、函数名、最小用例和结果；
 Git 源码、npm 包与当前官网之间的差别必须显式说明。

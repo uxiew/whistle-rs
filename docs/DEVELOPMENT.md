@@ -82,13 +82,23 @@ node run.js network               # 约 18 分钟（2026-09-29 本机 `all` 实�
 node run.js network --only cases-delete,https   # 只跑几步；--list 列出全部步骤
 ```
 
+**对照第二个上游版本（2.10.10）：** 它有自己的目录和锁文件，不会动到 2.10.8 基线。
+
+```sh
+(cd versions/2.10.10 && npm ci)                      # 一次
+node run.js all --whistle 2.10.10                    # 对 2.10.10 的门禁
+node matrix.js ../../target/differential/<基线那次> ../../target/differential/<2.10.10 那次>   # 两版之间谁变了
+```
+
+两次要用同一个二进制（先复制一份，用 `RS_BIN=` 指过去），否则 `matrix.js` 会拒绝比较（退出码 2）：它分不清一个变化是上游的还是本项目的。`--assume-baseline`、加新版本的步骤只写在[差分 README](../tests/differential/README.md#which-whistle-though)，两版的实测差别见 [STATUS 的 U1 记录](STATUS.md#2026-09-29-u1-上游版本矩阵)。
+
 `run.js` 自己起停需要的代理，数据目录、根证书和会话都放在用完即删的临时目录里，只监听 127.0.0.1；开跑前逐个检查要用的端口，被占用就直接退出并报端口号和占用者；每个子进程单独一个进程组，结束或 Ctrl-C 时整组杀掉，不会留下还在监听的代理。退出码：0 全部通过，1 有步骤失败，2 没法开始（端口被占、二进制缺失或比源码旧、没跑 `npm ci`）。归档在 `target/differential/<时间>-<套件>/`：`manifest.json` 记录提交与未提交文件、whistle-rs 版本和 SHA-256、whistle 版本和锁文件哈希、每个脚本和语料的哈希、Node 版本、每一步的命令和结果，外加每一步的输出和每个代理的日志。
 
-判定规则只有一条：**没人解释过的差异就失败。** 已知且接受的差异逐条写在 `tests/differential/declared.js`（用例、字段、测量时的上游版本、理由）；跨语料反复出现的模式在 `harness.js` 的 `EXPECTED`，每条都限定了能豁免的字段和用例范围。声明了却不再出现的差异同样算失败——留着它，以后这个字段在这个用例上出什么问题都会被放过。每个语料跑完还会跑 `triage-inert.js`：规则一条都没命中、又没说明原因的用例算失败。
+判定规则只有一条：**没人解释过的差异就失败。** 已知且接受的差异逐条写在 `tests/differential/declared.js`（用例、字段、在哪些上游版本上测过、理由；只对列出的版本生效）；跨语料反复出现的模式在 `harness.js` 的 `EXPECTED`，每条都限定了能豁免的字段和用例范围。声明了却不再出现的差异同样算失败——留着它，以后这个字段在这个用例上出什么问题都会被放过。每个语料跑完还会跑 `triage-inert.js`：规则一条都没命中、又没说明原因的用例算失败。
 
 新增例外时照这个格式写进 `declared.js`，别加宽 `EXPECTED` 的匹配范围，也别往 `IGNORE` 里加头。门禁到底能不能抓到回归，用 `node mutations.js` 验证：它在 HEAD 的临时 worktree 里逐条注入几个预设的语义回归，每条都必须让对应门禁失败（所以跑之前先提交）。
 
-**上游自带的测试**也是 `network` 里的一步（`upstream-suite`，约 4 分钟）：拿上游 v2.10.8 的 `test/` 原样跑 whistle-rs，第一次运行会从 GitHub 按提交号取到 `target/upstream-suite/`。它用上游固定的端口（6666、18080、5566、1080 等），跟 `--port-base` 无关，端口被占会直接报出来。单独跑：`node upstream-suite.js`；某个单元挂了，用 `node upstream-suite.js --target rs --only <单元名> --verbose` 看每条调用的状态和错误页。它评判哪些调用、怎么声明例外，只写在[差分 README](../tests/differential/README.md#upstreams-own-test-suite)。
+**上游自带的测试**也是 `network` 里的一步（`upstream-suite`，约 4 分钟）：拿所测上游版本那个 tag 的 `test/` 原样跑 whistle-rs（2.10.8 与 2.10.10 的 `test/` 完全相同），第一次运行会从 GitHub 按提交号取到 `target/upstream-suite/`。它用上游固定的端口（6666、18080、5566、1080 等），跟 `--port-base` 无关，端口被占会直接报出来。单独跑：`node upstream-suite.js`；某个单元挂了，用 `node upstream-suite.js --target rs --only <单元名> --verbose` 看每条调用的状态和错误页。它评判哪些调用、怎么声明例外，只写在[差分 README](../tests/differential/README.md#upstreams-own-test-suite)。
 
 **Node 版本会影响结果。** 对照组是跑在 Node 上的 whistle，有些答案随 Node 版本变（`cases-compose.js` 记录过 gzip 头的一个字节）。当前声明是在 Node 26 上测的，CI 的差分任务也用 26；换版本要重新测量。
 
@@ -96,7 +106,7 @@ node run.js network --only cases-delete,https   # 只跑几步；--list 列出�
 
 ## CI
 
-`.github/workflows/ci.yml` 在每个 PR 和推到 main 时运行：钉住工具链上的 fmt/Clippy/全部测试、MSRV 版本上的全部测试、在不含 Node 的 `rust:1.98.1-trixie` 容器里构建纯代理并检查占位页、Node 20.19.0 和 24 两个版本下的前端 typecheck/build、先构建控制台再构建 release 并断言嵌入的是真控制台（构件是二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md` 和它们的 SHA-256）、文档链接检查、`run.js fast`。`.github/workflows/differential.yml` 跑全量网络差分（`run.js all`），手动触发或每周一凌晨，结果归档上传。所有 action 都按提交哈希钉住版本，注释里写了对应的 tag。
+`.github/workflows/ci.yml` 在每个 PR 和推到 main 时运行：钉住工具链上的 fmt/Clippy/全部测试、MSRV 版本上的全部测试、在不含 Node 的 `rust:1.98.1-trixie` 容器里构建纯代理并检查占位页、Node 20.19.0 和 24 两个版本下的前端 typecheck/build、先构建控制台再构建 release 并断言嵌入的是真控制台（构件是二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md` 和它们的 SHA-256）、文档链接检查、`run.js fast`。`.github/workflows/differential.yml` 跑全量网络差分，同一个二进制先对 2.10.8、再对 2.10.10 各跑一遍 `run.js all`，最后用 `matrix.js` 比较两版，手动触发或每周一凌晨，结果归档上传。所有 action 都按提交哈希钉住版本，注释里写了对应的 tag。
 
 性能基准与长连接稳定性另行记录配置、硬件、制品和资源曲线。macOS 测试不能代替 Linux/Windows 真机，编译成功不能替代证书、网络和 UI 工作流测试。
 
