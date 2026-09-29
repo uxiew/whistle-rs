@@ -107,8 +107,8 @@ const FAST = [
   { name: 'qr', args: ['qr-bench.js'], timeout: 5 * MINUTE },
 ];
 
-// `standard` is one pair shared by every corpus, the way bench-versions.js has
-// always run them: `WHISTLE_DIFF_ENV=Alpha` on both (cases-filters asks
+// `standard` is one pair shared by every corpus, the way they have always
+// been run: `WHISTLE_DIFF_ENV=Alpha` on both (cases-filters asks
 // `env:`), `--insecure-upstream` on whistle-rs (cases-proxy's TLS hop and the
 // HTTPS bench's self-signed origin). https-bench goes last, because it turns on
 // whistle's persisted `Enable HTTPS` switch for everything after it.

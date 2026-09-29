@@ -50,7 +50,7 @@ numbers), each step's output, and each proxy's log.
 
 **A step fails on anything unexplained.** Each bench exits 1 on a difference
 nothing declares. The differences that are known and accepted are listed case by
-case in [`declared.js`](declared.js) — the case, the fields, the whistle version
+case in [`declared.js`](declared.js) — the case, the fields, the whistle versions
 it was measured against, and the reason — and a declaration that no longer
 matches anything fails the run too, so it cannot linger and excuse that field
 later. Patterns that recur across corpora stay in `harness.js`'s `EXPECTED`,
@@ -110,10 +110,12 @@ measured against.
 The 52 packages the suite brought (2026-09-29) were checked the same way:
 `resolved` from registry.npmjs.org, sha512, no install script.
 
-To move to a new whistle, change the version in `package.json`, run
+A second whistle does not replace this one: it gets a directory and a lockfile
+of its own — see [Which whistle, though](#which-whistle-though). Moving the
+**baseline** is a separate decision: change the version in `package.json`, run
 `npm install --package-lock-only --registry=https://registry.npmjs.org/` (a
 mirror's own URLs must not end up in the lock), and review the lock diff the
-same way before committing it; see ROADMAP task U1.
+same way before committing it.
 
 `PORT_BASE` claims three consecutive ports — whistle, whistle-rs, and the echo
 origin — so several benches can run at once, one per area under audit:
@@ -683,52 +685,65 @@ A clean run is `differing: 0`.
 
 ## Which whistle, though
 
-Every number here is measured against whistle **2.10.8**, and "agrees with
-2.10.8" is not the same claim as "agrees with whistle". Some alignment somewhere
-is bound to be with behaviour a single release happened to have, and a corpus
-cannot ask that question about itself.
+"Agrees with 2.10.8" is not the same claim as "agrees with whistle". Some
+alignment somewhere is bound to be with behaviour one release happened to have,
+and a corpus cannot ask that question about itself. So every declaration says
+which whistle it was measured against, and a run can be pointed at another.
 
-`bench-versions.js` asks it. Two runs of every corpus against two releases, and
-a diff **by case name** — two runs that both report three differences are not
-thereby the same three, and a corpus that gained one and lost one would show as
-unchanged under a count.
+The baseline is the version `package.json` locks, installed by `npm ci` here.
+Any other version has a directory of its own under `versions/`, with its own
+lockfile, so measuring it never disturbs the baseline:
 
 ```sh
-WHISTLE_DIFF_ENV=Alpha cargo run -- --port 19401 --no-persist \
-  --insecure-upstream --dir /tmp/rs-versions &        # once; it does not change
-
-WHISTLE_DIFF_ENV=Alpha PORT_BASE=19400 node oracle.js &
-PORT_BASE=19400 node bench-versions.js > /tmp/v2.10.8.json
-kill %2
-
-mkdir -p /tmp/w29 && (cd /tmp/w29 && npm i whistle@2.9.109)
-WHISTLE_PKG=/tmp/w29/node_modules/whistle \
-  WHISTLE_DIFF_ENV=Alpha PORT_BASE=19400 node oracle.js &
-WHISTLE_PKG=/tmp/w29/node_modules/whistle PORT_BASE=19400 \
-  node bench-versions.js > /tmp/v2.9.109.json
-
-node bench-versions.js --diff /tmp/v2.10.8.json /tmp/v2.9.109.json
+(cd versions/2.10.10 && npm ci)                        # once
+node run.js all --whistle 2.10.10                      # the gate, against 2.10.10
+node run.js all --whistle 2.10.10 --assume-baseline    # what moved since the baseline
+node matrix.js ../../target/differential/<baseline run> ../../target/differential/<2.10.10 run>
 ```
 
-`oracle.js` takes `WHISTLE_PKG` for this, and keys its storage directory on the
-version as well as the port — two releases sharing one directory would each read
-the other's state, and the answer to "did this change between versions" would be
-partly an answer about a file the other one wrote.
+* **`--whistle V`** — every script loads that whistle, through `whistle-pkg.js`:
+  the pair, the benches that start their own, the rules oracle, and upstream's
+  own suite (taken from V's tag). The archive's name and manifest say which
+  version it was. Only declarations measured against V are in force, so against
+  a version nobody has measured yet, **every** difference is reported — dozens
+  per corpus, most of them this port's own deliberate ones. That is the raw
+  measurement, not a verdict.
+* **`--assume-baseline`** — hold V to the baseline's declarations. What fails is
+  what moved: a difference nothing explains is one the baseline did not have,
+  and a stale declaration is a difference the baseline had and V does not.
+* **`matrix.js A B`** — two archives, compared case by case and field by field
+  on the differences **before** any declaration excused them (each bench prints
+  them as `raw`). It says, per step, which differences are the same, which
+  appeared (`away`: upstream moved away from this port, or B has something
+  new), which disappeared (`closer`) and which changed value. It refuses, with
+  exit 2, two runs of different whistle-rs binaries or port blocks: a move
+  could then be this port's rather than upstream's.
 
-**The first run of it, 2.10.8 against 2.9.109: 60 differences, and every one of
-them additive.** Not a single case that differs against 2.10.8 agrees with
-2.9.109 — so nothing here is an alignment with one release's quirk. What the 60
-are is whistle's own feature set moving: 2.9.109 has no header filter conditions
-at all (`reqH.`, `resH.`, `h:` — 30 cases), no `*://` scheme wildcards (2), no
-`parseFrameSep` and so no body framing (14), no `resCors` preflight and no
-escaped separators in `delete://` keys (7), and — worth naming on its own — **no
-refusal of a `..` path segment**, which 2.10 added and this port has.
+Pin the binary for the pair of runs (`RS_BIN=…`, a copy outside `target/debug`)
+so a rebuild between them cannot slip in; the manifests record its SHA-256.
 
-Eight corpora are byte-identical between the two releases, which is its own
-finding: the pattern layer, the body layer, the value loader, the proxy family
-and the groups API did not move at all.
+**Adding a version.** Make `versions/V/package.json` depending on `whistle: V`
+alone, run `npm install --package-lock-only --registry=https://registry.npmjs.org/`
+there, and review the lock the way [the baseline's](#the-oracles-dependencies)
+was: every `resolved` on registry.npmjs.org, sha512, no install scripts, the
+moved packages' integrity cross-checked. Compare the package's `lib/` with the
+release's git tag. Add the tag's commit to `SUITE_COMMITS` in
+`upstream-suite.js`. Then the three runs above. When the `--assume-baseline`
+run has shown which declarations still hold, add the release to `MEASURED` in
+`whistle-pkg.js` — every entry that names no version means that list — and give
+the ones that did not hold, and the differences only one release has, an
+`upstream` list of their own (`only(…)` in `declared.js`).
 
-The specialty benches are not run from here; each wants its own launch.
+What 2.10.8 and 2.10.10 disagree on, and what this port did about each, is in
+[STATUS, U1](../../docs/STATUS.md#2026-09-29-u1-上游版本矩阵).
+
+An earlier tool, `bench-versions.js`, ran the corpora (only) against an oracle
+started by hand. Its one finding stands: **2.10.8 against 2.9.109, 60
+differences, every one additive** — header filter conditions, `*://`
+wildcards, body framing, `resCors` preflight, escaped separators in `delete://`
+keys and the refusal of a `..` path segment were all new in 2.10, and nothing
+here agreed with 2.9.109 alone. Eight corpora were byte-identical between the
+two.
 
 ## Reading a difference
 
