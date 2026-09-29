@@ -40,6 +40,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use super::outcome::{self, Phase, stopped};
 use super::timing::Timings;
 
 use super::body::DynBody;
@@ -826,9 +827,18 @@ pub async fn forward_with_addr(
             );
             // The retry overwrites the phases of the attempt that failed, which
             // is right: they belong to a connection that was never used.
+            let first = format!("{err:#}");
             forward_once(&next, err.into_request(), timings)
                 .await
-                .map_err(RetryableError::into_inner)
+                .map_err(|retry| {
+                    retry.into_inner().context(format!(
+                        "falling back to {}:{} after {}:{} failed ({first})",
+                        next.connect_host,
+                        next.connect_port,
+                        target.connect_host,
+                        target.connect_port
+                    ))
+                })
         }
         // `auto2http`: an https leg that will not come up, to an address this
         // request has reason to think speaks plain HTTP — see
@@ -840,9 +850,15 @@ pub async fn forward_with_addr(
                 target.connect_host,
                 target.connect_port
             );
+            let first = format!("{err:#}");
             forward_once(&next, err.into_request(), timings)
                 .await
-                .map_err(RetryableError::into_inner)
+                .map_err(|retry| {
+                    retry.into_inner().context(format!(
+                        "retrying in cleartext after https to {}:{} failed ({first})",
+                        target.connect_host, target.connect_port
+                    ))
+                })
         }
         Err(err) => Err(err.into_inner()),
     }
@@ -890,7 +906,7 @@ pub(crate) async fn tunnel_stream(target: &Target) -> Result<BoxedIo> {
 /// request to hand back: every failure here is a failure to connect.
 async fn tunnel_once(target: &Target) -> Result<BoxedIo> {
     if let Some(addr) = self_loop(target).await {
-        return Err(anyhow!("Self loop ({addr})"));
+        return Err(stopped(Phase::Rules, anyhow!("Self loop ({addr})")));
     }
     // No request exists on this path, so the CONNECT to an upstream proxy carries
     // no `User-Agent` or client `Proxy-Authorization` to echo. The proxy URL's own
@@ -956,7 +972,7 @@ async fn forward_once(
     // one path every request takes into the network.
     if let Some(addr) = self_loop(target).await {
         return Err(RetryableError::Connect(Box::new(UnsentRequest {
-            error: anyhow!("Self loop ({addr})"),
+            error: stopped(Phase::Rules, anyhow!("Self loop ({addr})")),
             request: req,
         })));
     }
@@ -1080,28 +1096,56 @@ pub fn set_request_timeout(timeout_ms: u64) {
 ///
 /// Returns the moment the *connect* began, so the caller can decide what else
 /// belongs in that phase — for a proxied hop, opening the tunnel does.
+///
+/// Each half's failure is tagged with its own phase — a name that did not
+/// resolve and an address that did not answer are different problems with
+/// different fixes, and the session says which. A timeout belongs to whichever
+/// half was still running when the budget ran out.
 async fn dial(host: &str, port: u16, timings: &Timings) -> Result<(TcpStream, Instant)> {
-    connect_within(async move {
-        let looking_up = Instant::now();
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
-        timings.dns(looking_up);
-        let connecting = Instant::now();
-        let tcp = TcpStream::connect(&addrs[..]).await?;
-        Ok((tcp, connecting))
-    })
-    .await
+    let deadline = tokio::time::Instant::now() + connect_budget();
+    let looking_up = Instant::now();
+    let addrs: Vec<SocketAddr> = within(deadline, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(outcome::at(Phase::Dns))?
+        .collect();
+    timings.dns(looking_up);
+    if addrs.is_empty() {
+        // `connect` would say "could not resolve to any addresses", which is
+        // this — a lookup that answered nothing.
+        return Err(stopped(Phase::Dns, anyhow!("{host} has no addresses")));
+    }
+    let connecting = Instant::now();
+    let tcp = within(deadline, TcpStream::connect(&addrs[..]))
+        .await
+        .map_err(outcome::at(Phase::Connect))?;
+    Ok((tcp, connecting))
+}
+
+/// The connect budget in force — [`CONNECT_TIMEOUT`], or less.
+fn connect_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(CONNECT_BUDGET.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Await a connection attempt, giving up after [`CONNECT_TIMEOUT`].
+#[cfg(test)]
 async fn connect_within<F, T>(connect: F) -> Result<T>
 where
     F: std::future::Future<Output = std::io::Result<T>>,
 {
-    let budget =
-        std::time::Duration::from_millis(CONNECT_BUDGET.load(std::sync::atomic::Ordering::Relaxed));
-    match tokio::time::timeout(budget, connect).await {
+    within(tokio::time::Instant::now() + connect_budget(), connect).await
+}
+
+/// Await `step` of a connection attempt, giving up at `deadline`.
+async fn within<F, T>(deadline: tokio::time::Instant, step: F) -> Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    match tokio::time::timeout_at(deadline, step).await {
         Ok(result) => Ok(result?),
-        Err(_) => Err(anyhow!("timed out after {}s", budget.as_secs_f32())),
+        Err(_) => Err(anyhow!(
+            "timed out after {}s",
+            connect_budget().as_secs_f32()
+        )),
     }
 }
 
@@ -1141,21 +1185,28 @@ async fn origin_stream(
             connecting = at;
             ptcp.set_nodelay(true).ok();
             let peer = ptcp.peer_addr().ok();
-            // Optionally TLS to the proxy itself (https-proxy).
+            // Optionally TLS to the proxy itself (https-proxy). Everything from
+            // here to a byte pipe to the origin is the proxy's to fail: its
+            // handshake, its CONNECT, its SOCKS negotiation.
             let pstream: BoxedIo = if proxy.kind == ProxyKind::Https {
                 let connector = TlsConnector::from(CLIENT_CONFIG.clone());
-                let name = ServerName::try_from(proxy.host.clone())
-                    .map_err(|_| anyhow!("invalid proxy host {}", proxy.host))?;
+                let name = ServerName::try_from(proxy.host.clone()).map_err(|_| {
+                    stopped(Phase::Proxy, anyhow!("invalid proxy host {}", proxy.host))
+                })?;
                 BoxedIo(Box::new(
-                    connector.connect(name, ptcp).await.context("proxy TLS")?,
+                    connector
+                        .connect(name, ptcp)
+                        .await
+                        .context("proxy TLS")
+                        .map_err(outcome::at(Phase::Proxy))?,
                 ))
             } else {
                 BoxedIo(Box::new(ptcp))
             };
             let stream = match proxy.kind {
-                ProxyKind::Socks => {
-                    socks5_connect(pstream, dst_host, dst_port, &proxy.auth).await?
-                }
+                ProxyKind::Socks => socks5_connect(pstream, dst_host, dst_port, &proxy.auth)
+                    .await
+                    .map_err(outcome::at(Phase::Proxy))?,
                 ProxyKind::Http | ProxyKind::Https => {
                     if uses_absolute_form(target) {
                         // Plain http via a plain proxy: absolute-form, no CONNECT.
@@ -1164,7 +1215,8 @@ async fn origin_stream(
                     }
                     let tunnelled = http_connect(pstream, dst_host, dst_port, hop, proxy, false)
                         .await
-                        .with_context(|| format!("via proxy {}:{}", proxy.host, proxy.port))?;
+                        .with_context(|| format!("via proxy {}:{}", proxy.host, proxy.port))
+                        .map_err(outcome::at(Phase::Proxy))?;
                     if target.uses_proxy_tunnel() {
                         // The address we just reached is itself a proxy: ask it,
                         // through the tunnel we now hold, for the real origin.
@@ -1177,7 +1229,8 @@ async fn origin_stream(
                             true,
                         )
                         .await
-                        .with_context(|| format!("via proxy tunnel {dst_host}:{dst_port}"))?
+                        .with_context(|| format!("via proxy tunnel {dst_host}:{dst_port}"))
+                        .map_err(outcome::at(Phase::Proxy))?
                     } else {
                         tunnelled
                     }
@@ -1194,12 +1247,13 @@ async fn origin_stream(
             target.tls_ciphers.as_ref(),
         ));
         let server_name = ServerName::try_from(target.sni.clone())
-            .map_err(|_| anyhow!("invalid SNI host {}", target.sni))?;
+            .map_err(|_| stopped(Phase::Tls, anyhow!("invalid SNI host {}", target.sni)))?;
         let shaking_hands = Instant::now();
         let tls = connector
             .connect(server_name, base)
             .await
-            .context("upstream TLS handshake")?;
+            .context("upstream TLS handshake")
+            .map_err(outcome::at(Phase::Tls))?;
         timings.ssl(shaking_hands);
         Ok((BoxedIo(Box::new(tls)), peer))
     } else {
@@ -1214,7 +1268,8 @@ where
 {
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
-        .context("upstream handshake")?;
+        .context("upstream handshake")
+        .map_err(outcome::at(Phase::Response))?;
     // `with_upgrades()` keeps the connection usable for protocol upgrades
     // (WebSocket); a plain `conn.await` tears the socket down on 101.
     tokio::spawn(async move {
@@ -1222,10 +1277,18 @@ where
             tracing::debug!("upstream connection error: {err}");
         }
     });
-    let resp = sender
-        .send_request(req)
-        .await
-        .context("sending upstream request")?;
+    let resp = sender.send_request(req).await.map_err(|err| {
+        // hyper reports a request body that failed while it was being written
+        // as a *user* error: the client's upload broke, not the server.
+        let phase = match err.is_user() {
+            true => Phase::Request,
+            false => Phase::Response,
+        };
+        stopped(
+            phase,
+            anyhow::Error::new(err).context("sending upstream request"),
+        )
+    })?;
     Ok(resp)
 }
 

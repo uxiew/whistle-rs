@@ -10,8 +10,11 @@ pub mod body;
 pub mod ciphers;
 pub mod coding;
 pub mod dest;
+#[cfg(test)]
+mod failure_tests;
 pub mod forwarded;
 pub mod header_rules;
+pub mod outcome;
 pub mod persist;
 pub mod restream;
 pub mod script;
@@ -1120,6 +1123,11 @@ pub struct Session {
     /// — see [`timing::Timings`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<timing::Timings>,
+    /// Why the request did not complete, when it did not — see [`outcome`].
+    /// Absent for every request that got its whole answer, including one whose
+    /// origin answered `502`: that is the origin's answer, not a failure here.
+    #[serde(skip_serializing_if = "outcome::Outcome::is_ok")]
+    pub error: outcome::Outcome,
 }
 
 /// Read a single header as an owned string, if present and valid UTF-8.
@@ -2328,6 +2336,7 @@ mod hide_tests {
             req_body: None,
             res_body: None,
             timings: None,
+            error: Default::default(),
         };
         s.rules = rules
             .iter()
@@ -2483,7 +2492,7 @@ async fn top_level(
     }
     // Absolute-form URI => proxied request. Origin-form => a direct hit on us.
     if req.uri().authority().is_some() {
-        return guard(serve(state, req, Origin::Forward, peer).await);
+        return serve_recorded(state, req, Origin::Forward, peer).await;
     }
     // …unless the path opens with the escape hatch. Everything addressed to the
     // proxy's own port is its console, and `/-/` (or `/_/`) is how upstream lets
@@ -2498,7 +2507,7 @@ async fn top_level(
     // which is what upstream does with it too.
     if let Some(uri) = bypass_console(&req) {
         *req.uri_mut() = uri;
-        return guard(serve(state, req, Origin::Forward, peer).await);
+        return serve_recorded(state, req, Origin::Forward, peer).await;
     }
     // …and unless it names somebody else. "Addressed to the proxy's own port"
     // is what the `Host` says, not where the socket went: an origin-form
@@ -2524,7 +2533,7 @@ async fn top_level(
             return Ok(loop_detected(&uri));
         }
         *req.uri_mut() = uri;
-        return guard(serve(state, req, Origin::Forward, peer).await);
+        return serve_recorded(state, req, Origin::Forward, peer).await;
     }
     req.headers_mut().remove(upstream::LOOP_HEADER);
     Ok(webui::handle(&state, req).await)
@@ -2685,6 +2694,9 @@ fn tunnel_aborted(state: &Arc<AppState>, host: &str, port: u16, peer: SocketAddr
         // A connection has no request headers the rules were allowed to see —
         // see [`sni::connection_req_info`] — so showing some here would be
         // showing what did not take part in the decision.
+        error: aborted(
+            "tunnel refused by a rule (enable://abort, abortReq, abortRes or disable://tunnel)",
+        ),
         ..Default::default()
     });
     true
@@ -3109,7 +3121,7 @@ where
             tls,
             sni,
         };
-        async move { guard(serve(state, req, origin, peer).await) }
+        async move { serve_recorded(state, req, origin, peer).await }
     });
 
     hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -3140,7 +3152,7 @@ where
             tls,
             sni,
         };
-        async move { guard(serve(state, req, origin, peer).await) }
+        async move { serve_recorded(state, req, origin, peer).await }
     });
 
     hyper::server::conn::http1::Builder::new()
@@ -4116,7 +4128,137 @@ impl std::fmt::Display for Destroyed {
 
 impl std::error::Error for Destroyed {}
 
-/// Turn an internal error into a 502, except an abort, which gets no answer.
+/// The header on a response this proxy made up because the request failed,
+/// naming the [`outcome::Phase`] it failed in. Its presence is what tells a
+/// `502` from here apart from a `502` the origin sent.
+pub const ERROR_HEADER: &str = "x-whistle-rs-error";
+
+/// The header carrying the id of the session a failed request was recorded
+/// as, so the client that got the error can find it in the console.
+pub const SESSION_HEADER: &str = "x-whistle-rs-session";
+
+/// A request on its way to becoming a session.
+///
+/// Every request [`serve`] takes on becomes **exactly one** session, however it
+/// ends. The paths that answer record their own, through [`Ledger::record`]; a
+/// failure that escapes [`serve`] as an error is recorded by [`guard`] from the
+/// draft; and a request whose future is dropped — which is what hyper does when
+/// the client closes the connection or resets the stream while waiting — is
+/// recorded when the ledger is dropped with it. Before this, only the first of
+/// the three existed, so every request that failed before its response head
+/// arrived was in the log and nowhere else.
+pub(crate) struct Ledger {
+    state: Arc<AppState>,
+    /// What is known about the request so far. `None` until [`serve`] knows
+    /// this is a request the console records — the console's own traffic is not.
+    draft: Option<Session>,
+    /// When the request arrived. Every session's `time_ms` and `duration_ms`
+    /// count from here.
+    started: Instant,
+    time_ms: u128,
+    /// A session has been recorded; this request owes nothing more.
+    settled: bool,
+}
+
+impl Ledger {
+    pub(crate) fn new(state: &Arc<AppState>) -> Self {
+        Ledger {
+            state: state.clone(),
+            draft: None,
+            started: Instant::now(),
+            time_ms: now_ms(),
+            settled: false,
+        }
+    }
+
+    /// The request is one the console records: this much is known about it.
+    fn open(&mut self, draft: Session) {
+        self.draft = Some(Session {
+            time_ms: self.time_ms,
+            ..draft
+        });
+    }
+
+    /// Add to what the draft knows. A no-op before [`Ledger::open`].
+    fn note(&mut self, f: impl FnOnce(&mut Session)) {
+        if let Some(draft) = &mut self.draft {
+            f(draft);
+        }
+    }
+
+    /// Record `session` as this request's one session.
+    fn record(&mut self, session: Session) -> u64 {
+        self.settled = true;
+        self.state.record(session)
+    }
+
+    /// Record the draft as a request that failed with `failure`, the client
+    /// having been answered with `status` (0: nothing at all). `None` when
+    /// there is nothing to record — no draft, or a session already recorded.
+    fn fail(&mut self, failure: outcome::Failure, status: u16) -> Option<u64> {
+        if self.settled {
+            return None;
+        }
+        let draft = self.draft.take()?;
+        tracing::info!(
+            "{} {} -> failed at {}: {}",
+            draft.method,
+            draft.url,
+            failure.phase,
+            failure.message
+        );
+        Some(self.record(Session {
+            status,
+            duration_ms: self.started.elapsed().as_millis(),
+            error: outcome::Outcome::failed(failure),
+            ..draft
+        }))
+    }
+}
+
+impl Drop for Ledger {
+    /// The request's future was dropped before it settled. Nothing else drops
+    /// it: [`serve`] and [`guard`] settle every way out of it they can see, so
+    /// what is left is hyper giving up on a client that has gone.
+    fn drop(&mut self) {
+        self.fail(
+            outcome::Failure::new(
+                outcome::Phase::Client,
+                "the client closed the connection before the response arrived",
+            ),
+            0,
+        );
+    }
+}
+
+/// Where a forwarded request went, as its session's `target` says it.
+fn target_desc(target: &upstream::Target) -> String {
+    let mut desc = format!("{}:{}", target.connect_host, target.connect_port);
+    if target.proxy.is_some() {
+        desc.push_str(" (via proxy)");
+    }
+    desc
+}
+
+/// The outcome of a request a rule dropped on purpose.
+fn aborted(how: &str) -> outcome::Outcome {
+    outcome::Outcome::failed(outcome::Failure::new(outcome::Phase::Abort, how))
+}
+
+/// [`serve`] a request and settle its session, whatever happens to it.
+async fn serve_recorded(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    origin: Origin,
+    peer: SocketAddr,
+) -> Result<Response<DynBody>, Destroyed> {
+    let mut ledger = Ledger::new(&state);
+    let result = serve(state, req, origin, peer, &mut ledger).await;
+    guard(&mut ledger, result)
+}
+
+/// Turn a failure into a 502, except an abort, which gets no answer — and
+/// record it either way.
 ///
 /// The 502 is dressed like every other answer this proxy makes itself: it says
 /// what it is (`Content-Type`) and who made it (`x-server`). It went out as an
@@ -4126,19 +4268,44 @@ impl std::error::Error for Destroyed {}
 /// answer, from the same place (`wrapGatewayError` → `wrapResponse`,
 /// `_original/lib/util/index.js:1080-1109`); its body is HTML, and this one is
 /// the error chain as plain text, so it says `text/plain`.
-fn guard(result: Result<Response<DynBody>>) -> Result<Response<DynBody>, Destroyed> {
+///
+/// `x-server` alone cannot tell this 502 from an origin's: a `statusCode://502`
+/// rule carries it too. [`ERROR_HEADER`] can, and [`SESSION_HEADER`] says which
+/// session in the console is this request.
+fn guard(
+    ledger: &mut Ledger,
+    result: Result<Response<DynBody>>,
+) -> Result<Response<DynBody>, Destroyed> {
     match result {
         Ok(resp) => Ok(resp),
-        Err(err) if err.is::<Destroyed>() => Err(Destroyed),
+        Err(err) if err.is::<Destroyed>() => {
+            // Every abort records itself before it leaves `serve`; this is the
+            // backstop that keeps a missed one from being called a client that
+            // hung up.
+            ledger.fail(
+                outcome::Failure::new(outcome::Phase::Abort, format!("{err:#}")),
+                0,
+            );
+            Err(Destroyed)
+        }
         Err(err) => {
+            let phase = outcome::phase_of(&err).unwrap_or(outcome::Phase::Internal);
             // `{err:#}` includes the full anyhow context chain (e.g. the
             // underlying rustls reason behind "upstream TLS handshake").
-            tracing::debug!("request failed: {err:#}");
+            let message = format!("{err:#}");
+            let id = ledger.fail(outcome::Failure::new(phase, message.clone()), 502);
+            if id.is_none() {
+                tracing::debug!("request failed at {phase}: {message}");
+            }
             let mut resp = Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(body::full(Bytes::from(format!("whistle-rs: {err:#}"))))
+                .header(ERROR_HEADER, phase.as_str())
+                .body(body::full(Bytes::from(format!("whistle-rs: {message}"))))
                 .unwrap();
+            if let Some(id) = id {
+                resp.headers_mut().insert(SESSION_HEADER, id.into());
+            }
             apply::mark_self_generated(resp.headers_mut());
             Ok(resp)
         }
@@ -4151,6 +4318,7 @@ async fn serve(
     mut req: Request<Incoming>,
     origin: Origin,
     peer: SocketAddr,
+    ledger: &mut Ledger,
 ) -> Result<Response<DynBody>> {
     // The handful of hostnames that *are* the console, before anything else
     // looks at this request. `http://local.whistlejs.com/` through the proxy is
@@ -4335,6 +4503,18 @@ async fn serve(
         sni: matches!(origin, Origin::Mitm { sni: true, .. }),
         composer: from_composer,
     };
+    // From here on this request becomes a session however it ends. The
+    // client's own headers stand in until the outgoing ones exist, for the
+    // reason a locally answered request shows them — see
+    // `capture_client_request`.
+    ledger.open(Session {
+        method: info.method.clone(),
+        url: info.full_url.clone(),
+        client_ip: client_ip.clone(),
+        req_headers: header_pairs(req.headers()),
+        ..Default::default()
+    });
+    let (started, time_ms) = (ledger.started, ledger.time_ms);
 
     // A `b:` filter reads the request body, so the body has to be in hand
     // *before* the rules resolve. Whether any line asks is answered from the
@@ -4361,7 +4541,10 @@ async fn serve(
             // the plain one: `enable://reqMergeBigData` lives on a rule, and
             // which rules apply is the question this buffering exists to
             // answer, so consulting it would be circular.
-            match collect_capped_body(body::from_incoming(incoming), apply::REQ_BODY_LIMIT).await? {
+            match collect_capped_body(body::from_incoming(incoming), apply::REQ_BODY_LIMIT)
+                .await
+                .map_err(outcome::at(outcome::Phase::Request))?
+            {
                 body::Capped::Whole { bytes, .. } => (
                     Request::from_parts(parts, body::full(bytes.clone())),
                     Some(bytes),
@@ -4456,8 +4639,12 @@ async fn serve(
     // yet. A rule set that names no location walks its own operators and
     // returns; see `apply::load_rule_values`.
     apply::load_rule_values(&mut resolved, &info).await;
-    let started = Instant::now();
-    let time_ms = now_ms();
+    // Which rules applied is most of what a failed request's session has to
+    // say. Noted again below whenever a plugin can have added some.
+    ledger.note(|s| {
+        s.log = log_labels(&resolved);
+        s.rules = matched_ops(&resolved);
+    });
 
     // Plugins matched by `plugin://name` / `pipe://name`, minus any that aren't
     // registered. `pipe://` drives the *streaming* hooks and `plugin://` the
@@ -4498,7 +4685,9 @@ async fn serve(
             (true, Some(bytes)) => (req, Some(bytes)),
             (true, None) => {
                 let (parts, body) = req.into_parts();
-                let bytes = collect_body(body).await?;
+                let bytes = collect_body(body)
+                    .await
+                    .map_err(outcome::at(outcome::Phase::Request))?;
                 (
                     Request::from_parts(parts, body::full(bytes.clone())),
                     Some(bytes),
@@ -4549,6 +4738,11 @@ async fn serve(
             plugin_set_headers.extend(result.set_headers);
             plugin_remove_headers.extend(result.remove_headers);
             let blocked = result.blocked;
+            // A gate that failed rather than refused: the request stops here
+            // because a plugin broke, and its session says so.
+            let failure = result
+                .failure
+                .map(|why| outcome::Failure::new(outcome::Phase::Plugin, format!("{name}: {why}")));
             if let Some(resp) = result.response {
                 tracing::info!("{} {} -> plugin {name}", info.method, info.full_url);
                 let target = format!("plugin:{name}");
@@ -4583,7 +4777,7 @@ async fn serve(
                 // here — see `capture_client_request`.
                 let (req_headers, req_body) =
                     capture_client_request(&mut req, state.config.body_preview_cap).await;
-                state.record(Session {
+                ledger.record(Session {
                     id: 0,
                     time_ms,
                     method: info.method.clone(),
@@ -4600,6 +4794,7 @@ async fn serve(
                     res_body,
                     // Answered here: no connection was opened, so there are no phases.
                     timings: None,
+                    error: failure.map(outcome::Outcome::failed).unwrap_or_default(),
                 });
                 return Ok(response);
             }
@@ -4621,7 +4816,7 @@ async fn serve(
         // `enable://abort`.
         let (req_headers, req_body) =
             capture_client_request(&mut req, state.config.body_preview_cap).await;
-        state.record(Session {
+        ledger.record(Session {
             id: 0,
             time_ms,
             method: info.method.clone(),
@@ -4637,6 +4832,7 @@ async fn serve(
             rules: matched_ops(&resolved),
             req_headers,
             req_body,
+            error: aborted("dropped by a rule before it was sent (enable://abort or abortReq)"),
             ..Default::default()
         });
         return Err(Destroyed.into());
@@ -4694,7 +4890,7 @@ async fn serve(
         // `capture_client_request`.
         let (req_headers, req_body) =
             capture_client_request(&mut req, state.config.body_preview_cap).await;
-        state.record(Session {
+        ledger.record(Session {
             id: 0,
             time_ms,
             method: info.method.clone(),
@@ -4711,6 +4907,9 @@ async fn serve(
             res_body,
             // Answered here: no connection was opened, so there are no phases.
             timings: None,
+            // A rule's answer, whatever its status — a `file://` whose URL
+            // would not load answers 502 on purpose, as upstream's does.
+            error: Default::default(),
         });
         return Ok(resp);
     }
@@ -4753,11 +4952,16 @@ async fn serve(
         is_internal_req,
     );
     let forwarding = forwarding.as_ref().unwrap_or(&resolved);
+    // A plugin's request hook may have merged rules since they were last noted.
+    ledger.note(|s| {
+        s.log = log_labels(&resolved);
+        s.rules = matched_ops(&resolved);
+    });
 
     // WebSocket / other protocol upgrades are tunnelled after a 101.
     if is_upgrade(&req) {
         return serve_upgrade(
-            &state, req, &info, &resolved, &dest, forwarding, client_ip, time_ms, started,
+            &state, req, &info, &resolved, &dest, forwarding, client_ip, ledger,
         )
         .await;
     }
@@ -4770,13 +4974,19 @@ async fn serve(
     // instead sends the traffic somewhere the rule never asked for. See
     // `dest::unroutable_scheme`.
     if let Some(scheme) = dest::unroutable_scheme(&resolved) {
-        anyhow::bail!("unsupported protocol {scheme}:");
+        return Err(outcome::stopped(
+            outcome::Phase::Rules,
+            anyhow::anyhow!("unsupported protocol {scheme}:"),
+        ));
     }
 
     // Fails the request rather than silently connecting direct when a proxy rule
     // matched but could not be honoured (unusable address, unreachable or
     // throwing PAC file) — see `apply::find_proxy`.
-    let target = apply::resolve_target(&info, &dest, forwarding).await?;
+    let target = apply::resolve_target(&info, &dest, forwarding)
+        .await
+        .map_err(outcome::at(outcome::Phase::Rules))?;
+    ledger.note(|s| s.target = target_desc(&target));
 
     // A proxy rule that names this proxy would send the request back to us, be
     // matched by the same rule, and recurse until the sockets run out. whistle
@@ -4809,7 +5019,7 @@ async fn serve(
             .header(hyper::header::LOCATION, &location)
             .body(body::empty())
             .expect("static 302");
-        state.record(Session {
+        ledger.record(Session {
             id: 0,
             time_ms,
             method: info.method.clone(),
@@ -4909,7 +5119,10 @@ async fn serve(
         // Bounded: these operators need the body in memory, and the body is
         // whatever the client decided to send. Past the bound whistle stops
         // transforming and lets the rest through — see [`body::collect_capped`].
-        match collect_capped_body(incoming, apply::req_body_limit(&resolved)).await? {
+        match collect_capped_body(incoming, apply::req_body_limit(&resolved))
+            .await
+            .map_err(outcome::at(outcome::Phase::Request))?
+        {
             body::Capped::TooBig { body, .. } => {
                 // Said out loud, because every other way for these operators to
                 // do nothing has turned out to be a bug worth fixing. This one
@@ -5049,6 +5262,14 @@ async fn serve(
     // Handed in rather than returned: the row is recorded when the response head
     // arrives, and `receive` only lands when the body ends. See `timing`.
     let timings = timing::Timings::new();
+    // Everything a failed forward's session can show: what was sent, and how
+    // far the connection got — the phases stop where it failed.
+    ledger.note(|s| {
+        s.id = frame_session;
+        s.req_headers = req_header_pairs.clone();
+        s.req_body = req_body_cap.clone();
+        s.timings = Some(timings.clone());
+    });
     let (upstream_resp, server_addr) =
         upstream::forward_with_addr(&target, out_req, &timings).await?;
 
@@ -5088,8 +5309,8 @@ async fn serve(
         // Upstream keeps the head it is about to throw away (`req.__resHeaders`
         // / `req.__statusCode`, `res.js:1176-1177`) so the capture still shows
         // what arrived; without this the session reads as if nothing came back.
-        state.record(Session {
-            id: 0,
+        ledger.record(Session {
+            id: frame_session,
             time_ms,
             method: info.method.clone(),
             url: info.full_url.clone(),
@@ -5102,6 +5323,10 @@ async fn serve(
             req_headers: req_header_pairs,
             res_headers: header_pairs(&parts.headers),
             req_body: req_body_cap,
+            timings: Some(timings),
+            error: aborted(
+                "dropped by a rule after the server answered (enable://abort or abortRes)",
+            ),
             ..Default::default()
         });
         return Err(Destroyed.into());
@@ -5213,7 +5438,10 @@ async fn serve(
             Some(new) => collected = Some((Bytes::from(new.clone()), None)),
             None => {
                 let cap = apply::res_body_limit(&resolved, state.config.body_rewrite_cap);
-                match collect_capped_body(body, cap).await? {
+                match collect_capped_body(body, cap)
+                    .await
+                    .map_err(outcome::at(outcome::Phase::Response))?
+                {
                     body::Capped::Whole { bytes, trailers } => {
                         collected = Some((bytes, trailers));
                     }
@@ -5383,18 +5611,14 @@ async fn serve(
     // too; it was simply received before the operators ran.
     let res_body = timing::measure_receive(res_body, timings.clone());
 
-    let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
-    if target.proxy.is_some() {
-        target_desc.push_str(" (via proxy)");
-    }
-    let recorded = state.record(Session {
+    let recorded = ledger.record(Session {
         id: frame_session,
         time_ms,
         method: info.method.clone(),
         url: info.full_url.clone(),
         status: parts.status.as_u16(),
         client_ip: client_ip.clone(),
-        target: target_desc,
+        target: target_desc(&target),
         duration_ms: started.elapsed().as_millis(),
         log: log_labels(&resolved),
         rules: matched_ops(&resolved),
@@ -5403,6 +5627,7 @@ async fn serve(
         req_body: req_body_cap,
         res_body: res_body_cap,
         timings: Some(timings.clone()),
+        error: Default::default(),
     });
     for (dir, payload) in buffered_frames {
         state.record_frame(WsFrame::body_frame(recorded, dir, &payload));
@@ -5569,10 +5794,13 @@ async fn serve_upgrade(
     dest: &dest::Destination,
     forwarding: &Resolved,
     client_ip: Option<String>,
-    time_ms: u128,
-    started: Instant,
+    ledger: &mut Ledger,
 ) -> Result<Response<DynBody>> {
-    let target = apply::resolve_target(info, dest, forwarding).await?;
+    let (time_ms, started) = (ledger.time_ms, ledger.started);
+    let target = apply::resolve_target(info, dest, forwarding)
+        .await
+        .map_err(outcome::at(outcome::Phase::Rules))?;
+    ledger.note(|s| s.target = target_desc(&target));
     let frame_script = resolved.value("frameScript").and_then(script::load_script);
     let websocket = is_websocket(&req, resolved);
     // Which plugins may hook this session's frames. Resolving the plan contacts
@@ -5623,12 +5851,12 @@ async fn serve_upgrade(
         target.connect_port
     );
 
-    let mut resp = upstream::forward(&target, out_req).await?;
-
-    let mut target_desc = format!("{}:{}", target.connect_host, target.connect_port);
-    if target.proxy.is_some() {
-        target_desc.push_str(" (via proxy)");
-    }
+    // Measured for the same reason as a plain request's: a handshake that
+    // fails to connect shows how far it got.
+    let timings = timing::Timings::new();
+    ledger.note(|s| s.timings = Some(timings.clone()));
+    let (mut resp, _) = upstream::forward_with_addr(&target, out_req, &timings).await?;
+    let target_desc = target_desc(&target);
 
     // `enable://abort` / `abortRes` on an upgrade: the handshake went out, the
     // server answered it, and the client is cut off instead of being handed the
@@ -5645,7 +5873,7 @@ async fn serve_upgrade(
         // The head that is being thrown away is still recorded, for the reason
         // the HTTP gate records one: a session that shows nothing coming back
         // reads as if the server never answered, and it did.
-        state.record(Session {
+        ledger.record(Session {
             id: 0,
             time_ms,
             method: info.method.clone(),
@@ -5657,12 +5885,16 @@ async fn serve_upgrade(
             log: log_labels(resolved),
             rules: matched_ops(resolved),
             res_headers: header_pairs(resp.headers()),
+            timings: Some(timings),
+            error: aborted(
+                "dropped by a rule after the server answered (enable://abort or abortRes)",
+            ),
             ..Default::default()
         });
         return Err(Destroyed.into());
     }
 
-    let session_id = state.record(Session {
+    let session_id = ledger.record(Session {
         id: 0,
         time_ms,
         method: info.method.clone(),
@@ -5674,6 +5906,7 @@ async fn serve_upgrade(
         log: log_labels(resolved),
         rules: matched_ops(resolved),
         res_headers: header_pairs(resp.headers()),
+        timings: Some(timings),
         ..Default::default()
     });
 

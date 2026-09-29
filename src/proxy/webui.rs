@@ -741,7 +741,7 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
         q.iter()
             .rev()
             .map(|s| {
-                serde_json::json!({
+                let mut row = serde_json::json!({
                     "id": s.id,
                     "time_ms": s.time_ms,
                     "method": s.method,
@@ -777,7 +777,15 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
                     "type": s.res_headers.iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                         .map(|(_, v)| v.as_str()),
-                })
+                });
+                // Why the request did not complete, on the row itself: "which of
+                // these failed, and where" is a question about the whole list.
+                // Only on the rows that have one, so the poll does not carry a
+                // `null` for every request that went fine.
+                if let Some(failure) = s.error.get() {
+                    row["error"] = serde_json::json!(failure);
+                }
+                row
             })
             .collect()
     };
@@ -891,6 +899,10 @@ fn har_entry(s: &Session) -> serde_json::Value {
         "serverIPAddress": "",
         "_target": s.target,
         "_clientIp": s.client_ip,
+        // Chrome's own export writes a failed request's reason here as one
+        // string (`net::ERR_CONNECTION_REFUSED`), and HAR viewers that show it
+        // expect a string; the phase leads so it reads the same way.
+        "_error": s.error.get().map(|f| format!("{}: {}", f.phase, f.message)),
     })
 }
 

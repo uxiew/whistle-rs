@@ -430,6 +430,11 @@ pub struct PluginResult {
     /// which ignores every other rule on the request
     /// (`_original/lib/plugins/index.js:936-959`).
     pub blocked: bool,
+    /// Why the gate blocked this request when the plugin *failed* — could not
+    /// be reached, did not answer in time, answered nonsense — rather than
+    /// refused. The request's session carries it as a failure, where a refusal
+    /// is the plugin's answer and is not one.
+    pub failure: Option<String>,
 }
 
 /// What a plugin's response hook returns. All fields optional — an empty result
@@ -624,6 +629,7 @@ impl RemotePlugin {
                     return PluginResult {
                         response: Some(auth::deny_response(&self.name, &denial).await),
                         blocked: true,
+                        failure: denial.reason.clone(),
                         ..Default::default()
                     };
                 }
@@ -816,6 +822,7 @@ fn parse_request_result(bytes: &[u8]) -> PluginResult {
         // refusal: refusals come from the `auth` gate, which is a different
         // route with a verdict of its own.
         blocked: false,
+        failure: None,
     }
 }
 
@@ -1012,6 +1019,7 @@ impl Plugins {
                             return Some(PluginResult {
                                 response: Some(auth::deny_response(name, &denial).await),
                                 blocked: true,
+                                failure: denial.reason.clone(),
                                 ..Default::default()
                             });
                         }

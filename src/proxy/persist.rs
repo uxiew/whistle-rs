@@ -51,6 +51,10 @@ pub struct PersistedSession {
     /// Snapshotted response body preview text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub res_body_preview: Option<BodySnapshot>,
+    /// Why the request did not complete, when it did not — see
+    /// [`super::outcome`]. `default` so older files, which never had it, load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<super::outcome::Failure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +97,7 @@ impl PersistedSession {
                 }
             }),
             timings: s.timings.clone(),
+            error: s.error.get(),
         }
     }
 
@@ -130,6 +135,10 @@ impl PersistedSession {
                     snap.text.len().max(snap.len),
                 )
             }),
+            error: self
+                .error
+                .map(super::outcome::Outcome::failed)
+                .unwrap_or_default(),
         }
     }
 }
@@ -381,6 +390,10 @@ mod tests {
                 truncated: false,
                 text: "hello".into(),
             }),
+            error: Some(super::super::outcome::Failure::new(
+                super::super::outcome::Phase::Connect,
+                "connecting to example.com:80: Connection refused",
+            )),
         };
         let json = serde_json::to_string(&ps).unwrap();
         let back: PersistedSession = serde_json::from_str(&json).unwrap();
@@ -393,6 +406,10 @@ mod tests {
         // after a restart that could not say what applied to it is a session
         // the console cannot answer its central question about.
         assert_eq!(session.rules[0].raw, "host://1.2.3.4");
+        // Why it failed survives a restart too: a failed request reloaded as
+        // an ordinary one would be the exact confusion the field exists to end.
+        let failure = session.error.get().expect("the failure survives");
+        assert_eq!(failure.phase, super::super::outcome::Phase::Connect);
     }
 
     /// A JSONL file written before `rules` existed still loads. Sessions are
@@ -405,6 +422,7 @@ mod tests {
             "client_ip":null,"target":"a:80","duration_ms":1}"#;
         let back: PersistedSession = serde_json::from_str(line).expect("an older session");
         assert!(back.rules.is_empty());
+        assert!(back.error.is_none());
     }
 
     fn scratch(name: &str) -> PathBuf {
