@@ -14,6 +14,7 @@ certificates after you install and trust that root CA.
   - [iOS](#ios)
   - [Android](#android)
   - [Firefox](#firefox-all-platforms)
+- [Remove it](#remove-it)
 - [Verify](#verify)
 - [How it works](#how-it-works)
 - [Security notes](#security-notes)
@@ -134,6 +135,45 @@ Firefox uses its own trust store, not the OS one:
 
 **Settings → Privacy & Security → Certificates → View Certificates → Authorities →
 Import** → select `root.crt` → check *Trust this CA to identify websites*.
+
+---
+
+## Remove it
+
+When you stop debugging, or before deleting the storage directory: a trusted root
+whose private key is still on disk lets whoever reads `root.key` impersonate any
+site to this client. Remove the trust first, then the files. Every whistle-rs CA
+is named **whistle-rs Root CA**, so if you ever regenerated it, more than one may
+be installed; the commands below remove all of them.
+
+```bash
+# macOS — repeat until it answers "Unable to delete certificate matching"
+sudo security delete-certificate -c "whistle-rs Root CA" /Library/Keychains/System.keychain
+
+# Debian / Ubuntu
+sudo rm /usr/local/share/ca-certificates/whistle-rs.crt
+sudo update-ca-certificates --fresh
+
+# Fedora / RHEL
+sudo rm /etc/pki/ca-trust/source/anchors/whistle-rs.crt
+sudo update-ca-trust
+```
+
+```powershell
+# Windows, as Administrator
+Get-ChildItem Cert:\LocalMachine\Root |
+  Where-Object Subject -like '*CN=whistle-rs Root CA*' | Remove-Item
+```
+
+- **iOS:** Settings → General → VPN & Device Management → the whistle-rs profile →
+  Remove Profile.
+- **Android:** Settings → Security → Encryption & credentials → Trusted credentials →
+  User → whistle-rs Root CA → Remove.
+- **Firefox:** Settings → Privacy & Security → Certificates → View Certificates →
+  Authorities → whistle-rs Root CA → Delete or Distrust.
+
+Also set the client's proxy back. None of these commands were run by this
+project's tests, which never touch a trust store.
 
 ---
 
