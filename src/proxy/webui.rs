@@ -4339,6 +4339,43 @@ mod api_doc_tests {
         (routes, paths)
     }
 
+    /// The paths the document's `curl` examples call, with the method each
+    /// uses: `-X POST` or `-d` make it a POST, as curl does.
+    fn examples() -> Vec<(String, String)> {
+        let doc = include_str!("../../docs/API.md");
+        let url = regex::Regex::new(r"http://127\.0\.0\.1:8899(/[^'\s?]*)").unwrap();
+        let method = regex::Regex::new(r"-X (GET|POST|DELETE)").unwrap();
+        doc.lines()
+            .filter(|line| line.contains("curl "))
+            .flat_map(|line| {
+                let m = match method.captures(line) {
+                    Some(c) => c[1].to_string(),
+                    None if line.contains(" -d ") => "POST".to_string(),
+                    None => "GET".to_string(),
+                };
+                url.captures_iter(line)
+                    .map(|c| (m.clone(), c[1].to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The examples are what gets copied, so they are held to the table too.
+    #[test]
+    fn every_api_example_calls_a_route_that_exists() {
+        let routes = routes();
+        let examples = examples();
+        assert!(examples.len() >= 4, "the examples were read: {examples:?}");
+        let broken: Vec<_> = examples
+            .iter()
+            .filter(|(m, p)| {
+                !routes.contains(&(m.clone(), p.clone()))
+                    && !routes.contains(&("*".to_string(), p.clone()))
+            })
+            .collect();
+        assert!(broken.is_empty(), "examples calling no route: {broken:?}");
+    }
+
     /// docs/API.md is the contract an agent programs against, and it said
     /// nothing a test could hold it to: a route added here and not written
     /// down, or written down and gone, was noticed by whoever tripped on it.
