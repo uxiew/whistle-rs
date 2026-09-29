@@ -78,7 +78,7 @@ cargo build --locked              # 仓库根目录；比源码旧的二进制�
 cd tests/differential
 npm ci                            # 按锁文件装 whistle 2.10.8 全套依赖；不要用 npm install
 node run.js fast                  # 约 5 秒：规则解析差分（文档语料 + 手写语料）和二维码，不开端口代理
-node run.js network               # 约 14 分钟（本机实测 851 秒）：两边代理都起来，所有语料和专项 bench
+node run.js network               # 约 18 分钟（2026-09-29 本机 `all` 实测 1093 秒）：两边代理都起来，所有语料、专项 bench 和上游自带测试
 node run.js network --only cases-delete,https   # 只跑几步；--list 列出全部步骤
 ```
 

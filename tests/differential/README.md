@@ -26,7 +26,7 @@ cargo build --locked            # from the repo root; run.js refuses a binary ol
 cd tests/differential
 npm ci                          # once — real whistle, from the lockfile
 node run.js fast                # ~5 s: the rules oracle over both corpora, the QR encoder
-node run.js network             # ~14 min (851 s measured): both proxies, every corpus and bench
+node run.js network             # ~18 min (1093 s measured for `all`): both proxies, every corpus and bench, upstream's own suite
 node run.js network --only cases-delete,https   # a few steps; --list names them
 ```
 
