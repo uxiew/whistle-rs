@@ -46,7 +46,8 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/forwarded.rs` | `lib/util/index.js:3697-3728`, `util/common.js:1231-1266` | What a front proxy claims — `x-forwarded-host`/`-proto` behind their modes, and the two whistle spellings upstream reads with no gate |
 | `src/qr.rs` | `qrcode@1.2.0` (a dependency there) | A QR encoder for the console's LAN addresses: byte mode, level M, versions 1-10. Compared module for module by `tests/differential/qr-bench.js` |
 | `src/proxy/template.rs` | `lib/handlers/file-proxy.js` (`render`) | `tpl`/`dust`/`jsonp` two-pass rendering + `${var}` variables |
-| `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation) |
+| `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation). A body preview is written with its flags (`truncated`, `binary`, `undecodable`) and, when its text is not its bytes, the bytes; it is restored from those rather than re-derived |
+| `src/proxy/search.rs` | `biz/webui/htdocs/src/js/network-modal.js` (`h:`/`b:`) | The search box's `h:` and `b:`, answered over every held session; patterns compiled by regress, so they mean what the browser's `RegExp` means |
 | `src/proxy/outcome.rs` | `lib/inspectors/data.js` (`reqError`/`resError`) | How a request ended when it did not complete: the phase, the reason, the error tag that carries them out of `upstream`, and the body wrapper that notices a response breaking off |
 | `src/proxy/sni.rs` | `lib/https/index.js:1281`, `lib/https/load-cert.js` | The SNI stage: peek the ClientHello, pick the certificate, or relay the connection untouched |
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
@@ -420,6 +421,7 @@ whistle-rs/
         ├── forwarded.rs   # what a front proxy claims, and whether to believe it
         ├── template.rs    # tpl/dust/jsonp rendering + ${var} variables
         ├── persist.rs     # session persistence (JSONL)
+        ├── search.rs      # the search box's h:/b:, answered here
         ├── upstream.rs
         ├── sni.rs         # peek the ClientHello, pick a certificate, or relay
         ├── socks.rs       # inbound SOCKS5 server
