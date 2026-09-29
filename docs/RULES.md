@@ -1882,6 +1882,22 @@ script error leaves the response unchanged.
 example.com   resScript:///abs/path/patch.js
 ```
 
+This hook is this port's own, and it is recognised by the word `ctx`. Upstream
+has no hook: to it a `resScript://` text is **response rules** — and so it is
+here, whenever the text does not mention `ctx`:
+
+````
+```tps.rules
+# rules
+example.com jsAppend://(console.log('appended'))
+```
+example.com   resScript://{tps.rules}
+````
+
+A value or path that names nothing runs nothing. Before 2026-09 every
+`resScript` text without `rules`/`values` in it was run as JavaScript, so a
+rules text failed to parse and silently did nothing.
+
 **A script may instead *produce rules*.** This is upstream's original meaning
 for the family and it is now implemented: when the script's text is bracketed,
 carries no `#` comment or ``` `` ``` fence, and names `rules` or `values`
@@ -2534,9 +2550,10 @@ Measured against whistle 2.10.8 (`tests/differential/cases-compose.js`):
 #### `resRules://` — rules for the response
 
 `resRules://` is the response-phase twin: whistle keeps it in the same
-accumulating list as `resScript://` and tells the two apart by spelling, then
-parses what the `resRules://` lines hold and merges it once the response head is
-in (`getResRules`, `_original/lib/plugins/index.js:1337-1360`).
+accumulating list as `resScript://`, parses what the lines hold and merges it
+once the response head is in (`getResRules`, `_original/lib/plugins/index.js:1337-1360`).
+A rules text under the `resScript://` spelling is merged the same way; only a
+`resScript://` text that uses `ctx` is this port's [hook](#scripting) instead.
 
 Only the **response** half of the produced text applies — upstream's
 `mergeRules(req, …, isResRules)` is restricted to `resProtocols`

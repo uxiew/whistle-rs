@@ -775,12 +775,22 @@ pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
     accumulated_script_ops(resolved, "resScript", "resRules")
         .into_iter()
         .filter(|op| raw_protocol(op) != Some("resRules"))
-        // A script that names `rules`/`values` is upstream's rules *producer*
-        // and is executed by [`merge_res_rules`]; the response hook — this
-        // port's own reading of `resScript` — keeps everything else. The two
-        // populations are disjoint under upstream's own classifier, because a
-        // hook script mutates `ctx.res.…` and never says either word.
-        .find(|op| !op.value_is_content || crate::proxy::script::is_rules_content(&op.value))
+        // Only a text that is this port's hook: one that edits `ctx.res`
+        // ([`crate::proxy::script::is_response_hook`]). A script that names
+        // `rules`/`values` produces rules, and a rules text is rules; both go
+        // to [`merge_res_rules`]. A path that names no file runs nothing.
+        .find(|op| {
+            script_text(op).is_some_and(|text| crate::proxy::script::is_response_hook(&text))
+        })
+}
+
+/// The text a script-family operator carries: the value itself for the
+/// `{name}` and inline forms, the file it names otherwise.
+fn script_text(op: &RuleOp) -> Option<String> {
+    match op.value_is_content {
+        true => Some(op.value.clone()),
+        false => std::fs::read_to_string(&op.value).ok(),
+    }
 }
 
 /// `resRules://` — a rules text that applies to the **response**, merged once
@@ -810,15 +820,13 @@ pub fn merge_res_rules(
     let texts = accumulated_script_ops(resolved, "resScript", "resRules")
         .into_iter()
         .filter_map(|op| {
-            let text = match op.value_is_content {
-                true => Some(op.value.clone()),
-                false => std::fs::read_to_string(&op.value).ok(),
-            }?;
+            let text = script_text(op)?;
             // Upstream keeps both spellings in one list and asks the *text*
             // which it is: script-shaped and it runs, with the response head in
-            // its context; rules-shaped and it is rules — but only when spelled
-            // `resRules://`, because a rules-shaped `resScript://` is this
-            // port's response hook and is consumed by `res_script_op` instead.
+            // its context; rules-shaped and it is rules, under either spelling
+            // (`getResRules`, `_original/lib/plugins/index.js:808-820`). The one
+            // exception is this port's own: a `resScript://` text that edits
+            // `ctx` is the response hook, consumed by `res_script_op`.
             if !crate::proxy::script::is_rules_content(&text) {
                 let res = info
                     .res
@@ -843,7 +851,9 @@ pub fn merge_res_rules(
                 )?;
                 return Some((produced.rules, produced.values));
             }
-            (raw_protocol(op) == Some("resRules")).then(|| (text, HashMap::new()))
+            let hook = raw_protocol(op) != Some("resRules")
+                && crate::proxy::script::is_response_hook(&text);
+            (!hook).then(|| (text, HashMap::new()))
         })
         .collect::<Vec<_>>();
     let mut carried: Option<HashMap<String, String>> = None;
@@ -11967,28 +11977,62 @@ mod tests {
     /// script was handed to the JS engine in its place.
     #[test]
     fn res_script_skips_the_rules_spelling() {
+        let fx = Fixtures::new("res-script-pick");
+        let hook = fx.write("hook.js", b"ctx.res.headers['x-hook'] = '1';\n");
+        let other = fx.write("other.js", b"ctx.res.headers['x-other'] = '1';\n");
+        let rules = fx.write("rules.txt", b"example.com resHeaders://x-r=1\n");
         let resolved = resolve(
-            "example.com resRules:///rules.txt resScript:///script.js\n",
+            &format!("example.com resRules://{rules} resScript://{hook}\n"),
             "http://example.com/",
         );
         assert_eq!(
             res_script_op(&resolved).map(|op| op.value.as_str()),
-            Some("/script.js")
+            Some(hook.as_str())
         );
         // With no script at all there is nothing to run, rather than the rules
         // file being evaluated as JavaScript.
-        let only_rules = resolve("example.com resRules:///rules.txt\n", "http://example.com/");
+        let only_rules = resolve(
+            &format!("example.com resRules://{rules}\n"),
+            "http://example.com/",
+        );
         assert!(res_script_op(&only_rules).is_none());
         // A second script is dropped before the search, so it can never be
         // reached even if the first is a `resRules://` line.
         let two = resolve(
-            "example.com resScript:///one.js resScript:///two.js\n",
+            &format!("example.com resScript://{hook} resScript://{other}\n"),
             "http://example.com/",
         );
         assert_eq!(
             res_script_op(&two).map(|op| op.value.as_str()),
-            Some("/one.js")
+            Some(hook.as_str())
         );
+        // A path that names no file runs nothing: its *name* is not a script.
+        let missing = resolve(
+            "example.com resScript:///no/such.js\n",
+            "http://example.com/",
+        );
+        assert!(res_script_op(&missing).is_none());
+    }
+
+    /// A `resScript://` text that is rules — not a script, and not this port's
+    /// `ctx` hook — applies to the response as rules, under that spelling as
+    /// under `resRules://`. Upstream's `tps.test.js` sends `# rules` + a
+    /// `jsAppend://` line through it; this port ran the text as JavaScript and
+    /// appended nothing.
+    #[test]
+    fn a_rules_text_under_the_res_script_spelling_is_rules() {
+        let fx = Fixtures::new("res-script-rules");
+        let rules = fx.write("tps.rules", b"# rules\nexample.com resHeaders://x-r=1\n");
+        let (mut info, mut resolved) = resolve_with_info(
+            &format!("example.com resScript://{rules}\n"),
+            "http://example.com/",
+        );
+        assert!(res_script_op(&resolved).is_none(), "not the hook");
+        info.res = Some(build_res_info(200, &HeaderMap::new(), None, None));
+        assert!(merge_res_rules(&mut resolved, &info, &HashMap::new(), false).is_some());
+        let mut h = HeaderMap::new();
+        apply_header_ops(&mut h, &resolved, "resHeaders");
+        assert_eq!(h.get("x-r").unwrap(), "1");
     }
 
     /// A `resRules://` text is rules, and they apply to the response. Every

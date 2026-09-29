@@ -143,12 +143,35 @@ pub fn is_rules_content(text: &str) -> bool {
     !has_script_word(text)
 }
 
+/// Is this `resScript` text this port's response hook, rather than rules?
+///
+/// Upstream has no hook: a `resScript://` text is rules, or a script that
+/// produces them ([`is_rules_content`] tells the two apart). This port's hook
+/// — JavaScript that edits `ctx.res` — is shaped like rules by that test,
+/// because it names neither `rules` nor `values`, so the test alone cannot
+/// keep it apart from a real rules text. The word `ctx` does: a hook cannot
+/// work without it, and a rules text has no reason to say it. Upstream's own
+/// `frameScript` asks the same question the same way (`CTX_RE`,
+/// `_original/lib/rules/index.js:449-453`).
+///
+/// Before this, every rules-shaped `resScript` was run as a hook — upstream's
+/// `tps.test.js` hands it `# rules\n… jsAppend://…`, which the JS engine
+/// rejected, and nothing was appended.
+pub fn is_response_hook(text: &str) -> bool {
+    is_rules_content(text) && has_word(text, &["ctx"])
+}
+
 /// `/\b(?:rules|values)\b/` without pulling in a regex: the word with no
 /// `[A-Za-z0-9_]` on either side.
 fn has_script_word(text: &str) -> bool {
+    has_word(text, &["rules", "values"])
+}
+
+/// Does `text` say any of `words` as a word of its own?
+fn has_word(text: &str, words: &[&str]) -> bool {
     let bytes = text.as_bytes();
     let word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    for word in ["rules", "values"] {
+    for &word in words {
         let mut from = 0;
         while let Some(i) = text[from..].find(word) {
             let at = from + i;
