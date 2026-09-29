@@ -575,3 +575,30 @@ async fn a_tunnel_closed_without_a_byte_leaves_nothing() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(state.sessions.lock().unwrap().is_empty());
 }
+
+/// Inside an intercepted tunnel a request is served by the same pipeline as a
+/// plain one, and fails the same way: a 502 inside the TLS, naming its session.
+#[tokio::test]
+async fn a_request_inside_an_intercepted_tunnel_fails_like_any_other() {
+    let dead = refused().await;
+    let (state, proxy) = proxy_with(&format!("mitm.test {dead} disable://auto2http")).await;
+    let client = tunnel(proxy, "mitm.test:443").await;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(state.ca.root_cert_der()).unwrap();
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("mitm.test").unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, client)
+        .await
+        .expect("the client trusts this proxy's root");
+    tls.write_all(b"GET /inside HTTP/1.1\r\nHost: mitm.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    tls.read_to_end(&mut got).await.ok();
+    let response = String::from_utf8_lossy(&got).into_owned();
+    let s = one_failure(&state, &response, Phase::Connect).await;
+    assert_eq!(s.url, "https://mitm.test/inside");
+}
