@@ -446,3 +446,70 @@ async fn a_plugin_hook_that_fails_is_named() {
         s.unapplied
     );
 }
+
+/// Over the limit, a chunked response is passed through the same way as one
+/// with a length: every byte, framing intact.
+#[tokio::test]
+async fn a_chunked_response_over_the_limit_arrives_whole() {
+    let chunk = "a".repeat(40);
+    let body = format!("28\r\n{chunk}\r\n28\r\n{chunk}\r\n0\r\n\r\n");
+    let site = origin(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+        body.into_bytes(),
+    )
+    .await;
+    let (state, proxy) = proxy_with_config(&format!("http://{site} resReplace://a=b"), |c| {
+        c.body_rewrite_cap = 64
+    })
+    .await;
+    let (_, got) = ask(proxy, &format!("http://{site}/x"), "", b"").await;
+    let text = String::from_utf8_lossy(&got);
+    assert_eq!(text.matches('a').count(), 80, "{text}");
+    assert!(text.ends_with("0\r\n\r\n"), "{text}");
+    assert_eq!(session(&state).await.unapplied[0].kind, Kind::BodyOverLimit);
+}
+
+/// A client that leaves an event stream takes the origin's connection with it:
+/// the proxy does not keep reading a stream nobody is there to receive.
+#[tokio::test]
+async fn a_client_leaving_a_stream_releases_the_origin() {
+    let (closed_tx, closed) = tokio::sync::oneshot::channel::<()>();
+    let site = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: one\n\n",
+                )
+                .await;
+            // Keep sending until a write fails: the proxy closed its side.
+            for _ in 0..500 {
+                if sock.write_all(b"data: more\n\n").await.is_err() {
+                    let _ = closed_tx.send(());
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        addr
+    };
+    let (_state, proxy) =
+        proxy_with_config(&format!("http://{site} resMerge://{{}}"), |_| {}).await;
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client
+        .write_all(format!("GET http://{site}/events HTTP/1.1\r\nHost: {site}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    let n = client.read(&mut buf).await.unwrap();
+    assert!(n > 0);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(3), closed)
+        .await
+        .expect("the origin's connection is closed once the client has gone")
+        .unwrap();
+}
