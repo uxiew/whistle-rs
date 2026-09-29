@@ -1258,7 +1258,7 @@ whistle-rs --plugin name=127.0.0.1:9000
 
 | whistle-rs 怎么停的 | 插件 |
 | --- | --- |
-| Ctrl+C、`kill`（SIGTERM）；Windows 上 Ctrl+C、Ctrl+Break、关控制台窗口 | whistle-rs 先把已完成的会话写完盘，再结束插件进程，自己以退出码 0 退出 |
+| Ctrl+C、`kill`（SIGTERM）；Windows 上 Ctrl+C、Ctrl+Break、关控制台窗口（Windows 这几种没有实测：CI 只能从外面强杀进程） | whistle-rs 先把已完成的会话写完盘，再结束插件进程，自己以退出码 0 退出 |
 | `kill -9`、`taskkill /F`、崩溃（whistle-rs 自己的代码一行都跑不到） | 用 SDK 写的插件自己退出：whistle-rs 给插件的 stdin 是一根只有它握着的管道，它一没，操作系统就关掉管道，SDK 读到结尾就退出（环境变量 `WHISTLE_RS_PLUGIN_STDIN=lifeline` 表示 stdin 是这根管道） |
 
 不用 SDK 的插件要自己照做：`WHISTLE_RS_PLUGIN_STDIN` 为 `lifeline` 时读 stdin，读到结尾就退出。不这么做，whistle-rs 被强杀后插件还会一直占着端口，下次启动分到的新端口不受影响，但旧进程要手动结束。以前（2026-09-29 之前）连 `kill` 也会留下插件进程，只有终端里的 Ctrl+C 能带走它们，因为 Ctrl+C 发给整个进程组。

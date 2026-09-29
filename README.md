@@ -15,6 +15,8 @@ npm ci --prefix ui-src && npm run build --prefix ui-src   # 控制台，Rust 编
 cargo build --locked --release                            # 产物 target/release/whistle-rs
 ```
 
+不想自己构建：CI 给五个平台打好的包和校验、数据目录、升级卸载，见[安装、升级与卸载](docs/INSTALL.md)。
+
 只跑 `cargo build` 也能得到可用的代理，但首页是"控制台未构建"的占位页。运行代理不需要 Node（Node 插件除外）。改代码后要过的检查见[开发与验证](docs/DEVELOPMENT.md)。
 
 ## 使用
@@ -46,7 +48,7 @@ example.com resHeaders://x-debug=1
 
 ## 文档
 
-[文档导航](docs/README.md) · [使用手册](docs/COOKBOOK.zh-CN.md) · [CLI](docs/CLI.md) · [API](docs/API.md) · [证书](docs/CERTIFICATES.md) · [插件](docs/PLUGINS.md) · [上游基线](docs/UPSTREAM.md)
+[文档导航](docs/README.md) · [安装与卸载](docs/INSTALL.md) · [使用手册](docs/COOKBOOK.zh-CN.md) · [CLI](docs/CLI.md) · [API](docs/API.md) · [证书](docs/CERTIFICATES.md) · [插件](docs/PLUGINS.md) · [上游基线](docs/UPSTREAM.md)
 
 ## 许可
 
