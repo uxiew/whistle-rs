@@ -233,6 +233,16 @@ const DECLARED = {
         '2.10.8 hands a client frame to the handler for server frames; fixed in 2.10.10, and right here. ws-bench.js header')),
   ],
 
+  'h2-bench.js': [
+    // whistle's `disable://http2` turns h2 off on both legs: its forged server
+    // stops offering h2 to the client (`getSNIServer(…, disableH2)`,
+    // `_original/lib/https/index.js:1263-1270`) as well as to the origin. This
+    // port turns off the origin leg only; the client half would need the rules
+    // resolved before the TLS handshake picks an ALPN. RULES.md, `h2`.
+    d('an h2 client with disable://http2', ['client protocol'],
+      'the client half of disable://http2 is not implemented; the origin half is. h2-bench.js, declared.js'),
+  ],
+
   'write-bench.js': [
     d('an empty write path', ['file cwd:echo'],
       'upstream writes the dump to a path relative to its cwd; this port writes nothing. See the case\'s comment'),

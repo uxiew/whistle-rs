@@ -135,6 +135,9 @@ const NETWORK = [
   // delete something that was not its to delete.
   { name: 'write', pair: 'standard', args: ['write-bench.js'], ports: [PB + 2], cwd: 'cwd', timeout: 10 * MINUTE },
   { name: 'https', pair: 'standard', args: ['https-bench.js'], ports: [PB + 2, PB + 3], timeout: 10 * MINUTE },
+  // After https-bench, whose `Enable HTTPS` switch it needs too (and sets
+  // itself, for running by hand).
+  { name: 'h2', pair: 'standard', args: ['h2-bench.js'], ports: [PB + 2], timeout: 5 * MINUTE },
   // Its own pair: every other bench installs rules through the console this
   // one locks.
   { name: 'auth', pair: 'auth', args: ['auth-bench.js'], ports: [PB + 2], timeout: 10 * MINUTE },
