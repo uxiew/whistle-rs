@@ -13,7 +13,7 @@ use super::*;
 /// would be at top level.
 ///
 /// The manager is **returned, not dropped**: it holds the parsed rules the
-/// response phase resolves a second time — see [`merge_response_phase_of`].
+/// response phase resolves a second time — see [`response_phase_of`].
 #[must_use = "the caller must keep this for the response phase"]
 pub fn merge_rules_text(
     resolved: &mut Resolved,
@@ -176,7 +176,7 @@ pub(super) const MERGED_AFTER_IMPORTANT: u64 = 1 << 32;
 /// own scope.
 ///
 /// The managers are returned so the response phase can resolve them again —
-/// see [`merge_response_phase_of`].
+/// see [`response_phase_of`].
 #[must_use = "the caller must keep these for the response phase"]
 pub fn merge_included_rules(
     resolved: &mut Resolved,

@@ -258,7 +258,7 @@ pub(super) fn aborts(resolved: &Resolved, side: &str) -> bool {
 ///
 /// The precedence is upstream's — `br` beats `gzip` beats `deflate` — and it is
 /// the one case where a body that arrived uncompressed goes out compressed. The
-/// caller hands this to [`coding::reencode`], which lets it win over the body's
+/// caller hands this to [`coding::reencode`](crate::proxy::coding::reencode), which lets it win over the body's
 /// own coding.
 pub fn forced_encoding(resolved: &Resolved) -> Option<super::super::coding::Coding> {
     let e = enabled_flags(resolved);
