@@ -118,7 +118,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 
 环境同 Q1：macOS / Apple M4 / Darwin 25.3.0 arm64，Rust 1.98.1，Node.js **v26.4.0**，npm 11.17.0；对照组 whistle **2.10.8**，锁文件 SHA-256 `45b91b6c…6fdec`。每条测量后面写了它对应的提交。
 
-**结论：** 完成。本地实测了锁文件、统一入口、逐条声明、未知差异非零退出、inert 必须有解释、预设回归必被抓住、全新 clone 可重建；CI 首跑（`6e28a23`）8 个 job 全部通过；全量差分在 Linux 容器里 27 步全过，没有冒出新差异。全量差分 workflow 本身还没在 GitHub 上触发过。
+**结论：** 完成。本地实测了锁文件、统一入口、逐条声明、未知差异非零退出、inert 必须有解释、预设回归必被抓住、全新 clone 可重建；CI 首跑（`6e28a23`）8 个 job 全部通过；全量差分在 Linux 容器里 27 步全过，没有冒出新差异。全量差分 workflow 2026-09-29 第一次在 GitHub 上跑，见[那次记录](#2026-09-29-全量差分第一次在-github-上跑)。
 
 ### 做了什么
 
@@ -186,7 +186,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 
 ### 没有执行 / 剩余风险
 
-- **全量差分 workflow（`differential.yml`）还没在 GitHub 上跑过**，要在 Actions 页面手动触发，之后每周一自动跑。它的内容（`run.js all`）已在 Linux 容器里通过，但那是 arm64，GitHub 是 x86_64。
+- ~~全量差分 workflow（`differential.yml`）还没在 GitHub 上跑过~~ 2026-09-29 跑了：第一次失败，暴露两个只在名字解析不了时出现的隧道问题，修后第二次通过，见[那次记录](#2026-09-29-全量差分第一次在-github-上跑)。
 - 容器里用 `git archive` 导出的代码没有 `.git`，归档清单的提交号为空；在正常检出里（包括 CI）会记录。
 - `run.js` 用进程组清理子进程，不支持 Windows。
 - 网络套件里 auth/https/mode 会查询 `local.whistlejs.com`、`rootca.pro` 等名字，依赖 DNS；timing 按时间容差判定，在 CI 上是否稳定未知。
@@ -283,7 +283,7 @@ S1 记录里"`Host: evil.example` 得 403"指的是控制台本身，仍然成�
 - `jsAppend` 这类操作符的 `{name}` 查不到时，上游什么都不追加，whistle-rs 追加字面量 `{name}`（顺带发现，未修）。
 - 上游 2.10.8 不认 `rule://名字` 这种引入写法（报 Unsupported protocol），whistle-rs 认，属于既有差异，未处理。
 - 驱动在上游一侧有一条 WebSocket 调用偶发超时（`proxy` 单元 `ws3.w2.org`，本地 3 次里出现 1 次）；门禁取两次上游都通过的调用，这类偶发只会让那一次少评判一条，不会误报。
-- ~~这批改动还没在 GitHub CI 上跑过~~ 2026-09-29 推送后 CI 8 个 job 全过（`502c153`）；每周的 `Differential` workflow 仍未在 GitHub 上触发过。
+- ~~这批改动还没在 GitHub CI 上跑过~~ 2026-09-29 推送后 CI 8 个 job 全过（`502c153`）；每周的 `Differential` workflow 2026-09-29 第一次跑，修了两个隧道问题后通过。
 
 ## 2026-09-29 O1 失败会话与生命周期
 
@@ -585,6 +585,26 @@ whistle 一列取自最后一轮，三轮之间它自己在 h2 页面加载上�
 **剩余风险：**
 - 全量差分只在两个里程碑跑过（`apply.rs` 拆完、全部拆完），不是每个提交都跑。每个提交的保证是逐字核对加全量单测。
 - `cargo doc` 仍有十几条无法解析的文档链接。它们在拆分前就存在，落在搬动过的文件里的两条已修。
+
+## 2026-09-29 全量差分第一次在 GitHub 上跑
+
+`differential.yml` 手动触发了两次，GitHub 的 ubuntu-24.04（x86_64）、Node 26，同一个二进制先对 2.10.8、再对 2.10.10 跑 `run.js all`，最后 `matrix.js` 比较两版。
+
+| 运行 | 提交 | 结果 |
+| --- | --- | --- |
+| `36578161324` | `baf51bb`（M1 做完） | **失败**：两个版本都是 31 步里过 29 步。`modes` 5 处差异，`upstream-suite` 1 处 |
+| `36590617642` | `b2ee118`（加了下面三个修复） | **通过**，差分这一步 33 分钟；两个版本的 `run.js all` 和 `matrix.js` 都以 0 退出 |
+
+同一时间 `ci.yml` 在 `baf51bb`、`b2ee118` 上也都全过，M1 的改动从此在 GitHub 上验证过。
+
+第一次失败的原因，这台 Mac 上一直测不出来：本机的系统代理用 fake-ip DNS，任何名字都解析得到，而 CI 上 `probe.test`、`break.whistlejs.com` 解析不了。
+
+- `modes`：`multiEnv`、`nohost`、`disableCapture`、`notAllowedEnableHTTPS`、`multiple` 五个模式里，whistle 报 `connect ECONNRESET`，whistle-rs 报 `tls ECONNRESET`。不解密的隧道，whistle 连上目标之后才回 CONNECT、连不上就不回；本项目先回 `200` 再去连，客户端以为隧道通了，到 TLS 握手才断。修复 `95f7c6f`：只凭 CONNECT 就能决定不解密的隧道，先连再回。
+- `upstream-suite`：`CONNECT+GET http://break.whistlejs.com` 一条。上游的测试辅助函数发 `CONNECT /`、目标只写在 `Host` 里，本项目回 `400`，辅助函数没挂错误监听，一直挂到超时（`05feda1`，改为和 whistle 一样从 `Host` 取目标）；它还带着 `x-whistle-policy: tunnel` 要求只转发不解密，本项目以前不认（`b2ee118`，认 `tunnel`/`connect`/`weakTunnel`）。
+
+本机能评判的上游自带测试是 180 条，CI 上是 181 条，多出的就是这一条：本机 whistle 自己也过不了它（名字解析得到），不计入评判。
+
+两次运行的归档（清单、每步输出、代理日志）在 Actions 页面，要登录才能下载；第二次的归档本文没有逐项核对，上面的"通过"依据的是那一步的退出码。
 
 ## 2026-09-29 D1 跨平台构建与验证（进行中）
 
