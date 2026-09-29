@@ -125,6 +125,7 @@ const NETWORK = [
   { name: 'frames', pair: 'standard', args: ['frames-bench.js'], ports: [PB + 2], timeout: 10 * MINUTE },
   { name: 'timing', pair: 'standard', args: ['timing-bench.js'], ports: [PB + 2], timeout: 10 * MINUTE },
   { name: 'ws', pair: 'standard', args: ['ws-bench.js'], ports: [PB + 2], timeout: 5 * MINUTE },
+  { name: 'dns', pair: 'standard', args: ['dns-bench.js'], ports: [PB + 2, PB + 3, PB + 4], timeout: 5 * MINUTE },
   // Run in the proxies' own working directory: whistle writes an empty
   // `resWrite://` path relative to its cwd, and this bench finds it — and then
   // deletes it — by watching its own. Anywhere else it would miss the file, or
