@@ -128,6 +128,7 @@ pub struct Builder {
     intercept_https: Option<bool>,
     persist: bool,
     body_preview_cap: Option<usize>,
+    body_rewrite_cap: Option<usize>,
     /// A whistle `-M/--mode` list, applied last — see [`Builder::mode`].
     mode: Option<String>,
 }
@@ -220,6 +221,14 @@ impl Builder {
         self
     }
 
+    /// The largest response body the body operators may rewrite — the
+    /// binary's `--body-rewrite-limit`. A body over it is forwarded as it
+    /// arrived, and its session names the operators that did not run.
+    pub fn body_rewrite_cap(mut self, bytes: usize) -> Self {
+        self.body_rewrite_cap = Some(bytes);
+        self
+    }
+
     /// Apply a whistle `-M/--mode` list — the same string the binary's `-M`
     /// takes, `|`, `,` or `&` separated.
     ///
@@ -258,6 +267,9 @@ impl Builder {
         }
         if let Some(cap) = self.body_preview_cap {
             config.body_preview_cap = cap;
+        }
+        if let Some(cap) = self.body_rewrite_cap {
+            config.body_rewrite_cap = cap;
         }
         // After the explicit setters, because a mode is upstream's way of
         // saying the same things and the later word should win — `-M capture`

@@ -37,6 +37,7 @@ const capture = computed<Pair[]>(() => [
   ['Sessions held', st.value?.sessions],
   ['WS frames held', st.value?.frames],
   ['Body preview cap', fmtBytes(st.value?.body_preview_cap)],
+  ['Body rewrite limit', fmtBytes(st.value?.body_rewrite_cap)],
   ['Persist', st.value?.persist_sessions ? `${st.value.persist_days} days` : 'off'],
 ]);
 

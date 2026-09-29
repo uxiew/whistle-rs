@@ -251,6 +251,8 @@ export interface ProxyStatus {
   storage_dir: string;
   root_ca: string;
   body_preview_cap: number;
+  /** Past this a response body is forwarded unchanged and the body operators do not run. */
+  body_rewrite_cap: number;
   persist_sessions: boolean;
   persist_days: number;
   timeout_ms: number;

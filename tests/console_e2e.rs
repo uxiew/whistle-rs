@@ -748,3 +748,23 @@ async fn the_session_list_can_be_polled_as_a_cursor() {
     assert!(status.contains(" 400 "), "{status}");
     proxy.shutdown().await;
 }
+
+/// The rewrite limit decides whether a rule's body operators run at all, and
+/// an embedder can set it and read it back like the preview limit.
+#[tokio::test]
+async fn the_rewrite_limit_can_be_set_and_read_back() {
+    let proxy = whistle_rs::embed::Proxy::builder()
+        .port(0)
+        .persist_sessions(false)
+        .storage_dir(
+            std::env::temp_dir().join(format!("whistle-rs-rewrite-cap-{}", std::process::id())),
+        )
+        .body_rewrite_cap(64)
+        .start()
+        .await
+        .expect("proxy starts");
+    let status = console(proxy.addr(), "GET", "/api/status", None).await;
+    let status: serde_json::Value = serde_json::from_str(&status).expect("json");
+    assert_eq!(status["body_rewrite_cap"], 64, "{status}");
+    proxy.shutdown().await;
+}

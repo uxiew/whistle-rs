@@ -1892,6 +1892,9 @@ async fn status_json(state: &Arc<AppState>, restricted: bool) -> Response<DynBod
         "storage_dir": cfg.storage_dir.to_string_lossy(),
         "root_ca": cfg.root_ca_cert_path().to_string_lossy(),
         "body_preview_cap": cfg.body_preview_cap,
+        // The one that decides whether a rule's body operators run at all —
+        // see `unapplied`. It was nowhere a person could read it back.
+        "body_rewrite_cap": cfg.body_rewrite_cap,
         "persist_sessions": cfg.persist_sessions,
         "persist_days": cfg.persist_days,
         "timeout_ms": cfg.timeout_ms,
