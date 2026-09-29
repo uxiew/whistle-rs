@@ -858,19 +858,13 @@ const DECLARED = [
       'ui GET http://mock.remote-key3.test.w2.org/test/script/api #1',
     ],
   },
-  {
-    why: 'upstream\'s console API, `/cgi-bin/*`: a stated non-goal — this port has '
-      + 'its own (docs/API.md). The three `rename` calls are made from the `add` '
-      + 'calls\' callbacks, and so are never made here',
-    calls: [
-      'ui POST http://local.whistlejs.com/cgi-bin/values/add #1',
-      'ui POST http://local.wproxy.org:1234/cgi-bin/values/add #1',
-      'ui POST http://local.whistle.com/cgi-bin/values/add #1',
-      'ui POST http://local.whistlejs.com/cgi-bin/values/rename #1',
-      'ui POST http://local.wproxy.org:1234/cgi-bin/values/rename #1',
-      'ui POST http://local.whistle.com/cgi-bin/values/rename #1',
-    ],
-  },
+  // Upstream's console API, `/cgi-bin/*`, is a stated non-goal — this port has
+  // its own (docs/API.md) — and it is *not* declared here, because none of the
+  // judged calls to it fails any more. The `values/add` and `values/rename`
+  // calls have no callback of their own: `util.request` asserts only that the
+  // answer parses as JSON, and since every refusal here is `{ok:false, error}`
+  // (`d37777c`) a 404 does. They pass without `/cgi-bin` existing; they were
+  // declared while the 404 was the text `not found`.
   {
     why: 'an interim (`100`) or out-of-range (`1000`) status: upstream breaks the '
       + 'connection, this port answers — docs/RULES.md, "A status value that is '

@@ -190,13 +190,17 @@ A clean run ends:
 
 ```
 judged 180 calls — the ones whistle passes under the flattened rules, with and without the network
-  154 pass on whistle-rs
+  160 pass on whistle-rs
   18 declared: rules set through upstream's embedding API …
-  6 declared: upstream's console API, `/cgi-bin/*` …
   2 declared: an interim (`100`) or out-of-range (`1000`) status …
 
-upstream suite: judged 180, passed 154, declared 26, differing 0, stale 0 — passed
+upstream suite: judged 180, passed 160, declared 20, differing 0, stale 0 — passed
 ```
+
+Six of the 160 pass without the feature they call: the `/cgi-bin/values/add`
+and `rename` calls assert only that the answer is JSON, and this port's 404 for
+a path it does not have is JSON. `/cgi-bin/*` is still not implemented; the
+comment in `DECLARED` says the same.
 
 **Why 180 and not 280.** Two thirds of the calls go through the suite's eight
 Node plugins (`test/plugins/`): most of the rules live in their `rules.txt` and
