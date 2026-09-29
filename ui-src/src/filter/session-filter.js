@@ -177,8 +177,20 @@ function matchSession(session, conditions, ctx) {
     if (c.field === 'mark') {
       text = marked.includes(session.id) ? (session.url || '') : '';
     } else if (c.field === 'e') {
-      const failed = !session.status || session.status >= 400;
-      text = failed ? [session.url || '', String(session.status || 0)].join(' ') : '';
+      // Gone wrong: the proxy recorded why it did not complete, or the answer
+      // was an error status — or no answer at all, in history written before
+      // failures were recorded. The phase and the reason are searchable, so
+      // `e:dns` finds the names that did not resolve.
+      const failure = session.error;
+      const failed = !!failure || !session.status || session.status >= 400;
+      text = failed
+        ? [
+          session.url || '',
+          String(session.status || 0),
+          failure ? failure.phase : '',
+          failure ? failure.message : '',
+        ].join(' ')
+        : '';
     } else {
       text = FIELDS[c.field](session);
     }

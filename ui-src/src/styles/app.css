@@ -476,6 +476,8 @@ table.requests tbody tr[aria-selected="true"] .mark { fill: var(--accent-fg); }
 }
 
 .tag.ws { background: var(--info); }
+/* Where a failed request stopped; the reason is in the detail panel. */
+.tag.err { background: var(--err); }
 
 /* ── action bar ────────────────────────────────────────────────────────── */
 
@@ -590,6 +592,7 @@ table.requests tbody tr[aria-selected="true"] .mark { fill: var(--accent-fg); }
 
 .badge.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
 .badge.bad { background: color-mix(in srgb, var(--err) 18%, transparent); color: var(--err); }
+.badge.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 
 .tabs {
   flex: 0 0 auto;
@@ -699,7 +702,9 @@ table.requests tbody tr[aria-selected="true"] .mark { fill: var(--accent-fg); }
 }
 
 .card dt { color: var(--fg-dim); white-space: nowrap; }
-.card dd { margin: 0; word-break: break-all; }
+/* Long tokens (a URL, a hostname) still wrap, but a sentence — a failure's
+   reason — wraps between words rather than through them. */
+.card dd { margin: 0; overflow-wrap: anywhere; }
 
 /* Header list and body dumps. */
 .kv {

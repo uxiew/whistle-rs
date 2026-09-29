@@ -49,6 +49,32 @@ export interface SessionSummary {
    * by `x-whistle-custom-frame-separator`.
    */
   has_frames?: boolean;
+  /**
+   * Why the request did not complete, when it did not. Absent for every request
+   * that got its whole answer — an origin's own 502 included.
+   */
+  error?: SessionFailure;
+}
+
+/** Where a request stopped, in the order a request meets these steps. */
+export type FailurePhase =
+  | 'client-tls'
+  | 'request'
+  | 'rules'
+  | 'plugin'
+  | 'dns'
+  | 'connect'
+  | 'proxy'
+  | 'tls'
+  | 'response'
+  | 'client'
+  | 'abort'
+  | 'internal';
+
+export interface SessionFailure {
+  phase: FailurePhase;
+  /** The error chain, as the client's 502 carried it. */
+  message: string;
 }
 
 /** A captured body preview: `len` is the whole body, `text` only the prefix. */

@@ -3592,6 +3592,23 @@ mod tests {
         assert!(ask(&mut ctx, "mark:", "[7]"));
         assert!(ask(&mut ctx, "e:", "[]"), "the row is a 404");
         assert!(!ask(&mut ctx, "s:200 e:", "[]"), "and 200s are not errors");
+        // …unless the proxy recorded that it did not complete: a 200 whose
+        // body broke off went wrong, and `e:` finds it by the phase too.
+        let broken = |ctx: &mut Context, query: &str| -> bool {
+            let script = format!(
+                "whistleMatchSession({{ id: 8, url: 'https://a.example/x', status: 200, \
+                   error: {{ phase: 'response', message: 'the response body broke off' }} }}, \
+                   whistleParseFilter({query:?}).conditions, {{ marked: [] }})"
+            );
+            ctx.eval(Source::from_bytes(script.as_bytes()))
+                .expect("the filter runs")
+                .as_boolean()
+                .expect("a boolean")
+        };
+        assert!(broken(&mut ctx, "e:"));
+        assert!(broken(&mut ctx, "e:response"));
+        assert!(broken(&mut ctx, "e:broke"));
+        assert!(!broken(&mut ctx, "e:dns"));
 
         // **A path is not a regexp.** A leading `/` looks like the start of one,
         // and a path is the most natural thing to type into these boxes: an

@@ -88,7 +88,7 @@ const allMarked = computed(
           :key="s.id"
           :data-id="s.id"
           :class="{
-            failed: s.status >= 400 || s.status === 0,
+            failed: !!s.error || s.status >= 400 || s.status === 0,
             marked: state.marked.includes(s.id),
             current: s.id === state.selected,
           }"
@@ -105,7 +105,7 @@ const allMarked = computed(
               {{ s.id }}
             </template>
             <template v-else-if="c.key === 'status'">
-              <span class="status-dot" :class="statusClass(s.status)"></span>{{ s.status || '—' }}<span v-if="s.status === 101" class="tag ws">WS</span>
+              <span class="status-dot" :class="statusClass(s.status, !!s.error)"></span>{{ s.status || '—' }}<span v-if="s.status === 101" class="tag ws">WS</span><span v-if="s.error" class="tag err" :title="s.error.message">{{ s.error.phase }}</span>
             </template>
             <template v-else>{{ c.text ? c.text(s) : c.get(s) }}</template>
           </td>

@@ -1,6 +1,25 @@
 // Formatting a traffic table can afford: short, aligned, never surprising.
 
-import type { SessionSummary } from './api';
+import type { FailurePhase, SessionSummary } from './api';
+
+/**
+ * Where a request stopped, in words — the phase name is for filters and
+ * scripts; a person reading the detail panel gets the step.
+ */
+export const PHASE_TEXT: Record<FailurePhase, string> = {
+  'client-tls': 'TLS handshake with the client',
+  request: 'reading the request from the client',
+  rules: 'carrying out a rule',
+  plugin: 'a plugin',
+  dns: 'DNS lookup',
+  connect: 'connecting to the server',
+  proxy: 'the upstream proxy',
+  tls: 'TLS handshake with the server',
+  response: "the server's response",
+  client: 'the client left before the end',
+  abort: 'dropped by a rule',
+  internal: 'inside the proxy',
+};
 
 /** Bytes at the granularity a traffic column wants: never more than 4 chars. */
 export function fmtBytes(n: number | undefined): string {

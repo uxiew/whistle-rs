@@ -7,9 +7,21 @@ import InfoCard from '../components/InfoCard.vue';
 import Waterfall from './Waterfall.vue';
 import type { Pair } from '../components/InfoCard.vue';
 import type { SessionDetail, SessionSummary } from '../api';
-import { fmtBytes, fmtDateTime, headerOf } from '../format';
+import { PHASE_TEXT, fmtBytes, fmtDateTime, headerOf } from '../format';
 
 const props = defineProps<{ session: SessionSummary; detail: SessionDetail | null }>();
+
+// First, when there is one: the question a failed request is opened to answer.
+// Empty — and so not shown — for every request that got its whole answer.
+const failure = computed<Pair[]>(() => {
+  const e = props.session.error;
+  return e
+    ? [
+        ['Stopped at', `${PHASE_TEXT[e.phase] || e.phase} (${e.phase})`],
+        ['Reason', e.message],
+      ]
+    : [];
+});
 
 const http = computed<Pair[]>(() => [
   ['Method', props.session.method],
@@ -53,6 +65,7 @@ const content = computed<Pair[]>(() => [
 
 <template>
   <div class="cards">
+    <InfoCard title="Did not complete" :pairs="failure" />
     <InfoCard title="HTTP" :pairs="http" />
     <InfoCard title="Policy" :pairs="policy" />
     <InfoCard title="Traffic" :pairs="traffic" />

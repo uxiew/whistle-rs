@@ -27,13 +27,22 @@ const activeTab = computed<DetailTab>(() =>
   tabEnabled(state.detailTab) ? state.detailTab : 'general',
 );
 
+// A request the proxy recorded as not completing says so first — whatever its
+// status. An error *status* is an answer, and is called one: a 502 the origin
+// sent and a 502 this proxy made up used to wear the same "Failed" badge.
+// Status 0 without a recorded reason is history from before reasons existed.
 const badge = computed(() => {
   const s = session.value;
   if (!s) return null;
-  return {
-    text: s.status === 101 ? 'WebSocket' : s.status >= 400 ? 'Failed' : 'Completed',
-    cls: s.status >= 400 ? 'bad' : 'ok',
-  };
+  if (s.error) {
+    return s.error.phase === 'abort'
+      ? { text: 'Aborted', cls: 'warn' }
+      : { text: 'Failed', cls: 'bad' };
+  }
+  if (s.status === 0) return { text: 'No response', cls: 'bad' };
+  if (s.status === 101) return { text: 'WebSocket', cls: 'ok' };
+  if (s.status >= 400) return { text: 'Error response', cls: 'bad' };
+  return { text: 'Completed', cls: 'ok' };
 });
 
 watch(
