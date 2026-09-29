@@ -27,8 +27,11 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+// fileURLToPath, not `.pathname`: on Windows that is `/D:/a/…`, which resolves
+// to a directory that does not exist.
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const arg = (name) => {
   const i = process.argv.indexOf(name);
   return i === -1 ? undefined : process.argv[i + 1];
