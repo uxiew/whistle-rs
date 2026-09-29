@@ -356,7 +356,8 @@ api.example.com enable://captureStream resHeaders://(x-whistle-custom-frame-sepa
 ```
 
 Each line becomes a frame in the Frames panel. An event stream
-(`content-type: text/event-stream`) needs neither the flag nor the header. The
+(`content-type: text/event-stream`, with or without a `charset`) needs neither
+the flag nor the header. The
 flag is not optional for the header form — whistle wants the same pair, and a
 separator header can arrive from the origin rather than from you.
 

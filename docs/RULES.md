@@ -2243,9 +2243,10 @@ frames when it is an event stream, and when a header names a separator
 `_original/lib/inspectors/data.js:67-135,:323-345`). This port showed such a
 body only as one preview, which for a stream that never ends is nothing at all.
 
-* **`content-type: text/event-stream`** — compared whole, so
-  `text/event-stream; charset=utf-8` is *not* framed by default — is cut at
-  every blank line, one frame per SSE event.
+* **`content-type: text/event-stream`** is cut at every blank line, one frame
+  per SSE event. Only the type counts: `text/event-stream; charset=utf-8` is an
+  event stream too. whistle 2.10.8 compared the header whole and showed that one
+  as a single body; 2.10.9 fixed it, and this port follows the fix.
 * **`x-whistle-custom-frame-separator`** names any separator, on the request or
   the response, and works for any content type — **together with
   `enable://captureStream`**, which is not optional:
@@ -2262,10 +2263,13 @@ body only as one preview, which for a stream that never ends is nothing at all.
 
   The flag is required because the header need not have come from you: it can
   arrive from the origin, or from a whistle further up the chain, and a header
-  somebody else sent should not decide what this proxy holds on to. Upstream
-  wants the same pair — measured through its own frames API, a separator with no
-  flag frames nothing there either, on the request side as well as the response.
-  An event stream is the exception and turns the flag on by itself.
+  somebody else sent should not decide what this proxy holds on to. whistle
+  2.10.8 wants the same pair — measured through its own frames API, a separator
+  with no flag frames nothing there, on the request side as well as the
+  response. 2.10.10 frames the response of a request **with no body** (a GET)
+  without the flag, as a side effect of a change to when it records that the
+  request was sent; its changelog and FAQ still ask for the flag, and so does
+  this port. An event stream is the exception and turns the flag on by itself.
 * **`disable://captureStream`** turns both off, and a compressed body is never
   framed — searching a deflate stream for a separator finds nothing.
 

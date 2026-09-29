@@ -1607,6 +1607,28 @@ mod forced_encoding_tests {
         assert!(is_event_stream(Some("text/event-streamlike")));
     }
 
+    /// The Frames panel cuts an event stream by its **type**: a `charset`
+    /// parameter, spacing and case do not hide one (whistle 2.10.9 and later),
+    /// and a type that merely starts the same way is not one.
+    #[test]
+    fn an_event_stream_is_framed_whatever_its_parameters() {
+        let framed = |ct: &str| {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(hyper::header::CONTENT_TYPE, ct.parse().unwrap());
+            response_frames(&resolved_for("reqHeaders://x-a=1"), &mut headers, None).is_some()
+        };
+        for ct in [
+            "text/event-stream",
+            "text/event-stream; charset=utf-8",
+            "  TEXT/EVENT-STREAM ;charset=utf-8",
+        ] {
+            assert!(framed(ct), "{ct}");
+        }
+        for ct in ["text/event-streamlike", "application/event-stream", "text/plain"] {
+            assert!(!framed(ct), "{ct}");
+        }
+    }
+
     /// A `Resolved` for one rule line, for the gate tests below.
     fn resolved_for(rule: &str) -> Resolved {
         let mut m = RuleManager::new();
@@ -3795,9 +3817,13 @@ fn must_collect_body(
 /// whistle's Frames panel gets a body cut into pieces in two cases
 /// (`handleResBody`, `_original/lib/inspectors/data.js:323-345`):
 ///
-/// * the response **is** an event stream — `content-type: text/event-stream`,
-///   compared whole, which is a narrower test than the one deciding whether the
-///   body may be buffered;
+/// * the response **is** an event stream — the type before any `;`, so
+///   `text/event-stream; charset=utf-8` counts. whistle compared the header
+///   whole up to 2.10.8 and framed that one as a plain body; 2.10.9 fixed it
+///   ("support `text/event-stream` responses with a `charset=utf-8` parameter",
+///   `trimType`, `data.js:335`), and this follows. Still narrower than the test
+///   deciding whether the body may be buffered ([`is_event_stream`]), which
+///   also takes `text/event-streamlike`;
 /// * a `x-whistle-custom-frame-separator` header names a separator, which works
 ///   for any content type and is how the FAQ turns a chunked JSON stream into
 ///   frames.
@@ -3823,7 +3849,10 @@ fn response_frames(
     let is_sse = headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.trim() == "text/event-stream");
+        .is_some_and(|ct| {
+            let essence = ct.split(';').next().unwrap_or("").trim();
+            essence.eq_ignore_ascii_case("text/event-stream")
+        });
     // **A named separator frames only when `enable://captureStream` says so.**
     // An event stream turns it on by itself — `captureStream = captureStream ||
     // isSse`, and only then does a separator decide anything
