@@ -3192,6 +3192,13 @@ to drop a response that arrived.
 The values that *are* statuses agree, including the two outside the registered
 range — `999` and `600` are written as asked, by both.
 
+An **interim** status other than `101` — `statusCode://100`, say — cannot be a
+final answer: upstream writes it and the client goes on waiting for the answer
+that never follows; this port's HTTP server refuses to send one and answers
+`500`. Upstream's own suite expects an error from both kinds
+(`test/units/statusCode.test.js`, `statuscode4`/`statuscode5`); the two calls are
+declared in `tests/differential/upstream-suite.js` rather than matched.
+
 ### A method value that is not a token
 
 Same shape, one operator over. `method://GET;`, `method://{"method":"PUT"}` and
