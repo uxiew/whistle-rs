@@ -260,3 +260,86 @@ async fn an_event_stream_streams_and_names_what_needs_the_whole_body() {
         ["resMerge://{\"a\":1}", "htmlAppend://<b>x</b>"]
     );
 }
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    super::coding::encode(super::coding::Coding::Gzip, bytes).expect("gzip")
+}
+
+/// A body this proxy cannot take out of its coding goes through exactly as it
+/// arrived — not with the operators run over compressed bytes, which wrote
+/// `resAppend` text after the end of a gzip stream — and the session says why.
+/// A gzip that would inflate past the rewrite limit is one of them: the limit
+/// bounds memory, and a small gzip can inflate to gigabytes.
+#[tokio::test]
+async fn a_body_that_cannot_be_undone_goes_through_as_it_arrived() {
+    const GZ: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-encoding: gzip\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n";
+    const ZSTD: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-encoding: zstd\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n";
+    let zeros = gzip(&[b'a'; 1000]);
+    assert!(zeros.len() < 64, "small on the wire: {}", zeros.len());
+    let cases: [(&str, &'static str, Vec<u8>, Option<Kind>); 4] = [
+        (
+            "corrupt",
+            GZ,
+            b"this is not gzip".to_vec(),
+            Some(Kind::Undecodable),
+        ),
+        (
+            "zstd",
+            ZSTD,
+            b"(zstd bytes)".to_vec(),
+            Some(Kind::UnsupportedCoding),
+        ),
+        (
+            "inflates past the limit",
+            GZ,
+            zeros,
+            Some(Kind::DecodedOverLimit),
+        ),
+        ("the control", GZ, gzip(b"aaaa"), None),
+    ];
+    for (name, head, wire, kind) in cases {
+        let site = origin(head, wire.clone()).await;
+        let rules = format!("http://{site} resAppend://END");
+        let (state, proxy) = proxy_with_config(&rules, |c| c.body_rewrite_cap = 64).await;
+        let (_, body) = ask(proxy, &format!("http://{site}/x"), "", b"").await;
+        let s = session(&state).await;
+        match kind {
+            Some(kind) => {
+                assert_eq!(body, wire, "{name}: the bytes as they arrived");
+                assert_eq!(s.unapplied.len(), 1, "{name}: {:?}", s.unapplied);
+                assert_eq!(s.unapplied[0].kind, kind, "{name}");
+                assert_eq!(s.unapplied[0].ops, ["resAppend://END"], "{name}");
+            }
+            None => {
+                let plain = super::coding::decode(super::coding::Coding::Gzip, &body);
+                assert_eq!(plain.as_deref(), Some(&b"aaaaEND"[..]), "{name}");
+                assert!(s.unapplied.is_empty(), "{name}: {:?}", s.unapplied);
+            }
+        }
+    }
+}
+
+/// The request side, the same way: a body whose coding will not undo reaches
+/// the origin as the client sent it.
+#[tokio::test]
+async fn a_request_body_that_cannot_be_undone_reaches_the_origin_as_sent() {
+    let (site, kept) = keeper().await;
+    let (state, proxy) = proxy_with_config(&format!("http://{site} reqAppend://END"), |_| {}).await;
+    let sent = b"this is not gzip";
+    ask(
+        proxy,
+        &format!("http://{site}/up"),
+        "content-type: text/plain\r\ncontent-encoding: gzip\r\n",
+        sent,
+    )
+    .await;
+    assert_eq!(kept.lock().unwrap().pop().as_deref(), Some(&sent[..]));
+    let s = session(&state).await;
+    assert_eq!(s.unapplied.len(), 1, "{:?}", s.unapplied);
+    assert_eq!(s.unapplied[0].kind, Kind::Undecodable);
+    assert!(
+        s.unapplied[0].reason.contains("request body"),
+        "{}",
+        s.unapplied[0].reason
+    );
+}

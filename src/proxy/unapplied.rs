@@ -79,6 +79,42 @@ impl Unapplied {
     }
 }
 
+/// The entry for a body left under its coding — see
+/// [`super::coding::NotDecoded`]. `side` is `request` or `response`.
+pub fn not_decoded(
+    why: super::coding::NotDecoded,
+    side: &str,
+    encoding: &str,
+    matched: &[MatchedOp],
+    covers: impl Fn(&MatchedOp) -> bool,
+) -> Option<Unapplied> {
+    use super::coding::NotDecoded;
+    let (kind, reason) = match why {
+        NotDecoded::Unsupported => (
+            Kind::UnsupportedCoding,
+            format!(
+                "the {side} body is under content-encoding `{encoding}`, which this proxy \
+                 cannot undo, so it was forwarded as it arrived"
+            ),
+        ),
+        NotDecoded::Corrupt => (
+            Kind::Undecodable,
+            format!(
+                "the {side} body's content-encoding `{encoding}` would not decode — the \
+                 bytes are not what the header says — so it was forwarded as it arrived"
+            ),
+        ),
+        NotDecoded::TooBig(limit) => (
+            Kind::DecodedOverLimit,
+            format!(
+                "undone, the {side} body's content-encoding `{encoding}` would come to more \
+                 than {limit} bytes, the rewrite limit, so it was forwarded as it arrived"
+            ),
+        ),
+    };
+    Unapplied::over(matched, covers, kind, reason)
+}
+
 /// The response-body operators: each one needs the body in hand, so each is
 /// skipped when the body is forwarded as it arrived.
 const RES_BODY: &[&str] = &[

@@ -92,12 +92,65 @@ impl Coding {
 /// serve — the client would get a body shorter than the origin sent, with no
 /// indication anything was lost.
 pub fn decode(coding: Coding, body: &[u8]) -> Option<Vec<u8>> {
+    decode_within(coding, body, usize::MAX).ok()
+}
+
+/// Why a body was left under its coding rather than undone for rewriting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotDecoded {
+    /// A coding this proxy cannot undo — `zstd`, stacked codings.
+    Unsupported,
+    /// The bytes are not what the header says, or the stream is cut short.
+    Corrupt,
+    /// Undone, the body would be over this many bytes.
+    TooBig(usize),
+}
+
+/// The decoded output, refusing to grow past `limit`: a 16 MiB gzip of zeros
+/// inflates to gigabytes, and the rewrite limit is a bound on memory, not on
+/// what arrived on the wire.
+struct Bounded {
+    out: Vec<u8>,
+    limit: usize,
+    over: bool,
+}
+
+impl Write for Bounded {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.out.len().saturating_add(buf.len()) > self.limit {
+            self.over = true;
+            return Err(std::io::Error::other("decoded body over the limit"));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`decode`], stopping — and saying so — once the output would pass `limit`.
+pub fn decode_within(coding: Coding, body: &[u8], limit: usize) -> Result<Vec<u8>, NotDecoded> {
+    let mut out = Bounded {
+        out: Vec::new(),
+        limit,
+        over: false,
+    };
+    // Each decoder writes into `out`; an error is "too big" when `out` refused
+    // it, and "corrupt" otherwise.
+    let verdict = |out: &Bounded, ok: bool| match (ok, out.over) {
+        (_, true) => Err(NotDecoded::TooBig(limit)),
+        (false, false) => Err(NotDecoded::Corrupt),
+        (true, false) => Ok(()),
+    };
     match coding {
-        Coding::Identity | Coding::Other => None,
+        Coding::Identity | Coding::Other => return Err(NotDecoded::Unsupported),
         Coding::Gzip => {
-            let mut d = flate2::write::GzDecoder::new(Vec::new());
-            d.write_all(body).ok()?;
-            d.finish().ok()
+            let mut d = flate2::write::GzDecoder::new(&mut out);
+            let ok = d.write_all(body).and_then(|()| d.try_finish()).is_ok();
+            drop(d);
+            verdict(&out, ok)?;
         }
         Coding::Deflate => {
             // zlib-wrapped first, which is what `Content-Encoding: deflate`
@@ -105,28 +158,29 @@ pub fn decode(coding: Coding, body: &[u8]) -> Option<Vec<u8>> {
             // second rather than treated as a failure — Node's zlib accepts
             // both and a body this proxy refuses to decode is a body no
             // operator can touch.
-            let mut d = flate2::write::ZlibDecoder::new(Vec::new());
-            if d.write_all(body).is_ok()
-                && let Ok(out) = d.finish()
-            {
-                return Some(out);
+            let mut d = flate2::write::ZlibDecoder::new(&mut out);
+            let ok = d.write_all(body).and_then(|()| d.try_finish()).is_ok();
+            drop(d);
+            if !ok && !out.over {
+                out.out.clear();
+                let mut d = flate2::write::DeflateDecoder::new(&mut out);
+                let ok = d.write_all(body).and_then(|()| d.try_finish()).is_ok();
+                drop(d);
+                verdict(&out, ok)?;
+            } else {
+                verdict(&out, ok)?;
             }
-            let mut d = flate2::write::DeflateDecoder::new(Vec::new());
-            d.write_all(body).ok()?;
-            d.finish().ok()
         }
         Coding::Brotli => {
-            let mut out = Vec::new();
-            {
-                let mut w = brotli::DecompressorWriter::new(&mut out, 4096);
-                w.write_all(body).ok()?;
-                // Flushed by `Drop`, but an error there is invisible, so the
-                // writer is finished explicitly.
-                w.flush().ok()?;
-            }
-            Some(out)
+            let mut w = brotli::DecompressorWriter::new(&mut out, 4096);
+            // Flushed by `Drop`, but an error there is invisible, so the
+            // writer is finished explicitly.
+            let ok = w.write_all(body).and_then(|()| w.flush()).is_ok();
+            drop(w);
+            verdict(&out, ok)?;
         }
     }
+    Ok(out.out)
 }
 
 /// Recompress a rewritten body under `coding`. `None` means it could not be
@@ -170,6 +224,10 @@ pub struct Decoded {
     pub body: Bytes,
     /// What to put back on the way out.
     pub restore: Restore,
+    /// Why the body is still under its coding, when it is: then `body` is the
+    /// bytes as they arrived, and the caller forwards them untouched rather
+    /// than rewrite bytes it cannot read.
+    pub not_decoded: Option<NotDecoded>,
 }
 
 /// What [`reencode`] needs to know about where a body came from.
@@ -188,37 +246,39 @@ pub struct Restore {
 }
 
 /// Decompress `body` for rewriting, if it is compressed under a coding we can
-/// round-trip.
+/// round-trip, into at most `limit` bytes.
 ///
-/// The failure path is deliberately quiet in effect but loud in the log: a body
-/// that cannot be inflated is returned as it arrived with `restore` set to
-/// identity, so the operators run over bytes they will not usefully match —
-/// exactly what happened before this module existed — rather than the response
-/// being corrupted or failed.
-pub fn decode_for_rewrite(body: Bytes, encoding: Option<&str>) -> Decoded {
+/// A body that cannot be undone — a coding this proxy does not have, bytes
+/// that are not what the header says, or more than `limit` once inflated — is
+/// returned as it arrived with `restore` set to identity and `not_decoded`
+/// saying why. The caller forwards it untouched: an operator run over encoded
+/// bytes matches nothing at best, and at worst writes plain text into a gzip
+/// stream the client can no longer read.
+pub fn decode_for_rewrite(body: Bytes, encoding: Option<&str>, limit: usize) -> Decoded {
     let coding = Coding::of(encoding);
-    if !coding.needs_decoding() {
+    if coding == Coding::Identity {
         return Decoded {
             body,
             restore: Restore {
                 coding: Coding::Identity,
-                // Identity really is plain; a coding we cannot round-trip is not.
-                plain: coding == Coding::Identity,
+                plain: true,
             },
+            not_decoded: None,
         };
     }
-    match decode(coding, &body) {
-        Some(plain) => Decoded {
+    match decode_within(coding, &body, limit) {
+        Ok(plain) => Decoded {
             body: Bytes::from(plain),
             restore: Restore {
                 coding,
                 plain: true,
             },
+            not_decoded: None,
         },
-        None => {
+        Err(why) => {
             tracing::warn!(
-                "content-encoding {} could not be decoded ({} bytes); body operators \
-                 ran over the encoded bytes",
+                "content-encoding {} was not undone ({why:?}, {} bytes); the body is \
+                 forwarded as it arrived",
                 encoding.unwrap_or(""),
                 body.len()
             );
@@ -228,6 +288,7 @@ pub fn decode_for_rewrite(body: Bytes, encoding: Option<&str>) -> Decoded {
                     coding: Coding::Identity,
                     plain: false,
                 },
+                not_decoded: Some(why),
             }
         }
     }
@@ -260,7 +321,8 @@ pub fn reencode(body: Bytes, restore: Restore, forced: Option<Coding>) -> (Bytes
         false => {
             if forced.is_some() {
                 tracing::warn!(
-                    "enable:// asked for a coding on a body that could not be decoded;                      leaving it as it arrived"
+                    "enable:// asked for a coding on a body that could not be decoded; \
+                     leaving it as it arrived"
                 );
             }
             None
@@ -391,13 +453,13 @@ mod tests {
     /// put it back.
     #[test]
     fn a_compressed_body_is_handed_over_as_text() {
-        let d = decode_for_rewrite(Bytes::from(gzip(b"ORIGINAL")), Some("gzip"));
+        let d = decode_for_rewrite(Bytes::from(gzip(b"ORIGINAL")), Some("gzip"), usize::MAX);
         assert_eq!(&d.body[..], b"ORIGINAL");
         assert_eq!(d.restore.coding, Coding::Gzip);
         assert!(d.restore.plain);
 
         // An identity body is not copied or changed, and needs no restoring.
-        let d = decode_for_rewrite(Bytes::from_static(b"plain"), None);
+        let d = decode_for_rewrite(Bytes::from_static(b"plain"), None, usize::MAX);
         assert_eq!(&d.body[..], b"plain");
         assert_eq!(d.restore.coding, Coding::Identity);
     }
@@ -406,7 +468,11 @@ mod tests {
     /// bytes come back as they arrived, and nothing is re-encoded over them.
     #[test]
     fn an_undecodable_body_survives_as_it_arrived() {
-        let d = decode_for_rewrite(Bytes::from_static(b"not actually gzip"), Some("gzip"));
+        let d = decode_for_rewrite(
+            Bytes::from_static(b"not actually gzip"),
+            Some("gzip"),
+            usize::MAX,
+        );
         assert_eq!(&d.body[..], b"not actually gzip");
         assert_eq!(
             d.restore.coding,
@@ -576,12 +642,20 @@ mod tests {
 
         // And `decode_for_rewrite` reports the distinction in the first place.
         assert!(
-            !decode_for_rewrite(payload.clone(), Some("zstd"))
+            !decode_for_rewrite(payload.clone(), Some("zstd"), usize::MAX)
                 .restore
                 .plain
         );
-        assert!(decode_for_rewrite(payload.clone(), None).restore.plain);
+        assert!(
+            decode_for_rewrite(payload.clone(), None, usize::MAX)
+                .restore
+                .plain
+        );
         // A gzip header that does not decode is not plain either.
-        assert!(!decode_for_rewrite(payload, Some("gzip")).restore.plain);
+        assert!(
+            !decode_for_rewrite(payload, Some("gzip"), usize::MAX)
+                .restore
+                .plain
+        );
     }
 }

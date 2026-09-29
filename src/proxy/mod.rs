@@ -4411,7 +4411,11 @@ async fn finish_local_response(
         // upstream path gives a compressed body. A plugin answer or a mocked
         // response rarely arrives encoded, but `enable://gzip` can still ask for
         // one on the way out, and a plugin is free to send `Content-Encoding`.
-        let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
+        //
+        // Unbounded, and applied whatever came of it: this body was made here,
+        // in memory already, by a rule or a plugin — not received from a server
+        // that may send anything.
+        let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref(), usize::MAX);
         let restore = decoded.restore;
         let mut new = apply::transform_res_body(decoded.body, resolved, res_ct.as_deref());
 
@@ -5569,7 +5573,12 @@ async fn serve(
         // Bounded: these operators need the body in memory, and the body is
         // whatever the client decided to send. Past the bound whistle stops
         // transforming and lets the rest through — see [`body::collect_capped`].
-        match collect_capped_body(incoming, apply::req_body_limit(&resolved))
+        let limit = apply::req_body_limit(&resolved);
+        let params_on_body = apply::params_rewrite_body(&resolved, body_ctx);
+        let req_body_op = |op: &MatchedOp| {
+            unapplied::req_body_op(op) || (op.protocol == "params" && params_on_body)
+        };
+        match collect_capped_body(incoming, limit)
             .await
             .map_err(outcome::at(outcome::Phase::Request))?
         {
@@ -5578,7 +5587,6 @@ async fn serve(
                 // do nothing has turned out to be a bug worth fixing. This one
                 // is a deliberate refusal, and a rule that quietly stopped
                 // applying above some size would read exactly like the bugs.
-                let limit = apply::req_body_limit(&resolved);
                 tracing::warn!(
                     "{} {}: request body is over {} bytes, so it is forwarded \
                      unchanged — reqBody/reqReplace/params/reqWrite and reqSpeed \
@@ -5587,10 +5595,9 @@ async fn serve(
                     info.full_url,
                     limit,
                 );
-                let params_on_body = apply::params_rewrite_body(&resolved, body_ctx);
                 ledger.unapplied(unapplied::Unapplied::over(
                     &matched_ops(&resolved),
-                    |op| unapplied::req_body_op(op) || (op.protocol == "params" && params_on_body),
+                    req_body_op,
                     unapplied::Kind::RequestBodyOverLimit,
                     format!(
                         "the request body is over {limit} bytes, the limit for rewriting \
@@ -5606,7 +5613,7 @@ async fn serve(
                 req_body_cap = Some(cap.clone());
                 body::tee(body, cap)
             }
-            body::Capped::Whole { bytes, .. } => {
+            body::Capped::Whole { bytes, .. } => 'rewrite: {
                 // Decompress before rewriting, exactly as the response path
                 // does. Upstream reaches it from the other end: every request
                 // body operator goes through `addTextTransform`/`addZipTransform`,
@@ -5623,7 +5630,25 @@ async fn serve(
                 // one argument (`rules.js:164`), so its `req.enable` lookup is on
                 // `undefined` and the flag never reaches the request side. The
                 // body goes back under the coding it arrived with, or none.
-                let decoded = coding::decode_for_rewrite(bytes, req_enc.as_deref());
+                let decoded = coding::decode_for_rewrite(bytes, req_enc.as_deref(), limit);
+                // A body that cannot be undone goes to the origin as the client
+                // sent it — not rewritten in bytes nobody here can read.
+                if let Some(why) = decoded.not_decoded {
+                    ledger.unapplied(unapplied::not_decoded(
+                        why,
+                        "request",
+                        req_enc.as_deref().unwrap_or_default(),
+                        &matched_ops(&resolved),
+                        req_body_op,
+                    ));
+                    let cap = Capture::new(
+                        req_ct.clone(),
+                        req_enc.as_deref(),
+                        state.config.body_preview_cap,
+                    );
+                    req_body_cap = Some(cap.clone());
+                    break 'rewrite body::tee(body::full(decoded.body), cap);
+                }
                 let restore = decoded.restore;
                 let new = apply::transform_req_body(decoded.body, &resolved, body_ctx);
                 let (new, encoded_as) = coding::reencode(new, restore, None);
@@ -5914,7 +5939,7 @@ async fn serve(
     // response that arrived with trailers reached the client without them the
     // moment *any* body operator matched — including one that had nothing to do
     // with trailers.
-    let mut collected: Option<(Bytes, Option<hyper::HeaderMap>)> = None;
+    let mut collected: Option<(coding::Decoded, Option<hyper::HeaderMap>)> = None;
     let mut streamed: Option<DynBody> = None;
     if must_collect_body(
         &ops,
@@ -5926,7 +5951,13 @@ async fn serve(
             // A plugin that replaced the body outright makes the upstream bytes
             // irrelevant — don't wait on them, and don't measure them either:
             // they are already in memory and were never read from a socket.
-            Some(new) => collected = Some((Bytes::from(new.clone()), None)),
+            // Decoded unbounded and used whatever came of it, as a local
+            // response's body is: it was made by the plugin, not received.
+            Some(new) => {
+                let bytes = Bytes::from(new.clone());
+                let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref(), usize::MAX);
+                collected = Some((decoded, None));
+            }
             None => {
                 let cap = apply::res_body_limit(&resolved, state.config.body_rewrite_cap);
                 match collect_capped_body(body, cap)
@@ -5934,7 +5965,23 @@ async fn serve(
                     .map_err(outcome::at(outcome::Phase::Response))?
                 {
                     body::Capped::Whole { bytes, trailers } => {
-                        collected = Some((bytes, trailers));
+                        // Decompressed before rewriting — see below. A body that
+                        // cannot be undone takes the path a body too big to
+                        // hold does: through as it arrived, trailers and all.
+                        let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref(), cap);
+                        match decoded.not_decoded {
+                            None => collected = Some((decoded, trailers)),
+                            Some(why) => {
+                                ledger.unapplied(unapplied::not_decoded(
+                                    why,
+                                    "response",
+                                    res_enc.as_deref().unwrap_or_default(),
+                                    &matched_ops(&resolved),
+                                    unapplied::res_body_op,
+                                ));
+                                streamed = Some(retrailer(body::full(decoded.body), trailers));
+                            }
+                        }
                     }
                     body::Capped::TooBig { body, .. } => {
                         // whistle never needs this bound: its response rewriting
@@ -5975,7 +6022,7 @@ async fn serve(
     } else {
         streamed = Some(body);
     }
-    let res_body: DynBody = if let Some((bytes, origin_trailers)) = collected {
+    let res_body: DynBody = if let Some((decoded, origin_trailers)) = collected {
         // Decompress before rewriting. Every body operator works on text,
         // and most origins answer compressed — so without this a
         // `resReplace://` against a gzipped page searched the deflate
@@ -5984,7 +6031,6 @@ async fn serve(
         // transform sets `_needGunzip`, which puts a decoder in front of it
         // and a re-encoder behind (`addZipTransform`,
         // `_original/lib/inspectors/data.js:` and `inspectors/rules.js:60-140`).
-        let decoded = coding::decode_for_rewrite(bytes, res_enc.as_deref());
         let restore = decoded.restore;
         let mut new = apply::transform_res_body(decoded.body, &resolved, res_ct.as_deref());
 

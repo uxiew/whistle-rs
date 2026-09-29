@@ -8978,7 +8978,7 @@ mod tests {
 
         let sent = |rule: &str, ct: &str| {
             let wire = coding::encode(coding::Coding::Gzip, b"ORIGINAL body").expect("gzip");
-            let decoded = coding::decode_for_rewrite(Bytes::from(wire), Some("gzip"));
+            let decoded = coding::decode_for_rewrite(Bytes::from(wire), Some("gzip"), usize::MAX);
             let restore = decoded.restore;
             let new = transform_req_body(
                 decoded.body,
@@ -9004,8 +9004,11 @@ mod tests {
 
         // A coding this proxy cannot undo is not re-encoded over: the operators
         // run on bytes they will not usefully match, and nothing is corrupted.
-        let opaque =
-            coding::decode_for_rewrite(Bytes::from_static(b"not really zstd"), Some("zstd"));
+        let opaque = coding::decode_for_rewrite(
+            Bytes::from_static(b"not really zstd"),
+            Some("zstd"),
+            usize::MAX,
+        );
         assert!(!opaque.restore.plain);
         let (out, coded) = coding::reencode(opaque.body, opaque.restore, None);
         assert_eq!(coded, coding::Coding::Identity);
