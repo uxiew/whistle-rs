@@ -22,7 +22,7 @@ const gzPost = (text, headers) => post(zlib.gzipSync(text), { 'content-encoding'
 module.exports = [
   // ── baselines: no rule, every origin answer this corpus uses ───────────
   ...['/gz', '/deflate', '/rawdeflate', '/br', '/xgzip', '/zstd', '/liar',
-    '/gbk', '/js', '/css', '/json', '/plain', '/xml', '/png', '/octet',
+    '/gbk', '/js', '/css', '/json', '/plain', '/xml', '/png', '/svg', '/octet',
     '/notutf8', '/notype', '/chunked', '/trailers', '/gzjson', '/html',
   ].map((path) => ({ name: `baseline ${path}`, rules: '', request: { path } })),
   { name: 'baseline /big 64k', rules: '', request: { path: '/big?n=65536' } },
@@ -107,6 +107,11 @@ module.exports = [
 
   // ── bodies that are not text ───────────────────────────────────────────
   { name: 'resReplace on an image', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/png' } },
+  // An SVG is an image **and** XML text. whistle 2.10.8 classifies by
+  // substring, `xml` before `image/`, so this is text and the substitution
+  // runs; 2.10.10 checks `image/` first (`getContentType`, avwo/whistle@ca15b3f)
+  // and leaves it alone. This port keeps 2.10.8's answer — see declared.js.
+  { name: 'resReplace on an svg image', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/svg' } },
   { name: 'resReplace on octet-stream', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/octet' } },
   { name: 'resReplace on a body that is not utf-8', rules: `${P} resReplace://ORIG=X`, request: { path: '/notutf8' } },
   { name: 'resReplace on a typeless body', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/notype' } },

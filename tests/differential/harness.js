@@ -441,6 +441,9 @@ const FIXED = {
   '/plain': ['text/plain', 'ORIGINAL text', {}],
   '/xml': ['application/xml', '<r>ORIGINAL</r>', {}],
   '/png': ['image/png', Buffer.from('89504e470d0a1a0a4f524947494e414c', 'hex'), {}],
+  // An image that is text. Whether it is one or the other is exactly what
+  // whistle changed its mind about in 2.10.10 — see cases-bodies.js.
+  '/svg': ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg"><text>ORIGINAL</text></svg>', {}],
   '/octet': ['application/octet-stream', 'ORIGINAL bytes', {}],
   // Latin-1 bytes under an HTML type: a body no UTF-8 decoder accepts.
   '/notutf8': ['text/html', Buffer.from([0x4f, 0x52, 0x49, 0x47, 0xff, 0xfe, 0x49, 0x4e, 0x41, 0x4c]), {}],
@@ -459,9 +462,9 @@ const FIXED = {
   // becomes of the separator header, neither of which needs a stream that runs
   // forever. The blank lines are the frame boundaries.
   '/sse': ['text/event-stream', 'data: one\n\ndata: two\n\ndata: three\n\n', {}],
-  // The type with a parameter on it: upstream compares `content-type` **whole**
-  // for this decision (`headers['content-type'] === 'text/event-stream'`), which
-  // is narrower than the test deciding whether a body may be buffered.
+  // The type with a parameter on it. whistle 2.10.8 compared `content-type`
+  // **whole** for the Frames decision (`headers['content-type'] ===
+  // 'text/event-stream'`); 2.10.9 and later compare the type alone.
   '/sse-charset': ['text/event-stream; charset=utf-8', 'data: one\n\ndata: two\n\n', {}],
   '/sse-gz': ['text/event-stream', zlib.gzipSync('data: one\n\ndata: two\n\n'),
     { 'content-encoding': 'gzip' }],
