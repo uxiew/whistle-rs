@@ -36,8 +36,25 @@ struct HostCache<V> {
     inserted: VecDeque<String>,
 }
 
-/// The generated leaf certificates, one acceptor per signed name.
-type AcceptorCache = HostCache<TlsAcceptor>;
+/// The generated leaf certificates, one per signed name.
+type AcceptorCache = HostCache<Leaf>;
+
+/// A leaf this proxy signed, and when — so it is replaced before it expires.
+#[derive(Clone)]
+struct Leaf {
+    acceptor: TlsAcceptor,
+    issued: SystemTime,
+}
+
+impl Leaf {
+    /// Still worth serving: signed less than [`LEAF_REISSUE_AFTER`] ago. A clock
+    /// that moved backwards reads as fresh, which only delays the re-issue.
+    fn fresh(&self) -> bool {
+        self.issued
+            .elapsed()
+            .map_or(true, |age| age < LEAF_REISSUE_AFTER)
+    }
+}
 
 // Derived `Default` would demand `V: Default`, which neither value here has.
 impl<V> Default for HostCache<V> {
@@ -232,12 +249,18 @@ impl CertAuthority {
             let cache = self.acceptors.lock().unwrap();
             cert_host(&host, |name| cache.by_host.contains_key(name))
         };
-        if let Some(acc) = self.acceptors.lock().unwrap().get(&key) {
-            return Ok(acc);
+        if let Some(leaf) = self.acceptors.lock().unwrap().get(&key)
+            && leaf.fresh()
+        {
+            return Ok(leaf.acceptor);
         }
-        let acc = self.build_acceptor(&key)?;
-        self.acceptors.lock().unwrap().insert(key, acc.clone());
-        Ok(acc)
+        let acceptor = self.build_acceptor(&key)?;
+        let leaf = Leaf {
+            acceptor: acceptor.clone(),
+            issued: SystemTime::now(),
+        };
+        self.acceptors.lock().unwrap().insert(key, leaf);
+        Ok(acceptor)
     }
 
     fn build_acceptor(&self, host: &str) -> Result<TlsAcceptor> {
@@ -319,12 +342,10 @@ impl CertAuthority {
         let leaf_key = KeyPair::generate().context("generating leaf key")?;
         let mut params = CertificateParams::new(vec![host.to_string()]).context("leaf params")?;
         params.distinguished_name.push(DnType::CommonName, host);
-        // Validity is relative to now, as upstream's `createCert(…, isShortPeriod)`
-        // is (`ca.js:552-568`): backdated 20 days so a client with a slow clock
-        // still accepts it, and valid for a year. A fixed window would quietly
-        // start issuing expired certificates once it elapsed.
-        params.not_before = (SystemTime::now() - Duration::from_secs(20 * ONE_DAY)).into();
-        params.not_after = (SystemTime::now() + Duration::from_secs(365 * ONE_DAY)).into();
+        // Relative to now, as upstream's `createCert(…, isShortPeriod)` is: a
+        // fixed window would quietly start issuing expired certificates.
+        params.not_before = (SystemTime::now() - LEAF_BACKDATE).into();
+        params.not_after = (SystemTime::now() + LEAF_LIFETIME).into();
         params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
@@ -346,6 +367,31 @@ impl CertAuthority {
 
 /// Seconds in a day, for the certificate validity windows.
 const ONE_DAY: u64 = 24 * 60 * 60;
+
+/// How far a leaf is backdated, so a client whose clock runs slow still
+/// accepts it.
+///
+/// With [`LEAF_LIFETIME`] this is whistle 2.10.10's window (`ca.js`, `MIN_DATE`
+/// and `MAX_DATE`, avwo/whistle#1360): 43 days in all. It used to be 20 days
+/// back and 365 forward — 385 days, as in 2.10.8 — and Chromium refuses a
+/// certificate valid for longer than the CA/Browser Forum allows at the time it
+/// was issued: 200 days for one issued from 2026-03-15, 100 from 2027-03-15, 47
+/// from 2029-03-15 (`HasTooLongValidity`, `net/cert/cert_verify_proc.cc`). It
+/// checks that only under a root it counts as publicly trusted, which on
+/// Android means one in the **system** store — and that is where a tester often
+/// has to put this root, since apps targeting Android 7 and later ignore
+/// user-installed ones. The page then fails with `ERR_CERT_VALIDITY_TOO_LONG`,
+/// the upstream report was from an Android WebView. 43 days is under every step
+/// of that schedule.
+const LEAF_BACKDATE: Duration = Duration::from_secs(7 * ONE_DAY);
+
+/// How long a leaf is valid from the moment it is signed. See [`LEAF_BACKDATE`].
+const LEAF_LIFETIME: Duration = Duration::from_secs(36 * ONE_DAY);
+
+/// When a cached leaf is signed again: two days before it would expire, so a
+/// proxy left running for weeks never hands out one that is about to. Upstream
+/// gets the same by emptying its whole cache every 34 days.
+const LEAF_REISSUE_AFTER: Duration = Duration::from_secs(34 * ONE_DAY);
 
 /// Build the TLS acceptor whistle-rs presents to an intercepted client.
 ///
@@ -729,9 +775,12 @@ mod tests {
     fn the_acceptor_cache_stays_bounded() {
         let mut cache = AcceptorCache::default();
         let ca = ca("bound");
-        let acceptor = ca.acceptor_for("example.com").expect("acceptor");
+        let leaf = Leaf {
+            acceptor: ca.acceptor_for("example.com").expect("acceptor"),
+            issued: SystemTime::now(),
+        };
         for i in 0..MAX_CACHED_HOSTS + 10 {
-            cache.insert(format!("h{i}.test"), acceptor.clone());
+            cache.insert(format!("h{i}.test"), leaf.clone());
         }
         assert_eq!(cache.by_host.len(), MAX_CACHED_HOSTS);
         assert_eq!(cache.inserted.len(), MAX_CACHED_HOSTS);
@@ -800,6 +849,67 @@ mod tests {
         handshake_as(&ca, "www.example.com").expect("wildcard-covered subdomain");
         handshake_as(&ca, "example.com").expect("apex domain");
         handshake_as(&ca, "127.0.0.1").expect("IPv4 literal");
+    }
+
+    /// Short enough for Chromium under a root it counts as public: 47 days is
+    /// the tightest step of `HasTooLongValidity`'s schedule, and the window has
+    /// to contain now. See [`LEAF_BACKDATE`].
+    #[test]
+    fn a_leaf_is_valid_for_less_than_chromium_s_shortest_limit() {
+        let ca = ca("lifetime");
+        let (chain, _) = ca.sign_leaf("example.com").expect("leaf");
+        let params = CertificateParams::from_ca_cert_der(&chain[0]).expect("parse leaf");
+        let (from, to) = (
+            params.not_before.unix_timestamp(),
+            params.not_after.unix_timestamp(),
+        );
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(from < now && now < to);
+        let days = (to - from) / ONE_DAY as i64;
+        assert!(
+            days <= 47,
+            "a leaf valid for {days} days is refused by Chromium"
+        );
+        assert_eq!(
+            days, 43,
+            "whistle 2.10.10's window: 7 days back, 36 forward"
+        );
+    }
+
+    /// A proxy left running outlives its leaves; the cache must not hand one
+    /// out after it expired.
+    #[test]
+    fn a_cached_leaf_is_signed_again_before_it_expires() {
+        let ca = ca("reissue");
+        ca.acceptor_for("example.com").unwrap();
+        let signed_at =
+            |ca: &CertAuthority| ca.acceptors.lock().unwrap().by_host["example.com"].issued;
+        let first = signed_at(&ca);
+        ca.acceptor_for("example.com").unwrap();
+        assert_eq!(signed_at(&ca), first, "a fresh leaf is reused");
+
+        let old = SystemTime::now() - LEAF_REISSUE_AFTER - Duration::from_secs(60);
+        ca.acceptors
+            .lock()
+            .unwrap()
+            .by_host
+            .get_mut("example.com")
+            .unwrap()
+            .issued = old;
+        ca.acceptor_for("example.com").unwrap();
+        let again = signed_at(&ca);
+        assert!(
+            again > old + LEAF_REISSUE_AFTER,
+            "an old leaf is signed again"
+        );
+        assert_eq!(
+            ca.acceptors.lock().unwrap().inserted.len(),
+            1,
+            "replaced, not added"
+        );
     }
 
     /// The shared wildcard must not stretch beyond its domain: the certificate
