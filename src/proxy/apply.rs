@@ -1,8 +1,25 @@
 //! Translate resolved rules into concrete request/response mutations.
 //!
 //! Ported from the request/response inspectors in `_original/lib/inspectors/`
-//! (`req.js`, `res.js`) and the handlers. Implements the most-used operators;
-//! others parse and resolve but are not yet applied (documented in README).
+//! (`req.js`, `res.js`) and the handlers. This file builds the facts the
+//! matcher needs ([`build_req_info`], [`build_res_info`]); the operators live
+//! one kind of work per file:
+//!
+//! | file | what it does |
+//! | --- | --- |
+//! | `substitute` | backtick templates, `{value}` references, `$1`, `${…}` in operator values |
+//! | `value_sources` | loading values that name a file or URL, before anything applies |
+//! | `merge` | rules that arrive late: plugin text, includes, `resRules`, the response phase |
+//! | `route` | where a request goes: `host`/`proxy`/`pac`, and the [`Target`] |
+//! | `flags` | `enable://`/`disable://` and the questions asked of them |
+//! | `local`, `files` | answers made without the origin, and finding their files |
+//! | `req_ops`, `res_ops` | the request and response heads |
+//! | `header_ops`, `cookies`, `deletes`, `cors`, `cache`, `content_types` | one operator family each, both sides |
+//! | `path_query` | the request's path and query |
+//! | `body_ops`, `op_data` | rewriting bodies, and parsing operator values as data |
+//! | `pacing`, `trailers`, `writes` | delays and speeds, trailers, `reqWrite`/`resWrite` |
+//!
+//! The tests are in `tests.rs`, one module for the lot.
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use bytes::Bytes;
