@@ -2711,6 +2711,22 @@ mod body_tests {
         assert!(entry["request"]["postData"].is_null());
         assert_eq!(entry["response"]["content"]["size"], 0);
         assert_eq!(entry["response"]["content"]["text"], "");
+        assert!(entry["_error"].is_null(), "nothing went wrong");
+    }
+
+    /// A failed request exports its reason where Chrome's own export puts one:
+    /// `_error`, a single string, phase first.
+    #[test]
+    fn a_failed_session_exports_its_reason() {
+        let mut s = session("http://example.com/", 1);
+        s.error = crate::proxy::outcome::Outcome::failed(crate::proxy::outcome::Failure::new(
+            crate::proxy::outcome::Phase::Connect,
+            "connecting to example.com:80: Connection refused",
+        ));
+        assert_eq!(
+            har_entry(&s)["_error"],
+            "connect: connecting to example.com:80: Connection refused"
+        );
     }
 }
 
