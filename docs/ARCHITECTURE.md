@@ -47,6 +47,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/qr.rs` | `qrcode@1.2.0` (a dependency there) | A QR encoder for the console's LAN addresses: byte mode, level M, versions 1-10. Compared module for module by `tests/differential/qr-bench.js` |
 | `src/proxy/template.rs` | `lib/handlers/file-proxy.js` (`render`) | `tpl`/`dust`/`jsonp` two-pass rendering + `${var}` variables |
 | `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation) |
+| `src/proxy/outcome.rs` | `lib/inspectors/data.js` (`reqError`/`resError`) | How a request ended when it did not complete: the phase, the reason, the error tag that carries them out of `upstream`, and the body wrapper that notices a response breaking off |
 | `src/proxy/sni.rs` | `lib/https/index.js:1281`, `lib/https/load-cert.js` | The SNI stage: peek the ClientHello, pick the certificate, or relay the connection untouched |
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
 | `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
@@ -92,7 +93,7 @@ handle_connect     serve(Forward)                serve(Forward)   local_ui
    ▼                   │                              │             /rootCA.crt)
 serve_tunnel           │                              │
    │ peek ClientHello  │                              │
-   ├─ sni::decide ─ "do not intercept" ──▶ sni::relay (opaque, no rules)
+   ├─ sni::decide ─ "do not intercept" ──▶ relay_recorded (opaque; one CONNECT session)
    │ TLS-accept        │                              │
    │ (leaf for the SNI,│                              │
    │  or a plugin's)   │                              │
@@ -117,6 +118,42 @@ serve(Mitm) ──────────────────────�
 The two entry origins (`Forward`, `Mitm`) converge on the same `serve()` pipeline;
 they differ only in how scheme/host/port are derived. That's why rules apply
 identically to plain HTTP and to intercepted HTTPS.
+
+### How a request becomes exactly one session
+
+Every request `serve()` takes on becomes one session, however it ends. The
+caller is `serve_recorded`, which hands `serve()` a `Ledger` — a draft of the
+session that fills in as the request goes (method and URL, then the matched
+rules, then the target, the outgoing headers and the connection's timings) —
+and settles it three ways:
+
+- **A path that answers records its own** through `Ledger::record`: a local
+  answer, a plugin's, an abort, the response head from the origin.
+- **An error that escapes `serve()`** reaches `guard`, which records the draft
+  with the error's phase and answers `502` with `x-whistle-rs-error` and
+  `x-whistle-rs-session`. The phase is not guessed from the message: `upstream`
+  wraps each failure in an `outcome::Stopped` where it happens (`dial` tags DNS
+  and connect separately, the proxy handshake, the TLS handshake, the send), and
+  `outcome::phase_of` finds the innermost tag under any `.context()` added on
+  top. An untagged error is `internal` — a gap in the tagging, not a category.
+- **A dropped future** — hyper drops the service future when the client closes
+  the connection or resets the stream — drops the `Ledger`, whose `Drop` records
+  the draft as `client`.
+
+`settled` is what keeps the three from doubling up. A forwarded response is
+different in one way: its row appears at the head, but it is not *complete*
+until the body is. `AppState::record_open` shows it, and `outcome::settle`
+wraps the body and calls `AppState::complete` once — when the body ends, fails
+(`response`) or is dropped short (`client`). `complete` is the only place the
+observer is called and the history written, so both see the final session.
+hyper also drops a body it has finished without polling it to the end, once a
+`content-length` is written; `settle` counts the bytes so that is not mistaken
+for a client leaving.
+
+A tunnel whose contents are not read has no request inside it to do this, so
+`serve_tunnel` records the CONNECT itself through a `Tunnel`: when it is relayed
+(`relay_recorded` — shown once connected, complete when it closes), when it
+cannot be routed, and when the client refuses the certificate (`client-tls`).
 
 ### Why we open our own upstream connection
 
