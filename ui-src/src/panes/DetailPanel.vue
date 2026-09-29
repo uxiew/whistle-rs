@@ -96,7 +96,11 @@ watch(
       <!-- From the summary, not the detail: `/sessions.json` already carries
            which rules matched, so the tab fills with the row rather than a
            round trip after it. -->
-      <RulesTab v-else-if="activeTab === 'rules'" :rules="session.rules" />
+      <RulesTab
+        v-else-if="activeTab === 'rules'"
+        :rules="session.rules"
+        :unapplied="session.unapplied"
+      />
       <HeaderList v-else-if="activeTab === 'req-head'" :pairs="state.detail?.req_headers" />
       <HeaderList v-else-if="activeTab === 'res-head'" :pairs="state.detail?.res_headers" />
       <!-- Which session and which side, so the panel can ask for the body's

@@ -60,6 +60,27 @@ export interface SessionSummary {
   composer?: true;
   /** The response is still arriving; sizes, body and `error` can change. */
   open?: true;
+  /** Operators in `rules` that did not take effect, and why. Absent when all did. */
+  unapplied?: Unapplied[];
+}
+
+/** Why some matched operators did not take effect — `src/proxy/unapplied.rs`. */
+export type UnappliedKind =
+  | 'body-over-limit'
+  | 'request-body-over-limit'
+  | 'event-stream'
+  | 'decoded-over-limit'
+  | 'undecodable'
+  | 'unsupported-coding'
+  | 'plugin-failed'
+  | 'cipher-unusable';
+
+export interface Unapplied {
+  kind: UnappliedKind;
+  /** The operators it covers, each the `raw` of an entry in `rules`. */
+  ops: string[];
+  /** What happened, in words, with the numbers that decided it. */
+  reason: string;
 }
 
 /** `/api/sessions/search`'s answer to the box's `h:`/`b:` conditions. */

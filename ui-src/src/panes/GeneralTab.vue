@@ -38,10 +38,16 @@ const policy = computed<Pair[]>(() => [
   ['log:// tags', (props.session.log || []).join(', ')],
 ]);
 
-/** Never blank: "none" is the answer people come to this card for. */
+/**
+ * Never blank: "none" is the answer people come to this card for. And a match
+ * is not an effect: operators the proxy did not carry out are counted apart,
+ * with the why on the Rules tab.
+ */
 const matched = computed(() => {
   const n = props.session.rules?.length || 0;
-  return n ? `${n} matched` : 'none matched';
+  if (!n) return 'none matched';
+  const skipped = new Set((props.session.unapplied || []).flatMap((u) => u.ops)).size;
+  return skipped ? `${n} matched, ${skipped} did not take effect` : `${n} matched`;
 });
 
 const traffic = computed<Pair[]>(() => [
