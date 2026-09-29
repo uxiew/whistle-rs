@@ -6,6 +6,7 @@ import DetailPanel from './DetailPanel.vue';
 import RequestTable from './RequestTable.vue';
 import {
   captureFiltering,
+  captureGaps,
   captureRefused,
   clearSessions,
   purgeSessions,
@@ -92,7 +93,7 @@ function onPurge(): void {
       <button
         class="btn"
         :class="{ on: captureFiltering }"
-        title="Keep or drop requests as they arrive, by URL, m:, H: or i:"
+        title="Show or hide requests in this list as they arrive. The proxy still records them."
         @click="showCapture = !showCapture"
       >
         Capture filter{{ captureRefused ? ` (${captureRefused} hidden)` : '' }}
@@ -117,7 +118,17 @@ function onPurge(): void {
         Applies to requests that arrive from now on; rows already listed stay.
         Conditions in one box are OR-ed, the two boxes are AND-ed. Prefixes:
         <code>m:</code> <code>H:</code> <code>i:</code> <code>s:</code>
-        <code>t:</code>, or a bare word for the URL.
+        <code>t:</code> <code>e:</code> <code>fc:</code>, or a bare word for the URL.
+        This only changes what the list shows: a hidden request is still
+        recorded, exported and kept on disk. To keep one out of the record, use
+        <code>enable://hide</code> in the rules.
+      </p>
+      <!-- A condition these boxes cannot act on used to be dropped without a
+           word, and a box holding only such conditions let everything in. -->
+      <p v-if="captureGaps.length" class="hint warn">
+        <span v-for="g in captureGaps" :key="g.prefix">
+          Ignored <code>{{ g.prefix }}:</code> — {{ g.why }}.
+        </span>
       </p>
     </div>
 

@@ -1025,6 +1025,9 @@ pre.dump.hex {
   color: var(--fg-faint);
 }
 
+.hint.warn { color: var(--warn); }
+.hint.warn span { display: block; }
+
 .hint code {
   font-family: var(--mono);
   background: var(--bg-sub);

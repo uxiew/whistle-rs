@@ -81,10 +81,14 @@ interface State {
   marked: number[];
   markedOnly: boolean;
   /**
-   * The capture filters — `gui/network.md`'s Include/Exclude Filter. Unlike the
-   * search box these decide what is **kept at all**, they read only what a
-   * request carries, and they apply to requests that arrive *after* they are
-   * set: a row already on screen stays there.
+   * The capture filters — `gui/network.md`'s Include/Exclude Filter. They
+   * apply to requests that arrive *after* they are set, and a row already on
+   * screen stays there, which is what sets them apart from the search box.
+   *
+   * They decide what **this console shows**, not what the proxy records: a
+   * refused request is still in `/sessions.json`, in a HAR export and in the
+   * history on disk. Keeping a request out of the record is a rule's job —
+   * `enable://hide` — and is not done from here.
    */
   captureInclude: string;
   captureExclude: string;
@@ -274,6 +278,19 @@ export const captureRefused = computed(() => refused.value);
 export const captureFiltering = computed(
   () => !!(state.captureInclude.trim() || state.captureExclude.trim()),
 );
+
+/**
+ * What the capture filters cannot act on, with the reason. Without this a box
+ * holding only `h:cookie` dropped the condition and let everything through,
+ * and nothing on screen said the filter was not filtering.
+ */
+export const captureGaps = computed(() => {
+  const gaps = [
+    ...parseFilter(state.captureInclude).unsupported,
+    ...parseFilter(state.captureExclude).unsupported,
+  ];
+  return gaps.filter((g, i) => gaps.findIndex((o) => o.prefix === g.prefix) === i);
+});
 
 /** Apply the capture filters to a freshly fetched list. */
 function admit(list: SessionSummary[]): SessionSummary[] {
