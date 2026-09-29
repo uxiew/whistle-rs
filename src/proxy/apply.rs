@@ -2620,6 +2620,18 @@ const LOADABLE_TEXT_OPS: &[&str] = &[
     "htmlAppend",
 ];
 
+/// The operators whose loaded value is sent as bytes, not text — upstream's
+/// `binProtocols` (`_original/lib/rules/protocols.js:121-128`), read with
+/// `needRawData` (`util/index.js:1273-1274`). See [`RuleOp::value_bytes`].
+const BINARY_OPS: &[&str] = &[
+    "reqBody",
+    "reqPrepend",
+    "reqAppend",
+    "resBody",
+    "resPrepend",
+    "resAppend",
+];
+
 /// The `js*`/`css*` families: a file value loads, a URL value does not — see
 /// [`LOADABLE_TEXT_OPS`].
 const LOADABLE_FILE_ONLY_OPS: &[&str] = &[
@@ -2772,14 +2784,29 @@ const MAX_URL_VALUE: usize = 256 * 1024;
 /// yields `undefined` and its URL fetch yields `''` for a non-200, a timeout or
 /// an oversized body (`requestValue`, `_original/lib/plugins/index.js:1500-1512`).
 /// What the caller does with it differs by family — see [`load_rule_values`].
-async fn read_value_source(source: &ValueSource) -> Option<String> {
+/// What a value source yielded: its text, and — for a file — its bytes.
+#[derive(Clone)]
+struct Loaded {
+    text: String,
+    /// The files' bytes joined with CRLF, untouched: what the binary operators
+    /// send (see [`RuleOp::value_bytes`]); a URL's body likewise.
+    raw: Option<Bytes>,
+}
+
+async fn read_value_source(source: &ValueSource) -> Option<Loaded> {
     match source {
         // `readFileText` splits on `|` and joins what it read with CRLF, missing
         // files dropping out (`_original/lib/util/file-mgr.js:96-102,:157-166`).
         // That is *not* the first-one-wins of a `file://` rule: several files
         // concatenate into one value.
+        //
+        // The text is each file decoded on its own, which is `readFileText`'s;
+        // the bytes are the files as they are, which is `readFile`'s, and what
+        // `joinData` concatenates for a binary operator (`file-mgr.js:93-109`).
+        // Upstream's suite splits a Chinese sentence across three files mid-
+        // character (`test/units/insertFile.test.js`); only the bytes join back.
         ValueSource::File(spec) => {
-            let mut parts: Vec<String> = Vec::new();
+            let mut parts: Vec<Vec<u8>> = Vec::new();
             for entry in spec.split('|') {
                 let path = convert_slash(&expand_home(&decode_path(entry.trim())));
                 if has_parent_ref(&path) {
@@ -2787,23 +2814,29 @@ async fn read_value_source(source: &ValueSource) -> Option<String> {
                     continue;
                 }
                 match read_cached(Path::new(&path)) {
-                    // A rule value is a string; a binary mock body has to go
-                    // through `file://`, which never decodes.
-                    Some(data) => parts.push(String::from_utf8_lossy(&data).into_owned()),
+                    Some(data) => parts.push(data.to_vec()),
                     // Only `debug`: `a|b` is written precisely so that a missing
                     // alternative is normal. The caller warns once when *nothing*
                     // was read, which is the case worth a line per request.
                     None => tracing::debug!("rule value {path}: not readable"),
                 }
             }
-            (!parts.is_empty()).then(|| parts.join("\r\n"))
+            (!parts.is_empty()).then(|| Loaded {
+                text: parts
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("\r\n"),
+                raw: Some(Bytes::from(parts.join(CRLF))),
+            })
         }
         ValueSource::Url(url) => {
             let fetch = super::upstream::simple_get(url);
             match tokio::time::timeout(VALUE_FETCH_TIMEOUT, fetch).await {
-                Ok(Ok((200, bytes))) if bytes.len() <= MAX_URL_VALUE => {
-                    Some(String::from_utf8_lossy(&bytes).into_owned())
-                }
+                Ok(Ok((200, bytes))) if bytes.len() <= MAX_URL_VALUE => Some(Loaded {
+                    text: String::from_utf8_lossy(&bytes).into_owned(),
+                    raw: Some(Bytes::copy_from_slice(&bytes)),
+                }),
                 Ok(Ok((200, bytes))) => {
                     tracing::warn!("rule value {url}: {} bytes exceeds the limit", bytes.len());
                     None
@@ -2853,7 +2886,7 @@ async fn read_value_source(source: &ValueSource) -> Option<String> {
 /// the response phase merges operators that were withheld from the request pass
 /// — reads nothing twice.
 pub async fn load_rule_values(resolved: &mut Resolved, at: &ReqInfo) {
-    let mut wanted: HashMap<ValueSource, Option<String>> = HashMap::new();
+    let mut wanted: HashMap<ValueSource, Option<Loaded>> = HashMap::new();
     for op in resolved.ops_mut() {
         if let Some(source) = value_source(op) {
             wanted.entry(source).or_default();
@@ -2870,8 +2903,11 @@ pub async fn load_rule_values(resolved: &mut Resolved, at: &ReqInfo) {
             continue;
         };
         match wanted.get(&source).and_then(Option::as_ref) {
-            Some(content) => {
-                op.value = content.clone();
+            Some(loaded) => {
+                op.value = loaded.text.clone();
+                if BINARY_OPS.contains(&op.protocol.as_str()) {
+                    op.value_bytes = loaded.raw.clone();
+                }
                 op.value_is_content = true;
                 op.value_loaded = true;
             }
@@ -5837,9 +5873,9 @@ const DOCTYPE: &[u8] = b"<!DOCTYPE html>\r\n";
 /// with CRLF, whistle's separator for everything that lands in one slot.
 #[derive(Default)]
 struct Injection {
-    top: Vec<Vec<u8>>,
-    body: Vec<Vec<u8>>,
-    bottom: Vec<Vec<u8>>,
+    top: Vec<Piece>,
+    body: Vec<Piece>,
+    bottom: Vec<Piece>,
     /// Whether the body slot was claimed at all. Distinct from `body` being
     /// non-empty: a `*Body` operator that matched with a blank value still
     /// replaces the body (upstream substitutes an empty *buffer*, which is
@@ -5861,12 +5897,16 @@ impl Injection {
     ///
     /// The separators stay as they are: CRLF and the doctype are ASCII, and
     /// every charset with a `charset=` label worth honouring is ASCII-compatible.
+    ///
+    /// Bytes a binary operator read from a file are not text in anybody's
+    /// charset and go as they are — upstream's `toBuffer` returns a `Buffer`
+    /// untouched (`_original/lib/util/common.js:1563-1566`).
     fn recode(&mut self, encoding: &'static encoding_rs::Encoding) {
         for slot in [&mut self.top, &mut self.body, &mut self.bottom] {
-            for piece in slot.iter_mut() {
-                *piece = super::coding::encode_charset(
+            for piece in slot.iter_mut().filter(|p| !p.raw) {
+                piece.bytes = super::coding::encode_charset(
                     encoding,
-                    &String::from_utf8_lossy(std::mem::take(piece).as_slice()),
+                    &String::from_utf8_lossy(std::mem::take(&mut piece.bytes).as_slice()),
                 );
             }
         }
@@ -5888,28 +5928,40 @@ impl Injection {
     }
 }
 
+/// One line's contribution to a slot.
+struct Piece {
+    bytes: Vec<u8>,
+    /// Bytes a binary operator loaded as they are ([`RuleOp::value_bytes`]),
+    /// which no charset applies to.
+    raw: bool,
+}
+
+impl Piece {
+    /// Text: a rule's value, or markup made from one.
+    fn text(bytes: Vec<u8>) -> Self {
+        Piece { bytes, raw: false }
+    }
+
+    /// What an operator line sends: its loaded bytes when it has them.
+    fn of(op: &RuleOp) -> Self {
+        match &op.value_bytes {
+            Some(bytes) => Piece {
+                bytes: bytes.to_vec(),
+                raw: true,
+            },
+            None => Piece::text(op.value.as_bytes().to_vec()),
+        }
+    }
+}
+
 /// Append `pieces` to `out`, CRLF-separated.
-fn join_into(out: &mut Vec<u8>, pieces: Vec<Vec<u8>>) {
+fn join_into(out: &mut Vec<u8>, pieces: Vec<Piece>) {
     for (i, piece) in pieces.into_iter().enumerate() {
         if i > 0 {
             out.extend_from_slice(CRLF);
         }
-        out.extend(piece);
+        out.extend(piece.bytes);
     }
-}
-
-/// CRLF-join the values of one operator's matching lines, dropping blanks
-/// (`joinData`, `_original/lib/util/file-mgr.js:93-109`, whose loop skips falsy
-/// entries; the HTML path filters them a step earlier, `index.js:1320-1322`).
-fn join_values(values: &[&str]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    for value in values.iter().filter(|v| !v.is_empty()) {
-        if !out.is_empty() {
-            out.extend_from_slice(CRLF);
-        }
-        out.extend_from_slice(value.as_bytes());
-    }
-    out
 }
 
 /// Deep-merge `patch` (a JSON object) into `target`; objects merge recursively,
@@ -6447,7 +6499,7 @@ fn collect_generic(injection: &mut Injection, gate: &InjectionGate<'_>, prefix: 
         .filter(Joined::claims_body)
     {
         injection.replaces_body = true;
-        injection.body.push(joined.bytes);
+        injection.body.extend(joined.pieces);
     }
     // `*Prepend`/`*Append` are tested the same way: upstream assigns the raw
     // value and tests it for truthiness, so an all-blank one contributes nothing
@@ -6456,8 +6508,8 @@ fn collect_generic(injection: &mut Injection, gate: &InjectionGate<'_>, prefix: 
         (format!("{prefix}Prepend"), &mut injection.top),
         (format!("{prefix}Append"), &mut injection.bottom),
     ] {
-        if let Some(joined) = gate.joined(&protocol).filter(|j| !j.bytes.is_empty()) {
-            slot.push(joined.bytes);
+        if let Some(joined) = gate.joined(&protocol).filter(|j| !j.pieces.is_empty()) {
+            slot.extend(joined.pieces);
         }
     }
 }
@@ -6499,11 +6551,11 @@ fn collect_res_injection(gate: &InjectionGate<'_>, families: BodyFamilies) -> In
             // both bodies. Blanks contribute nothing.
             let mut pushed = false;
             for (value, props) in lines.into_iter().filter(|(v, _)| !v.is_empty()) {
-                slot.push(match (html, family) {
+                slot.push(Piece::text(match (html, family) {
                     (true, "js") => wrap_js(value, props).into_bytes(),
                     (true, "css") => wrap_css(value).into_bytes(),
                     _ => value.as_bytes().to_vec(),
-                });
+                }));
                 pushed = true;
             }
             // A typed `*Body` only claims the slot when it actually contributed
@@ -6581,6 +6633,16 @@ impl<'a> InjectionGate<'a> {
     /// by contrast, is an operator that matched and had every line refused
     /// individually, which the body slot treats differently.
     fn lines(&self, protocol: &str) -> Option<Vec<(&'a str, &'a LineProps)>> {
+        Some(
+            self.kept(protocol)?
+                .into_iter()
+                .map(|op| (op.value.as_str(), &op.props))
+                .collect(),
+        )
+    }
+
+    /// The operator lines behind [`lines`](Self::lines).
+    fn kept(&self, protocol: &str) -> Option<Vec<&'a RuleOp>> {
         let ops = self.resolved.all(protocol);
         if ops.is_empty() || (self.html && !self.global.allows_injection(self.body)) {
             return None;
@@ -6588,26 +6650,30 @@ impl<'a> InjectionGate<'a> {
         Some(
             ops.iter()
                 .filter(|op| !self.html || op.props.allows_injection(self.body))
-                .map(|op| (op.value.as_str(), &op.props))
                 .collect(),
         )
     }
 
-    /// The CRLF-join of an operator's surviving lines, or `None` when it
-    /// contributes nothing (see [`InjectionGate::lines`]).
+    /// An operator's surviving lines, blanks dropped, or `None` when it
+    /// contributes nothing (see [`InjectionGate::lines`]). One piece per line:
+    /// a slot CRLF-joins its pieces, so the bytes are those of joining the
+    /// lines first (`joinData`, `_original/lib/util/file-mgr.js:93-109`, whose
+    /// loop skips falsy entries), and each line keeps whether it is raw.
     fn joined(&self, protocol: &str) -> Option<Joined> {
-        let kept = self.lines(protocol)?;
-        let values: Vec<&str> = kept.iter().map(|(v, _)| *v).collect();
-        Some(Joined {
-            bytes: join_values(&values),
-        })
+        let pieces = self
+            .kept(protocol)?
+            .into_iter()
+            .map(Piece::of)
+            .filter(|p| !p.bytes.is_empty())
+            .collect();
+        Some(Joined { pieces })
     }
 }
 
-/// One operator's contribution to a slot, after gating and joining.
+/// One operator's contribution to a slot, after gating.
 struct Joined {
-    /// The CRLF-join of the lines that survived the gate.
-    bytes: Vec<u8>,
+    /// The non-blank lines that survived the gate, in order.
+    pieces: Vec<Piece>,
 }
 
 impl Joined {
@@ -6630,7 +6696,7 @@ impl Joined {
     /// yields the falsy `''` (`_original/lib/util/whistle-transform.js:47-60,110`)
     /// — so the two need not be told apart.
     fn claims_body(&self) -> bool {
-        !self.bytes.is_empty()
+        !self.pieces.is_empty()
     }
 }
 
@@ -10866,6 +10932,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// The six binary operators send a file's bytes as they are. Upstream's
+    /// suite splits a Chinese sentence across three files mid-character
+    /// (`test/units/insertFile.test.js`); decoded one file at a time, the three
+    /// halves became U+FFFD. And bytes are not re-encoded into a response's
+    /// `charset=`: a GBK file injected into a GBK page stays GBK.
+    #[test]
+    fn a_binary_operator_sends_its_files_bytes() {
+        let dir = value_dir("binary");
+        let sentence = "我们是社会主义接班人!".as_bytes();
+        let (top, rest) = sentence.split_at(10);
+        let (mid, bottom) = rest.split_at(10);
+        for (name, bytes) in [("top", top), ("mid", mid), ("bottom", bottom)] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let f = |name: &str| dir.join(name).display().to_string();
+        let resolved = loaded(&format!(
+            "a.com resPrepend://{} resBody://{} resAppend://{}\n",
+            f("top"),
+            f("mid"),
+            f("bottom")
+        ));
+        let body = transform_res_body(Bytes::from_static(b"origin"), &resolved, Some("text/plain"));
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "我们是社会主义接班人!");
+
+        // "中文" in GBK, into a page that says it is GBK: sent as it is.
+        let gbk: &[u8] = &[0xd6, 0xd0, 0xce, 0xc4];
+        std::fs::write(dir.join("gbk"), gbk).unwrap();
+        let resolved = loaded(&format!("a.com resAppend://{}\n", f("gbk")));
+        let body = transform_res_body(
+            Bytes::from_static(b"x"),
+            &resolved,
+            Some("text/plain; charset=gbk"),
+        );
+        assert_eq!(&body[..], &[b'x', 0xd6, 0xd0, 0xce, 0xc4][..]);
     }
 
     /// `reqHeaders:///etc/whistle/headers.json` used to set **nothing**: the

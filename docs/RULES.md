@@ -624,8 +624,12 @@ is a CORS rule, not a fetch. A *path* there is still read.
   `lib/plugins/index.js:1497`). A non-200, a timeout, or an oversized body is a
   failure. Put the content in a file if you do not want an outbound call per
   request.
-- The content becomes a **string**, so a binary mock body has to go through
-  `file://` instead.
+- For `reqBody`, `resBody`, `reqPrepend`, `resPrepend`, `reqAppend` and
+  `resAppend` the content is the file's **bytes**, sent as they are — a GBK
+  page or an image works, and a character split across `a|b` joins back — and
+  never re-encoded into the response's `charset=`. That is upstream's
+  `binProtocols` (`lib/rules/protocols.js:121-128`). Every other operator reads
+  the content as UTF-8 text.
 - `(inline)` and a whole-value `{name}` are content already and are never read
   (`if (rule.value)`, `util/index.js:1177-1179`).
 

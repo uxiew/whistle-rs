@@ -201,6 +201,12 @@ pub struct RuleOp {
     /// so by the time the value is applied the written form is gone and this
     /// flag is what remembers which road it took.
     pub value_loaded: bool,
+    /// A file's bytes as they are on disk, for the six operators upstream
+    /// reads raw (`binProtocols`, `_original/lib/rules/protocols.js:121-128`):
+    /// `reqBody`, `resBody` and the two `*Prepend`/`*Append` pairs. `value` then
+    /// holds a UTF-8 reading of them for display, and is not what is sent — see
+    /// `crate::proxy::apply::load_rule_values`.
+    pub value_bytes: Option<bytes::Bytes>,
     /// The values-store name [`value`](RuleOp::value) came from, when it came
     /// from one.
     ///
