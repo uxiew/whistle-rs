@@ -678,9 +678,10 @@ export async function replaySelected(): Promise<void> {
   const res = await reach(() => api.replay(ids));
   if (!res) return;
   // One replay is reported in full — whether its body survived the capture is
-  // the thing worth saying. A batch reports the count; naming which of twenty
-  // requests lost bytes belongs on the rows, not in a one-line note.
-  flashNote(ids.length > 1 ? `Replayed ${res.replayed} requests` : replayNote(res.sessions?.[0]));
+  // the thing worth saying. A batch reports the count, and how many of them
+  // did not go out with the body they were captured with: naming which of
+  // twenty belongs on the rows, but "all fine" must not be implied.
+  flashNote(ids.length > 1 ? batchNote(res) : replayNote(res.sessions?.[0]));
   // The replay is fired off asynchronously by the proxy; give it a moment to
   // come back around through the capture before asking for the list again.
   setTimeout(() => void loadSessions(), 400);
@@ -705,6 +706,17 @@ function replayNote(r: ReplayedSession | undefined): string {
     default:
       return 'Replayed';
   }
+}
+
+/** A batch replay's note: the count, and the ones whose body was not whole. */
+function batchNote(res: { replayed: number; sessions?: ReplayedSession[] }): string {
+  const count = (kind: string) => (res.sessions ?? []).filter((r) => r.body === kind).length;
+  const cut = count('partial');
+  const lost = count('undecodable');
+  const said = [`Replayed ${res.replayed} requests`];
+  if (cut) said.push(`${cut} with the body cut short`);
+  if (lost) said.push(`${lost} without a body that would not decode`);
+  return said.join(' · ');
 }
 
 let noteTimer: number | undefined;
@@ -761,16 +773,23 @@ export function composeFrom(s: SessionSummary, d: SessionDetail | null): void {
       .filter(([name]) => !/^(content-length|host)$/i.test(name))
       .map(([name, value]) => `${name}: ${value}`)
       .join('\n'),
-    body: d?.req_body?.text ?? '',
+    // A binary body's `text` is its `[binary, N bytes]` marker; seeded, the
+    // Composer would send that sentence as the body.
+    body: d?.req_body?.binary ? '' : (d?.req_body?.text ?? ''),
   };
   // A capture is a capped preview, so what is seeded is not always what was
   // sent. Saying so is the point: a composition silently missing 190 KB of a
   // 200 KB upload would come back 200 and be read as proof the endpoint works.
   const body = d?.req_body;
-  state.composeStatus =
-    body?.truncated === true
-      ? `Seeded from #${s.id} · the capture held ${fmtBytes(byteLength(body.text))} of a ${fmtBytes(body.len)} body`
-      : `Seeded from #${s.id}`;
+  let status = `Seeded from #${s.id}`;
+  if (body?.binary && body.len > 0) {
+    status += ` · its ${fmtBytes(body.len)} binary body was left out; the Composer sends text`;
+  } else if (body?.undecodable) {
+    status += ' · its body would not decode, so what is here is only what came out before it broke';
+  } else if (body?.truncated) {
+    status += ` · the capture held ${fmtBytes(byteLength(body.text))} of a ${fmtBytes(body.len)} body`;
+  }
+  state.composeStatus = status;
   showPane('composer');
 }
 
