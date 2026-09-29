@@ -3855,17 +3855,46 @@ fn apply_header_replace(headers: &mut HeaderMap, resolved: &Resolved, want: Head
                 Some(colon) => &key[colon + 1..],
                 None => key.as_str(),
             };
-            // An absent or empty header is left alone (`handleHeaderReplace`).
-            if let Some(cur) = headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-            {
-                set_header(headers, name, &replace_once_or_all(&cur, pattern, repl));
-            }
+            replace_in_header(headers, name, pattern, repl);
         }
     }
+}
+
+/// One `headerReplace` substitution on one header, however many times it
+/// appears — `handleHeaderReplace` (`_original/lib/util/index.js:2274-2292`).
+///
+/// Node hands upstream a repeated header in one of two shapes, and the
+/// substitution follows the shape: `set-cookie` stays a list and each entry is
+/// rewritten on its own; any other name arrives already joined (`, `, or `; `
+/// for `cookie`) and is rewritten — and written back — as that one string.
+/// This port used to rewrite the first `set-cookie` and drop the rest, which
+/// upstream's `plugin.test.js` caught with two cookies in and one out.
+///
+/// An absent or empty header is left alone.
+fn replace_in_header(headers: &mut HeaderMap, name: &str, pattern: &str, repl: &str) {
+    let values: Vec<String> = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_string)
+        .collect();
+    if values.iter().all(String::is_empty) {
+        return;
+    }
+    if name.eq_ignore_ascii_case("set-cookie") {
+        remove_header(headers, name);
+        for value in values {
+            append_header(headers, name, &replace_once_or_all(&value, pattern, repl));
+        }
+        return;
+    }
+    let separator = if name.eq_ignore_ascii_case("cookie") {
+        "; "
+    } else {
+        ", "
+    };
+    let joined = values.join(separator);
+    set_header(headers, name, &replace_once_or_all(&joined, pattern, repl));
 }
 
 /// whistle's `_parseJSON` (`_original/lib/util/index.js:1135-1143`): the three
@@ -9720,6 +9749,36 @@ mod tests {
             replaced("{\"res.x-foo\":\"XX\"}", "bar"),
             Some("bar".to_string())
         );
+    }
+
+    /// A repeated `set-cookie` is rewritten entry by entry and every entry
+    /// stays; any other repeated header is joined and rewritten as one, the
+    /// shapes Node hands upstream (`handleHeaderReplace`,
+    /// `_original/lib/util/index.js:2274-2292`).
+    #[test]
+    fn header_replace_keeps_every_set_cookie() {
+        let resolved = resolve(
+            "example.com headerReplace://res.set-cookie:test=abc headerReplace://res.x-dup:b=B\n",
+            "http://example.com/",
+        );
+        let mut h = HeaderMap::new();
+        for (k, v) in [
+            ("set-cookie", "test"),
+            ("set-cookie", "test222"),
+            ("x-dup", "a"),
+            ("x-dup", "b"),
+        ] {
+            h.append(HeaderName::from_static(k), HeaderValue::from_static(v));
+        }
+        apply_header_replace(&mut h, &resolved, HeaderScope::Response);
+        let all = |name| {
+            h.get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(all("set-cookie"), ["abc", "abc222"]);
+        assert_eq!(all("x-dup"), ["a, B"]);
     }
 
     /// An unscoped key inherits the previous key's scope **and its header

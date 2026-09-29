@@ -2391,6 +2391,9 @@ details are inherited from upstream and are easy to trip over:
   spelling either with a **double** `$` (`$$1`) inserts it **percent-encoded**.
   A backslash escapes the reference (`\$1` is the literal `$1`), and two keep one
   backslash and still substitute.
+- A header that appears more than once: every `set-cookie` is rewritten on its
+  own and all of them stay; any other name is joined first (`, `, or `; ` for
+  `cookie`) and rewritten as one value — the two shapes Node gives upstream.
 
 ```
 api.example.com     enable://cors
