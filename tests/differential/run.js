@@ -18,6 +18,8 @@
 //   --whistle V       measure against whistle V instead of the baseline in
 //                     package.json; V needs a lockfile of its own under
 //                     versions/V (see the README, "Which whistle, though")
+//   --assume-baseline with --whistle: hold V to the baseline's declarations,
+//                     so what fails is what moved between the two releases
 //
 // Exit status: 0 every step passed; 1 a step failed; 2 it could not start —
 // a port was taken, the binary is missing or stale, `npm ci` was not run.
@@ -76,6 +78,7 @@ if (!fs.existsSync(path.join(WHISTLE_HOME, 'package-lock.json'))) {
   process.exit(2);
 }
 const WHISTLE_PKG = path.join(WHISTLE_HOME, 'node_modules', 'whistle');
+const ASSUME_BASELINE = flag('--assume-baseline');
 const only = option('--only') ? new Set(option('--only').split(',')) : null;
 
 // ── the steps ─────────────────────────────────────────────────────────────
@@ -278,7 +281,8 @@ class SetupError extends Error {}
 
 const started = new Date();
 const stamp = started.toISOString().replace(/[:.]/g, '-');
-const versionTag = WHISTLE_VERSION === BASELINE ? '' : `-whistle-${WHISTLE_VERSION}`;
+const versionTag = (WHISTLE_VERSION === BASELINE ? '' : `-whistle-${WHISTLE_VERSION}`)
+  + (ASSUME_BASELINE ? '-assume-baseline' : '');
 const OUT = path.resolve(option('--out') || path.join(REPO, 'target', 'differential', `${stamp}-${suite}${versionTag}`));
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'whistle-rs-diff-'));
 const dirs = {
@@ -299,6 +303,7 @@ const baseEnv = {
   // Read by whistle-pkg.js in every script: which whistle to load, and so which
   // declarations are in force.
   WHISTLE_PKG,
+  ...(ASSUME_BASELINE ? { DIFF_ASSUME_BASELINE: '1' } : {}),
   DIFF_STATE: dirs.state,
   DIFF_HOST: HOST,
   TMPDIR: dirs.tmp,
@@ -494,6 +499,7 @@ function manifest(exitCode) {
         ? JSON.parse(fs.readFileSync(path.join(WHISTLE_PKG, 'package.json'), 'utf8')).version
         : null,
       baseline: WHISTLE_VERSION === BASELINE,
+      assumeBaselineDeclarations: ASSUME_BASELINE,
       lockfile: path.relative(REPO, path.join(WHISTLE_HOME, 'package-lock.json')),
       lockfileSha256: sha256(path.join(WHISTLE_HOME, 'package-lock.json')),
     },

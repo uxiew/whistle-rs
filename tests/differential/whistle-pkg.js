@@ -37,6 +37,15 @@ const dir = (() => {
 const version = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
 
 /**
+ * `run.js --assume-baseline`: every entry measured on the baseline counts as
+ * measured on this version too. Not a verdict but a question — which of the
+ * baseline's excuses still describe this release? A difference nothing then
+ * explains is one the baseline did not have; a stale entry is a difference the
+ * baseline had and this release does not. Between them, that is what moved.
+ */
+const ASSUME_BASELINE = process.env.DIFF_ASSUME_BASELINE === '1';
+
+/**
  * The entries of a declaration list that hold for the whistle being measured.
  *
  * An entry's `upstream` is the version, or the list of versions, whose answer it
@@ -52,8 +61,9 @@ function forVersion(entries) {
   return entries.filter((e) => {
     const u = e.upstream === undefined ? BASELINE : e.upstream;
     if (u === 'any') return true;
-    return Array.isArray(u) ? u.includes(version) : u === version;
+    const measured = Array.isArray(u) ? u : [u];
+    return measured.includes(version) || (ASSUME_BASELINE && measured.includes(BASELINE));
   });
 }
 
-module.exports = { dir, version, BASELINE, forVersion };
+module.exports = { dir, version, BASELINE, ASSUME_BASELINE, forVersion };
