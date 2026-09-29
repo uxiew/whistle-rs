@@ -986,8 +986,12 @@ async fn find_proxy(
         // `parse_proxy_rule` reads the address and the `?host=` override off the
         // matcher as written; whistle's other query flags (`?proxyHost`) are not
         // part of either.
-        let mut cfg = parse_proxy_rule(proxy_kind(proto), &op.value)
-            .ok_or_else(|| anyhow!("{proto}://{} is not a usable proxy address", op.value))?;
+        let mut cfg = parse_proxy_rule(proxy_kind(proto), &op.value).ok_or_else(|| {
+            anyhow!(
+                "{proto}://{} is not a usable proxy address",
+                super::upstream::without_credentials(&op.value)
+            )
+        })?;
         cfg.tunnel = proxy_tunnel(resolved, proto);
         // The `x`-prefixed spellings ask for a direct connection if the hop
         // fails (`X_RE`, `_original/lib/inspectors/res.js:31`).
@@ -13601,6 +13605,27 @@ mod tests {
                 "{rules:?}: {err:#}"
             );
         }
+    }
+
+    /// The error names the value it could not use, but not the password in it:
+    /// the text goes into the client's 502 and into the session.
+    #[test]
+    fn an_unusable_proxy_value_is_reported_without_its_password() {
+        let err = try_target(
+            "example.com proxy://alice:s3cret@:8080\n",
+            "http://example.com/",
+        )
+        .expect_err("no host, so not usable");
+        let message = format!("{err:#}");
+        assert!(!message.contains("s3cret"), "{message}");
+        assert!(!message.contains("alice"), "{message}");
+        assert!(message.contains("proxy://***@:8080"), "{message}");
+        assert_eq!(
+            super::super::upstream::without_credentials("//u:p@h:1/x?y=@z"),
+            "//***@h:1/x?y=@z",
+            "only the authority's credentials; an @ in the query is not one"
+        );
+        assert_eq!(super::super::upstream::without_credentials("h:1"), "h:1");
     }
 
     /// A PAC file that answers with something we cannot use is an error too;

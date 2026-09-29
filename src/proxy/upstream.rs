@@ -1643,6 +1643,20 @@ pub fn parse_proxy_rule(kind: ProxyKind, matcher: &str) -> Option<ProxyConfig> {
     Some(cfg)
 }
 
+/// A proxy operator value fit to repeat in an error: the `user:pass@` part, if
+/// there is one, replaced by `***@`. An error about an unusable address goes
+/// into the client's 502 and into the session, and neither is a place for the
+/// upstream proxy's password.
+pub fn without_credentials(value: &str) -> String {
+    let start = value.len() - value.trim_start().trim_start_matches("//").len();
+    let rest = &value[start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{}***{}", &value[..start], &rest[at..]),
+        None => value.to_string(),
+    }
+}
+
 /// Parse a proxy operator value: `[user[:pass]@]host[:port]`.
 pub fn parse_proxy(kind: ProxyKind, value: &str) -> Option<ProxyConfig> {
     let value = value.trim().trim_start_matches("//");
