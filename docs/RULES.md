@@ -3838,8 +3838,17 @@ so the hook is not called.
 
 `--no-intercept-https` says the same thing for every connection at once.
 
+A client can say it for one tunnel itself, with a request header on the
+`CONNECT`: `x-whistle-policy: tunnel` (or `connect`, or `weakTunnel`) — whistle's
+own convention, used by its plugins and by a whistle chained in front
+(`_original/lib/tunnel.js:143-147`). It wins over `enable://capture`, as there.
+The values asking for the opposite, `intercept` and `capture`, are not honoured:
+with interception on (the default) they change nothing, and with it off the
+tunnel is still relayed, where whistle would read it.
+
 **The far end is reached before the client is told the tunnel is open.** When
-the rule matches the address in the `CONNECT` itself (or interception is off),
+the rule matches the address in the `CONNECT` itself (or interception is off, or
+the header asked),
 whistle-rs dials first and answers `200` only once the far end has answered, as
 whistle does (`_original/lib/tunnel.js:637-695`). A name that does not resolve
 or a port that refuses leaves the `CONNECT` with **no reply at all**: the

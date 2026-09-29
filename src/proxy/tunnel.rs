@@ -121,7 +121,8 @@ pub(super) async fn handle_connect(
         return Err(Destroyed);
     }
 
-    if let Some(resolution) = relayed_unread(&state, &host, port, peer) {
+    let asked = asks_for_a_relay(&req);
+    if let Some(resolution) = relayed_unread(&state, &host, port, peer, asked) {
         return relay_before_reply(state, req, &host, port, peer, resolution).await;
     }
 
@@ -168,15 +169,34 @@ fn connect_established() -> Response<DynBody> {
         .unwrap()
 }
 
+/// Does the client ask, in `x-whistle-policy`, for this tunnel to be relayed
+/// rather than read?
+///
+/// whistle's header for it — sent by its plugins, by a whistle chained in front,
+/// and by its own test helper. `tunnel`, `connect` and `weakTunnel` all ask
+/// (`useTunnelPolicy`, `_original/lib/tunnel.js:143-147`), and the answer
+/// outranks `enable://capture` there (`isDisableIntercept`, `:170-177`).
+/// `weakTunnel` gives way only to a `filter://` line asking for capture
+/// (`:202-203`), which is not a rule this port has, so here it is `tunnel` by
+/// another name. The opposite values, `intercept` and `capture`, are not
+/// honoured: they differ from no header only when interception is off, and
+/// then the tunnel is still relayed.
+fn asks_for_a_relay(req: &Request<Incoming>) -> bool {
+    req.headers()
+        .get("x-whistle-policy")
+        .is_some_and(|v| matches!(v.as_bytes(), b"tunnel" | b"connect" | b"weakTunnel"))
+}
+
 /// Is this tunnel already decided against reading, on the CONNECT alone — and
 /// if so, the connection's rules, resolved once, to route it by.
 ///
-/// Two things decide it that early, and both are answers `sni::decide` would
-/// reach after the ClientHello anyway: interception switched off for every
-/// connection (`--no-intercept-https`, and the modes that lock capture off),
-/// and `disable://intercept` (or `https`, `capture`) on the address the client
-/// asked for. Upstream decides at the same point, on the same address
-/// (`isIntercept()`, `_original/lib/tunnel.js:201-215`, against
+/// Three things decide it that early. Two are answers `sni::decide` would reach
+/// after the ClientHello anyway: interception switched off for every connection
+/// (`--no-intercept-https`, and the modes that lock capture off), and
+/// `disable://intercept` (or `https`, `capture`) on the address the client
+/// asked for. The third is the client asking itself (`asked`, see
+/// [`asks_for_a_relay`]). Upstream decides at the same point, on the same
+/// address (`isIntercept()`, `_original/lib/tunnel.js:201-215`, against
 /// `tunnel://host:port`). Anything else needs the ClientHello, which only
 /// arrives once the CONNECT has been answered.
 fn relayed_unread(
@@ -184,17 +204,18 @@ fn relayed_unread(
     host: &str,
     port: u16,
     peer: SocketAddr,
+    asked: bool,
 ) -> Option<(crate::rules::ReqInfo, crate::rules::Resolved)> {
-    let everything = !state.config.intercepts_https();
+    let decided = asked || !state.config.intercepts_https();
     let rules = state.rules.read().unwrap();
-    // One `bool` per group when neither applies, which is the default setup.
-    if !everything && !rules.has_no_intercept() {
+    // One `bool` per group when none applies, which is the default setup.
+    if !decided && !rules.has_no_intercept() {
         return None;
     }
     // No ClientHello yet, so no SNI: the same reading `tunnel_aborted` makes.
     let info = sni::connection_req_info(host, port, peer, false);
     let resolved = rules.resolve(&info);
-    (everything || sni::no_intercept(&resolved)).then_some((info, resolved))
+    (decided || sni::no_intercept(&resolved)).then_some((info, resolved))
 }
 
 /// Relay a tunnel nobody is going to read, answering the CONNECT only once the
@@ -1041,6 +1062,37 @@ pub(crate) mod tunnel_abort_tests {
             .clone();
         assert_eq!(refused, "https://blocked.test/", "and 443 was assumed");
         assert_eq!(answer(b"CONNECT / HTTP/1.1\r\n\r\n").await, "HTTP/1.1 400");
+    }
+
+    /// `x-whistle-policy: tunnel` asks for a relay, and a relay decided on the
+    /// CONNECT is dialled before it is answered — so a dead far end shows which
+    /// path a CONNECT took: silence for a relay, `200` for a tunnel that may
+    /// still be read. Upstream's test helper sends the header on every tunnel
+    /// (`test/util.test.js:184`).
+    #[tokio::test]
+    async fn a_client_can_ask_for_its_tunnel_to_be_relayed() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let (_state, addr) = proxy_with("").await;
+        let answer = |policy: Option<&'static str>| async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let policy = policy.map_or(String::new(), |p| format!("x-whistle-policy: {p}\r\n"));
+            let req = format!("CONNECT {dead} HTTP/1.1\r\nHost: {dead}\r\n{policy}\r\n");
+            client.write_all(req.as_bytes()).await.unwrap();
+            let mut head = [0u8; 12];
+            match client.read_exact(&mut head).await {
+                Ok(_) => String::from_utf8_lossy(&head).to_string(),
+                Err(_) => "(silence)".to_string(),
+            }
+        };
+        for policy in ["tunnel", "connect", "weakTunnel"] {
+            assert_eq!(answer(Some(policy)).await, "(silence)", "{policy}");
+        }
+        for policy in [None, Some("intercept"), Some("capture"), Some("Tunnel")] {
+            assert_eq!(answer(policy).await, "HTTP/1.1 200", "{policy:?}");
+        }
     }
 
     /// With interception off, every tunnel is answered only once its far end
