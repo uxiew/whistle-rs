@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::outcome::Phase;
-use super::tunnel_abort_tests::proxy_with;
+use super::tunnel_abort_tests::{proxy_with, proxy_with_plugins};
 use super::{AppState, ERROR_HEADER, SESSION_HEADER, Session};
 
 /// A request through the proxy, `Connection: close` so reading to the end ends.
@@ -238,6 +238,48 @@ async fn an_abort_is_recorded_as_the_rules_doing() {
     assert_eq!(response, "", "an abort answers nothing");
     let s = one_failure(&state, "", Phase::Abort).await;
     assert_eq!(s.status, 0);
+}
+
+/// A plugin's auth gate that breaks — here its `/auth` call gets a 500 — blocks
+/// the request, and the session says the plugin is why. A gate that *refuses*
+/// is the plugin's answer and not a failure; this is the other one, and its 502
+/// is made up here, so it carries the same two headers as any other.
+#[tokio::test]
+async fn an_auth_plugin_that_breaks_fails_at_plugin() {
+    let plugin = server(|mut sock| async move {
+        let mut buf = [0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let reply = if buf[..n].starts_with(b"GET /manifest") {
+            let manifest = r#"{"name":"p","version":"1","hooks":["auth"]}"#;
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{manifest}",
+                manifest.len()
+            )
+        } else {
+            "HTTP/1.1 500 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+        };
+        let _ = sock.write_all(reply.as_bytes()).await;
+    })
+    .await;
+    let mut plugins = crate::plugins::Plugins::new();
+    plugins.register_remote("p", &plugin.to_string());
+    let (state, proxy) = proxy_with_plugins("gate.test plugin://p", plugins).await;
+    let response = ask(proxy, "http://gate.test/x").await;
+    let s = one_failure(&state, "", Phase::Plugin).await;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    assert_eq!(
+        header(&response, ERROR_HEADER),
+        Some("plugin"),
+        "{response}"
+    );
+    assert_eq!(
+        header(&response, SESSION_HEADER),
+        Some(s.id.to_string().as_str()),
+        "{response}"
+    );
+    let message = s.error.get().unwrap().message;
+    assert!(message.starts_with("p: "), "names the plugin: {message}");
+    assert!(message.contains("500"), "{message}");
 }
 
 /// The client gives up while the origin is still thinking. hyper drops the

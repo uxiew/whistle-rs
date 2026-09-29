@@ -2769,6 +2769,14 @@ pub(crate) mod tunnel_abort_tests {
 
     /// State over a storage directory nobody else touches, with `rules` loaded.
     pub(crate) fn state_with(rules: &str) -> Arc<AppState> {
+        state_with_plugins(rules, crate::plugins::Plugins::new())
+    }
+
+    /// [`state_with`], with `plugins` as the registry.
+    pub(crate) fn state_with_plugins(
+        rules: &str,
+        plugins: crate::plugins::Plugins,
+    ) -> Arc<AppState> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let config = crate::config::Config {
@@ -2782,12 +2790,7 @@ pub(crate) mod tunnel_abort_tests {
         let ca = CertAuthority::load_or_create(&config).expect("root CA");
         let mut mgr = RuleManager::new();
         mgr.set_text(rules);
-        Arc::new(AppState::with_plugins(
-            config,
-            mgr,
-            ca,
-            crate::plugins::Plugins::new(),
-        ))
+        Arc::new(AppState::with_plugins(config, mgr, ca, plugins))
     }
 
     pub(crate) fn peer() -> SocketAddr {
@@ -2884,7 +2887,15 @@ pub(crate) mod tunnel_abort_tests {
 
     /// Start a proxy on an ephemeral port with `rules` loaded.
     pub(crate) async fn proxy_with(rules: &str) -> (Arc<AppState>, SocketAddr) {
-        let state = state_with(rules);
+        proxy_with_plugins(rules, crate::plugins::Plugins::new()).await
+    }
+
+    /// [`proxy_with`], with `plugins` as the registry.
+    pub(crate) async fn proxy_with_plugins(
+        rules: &str,
+        plugins: crate::plugins::Plugins,
+    ) -> (Arc<AppState>, SocketAddr) {
+        let state = state_with_plugins(rules, plugins);
         let (listener, addr) = bind(&state).await.expect("bind");
         let serving = state.clone();
         tokio::spawn(async move {
@@ -5034,7 +5045,7 @@ async fn serve(
                 // An answer is an ordinary response: every response operator and
                 // every response hook runs over it. A *refusal* from the auth
                 // gate is served as produced — see [`pin_refusal`].
-                let (response, res_body) = if blocked {
+                let (mut response, res_body) = if blocked {
                     pin_refusal(&state, plugin_response(resp))
                 } else {
                     finish_local_response(
@@ -5057,7 +5068,15 @@ async fn serve(
                 // here — see `capture_client_request`.
                 let (req_headers, req_body) =
                     capture_client_request(&mut req, state.config.body_preview_cap).await;
-                ledger.record(Session {
+                // A broken gate's 502 is made up here like any failed request's,
+                // so it says so the same way; without these it reads as an
+                // origin's own 502, which is what the header exists to rule out.
+                if let Some(failure) = &failure {
+                    response
+                        .headers_mut()
+                        .insert(ERROR_HEADER, failure.phase.as_str().parse().unwrap());
+                }
+                let id = ledger.record(Session {
                     id: 0,
                     time_ms,
                     method: info.method.clone(),
@@ -5074,8 +5093,15 @@ async fn serve(
                     res_body,
                     // Answered here: no connection was opened, so there are no phases.
                     timings: None,
-                    error: failure.map(outcome::Outcome::failed).unwrap_or_default(),
+                    error: failure
+                        .clone()
+                        .map(outcome::Outcome::failed)
+                        .unwrap_or_default(),
                 });
+                if let Some(failure) = &failure {
+                    log_failure(id, &info.method, &info.full_url, failure);
+                    response.headers_mut().insert(SESSION_HEADER, id.into());
+                }
                 return Ok(response);
             }
         }
