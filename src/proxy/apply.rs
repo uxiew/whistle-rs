@@ -6131,6 +6131,12 @@ enum ParamsBody {
 /// what keeps this off the hot path: an unmatched request never looks at its own
 /// content type. Both guards are map lookups — `Deletions::of`, which walks and
 /// allocates, is reached only once a `delete://` has actually matched.
+/// Whether `params://` rewrites this request's **body** — a form or JSON one —
+/// rather than only its query string.
+pub fn params_rewrite_body(resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> bool {
+    params_body_kind(resolved, ctx).is_some()
+}
+
 fn params_body_kind(resolved: &Resolved, ctx: ReqBodyCtx<'_>) -> Option<ParamsBody> {
     let asks = !resolved.all("params").is_empty()
         || (!resolved.all("delete").is_empty()

@@ -118,3 +118,81 @@ async fn a_big_response_no_rule_touches_says_nothing() {
     ask(proxy, &format!("http://{site}/x"), "", b"").await;
     assert!(session(&state).await.unapplied.is_empty());
 }
+
+/// An origin that keeps each request body it receives and answers `ok`.
+async fn keeper() -> (SocketAddr, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    let kept: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let sink = kept.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = l.accept().await {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                let mut buf = vec![0u8; 64 * 1024];
+                let body = loop {
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&got[..at]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse().unwrap());
+                    if got.len() >= at + 4 + len {
+                        break got[at + 4..at + 4 + len].to_vec();
+                    }
+                };
+                sink.lock().unwrap().push(body);
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    (addr, kept)
+}
+
+/// The request side has its own limit — 2 MiB unless a flag raises it — and
+/// the same promise: over it, the body reaches the origin as the client sent
+/// it, and the session names the operators that did not run on it.
+#[tokio::test]
+async fn a_request_over_its_limit_names_the_operators_it_skipped() {
+    const LIMIT: usize = 2 * 1024 * 1024;
+    for (len, rewritten) in [(LIMIT + 1, false), (LIMIT, true)] {
+        let (site, kept) = keeper().await;
+        let rules = format!("http://{site} reqReplace://a=b");
+        let (state, proxy) = proxy_with_config(&rules, |_| {}).await;
+        let sent = vec![b'a'; len];
+        let (head, _) = ask(
+            proxy,
+            &format!("http://{site}/up"),
+            "content-type: text/plain\r\n",
+            &sent,
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let got = kept.lock().unwrap().pop().expect("the origin got a body");
+        assert_eq!(got.len(), len, "the body arrives whole either way");
+        assert_eq!(got.iter().all(|&b| b == b'b'), rewritten, "{len} bytes");
+        let s = session(&state).await;
+        match rewritten {
+            true => assert!(s.unapplied.is_empty(), "{:?}", s.unapplied),
+            false => {
+                assert_eq!(s.unapplied.len(), 1, "{:?}", s.unapplied);
+                assert_eq!(s.unapplied[0].kind, Kind::RequestBodyOverLimit);
+                assert_eq!(s.unapplied[0].ops, ["reqReplace://a=b"]);
+            }
+        }
+    }
+}

@@ -5578,14 +5578,26 @@ async fn serve(
                 // do nothing has turned out to be a bug worth fixing. This one
                 // is a deliberate refusal, and a rule that quietly stopped
                 // applying above some size would read exactly like the bugs.
+                let limit = apply::req_body_limit(&resolved);
                 tracing::warn!(
                     "{} {}: request body is over {} bytes, so it is forwarded \
                      unchanged — reqBody/reqReplace/params/reqWrite and reqSpeed \
                      do not apply. `enable://reqMergeBigData` raises the limit",
                     info.method,
                     info.full_url,
-                    apply::req_body_limit(&resolved),
+                    limit,
                 );
+                let params_on_body = apply::params_rewrite_body(&resolved, body_ctx);
+                ledger.unapplied(unapplied::Unapplied::over(
+                    &matched_ops(&resolved),
+                    |op| unapplied::req_body_op(op) || (op.protocol == "params" && params_on_body),
+                    unapplied::Kind::RequestBodyOverLimit,
+                    format!(
+                        "the request body is over {limit} bytes, the limit for rewriting \
+                         one, so it was forwarded as it arrived. `enable://reqMergeBigData` \
+                         or `lineProps://enableBigData` on the params line raise it to 16 MiB"
+                    ),
+                ));
                 let cap = Capture::new(
                     req_ct.clone(),
                     req_enc.as_deref(),

@@ -110,7 +110,6 @@ const REQ_BODY: &[&str] = &[
     "reqPrepend",
     "reqAppend",
     "reqReplace",
-    "reqMerge",
     "reqSpeed",
     "reqWrite",
     "reqWriteRaw",
@@ -126,11 +125,12 @@ pub fn res_body_op(op: &MatchedOp) -> bool {
             && flags(&op.value).any(|f| matches!(f, "gzip" | "br" | "deflate")))
 }
 
-/// Does `op` act on a request body? `params://` does when it rewrites a form
-/// or JSON body, and `delete://body` / `delete://reqBody.…` do.
+/// Does `op` act on a request body? `delete://body` / `delete://reqBody.…` do.
+/// `params://` (which `reqMerge://` is an alias of) does only when it rewrites
+/// a form or JSON body rather than the query string, which the caller knows —
+/// see [`crate::proxy::apply::params_rewrite_body`].
 pub fn req_body_op(op: &MatchedOp) -> bool {
     REQ_BODY.contains(&op.protocol.as_str())
-        || op.protocol == "params"
         || (op.protocol == "delete"
             && (op.value.contains("reqBody") || flags(&op.value).any(|f| f == "body")))
 }
