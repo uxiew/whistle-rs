@@ -1,8 +1,16 @@
-//! The built-in web UI, served when a client hits the proxy port directly.
+//! The console, served when a client hits the proxy port directly (or the
+//! console port): the embedded single-page app, and the HTTP API it and any
+//! script use — traffic, rules, values, replay — plus the root CA and a PAC
+//! file. [`handle`] is the route table; the work is one kind per file:
 //!
-//! A self-contained single-page app (no external assets) mirroring the purpose
-//! of whistle's `biz/webui`: inspect live traffic and view/edit rules. Also
-//! serves the root CA, a PAC file, and a JSON traffic feed.
+//! | file | what it does |
+//! | --- | --- |
+//! | `access` | who may use the console: Host/Origin checks, `--allow-origin`, the login and guest account |
+//! | `console_hosts` | the hostnames the console answers through the proxy (`rootca.pro` …) |
+//! | `sessions`, `har` | captured traffic: list, search, detail, bodies, frames, status; HAR export |
+//! | `rules`, `values`, `bundle` | rules and rule groups, the Values store, both as one file |
+//! | `composer` | replay, the Composer, Test Rules |
+//! | `plugin_pages` | a plugin's own pages under `/plugin/<name>/` |
 
 use std::sync::Arc;
 
