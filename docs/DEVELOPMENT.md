@@ -136,9 +136,11 @@ RTT_MS=20 node perf-bench.js         # 源站前面加 20 ms 往返时延
 
 ## CI
 
-`.github/workflows/ci.yml` 在每个 PR 和推到 main 时运行：钉住工具链上的 fmt/Clippy/全部测试、MSRV 版本上的全部测试、在不含 Node 的 `rust:1.98.1-trixie` 容器里构建纯代理并检查占位页、Node 20.19.0 和 24 两个版本下的前端 typecheck/build、先构建控制台再构建 release 并断言嵌入的是真控制台（构件是二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md` 和它们的 SHA-256）、文档链接检查、`run.js fast`。`.github/workflows/differential.yml` 跑全量网络差分，同一个二进制先对 2.10.8、再对 2.10.10 各跑一遍 `run.js all`，最后用 `matrix.js` 比较两版，手动触发或每周一凌晨，结果归档上传。所有 action 都按提交哈希钉住版本，注释里写了对应的 tag。
+`.github/workflows/ci.yml` 在每个 PR 和推到 main 时运行：钉住工具链上的 fmt/Clippy/全部测试、MSRV 版本上的全部测试、在不含 Node 的 `rust:1.98.1-trixie` 容器里构建纯代理并检查占位页、Node 20.19.0 和 24 两个版本下的前端 typecheck/build、文档链接检查、`run.js fast`，以及五个平台的发布构建（`platforms`）。`.github/workflows/differential.yml` 跑全量网络差分，同一个二进制先对 2.10.8、再对 2.10.10 各跑一遍 `run.js all`，最后用 `matrix.js` 比较两版，手动触发或每周一凌晨，结果归档上传。所有 action 都按提交哈希钉住版本，注释里写了对应的 tag。
 
-性能基准与长连接稳定性另行记录配置、硬件、制品和资源曲线。macOS 测试不能代替 Linux/Windows 真机，编译成功不能替代证书、网络和 UI 工作流测试。
+`platforms` 在 Linux x86_64、Linux arm64、macOS arm64、macOS x86_64、Windows x86_64 各做一遍：先构建控制台再构建 release；除 Linux x86_64（`rust` 任务已测过）外跑全部测试；记下二进制对系统的最低要求（Linux 看链接的最高 glibc 符号版本，macOS 看 `minos`，Windows 确认不依赖 `VCRUNTIME140.dll`）；跑 `scripts/smoke.mjs --console built`；最后打包成 `whistle-rs-<版本>-<target>.tar.gz`（Windows 是 `.zip`），里面是二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md`、`BUILD-INFO.txt`（版本、提交、编译器、最低系统要求、嵌入的控制台哈希）和 `SHA256SUMS`，旁边是压缩包自己的 `.sha256` 和冒烟测试报告。构件在 Actions 页面保留 14 天；不会自动发布到 Releases。
+
+这些 runner 是 GitHub 的虚拟机，不是物理机；冒烟测试不碰系统代理设置和系统信任库，所以"在这台机器上设为系统代理、浏览器信任根证书后能用"这一步不在 CI 里，要在真机上按 [CERTIFICATES](CERTIFICATES.md) 做。Windows 的 `.cargo/config.toml` 把 C 运行库静态链接进去，否则没装 Visual C++ 运行库的机器上启动就报找不到 `VCRUNTIME140.dll`。性能基准与长连接稳定性另行记录配置、硬件、制品和资源曲线。
 
 ## 变更交接
 

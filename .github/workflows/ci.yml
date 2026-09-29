@@ -105,13 +105,43 @@ jobs:
       - run: npm run typecheck --prefix ui-src
       - run: npm run build --prefix ui-src
 
-  release:
-    name: Release binary with the real console
-    runs-on: ubuntu-24.04
+  # D1: a release binary with the real console for each platform, used there
+  # the way a person uses it (scripts/smoke.mjs: HTTP, intercepted HTTPS, WS,
+  # rules, values, a Node plugin, restart on the same data, stop), then
+  # packaged with its license texts and checksums. The runners are GitHub's
+  # virtual machines, not physical ones.
+  platforms:
+    name: ${{ matrix.name }} — release build, smoke test, package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Its tests already ran in the `rust` job (debug), so not again here.
+          - { name: Linux x86_64, os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, test: false }
+          - { name: Linux arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, test: true }
+          - { name: macOS arm64, os: macos-15, target: aarch64-apple-darwin, test: true }
+          - { name: macOS x86_64, os: macos-15-intel, target: x86_64-apple-darwin, test: true }
+          - { name: Windows x86_64, os: windows-2025, target: x86_64-pc-windows-msvc, test: true }
+    defaults:
+      run:
+        # Git Bash on Windows, so one script serves all five.
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Not every runner image comes with rustup; with it, rust-toolchain.toml
+      # picks the compiler.
+      - name: Toolchain
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup show active-toolchain && cargo --version
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
@@ -125,24 +155,74 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          key: platform-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/config.toml') }}
       - run: cargo build --locked --release
-      - name: The binary serves this console build, not the placeholder
-        run: scripts/check-console.sh target/release/whistle-rs built
+      # --release, to reuse the dependencies just built rather than compile
+      # everything a second time for the debug profile.
+      - name: Tests on this platform
+        if: matrix.test
+        run: cargo test --locked --release --all-targets
+      - name: Where the binary is, and what it needs from the system
+        run: |
+          exe=target/release/whistle-rs
+          if [ "$RUNNER_OS" = Windows ]; then exe=$exe.exe; fi
+          echo "EXE=$exe" >> "$GITHUB_ENV"
+          case "$RUNNER_OS" in
+            Linux)
+              # The newest glibc symbol version it links: the oldest glibc it runs on.
+              need=$(objdump -T "$exe" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1)
+              needs="glibc ${need#GLIBC_} or later" ;;
+            macOS)
+              need=$(otool -l "$exe" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+              needs="macOS $need or later" ;;
+            Windows)
+              # .cargo/config.toml links the C runtime in; the DLL's name left
+              # in the binary would mean it did not take.
+              if grep -qai 'vcruntime140' "$exe"; then
+                echo "the binary still imports VCRUNTIME140.dll"; exit 1
+              fi
+              needs="Windows 10 or later; no Visual C++ Redistributable" ;;
+          esac
+          if command -v sha256sum >/dev/null; then sum="sha256sum"; else sum="shasum -a 256"; fi
+          echo "SUM=$sum" >> "$GITHUB_ENV"
+          {
+            echo "whistle-rs: $("$exe" --version)"
+            echo "target: ${{ matrix.target }}"
+            echo "commit: $GITHUB_SHA"
+            echo "built by: $(rustc --version) on $ImageOS $ImageVersion"
+            echo "runs on: $needs"
+            # Which build of ui-src the binary embeds.
+            echo "console: ui-src/dist/index.html sha256 $($sum ui-src/dist/index.html | cut -d' ' -f1)"
+          } | tee BUILD-INFO.txt
+      - name: Smoke test — use it as a person would
+        run: node scripts/smoke.mjs "$EXE" --console built --json smoke-${{ matrix.target }}.json
       # The binary travels with its terms: our LICENSE, where things come from
       # (NOTICE.md), and the license texts of every crate and npm package
       # built into it, generated from the lockfiles for this target.
-      - name: Binary, license texts and checksums
+      - name: Package with license texts and checksums
         run: |
-          mkdir -p dist-ci
-          cp target/release/whistle-rs LICENSE NOTICE.md dist-ci/
-          node scripts/third-party-licenses.mjs --target x86_64-unknown-linux-gnu --out dist-ci/THIRD-PARTY-LICENSES.md
-          (cd dist-ci && sha256sum whistle-rs LICENSE NOTICE.md THIRD-PARTY-LICENSES.md > SHA256SUMS)
-          sha256sum ui-src/dist/index.html | sed 's#ui-src/dist/##' >> dist-ci/SHA256SUMS
-          cat dist-ci/SHA256SUMS
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          name="whistle-rs-$version-${{ matrix.target }}"
+          mkdir -p "dist-ci/$name"
+          cp "$EXE" LICENSE NOTICE.md BUILD-INFO.txt "dist-ci/$name/"
+          node scripts/third-party-licenses.mjs --target ${{ matrix.target }} --out "dist-ci/$name/THIRD-PARTY-LICENSES.md"
+          # `sha256sum -c SHA256SUMS` inside the unpacked directory checks every file.
+          (cd "dist-ci/$name" && $SUM "$(basename "$EXE")" LICENSE NOTICE.md BUILD-INFO.txt THIRD-PARTY-LICENSES.md > SHA256SUMS)
+          cd dist-ci
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip -bso0 "$name.zip" "$name"
+            archive="$name.zip"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            archive="$name.tar.gz"
+          fi
+          $SUM "$archive" > "$archive.sha256"
+          mv "../smoke-${{ matrix.target }}.json" .
+          rm -rf "$name"
+          cat "$archive.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: whistle-rs-linux-x86_64
+          name: whistle-rs-${{ matrix.target }}
           path: dist-ci/
           retention-days: 14
           if-no-files-found: error
