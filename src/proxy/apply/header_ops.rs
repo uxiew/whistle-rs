@@ -271,3 +271,150 @@ pub(super) fn set_header(headers: &mut HeaderMap, name: &str, value: &str) {
         headers.insert(name, v);
     }
 }
+
+/// Apply `headerReplace://` operators for one side.
+///
+/// The value is a JSON object keyed `"<scope>.<name>:<pattern>"`, where the
+/// scope is exactly `req.`/`reqH.` or `res.`/`resH.` — upstream tests those four
+/// prefixes literally (`parseHeaderReplace`,
+/// `_original/lib/util/index.js:2219-2223`), so `reqHeaders.` is not one of
+/// them. The pattern follows the same rule as the body operators: `/…/flags` is
+/// a regular expression, anything else is a literal.
+pub(super) fn apply_header_replace(
+    headers: &mut HeaderMap,
+    resolved: &Resolved,
+    want: HeaderScope,
+) {
+    let want = want.key();
+    for value in collect_values(resolved, "headerReplace") {
+        // Order matters here, and `serde_json::Map` sorts: a key with no scope
+        // prefix inherits the *previous* key's scope, so the entries have to be
+        // seen in the order they were written.
+        let Some(entries) = ordered_pairs(value.trim()) else {
+            continue;
+        };
+        // Carried over from the last key that named a scope — *both* the scope
+        // and the header name, which is the quirk: upstream writes
+        // `name = name || key.substring(…)`, and only a key that named a scope
+        // resets `name` to null. So an unscoped key reuses the previous key's
+        // header name and contributes nothing but its own pattern.
+        //
+        // Both start unset, which is upstream's `else if (!prop) return`: a
+        // leading unscoped key is dropped rather than defaulting to a side.
+        let mut carried: Option<(&str, String)> = None;
+        for (key, repl) in &entries {
+            let repl = repl.as_str().unwrap_or("");
+            // The five prefixes upstream recognises, and the only ones: a
+            // `resHeaders.` key matches none of them and is inert.
+            let named = [
+                ("req.", "req"),
+                ("reqH.", "req"),
+                ("res.", "res"),
+                ("resH.", "res"),
+                ("trailer.", "trailer"),
+            ]
+            .into_iter()
+            .find(|(prefix, _)| key.starts_with(prefix))
+            .map(|(_, s)| s);
+            let colon = key.find(':');
+            let (scope, name) = match named {
+                // This key names its own scope, so the prefix is sliced off and
+                // the name is taken from it. With no `:` that slice is empty
+                // (`substring(dot + 1, -1)`), and upstream's `if (!name) return`
+                // drops the key.
+                Some(scope) => {
+                    let Some(colon) = colon else {
+                        continue;
+                    };
+                    let name = key[key.find('.').map(|i| i + 1).unwrap_or(0)..colon].trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    carried = Some((scope, name.to_string()));
+                    (scope, name.to_string())
+                }
+                // It does not, so it inherits — and its own name portion is
+                // ignored entirely, however it is spelled.
+                None => match &carried {
+                    Some((scope, name)) => (*scope, name.clone()),
+                    None => continue,
+                },
+            };
+            if scope != want {
+                continue;
+            }
+            let name = name.as_str();
+            // `key.substring(index + 1)`, and `index` is `-1` when there is no
+            // colon — so the **whole key** is the pattern. That is what makes
+            // the documented `res.x:p1=v1&p2=v2` two substitutions on one
+            // header: the second entry is a bare pattern inheriting the first
+            // entry's scope and name.
+            let pattern = match colon {
+                Some(colon) => &key[colon + 1..],
+                None => key.as_str(),
+            };
+            replace_in_header(headers, name, pattern, repl);
+        }
+    }
+}
+
+/// One `headerReplace` substitution on one header, however many times it
+/// appears — `handleHeaderReplace` (`_original/lib/util/index.js:2274-2292`).
+///
+/// Node hands upstream a repeated header in one of two shapes, and the
+/// substitution follows the shape: `set-cookie` stays a list and each entry is
+/// rewritten on its own; any other name arrives already joined (`, `, or `; `
+/// for `cookie`) and is rewritten — and written back — as that one string.
+/// This port used to rewrite the first `set-cookie` and drop the rest, which
+/// upstream's `plugin.test.js` caught with two cookies in and one out.
+///
+/// An absent or empty header is left alone.
+pub(super) fn replace_in_header(headers: &mut HeaderMap, name: &str, pattern: &str, repl: &str) {
+    let values: Vec<String> = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_string)
+        .collect();
+    if values.iter().all(String::is_empty) {
+        return;
+    }
+    if name.eq_ignore_ascii_case("set-cookie") {
+        remove_header(headers, name);
+        for value in values {
+            append_header(headers, name, &replace_once_or_all(&value, pattern, repl));
+        }
+        return;
+    }
+    let separator = if name.eq_ignore_ascii_case("cookie") {
+        "; "
+    } else {
+        ", "
+    };
+    let joined = values.join(separator);
+    set_header(headers, name, &replace_once_or_all(&joined, pattern, repl));
+}
+
+/// Which set of headers a `headerReplace://` key addresses.
+///
+/// Upstream keys these by string (`result.req` / `result.res` / `result.trailer`,
+/// `_original/lib/util/index.js:2207-2254`) and applies each set where those
+/// headers exist: the request head, the response head, and the trailers that go
+/// out after the body (`res.js:945,:1281`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HeaderScope {
+    Request,
+    Response,
+    Trailer,
+}
+
+impl HeaderScope {
+    /// The scope name upstream's keys carry.
+    pub(super) fn key(self) -> &'static str {
+        match self {
+            HeaderScope::Request => "req",
+            HeaderScope::Response => "res",
+            HeaderScope::Trailer => "trailer",
+        }
+    }
+}
