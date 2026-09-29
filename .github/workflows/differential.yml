@@ -1,12 +1,17 @@
-# The whole differential: real whistle 2.10.8 and whistle-rs side by side,
-# every hand-written corpus, the HTTPS/frames/timing/write/auth benches, and the
-# benches that start one proxy per mode. About fourteen minutes on a laptop,
-# so not on every pull request (ci.yml runs the fast half there): by hand, and
-# weekly, so a regression is at most a week old when it is found.
+# The whole differential: real whistle and whistle-rs side by side, every
+# hand-written corpus, the HTTPS/frames/timing/write/ws/auth benches, the
+# benches that start one proxy per mode, and upstream's own suite — run twice,
+# against the baseline whistle 2.10.8 and against 2.10.10, with one whistle-rs
+# binary. About eighteen minutes each on a laptop, so not on every pull request
+# (ci.yml runs the fast half there): by hand, and weekly, so a regression is at
+# most a week old when it is found.
 #
-# Everything it saw is uploaded, pass or fail: the manifest (commit, binary
-# hash, whistle version, lockfile and corpus hashes), each step's output and
-# each proxy's log.
+# Each run is a gate on its own. matrix.js then compares the two case by case
+# and says what moved between the releases; that is information, not a verdict.
+#
+# Everything it saw is uploaded, pass or fail: each manifest (commit, binary
+# hash, whistle version, lockfile and corpus hashes), each step's output, each
+# proxy's log, and the comparison.
 
 name: Differential
 
@@ -23,9 +28,9 @@ env:
 
 jobs:
   network:
-    name: Differential — every corpus and bench, both proxies live
+    name: Differential — every corpus and bench, against 2.10.8 and 2.10.10
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,11 +47,26 @@ jobs:
             target
           key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - run: npm ci --prefix tests/differential
+      # The second release, from a lockfile of its own — see
+      # tests/differential/README.md, "Which whistle, though".
+      - run: npm ci --prefix tests/differential/versions/2.10.10
       - run: cargo build --locked
-      - run: node tests/differential/run.js all --out target/differential/all
+      # Both runs, then the comparison, whatever the first one said: a release
+      # that fails its gate is exactly when the comparison is wanted.
+      - name: Differential against both releases
+        run: |
+          # `target/` comes from the cache, and an archive directory left in it
+          # would have this run's logs appended to an older run's.
+          rm -rf target/differential
+          status=0
+          node tests/differential/run.js all --out target/differential/all || status=1
+          node tests/differential/run.js all --whistle 2.10.10 --out target/differential/all-2.10.10 || status=1
+          node tests/differential/matrix.js target/differential/all target/differential/all-2.10.10 \
+            --json target/differential/matrix.json || status=1
+          exit $status
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: differential-all
-          path: target/differential/all/
+          path: target/differential/
           retention-days: 90
