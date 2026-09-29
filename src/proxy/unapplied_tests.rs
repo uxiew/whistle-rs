@@ -196,3 +196,67 @@ async fn a_request_over_its_limit_names_the_operators_it_skipped() {
         }
     }
 }
+
+/// An event stream is passed through as it arrives, never held until it ends:
+/// the first event reaches the client while the origin is still holding the
+/// stream open. What needs the whole body does not run and is named; what can
+/// travel with the stream runs and is not.
+#[tokio::test]
+async fn an_event_stream_streams_and_names_what_needs_the_whole_body() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let site = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let release = release.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: one\n\n",
+            )
+            .await
+            .unwrap();
+            release.notified().await;
+            let _ = sock.write_all(b"data: two\n\n").await;
+        });
+        addr
+    };
+    let rules =
+        format!("http://{site} resReplace://one=ONE resMerge://{{\"a\":1}} htmlAppend://<b>x</b>");
+    let (state, proxy) = proxy_with_config(&rules, |_| {}).await;
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client
+        .write_all(format!("GET http://{site}/events HTTP/1.1\r\nHost: {site}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    // The first event, rewritten by the one operator that travels, before
+    // the origin has sent the second.
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&got).contains("data: ONE") {
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the first event arrives while the stream is open")
+            .unwrap();
+        assert!(n > 0, "closed early: {}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&buf[..n]);
+    }
+    release.notify_one();
+    client.read_to_end(&mut got).await.ok();
+    let text = String::from_utf8_lossy(&got);
+    assert!(text.contains("data: two\n\n"), "{text}");
+    assert!(
+        text.ends_with("0\r\n\r\n"),
+        "the stream ended cleanly: {text}"
+    );
+    assert!(!text.contains("<b>x</b>"), "{text}");
+
+    let s = session(&state).await;
+    assert_eq!(s.unapplied.len(), 1, "{:?}", s.unapplied);
+    assert_eq!(s.unapplied[0].kind, Kind::EventStream);
+    assert_eq!(
+        s.unapplied[0].ops,
+        ["resMerge://{\"a\":1}", "htmlAppend://<b>x</b>"]
+    );
+}

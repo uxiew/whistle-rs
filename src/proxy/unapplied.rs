@@ -125,6 +125,19 @@ pub fn res_body_op(op: &MatchedOp) -> bool {
             && flags(&op.value).any(|f| matches!(f, "gzip" | "br" | "deflate")))
 }
 
+/// Does `op` wait for the whole response body, and so not run on an event
+/// stream, which is never collected? Every response-body operator but the ones
+/// that travel with a stream: `resBody`, `resPrepend` and `resAppend` always,
+/// `resReplace` while the stream is not compressed (see `stream_replace`).
+pub fn needs_whole_res_body(op: &MatchedOp, encoded: bool) -> bool {
+    let travels = match op.protocol.as_str() {
+        "resBody" | "resPrepend" | "resAppend" => true,
+        "resReplace" => !encoded,
+        _ => false,
+    };
+    res_body_op(op) && !travels
+}
+
 /// Does `op` act on a request body? `delete://body` / `delete://reqBody.…` do.
 /// `params://` (which `reqMerge://` is an alias of) does only when it rewrites
 /// a form or JSON body rather than the query string, which the caller knows —

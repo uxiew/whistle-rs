@@ -5875,6 +5875,35 @@ async fn serve(
             info.full_url
         );
     }
+    // What [`ResBodyOps::of`] dropped for an event stream, on the session: the
+    // stream went through with what can travel with it, and the rest did not
+    // run. Only where there was a body for them to run on.
+    if is_event_stream(res_ct.as_deref()) && response_has_body(parts.status.as_u16(), &info.method)
+    {
+        let encoded = res_enc
+            .as_deref()
+            .is_some_and(|enc| !enc.trim().eq_ignore_ascii_case("identity"));
+        let plugins = match plugin_wants_res_body {
+            true => "; no plugin's responseBody hook saw it either",
+            false => "",
+        };
+        ledger.unapplied(unapplied::Unapplied::over(
+            &matched_ops(&resolved),
+            |op| unapplied::needs_whole_res_body(op, encoded),
+            unapplied::Kind::EventStream,
+            format!(
+                "the response is an event stream, which is passed through as it arrives \
+                 rather than held until it ends — so the operators that need the whole \
+                 body did not run{plugins}. resReplace, resBody, resPrepend and resAppend \
+                 still apply{}",
+                if encoded {
+                    ", except resReplace on a compressed stream"
+                } else {
+                    ""
+                }
+            ),
+        ));
+    }
     let mut res_body_cap: Option<Capture> = None;
     // Decide first, then act — because the buffered path may hand the body back.
     // A response too large to hold is not rewritten at all, and then this is the
