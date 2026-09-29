@@ -534,10 +534,19 @@ async fn main() -> Result<()> {
             .with_context(|| format!("invalid --node-plugin '{spec}', expected name=path.js"))?;
         let (name, path) = (name.trim(), path.trim());
         let port = free_port().context("allocating a port for a node plugin")?;
+        // stdin is a pipe only this process holds open, so the plugin can tell
+        // when this process is gone however it went. `kill_on_drop` covers a
+        // shutdown that runs our code; `kill -9`, `taskkill /F` or a crash
+        // runs none, and without this the plugin went on holding its port. The
+        // SDK exits when the pipe closes; `WHISTLE_RS_PLUGIN_STDIN` tells it
+        // the pipe means that, since a plugin started by hand may have a stdin
+        // that closes at once.
         let child = tokio::process::Command::new("node")
             .arg(path)
             .env("WHISTLE_RS_PLUGIN_PORT", port.to_string())
             .env("WHISTLE_RS_PLUGIN_NAME", name)
+            .env("WHISTLE_RS_PLUGIN_STDIN", "lifeline")
+            .stdin(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning node plugin '{name}' ({path})"))?;

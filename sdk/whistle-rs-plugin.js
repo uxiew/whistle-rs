@@ -194,7 +194,30 @@ function start(plugin, opts) {
     const bound = server.address().port;
     console.log(`[${name}] whistle-rs plugin listening on 127.0.0.1:${bound} (hooks: ${manifest.hooks.join(', ') || 'none'})`);
   });
+  exitWithParent(name);
   return server;
+}
+
+/**
+ * Leave when the whistle-rs that started us is gone.
+ *
+ * `--node-plugin` gives us a stdin only it holds open, and the operating
+ * system closes it when whistle-rs exits by any route — `kill -9`, `taskkill
+ * /F` and a crash included, none of which let whistle-rs stop us itself.
+ * Without this, a plugin outlived its proxy and kept its port. Only when
+ * whistle-rs says stdin means that: a plugin started by hand may have a stdin
+ * that is closed from the start.
+ */
+function exitWithParent(name) {
+  if (process.env.WHISTLE_RS_PLUGIN_STDIN !== 'lifeline') return;
+  const leave = () => {
+    console.log(`[${name}] whistle-rs has exited; stopping`);
+    process.exit(0);
+  };
+  process.stdin.on('end', leave);
+  process.stdin.on('close', leave);
+  process.stdin.on('error', leave);
+  process.stdin.resume();
 }
 
 /** Path prefix reserved for the plugin's own pages. */
