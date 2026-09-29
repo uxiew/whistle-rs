@@ -148,6 +148,23 @@ example.com  statusCode://204  file://({"beta":true})   # 回 204
 **不属于**这个家族的算子 —— `resHeaders://`、`reqHeaders://`、`resDelay://`、筛选器 ——
 照常累加，不需要这样处理。
 
+### 客户端没法设代理时
+
+有的客户端没有代理设置（某些 SDK、容器里的服务、一段写死地址的 WebSocket 代码）。直接把请求
+发到代理端口，`Host` 写真实域名，它就按规则走，和经代理来的请求一样：
+
+```bash
+curl -H 'Host: api.example.com' http://127.0.0.1:8899/v1/users   # 按 api.example.com 的规则处理
+```
+
+也可以在 hosts 文件里把域名指到本机，并用 `-p 80` 启动（80 端口需要管理员权限）。
+
+两个要注意的地方：
+
+- `Host` 是 IP、`localhost` 或控制台主机名时，回应的是**控制台**，不是规则。
+- 没有规则把这个域名转到别处、而它又解析回本机时，得到的是一个跳到控制台地址的 `302`，
+  不会出现死循环，也不会在这个域名下打开控制台。
+
 ---
 
 ## Mock 一个接口
@@ -192,6 +209,9 @@ api.example.com/users    file:///Users/me/mock/users.json
 只有这一种能**白拿正确的 `Content-Type`**：whistle-rs 从文件扩展名猜。另外两种没有文件名可猜，
 默认是 `text/html; charset=utf-8`，所以客户端挑剔时要加 `resType://json` ——
 `fetch().then(r => r.json())` 不在乎，严格的客户端在乎。
+
+文件内容按字节原样发出，不做任何转码，GBK 页面、图片都可以；`resBody:///path`、
+`resPrepend://`、`resAppend://`（以及请求侧的三个）读文件时也是这样。
 
 目录也可以，请求路径会拼到它后面：
 
@@ -305,6 +325,9 @@ Bearer eyJhbGciOi...
 ```bash
 whistle-rs --value 'bearer=Bearer eyJhbGciOi...' -r rules.txt
 ```
+
+命令行的 `--value` 会盖过规则文件里同名的围栏块，适合临时换一个值；在控制台 Values 里存的同名值
+**不会**，规则自己的块优先，和上游一样。
 
 注意两种花括号写法的区别。`{name}` 替换的是**整个**算子取值（`file://{users.json}`）；
 `${name}` 替换的是取值**内部**的一段（`reqHeaders://authorization=${bearer}`）。

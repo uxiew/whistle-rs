@@ -160,6 +160,28 @@ example.com  statusCode://204  file://({"beta":true})   # answers 204
 Operators that are *not* in that family — `resHeaders://`, `reqHeaders://`,
 `resDelay://`, filters — accumulate normally and do not need this treatment.
 
+### When the client cannot be given a proxy
+
+Some clients have no proxy setting — an SDK, a service in a container, a
+WebSocket library with a fixed address. Send the request straight to the proxy's
+port with the real name in `Host`, and the rules take it as if it had come
+through the proxy:
+
+```bash
+curl -H 'Host: api.example.com' http://127.0.0.1:8899/v1/users   # api.example.com's rules apply
+```
+
+A hosts-file line pointing the name at this machine, with the proxy started on
+`-p 80`, does the same for every client on the machine (port 80 needs admin
+rights).
+
+Two things to know:
+
+- a `Host` that is an IP address, `localhost` or a console hostname gets the
+  **console**, not the rules;
+- a name no rule sends elsewhere, and which resolves back to this machine, gets a
+  `302` to the console's address — no loop, and no console under that name.
+
 ---
 
 ## Mock an API endpoint
@@ -210,6 +232,10 @@ it from the file extension. The other two have no filename to guess from and
 default to `text/html; charset=utf-8`, so add `resType://json` when the client
 is fussy — a `fetch().then(r => r.json())` will not care, but a strict client
 will.
+
+The file goes out byte for byte, never re-encoded — a GBK page or an image works.
+So does a file read by `resBody:///path`, `resPrepend://`, `resAppend://` and the
+three request-side ones.
 
 A directory works too, and the request path is appended to it:
 
@@ -334,6 +360,10 @@ or from the command line:
 ```bash
 whistle-rs --value 'bearer=Bearer eyJhbGciOi...' -r rules.txt
 ```
+
+`--value` beats a fenced block of the same name in the rules file, which is what
+makes it useful for swapping one value for a run. A value saved in the console's
+Values pane does **not**: the rules text's own block wins, as upstream has it.
 
 Note the two brace forms. `{name}` replaces the **whole** operator value
 (`file://{users.json}`); `${name}` substitutes **inside** one
