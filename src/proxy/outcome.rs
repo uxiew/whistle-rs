@@ -105,31 +105,53 @@ impl Failure {
 }
 
 /// A session's [`Failure`], if it has one, shared between the session and the
-/// response body that may still produce one.
+/// response body that may still produce one — and whether that body is still
+/// arriving, since the copy in the console's list learns it through this too.
 #[derive(Clone, Default)]
-pub struct Outcome(Arc<Mutex<Option<Failure>>>);
+pub struct Outcome(Arc<Mutex<State>>);
+
+#[derive(Default)]
+struct State {
+    failure: Option<Failure>,
+    /// Recorded at its response head, and not over yet — see
+    /// [`AppState::record_open`](super::AppState). Nothing about the session is
+    /// final while this is set: its body preview grows, and it can still fail.
+    open: bool,
+}
 
 impl Outcome {
     /// An outcome that is already known to be a failure.
     pub fn failed(failure: Failure) -> Self {
-        Outcome(Arc::new(Mutex::new(Some(failure))))
+        Outcome(Arc::new(Mutex::new(State {
+            failure: Some(failure),
+            open: false,
+        })))
     }
 
     /// The failure, if there was one.
     pub fn get(&self) -> Option<Failure> {
-        self.0.lock().unwrap().clone()
+        self.0.lock().unwrap().failure.clone()
     }
 
     /// Record a failure. The first one stands: a body that broke off and was
     /// then dropped has one cause, and it is the break.
     pub fn fail(&self, failure: Failure) {
-        self.0.lock().unwrap().get_or_insert(failure);
+        self.0.lock().unwrap().failure.get_or_insert(failure);
     }
 
     /// No failure recorded — the request got its whole answer, or has not
     /// finished yet.
     pub fn is_ok(&self) -> bool {
-        self.0.lock().unwrap().is_none()
+        self.0.lock().unwrap().failure.is_none()
+    }
+
+    /// Whether the transaction is still under way: its response is arriving.
+    pub fn is_open(&self) -> bool {
+        self.0.lock().unwrap().open
+    }
+
+    pub(super) fn set_open(&self, open: bool) {
+        self.0.lock().unwrap().open = open;
     }
 }
 
@@ -147,7 +169,10 @@ impl serde::Serialize for Outcome {
 
 impl<'de> serde::Deserialize<'de> for Outcome {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Outcome(Arc::new(Mutex::new(Option::deserialize(d)?))))
+        Ok(Outcome(Arc::new(Mutex::new(State {
+            failure: Option::deserialize(d)?,
+            open: false,
+        }))))
     }
 }
 

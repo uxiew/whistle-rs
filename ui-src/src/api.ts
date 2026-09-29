@@ -58,6 +58,8 @@ export interface SessionSummary {
   type?: string | null;
   /** Sent from the Composer or Replay — what `fc:` asks. Absent otherwise. */
   composer?: true;
+  /** The response is still arriving; sizes, body and `error` can change. */
+  open?: true;
 }
 
 /** `/api/sessions/search`'s answer to the box's `h:`/`b:` conditions. */

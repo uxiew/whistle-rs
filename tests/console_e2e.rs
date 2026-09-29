@@ -663,3 +663,88 @@ async fn every_api_refusal_is_json_saying_why() {
     }
     proxy.shutdown().await;
 }
+
+/// `/sessions.json` as a cursor: `after` for what arrived since, `ids` for the
+/// rows being watched, and `open` on a row whose response is still arriving —
+/// here, an origin that sends half its body and waits.
+#[tokio::test]
+async fn the_session_list_can_be_polled_as_a_cursor() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let site = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let release = release.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhalf-")
+                .await
+                .unwrap();
+            release.notified().await;
+            sock.write_all(b"done!").await.unwrap();
+        });
+        addr
+    };
+    let proxy = proxy_with("").await;
+    let addr = proxy.addr();
+    let url = format!("http://{site}/slow");
+    let client = tokio::spawn(async move { through_proxy(addr, &url, "").await });
+
+    let rows = |q: &'static str| async move {
+        let list = console(addr, "GET", &format!("/sessions.json{q}"), None).await;
+        serde_json::from_str::<serde_json::Value>(&list).expect("json")
+    };
+    let row = until(async || {
+        let list = rows("").await;
+        list.as_array()?.first().cloned()
+    })
+    .await;
+    let id = row["id"].as_u64().unwrap();
+    assert_eq!(row["open"], true, "the body is still arriving: {row}");
+    let detail = console(addr, "GET", &format!("/session.json?id={id}"), None).await;
+    let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(detail["open"], true, "{detail}");
+
+    // `after` the newest id: nothing new. `ids` of the open one: that row.
+    let after = console(addr, "GET", &format!("/sessions.json?after={id}"), None).await;
+    assert_eq!(after, "[]");
+    let before = console(
+        addr,
+        "GET",
+        &format!("/sessions.json?after={}", id - 1),
+        None,
+    )
+    .await;
+    assert!(before.contains(&format!("\"id\":{id}")), "{before}");
+    let watched = console(
+        addr,
+        "GET",
+        &format!("/sessions.json?ids={id},999999"),
+        None,
+    )
+    .await;
+    let watched: serde_json::Value = serde_json::from_str(&watched).unwrap();
+    assert_eq!(watched.as_array().unwrap().len(), 1, "{watched}");
+
+    release.notify_one();
+    let answer = client.await.unwrap();
+    assert!(answer.ends_with("half-done!"), "{answer}");
+    let done = until(async || {
+        let list = console(addr, "GET", &format!("/sessions.json?ids={id}"), None).await;
+        let list: serde_json::Value = serde_json::from_str(&list).ok()?;
+        let row = list.as_array()?.first()?.clone();
+        row.get("open").is_none().then_some(row)
+    })
+    .await;
+    assert_eq!(done["down"], 10, "{done}");
+
+    let (status, _) = raw(
+        addr,
+        &format!("GET /sessions.json?after=latest HTTP/1.1\r\nHost: {addr}\r\n"),
+        "",
+    )
+    .await;
+    assert!(status.contains(" 400 "), "{status}");
+    proxy.shutdown().await;
+}

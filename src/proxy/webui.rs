@@ -50,7 +50,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
     let mut answer = match (req.method().as_str(), path.as_str()) {
         (_, "/rootCA.crt") | (_, "/rootca.crt") => root_ca(state),
         (_, "/proxy.pac") | (_, "/pac") => pac(state, &req),
-        (_, "/sessions.json") => sessions_json(state),
+        (_, "/sessions.json") => sessions_json(state, req.uri().query()),
         ("GET", "/api/sessions/search") => sessions_search(state, &req).await,
         (_, "/sessions.har") => sessions_har(state, &req),
         (_, "/session.json") => session_detail_json(state, &req),
@@ -725,8 +725,29 @@ fn pac(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
 }
 
 /// Lightweight session list for the polled Network view (no headers/bodies —
-/// those are fetched on demand via [`session_detail_json`]).
-fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
+/// those are fetched on demand via [`session_detail_json`]). Newest first.
+///
+/// Two optional parameters make it a cursor for a program that polls it:
+/// `after=N` keeps the rows with an id above N (ids only grow), and
+/// `ids=1,2,3` keeps those rows. A row marked `open` is still receiving its
+/// response, so polling `after` the newest id and `ids` of the open ones sees
+/// every session arrive and every session finish. The console reads it whole.
+fn sessions_json(state: &Arc<AppState>, query: Option<&str>) -> Response<DynBody> {
+    let param = |name: &str| {
+        query?
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+    };
+    let after: u64 = match param("after").map(str::parse) {
+        None => 0,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => return refused("after must be a session id"),
+    };
+    let only: Option<std::collections::HashSet<u64>> = param("ids").map(|v| {
+        v.split(',')
+            .filter_map(|id| id.trim().parse().ok())
+            .collect()
+    });
     // Which sessions have frames to show. Read once and looked up per row: a
     // body cut into frames (an event stream, or a separator a rule named) is
     // not a WebSocket, so the status cannot answer this on its own — and the
@@ -739,6 +760,7 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
         let q = state.sessions.lock().unwrap();
         q.iter()
             .rev()
+            .filter(|s| s.id > after && only.as_ref().is_none_or(|ids| ids.contains(&s.id)))
             .map(|s| {
                 let mut row = serde_json::json!({
                     "id": s.id,
@@ -788,6 +810,11 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
                 // on those rows, for the same reason.
                 if s.composer {
                     row["composer"] = serde_json::json!(true);
+                }
+                // Still receiving its response: its sizes, its body and its
+                // `error` can change. Only while it is.
+                if s.error.is_open() {
+                    row["open"] = serde_json::json!(true);
                 }
                 row
             })
@@ -1044,8 +1071,17 @@ fn session_detail_json(state: &Arc<AppState>, req: &Request<Incoming>) -> Respon
         let q = state.sessions.lock().unwrap();
         q.iter().find(|s| s.id == id).cloned()
     });
+    // An id the proxy does not hold (never had, hidden, or evicted) is `null`
+    // with a 200, not a 404: the console asks for the selected row on every
+    // poll, and a row that has just left the list is not an error.
     let body = match found {
-        Some(s) => serde_json::to_string(&s).unwrap_or_else(|_| "null".into()),
+        Some(s) => {
+            let mut detail = serde_json::to_value(&s).unwrap_or_default();
+            if s.error.is_open() {
+                detail["open"] = serde_json::json!(true);
+            }
+            detail.to_string()
+        }
         None => "null".into(),
     };
     Response::builder()
@@ -3115,7 +3151,11 @@ mod composer_tests {
         assert_eq!(marked, [(true, true), (false, false)], "{marked:?}");
         assert!(sessions.iter().all(|s| !s.error.is_ok()), "both failed");
 
-        let rows = sessions_json(&state).into_body().collect().await.unwrap();
+        let rows = sessions_json(&state, None)
+            .into_body()
+            .collect()
+            .await
+            .unwrap();
         let rows: Vec<serde_json::Value> = serde_json::from_slice(&rows.to_bytes()).unwrap();
         let flag = |suffix: &str| {
             rows.iter()

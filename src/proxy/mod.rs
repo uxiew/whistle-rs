@@ -367,6 +367,9 @@ impl AppState {
         if is_hidden(&session) {
             return (id, None);
         }
+        // Shared with the copy in the ring, so the list says it is under way
+        // until `complete` says otherwise.
+        session.error.set_open(true);
         self.show(session.clone());
         (id, Some(session))
     }
@@ -397,6 +400,7 @@ impl AppState {
     /// `inspectors/data.js:59`), so a hidden request is not shown, not stored
     /// and not replayable there either.
     fn complete(&self, session: &Session) {
+        session.error.set_open(false);
         if let Some(observe) = self.observer.get() {
             observe(session);
         }
