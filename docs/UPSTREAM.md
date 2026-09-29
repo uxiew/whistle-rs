@@ -14,6 +14,7 @@
 | --- | --- |
 | 可执行 oracle | npm 包 whistle **2.10.8**，连同全部传递依赖由 `tests/differential/package-lock.json` 固定 |
 | 源码定位 | 注释和文档里的 `_original/…:行号` 对应 tag **`v2.10.8` = 提交 `1df0805f09fd979e0e31fd6eab99ca97239ac1ec`** |
+| 上游自带测试 | 同一提交 `1df0805` 的 `test/`；npm 包不带它，`upstream-suite.js` 按提交号从 GitHub 取（git 逐对象校验哈希），缓存在 `target/upstream-suite/`。v2.10.4 与 v2.10.8 的 `test/` 完全相同 |
 | 在线 master / 官网 | 2026-09-25 在线观察 `master/package.json` 为 **2.10.10**（tag `v2.10.10` = `a1e4751`）；浮动资料，不自动成为兼容基线 |
 
 2026-09-28 核实过这三者的对应关系：`git ls-remote` 显示 `v2.10.8` 是指向 `1df0805` 的轻量 tag；npm 包 whistle@2.10.8 的 228 个文件里，227 个（含 `package.json`）与该提交的源码树逐字节相同，唯一多出的 `biz/webui/htdocs/js/index.js` 是发布时构建的上游控制台产物。所以差分测的对照组就是 `1df0805` 的源码，按行号查引用时应检出这个提交。

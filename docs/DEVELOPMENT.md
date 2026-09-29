@@ -88,6 +88,8 @@ node run.js network --only cases-delete,https   # 只跑几步；--list 列出�
 
 新增例外时照这个格式写进 `declared.js`，别加宽 `EXPECTED` 的匹配范围，也别往 `IGNORE` 里加头。门禁到底能不能抓到回归，用 `node mutations.js` 验证：它在 HEAD 的临时 worktree 里逐条注入几个预设的语义回归，每条都必须让对应门禁失败（所以跑之前先提交）。
 
+**上游自带的测试**也是 `network` 里的一步（`upstream-suite`，约 4 分钟）：拿上游 v2.10.8 的 `test/` 原样跑 whistle-rs，第一次运行会从 GitHub 按提交号取到 `target/upstream-suite/`。它用上游固定的端口（6666、18080、5566、1080 等），跟 `--port-base` 无关，端口被占会直接报出来。单独跑：`node upstream-suite.js`；某个单元挂了，用 `node upstream-suite.js --target rs --only <单元名> --verbose` 看每条调用的状态和错误页。它评判哪些调用、怎么声明例外，只写在[差分 README](../tests/differential/README.md#upstreams-own-test-suite)。
+
 **Node 版本会影响结果。** 对照组是跑在 Node 上的 whistle，有些答案随 Node 版本变（`cases-compose.js` 记录过 gzip 头的一个字节）。当前声明是在 Node 26 上测的，CI 的差分任务也用 26；换版本要重新测量。
 
 几条不要做的事：不要把官网示例直接当网络用例跑（真实 URL 会产生外部请求）；测试 CA 只给测试客户端信任，不导入系统；`npm audit fix` 会悄悄换掉对照组，别跑（原因见差分 README）。各语料、专项 bench 和锁文件审阅的细节只写在 [tests/differential/README.md](../tests/differential/README.md)。
