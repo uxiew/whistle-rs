@@ -787,6 +787,12 @@ export async function replaySelected(): Promise<void> {
   if (!ids.length) return;
   const res = await reach(() => api.replay(ids));
   if (!res) return;
+  if (res.error) {
+    // Refused — the row has left the proxy's list, say. It was read as a
+    // replay of nothing and announced as "Replayed".
+    flashNote(`Not replayed: ${res.error}`);
+    return;
+  }
   // One replay is reported in full — whether its body survived the capture is
   // the thing worth saying. A batch reports the count, and how many of them
   // did not go out with the body they were captured with: naming which of

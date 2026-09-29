@@ -306,6 +306,8 @@ export interface ReplayedSession {
 export interface ReplayResult {
   replayed: number;
   sessions?: ReplayedSession[];
+  /** Set, with `ok: false`, when nothing was replayed — see `api_error`. */
+  error?: string;
 }
 
 /**

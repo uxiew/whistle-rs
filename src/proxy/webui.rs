@@ -676,12 +676,10 @@ fn redirect_to(location: &str) -> Response<DynBody> {
         .unwrap_or_else(|_| not_found())
 }
 
-/// The web UI's own 404.
+/// The web UI's own 404 — in the API's refusal shape, since most of what asks
+/// for a path that is not here is a script asking the API.
 fn not_found() -> Response<DynBody> {
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(body::full(Bytes::from_static(b"not found")))
-        .unwrap()
+    api_error(StatusCode::NOT_FOUND, "not found")
 }
 
 fn root_ca(state: &Arc<AppState>) -> Response<DynBody> {
@@ -1708,24 +1706,20 @@ async fn read_body(req: Request<Incoming>) -> Result<Bytes, Box<Response<DynBody
     let mut buf = bytes::BytesMut::new();
     while let Some(frame) = body.frame().await {
         let Ok(frame) = frame else {
-            return Err(Box::new(
-                Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(body::full(Bytes::from_static(b"could not read body")))
-                    .unwrap(),
-            ));
+            return Err(Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                "could not read the request body",
+            )));
         };
         if let Some(data) = frame.data_ref() {
             if buf.len() + data.len() > limit {
-                return Err(Box::new(
-                    Response::builder()
-                        .status(StatusCode::PAYLOAD_TOO_LARGE)
-                        .body(body::full(Bytes::from(format!(
-                            "request body over the console's {} MiB limit\n",
-                            limit / (1024 * 1024)
-                        ))))
-                        .unwrap(),
-                ));
+                return Err(Box::new(api_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &format!(
+                        "request body over the console's {} MiB limit",
+                        limit / (1024 * 1024)
+                    ),
+                )));
             }
             buf.extend_from_slice(data);
         }
@@ -1742,14 +1736,7 @@ async fn read_json_body(
     req: Request<Incoming>,
 ) -> Result<serde_json::Value, Box<Response<DynBody>>> {
     let body = read_body(req).await?;
-    serde_json::from_slice(&body).map_err(|_| {
-        Box::new(
-            Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(body::full(Bytes::from_static(b"invalid JSON")))
-                .unwrap(),
-        )
-    })
+    serde_json::from_slice(&body).map_err(|e| Box::new(refused(&format!("invalid JSON: {e}"))))
 }
 
 fn json_ok() -> Response<DynBody> {
@@ -1761,11 +1748,20 @@ fn json_ok() -> Response<DynBody> {
 }
 
 fn json_error(msg: &str) -> Response<DynBody> {
-    let body = format!("{{\"ok\":false,\"error\":\"{msg}\"}}");
+    api_error(StatusCode::BAD_REQUEST, msg)
+}
+
+/// Every refusal the console's API makes, in one shape: `status`, JSON, and
+/// `{ok: false, error}`. The console reads every answer as JSON, and an agent
+/// should not have to sniff which of three shapes a failure came in — some
+/// were plain text, one was JSON built with `format!` that broke on the quotes
+/// in its own message.
+fn api_error(status: StatusCode, msg: &str) -> Response<DynBody> {
+    let body = serde_json::json!({ "ok": false, "error": msg });
     Response::builder()
-        .status(StatusCode::BAD_REQUEST)
+        .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(body::full(Bytes::from(body)))
+        .body(body::full(Bytes::from(body.to_string())))
         .unwrap()
 }
 
@@ -1939,10 +1935,7 @@ async fn values_post(state: &Arc<AppState>, req: Request<Incoming>) -> Response<
                 .body(body::full(Bytes::from_static(b"{\"ok\":true}")))
                 .unwrap()
         }
-        Err(_) => Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(body::full(Bytes::from_static(b"expected a JSON object")))
-            .unwrap(),
+        Err(_) => refused("expected a JSON object of names to text values"),
     }
 }
 
@@ -2113,24 +2106,14 @@ async fn replay_session(state: &Arc<AppState>, req: Request<Incoming>) -> Respon
     };
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(body::full(Bytes::from_static(b"invalid JSON")))
-                .unwrap();
-        }
+        Err(e) => return refused(&format!("invalid JSON: {e}")),
     };
     let ids: Vec<u64> = if let Some(id) = payload.get("id").and_then(|v| v.as_u64()) {
         vec![id]
     } else if let Some(arr) = payload.get("ids").and_then(|v| v.as_array()) {
         arr.iter().filter_map(|v| v.as_u64()).take(100).collect()
     } else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(body::full(Bytes::from_static(
-                b"{\"error\":\"expected id or ids\"}",
-            )))
-            .unwrap();
+        return refused("expected {\"id\": N} or {\"ids\": [N, …]}");
     };
 
     // Collect the sessions to replay while holding the lock briefly.
@@ -2141,12 +2124,10 @@ async fn replay_session(state: &Arc<AppState>, req: Request<Incoming>) -> Respon
             .collect()
     };
     if sessions.is_empty() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(body::full(Bytes::from_static(
-                b"{\"replayed\":0,\"error\":\"no matching sessions\"}",
-            )))
-            .unwrap();
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "no session with that id is held; it may have left the list or been cleared",
+        );
     }
 
     let port = state.config.port;
@@ -2386,12 +2367,7 @@ async fn explain_rules(state: &Arc<AppState>, req: Request<Incoming>) -> Respons
 
 /// A `400` the console can read: everything it posts, it reads back as JSON.
 fn refused(error: &str) -> Response<DynBody> {
-    let answer = serde_json::json!({ "ok": false, "error": error });
-    Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(body::full(Bytes::from(answer.to_string())))
-        .unwrap()
+    api_error(StatusCode::BAD_REQUEST, error)
 }
 
 /// Build what a composition puts on the wire, or say why it cannot.

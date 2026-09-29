@@ -595,3 +595,71 @@ content-length: 17\r\nConnection: close\r\n\r\n{\"success\":false}",
     );
     proxy.shutdown().await;
 }
+
+/// Every refusal from the console's API has one shape: a 4xx, JSON, and
+/// `{ok: false, error}` saying why. Some were plain text (`invalid JSON`),
+/// some JSON without a content type, and one was JSON built with `format!`
+/// that broke on the quotes in its own message.
+#[tokio::test]
+async fn every_api_refusal_is_json_saying_why() {
+    let proxy = proxy_with("").await;
+    let addr = proxy.addr();
+    let cases: [(&str, &str, Option<&str>, u16); 10] = [
+        ("POST", "/api/replay", Some("not json"), 400),
+        ("POST", "/api/replay", Some("{}"), 400),
+        ("POST", "/api/replay", Some(r#"{"id":999999}"#), 404),
+        ("POST", "/api/values", Some("[1]"), 400),
+        ("POST", "/api/value", Some("not json"), 400),
+        (
+            "POST",
+            "/api/ws/send",
+            Some(r#"{"id":1,"dir":"up","data":"x"}"#),
+            400,
+        ),
+        (
+            "POST",
+            "/api/composer",
+            Some(r#"{"method":"GET","url":"/only/a/path"}"#),
+            400,
+        ),
+        ("GET", "/api/sessions/search", None, 400),
+        ("GET", "/body.bin?id=999999&side=res", None, 404),
+        ("GET", "/api/no-such-thing", None, 404),
+    ];
+    for (method, path, body, want) in cases {
+        let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n");
+        let mut sock = TcpStream::connect(addr).await.expect("connect");
+        let body = body.unwrap_or("");
+        sock.write_all(
+            format!(
+                "{head}content-length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write");
+        let mut out = Vec::new();
+        sock.read_to_end(&mut out).await.expect("read");
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let (head, answer) = text.split_once("\r\n\r\n").expect("a response");
+        let case = format!("{method} {path}");
+        assert!(
+            head.starts_with(&format!("HTTP/1.1 {want} ")),
+            "{case}: {head}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "{case}: {head}"
+        );
+        let answer: serde_json::Value = serde_json::from_str(answer)
+            .unwrap_or_else(|e| panic!("{case}: not JSON ({e}): {answer}"));
+        assert_eq!(answer["ok"], false, "{case}: {answer}");
+        assert!(
+            answer["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{case}: {answer}"
+        );
+    }
+    proxy.shutdown().await;
+}
