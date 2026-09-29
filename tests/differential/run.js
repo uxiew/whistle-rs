@@ -47,7 +47,10 @@ const path = require('path');
 
 const HERE = __dirname;
 const REPO = path.resolve(HERE, '..', '..');
-const RS_BIN = process.env.RS_BIN || path.join(REPO, 'target', 'debug', 'whistle-rs');
+// Absolute, because the proxies are started in directories of their own: a
+// relative `RS_BIN` passed the existence check here and then failed to spawn
+// with an unhandled ENOENT.
+const RS_BIN = path.resolve(process.env.RS_BIN || path.join(REPO, 'target', 'debug', 'whistle-rs'));
 const HOST = '127.0.0.1';
 
 // ── arguments ─────────────────────────────────────────────────────────────
