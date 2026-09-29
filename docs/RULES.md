@@ -3493,6 +3493,15 @@ recorded as a session (status `101`) and each frame (both directions) is surface
 select the connection in the console and open its Frames tab, or fetch
 `/frames.json?id=<session>`.
 
+**No extension is negotiated through the proxy.** The client's
+`Sec-WebSocket-Extensions` offer — `permessage-deflate`, which browsers send by
+default — is not passed to the server, so frames travel uncompressed and every
+one the capture, `frameScript` and the plugins see is the one the ends wrote. The
+applications do not notice; the wire carries more bytes. Upstream passes the offer
+on and inflates a copy for its display. (Until 2026-09 this port passed it on and
+did not keep a frame's "compressed" bit, so a compressing server's messages
+arrived as binary noise.)
+
 `enable://ignoreSend` and `enable://ignoreReceive` silence one direction of such a
 session: the frames are still **captured and flagged**, they are simply never
 delivered to the peer, so the view shows what was dropped instead of a gap.

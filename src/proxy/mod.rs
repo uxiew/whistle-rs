@@ -5555,6 +5555,19 @@ async fn serve_upgrade(
     upstream::take_client_proxy_auth(&mut parts);
     mark_stripped_tls(&mut parts.headers, &target);
     apply::apply_request(&mut parts, resolved);
+    // Every WebSocket this proxy relays is read frame by frame — captured,
+    // offered to `frameScript` and the plugins' hooks — and a compressed frame
+    // is unreadable to all of them. Worse, the codec in `ws` does not carry a
+    // frame's RSV1 bit across, so once the two ends had agreed on
+    // `permessage-deflate` the receiver got compressed bytes marked as plain
+    // text: upstream's `connect.test.js` read back binary noise. So nothing is
+    // negotiated: the offer does not reach the server, and the frames stay as
+    // they were written. Compression is optional to both ends; this costs only
+    // bytes on the wire. (Upstream relays the frames compressed and inflates a
+    // copy for its display, `lib/socket-mgr.js:699-705`.)
+    parts
+        .headers
+        .remove(hyper::header::SEC_WEBSOCKET_EXTENSIONS);
     let out_req = Request::from_parts(parts, body::empty());
 
     tracing::info!(
@@ -5724,6 +5737,60 @@ mod upgrade_abort_tests {
             .unwrap_or(0);
         got.truncate(read);
         got
+    }
+
+    /// No extension is negotiated through the proxy: the client's
+    /// `Sec-WebSocket-Extensions` offer does not reach the server, so a server
+    /// that would compress cannot, and the frames the proxy reads and relays
+    /// are the ones the ends wrote. With the offer passed on, upstream's
+    /// `connect.test.js` got compressed bytes delivered as text.
+    #[tokio::test]
+    async fn a_compression_offer_does_not_reach_the_server() {
+        let offered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("origin");
+        let origin = listener.local_addr().unwrap();
+        let seen = offered.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            // A server that compresses whenever it is asked to.
+            let asked = head.contains("sec-websocket-extensions");
+            seen.store(asked, std::sync::atomic::Ordering::SeqCst);
+            let ext = if asked {
+                "Sec-WebSocket-Extensions: permessage-deflate\r\n"
+            } else {
+                ""
+            };
+            let answer = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n{ext}\r\n"
+            );
+            sock.write_all(answer.as_bytes()).await.ok();
+            let _ = sock.read(&mut buf).await;
+        });
+        let (_state, addr) = proxy_with("").await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET http://{origin}/ws HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut got = vec![0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut got))
+            .await
+            .expect("an answer")
+            .unwrap();
+        let head = String::from_utf8_lossy(&got[..n]).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 101"), "{head}");
+        assert!(
+            !offered.load(std::sync::atomic::Ordering::SeqCst),
+            "the offer reached the server"
+        );
+        assert!(!head.contains("sec-websocket-extensions"), "{head}");
     }
 
     /// `enable://abortRes` on an upgrade lets the handshake reach the server and
