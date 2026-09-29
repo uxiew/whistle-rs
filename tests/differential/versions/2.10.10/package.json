@@ -1,0 +1,8 @@
+{
+  "name": "whistle-rs-differential-2.10.10",
+  "private": true,
+  "description": "The second whistle the differential bench measures against; see ../../README.md, \"Which whistle, though\".",
+  "dependencies": {
+    "whistle": "2.10.10"
+  }
+}
