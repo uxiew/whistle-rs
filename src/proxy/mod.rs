@@ -1,7 +1,23 @@
 //! The proxy server: HTTP forward proxy, CONNECT tunnelling with HTTPS MITM,
-//! and a small built-in page to download the root CA.
+//! inbound SOCKS5, and the console on the same port.
 //!
-//! Ported from `_original/lib/index.js`, `lib/tunnel.js` and the handlers.
+//! Ported from `_original/lib/index.js`, `lib/tunnel.js` and the handlers. The
+//! server's own work is one kind per file:
+//!
+//! | file | what it does |
+//! | --- | --- |
+//! | `listen` | binding the ports, the accept loop, the LAN addresses to suggest |
+//! | `tunnel` | what arrives before a request: plain request or `CONNECT`; a tunnel refused, relayed unread, or intercepted and served as h1/h2 |
+//! | `serve` | the request pipeline: rules, the request side, a local answer or a forward |
+//! | `response` | the response phase, response body operators, plugin response hooks, trailers |
+//! | `upgrade` | WebSocket and other upgrades |
+//! | `ledger` | every request ends as exactly one session, failures included |
+//! | `session`, `capture` | what the console shows of a request, and capturing its bodies |
+//! | `state`, `markers`, `dumps` | shared state, whistle's own marker headers, `reqWrite`/`resWrite` files |
+//!
+//! The `pub mod`s below are subsystems of their own: `apply` turns rules into
+//! mutations, `upstream` (with `pool`) connects to origins, `webui` is the
+//! console, and `ws`, `sni`, `socks` handle their protocols.
 
 pub mod apply;
 #[cfg(test)]
