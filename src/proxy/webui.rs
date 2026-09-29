@@ -4302,3 +4302,81 @@ mod cross_site_tests {
         assert!(!same_origin("not an origin", "a.test"));
     }
 }
+
+#[cfg(test)]
+mod api_doc_tests {
+    use std::collections::BTreeSet;
+
+    /// Every route the console answers, as `(method, path)`, read from the
+    /// route table in this file — `"*"` where it answers any method.
+    fn routes() -> BTreeSet<(String, String)> {
+        let source = include_str!("webui.rs");
+        let start = source
+            .find("let mut answer = match (req.method().as_str(), path.as_str()) {")
+            .expect("the route table");
+        let table = &source[start..];
+        let table = &table[..table.find("_ => not_found(),").expect("its end")];
+        let arm = regex::Regex::new(r#"\((_|"([A-Z]+)"), "(/[^"]*)"\)"#).unwrap();
+        arm.captures_iter(table)
+            .map(|c| {
+                let method = c.get(2).map_or("*", |m| m.as_str());
+                (method.to_string(), c[3].to_string())
+            })
+            .collect()
+    }
+
+    /// Every `METHOD /path` docs/API.md names in code, and every other path
+    /// it names in code — an alias written as a bare `/path` beside one.
+    fn documented() -> (BTreeSet<(String, String)>, BTreeSet<String>) {
+        let doc = include_str!("../../docs/API.md");
+        let with_method = regex::Regex::new(r"`(GET|POST|DELETE|PUT) (/[^`?\s]*)").unwrap();
+        let bare = regex::Regex::new(r"`(/[^`?\s]*)").unwrap();
+        let routes = with_method
+            .captures_iter(doc)
+            .map(|c| (c[1].to_string(), c[2].to_string()))
+            .collect();
+        let paths = bare.captures_iter(doc).map(|c| c[1].to_string()).collect();
+        (routes, paths)
+    }
+
+    /// docs/API.md is the contract an agent programs against, and it said
+    /// nothing a test could hold it to: a route added here and not written
+    /// down, or written down and gone, was noticed by whoever tripped on it.
+    /// Now each side of the table is checked against the other.
+    #[test]
+    fn the_api_document_names_every_route_and_only_routes() {
+        let routes = routes();
+        let (named, paths) = documented();
+        assert!(routes.len() > 30, "the route table was read: {routes:?}");
+
+        let missing: Vec<_> = routes
+            .iter()
+            .filter(|(method, path)| {
+                let path_named = named.iter().any(|(_, p)| p == path) || paths.contains(path);
+                match method.as_str() {
+                    // Any method: the document names it by the one to use.
+                    "*" => !path_named,
+                    m => !named.contains(&(m.to_string(), path.clone())),
+                }
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "routes API.md does not name: {missing:?}"
+        );
+
+        // `/plugin/<name>/…` is a plugin's own space, not a route here.
+        let invented: Vec<_> = named
+            .iter()
+            .filter(|(method, path)| {
+                !path.starts_with("/plugin/")
+                    && !routes.contains(&(method.clone(), path.clone()))
+                    && !routes.contains(&("*".to_string(), path.clone()))
+            })
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "API.md names routes that are not here: {invented:?}"
+        );
+    }
+}
