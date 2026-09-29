@@ -535,14 +535,40 @@ which produced a false finding that looked exactly like news.
 
 The general lesson, and it is the third time today: **a bench that reads state it
 did not create is not measuring what it says it is**, and the failure looks like
-a finding rather than like a bug. 14 cases —
-the event stream, the flag on both sides of the exchange, the leading slash that
-keeps the separator, a separator that appears nowhere, and the FAQ's own example
-including its typo (`%A0` where it means `%0A`, which frames the whole body as
-one). A clean run is `differing: 0`.
+a finding rather than like a bug. 15 cases —
+the event stream with and without a `charset`, the flag on both sides of the
+exchange, the leading slash that keeps the separator, a separator that appears
+nowhere, and the FAQ's own example including its typo (`%A0` where it means
+`%0A`, which frames the whole body as one). A clean run is `differing: 0`; two
+of the cases are declared for one release each, because upstream changed its
+answer between 2.10.8 and 2.10.10 (`declared.js`).
 
 `cases-frames.js` is the other half: what the framing does to the wire, where
 the risk is a splitter that eats a boundary or holds the tail.
+
+## Frame scripts on a WebSocket
+
+`ws-bench.js` sends one text frame through each proxy to an echo origin under
+four `frameScript://` rules — none, a handler for each direction, one for the
+client's frames only, one for the server's only — and compares what the
+**origin** received and what the **client** got back. Neither end can be seen
+from the other, so both are asked. Runs on the standard pair (`run.js` step
+`ws`); by hand, `PORT_BASE=… node ws-bench.js` with a pair up.
+
+It exists because upstream changed: up to 2.10.9 a client's frame on a plain
+WebSocket went to `handleSendToClientFrame`, the other direction's handler
+(avwo/whistle#1358). Against 2.10.8 two of the four cases differ and are
+declared for that release; against 2.10.10 none do.
+
+## Which address `localhost` is dialled at
+
+`dns-bench.js` stands up three origins — IPv4 only, IPv6 only, one socket for
+both — and asks each proxy for `http://localhost:<port>/`; each origin answers
+with the address it was reached at. Both whistle releases dial IPv4 first for
+`localhost`, and so does this port since U1; started with `-M verbatim` (the
+resolver's order, `::1` first on macOS) it reaches the dual-stack origin over
+IPv6 and the bench fails. Where `::1` cannot be bound it prints `skipped` and
+compares nothing — a container with no IPv6 is not a finding.
 
 ## The mode bench
 
