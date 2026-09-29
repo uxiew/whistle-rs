@@ -168,6 +168,10 @@ export interface Timings {
   ssl?: number;
   wait?: number;
   receive?: number;
+  /** Which origin connection carried the request, numbered per proxy process. */
+  connection?: number;
+  /** The connection was left open by an earlier request from the same client. */
+  reused?: boolean;
 }
 
 export interface SessionDetail extends SessionSummary {

@@ -56,11 +56,20 @@ const bars = computed<Bar[]>(() => {
 
 const total = computed(() => bars.value.reduce((sum, b) => sum + b.ms, 0));
 
-/** The phases with nothing to show, named so their absence is legible. */
+/** The phases a connection is set up in, which a reused one never had. */
+const SETUP = new Set(['dns', 'connect', 'ssl']);
+
+/**
+ * The phases with nothing to show, named so their absence is legible — less
+ * the set-up phases of a reused connection, which are said separately: they
+ * did not go unmeasured, they did not happen.
+ */
 const absent = computed(() => {
   const t = props.timings;
   if (!t) return [];
-  return ORDER.filter(([key]) => typeof t[key] !== 'number').map(([, label]) => label);
+  return ORDER.filter(([key]) => typeof t[key] !== 'number')
+    .filter(([key]) => !(t.reused && SETUP.has(key)))
+    .map(([, label]) => label);
 });
 
 const fmt = (ms: number) => (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1)) + ' ms';
@@ -89,6 +98,13 @@ const fmt = (ms: number) => (ms >= 100 ? ms.toFixed(0) : ms.toFixed(1)) + ' ms';
         <span class="wf-ms">{{ fmt(total) }}</span>
       </li>
     </ul>
+    <p v-if="timings?.connection" class="wf-absent">
+      Origin connection #{{ timings.connection
+      }}<span v-if="timings.reused">
+        — reused from an earlier request by this client, so there was no DNS,
+        Connect or TLS</span
+      >.
+    </p>
     <p v-if="absent.length" class="wf-absent">
       Not measured: {{ absent.join(', ') }}<span v-if="absent.includes('Receive')">
         — the body had not ended</span
