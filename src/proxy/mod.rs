@@ -18,6 +18,7 @@ pub mod outcome;
 pub mod persist;
 pub mod restream;
 pub mod script;
+pub mod search;
 pub mod sni;
 pub mod socks;
 pub mod template;

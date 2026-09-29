@@ -62,6 +62,9 @@ json5 = "1.3.1"
 once_cell = "1.21.4"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 regex = "1.12.4"
+# Already here as boa's regexp engine; named directly so the search box's
+# `h:`/`b:` patterns are ECMAScript regexps on this side too (`proxy::search`).
+regress = "0.10.5"
 # Already here as rustls's crypto; named directly for the one digest a
 # WebSocket handshake needs (`Sec-WebSocket-Accept`, SHA-1 by RFC 6455).
 ring = "0.17.14"

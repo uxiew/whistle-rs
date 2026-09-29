@@ -51,6 +51,7 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         (_, "/rootCA.crt") | (_, "/rootca.crt") => root_ca(state),
         (_, "/proxy.pac") | (_, "/pac") => pac(state, &req),
         (_, "/sessions.json") => sessions_json(state),
+        ("GET", "/api/sessions/search") => sessions_search(state, &req).await,
         (_, "/sessions.har") => sessions_har(state, &req),
         (_, "/session.json") => session_detail_json(state, &req),
         (_, "/body.bin") => session_body_bytes(state, &req),
@@ -800,6 +801,52 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .body(body::full(Bytes::from(body)))
         .unwrap()
+}
+
+/// The search box's `h:` and `b:` over every session held — see
+/// [`super::search`]. `?c=h:cookie&c=b:/ok/i`: one `c` per condition.
+///
+/// The work runs off the runtime: it reads every kept header and body in the
+/// ring, and the console asks again on each poll while such a condition is in
+/// the box.
+async fn sessions_search(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
+    let asked = query_values(req, "c");
+    if asked.is_empty() {
+        return refused("nothing to search for: pass ?c=h:… or ?c=b:…, one c per condition");
+    }
+    let conditions = match asked
+        .iter()
+        .map(|c| super::search::Condition::parse(c))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(c) => c,
+        Err(why) => return refused(&why),
+    };
+    let sessions: Vec<Session> = state.sessions.lock().unwrap().iter().cloned().collect();
+    let scanned = sessions.len();
+    let answers =
+        tokio::task::spawn_blocking(move || super::search::search(&sessions, &conditions))
+            .await
+            .unwrap_or_default();
+    let body = serde_json::json!({ "scanned": scanned, "results": answers });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(body::full(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
+/// Every value of a repeated query parameter, decoded as a form encodes it,
+/// which is how `URLSearchParams` sends a search.
+fn query_values(req: &Request<Incoming>, name: &str) -> Vec<String> {
+    let Some(query) = req.uri().query() else {
+        return Vec::new();
+    };
+    query
+        .split('&')
+        .filter_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+        .map(percent_decode)
+        .collect()
 }
 
 /// A captured body as a HAR field carries it.

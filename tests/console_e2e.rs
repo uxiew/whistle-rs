@@ -541,3 +541,57 @@ async fn a_plugin_page_does_not_receive_the_console_login() {
 
     proxy.shutdown().await;
 }
+
+/// The search box's `h:` and `b:`, which a list row cannot answer, answered by
+/// the proxy over what it holds — and a condition it cannot answer refused in
+/// the JSON everything else here refuses in.
+#[tokio::test]
+async fn headers_and_bodies_are_searched_by_the_proxy() {
+    let site = origin(
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nset-cookie: sid=abc\r\n\
+content-length: 17\r\nConnection: close\r\n\r\n{\"success\":false}",
+    )
+    .await;
+    let proxy = proxy_with("").await;
+    let addr = proxy.addr();
+    through_proxy(addr, &format!("http://{site}/api"), "").await;
+    let id = until(async || {
+        let held = proxy.state().sessions.lock().unwrap();
+        held.iter()
+            .find(|s| s.url.ends_with("/api") && s.res_body.is_some())
+            .map(|s| s.id)
+    })
+    .await;
+
+    // `b:"success":false` and `h:/sid=\w+/`, as `URLSearchParams` sends them.
+    let found = console(
+        addr,
+        "GET",
+        "/api/sessions/search?c=b%3A%22success%22%3Afalse&c=h%3A%2Fsid%3D%5Cw%2B%2F&c=b%3Anowhere",
+        None,
+    )
+    .await;
+    let found: serde_json::Value = serde_json::from_str(&found).expect("JSON");
+    assert_eq!(found["scanned"], 1, "{found}");
+    let ids = |i: usize| found["results"][i]["ids"].clone();
+    assert_eq!(found["results"][0]["condition"], r#"b:"success":false"#);
+    assert_eq!(ids(0), serde_json::json!([id]), "{found}");
+    assert_eq!(ids(1), serde_json::json!([id]), "{found}");
+    assert_eq!(ids(2), serde_json::json!([]), "{found}");
+    assert_eq!(found["results"][2]["partly_kept"], serde_json::json!([]));
+
+    let (status, body) = raw(
+        addr,
+        &format!("GET /api/sessions/search?c=m%3APOST HTTP/1.1\r\nHost: {addr}\r\n"),
+        "",
+    )
+    .await;
+    assert!(status.contains(" 400 "), "{status}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["error"].as_str().unwrap().contains("h: and b:"),
+        "{body}"
+    );
+    proxy.shutdown().await;
+}
