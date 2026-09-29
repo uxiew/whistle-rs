@@ -498,9 +498,12 @@ whistle-rs -t 3000 -r rules.txt      # 连接 3 秒还建立不起来就放弃
 需要完整 body 的变换仍走不同路径，具体适用条件见 [RULES.md](RULES.md)。
 
 非事件流上的缓冲改写可能延迟首字节，直到输入完成或触及改写上限。
-`--body-rewrite-limit` 与 `--body-preview-limit` 是独立限制；超限可能变成原样转发，
-不是改写成功。延迟/限速不会把整包变换自动变成流式变换，应按实际算子、编码、压缩和取消情形验证。
-可见诊断与边界回归由 [ROADMAP.md](ROADMAP.md) 的 R1 跟进。
+`--body-rewrite-limit` 与 `--body-preview-limit` 是独立限制；超过改写上限的 body 原样转发，
+不会被改写。延迟/限速不会把整包变换自动变成流式变换。
+
+**想知道某个算子到底执行了没有**，打开这条请求的 Rules 标签页：代理没执行的算子（超上限、
+是事件流、压缩解不开、插件钩子失败、`cipher://` 用不了）会被划掉、标 "not applied"，下面写原因。
+同一份信息在 `/sessions.json` 的 `unapplied` 字段里，见 [`API.md`](API.md#没生效的规则)。
 
 ---
 
@@ -1022,7 +1025,8 @@ whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
 | 限速比预期快 8 倍 | `resSpeed://` 的单位是**千比特**，不是千字节 |
 | body 改写时灵时不灵 | 现在不会了 —— 响应体算子会顺带禁掉请求缓存，`304` 吞不掉它。如果你用的是旧版本，加 `disable://cache` |
 | chunked 响应不再流式 | 上面挂了 body 算子，它会把整个 body 缓冲完。去掉它，或者用筛选器把它避开 |
-| body 算子对 SSE 流毫无作用 | 那是刻意跳过的，为的是让流继续走 —— 见[限速做不到的事](#限速做不到的事) |
+| body 算子对 SSE 流毫无作用 | 那是刻意跳过的，为的是让流继续走；Rules 标签页会把它标成 "not applied" 并写原因 —— 见[限速做不到的事](#限速做不到的事) |
+| Rules 标签页里列着规则，body 却没变 | 看那一行有没有 "not applied"，原因写在下面：body 超过了 `--body-rewrite-limit`、用了代理解不开的压缩，或者插件钩子失败了 |
 | 一条带 `client-tls` 标签的 `CONNECT`，里面什么都没有 | 客户端不接受本代理的证书：要么没信任根证书 —— 见 [`CERTIFICATES.md`](CERTIFICATES.md) —— 要么是做了证书固定（pinning）的 App，装什么 CA 都没用。后一种就让这个域名不解密直接转发：`pinned.example.com disable://intercept` |
 | `CONNECT` 行的 Policy 列带 `(tunnel)` | 这条隧道没解密就转发了 —— `disable://intercept` 规则、`--no-intercept-https`，或者里面跑的不是 HTTP。这一行就是全部记录：转发的隧道里面什么都不读 |
 | 直连控制台却返回带 `Proxy-Connection` 的 `502` | 你的 shell 设了 `http_proxy`。`curl --noproxy '*'` |

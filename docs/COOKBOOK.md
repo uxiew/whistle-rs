@@ -543,11 +543,16 @@ handling. See the operator's entry in [RULES.md](RULES.md) for its scope.
 
 Non-event-stream rewrites that use the buffered path can delay the first byte
 until enough input arrives or the rewrite cap is reached. `--body-rewrite-limit`
-and `--body-preview-limit` are separate limits; exceeding a rewrite limit can
-result in unchanged forwarding rather than a successful rewrite. Delay and
-speed rules do not make a whole-body transformation streaming. Validate the
-actual operator, charset, compression and cancellation combination; R1 in
-[ROADMAP.md](ROADMAP.md) tracks visible diagnostics and boundary coverage.
+and `--body-preview-limit` are separate limits; a body over the rewrite limit is
+forwarded unchanged rather than rewritten. Delay and speed rules do not make a
+whole-body transformation streaming.
+
+**To see whether an operator actually ran**, open the request's Rules tab: an
+operator the proxy did not carry out — over the limit, on an event stream, under
+a compression it could not undo, a plugin hook that failed, a `cipher://` it
+could not use — is struck through and marked "not applied", with the reason.
+The same list is `unapplied` in `/sessions.json`; see
+[`API.md`](API.md#没生效的规则).
 
 ---
 
@@ -1128,7 +1133,8 @@ Then work down this list:
 | a throttle is 8× faster than expected | `resSpeed://` is **kilobits**, not kilobytes |
 | a body rewrite works sometimes | it does not, any more — a response-body operator now busts the request cache, so a `304` cannot swallow it. If you are on an older build, add `disable://cache` |
 | a chunked response stops streaming | a body operator on it buffers the whole body. Remove it, or scope it away with a filter |
-| a body operator does nothing to an SSE stream | it is skipped there on purpose, so the stream keeps flowing — see [What throttling will not do](#what-throttling-will-not-do) |
+| a body operator does nothing to an SSE stream | it is skipped there on purpose, so the stream keeps flowing; the Rules tab marks it "not applied" with the reason — see [What throttling will not do](#what-throttling-will-not-do) |
+| a rule is listed on the Rules tab and the body is untouched | look for "not applied" on that row: the reason is under it — the body was over `--body-rewrite-limit`, compressed with something the proxy cannot undo, or a plugin hook failed |
 | a `CONNECT` row tagged `client-tls`, and nothing inside it | the client refused this proxy's certificate: it does not trust the root CA — see [`CERTIFICATES.md`](CERTIFICATES.md) — or it is an app that pins its server's certificate, which no CA fixes. For the second, relay that host unread: `pinned.example.com disable://intercept` |
 | a `CONNECT` row with `(tunnel)` in its Policy column | the tunnel was relayed without being decrypted — a `disable://intercept` rule, `--no-intercept-https`, or traffic that is not HTTP. The row is the whole record: nothing inside a relayed tunnel is read |
 | a direct request to the console returns `502` with `Proxy-Connection` | your shell has `http_proxy` set. `curl --noproxy '*'` |
