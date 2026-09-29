@@ -113,6 +113,19 @@ const EXPECTED = [
     why: 'x-server names the proxy that actually answered, on every answer',
   },
   {
+    // A 502 this port makes up because the request failed says where it
+    // failed and which session it was recorded as (`ERROR_HEADER` and
+    // `SESSION_HEADER`, `src/proxy/mod.rs`). whistle's gateway error carries
+    // neither, and `x-server` alone cannot tell it from an origin's own 502.
+    // Only ever on this port's side, and only on a failed request.
+    id: 'failure-headers',
+    upstream: '2.10.8',
+    fields: /^res\.header\.x-whistle-rs-(error|session)$/,
+    anyCase: 'every request that fails here gets them, in whichever corpus it fails',
+    match: (p) => /res\.header\.x-whistle-rs-(error|session): whistle=undefined rs="/.test(p),
+    why: 'a failed request\'s 502 names the phase it failed in and its session',
+  },
+  {
     // The `Server` header a served local file carries (`file-proxy.js:315-318`).
     // Same header, same reason as above: naming whistle would be a lie.
     id: 'server',
