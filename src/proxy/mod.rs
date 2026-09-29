@@ -3216,18 +3216,14 @@ impl Tunnel<'_> {
     }
 
     fn fail_at(self, target: &str, failure: outcome::Failure) {
-        tracing::info!(
-            "CONNECT {} -> failed at {}: {}",
-            self.session.url,
-            failure.phase,
-            failure.message
-        );
-        self.state.record(Session {
+        let url = self.session.url.clone();
+        let id = self.state.record(Session {
             target: target.to_string(),
             duration_ms: self.started.elapsed().as_millis(),
-            error: outcome::Outcome::failed(failure),
+            error: outcome::Outcome::failed(failure.clone()),
             ..self.session
         });
+        log_failure(id, "CONNECT", &url, &failure);
     }
 }
 
@@ -4461,13 +4457,7 @@ impl Ledger {
         let state = self.state.clone();
         let body = outcome::settle(body, expected, move |failure| {
             if let Some(failure) = failure {
-                tracing::info!(
-                    "{} {} -> failed at {}: {}",
-                    session.method,
-                    session.url,
-                    failure.phase,
-                    failure.message
-                );
+                log_failure(session.id, &session.method, &session.url, &failure);
                 session.error.fail(failure);
             }
             state.complete(&session);
@@ -4483,20 +4473,27 @@ impl Ledger {
             return None;
         }
         let draft = self.draft.take()?;
-        tracing::info!(
-            "{} {} -> failed at {}: {}",
-            draft.method,
-            draft.url,
-            failure.phase,
-            failure.message
-        );
-        Some(self.record(Session {
+        let (method, url) = (draft.method.clone(), draft.url.clone());
+        let id = self.record(Session {
             status,
             duration_ms: self.started.elapsed().as_millis(),
-            error: outcome::Outcome::failed(failure),
+            error: outcome::Outcome::failed(failure.clone()),
             ..draft
-        }))
+        });
+        log_failure(id, &method, &url, &failure);
+        Some(id)
     }
+}
+
+/// The log line for a request that did not complete. It leads with the session
+/// id — the one the console lists and a failed request's 502 carries in
+/// [`SESSION_HEADER`] — so the three can be matched up.
+fn log_failure(id: u64, method: &str, url: &str, failure: &outcome::Failure) {
+    tracing::info!(
+        "#{id} {method} {url} -> failed at {}: {}",
+        failure.phase,
+        failure.message
+    );
 }
 
 impl Drop for Ledger {
