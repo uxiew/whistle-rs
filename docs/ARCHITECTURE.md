@@ -197,6 +197,19 @@ Sessions number the origin connection (`timings.connection`, `timings.reused`;
 HAR's `connection`), because a reused one has no DNS, connect or TLS phase and the
 console would otherwise only be able to call those "not measured".
 
+**HTTP/2 to the origin.** A request that arrived over h2 — which is every request
+a browser sends through an intercepted HTTPS tunnel — offers `h2` in the origin's
+ALPN (`upstream::offers_h2`; `enable://h2`/`disable://h2` override it, as in
+whistle). An h2 connection is not taken from the pool but shared: every request
+the client connection sends to that key goes over it concurrently
+(`ConnPool::session`). The first request of a burst makes the connection while
+the others wait on `ConnPool::opening`, so the first page load is one handshake,
+not one per request in flight; an origin that picks HTTP/1.1 gets HTTP/1.1 on the
+socket it already accepted and is remembered, so nobody waits for it again; and a
+failed attempt lets the waiters connect side by side rather than one connect
+timeout after another. `upstream::for_h2` turns `Host` into `:authority` and drops
+the connection-specific headers, as whistle's `formatH2Headers` does.
+
 ## What the capture costs
 
 Every proxied body streams through `body::tee`, which copies a bounded prefix into

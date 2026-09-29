@@ -570,6 +570,23 @@ resolver's order, `::1` first on macOS) it reaches the dual-stack origin over
 IPv6 and the bench fails. Where `::1` cannot be bound it prints `skipped` and
 compares nothing — a container with no IPv6 is not a finding.
 
+## Which HTTP version reaches an HTTPS origin
+
+`h2-bench.js` stands up one TLS origin that offers both h2 and HTTP/1.1, as most
+do, and asks it through each proxy from an h2 client and an HTTP/1.1 client, with
+and without `enable://h2`/`disable://h2`/`disable://httpsH2`/`disable://http2`, and
+with ten h2 requests at once. It compares the protocol the proxy spoke to the
+client, the version and headers the origin received (`:authority` and `Host`
+included), and how many connections the origin accepted. Runs on the standard
+pair after `https` (`run.js` step `h2`).
+
+https-bench's origin speaks HTTP/1.1 only, so before this nothing could see which
+protocol reached an origin. Against the build before PERF1, five of the eight
+cases differ — the origin got HTTP/1.1 with a `Host` header where whistle sent
+h2, and ten requests arrived as ten connections instead of one. Now one differs,
+on 2.10.8 and 2.10.10 alike, and is declared: whistle's `disable://http2` also
+stops offering h2 to the client.
+
 ## What a request costs the network
 
 `perf-bench.js` is a measurement, not a gate: nothing in it passes or fails,

@@ -2073,7 +2073,7 @@ example.com/old    locationHref://replace:/new
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `pauseSend`/`pauseReceive` (hold one direction until the console releases it), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection), `hide`/`show` (keep a request out of the capture, or put it back — see below), `websocket` (read an upgrade as WebSocket whatever it calls itself) |
+| `enable` | flag(s) | `abort`/`abortReq`/`abortRes` (destroy the connection — see below), `cors` (as `resCors://enable`), `captureStream` (ask the origin not to compress), `gzip`/`br`/`deflate` (force the response's outgoing encoding), `showHost` (report the address reached as `x-host-ip`), `ignoreSend`/`ignoreReceive` (drop one direction of a WebSocket), `pauseSend`/`pauseReceive` (hold one direction until the console releases it), `safeHtml`/`strictHtml` (gate every injection), `keepCSP`/`keepCache`/`keepAllCache` (survive an injection), `hide`/`show` (keep a request out of the capture, or put it back — see below), `websocket` (read an upgrade as WebSocket whatever it calls itself), `h2`/`http2`/`httpsH2` (offer HTTP/2 to an HTTPS origin — see below) |
 | `disable` | flag(s) | see the two tables below |
 | `trailers` | `name=value` / `{json}` | Add HTTP response trailer headers (forces chunked) — see below |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | Rewrite a header value; scope is `req.`/`reqH.`/`res.`/`resH.` |
@@ -2114,6 +2114,8 @@ the request on its way out, or from the response on its way back:
 `disable://tunnel` belongs to neither table: it strips nothing, it refuses the
 connection — see
 [Aborting a connection rather than a request](#aborting-a-connection-rather-than-a-request).
+Nor do `disable://h2`, `http2` and `httpsH2`, which keep the hop to an HTTPS
+origin on HTTP/1.1 — see [`h2`](#h2--which-http-version-reaches-an-https-origin).
 
 A flag this port does not recognise is **inert** — it parses and does nothing,
 rather than failing the rule.
@@ -2337,6 +2339,46 @@ not a `wss://` corner, and refusing it means the most common rule anyone writes
 answers 502 here and 200 in whistle. It is implemented as whistle implements it,
 and `disable://auto2http` is how a request opts out.
 
+#### `h2` — which HTTP version reaches an HTTPS origin
+
+A request that reached this proxy over **HTTP/2** goes on to an HTTPS origin over
+HTTP/2 too, when the origin offers it in its TLS handshake; one that arrived over
+HTTP/1.1 goes on over HTTP/1.1. That is whistle's default (`checkH2`,
+`_original/lib/inspectors/res.js:174-195`). Browsers speak h2 to this proxy for
+every HTTPS site it decrypts, so for a browser this is the usual case. The flags
+turn it either way for the requests they match:
+
+| Rule | To the origin |
+|---|---|
+| `enable://h2` (also `http2`, `httpsH2`) | offer HTTP/2 whatever the client spoke |
+| `disable://h2` (also `http2`, `httpsH2`) | HTTP/1.1 only; `disable` wins over `enable` |
+
+```
+# an origin that misbehaves over h2: talk HTTP/1.1 to it
+api.example.com disable://h2
+```
+
+What an origin sees over HTTP/2: the `Host` header becomes `:authority` and is not
+sent as a header, and the headers that only mean something on one HTTP/1.1
+connection — `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`,
+`Upgrade`, `HTTP2-Settings`, and `TE` other than `trailers` — are dropped, as
+whistle's `formatH2Headers` drops them. So a `reqHeaders://connection=close` rule
+reaches an h2 origin as nothing at all, on both sides. A plain `http://` origin,
+a WebSocket upgrade and an `internal-proxy://` hop (which strips the TLS) stay on
+HTTP/1.1.
+
+All the h2 requests one client connection sends to one origin share one
+connection to it, so a page of fifty resources is one TLS handshake rather than
+fifty; the session's timings name that connection and mark every request after
+the first as reused. Two differences from whistle, both measured by
+`tests/differential/h2-bench.js`:
+
+* `disable://http2` here turns off the **origin** half only. whistle's also stops
+  offering h2 to the client, so the client falls back to HTTP/1.1 as well; here
+  the client keeps h2. The origin sees the same thing either way.
+* `httpH2` — HTTP/2 without TLS to a plain `http://` origin — is not implemented
+  (below).
+
 #### The flags this port does not implement
 
 The official [`enable`](https://wproxy.org/docs/rules/enable.html) and
@@ -2351,7 +2393,9 @@ with the reason. They parse and do nothing.
 | `clientId`, `multiClient` | whistle's `x-whistle-client-id` — a header it stamps so an upstream can tell clients apart | there is no client-id concept here, and inventing one to honour a flag is the wrong way round. `keepClientId` **is** implemented, for the one thing it can mean here: keeping a client-id the *client* sent — see [Rules in a request header](#rules-in-a-request-header) |
 | `useLocalHost`, `useSafePort` | rewrite `log://` and `weinre://` URLs to whistle's own built-in host and port | those two rules point at whistle's own servers, which this port does not run |
 | `authCapture`, `tunnelHeadersFirst`, `tunnelAuthHeader` | order a plugin's `auth` hook against the HTTPS upgrade, and decide whose headers win when a plugin passed some through a tunnel | all three are about whistle's plugin API; this port's is its own — see [`PLUGINS.md`](PLUGINS.md) |
-| `flushHeaders`, `secureOptions`, `keepH2Session`, `httpH2` | Node and HTTP/2 plumbing — `response.flushHeaders()`, the h2 `options`, session reuse, and h2 to the **origin** | this port speaks HTTP/2 to clients and HTTP/1.1 upstream, and has no Node to flush |
+| `flushHeaders`, `secureOptions` | Node plumbing — `response.flushHeaders()` and the TLS socket's `secureOptions` | there is no Node here to flush or configure |
+| `httpH2` | HTTP/2 without TLS (h2c) to a plain `http://` origin | not implemented: HTTP/2 to an origin is offered over TLS only — see [`h2`](#h2--which-http-version-reaches-an-https-origin) |
+| `keepH2Session` | as `disable://keepH2Session`, share an origin h2 session between a client's connections instead of keeping one per connection | sessions here are always per client connection; sharing them across connections is the thing the pool is built not to do — see [`ARCHITECTURE.md`](ARCHITECTURE.md#reusing-origin-connections) |
 | `dnsCache` | turn whistle's DNS cache off | there is no DNS cache here to turn off, so the flag's effect is already the default |
 | `clientCert`, `requestCert` | make the forged server ask the **client** for a certificate (mTLS) | not implemented. A client configured for mutual TLS fails against this port where it works against whistle; the missing half is a client-certificate store, not the flag |
 | `forceResWrite` | nothing: only `forceReqWrite` is ever read, on **both** sides (`_original/lib/inspectors/req.js:604`, `res.js:1300`) | the flag exists in the documentation and not in the program |
@@ -3683,7 +3727,7 @@ Known gaps in the operator layer, deliberately left:
   same decode/encode pair it uses for responses; whistle-rs works on the bytes, so
   the operator is a no-op on a non-UTF-8 request body.
 - **An HTTP/2 request's `:authority` is forwarded as written.** Translating h2 to
-  HTTP/1.1 upstream, this port sends the `Host` the client asked for; whistle
+  HTTP/1.1 for a plain-HTTP origin, this port sends the `Host` the client asked for; whistle
   sends the authority the tunnel was opened to instead, so a client that opens
   `CONNECT host:80` and then asks for `:authority: host` sees `host` here and
   `host:80` there. Both name the same server, and a rule matching on `Host` is

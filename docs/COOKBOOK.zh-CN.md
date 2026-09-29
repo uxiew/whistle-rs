@@ -1030,6 +1030,7 @@ whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
 | 一条带 `client-tls` 标签的 `CONNECT`，里面什么都没有 | 客户端不接受本代理的证书：要么没信任根证书 —— 见 [`CERTIFICATES.md`](CERTIFICATES.md) —— 要么是做了证书固定（pinning）的 App，装什么 CA 都没用。后一种就让这个域名不解密直接转发：`pinned.example.com disable://intercept` |
 | 页面在浏览器里能打开，走代理却在 `connect` 阶段 16 秒后失败 | 这个域名有 IPv6 地址，当前网络的 IPv6 又不通，它被先试，把连接预算耗光了。现在默认先试 IPv4；旧版本按解析器给的顺序试，`-M ipv6first`、`-M verbatim` 现在也还是 —— 升级，或者去掉这个 mode。见 [`CLI.md`](CLI.md#-m--mode) |
 | Android 的 WebView 或 Chrome 打开被解密的页面报 `ERR_CERT_VALIDITY_TOO_LONG` | 根证书装在系统证书库里，Chromium 对这种情况下叶子证书的有效期有上限，而旧版本签的证书有效期一年。升级即可：现在叶子证书有效期 43 天 —— 见 [`CERTIFICATES.md`](CERTIFICATES.md#android) |
+| 源站日志里请求变成了 HTTP/2，或者源站说收不到 `Host` 头 | 浏览器经本代理解密的 HTTPS 请求走的是 h2，现在转给源站时也用 h2（源站支持的话），和 whistle 一样。h2 里没有 `Host` 头，主机名在 `:authority` 里；`Connection`、`Keep-Alive`、`Transfer-Encoding` 这类头也不会发。源站在 h2 下有问题，就对它用 `disable://h2`。见 [`RULES.md`](RULES.md#h2--which-http-version-reaches-an-https-origin) |
 | 请求的时间里没有 DNS、Connect、TLS，瀑布图写着 `Origin connection #N — reused` | 同一个客户端连接上前一个请求留下的源站连接被接着用了，没有重新连，所以没有这几段。复用只发生在同一条客户端连接之内，不跨客户端。想让每个请求都新建连接：`disable://keepAlive`。见 [`ARCHITECTURE.md`](ARCHITECTURE.md#reusing-origin-connections) |
 | `CONNECT` 行的 Policy 列带 `(tunnel)` | 这条隧道没解密就转发了 —— `disable://intercept` 规则、`--no-intercept-https`，或者里面跑的不是 HTTP。这一行就是全部记录：转发的隧道里面什么都不读 |
 | 直连控制台却返回带 `Proxy-Connection` 的 `502` | 你的 shell 设了 `http_proxy`。`curl --noproxy '*'` |

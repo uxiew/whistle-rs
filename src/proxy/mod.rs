@@ -3496,8 +3496,9 @@ fn client_tls_failure(err: &std::io::Error) -> String {
     }
 }
 
-/// Serve an intercepted HTTP/2 connection (ALPN negotiated `h2`). Upstream
-/// forwarding stays HTTP/1.1 — hyper translates request/response between them.
+/// Serve an intercepted HTTP/2 connection (ALPN negotiated `h2`). Its requests
+/// go on over h2 to an HTTPS origin that offers it and over HTTP/1.1 otherwise
+/// (`upstream::offers_h2`); hyper translates between the two.
 async fn serve_intercepted_h2<I>(
     state: Arc<AppState>,
     io: I,
