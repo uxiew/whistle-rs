@@ -343,3 +343,40 @@ async fn a_request_body_that_cannot_be_undone_reaches_the_origin_as_sent() {
         s.unapplied[0].reason
     );
 }
+
+/// A `cipher://` pin that cannot be used is dropped and the connection made
+/// without it — on the record, where it used to be a WARN. The note rides on
+/// whatever the session becomes; here the origin refuses TLS, so it is a
+/// failed one, and says both things.
+#[tokio::test]
+async fn a_cipher_pin_that_cannot_be_used_is_named() {
+    let site = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = l.accept().await {
+                drop(sock);
+            }
+        });
+        addr
+    };
+    let rules = format!("tls.test https://{site} cipher://NOTACIPHER disable://auto2http");
+    let (state, proxy) = proxy_with_config(&rules, |_| {}).await;
+    let (head, _) = ask(proxy, "http://tls.test/x", "", b"").await;
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    let s = session(&state).await;
+    assert_eq!(
+        s.error.get().map(|f| f.phase),
+        Some(super::outcome::Phase::Tls)
+    );
+    assert_eq!(s.unapplied.len(), 1, "{:?}", s.unapplied);
+    assert_eq!(s.unapplied[0].kind, Kind::CipherUnusable);
+    assert_eq!(s.unapplied[0].ops, ["cipher://NOTACIPHER"]);
+
+    // Over plain HTTP there is no handshake, so nothing to report missing.
+    let plain = origin(TEXT, b"ok".to_vec()).await;
+    let (state, proxy) =
+        proxy_with_config(&format!("http://{plain} cipher://NOTACIPHER"), |_| {}).await;
+    ask(proxy, &format!("http://{plain}/x"), "", b"").await;
+    assert!(session(&state).await.unapplied.is_empty());
+}

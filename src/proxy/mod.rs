@@ -4663,6 +4663,20 @@ impl Drop for Ledger {
     }
 }
 
+/// A `cipher://` pin that could not be used, on the session: the connection
+/// went ahead without it — see [`super::ciphers`] for why — and a pin that
+/// silently did not happen is the last thing to find out from a log.
+fn note_cipher_dropped(ledger: &mut Ledger, target: &upstream::Target, resolved: &Resolved) {
+    if let Some(why) = &target.cipher_dropped {
+        ledger.unapplied(unapplied::Unapplied::over(
+            &matched_ops(resolved),
+            |op| op.protocol == "cipher",
+            unapplied::Kind::CipherUnusable,
+            why.clone(),
+        ));
+    }
+}
+
 /// Where a forwarded request went, as its session's `target` says it.
 fn target_desc(target: &upstream::Target) -> String {
     let mut desc = format!("{}:{}", target.connect_host, target.connect_port);
@@ -5441,6 +5455,7 @@ async fn serve(
         .await
         .map_err(outcome::at(outcome::Phase::Rules))?;
     ledger.note(|s| s.target = target_desc(&target));
+    note_cipher_dropped(ledger, &target, &resolved);
 
     // A proxy rule that names this proxy would send the request back to us, be
     // matched by the same rule, and recurse until the sockets run out. whistle
@@ -6380,6 +6395,7 @@ async fn serve_upgrade(
         .await
         .map_err(outcome::at(outcome::Phase::Rules))?;
     ledger.note(|s| s.target = target_desc(&target));
+    note_cipher_dropped(ledger, &target, resolved);
     let frame_script = resolved.value("frameScript").and_then(script::load_script);
     let websocket = is_websocket(&req, resolved);
     // Which plugins may hook this session's frames. Resolving the plan contacts
@@ -7529,6 +7545,7 @@ mod internal_req_tests {
     fn the_stripped_tls_marker_is_set_by_the_hop_and_consumed_on_arrival() {
         let target = |tls: bool, stripped: bool| upstream::Target {
             tls_ciphers: None,
+            cipher_dropped: None,
             no_proxy_ua: false,
             proxy_connection_close: false,
             connect_host: "example.com".into(),

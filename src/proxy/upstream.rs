@@ -160,6 +160,10 @@ pub struct Target {
     /// The `cipher` operator's `ciphers` string, evaluated. `None` when the
     /// rule named none — see [`super::ciphers`].
     pub tls_ciphers: Option<Arc<super::ciphers::CipherPolicy>>,
+    /// Why the rule's `ciphers` were not pinned when it named some: none this
+    /// build has, or none the allowed TLS versions can use. The session says
+    /// so — see [`super::unapplied`].
+    pub cipher_dropped: Option<String>,
     /// `disable://proxyUA` — do not echo the client's `User-Agent` on the
     /// CONNECT to an upstream proxy (`_original/lib/inspectors/res.js:329-333`).
     pub no_proxy_ua: bool,
@@ -1535,6 +1539,7 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
     let (host, port) = split_host_port(authority, if tls { 443 } else { 80 });
     let target = Target {
         tls_ciphers: None,
+        cipher_dropped: None,
         no_proxy_ua: false,
         proxy_connection_close: false,
         connect_host: host.clone(),
@@ -1837,6 +1842,7 @@ mod tests {
     fn target(host: &str, port: u16, proxy: Option<ProxyConfig>) -> Target {
         Target {
             tls_ciphers: None,
+            cipher_dropped: None,
             no_proxy_ua: false,
             proxy_connection_close: false,
             connect_host: host.to_string(),

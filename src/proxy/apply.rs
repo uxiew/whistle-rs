@@ -1206,6 +1206,7 @@ pub async fn resolve_target(
     // not the request. See `parse_cipher_suites` for why the two are not the
     // same fact here that they are in OpenSSL.
     let tls_versions = parse_cipher_versions(&cipher);
+    let mut cipher_dropped = None;
     let tls_ciphers = match parse_cipher_suites(&cipher) {
         Ok(policy) => policy,
         Err(e) => {
@@ -1215,6 +1216,10 @@ pub async fn resolve_target(
                 info.method,
                 info.full_url
             );
+            cipher_dropped = Some(format!(
+                "{e} — the connection was made with this proxy's default cipher suites, \
+                 not the ones the rule asked for"
+            ));
             None
         }
     };
@@ -1231,6 +1236,12 @@ pub async fn resolve_target(
                 info.full_url,
                 policy.names()
             );
+            cipher_dropped = Some(format!(
+                "none of the suites it names ({}) can be used with the TLS versions it \
+                 allows, so the connection was made with the default suites for those \
+                 versions",
+                policy.names().join(", ")
+            ));
         }
         fits
     });
@@ -1256,6 +1267,8 @@ pub async fn resolve_target(
     Ok(Target {
         auto2http,
         tls_ciphers,
+        // Only where there is a handshake for a pin to be missing from.
+        cipher_dropped: cipher_dropped.filter(|_| tls),
         // Read straight off `disable`, as upstream reads them.
         no_proxy_ua: disabled.contains("proxyUA"),
         proxy_connection_close: disabled.contains("proxyConnection"),
