@@ -188,10 +188,115 @@ pub fn phase_of(error: &anyhow::Error) -> Option<Phase> {
     Some(found.phase)
 }
 
+/// Call `done` once `body` is over, with the reason if it did not end well.
+///
+/// A response body ends one of three ways, and this tells them apart:
+///
+/// * it runs to its end — `done(None)`;
+/// * it fails — the origin broke off, or something between it and the client
+///   did — and the error travels on to the client as it always did:
+///   `done(Some(Phase::Response))`;
+/// * it is dropped before either, which is hyper giving up on a client that
+///   went away: `done(Some(Phase::Client))`.
+///
+/// The third needs care, because hyper also drops a body it has *finished*
+/// without polling it to the end: when the body says [`is_end_stream`], or
+/// when the `content-length` it promised has all been written. `expected` is
+/// that length, so a body that delivered every byte it promised is not taken
+/// for one the client walked away from.
+///
+/// [`is_end_stream`]: hyper::body::Body::is_end_stream
+pub fn settle(
+    body: super::body::DynBody,
+    expected: Option<u64>,
+    done: impl FnOnce(Option<Failure>) + Send + Sync + 'static,
+) -> super::body::DynBody {
+    use http_body_util::BodyExt;
+    Settle {
+        inner: Box::pin(body),
+        expected,
+        sent: 0,
+        done: Some(Box::new(done)),
+    }
+    .boxed()
+}
+
+type Done = Box<dyn FnOnce(Option<Failure>) + Send + Sync>;
+
+/// Body wrapper for [`settle`].
+struct Settle {
+    inner: std::pin::Pin<Box<super::body::DynBody>>,
+    expected: Option<u64>,
+    sent: u64,
+    /// Taken on the first ending, so a body polled after it ended, or dropped
+    /// after it failed, reports once.
+    done: Option<Done>,
+}
+
+impl Settle {
+    fn finish(&mut self, failure: Option<Failure>) {
+        if let Some(done) = self.done.take() {
+            done(failure);
+        }
+    }
+}
+
+impl hyper::body::Body for Settle {
+    type Data = bytes::Bytes;
+    type Error = super::body::BodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        let out = this.inner.as_mut().poll_frame(cx);
+        match &out {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.sent += data.len() as u64;
+                }
+            }
+            Poll::Ready(Some(Err(err))) => this.finish(Some(Failure::new(
+                Phase::Response,
+                format!("the response body broke off: {err}"),
+            ))),
+            Poll::Ready(None) => this.finish(None),
+            Poll::Pending => {}
+        }
+        out
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for Settle {
+    fn drop(&mut self) {
+        use hyper::body::Body as _;
+        let delivered =
+            self.inner.is_end_stream() || self.expected.is_some_and(|len| self.sent >= len);
+        let failure = (!delivered).then(|| {
+            Failure::new(
+                Phase::Client,
+                "the client closed the connection before the response ended",
+            )
+        });
+        self.finish(failure);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Context;
+    use http_body_util::BodyExt;
 
     /// The tag survives the context a caller adds on the way out, which is how
     /// the connect path reports "connecting to host:port" around the real error.
@@ -243,5 +348,77 @@ mod tests {
             serde_json::to_value(Outcome::default()).unwrap(),
             serde_json::Value::Null
         );
+    }
+
+    /// What `settle` reported, once it has reported.
+    fn watched(
+        body: super::super::body::DynBody,
+        expected: Option<u64>,
+    ) -> (
+        super::super::body::DynBody,
+        std::sync::mpsc::Receiver<Option<Failure>>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let body = settle(body, expected, move |f| tx.send(f).unwrap());
+        (body, rx)
+    }
+
+    /// A body `n` bytes long that never says it has ended — the kind of
+    /// wrapper hyper stops polling once the promised length is written.
+    fn endless_after(n: usize) -> super::super::body::DynBody {
+        let (tx, body) = super::super::body::channel(4);
+        tx.try_send(Ok(bytes::Bytes::from(vec![b'x'; n]))).unwrap();
+        // Keep the sender alive: the body must not end on its own.
+        std::mem::forget(tx);
+        body
+    }
+
+    #[tokio::test]
+    async fn a_body_read_to_its_end_settles_without_a_failure() {
+        let (body, rx) = watched(super::super::body::full("hello"), Some(5));
+        body.collect().await.unwrap();
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert!(rx.try_recv().is_err(), "reported once");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_errors_settles_as_the_responses_failure() {
+        let (tx, inner) = super::super::body::channel(4);
+        tx.send(Ok(bytes::Bytes::from_static(b"par")))
+            .await
+            .unwrap();
+        tx.send(Err("origin went away".into())).await.unwrap();
+        let (body, rx) = watched(inner, None);
+        assert!(body.collect().await.is_err());
+        let failure = rx.try_recv().unwrap().expect("a failure");
+        assert_eq!(failure.phase, Phase::Response);
+        assert!(
+            failure.message.contains("origin went away"),
+            "{}",
+            failure.message
+        );
+        assert!(rx.try_recv().is_err(), "reported once");
+    }
+
+    /// Dropped part-way: the client left.
+    #[tokio::test]
+    async fn a_body_dropped_part_way_settles_as_the_clients_doing() {
+        let (mut body, rx) = watched(endless_after(3), Some(10));
+        body.frame().await.unwrap().unwrap();
+        drop(body);
+        assert_eq!(
+            rx.try_recv().unwrap().expect("a failure").phase,
+            Phase::Client
+        );
+    }
+
+    /// Dropped after every promised byte went out: hyper does that with a
+    /// `content-length` body, and it is not the client leaving.
+    #[tokio::test]
+    async fn a_body_dropped_after_its_promised_length_settles_cleanly() {
+        let (mut body, rx) = watched(endless_after(10), Some(10));
+        body.frame().await.unwrap().unwrap();
+        drop(body);
+        assert_eq!(rx.try_recv().unwrap(), None);
     }
 }

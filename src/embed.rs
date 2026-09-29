@@ -185,7 +185,9 @@ impl Builder {
         self
     }
 
-    /// Be told about every transaction as it completes.
+    /// Be told about every transaction as it completes — once each, when its
+    /// response has reached the client, failed, or been abandoned. A failed one
+    /// says where it stopped in [`Session::error`].
     ///
     /// Runs on the request's own task, so hand slow work to a channel. For
     /// inspection only — to *change* a request, register a [`plugin`](Self::plugin).

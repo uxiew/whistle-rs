@@ -320,3 +320,138 @@ async fn an_origins_own_502_is_not_a_failure() {
     assert_eq!(got[0].status, 502);
     assert!(got[0].error.is_ok(), "{:?}", got[0].error);
 }
+
+/// Waits up to two seconds for the one recorded session to have a failure,
+/// which a body that fails part-way gets only once it has failed.
+async fn failed_later(state: &Arc<AppState>) -> Session {
+    for _ in 0..200 {
+        let got: Vec<Session> = state.sessions.lock().unwrap().iter().cloned().collect();
+        if let [s] = got.as_slice()
+            && !s.error.is_ok()
+        {
+            return s.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "no failure recorded: {:?}",
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| (s.status, s.error.get()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// What the observer was handed, in order.
+fn observed(state: &Arc<AppState>) -> Arc<std::sync::Mutex<Vec<Session>>> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    state.observe(move |s| sink.lock().unwrap().push(s.clone()));
+    seen
+}
+
+/// The origin promises 100 bytes, sends 10 and hangs up. The client already
+/// has a `200`; what the session adds is that the body never finished.
+#[tokio::test]
+async fn a_body_the_origin_breaks_off_fails_at_response() {
+    let origin = server(|mut sock| async move {
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789")
+            .await;
+    })
+    .await;
+    let (state, proxy) = proxy_with("").await;
+    let seen = observed(&state);
+    let response = ask(proxy, &format!("http://{origin}/x")).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let s = failed_later(&state).await;
+    assert_eq!(s.status, 200, "the status the client got");
+    let failure = s.error.get().unwrap();
+    assert_eq!(failure.phase, Phase::Response, "{}", failure.message);
+    // The observer — and the history on disk, which is handed the same
+    // session at the same moment — hears about it once, failure included.
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].error.get().map(|f| f.phase), Some(Phase::Response));
+}
+
+/// The client reads the head and part of the body, then leaves while the
+/// origin is still sending.
+#[tokio::test]
+async fn a_client_that_leaves_part_way_through_the_body_is_recorded() {
+    let origin = server(|mut sock| async move {
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n")
+            .await;
+        // A trickle, so the proxy has something to write — writing is how it
+        // finds out the client has gone.
+        for _ in 0..200 {
+            if sock.write_all(&[b'x'; 100]).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let (state, proxy) = proxy_with("").await;
+    let seen = observed(&state);
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client
+        .write_all(format!("GET http://{origin}/x HTTP/1.1\r\nHost: {origin}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut got = vec![0u8; 256];
+    let n = client.read(&mut got).await.unwrap();
+    assert!(got[..n].starts_with(b"HTTP/1.1 200"));
+    // The row is there while the body is still arriving, with nothing wrong
+    // with it yet, and the observer has not been told: it is not over.
+    let rows = sessions(&state, 1).await;
+    assert!(rows[0].error.is_ok());
+    assert!(seen.lock().unwrap().is_empty(), "not complete yet");
+    drop(client);
+    let s = failed_later(&state).await;
+    assert_eq!(s.error.get().unwrap().phase, Phase::Client);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// A request that goes fine is handed to the observer once, when it is over —
+/// with the whole body in its preview, not the part that had arrived when the
+/// head did.
+#[tokio::test]
+async fn a_completed_request_is_observed_once_with_its_whole_body() {
+    let origin = server(|mut sock| async move {
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n")
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = sock.write_all(b"6\r\n world\r\n0\r\n\r\n").await;
+    })
+    .await;
+    let (state, proxy) = proxy_with("").await;
+    let seen = observed(&state);
+    let response = ask(proxy, &format!("http://{origin}/x")).await;
+    assert!(
+        response.ends_with("hello world") || response.contains("world"),
+        "{response}"
+    );
+    for _ in 0..200 {
+        if !seen.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].error.is_ok(), "{:?}", seen[0].error);
+    let (_, _, text) = seen[0].res_body.as_ref().expect("captured").snapshot();
+    assert_eq!(text, "hello world");
+}

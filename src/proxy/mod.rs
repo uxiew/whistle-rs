@@ -281,9 +281,17 @@ impl AppState {
     ///
     /// For an **embedding** program: a proxy inside another application usually
     /// wants the traffic delivered, not polled out of `/sessions.json`. The
-    /// callback runs on the request's own task, after the response has gone to
-    /// the client and before the session enters the ring buffer, so it must be
-    /// quick — hand the work to a channel if it is not.
+    /// callback runs on the request's own task once the transaction is over —
+    /// the response has reached the client, or failed, or the client left — so
+    /// it must be quick; hand the work to a channel if it is not. Each request
+    /// is delivered exactly once, failed ones included, with
+    /// [`Session::error`] saying where a failed one stopped.
+    ///
+    /// A forwarded response is in the console from the moment its head
+    /// arrives, and reaches this callback only when its body ends; a stream
+    /// that never ends is never delivered. A WebSocket is over, for this
+    /// purpose, once its handshake is: the frames that follow are not part of
+    /// the session.
     ///
     /// Settable once, before serving. A second call is ignored rather than
     /// replacing the first, so a library consumer cannot silently lose the
@@ -304,34 +312,63 @@ impl AppState {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Record a transaction that is already over — answered here, failed, or
+    /// aborted. Returns its id.
     fn record(&self, mut session: Session) -> u64 {
-        let id = match session.id {
-            0 => self.next_id.fetch_add(1, Ordering::Relaxed),
-            reserved => reserved,
-        };
-        session.id = id;
-        // `enable://hide` — the request happens, and the console never hears
-        // about it. Upstream gates its own data server on the same question
-        // (`isHide`, `_original/lib/util/index.js:3990-3996`, read by
-        // `inspectors/data.js:59`), so a hidden request is not shown, not
-        // stored and not replayable there either.
+        let id = self.assign_id(&mut session);
+        if !is_hidden(&session) {
+            self.complete(&session);
+            self.show(session);
+        }
+        id
+    }
+
+    /// Record a transaction whose response is still arriving: it is in the
+    /// console from now on, and [`Self::complete`] is owed the session
+    /// returned once it is over — the observer and the history on disk get it
+    /// then, with the whole body preview, every phase and, if it came to that,
+    /// why it failed. `None` for a hidden one, which is owed nothing.
+    fn record_open(&self, mut session: Session) -> (u64, Option<Session>) {
+        let id = self.assign_id(&mut session);
         if is_hidden(&session) {
-            return id;
+            return (id, None);
         }
-        if let Some(observe) = self.observer.get() {
-            observe(&session);
+        self.show(session.clone());
+        (id, Some(session))
+    }
+
+    /// The id a session is recorded under: the one reserved for it, or the next.
+    fn assign_id(&self, session: &mut Session) -> u64 {
+        if session.id == 0 {
+            session.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         }
-        // Persist to disk before inserting into the in-memory ring buffer.
-        if let Some(store) = &self.session_store {
-            store.persist(&session);
-        }
+        session.id
+    }
+
+    /// Put a session in the console's ring, evicting the oldest past the cap.
+    fn show(&self, session: Session) {
         let mut q = self.sessions.lock().unwrap();
         let cap = self.config.req_cache_size.max(1);
         while q.len() >= cap {
             q.pop_front();
         }
         q.push_back(session);
-        id
+    }
+
+    /// Hand a finished transaction to the observer and to the history on disk.
+    ///
+    /// `enable://hide` never gets here — the request happens, and the console
+    /// never hears about it. Upstream gates its own data server on the same
+    /// question (`isHide`, `_original/lib/util/index.js:3990-3996`, read by
+    /// `inspectors/data.js:59`), so a hidden request is not shown, not stored
+    /// and not replayable there either.
+    fn complete(&self, session: &Session) {
+        if let Some(observe) = self.observer.get() {
+            observe(session);
+        }
+        if let Some(store) = &self.session_store {
+            store.persist(session);
+        }
     }
 
     /// Clear all in-memory sessions and WebSocket frames.
@@ -4192,6 +4229,39 @@ impl Ledger {
         self.state.record(session)
     }
 
+    /// Record `session` as this request's one session, its response `body`
+    /// still to come: it is completed when the body is over, and fails then
+    /// if the body breaks off or the client leaves before the end. `expected`
+    /// is the `content-length` the response promises, if any — see
+    /// [`outcome::settle`].
+    fn record_streaming(
+        &mut self,
+        session: Session,
+        body: DynBody,
+        expected: Option<u64>,
+    ) -> (u64, DynBody) {
+        self.settled = true;
+        let (id, open) = self.state.record_open(session);
+        let Some(session) = open else {
+            return (id, body);
+        };
+        let state = self.state.clone();
+        let body = outcome::settle(body, expected, move |failure| {
+            if let Some(failure) = failure {
+                tracing::info!(
+                    "{} {} -> failed at {}: {}",
+                    session.method,
+                    session.url,
+                    failure.phase,
+                    failure.message
+                );
+                session.error.fail(failure);
+            }
+            state.complete(&session);
+        });
+        (id, body)
+    }
+
     /// Record the draft as a request that failed with `failure`, the client
     /// having been answered with `status` (0: nothing at all). `None` when
     /// there is nothing to record — no draft, or a session already recorded.
@@ -5611,7 +5681,7 @@ async fn serve(
     // too; it was simply received before the operators ran.
     let res_body = timing::measure_receive(res_body, timings.clone());
 
-    let recorded = ledger.record(Session {
+    let session = Session {
         id: frame_session,
         time_ms,
         method: info.method.clone(),
@@ -5628,12 +5698,36 @@ async fn serve(
         res_body: res_body_cap,
         timings: Some(timings.clone()),
         error: Default::default(),
-    });
+    };
+    // The row appears now, while the body is still arriving; the transaction
+    // is complete — and can still fail — only when the body is over. A
+    // response that has no body to send is over already: hyper drops it
+    // unread, and that is not a client leaving.
+    let (recorded, res_body) = match carries_body(parts.status.as_u16(), &info.method) {
+        true => {
+            let expected = parts
+                .headers
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()?.parse().ok());
+            ledger.record_streaming(session, res_body, expected)
+        }
+        false => (ledger.record(session), res_body),
+    };
     for (dir, payload) in buffered_frames {
         state.record_frame(WsFrame::body_frame(recorded, dir, &payload));
     }
 
     Ok(Response::from_parts(parts, res_body))
+}
+
+/// Whether a response to `method` with `status` sends a body at all. Stricter
+/// than [`response_has_body`], which is about the body *operators* and leaves
+/// a redirect's body alone: a 302 still sends one, and it can still break off.
+fn carries_body(status: u16, method: &str) -> bool {
+    !(method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304)
 }
 
 /// Hand `body` to every matched `pipe://` plugin that serves the streaming hook
