@@ -120,6 +120,13 @@ sudo update-ca-trust
 3. Note: since Android 7, apps only trust **user** CAs if they opt in via a network
    security config. System-level install (rooted devices) or an app-specific config
    may be required to intercept a given app.
+4. With the root in the **system** store, Chrome and WebViews check the leaf
+   certificates the way they check a public one, and refuse any valid for longer
+   than the CA/Browser Forum allows (200 days for one issued from 2026-03-15):
+   the page fails with `ERR_CERT_VALIDITY_TOO_LONG`. The leaves whistle-rs signs
+   are valid for 43 days — 7 back, 36 ahead, as whistle 2.10.10's — and are
+   signed again before they run out, so this does not happen. A version before
+   that signed them for a year and a bit; if you see the error, update.
 
 ### Firefox (all platforms)
 

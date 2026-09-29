@@ -1982,6 +1982,13 @@ A handler's return value is the frame to deliver; a falsy one delivers
 **nothing**, which is upstream's `cb(null, chunk || null)`
 (`_original/lib/socket-mgr.js:198-206,:303-323`).
 
+The client's frames go to `handleSendToServerFrame` here, as the name says. On
+a plain WebSocket, whistle up to 2.10.9 gave them to `handleSendToClientFrame`
+instead, so a script with only the first handler did nothing there and one with
+both applied the wrong one; 2.10.10 fixed it (avwo/whistle#1358).
+`tests/differential/ws-bench.js` measures it through both proxies: two
+differences against 2.10.8, none against 2.10.10.
+
 **This port's**, which is shorter for a one-liner: `ctx.frame.data`, assigned in
 place, with `ctx.direction` naming the direction.
 
@@ -3034,6 +3041,12 @@ occurs. The regexp form follows JavaScript, so without the `g` flag only the
 
 `resReplace` is skipped entirely for a response with no `Content-Type` or an
 image one. `*Replace` on a non-UTF-8 (binary) body is a no-op.
+
+An SVG (`image/svg+xml`) is **text** here, so `resReplace` runs on it — handy for
+recolouring an icon — and a `file://` SVG is served with `; charset=utf-8`. That
+is whistle 2.10.8's answer, which tests `xml` before `image/`. whistle 2.10.10
+tests `image/` first, so there an SVG is an image and the replacement silently
+does nothing; this port keeps the older answer on purpose (STATUS, U1).
 
 Several matching lines do **not** run as separate passes: their pairs are
 collapsed into one map first, so a pattern written twice takes the first line's
