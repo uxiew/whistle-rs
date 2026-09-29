@@ -1205,6 +1205,7 @@ pub async fn resolve_target(
     // A cipher string that names nothing this build has takes the **pin** down,
     // not the request. See `parse_cipher_suites` for why the two are not the
     // same fact here that they are in OpenSSL.
+    let tls_versions = parse_cipher_versions(&cipher);
     let tls_ciphers = match parse_cipher_suites(&cipher) {
         Ok(policy) => policy,
         Err(e) => {
@@ -1217,6 +1218,22 @@ pub async fn resolve_target(
             None
         }
     };
+    // Suites that no version the same rule allows can use — only TLS 1.3 ones
+    // under a `maxVersion` of 1.2 — are dropped the same way: the handshake
+    // cannot happen with them, and rustls refuses to even build it.
+    let tls_ciphers = tls_ciphers.filter(|policy| {
+        let fits = policy.fits(tls_versions);
+        if !fits {
+            tracing::warn!(
+                "{} {}: cipher://: none of {:?} can be used with the TLS versions the rule \
+                 allows — the connection is made without the suite pin",
+                info.method,
+                info.full_url,
+                policy.names()
+            );
+        }
+        fits
+    });
     let disabled = disabled_flags(resolved);
     // `checkAuto2Http` (`_original/lib/util/index.js:3191-3198`): a `host://`
     // rule, a local address, or the flag said so out loud — and `disable://`
@@ -1251,7 +1268,7 @@ pub async fn resolve_target(
         sni: dest.host.clone(),
         request_port: dest.port,
         proxy,
-        tls_versions: parse_cipher_versions(&cipher),
+        tls_versions,
         host_fallback_direct,
     })
 }
@@ -13258,6 +13275,18 @@ mod tests {
             "https://example.com/",
         )
         .expect("the version half is still usable");
+        assert!(target.tls_ciphers.is_none());
+        assert_eq!(target.tls_versions, TlsVersions::Only12);
+
+        // Suites that exist but that no allowed version can use — only TLS 1.3
+        // ones, capped at 1.2 — go the same way. Building the connection for
+        // them panicked the request's task, which then read as the client
+        // having left.
+        let target = try_target(
+            "example.com cipher://{\"ciphers\":\"TLS_AES_128_GCM_SHA256\",\"maxVersion\":\"TLSv1.2\"}\n",
+            "https://example.com/",
+        )
+        .expect("a pin nothing can use does not fail the request");
         assert!(target.tls_ciphers.is_none());
         assert_eq!(target.tls_versions, TlsVersions::Only12);
 

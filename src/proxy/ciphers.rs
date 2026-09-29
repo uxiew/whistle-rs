@@ -368,6 +368,21 @@ impl CipherPolicy {
         self.order.iter().map(|&i| SUITES[i].rustls).collect()
     }
 
+    /// Whether any suite in it can be used by a connection limited to
+    /// `versions`. A string naming only TLS 1.3 suites, capped at TLS 1.2 by
+    /// `maxVersion`, has none: no handshake could satisfy both.
+    pub fn fits(&self, versions: super::upstream::TlsVersions) -> bool {
+        use super::upstream::TlsVersions;
+        let wanted = match versions {
+            TlsVersions::Default => return !self.order.is_empty(),
+            TlsVersions::Only12 => rustls::ProtocolVersion::TLSv1_2,
+            TlsVersions::Only13 => rustls::ProtocolVersion::TLSv1_3,
+        };
+        self.order
+            .iter()
+            .any(|&i| SUITES[i].rustls.version().version == wanted)
+    }
+
     /// The suite names, for logging what a rule actually did.
     pub fn names(&self) -> Vec<&'static str> {
         self.order

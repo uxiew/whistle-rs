@@ -563,9 +563,18 @@ fn build_client_config_with(
         provider.cipher_suites = wanted.clone();
         provider.cipher_suites.retain(|cs| wanted.contains(cs));
         let provider = Arc::new(provider);
-        let builder = ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(versions)
-            .expect("the provider carries every version asked for");
+        // rustls refuses a version none of the suites can serve. A pin like
+        // that is dropped where the rule is read (`apply::resolve_target`);
+        // this keeps one that got past it from panicking the request's task,
+        // which the ledger would then have recorded as the client leaving.
+        let Ok(builder) =
+            ClientConfig::builder_with_provider(provider.clone()).with_protocol_versions(versions)
+        else {
+            tracing::warn!(
+                "cipher://: no suite in the pin fits the TLS versions allowed; connecting without the pin"
+            );
+            return build_client_config_with(versions, None);
+        };
         let cfg = if insecure_upstream() {
             builder
                 .dangerous()
@@ -1776,6 +1785,24 @@ mod timeout_tests {
 
 #[cfg(test)]
 mod tests {
+    /// `cipher://{"ciphers":"TLS_AES_128_GCM_SHA256","maxVersion":"TLSv1.2"}`:
+    /// only TLS 1.3 suites, and TLS 1.2 only. No handshake can satisfy both,
+    /// and building the config for it panicked — rustls refuses a version with
+    /// no suite to go with it, and the builder `expect`ed it would not.
+    #[test]
+    fn suites_no_allowed_version_can_use_do_not_panic() {
+        let only13 = super::super::ciphers::evaluate("TLS_AES_128_GCM_SHA256").expect("a suite");
+        let only12 =
+            super::super::ciphers::evaluate("ECDHE-RSA-AES128-GCM-SHA256").expect("a suite");
+        let cfg = super::client_config_for(super::TlsVersions::Only12, Some(&Arc::new(only13)));
+        assert!(
+            !cfg.crypto_provider().cipher_suites.is_empty(),
+            "a config that can still connect"
+        );
+        let cfg = super::client_config_for(super::TlsVersions::Only13, Some(&Arc::new(only12)));
+        assert!(!cfg.crypto_provider().cipher_suites.is_empty());
+    }
+
     /// The opt-out is process-wide and read when a TLS config is first built,
     /// so it must be set before serving starts. Guarding the default here
     /// because "verifies unless asked not to" is the security property.
