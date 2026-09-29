@@ -10,6 +10,10 @@
     "whistle": "2.10.8"
   },
   "devDependencies": {
-    "qrcode": "1.2.0"
+    "qrcode": "1.2.0",
+    "request": "2.88.2",
+    "should": "13.2.3",
+    "should-http": "0.1.1",
+    "ws": "1.1.5"
   }
 }

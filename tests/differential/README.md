@@ -95,14 +95,20 @@ a `node_modules` byte-identical to the one it was taken from. npm replaces the
 registry.npmjs.org host with whatever registry you have configured, so a mirror
 works unchanged and the integrity check still applies.
 
-`npm audit` reports 11 advisories (4 high, 7 moderate: `adm-zip`, `qs` via
-`express`/`body-parser`, and `cross-spawn`/`mem`/`yargs-parser` via
-`qrcode@1.2.0`). They are **accepted, not fixed**: the oracle has to be the
-whistle upstream shipped, with the dependencies it shipped with, and `qrcode`
-is held at the version whistle itself uses. None of it is distributed, and it
-only ever handles this bench's own requests on loopback. Do not run
-`npm audit fix` here — it would silently swap the reference being measured
-against.
+`npm audit` reports 16 advisories (2 critical, 5 high, 9 moderate): `adm-zip`,
+`qs` via `express`/`body-parser`, and `cross-spawn`/`mem`/`yargs-parser` via
+`qrcode@1.2.0`; and, since 2026-09-29, `request` with its `form-data`,
+`tough-cookie` and `uuid`, and `ws@1` — the libraries upstream's own test suite
+is written against ([below](#upstreams-own-test-suite)). They are **accepted,
+not fixed**: the oracle has to be the whistle upstream shipped, with the
+dependencies it shipped with, `qrcode` is held at the version whistle itself
+uses, and the suite's libraries at the versions its code calls. None of it is
+distributed, and it only ever handles this bench's own requests on loopback. Do
+not run `npm audit fix` here — it would silently swap the reference being
+measured against.
+
+The 52 packages the suite brought (2026-09-29) were checked the same way:
+`resolved` from registry.npmjs.org, sha512, no install script.
 
 To move to a new whistle, change the version in `package.json`, run
 `npm install --package-lock-only --registry=https://registry.npmjs.org/` (a
@@ -164,6 +170,81 @@ corpora and with each other — one place said compose ends at 7, its header 9, 
 a run says 9; paths listed two `urlReplace://` cases the corpus no longer has
 and missed the emoji header and the non-UTF-8 body that do differ. That is why the
 declarations are per case now: a count cannot say *which* differences it means.
+
+## Upstream's own test suite
+
+```sh
+node upstream-suite.js                 # ~4 min: the gate — 180 calls judged
+node upstream-suite.js --control       # + whistle running its own suite (280/280)
+node upstream-suite.js --target rs --only file,reqHeaders --verbose   # one run, a few units
+```
+
+It takes whistle's **own** tests — `test/` of the v2.10.8 commit, 82 unit files,
+280 calls that assert something — fetched once by commit id into
+`target/upstream-suite/`, and runs them against whistle-rs. The assertions are
+upstream's, unchanged; only the driver is new, because upstream's reports one
+thing — the first assertion that throws ends the process — and here each call is
+a row: passed, failed at which line of which unit, or no answer.
+
+A clean run ends:
+
+```
+judged 180 calls — the ones whistle passes under the flattened rules, with and without the network
+  154 pass on whistle-rs
+  18 declared: rules set through upstream's embedding API …
+  6 declared: upstream's console API, `/cgi-bin/*` …
+  2 declared: an interim (`100`) or out-of-range (`1000`) status …
+
+upstream suite: judged 180, passed 154, declared 26, differing 0, stale 0 — passed
+```
+
+**Why 180 and not 280.** Two thirds of the calls go through the suite's eight
+Node plugins (`test/plugins/`): most of the rules live in their `rules.txt` and
+`_rules.txt`, and many answers come from their servers. Running upstream's plugin
+API is a stated non-goal here, and without the plugins **whistle itself** passes
+74 of 280. So the gate hands both proxies the rules those plugins ship, as plain
+rules (`--print-fixture` shows the translation), and asks whistle first — twice,
+once with every DNS lookup failing — and judges whistle-rs on the calls whistle
+passed both times. What is left out needs the plugins' own code, or the network.
+
+**Reading a failure.** `FAIL <unit> <METHOD url> #n [<unit>.test.js:<line>]` and
+the assertion's message. `--target rs --only <unit> --verbose` runs that unit
+alone and prints the status, a transport error or the start of an error page for
+each call. The same with `--target whistle --fixture flat` shows what upstream
+does with the same rules. A call that is meant to fail goes in `DECLARED` in
+`upstream-suite.js`, by its exact key and with the reason; one that starts passing
+fails the gate as `STALE` until the declaration goes.
+
+**Its ports are fixed** — 6666, 18080, 18081, 5566, 1080, 1118, 7788, 2080, 2081,
+and 19999/37621 unused on purpose — because the units spell them out in their
+URLs. Something already on one of them stops the run with its number.
+
+Three things in how it runs differ from `index.test.js`, and are why its numbers
+can be trusted:
+
+* upstream's client runs in the same process as upstream, which switches
+  certificate checks off process-wide (`lib/util/patch.js:20`); against
+  whistle-rs the driver does the same, or every HTTPS call fails on the proxy's
+  certificate;
+* the two SOCKS fixtures raced their clients — they reported success before the
+  onward connection existed, dropping what arrived meanwhile, and wrote their
+  answer before the request came. Node happens to lose those races; whistle-rs
+  lost half the SOCKS calls at random. The fixtures now wait. Their answers are
+  unchanged;
+* every fixture listens on `127.0.0.1` only.
+
+**What it found**, all fixed on 2026-09-29, each with a test of its own:
+
+| Unit | What was wrong in whistle-rs |
+|---|---|
+| `keys` | a values-store entry beat the rules text's own ``` block of the same name, and a block inside rules a request carried was dropped |
+| `script` | what a `reqScript` set on `values` did not reach the rules it pushed, and `reqScriptData` did not last from the request script to the response script |
+| `tps` | a rules text under `resScript://` was run as JavaScript and applied nothing |
+| `ws` | a request for another name sent to the proxy port origin-form got the console's 403 instead of being forwarded; `statusCode://101` sent a 101 no client accepts |
+| `connect` | a server that compresses WebSocket frames delivered noise: the relay dropped the "compressed" bit |
+| `insertFile` | the body operators decoded file contents as UTF-8, so a character split across two files — or a GBK page — was mangled |
+| `plugin` | `headerReplace` on two `set-cookie` headers left one |
+| `params` | an object param in a multipart body became an empty field instead of a file |
 
 ## The console's front door
 

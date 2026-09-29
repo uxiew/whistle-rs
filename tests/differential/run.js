@@ -117,6 +117,15 @@ const NETWORK = [
   { name: 'modes', args: ['mode-bench.js'], ports: range(0, 3), timeout: 20 * MINUTE },
   { name: 'forwarded', args: ['forwarded-bench.js'], ports: range(0, 3), timeout: 15 * MINUTE },
   { name: 'header-rules', args: ['header-rules-bench.js'], ports: range(0, 3), timeout: 15 * MINUTE },
+  // Upstream's own test suite. Its ports are its own and fixed — the units
+  // spell them out in their URLs — so this step does not move with --port-base.
+  // It fetches upstream's `test/` into `target/` on first use.
+  {
+    name: 'upstream-suite',
+    args: ['upstream-suite.js'],
+    ports: [6666, 18080, 18081, 5566, 1080, 1118, 7788, 2080, 2081, 19999, 37621],
+    timeout: 20 * MINUTE,
+  },
 ];
 
 const PAIRS = {
