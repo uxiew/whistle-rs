@@ -3,7 +3,7 @@
 // filter box.
 
 import { computed, onMounted, ref } from 'vue';
-import { applyTheme, filterGaps, loadStatus, showPane, state } from '../store';
+import { applyTheme, filterGaps, loadStatus, remoteSearch, showPane, state } from '../store';
 import type { Pane } from '../store';
 
 const PANES: { key: Pane; label: string }[] = [
@@ -50,9 +50,20 @@ const FILTER_HELP = [
   '  m:  method        s:  status        t:  content type',
   '  H:  host          i:  client or server IP',
   '  e:  went wrong    style:  a style:// value    mark:  marked by hand',
+  '  fc: sent from the Composer or Replay',
+  '  h:  a header      b:  a body — the proxy searches what it kept',
   'Each takes a keyword or a /regexp/flags. Several are AND-ed:',
   '  m:POST s:/^5/ H:api.example.com',
 ].join('\n');
+
+/**
+ * The proxy's refusal of the box's `h:`/`b:` — a regexp it cannot compile —
+ * which otherwise reads as an empty list. How many rows a `b:` could not rule
+ * out is said beside the count instead (`countLabel`).
+ */
+const remoteNote = computed(() =>
+  remoteSearch.error ? `h:/b: not searched — ${remoteSearch.error}` : '',
+);
 
 /** ⌘F focuses the filter from anywhere, the way a request list should. */
 function focusFilter(): void {
@@ -105,16 +116,18 @@ defineExpose({ focusFilter });
         ref="filterInput"
         v-model="state.filter"
         :title="FILTER_HELP"
-        placeholder="Filter — m: s: t: H: i: e: style: mark:"
+        placeholder="Filter — m: s: t: H: i: e: h: b: fc: mark:"
         spellcheck="false"
       />
       <!-- A condition this console cannot answer would otherwise just show an
            empty list, which reads as "nothing matched" rather than "I cannot
            ask that". Saying so is the whole point. -->
-      <p v-if="filterGaps.length" class="filter-gap">
+      <!-- The proxy refusing an `h:`/`b:` goes here too, for the same reason. -->
+      <p v-if="filterGaps.length || remoteNote" class="filter-gap">
         <span v-for="g in filterGaps" :key="g.prefix">
           <code>{{ g.prefix }}:</code> {{ g.why }}
         </span>
+        <span v-if="remoteNote">{{ remoteNote }}</span>
       </p>
     </div>
   </div>

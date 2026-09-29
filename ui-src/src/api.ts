@@ -54,6 +54,23 @@ export interface SessionSummary {
    * that got its whole answer — an origin's own 502 included.
    */
   error?: SessionFailure;
+  /** The response's `content-type`, for the `t:` filter. */
+  type?: string | null;
+  /** Sent from the Composer or Replay — what `fc:` asks. Absent otherwise. */
+  composer?: true;
+}
+
+/** `/api/sessions/search`'s answer to the box's `h:`/`b:` conditions. */
+export interface SessionSearch {
+  /** How many sessions the proxy held and read. */
+  scanned: number;
+  results: {
+    /** The condition as it was sent, e.g. `b:"success":false`. */
+    condition: string;
+    ids: number[];
+    /** `b:` only: no match, but a body was cut short, so it could be past the cut. */
+    partly_kept?: number[];
+  }[];
 }
 
 /** Where a request stopped, in the order a request meets these steps. */
@@ -348,6 +365,17 @@ function dispositionName(header: string | null): string {
 
 export const api = {
   sessions: () => getJson<SessionSummary[]>('/sessions.json'),
+  /**
+   * `h:`/`b:` over every session the proxy holds. A refusal (a bad regexp)
+   * comes back `{ok: false, error}` and is thrown with its reason.
+   */
+  searchSessions: async (conditions: string[]): Promise<SessionSearch> => {
+    const query = new URLSearchParams(conditions.map((c) => ['c', c]));
+    const res = await fetch(`/api/sessions/search?${query}`);
+    const body = await res.json();
+    if (!res.ok) throw new Error(body?.error || `/api/sessions/search: ${res.status}`);
+    return body as SessionSearch;
+  },
   session: (id: number) => getJson<SessionDetail | null>(`/session.json?id=${id}`),
   /**
    * The captured body as bytes — what the hex view, the image preview and the

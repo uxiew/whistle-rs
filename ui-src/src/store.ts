@@ -230,18 +230,26 @@ watch(
 watch(() => state.compose, (c) => writeStored(COMPOSE_KEY, c), { deep: true });
 watch(() => state.test, (t) => writeStored(TEST_KEY, t), { deep: true });
 
+/** A parsed condition; `remote` ones are answered by the proxy under `key`. */
+interface FilterCondition {
+  field: string;
+  remote?: boolean;
+  key?: string;
+}
+
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const parseFilter = (globalThis as any).whistleParseFilter as (
   q: string,
-) => { conditions: unknown[]; unsupported: { prefix: string; why: string }[] };
+  opts?: { remote: boolean },
+) => { conditions: FilterCondition[]; unsupported: { prefix: string; why: string }[] };
 const matchSession = (globalThis as any).whistleMatchSession as (
   s: SessionSummary,
-  c: unknown[],
-  ctx: { marked: number[] },
+  c: FilterCondition[],
+  ctx: { marked: number[]; remote?: Record<string, Set<number>> },
 ) => boolean;
 const matchAny = (globalThis as any).whistleMatchAny as (
   s: SessionSummary,
-  c: unknown[],
+  c: FilterCondition[],
   ctx: { marked: number[] },
 ) => boolean;
 
@@ -301,21 +309,90 @@ function admit(list: SessionSummary[]): SessionSummary[] {
  * `filter/session-filter.js`, which is the one copy of the grammar and is tested
  * from Rust against the same table.
  */
-const parsedFilter = computed(() => parseFilter(state.filter));
+const parsedFilter = computed(() => parseFilter(state.filter, { remote: true }));
 
 /** The prefixes in the box this console has no answer for, with the reason. */
 export const filterGaps = computed(() => parsedFilter.value.unsupported);
 
+/** The box's `h:`/`b:` conditions, as the proxy is asked them. */
+const remoteKeys = computed(() =>
+  parsedFilter.value.conditions.filter((c) => c.remote).map((c) => c.key as string),
+);
+
+/**
+ * The proxy's answers to the box's `h:`/`b:` — see `/api/sessions/search`.
+ *
+ * `maybe` is each answer widened by the rows a `b:` could not rule out: no
+ * match in what was kept of a body cut short. The rows only the wider answers
+ * let through are counted beside the total, because a body search that
+ * silently read 16 KB of a 2 MB response would pass for "not in there".
+ */
+export const remoteSearch = reactive({
+  answers: {} as Record<string, Set<number>>,
+  maybe: {} as Record<string, Set<number>>,
+  scanned: 0,
+  asking: false,
+  error: null as string | null,
+});
+
+let searchSeq = 0;
+
+/** Ask the proxy the box's `h:`/`b:` over everything it holds now. */
+async function refreshRemote(): Promise<void> {
+  const keys = remoteKeys.value;
+  const seq = ++searchSeq;
+  if (!keys.length) {
+    Object.assign(remoteSearch, { answers: {}, maybe: {}, scanned: 0, asking: false, error: null });
+    return;
+  }
+  remoteSearch.asking = true;
+  try {
+    const res = await api.searchSessions(keys);
+    if (seq !== searchSeq) return;
+    const answers: Record<string, Set<number>> = {};
+    const maybe: Record<string, Set<number>> = {};
+    for (const r of res.results) {
+      answers[r.condition] = new Set(r.ids);
+      maybe[r.condition] = new Set([...r.ids, ...(r.partly_kept ?? [])]);
+    }
+    Object.assign(remoteSearch, { answers, maybe, scanned: res.scanned, asking: false, error: null });
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    const error = e instanceof Error ? e.message : String(e);
+    Object.assign(remoteSearch, { answers: {}, maybe: {}, asking: false, error });
+  }
+}
+
+let searchTimer: number | undefined;
+// Typing asks once the typing stops, not at every keystroke.
+watch(remoteKeys, () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => void refreshRemote(), 250) as unknown as number;
+});
+
 /** The sessions the source list and the filter box agree on. */
-const visibleSessions = computed(() => {
+const visibleSessions = computed(() => shownUnder(remoteSearch.answers));
+
+/**
+ * Rows hidden only because a `b:` read part of their body: every other
+ * condition holds, and the part not kept could hold the match.
+ */
+const notRuledOut = computed(() => {
+  if (!Object.keys(remoteSearch.maybe).length) return 0;
+  return shownUnder(remoteSearch.maybe).length - visibleSessions.value.length;
+});
+
+/** The rows the list shows, given these answers for the remote conditions. */
+function shownUnder(remote: Record<string, Set<number>>): SessionSummary[] {
   const { conditions } = parsedFilter.value;
+  const ctx = { marked: state.marked, remote };
   return state.sessions.filter((s) => {
     if (state.client && clientOf(s) !== state.client) return false;
     if (state.markedOnly && !state.marked.includes(s.id)) return false;
     if (!conditions.length) return true;
-    return matchSession(s, conditions, { marked: state.marked });
+    return matchSession(s, conditions, ctx);
   });
-});
+}
 
 /** The rows as currently shown, which is what the arrow keys move through. */
 export const shownRows = computed(() => {
@@ -342,8 +419,22 @@ export const countLabel = computed(() => {
   if (state.offline) return 'proxy not answering';
   const shown = shownRows.value.length;
   const total = state.sessions.length;
-  return shown === total ? `${total} requests` : `${shown} of ${total} requests`;
+  const count = shown === total ? `${total} requests` : `${shown} of ${total} requests`;
+  return count + remoteCount();
 });
+
+/**
+ * What the count adds about the box's `h:`/`b:`: that the proxy is still being
+ * asked, or how many rows a `b:` could not rule out. Beside the count, where
+ * it qualifies the number, rather than over the table.
+ */
+function remoteCount(): string {
+  if (!remoteKeys.value.length || remoteSearch.error) return '';
+  if (remoteSearch.asking && !Object.keys(remoteSearch.answers).length) return ' · asking the proxy';
+  const n = notRuledOut.value;
+  if (!n) return '';
+  return ` · ${n} not ruled out: ${n === 1 ? 'its body was' : 'their bodies were'} only partly kept`;
+}
 
 /** One entry per client seen, newest capture included, sorted by address. */
 export const clientCounts = computed(() => {
@@ -448,6 +539,8 @@ export async function loadSessions(): Promise<void> {
     state.frames = null;
     state.wsPause = null;
   }
+  // New rows have not been searched yet: ask again over what is held now.
+  if (remoteKeys.value.length) void refreshRemote();
 }
 
 /** What a click carried, as the table's modifier keys mean it. */

@@ -10,8 +10,9 @@
 // This console used to match a bare substring against four fields and ignore any
 // prefix, which meant `m:POST` looked for the *text* `m:POST` in the URL and
 // found nothing. A filter that silently matches nothing is the same trap as a
-// rule that silently does nothing, so the four conditions this console cannot
-// answer are **reported** rather than quietly dropped — see `UNSUPPORTED`.
+// rule that silently does nothing, so a condition this console cannot answer is
+// **reported** rather than quietly dropped — see `UNSUPPORTED`. `h:` and `b:`
+// read what a row does not carry, and the proxy answers them — see `REMOTE`.
 //
 // ── why this file is plain script-shaped JavaScript ────────────────────────
 // The same reason as `editor/whistle-classify.js`: it is bundled into the
@@ -27,8 +28,7 @@
  *
  * The list rows carry no headers and no bodies — those are fetched per request,
  * and carrying them for every row is what the summary exists to avoid — so the
- * conditions that need them are not here. They are named in `UNSUPPORTED`, where
- * a person can be told rather than left with an empty list.
+ * conditions that need them are not here but in `REMOTE`.
  */
 const FIELDS = {
   // The default: the whole URL.
@@ -55,18 +55,33 @@ const FIELDS = {
 };
 
 /**
- * Conditions that need a per-row fact this console does not keep.
+ * Conditions the proxy answers, because a row does not carry what they read.
+ *
+ * The headers and bodies are not on a summary row, so the search box sends
+ * these to `/api/sessions/search` and passes the answer back in as
+ * `ctx.remote`: the ids that matched, keyed by the condition as written.
+ */
+const REMOTE = { h: true, b: true };
+
+/**
+ * Conditions this console cannot answer at all.
  *
  * Each one is a sentence rather than a flag, because the point is to say *why*:
- * a person who types `b:` deserves to know the bodies are not in the list rather
- * than to conclude their body does not contain what they know it contains.
+ * a person who types `app:` deserves to know the console cannot tell rather
+ * than to conclude no request came from the app they know sent some.
  */
 const UNSUPPORTED = {
-  h: 'the raw headers are fetched per request, not carried on every row',
-  b: 'the bodies are fetched per request, not carried on every row',
+  // Upstream guesses it in the browser from the User-Agent; a guess presented
+  // as a fact about the traffic is worse than no answer.
   app: 'this console does not know which application a request came from',
-  fc: 'requests sent from the Composer are not marked as such yet',
 };
+
+/**
+ * Why the capture filters take no `h:`/`b:`: they decide on a row as it
+ * arrives, from the row, and the answer to these comes from the proxy later.
+ */
+const NOT_ON_ARRIVAL =
+  'the capture filters decide on a row as it arrives, from the row alone; search headers and bodies from the search box';
 
 /** `/…/flags` is a regexp; anything else is a case-insensitive substring. */
 function toTest(value) {
@@ -133,27 +148,41 @@ function split(query) {
  * A prefix is only a prefix when it is one this console knows: `s:404` asks
  * about the status, and `http://a/b:c` is a URL that happens to contain a colon
  * and stays one.
+ *
+ * `opts.remote` says the caller will ask the proxy about `h:`/`b:` — the search
+ * box does. A condition that needs the proxy carries `remote: true` and the
+ * `key` its answer is filed under. Without it, as in the capture filters, the
+ * two are reported like any other condition that cannot be answered.
  */
-function parseFilter(query) {
+function parseFilter(query, opts) {
+  const remote = !!(opts && opts.remote);
   const conditions = [];
   const unsupported = [];
+  const report = (prefix, why) => {
+    if (!unsupported.some((u) => u.prefix === prefix)) unsupported.push({ prefix, why });
+  };
   for (const piece of split(String(query || '').trim())) {
     const at = piece.indexOf(':');
     const prefix = at === -1 ? null : piece.slice(0, at);
     const value = at === -1 ? piece : piece.slice(at + 1);
     if (prefix !== null && Object.prototype.hasOwnProperty.call(UNSUPPORTED, prefix)) {
-      if (!unsupported.some((u) => u.prefix === prefix)) {
-        unsupported.push({ prefix, why: UNSUPPORTED[prefix] });
-      }
+      report(prefix, UNSUPPORTED[prefix]);
+      continue;
+    }
+    if (prefix !== null && Object.prototype.hasOwnProperty.call(REMOTE, prefix)) {
+      if (!remote) report(prefix, NOT_ON_ARRIVAL);
+      // `h:` with nothing after it asks nothing, like `m:`.
+      else if (value) conditions.push({ field: prefix, remote: true, key: piece });
       continue;
     }
     const known = prefix !== null && Object.prototype.hasOwnProperty.call(FIELDS, prefix) && prefix !== '';
-    // Two prefixes are a *set* as much as a pattern, so an empty value means
-    // the set itself: `mark:` is "the ones I marked" and `e:` is "the ones that
-    // went wrong". Without this, `toTest('')` matches every string — including
-    // the empty one a row that did *not* go wrong reports — and `e:` on its own
-    // would quietly select everything, which is the opposite of what it says.
-    if (prefix === 'mark' || prefix === 'e') {
+    // Some prefixes are a *set* as much as a pattern, so an empty value means
+    // the set itself: `mark:` is "the ones I marked", `e:` "the ones that went
+    // wrong" and `fc:` "the ones the Composer sent". Without this, `toTest('')`
+    // matches every string — including the empty one a row that did *not* go
+    // wrong reports — and `e:` on its own would quietly select everything,
+    // which is the opposite of what it says.
+    if (prefix === 'mark' || prefix === 'e' || prefix === 'fc') {
       const test = value ? toTest(value) : (text) => text !== '';
       conditions.push({ field: prefix, test });
       continue;
@@ -167,14 +196,28 @@ function parseFilter(query) {
 /**
  * Does this row satisfy every condition?
  *
- * `ctx.marked` is the set of ids the console has marked by hand, which is the
- * one condition whose answer is not on the row.
+ * Two answers are not on the row: `ctx.marked` is the ids the console has
+ * marked by hand, and `ctx.remote` maps a remote condition's `key` to the ids
+ * the proxy said match it (an array or a `Set`). A remote condition with no
+ * answer yet matches nothing — the caller says it is still asking.
  */
 function matchSession(session, conditions, ctx) {
   const marked = (ctx && ctx.marked) || [];
+  const answers = (ctx && ctx.remote) || {};
   for (const c of conditions) {
+    if (c.remote) {
+      const ids = answers[c.key];
+      const hit = ids && (typeof ids.has === 'function' ? ids.has(session.id) : ids.includes(session.id));
+      if (!hit) return false;
+      continue;
+    }
     let text;
-    if (c.field === 'mark') {
+    if (c.field === 'fc') {
+      // Sent from the Composer or Replay — and, with a value, to a URL that
+      // matches it: upstream's `fc:` is that same pair
+      // (`network-modal.js:236-238`).
+      text = session.composer ? (session.url || '') : '';
+    } else if (c.field === 'mark') {
       text = marked.includes(session.id) ? (session.url || '') : '';
     } else if (c.field === 'e') {
       // Gone wrong: the proxy recorded why it did not complete, or the answer

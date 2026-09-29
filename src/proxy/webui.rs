@@ -3872,11 +3872,63 @@ mod tests {
             "and neither matching is still no"
         );
 
-        // And the four this console cannot answer are named, not dropped.
-        assert_eq!(unsupported(&mut ctx, "b:hello"), "b");
+        // `fc:` is the Composer's, and with a value its URL too.
+        let composed = |ctx: &mut Context, composer: bool, query: &str| -> bool {
+            let script = format!(
+                "whistleMatchSession({{ id: 9, url: 'https://a.example/login', status: 200, \
+                   composer: {composer} }}, whistleParseFilter({query:?}).conditions, {{ marked: [] }})"
+            );
+            ctx.eval(Source::from_bytes(script.as_bytes()))
+                .expect("the filter runs")
+                .as_boolean()
+                .expect("a boolean")
+        };
+        assert!(composed(&mut ctx, true, "fc:"));
+        assert!(!composed(&mut ctx, false, "fc:"), "fc: alone is the set");
+        assert!(composed(&mut ctx, true, "fc:login"));
+        assert!(!composed(&mut ctx, true, "fc:logout"));
+        assert!(!composed(&mut ctx, false, "fc:login"));
+
+        // `h:` and `b:` are answered by the proxy when the caller asks it to —
+        // the search box does — and matched by id against its answer.
+        let remote = |ctx: &mut Context, query: &str, answer: &str| -> bool {
+            let script = format!(
+                "(() => {{ const p = whistleParseFilter({query:?}, {{ remote: true }});
+                   return whistleMatchSession({row}, p.conditions, {{ marked: [], remote: {answer} }}); }})()"
+            );
+            ctx.eval(Source::from_bytes(script.as_bytes()))
+                .expect("runs")
+                .as_boolean()
+                .expect("a boolean")
+        };
+        assert!(remote(&mut ctx, "b:ok", "{ 'b:ok': [7] }"));
+        assert!(!remote(&mut ctx, "b:ok", "{ 'b:ok': [8] }"));
+        assert!(remote(&mut ctx, "h:x m:POST", "{ 'h:x': new Set([7]) }"));
+        assert!(
+            !remote(&mut ctx, "h:x m:GET", "{ 'h:x': [7] }"),
+            "still AND-ed"
+        );
+        assert!(
+            !remote(&mut ctx, "b:ok", "{}"),
+            "no answer yet is not a match"
+        );
+        let remote_gaps = |ctx: &mut Context, query: &str| -> String {
+            let script = format!(
+                "whistleParseFilter({query:?}, {{ remote: true }}).unsupported.map((u) => u.prefix).join(',')"
+            );
+            let value = ctx
+                .eval(Source::from_bytes(script.as_bytes()))
+                .expect("parses");
+            value.as_string().expect("a string").to_std_string_escaped()
+        };
+        assert_eq!(remote_gaps(&mut ctx, "h:cookie b:x fc:y"), "");
+
+        // What cannot be answered is named, not dropped: `app:` anywhere, and
+        // `h:`/`b:` where nobody will ask the proxy — the capture filters.
+        assert_eq!(remote_gaps(&mut ctx, "app:wechat"), "app");
         assert_eq!(
             unsupported(&mut ctx, "h:cookie b:x app:wechat fc:y"),
-            "h,b,app,fc"
+            "h,b,app"
         );
         assert_eq!(unsupported(&mut ctx, "m:POST"), "");
         // An unsupported condition does not also silently filter everything out:
