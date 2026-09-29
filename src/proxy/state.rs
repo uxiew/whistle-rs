@@ -221,6 +221,14 @@ impl AppState {
         }
     }
 
+    /// Wait until every completed session is on disk; see
+    /// [`persist::SessionStore::flush`]. Nothing to wait for without history.
+    pub async fn flush_history(&self) {
+        if let Some(store) = &self.session_store {
+            store.flush().await;
+        }
+    }
+
     /// Clear all in-memory sessions and WebSocket frames.
     ///
     /// Memory only: what persistence wrote to disk stays there and comes back

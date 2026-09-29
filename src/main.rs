@@ -575,9 +575,69 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(state);
 
-    // Keep the spawned Node plugin processes alive for the server's lifetime.
-    let _children = children;
-    proxy::run(state).await
+    // Asked to stop, finish writing history and take the Node plugins down
+    // before going. Without a handler the signal's default action ended the
+    // process on the spot: plugins stayed running on their ports unless the
+    // signal happened to reach them too (a terminal's Ctrl+C does, `kill` and
+    // a service manager's stop do not), and a session completed a moment
+    // before was not always on disk. Requests still in flight are not waited
+    // for: a long-lived stream would hold the exit open indefinitely.
+    let result = tokio::select! {
+        result = proxy::run(state.clone()) => result,
+        signal = shutdown_signal() => {
+            tracing::info!("{signal}: shutting down");
+            state.flush_history().await;
+            Ok(())
+        }
+    };
+    drop(children); // kill_on_drop
+    result
+}
+
+/// Resolves when this process is asked to stop, naming what asked.
+///
+/// SIGHUP is left alone on purpose: installing a handler for it would override
+/// the "ignore" that `nohup` sets, and a proxy started that way would then stop
+/// when its terminal closed.
+#[cfg(unix)]
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return "SIGINT";
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term.recv() => "SIGTERM",
+    }
+}
+
+/// Resolves when this process is asked to stop, naming what asked. Closing
+/// the console window gives a process a few seconds before Windows ends it,
+/// which is enough for this.
+#[cfg(windows)]
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::windows;
+    let (Ok(mut brk), Ok(mut close), Ok(mut shutdown)) = (
+        windows::ctrl_break(),
+        windows::ctrl_close(),
+        windows::ctrl_shutdown(),
+    ) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return "Ctrl+C";
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "Ctrl+C",
+        _ = brk.recv() => "Ctrl+Break",
+        _ = close.recv() => "console window closed",
+        _ = shutdown.recv() => "system shutting down",
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "Ctrl+C"
 }
 
 /// `whistle-rs explain` — see [`whistle_rs::explain`].

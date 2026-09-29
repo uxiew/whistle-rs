@@ -230,6 +230,8 @@ enum Msg {
     Save(Box<PersistedSession>),
     /// Delete every session file; answers with how many there were.
     Purge(tokio::sync::oneshot::Sender<usize>),
+    /// Answers once every save queued before it is on disk.
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Handles for the persist background task.
@@ -272,6 +274,20 @@ impl SessionStore {
             return 0;
         }
         rx.await.unwrap_or(0)
+    }
+
+    /// Wait until every session queued so far is written.
+    ///
+    /// For shutting down: a session is queued the moment it completes and
+    /// written a moment later by the writer task, and a process that exits in
+    /// between loses it — the last request before Ctrl+C was the one missing
+    /// from history. The channel is first in, first out, so the answer to this
+    /// message comes after every save sent before it.
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Msg::Flush(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 
     /// Load historical sessions from the most recent JSONL files in `dir`,
@@ -318,6 +334,13 @@ async fn writer_task(dir: PathBuf, retain_days: u32, mut rx: mpsc::UnboundedRece
     while let Some(msg) = rx.recv().await {
         let snap = match msg {
             Msg::Save(snap) => snap,
+            Msg::Flush(done) => {
+                if let Some(f) = &mut file {
+                    let _ = f.flush();
+                }
+                let _ = done.send(());
+                continue;
+            }
             Msg::Purge(done) => {
                 // Close today's file before deleting it, then start afresh.
                 if let Some(mut f) = file.take() {
@@ -635,5 +658,20 @@ mod tests {
         store.persist(&session.into_session());
         // A second purge reports the file the new session went to.
         assert_eq!(store.purge().await, 1);
+    }
+
+    /// What was queued before `flush` is in the file when it returns — what
+    /// shutting down waits for.
+    #[tokio::test]
+    async fn flush_returns_once_what_was_queued_is_written() {
+        let dir = scratch("flush");
+        let store = SessionStore::new(dir.clone(), 7);
+        let session: PersistedSession = serde_json::from_str(LINE).expect("line");
+        for _ in 0..3 {
+            store.persist(&session.clone().into_session());
+        }
+        store.flush().await;
+        let written = fs::read_to_string(jsonl_path(&dir, &today_tag())).expect("today's file");
+        assert_eq!(written.lines().count(), 3);
     }
 }
