@@ -545,10 +545,13 @@ async function finish(code) {
   // An interrupted run must not end on "all passed": the steps it never got
   // to are exactly the ones nobody knows about. It said so, once, after being
   // stopped two steps short.
+  // Nor may one that never started: "0 of 28 step(s) run, all passed" is what a
+  // stale binary used to end on, with exit status 2 underneath it.
   const verdict = interrupted
     ? `INTERRUPTED by ${interrupted}; not completed: ${steps.slice(results.length).map((s) => s.name).join(', ') || 'none'}`
       + (failed.length ? `; FAILED: ${failed.join(', ')}` : '')
-    : failed.length ? `FAILED: ${failed.join(', ')}` : 'all passed';
+    : code === 2 ? 'COULD NOT START (see setup: above)'
+      : failed.length ? `FAILED: ${failed.join(', ')}` : 'all passed';
   console.log(`\n${suite} against whistle ${WHISTLE_VERSION}: ${results.length} of ${steps.length} step(s) run, ${verdict}`);
   console.log(`archive: ${path.relative(process.cwd(), OUT) || OUT}${flag('--keep') ? `\nscratch kept: ${SCRATCH}` : ''}`);
   process.exit(code);
