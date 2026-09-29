@@ -816,6 +816,12 @@ fn sessions_json(state: &Arc<AppState>, query: Option<&str>) -> Response<DynBody
                 if s.error.is_open() {
                     row["open"] = serde_json::json!(true);
                 }
+                // Operators in `rules` that did not take effect. On the row
+                // because "which of these did my rule not touch" is a question
+                // about the list, and it sits beside `rules` there.
+                if !s.unapplied.is_empty() {
+                    row["unapplied"] = serde_json::json!(s.unapplied);
+                }
                 row
             })
             .collect()

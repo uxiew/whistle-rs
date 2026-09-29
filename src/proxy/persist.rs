@@ -58,6 +58,9 @@ pub struct PersistedSession {
     /// Sent from the Composer or Replay — see [`Session::composer`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub composer: bool,
+    /// Matched operators that did not take effect — see [`Session::unapplied`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unapplied: Vec<super::unapplied::Unapplied>,
 }
 
 /// A body preview as written to history: what the API showed for it, and the
@@ -156,6 +159,7 @@ impl PersistedSession {
             timings: s.timings.clone(),
             error: s.error.get(),
             composer: s.composer,
+            unapplied: s.unapplied.clone(),
         }
     }
 
@@ -184,6 +188,7 @@ impl PersistedSession {
                 .map(super::outcome::Outcome::failed)
                 .unwrap_or_default(),
             composer: self.composer,
+            unapplied: self.unapplied,
         }
     }
 }
@@ -444,6 +449,11 @@ mod tests {
                 "connecting to example.com:80: Connection refused",
             )),
             composer: true,
+            unapplied: vec![super::super::unapplied::Unapplied {
+                kind: super::super::unapplied::Kind::BodyOverLimit,
+                ops: vec!["resReplace://a=b".into()],
+                reason: "over the limit".into(),
+            }],
         };
         let json = serde_json::to_string(&ps).unwrap();
         let back: PersistedSession = serde_json::from_str(&json).unwrap();
@@ -462,6 +472,8 @@ mod tests {
         assert_eq!(failure.phase, super::super::outcome::Phase::Connect);
         // And so does where it was sent from, or `fc:` forgets it at a restart.
         assert!(session.composer);
+        // And what did not take effect, or a restart would make it look applied.
+        assert_eq!(session.unapplied[0].ops, ["resReplace://a=b"]);
     }
 
     /// A body as the console and the API show it, as `/body.bin` serves it and

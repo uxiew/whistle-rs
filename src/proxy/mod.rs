@@ -23,6 +23,9 @@ pub mod sni;
 pub mod socks;
 pub mod template;
 pub mod timing;
+pub mod unapplied;
+#[cfg(test)]
+mod unapplied_tests;
 pub mod upstream;
 pub mod webui;
 pub mod ws;
@@ -1260,6 +1263,11 @@ pub struct Session {
     /// that fails is marked as one too.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub composer: bool,
+    /// Operators in [`Session::rules`] that did not take effect, and why — see
+    /// [`unapplied`]. Filled by the [`Ledger`] from what `serve` noted on the
+    /// way, so a literal building a session leaves it empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unapplied: Vec<unapplied::Unapplied>,
 }
 
 /// Read a single header as an owned string, if present and valid UTF-8.
@@ -2470,6 +2478,7 @@ mod hide_tests {
             timings: None,
             error: Default::default(),
             composer: false,
+            unapplied: Vec::new(),
         };
         s.rules = rules
             .iter()
@@ -2850,9 +2859,18 @@ pub(crate) mod tunnel_abort_tests {
         rules: &str,
         plugins: crate::plugins::Plugins,
     ) -> Arc<AppState> {
+        state_with_config(rules, plugins, |_| {})
+    }
+
+    /// [`state_with_plugins`], with the config adjusted by `tweak` first.
+    pub(crate) fn state_with_config(
+        rules: &str,
+        plugins: crate::plugins::Plugins,
+        tweak: impl FnOnce(&mut crate::config::Config),
+    ) -> Arc<AppState> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let config = crate::config::Config {
+        let mut config = crate::config::Config {
             port: 0,
             host: Some("127.0.0.1".parse().unwrap()),
             storage_dir: std::env::temp_dir()
@@ -2860,6 +2878,7 @@ pub(crate) mod tunnel_abort_tests {
             persist_sessions: false,
             ..crate::config::Config::default()
         };
+        tweak(&mut config);
         let ca = CertAuthority::load_or_create(&config).expect("root CA");
         let mut mgr = RuleManager::new();
         mgr.set_text(rules);
@@ -2968,7 +2987,24 @@ pub(crate) mod tunnel_abort_tests {
         rules: &str,
         plugins: crate::plugins::Plugins,
     ) -> (Arc<AppState>, SocketAddr) {
-        let state = state_with_plugins(rules, plugins);
+        serve_state(state_with_plugins(rules, plugins)).await
+    }
+
+    /// [`proxy_with`], with the config adjusted by `tweak`.
+    pub(crate) async fn proxy_with_config(
+        rules: &str,
+        tweak: impl FnOnce(&mut crate::config::Config),
+    ) -> (Arc<AppState>, SocketAddr) {
+        serve_state(state_with_config(
+            rules,
+            crate::plugins::Plugins::new(),
+            tweak,
+        ))
+        .await
+    }
+
+    /// Serve `state` on an ephemeral port.
+    async fn serve_state(state: Arc<AppState>) -> (Arc<AppState>, SocketAddr) {
         let (listener, addr) = bind(&state).await.expect("bind");
         let serving = state.clone();
         tokio::spawn(async move {
@@ -4488,6 +4524,9 @@ pub(crate) struct Ledger {
     time_ms: u128,
     /// A session has been recorded; this request owes nothing more.
     settled: bool,
+    /// Matched operators that did not take effect, noted as `serve` found
+    /// out, for whichever session this request becomes — see [`unapplied`].
+    unapplied: Vec<unapplied::Unapplied>,
 }
 
 impl Ledger {
@@ -4498,7 +4537,19 @@ impl Ledger {
             started: Instant::now(),
             time_ms: now_ms(),
             settled: false,
+            unapplied: Vec::new(),
         }
+    }
+
+    /// Note that matched operators did not take effect. `None` notes nothing:
+    /// [`unapplied::Unapplied::over`] returns it when no rule was waiting.
+    fn unapplied(&mut self, note: Option<unapplied::Unapplied>) {
+        self.unapplied.extend(note);
+    }
+
+    /// Put what was noted on the session this request is recorded as.
+    fn stamp(&mut self, session: &mut Session) {
+        session.unapplied.append(&mut self.unapplied);
     }
 
     /// The request is one the console records: this much is known about it.
@@ -4517,8 +4568,9 @@ impl Ledger {
     }
 
     /// Record `session` as this request's one session.
-    fn record(&mut self, session: Session) -> u64 {
+    fn record(&mut self, mut session: Session) -> u64 {
         self.settled = true;
+        self.stamp(&mut session);
         self.state.record(session)
     }
 
@@ -4529,11 +4581,12 @@ impl Ledger {
     /// [`outcome::settle`].
     fn record_streaming(
         &mut self,
-        session: Session,
+        mut session: Session,
         body: DynBody,
         expected: Option<u64>,
     ) -> (u64, DynBody) {
         self.settled = true;
+        self.stamp(&mut session);
         let (id, open) = self.state.record_open(session);
         let Some(session) = open else {
             return (id, body);
@@ -4551,8 +4604,9 @@ impl Ledger {
 
     /// Record `session` as this request's one session, and say whether there is
     /// one to look up — see [`AppState::record_visible`].
-    fn record_visible(&mut self, session: Session) -> Option<u64> {
+    fn record_visible(&mut self, mut session: Session) -> Option<u64> {
         self.settled = true;
+        self.stamp(&mut session);
         self.state.record_visible(session)
     }
 
@@ -5182,6 +5236,7 @@ async fn serve(
                         .map(outcome::Outcome::failed)
                         .unwrap_or_default(),
                     composer: info.from.composer,
+                    unapplied: Vec::new(),
                 });
                 if let Some(failure) = &failure {
                     log_failure(id, &info.method, &info.full_url, failure);
@@ -5304,6 +5359,7 @@ async fn serve(
             // would not load answers 502 on purpose, as upstream's does.
             error: Default::default(),
             composer: info.from.composer,
+            unapplied: Vec::new(),
         });
         return Ok(resp);
     }
@@ -5854,6 +5910,22 @@ async fn serve(
                             info.full_url,
                             cap,
                         );
+                        // …and on the session, which is where someone looking
+                        // at a response their rule did not touch will look.
+                        let plugins = match plugin_wants_res_body {
+                            true => "; no plugin's responseBody hook saw it either",
+                            false => "",
+                        };
+                        ledger.unapplied(unapplied::Unapplied::over(
+                            &matched_ops(&resolved),
+                            unapplied::res_body_op,
+                            unapplied::Kind::BodyOverLimit,
+                            format!(
+                                "the response body is over {cap} bytes, the rewrite limit, \
+                                 so it was forwarded as it arrived{plugins}. \
+                                 --body-rewrite-limit raises it"
+                            ),
+                        ));
                         streamed = Some(body);
                     }
                 }
@@ -6023,6 +6095,7 @@ async fn serve(
         timings: Some(timings.clone()),
         error: Default::default(),
         composer: info.from.composer,
+        unapplied: Vec::new(),
     };
     // The row appears now, while the body is still arriving; the transaction
     // is complete — and can still fail — only when the body is over. A
