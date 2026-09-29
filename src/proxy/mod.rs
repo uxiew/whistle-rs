@@ -1238,6 +1238,13 @@ pub struct Session {
     /// origin answered `502`: that is the origin's answer, not a failure here.
     #[serde(skip_serializing_if = "outcome::Outcome::is_ok")]
     pub error: outcome::Outcome,
+    /// Sent by the console's Composer or Replay rather than by a client — what
+    /// the search box's `fc:` asks about, as upstream's `fc` flag does
+    /// (`_original/lib/inspectors/data.js:159`). Read off the marker those two
+    /// put on the request, and on the draft from then on, so a composition
+    /// that fails is marked as one too.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub composer: bool,
 }
 
 /// Read a single header as an owned string, if present and valid UTF-8.
@@ -2447,6 +2454,7 @@ mod hide_tests {
             res_body: None,
             timings: None,
             error: Default::default(),
+            composer: false,
         };
         s.rules = rules
             .iter()
@@ -4853,6 +4861,7 @@ async fn serve(
         url: info.full_url.clone(),
         client_ip: client_ip.clone(),
         req_headers: header_pairs(req.headers()),
+        composer: from_composer,
         ..Default::default()
     });
     let (started, time_ms) = (ledger.started, ledger.time_ms);
@@ -5147,6 +5156,7 @@ async fn serve(
                         .clone()
                         .map(outcome::Outcome::failed)
                         .unwrap_or_default(),
+                    composer: info.from.composer,
                 });
                 if let Some(failure) = &failure {
                     log_failure(id, &info.method, &info.full_url, failure);
@@ -5266,6 +5276,7 @@ async fn serve(
             // A rule's answer, whatever its status — a `file://` whose URL
             // would not load answers 502 on purpose, as upstream's does.
             error: Default::default(),
+            composer: info.from.composer,
         });
         return Ok(resp);
     }
@@ -5984,6 +5995,7 @@ async fn serve(
         res_body: res_body_cap,
         timings: Some(timings.clone()),
         error: Default::default(),
+        composer: info.from.composer,
     };
     // The row appears now, while the body is still arriving; the transaction
     // is complete — and can still fail — only when the body is over. A

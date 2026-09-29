@@ -55,6 +55,9 @@ pub struct PersistedSession {
     /// [`super::outcome`]. `default` so older files, which never had it, load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<super::outcome::Failure>,
+    /// Sent from the Composer or Replay — see [`Session::composer`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub composer: bool,
 }
 
 /// A body preview as written to history: what the API showed for it, and the
@@ -152,6 +155,7 @@ impl PersistedSession {
             res_body_preview: s.res_body.as_ref().map(BodySnapshot::of),
             timings: s.timings.clone(),
             error: s.error.get(),
+            composer: s.composer,
         }
     }
 
@@ -179,6 +183,7 @@ impl PersistedSession {
                 .error
                 .map(super::outcome::Outcome::failed)
                 .unwrap_or_default(),
+            composer: self.composer,
         }
     }
 }
@@ -438,6 +443,7 @@ mod tests {
                 super::super::outcome::Phase::Connect,
                 "connecting to example.com:80: Connection refused",
             )),
+            composer: true,
         };
         let json = serde_json::to_string(&ps).unwrap();
         let back: PersistedSession = serde_json::from_str(&json).unwrap();
@@ -454,6 +460,8 @@ mod tests {
         // an ordinary one would be the exact confusion the field exists to end.
         let failure = session.error.get().expect("the failure survives");
         assert_eq!(failure.phase, super::super::outcome::Phase::Connect);
+        // And so does where it was sent from, or `fc:` forgets it at a restart.
+        assert!(session.composer);
     }
 
     /// A body as the console and the API show it, as `/body.bin` serves it and

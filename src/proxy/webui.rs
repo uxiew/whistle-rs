@@ -785,6 +785,11 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
                 if let Some(failure) = s.error.get() {
                     row["error"] = serde_json::json!(failure);
                 }
+                // Sent from the Composer or Replay: what `fc:` asks about. Only
+                // on those rows, for the same reason.
+                if s.composer {
+                    row["composer"] = serde_json::json!(true);
+                }
                 row
             })
             .collect()
@@ -3057,6 +3062,46 @@ mod composer_tests {
             header(&headers, super::super::COMPOSER_REQ_HEADER),
             Some("1")
         );
+    }
+
+    /// A request the Composer or Replay sent is marked on its session and its
+    /// row — all `fc:` asks — including when it fails, which is when someone
+    /// goes looking for it. One a client sent is not marked.
+    #[tokio::test]
+    async fn a_composed_request_is_marked_on_its_session_and_row() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let (state, proxy) = crate::proxy::tunnel_abort_tests::proxy_with("").await;
+        for (path, marker) in [("/composed", "x-whistle-composer: 1\r\n"), ("/sent", "")] {
+            let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            let head = format!(
+                "GET http://{dead}{path} HTTP/1.1\r\nHost: {dead}\r\n{marker}Connection: close\r\n\r\n"
+            );
+            client.write_all(head.as_bytes()).await.unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.ok();
+        }
+        let sessions: Vec<Session> = state.sessions.lock().unwrap().iter().cloned().collect();
+        let marked: Vec<(bool, bool)> = sessions
+            .iter()
+            .map(|s| (s.url.ends_with("/composed"), s.composer))
+            .collect();
+        assert_eq!(marked, [(true, true), (false, false)], "{marked:?}");
+        assert!(sessions.iter().all(|s| !s.error.is_ok()), "both failed");
+
+        let rows = sessions_json(&state).into_body().collect().await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&rows.to_bytes()).unwrap();
+        let flag = |suffix: &str| {
+            rows.iter()
+                .find(|r| r["url"].as_str().unwrap().ends_with(suffix))
+                .map(|r| r.get("composer").cloned())
+                .expect("a row")
+        };
+        assert_eq!(flag("/composed"), Some(serde_json::json!(true)));
+        assert_eq!(flag("/sent"), None, "absent, not false, on a client's row");
     }
 
     /// Typing a bare host is how anyone reaches for a quick request, and whistle
