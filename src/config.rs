@@ -349,10 +349,6 @@ pub enum DnsOrder {
     Verbatim,
 }
 
-/// Upstream's composite modes, expanded before anything else looks at the list
-/// (`_original/lib/config.js:766-773`). `admin`'s expansion differs under
-/// `debug`, and this takes the non-debug one; the extra tokens it adds are all
-/// inert here, so the difference is not reachable.
 /// Whether a request may carry its **own rules**, in its own headers.
 ///
 /// whistle reads five headers off an arriving request and, when a mode says so,
@@ -417,6 +413,10 @@ impl HeaderRules {
     }
 }
 
+/// Upstream's composite modes, expanded before anything else looks at the list
+/// (`_original/lib/config.js:766-773`). `admin`'s expansion differs under
+/// `debug`, and this takes the non-debug one; the extra tokens it adds are all
+/// inert here, so the difference is not reachable.
 fn expand_mode(token: &str) -> Option<&'static [&'static str]> {
     match token {
         "multiple" => Some(&[
