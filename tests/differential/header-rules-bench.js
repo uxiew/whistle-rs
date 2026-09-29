@@ -40,6 +40,8 @@ const { spawn } = require('child_process');
 
 const BASE = Number(process.env.PORT_BASE || 20500);
 const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+/** The whistle this run measures — `WHISTLE_PKG`, or the baseline. */
+const WHISTLE = require('./whistle-pkg');
 // Set by `run.js`; see mode-bench.js.
 const STATE = process.env.DIFF_STATE || __dirname;
 const HOST = process.env.DIFF_HOST;
@@ -83,7 +85,7 @@ function start(which, mode) {
     const dir = path.join(STATE, `.hdr-${which}-${(mode || 'none').replace(/\W/g, '_')}`);
     const child = which === 'whistle'
       ? spawn('node', ['-e', `
-          const whistle = require('whistle');
+          const whistle = require(${JSON.stringify(WHISTLE.dir)});
           whistle({ port: ${W}, baseDir: ${JSON.stringify(dir)}${HOST ? `, host: ${JSON.stringify(HOST)}` : ''}${mode ? `, mode: ${JSON.stringify(mode)}` : ''} },
             () => console.log('READY'));
         `], { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] })

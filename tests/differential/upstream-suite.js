@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Upstream's own test suite — whistle v2.10.8's `test/` directory, 82 unit
-// files, 280 calls that assert something — run against whistle-rs.
+// Upstream's own test suite — the `test/` directory of the whistle release being
+// measured (82 unit files, 280 calls that assert something, in 2.10.8 and
+// 2.10.10 alike) — run against whistle-rs.
 //
 //   node upstream-suite.js                          # the gate: three runs, one verdict
 //   node upstream-suite.js --target rs --only file,reqHeaders --verbose
@@ -77,15 +78,32 @@ const os = require('os');
 const path = require('path');
 const { createRequire } = require('module');
 const { StringDecoder } = require('string_decoder');
+
+const WHISTLE = require('./whistle-pkg');
+const { forVersion } = WHISTLE;
 const { parse: parseUrl } = require('url');
 
 const HERE = __dirname;
 const REPO = path.resolve(HERE, '..', '..');
 const RS_BIN = process.env.RS_BIN || path.join(REPO, 'target', 'debug', 'whistle-rs');
 
-/** whistle v2.10.8, the version `package.json` installs; `git rev-parse v2.10.8`. */
 const UPSTREAM_REPO = 'https://github.com/avwo/whistle';
-const UPSTREAM_COMMIT = '1df0805f09fd979e0e31fd6eab99ca97239ac1ec';
+/**
+ * The commit each release was tagged at (`git rev-parse v2.10.8^{commit}`); the
+ * suite of that commit is run against that release. The two `test/` directories
+ * are byte-identical (`git diff --stat v2.10.8 v2.10.10 -- test` prints
+ * nothing), and each release still gets its own: one whose suite does move is
+ * then measured with the suite it shipped, not with its predecessor's.
+ */
+const SUITE_COMMITS = {
+  '2.10.8': '1df0805f09fd979e0e31fd6eab99ca97239ac1ec',
+  '2.10.10': 'a1e4751d157150e8fe9e6590f4b892a855664b7f',
+};
+const UPSTREAM_COMMIT = SUITE_COMMITS[WHISTLE.version];
+if (!UPSTREAM_COMMIT) {
+  console.error(`no suite commit is known for whistle ${WHISTLE.version}; add its tag's commit to SUITE_COMMITS`);
+  process.exit(2);
+}
 
 // ── arguments ─────────────────────────────────────────────────────────────
 
@@ -154,7 +172,7 @@ function suiteDir() {
  *   W/node_modules → ./node_modules    should, request, ws@1, sockx…
  */
 function workDir(src) {
-  const whistle = path.dirname(require.resolve('whistle/package.json'));
+  const whistle = WHISTLE.dir;
   const w = fs.mkdtempSync(path.join(process.env.DIFF_STATE || os.tmpdir(), 'whistle-upstream-suite-'));
   // Not a `node_modules` or `.whistle` an existing checkout may carry: the
   // dependencies are ours, and `.whistle` is state from someone's last run.
@@ -811,7 +829,7 @@ function report(W) {
   console.log(`\n${TARGET}: ${passed}/${checked} checked calls passed, ${failed} failed, ${timedOut} without an answer; ${sent} sent without a check`);
   if (JSON_OUT) {
     fs.writeFileSync(JSON_OUT, JSON.stringify({
-      target: TARGET, commit: UPSTREAM_COMMIT,
+      target: TARGET, whistle: WHISTLE.version, commit: UPSTREAM_COMMIT,
       units: units.map((u) => ({
         name: u.name, skipped: u.skipped, ms: u.ms, errors: u.errors,
         calls: u.calls.map(({ desc, kind, state, error, at, late, answeredBy, transport, status, body }) =>
@@ -832,7 +850,7 @@ function report(W) {
  * need the feature. Every one must still fail (or, made from a failed call's
  * callback, still not be made), or the declaration is stale.
  */
-const DECLARED = [
+const DECLARED = forVersion([
   {
     why: 'rules set through upstream\'s embedding API — `rulesUtil.setMockRules`, '
       + '`setServiceRules`, `setShadowRules` (index.test.js:206-208) — which has no '
@@ -874,7 +892,7 @@ const DECLARED = [
       'statusCode GET https://statuscode5.test.whistlejs.com/index.html?resBody= #1',
     ],
   },
-];
+]);
 
 /** One call per key: unit, description, and which occurrence of it. */
 function indexCalls(result) {
@@ -934,10 +952,12 @@ async function gate() {
   }
 
   const [noNetwork, network, rs] = runs.filter((r) => !r.control).map((r) => indexCalls(r.result));
-  const verdict = { commit: UPSTREAM_COMMIT, judged: 0, passed: 0, notRun: 0, declared: [], failed: [], stale: [] };
+  const verdict = { whistle: WHISTLE.version, commit: UPSTREAM_COMMIT, judged: 0, passed: 0, notRun: 0, declared: [], failed: [], stale: [], judgedKeys: [] };
   for (const [key, control] of noNetwork) {
     if (control.state !== 'pass' || network.get(key)?.state !== 'pass') continue;
     verdict.judged++;
+    // By key, so two versions' runs can be compared call by call (`matrix.js`).
+    verdict.judgedKeys.push(key);
     const got = rs.get(key) || { state: 'never made' };
     if (got.skipped) {
       verdict.notRun++;

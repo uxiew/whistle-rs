@@ -14,6 +14,7 @@ const http = require('http');
 const path = require('path');
 const zlib = require('zlib');
 const { judge, fieldOf } = require('./declared.js');
+const { forVersion } = require('./whistle-pkg');
 
 // Ports and corpus come from the environment so several benches can run at
 // once — one per area under audit — without colliding on a port or on a file.
@@ -73,7 +74,10 @@ const IGNORE = new Map([
  *   * its scope  — `cases` (a RegExp over the case name) and/or `rules` (over
  *                  the case's rules text), or `anyCase`, a sentence saying why
  *                  it is safe to apply to every case;
- *   * `upstream` — the whistle version the divergence was measured against;
+ *   * `upstream` — the whistle version the divergence was measured against,
+ *                  or a list of them; `'any'` when it is about this port
+ *                  alone. Only entries for the version being asked are in
+ *                  force (`whistle-pkg.js`);
  *   * `why`.
  *
  * `match` then checks the *shape* of the difference — which side said what.
@@ -350,10 +354,13 @@ for (const e of EXPECTED) {
   }
 }
 
+/** The entries measured against the whistle this run is asking (`whistle-pkg.js`). */
+const EXPECTED_IN_FORCE = forVersion(EXPECTED);
+
 /** The `EXPECTED` entry that excuses this difference in this case, if any. */
 function expectedFor(problem, c) {
   const field = fieldOf(problem);
-  return EXPECTED.find((e) => e.fields.test(field)
+  return EXPECTED_IN_FORCE.find((e) => e.fields.test(field)
     && (!e.cases || e.cases.test(c.name))
     && (!e.rules || e.rules.test(allRules(c)))
     && e.match(problem, c));
@@ -866,6 +873,12 @@ async function main() {
   const inert = [];
   /** How many differences each `EXPECTED` entry excused, by id. */
   const expected = {};
+  /**
+   * Every difference, before anything excuses it — what `matrix.js` compares
+   * between two whistle versions. Declared or not is a verdict about this port;
+   * this is the measurement the verdict was made on.
+   */
+  const raw = [];
 
   // Upstream selects **one** rule file at a time unless `allowMultipleChoice`
   // is on: `selectRulesFile` starts from an empty list when it is off
@@ -891,6 +904,7 @@ async function main() {
     ran++;
 
     const problems = problemsBetween(w, rs);
+    if (problems.length) raw.push({ name: c.name, problems });
 
     // Did the case's own rules change anything this bench can see? Asked of
     // the raw differences, not the filtered ones: `EXPECTED` excuses places
@@ -922,6 +936,7 @@ async function main() {
     expected,
     inert: inert.length,
     inertCases: inert,
+    raw,
   }, null, 2));
   // A difference nothing explains fails the run, and so does a declaration
   // that no longer describes anything: left in place, it would go on excusing

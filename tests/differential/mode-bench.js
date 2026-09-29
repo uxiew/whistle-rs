@@ -34,6 +34,9 @@ const { spawn } = require('child_process');
 const BASE = Number(process.env.PORT_BASE || 20100);
 /** The binary under test; built by `cargo build` from the repo root. */
 const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+/** The whistle this run measures — `WHISTLE_PKG`, or the baseline. */
+const WHISTLE = require('./whistle-pkg');
+const { forVersion } = WHISTLE;
 // `run.js` sets both: a scratch directory for every proxy's state, and a
 // loopback listener. Unset, the state lands beside this file and the proxies
 // listen on every interface, as they always did.
@@ -177,7 +180,7 @@ function start(which, mode, port) {
     const wMode = mode ? `capture|${mode}` : 'capture';
     const child = which === 'whistle'
       ? spawn('node', ['-e', `
-          const whistle = require('whistle');
+          const whistle = require(${JSON.stringify(WHISTLE.dir)});
           whistle({ port: ${port}, baseDir: ${JSON.stringify(dir)},${HOST ? ` host: ${JSON.stringify(HOST)},` : ''}
             mode: ${JSON.stringify(wMode)} }, () => console.log('READY'));
         `], { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -234,7 +237,7 @@ async function main() {
   //
   // The baseline row is compared too: a mode bench whose no-mode row diverged
   // would be measuring the launch rather than the mode.
-  const DECLARED = [
+  const DECLARED = forVersion([
     // `multiEnv` / `nohost` / `enableRequestHeaderRules` / `multiple` and
     // `notAllowedEnableHTTPS` used to be declared here. They are implemented —
     // see `header-rules-bench.js`, which measures the five headers probe by
@@ -246,7 +249,7 @@ async function main() {
     // `x-forwarded-proto` / `x-forwarded-host` were declared here. They are
     // implemented — see `forwarded-bench.js`, which sends the headers this
     // battery does not and compares where the request ended up.
-  ];
+  ]);
 
   /**
    * How each probe is compared, and why it is not one rule for all of them.

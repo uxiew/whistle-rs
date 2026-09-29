@@ -15,6 +15,9 @@
 //   --out DIR         where the archive goes (default target/differential/<stamp>-<suite>)
 //   --keep            keep the scratch directory (proxy state, CAs) for debugging
 //   --allow-stale     run even if the whistle-rs binary is older than its source
+//   --whistle V       measure against whistle V instead of the baseline in
+//                     package.json; V needs a lockfile of its own under
+//                     versions/V (see the README, "Which whistle, though")
 //
 // Exit status: 0 every step passed; 1 a step failed; 2 it could not start —
 // a port was taken, the binary is missing or stale, `npm ci` was not run.
@@ -55,10 +58,24 @@ const option = (name) => {
 };
 const suite = argv.find((a) => ['fast', 'network', 'all'].includes(a));
 if (!suite) {
-  console.error('usage: node run.js fast|network|all [--only a,b] [--list] [--port-base N] [--out DIR] [--keep]');
+  console.error('usage: node run.js fast|network|all [--only a,b] [--list] [--port-base N] [--out DIR] [--keep] [--whistle V]');
   process.exit(2);
 }
 const PB = Number(option('--port-base') || process.env.PORT_BASE || 18700);
+
+// Which whistle. The baseline is the one package.json locks, installed beside
+// this file; any other version has a directory of its own under versions/, with
+// its own lockfile, so measuring a second release never disturbs the first.
+const BASELINE = require('./package.json').dependencies.whistle;
+const WHISTLE_VERSION = option('--whistle') || BASELINE;
+const WHISTLE_HOME = WHISTLE_VERSION === BASELINE ? HERE : path.join(HERE, 'versions', WHISTLE_VERSION);
+if (!fs.existsSync(path.join(WHISTLE_HOME, 'package-lock.json'))) {
+  const known = fs.existsSync(path.join(HERE, 'versions')) ? fs.readdirSync(path.join(HERE, 'versions')) : [];
+  console.error(`no lockfile for whistle ${WHISTLE_VERSION}: expected versions/${WHISTLE_VERSION}/package-lock.json`
+    + ` (have: ${[BASELINE, ...known].join(', ')})`);
+  process.exit(2);
+}
+const WHISTLE_PKG = path.join(WHISTLE_HOME, 'node_modules', 'whistle');
 const only = option('--only') ? new Set(option('--only').split(',')) : null;
 
 // ── the steps ─────────────────────────────────────────────────────────────
@@ -125,6 +142,8 @@ const NETWORK = [
     args: ['upstream-suite.js'],
     ports: [6666, 18080, 18081, 5566, 1080, 1118, 7788, 2080, 2081, 19999, 37621],
     timeout: 20 * MINUTE,
+    // Its verdict with every judged call's key, for comparing versions call by call.
+    json: true,
   },
 ];
 
@@ -259,7 +278,8 @@ class SetupError extends Error {}
 
 const started = new Date();
 const stamp = started.toISOString().replace(/[:.]/g, '-');
-const OUT = path.resolve(option('--out') || path.join(REPO, 'target', 'differential', `${stamp}-${suite}`));
+const versionTag = WHISTLE_VERSION === BASELINE ? '' : `-whistle-${WHISTLE_VERSION}`;
+const OUT = path.resolve(option('--out') || path.join(REPO, 'target', 'differential', `${stamp}-${suite}${versionTag}`));
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'whistle-rs-diff-'));
 const dirs = {
   state: path.join(SCRATCH, 'state'),
@@ -276,6 +296,9 @@ for (const d of [OUT, path.join(OUT, 'steps'), path.join(OUT, 'logs'), ...Object
 const baseEnv = {
   PORT_BASE: String(PB),
   RS_BIN,
+  // Read by whistle-pkg.js in every script: which whistle to load, and so which
+  // declarations are in force.
+  WHISTLE_PKG,
   DIFF_STATE: dirs.state,
   DIFF_HOST: HOST,
   TMPDIR: dirs.tmp,
@@ -340,7 +363,9 @@ async function runStep(step) {
   const outFile = path.join(OUT, 'steps', `${step.name}.out`);
   const errFile = path.join(OUT, 'steps', `${step.name}.err`);
   if (step.ports) await requireFree(step.ports, `step ${step.name}`);
-  const child = startGroup(step.name, process.execPath, step.args.map((a, i) => (i === 0 ? path.join(HERE, a) : a)), {
+  const args = step.args.map((a, i) => (i === 0 ? path.join(HERE, a) : a));
+  if (step.json) args.push('--json', path.join(OUT, 'steps', `${step.name}.json`));
+  const child = startGroup(step.name, process.execPath, args, {
     cwd: step.cwd ? dirs[step.cwd] : HERE,
     env: { ...baseEnv, ...(step.env || {}) },
     out: fs.openSync(outFile, 'w'),
@@ -423,15 +448,21 @@ function preflight() {
   if (!flag('--allow-stale') && !process.env.RS_BIN && src.mtime > fs.statSync(RS_BIN).mtimeMs) {
     throw new SetupError(`${path.relative(REPO, RS_BIN)} is older than ${src.file}: it would measure code that is not in the tree.\nRun cargo build --locked (or pass --allow-stale).`);
   }
-  const lock = path.join(HERE, 'package-lock.json');
-  const installed = path.join(HERE, 'node_modules', 'whistle', 'package.json');
+  const lock = path.join(WHISTLE_HOME, 'package-lock.json');
+  const installed = path.join(WHISTLE_PKG, 'package.json');
+  const where = path.relative(REPO, WHISTLE_HOME);
   if (!fs.existsSync(installed)) {
-    throw new SetupError('whistle is not installed here. Run: npm ci (in tests/differential)');
+    throw new SetupError(`whistle ${WHISTLE_VERSION} is not installed. Run: npm ci (in ${where})`);
   }
   const locked = JSON.parse(fs.readFileSync(lock, 'utf8')).packages['node_modules/whistle'].version;
   const actual = JSON.parse(fs.readFileSync(installed, 'utf8')).version;
-  if (locked !== actual) {
-    throw new SetupError(`node_modules has whistle ${actual}, the lockfile says ${locked}. Run: npm ci`);
+  if (locked !== actual || actual !== WHISTLE_VERSION) {
+    throw new SetupError(`${where}/node_modules has whistle ${actual}, the lockfile says ${locked}. Run: npm ci (in ${where})`);
+  }
+  // The baseline's node_modules also holds what the benches themselves use
+  // (upstream's test libraries, qrcode), whichever whistle is measured.
+  if (WHISTLE_HOME !== HERE && !fs.existsSync(path.join(HERE, 'node_modules', 'should'))) {
+    throw new SetupError('the bench\'s own dependencies are not installed. Run: npm ci (in tests/differential)');
   }
 }
 
@@ -459,10 +490,12 @@ function manifest(exitCode) {
       sha256: fs.existsSync(RS_BIN) ? sha256(RS_BIN) : null,
     },
     whistle: {
-      version: fs.existsSync(path.join(HERE, 'node_modules', 'whistle', 'package.json'))
-        ? require(path.join(HERE, 'node_modules', 'whistle', 'package.json')).version
+      version: fs.existsSync(path.join(WHISTLE_PKG, 'package.json'))
+        ? JSON.parse(fs.readFileSync(path.join(WHISTLE_PKG, 'package.json'), 'utf8')).version
         : null,
-      lockfileSha256: sha256(path.join(HERE, 'package-lock.json')),
+      baseline: WHISTLE_VERSION === BASELINE,
+      lockfile: path.relative(REPO, path.join(WHISTLE_HOME, 'package-lock.json')),
+      lockfileSha256: sha256(path.join(WHISTLE_HOME, 'package-lock.json')),
     },
     portBase: PB,
     listen: HOST,
@@ -516,7 +549,7 @@ async function finish(code) {
     ? `INTERRUPTED by ${interrupted}; not completed: ${steps.slice(results.length).map((s) => s.name).join(', ') || 'none'}`
       + (failed.length ? `; FAILED: ${failed.join(', ')}` : '')
     : failed.length ? `FAILED: ${failed.join(', ')}` : 'all passed';
-  console.log(`\n${suite}: ${results.length} of ${steps.length} step(s) run, ${verdict}`);
+  console.log(`\n${suite} against whistle ${WHISTLE_VERSION}: ${results.length} of ${steps.length} step(s) run, ${verdict}`);
   console.log(`archive: ${path.relative(process.cwd(), OUT) || OUT}${flag('--keep') ? `\nscratch kept: ${SCRATCH}` : ''}`);
   process.exit(code);
 }

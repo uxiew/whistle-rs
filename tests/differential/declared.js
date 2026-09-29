@@ -20,7 +20,9 @@
 //   case:     the case's `name`, exactly
 //   fields:   the differing fields — the text before `: whistle=` in the
 //             bench's report, e.g. `status`, `res.body`, `req.header.x-a`
-//   upstream: the whistle version the difference was measured against
+//   upstream: the whistle version the difference was measured against, or a
+//             list of them; an entry is in force only in a run against one of
+//             them (`whistle-pkg.js`, `forVersion`)
 //   why:      the reason, or where the reason is written down
 
 /** The field a reported problem is about: `req.header.x-a: whistle=…` → `req.header.x-a`. */
@@ -28,6 +30,8 @@ function fieldOf(problem) {
   const m = /^(.*?): whistle=/.exec(problem);
   return m ? m[1] : problem.split(': ')[0];
 }
+
+const { forVersion } = require('./whistle-pkg');
 
 const UPSTREAM = '2.10.8';
 
@@ -202,7 +206,8 @@ const DECLARED = {
  * — renamed or deleted — is reported as stale rather than silently ignored.
  */
 function judge(bench, report, ran) {
-  const entries = (DECLARED[bench] || []).map((e) => ({ ...e, used: false }));
+  // Only the entries measured against the whistle this run is asking.
+  const entries = forVersion(DECLARED[bench] || []).map((e) => ({ ...e, used: false }));
   const news = [];
   let declared = 0;
   for (const item of report) {

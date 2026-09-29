@@ -17,6 +17,7 @@ const tls = require('tls');
 const http2 = require('http2');
 const fs = require('fs');
 const { execSync } = require('child_process');
+const { forVersion } = require('./whistle-pkg');
 
 const BASE = Number(process.env.PORT_BASE || 19600);
 const [W, RS, ORIGIN] = [BASE, BASE + 1, BASE + 2];
@@ -281,10 +282,12 @@ const norm = (h) => Object.fromEntries(
  *    Narrow on purpose — it excuses a difference only where whistle sat on the
  *    default. Two proxies that both pin, and pin differently, is news.
  */
-const EXPECTED = (p) =>
-  /req\.header\.(pragma|cache-control): whistle=undefined rs="no-cache"/.test(p)
-  || /req\.tls: whistle="TLSv1\.3" rs="TLSv1\.2"/.test(p)
-  || /req\.suite: whistle="TLS_AES_256_GCM_SHA384" rs="[\w-]+"/.test(p);
+const EXPECTED = forVersion([
+  { match: (p) => /req\.header\.(pragma|cache-control): whistle=undefined rs="no-cache"/.test(p) },
+  { match: (p) => /req\.tls: whistle="TLSv1\.3" rs="TLSv1\.2"/.test(p) },
+  { match: (p) => /req\.suite: whistle="TLS_AES_256_GCM_SHA384" rs="[\w-]+"/.test(p) },
+]);
+const excused = (p) => EXPECTED.some((e) => e.match(p));
 
 const show = (v) => JSON.stringify(v);
 
@@ -448,6 +451,8 @@ async function main() {
 
   let ran = 0, differing = 0;
   const report = [];
+  // Every difference before `EXPECTED` excuses any, for `matrix.js`.
+  const raw = [];
   for (const c of CASES) {
     await setRules(c.rules);
     const [w, rs] = [
@@ -455,7 +460,9 @@ async function main() {
       await throughTunnel(RS, rsCa, c.request),
     ];
     ran++;
-    const problems = compare(w, rs).filter((p) => !EXPECTED(p));
+    const all = compare(w, rs);
+    if (all.length) raw.push({ name: c.name, problems: all });
+    const problems = all.filter((p) => !excused(p));
     if (problems.length) { differing++; report.push({ name: c.name, rules: c.rules, problems }); }
   }
 
@@ -672,7 +679,7 @@ async function main() {
   }
 
   origin.close();
-  console.log(JSON.stringify({ ran, differing, report }, null, 2));
+  console.log(JSON.stringify({ ran, differing, report, raw }, null, 2));
   process.exitCode = differing ? 1 : 0;
 }
 

@@ -44,6 +44,9 @@ const { spawn } = require('child_process');
 
 const BASE = Number(process.env.PORT_BASE || 20900);
 const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+/** The whistle this run measures — `WHISTLE_PKG`, or the baseline. */
+const WHISTLE = require('./whistle-pkg');
+const { forVersion } = WHISTLE;
 // Set by `run.js`; see mode-bench.js.
 const STATE = process.env.DIFF_STATE || __dirname;
 const HOST = process.env.DIFF_HOST;
@@ -104,7 +107,7 @@ function start(which, mode) {
     const dir = path.join(STATE, `.fwd-${which}-${(mode || 'none').replace(/\W/g, '_')}`);
     const child = which === 'whistle'
       ? spawn('node', ['-e', `
-          const whistle = require('whistle');
+          const whistle = require(${JSON.stringify(WHISTLE.dir)});
           whistle({ port: ${W}, baseDir: ${JSON.stringify(dir)}${HOST ? `, host: ${JSON.stringify(HOST)}` : ''}${mode ? `, mode: ${JSON.stringify(mode)}` : ''} },
             () => console.log('READY'));
         `], { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -194,7 +197,7 @@ const WHY = 'a request opening its own gate. Upstream reads `x-whistle-real-host
 const hasHost = (mode) => /x-forwarded-host/.test(mode);
 const hasProto = (mode) => /x-forwarded-proto/.test(mode);
 
-const DECLARED = [
+const DECLARED = forVersion([
   // The whistle spelling of the host claim: honoured here **only** once the
   // host gate is open, and honoured upstream always.
   { probes: ['x-whistle-real-host names B', 'both host spellings disagree'],
@@ -207,7 +210,7 @@ const DECLARED = [
   // (`-M keepXFF` is measured by `mode-bench.js`, which is where that gate
   // lives.)
   { probes: ['props names all three'], modes: () => true, why: WHY },
-];
+]);
 
 async function answersFor(which, mode) {
   let child;

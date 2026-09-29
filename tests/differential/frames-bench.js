@@ -42,6 +42,7 @@
 'use strict';
 
 const http = require('http');
+const { judge } = require('./declared.js');
 
 const BASE = Number(process.env.PORT_BASE || 19300);
 const [W, RS, ORIGIN] = [BASE, BASE + 1, BASE + 2];
@@ -240,13 +241,19 @@ async function main() {
     }
     ran++;
     if (JSON.stringify(w) !== JSON.stringify(rs)) {
-      differing++;
-      report.push({ name: c.name, rules: c.rules, whistle: w, rs });
+      report.push({ name: c.name, rules: c.rules, problems: [`frames: whistle=${JSON.stringify(w)} rs=${JSON.stringify(rs)}`] });
     }
   }
   origin.close();
-  console.log(JSON.stringify({ ran, differing, report }, null, 2));
-  process.exitCode = differing ? 1 : 0;
+  // A difference `declared.js` names for this whistle is excused; anything
+  // else, or a declaration that no longer happens, fails the run.
+  const verdict = judge('frames-bench.js', report, CASES.map((c) => c.name));
+  differing = verdict.news.length;
+  console.log(JSON.stringify({
+    ran, differing, declared: verdict.declared, stale: verdict.stale, report: verdict.news,
+    raw: report.map(({ name, problems }) => ({ name, problems })),
+  }, null, 2));
+  process.exitCode = differing || verdict.stale.length ? 1 : 0;
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

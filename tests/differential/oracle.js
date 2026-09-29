@@ -4,25 +4,18 @@
 // whistle takes a few seconds to come up and there is no reason to pay it
 // twice.
 //
-// `WHISTLE_PKG` names the package to load, so a second version can be pointed
-// at from a directory of its own without disturbing the one `npm install` put
-// here. It is how `bench-versions.js` asks whether an alignment was with
-// whistle or only with 2.10.8.
-const whistle = require(process.env.WHISTLE_PKG || 'whistle');
+// Which whistle comes from `whistle-pkg.js`: `WHISTLE_PKG`, or the baseline
+// `npm ci` put here. `run.js --whistle 2.10.10` is how a second version runs.
+const WHISTLE = require('./whistle-pkg');
+const whistle = require(WHISTLE.dir);
 const path = require('path');
 
 // The storage directory is keyed on the **version** as well as the port. Two
 // releases sharing one directory would each read the other's state, and the
 // answer to "did this behaviour change between versions" would be partly an
-// answer about a data file written by the other one.
-const tag = (() => {
-  if (!process.env.WHISTLE_PKG) return '';
-  try {
-    return '-' + require(`${process.env.WHISTLE_PKG}/package.json`).version;
-  } catch (e) {
-    return '-alt';
-  }
-})();
+// answer about a data file written by the other one. (`run.js` gives every run
+// a scratch directory anyway; this is for an oracle started by hand.)
+const tag = WHISTLE.version === WHISTLE.BASELINE ? '' : `-${WHISTLE.version}`;
 
 // A console login, for `auth-bench.js` and for nothing else: every other bench
 // installs its rules through the same console, and would be locked out. Named
@@ -50,5 +43,5 @@ whistle(
     ...host,
     ...auth,
   },
-  () => console.log('whistle listening on', process.env.PORT_BASE || 18700),
+  () => console.log(`whistle ${WHISTLE.version} listening on`, process.env.PORT_BASE || 18700),
 );

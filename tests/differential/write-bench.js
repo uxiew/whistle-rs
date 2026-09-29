@@ -312,6 +312,8 @@ async function main() {
   differing = verdict.news.length;
   console.log(JSON.stringify({
     ran, differing, declared: verdict.declared, stale: verdict.stale, wroteNothing, report: verdict.news,
+    // Every difference before `declared.js` excuses any, for `matrix.js`.
+    raw: report.map(({ name, problems }) => ({ name, problems })),
   }, null, 2));
   process.exitCode = differing || verdict.stale.length ? 1 : 0;
 }

@@ -26,6 +26,7 @@
 //     19800 whistle · 19801 whistle-rs · 19802 the echo origin
 
 const http = require('http');
+const { forVersion } = require('./whistle-pkg');
 
 const BASE = Number(process.env.PORT_BASE || 19800);
 const [W, RS, ORIGIN] = [BASE, BASE + 1, BASE + 2];
@@ -44,7 +45,7 @@ const GUEST_B64 = b64(`${GUEST}:${GUEST_PASS}`);
  * left out of the corpus: a case that is not written proves nothing, and one
  * that is written and excused says what this port decided and why.
  */
-const EXPECTED = [
+const EXPECTED = forVersion([
   {
     match: (name) => /^static suffix/.test(name),
     why: "upstream exempts every path ending .ico/.js/.css/.png from the login "
@@ -52,7 +53,7 @@ const EXPECTED = [
       + 'its own assets. This console is one self-contained page with no assets to '
       + 'fetch, so the exemption would only be a hole.',
   },
-];
+]);
 
 /** One request, reduced to the three things the front door decides. */
 function probe(port, { method = 'GET', path = '/no-such-route', headers = {} }) {

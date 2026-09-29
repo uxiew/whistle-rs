@@ -51,18 +51,14 @@ const path = require('path');
 const Module = require('module');
 const { execFileSync } = require('child_process');
 
-// The real path, not the spelled one: `loadUpstreamRules` plants a stub in
-// `require.cache`, and Node keys that cache by real path. Through a symlinked
-// `node_modules` (mutations.js's scratch worktree) the stub landed under a key
-// nothing looked up, upstream's circular require ran for real, and every run
-// died on "Rules is not a constructor".
-const WHISTLE_RULES = require('fs').realpathSync(path.join(
-  __dirname,
-  'node_modules',
-  'whistle',
-  'lib',
-  'rules'
-));
+// The real path, not the spelled one (`whistle-pkg.js` resolves it):
+// `loadUpstreamRules` plants a stub in `require.cache`, and Node keys that cache
+// by real path. Through a symlinked `node_modules` (mutations.js's scratch
+// worktree) the stub landed under a key nothing looked up, upstream's circular
+// require ran for real, and every run died on "Rules is not a constructor".
+const WHISTLE = require('./whistle-pkg');
+const { forVersion } = WHISTLE;
+const WHISTLE_RULES = path.join(WHISTLE.dir, 'lib', 'rules');
 // `RS_BIN` as in the benches that start a proxy, so every tool here can be
 // pointed at the same binary — a release build, or one under test elsewhere.
 const BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
@@ -970,7 +966,7 @@ function main() {
 // Divergences this port has **declared**, each with the reason and each scoped
 // so it cannot excuse anything else. The same discipline `harness.js` keeps:
 // a matcher wide enough to swallow a real difference is worse than no matcher.
-const DECLARED = [
+const DECLARED = forVersion([
   {
     // `host:` / `host=` is a *filter condition*, and upstream answers it from
     // the address it will dial rather than from the request's host — so it says
@@ -1011,7 +1007,7 @@ const DECLARED = [
       /\b(ignore|skip):\/\//.test(query.rules),
     why: 'an ignored proxy takes the PAC fallback with it, one step earlier',
   },
-];
+]);
 
 // The one **declared** divergence this bench meets: a domain pattern is matched
 // against the request's host with the case folded here, and as written
