@@ -261,6 +261,20 @@ async fn relay_decision(
     info: &crate::rules::ReqInfo,
     resolved: &crate::rules::Resolved,
 ) -> Decision {
+    match relay_target(state, info, resolved).await {
+        Ok(target) => Decision::Bypass(Box::new(target)),
+        Err(why) => Decision::Unroutable(why),
+    }
+}
+
+/// [`relay_decision`]'s answer as the target itself, or why there is none —
+/// for the CONNECT handler, which relays before it has a ClientHello to decide
+/// anything else about (see `super::tunnel::relay_before_reply`).
+pub(super) async fn relay_target(
+    state: &Arc<AppState>,
+    info: &crate::rules::ReqInfo,
+    resolved: &crate::rules::Resolved,
+) -> std::result::Result<upstream::Target, String> {
     let dest = super::dest::Destination::of(info, resolved);
     // No values pass here, because the connection's own resolution had none:
     // `decide` matches against the live rule set and nothing else.
@@ -269,10 +283,9 @@ async fn relay_decision(
         super::apply::reresolve_forwarding(resolved, &dest.moved_req_info(info), &rules, &[], false)
     });
     let forwarding = forwarding.as_ref().unwrap_or(resolved);
-    match super::apply::resolve_target(info, &dest, forwarding).await {
-        Ok(target) => Decision::Bypass(Box::new(target)),
-        Err(err) => Decision::Unroutable(format!("{err:#}")),
-    }
+    super::apply::resolve_target(info, &dest, forwarding)
+        .await
+        .map_err(|err| format!("{err:#}"))
 }
 
 /// Consult the `sniCallback://` rules for this connection.
@@ -286,7 +299,7 @@ async fn relay_decision(
 ///
 /// Read straight off `disable`, without the `enable://` cancellation, as
 /// upstream reads it. The three spellings are one question there and one here.
-fn no_intercept(resolved: &crate::rules::Resolved) -> bool {
+pub(super) fn no_intercept(resolved: &crate::rules::Resolved) -> bool {
     let disabled = crate::proxy::apply::disabled_flags(resolved);
     ["intercept", "https", "capture"]
         .iter()

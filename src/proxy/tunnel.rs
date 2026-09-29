@@ -12,7 +12,7 @@ pub(super) async fn top_level(
     peer: SocketAddr,
 ) -> Result<Response<DynBody>, Destroyed> {
     if req.method() == hyper::Method::CONNECT {
-        return handle_connect(state, req, peer);
+        return handle_connect(state, req, peer).await;
     }
     // Absolute-form URI => proxied request. Origin-form => a direct hit on us.
     if req.uri().authority().is_some() {
@@ -101,8 +101,9 @@ pub(super) fn bypass_console(req: &Request<Incoming>) -> Option<hyper::Uri> {
     format!("http://{host}/{rest}").parse().ok()
 }
 
-/// Handle a CONNECT: acknowledge, then intercept the tunnel with MITM.
-pub(super) fn handle_connect(
+/// Handle a CONNECT: refuse it, relay it once the far end has answered, or
+/// acknowledge it and decide at the ClientHello whether to intercept.
+pub(super) async fn handle_connect(
     state: Arc<AppState>,
     req: Request<Incoming>,
     peer: SocketAddr,
@@ -120,6 +121,10 @@ pub(super) fn handle_connect(
         return Err(Destroyed);
     }
 
+    if let Some(resolution) = relayed_unread(&state, &host, port, peer) {
+        return relay_before_reply(state, req, &host, port, peer, resolution).await;
+    }
+
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
@@ -134,10 +139,117 @@ pub(super) fn handle_connect(
         }
     });
 
-    Ok(Response::builder()
+    Ok(connect_established())
+}
+
+fn connect_established() -> Response<DynBody> {
+    Response::builder()
         .status(StatusCode::OK)
         .body(body::empty())
-        .unwrap())
+        .unwrap()
+}
+
+/// Is this tunnel already decided against reading, on the CONNECT alone — and
+/// if so, the connection's rules, resolved once, to route it by.
+///
+/// Two things decide it that early, and both are answers `sni::decide` would
+/// reach after the ClientHello anyway: interception switched off for every
+/// connection (`--no-intercept-https`, and the modes that lock capture off),
+/// and `disable://intercept` (or `https`, `capture`) on the address the client
+/// asked for. Upstream decides at the same point, on the same address
+/// (`isIntercept()`, `_original/lib/tunnel.js:201-215`, against
+/// `tunnel://host:port`). Anything else needs the ClientHello, which only
+/// arrives once the CONNECT has been answered.
+fn relayed_unread(
+    state: &Arc<AppState>,
+    host: &str,
+    port: u16,
+    peer: SocketAddr,
+) -> Option<(crate::rules::ReqInfo, crate::rules::Resolved)> {
+    let everything = !state.config.intercepts_https();
+    let rules = state.rules.read().unwrap();
+    // One `bool` per group when neither applies, which is the default setup.
+    if !everything && !rules.has_no_intercept() {
+        return None;
+    }
+    // No ClientHello yet, so no SNI: the same reading `tunnel_aborted` makes.
+    let info = sni::connection_req_info(host, port, peer, false);
+    let resolved = rules.resolve(&info);
+    (everything || sni::no_intercept(&resolved)).then_some((info, resolved))
+}
+
+/// Relay a tunnel nobody is going to read, answering the CONNECT only once the
+/// far end has answered.
+///
+/// Upstream dials first and writes `200 Connection Established` from the
+/// connect callback (`handleConnect` → `sendEstablished`,
+/// `_original/lib/tunnel.js:637-695`). When the name does not resolve or the
+/// dial fails, it destroys the client's socket without a reply (`emitError`,
+/// `:833-836`), so the client's CONNECT itself fails — Chrome reports
+/// `ERR_TUNNEL_CONNECTION_FAILED`. This port used to answer `200` to every
+/// tunnel first, so a relay that could not connect looked to the client like a
+/// server that accepted the connection and hung up mid-handshake.
+///
+/// Only for tunnels [`relayed_unread`] decided on: one that may yet be
+/// intercepted has to be acknowledged before its ClientHello can be read, and a
+/// relay decided *there* still dials after the `200` — as upstream's does on
+/// that path (`rollBackTunnel`, `tunnel.js:270-271`).
+async fn relay_before_reply(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    host: &str,
+    port: u16,
+    peer: SocketAddr,
+    (info, resolved): (crate::rules::ReqInfo, crate::rules::Resolved),
+) -> Result<Response<DynBody>, Destroyed> {
+    let started = Instant::now();
+    let session = tunnel_session_of(&info, &resolved, peer, now_ms());
+    // Not answered, and now never will be.
+    let refused = |session: Session| Tunnel {
+        state: &state,
+        session: Session {
+            status: 0,
+            ..session
+        },
+        started,
+    };
+    let target = match sni::relay_target(&state, &info, &resolved).await {
+        Ok(target) => target,
+        Err(why) => {
+            let err = anyhow::anyhow!("tunnel to {host}:{port} not routable: {why}");
+            refused(session).fail("", outcome::Phase::Rules, &err);
+            return Err(Destroyed);
+        }
+    };
+    let timings = timing::Timings::new();
+    let origin = match upstream::tunnel_stream(&target, &timings).await {
+        Ok(origin) => origin,
+        Err(err) => {
+            let mut tunnel = refused(session);
+            tunnel.session.timings = Some(timings);
+            tunnel.fail(&target_desc(&target), outcome::Phase::Internal, &err);
+            return Err(Destroyed);
+        }
+    };
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let client = sni::Prefixed::new(Vec::new(), TokioIo::new(upgraded));
+                let tunnel = Tunnel {
+                    state: &state,
+                    session,
+                    started,
+                };
+                if let Err(err) =
+                    relay_dialled(client, origin, &target, timings, Some(tunnel)).await
+                {
+                    tracing::debug!("relay error: {err}");
+                }
+            }
+            Err(err) => tracing::debug!("connect upgrade failed: {err}"),
+        }
+    });
+    Ok(connect_established())
 }
 
 /// Does a rule refuse to carry this connection — and, when one does, record the
@@ -410,17 +522,29 @@ pub(super) fn tunnel_session(
         let resolved = rules.resolve(&info);
         (info, resolved)
     };
+    tunnel_session_of(&info, &resolved, peer, time_ms)
+}
+
+/// [`tunnel_session`], from a resolution already made.
+fn tunnel_session_of(
+    info: &crate::rules::ReqInfo,
+    resolved: &crate::rules::Resolved,
+    peer: SocketAddr,
+    time_ms: u128,
+) -> Session {
     Session {
         time_ms,
         method: "CONNECT".to_string(),
-        url: info.full_url,
-        // The CONNECT was answered before anything below happened: hyper hands
-        // over a tunnel's bytes only after its `200` has gone out — see
-        // [`tunnel_aborted`]. A SOCKS client was likewise told "granted".
+        url: info.full_url.clone(),
+        // The CONNECT was answered before the row appears: hyper hands over a
+        // tunnel's bytes only after its `200` has gone out — see
+        // [`tunnel_aborted`] — and a relay decided on the CONNECT answers once
+        // the far end has ([`relay_before_reply`], which writes 0 when it never
+        // does). A SOCKS client was likewise told "granted".
         status: 200,
         client_ip: Some(peer.ip().to_string()),
-        log: log_labels(&resolved),
-        rules: matched_ops(&resolved),
+        log: log_labels(resolved),
+        rules: matched_ops(resolved),
         ..Default::default()
     }
 }
@@ -460,6 +584,21 @@ where
             return Err(err);
         }
     };
+    relay_dialled(client, origin, target, timings, tunnel).await
+}
+
+/// The rest of [`relay_recorded`], once the far end is connected: the row
+/// appears now, and is complete when the tunnel closes.
+async fn relay_dialled<S>(
+    client: sni::Prefixed<S>,
+    origin: upstream::BoxedIo,
+    target: &upstream::Target,
+    timings: timing::Timings,
+    tunnel: Option<Tunnel<'_>>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let open = tunnel.and_then(|t| {
         let (_, open) = t.state.record_open(Session {
             target: format!("{} (tunnel)", target_desc(target)),
@@ -845,6 +984,83 @@ pub(crate) mod tunnel_abort_tests {
             .await
             .expect("a CONNECT reply");
         assert_eq!(&head, b"HTTP/1.1 200");
+    }
+
+    /// With interception off, every tunnel is answered only once its far end
+    /// has been reached, and not at all when it cannot be — upstream's order
+    /// (`_original/lib/tunnel.js:637-695`, `:833-836`). Before, the `200` went
+    /// out first, and a client whose origin did not resolve saw a server that
+    /// accepted the tunnel and then hung up in the middle of its handshake:
+    /// measured on Linux, where `probe.test` does not resolve, as
+    /// `connect ECONNRESET` from whistle against `tls ECONNRESET` from this port
+    /// (`mode-bench.js`). The `disable://intercept` path is
+    /// `failure_tests::a_relayed_tunnel_that_cannot_connect_fails_at_connect`.
+    #[tokio::test]
+    async fn with_interception_off_a_tunnel_is_answered_once_the_far_end_is() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        // An origin that echoes one line back, so relaying is seen to work.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    sock.write_all(&buf[..n]).await.ok();
+                });
+            }
+        });
+        let connect = |addr: SocketAddr, authority: String| async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+            client.write_all(req.as_bytes()).await.unwrap();
+            client
+        };
+
+        let (state, addr) = proxy_with_config("", |c| c.intercept_https = false).await;
+
+        let mut refused = connect(addr, dead.to_string()).await;
+        let mut got = Vec::new();
+        refused.read_to_end(&mut got).await.ok();
+        assert!(
+            got.is_empty(),
+            "expected silence, got {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        {
+            let sessions = state.sessions.lock().unwrap();
+            let session = sessions
+                .iter()
+                .next()
+                .expect("the failed tunnel is on the list");
+            assert_eq!(session.method, "CONNECT");
+            assert_eq!(session.status, 0, "nothing was answered");
+            let failure = session.error.get().expect("recorded as failed");
+            assert_eq!(failure.phase, outcome::Phase::Connect, "{failure:?}");
+        }
+
+        let mut relayed = connect(addr, live.to_string()).await;
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            relayed
+                .read_exact(&mut byte)
+                .await
+                .expect("a CONNECT reply");
+            head.push(byte[0]);
+        }
+        assert!(
+            head.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&head)
+        );
+        relayed.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        relayed.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping", "relayed, not read");
     }
 
     /// An aborted *request* is recorded too, for the same reason an aborted

@@ -3838,6 +3838,16 @@ so the hook is not called.
 
 `--no-intercept-https` says the same thing for every connection at once.
 
+**The far end is reached before the client is told the tunnel is open.** When
+the rule matches the address in the `CONNECT` itself (or interception is off),
+whistle-rs dials first and answers `200` only once the far end has answered, as
+whistle does (`_original/lib/tunnel.js:637-695`). A name that does not resolve
+or a port that refuses leaves the `CONNECT` with **no reply at all**: the
+browser reports `ERR_TUNNEL_CONNECTION_FAILED`, and the console has a `CONNECT`
+row at status 0 failed at `dns` or `connect`. A rule that matches only the name
+in the ClientHello is decided after the `200` has gone out, so there the client
+sees the tunnel open and then close, with the same row.
+
 **Two narrower flags, one for each half of the connections.** The half is decided
 by whether the ClientHello named a server, which is a fact about the client and
 not about the rule:

@@ -141,12 +141,12 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | --- | --- |
 | 普通 HTTP 代理请求 | 每个请求一条，失败的也有 |
 | 解密的 HTTPS（MITM） | 隧道里每个请求各一条，和普通请求一样。隧道本身没有自己的一条 —— 除非 TLS 握手就失败了：客户端不接受本代理的证书时，记一条 `CONNECT`，`phase` 是 `client-tls` |
-| 不解密转发的隧道（`disable://intercept`、`--no-intercept-https`、非 HTTP 流量） | 一条 `CONNECT`，Policy（`target`）末尾带 `(tunnel)`，状态 `200`；连不上远端时按 `dns`/`connect`/`proxy` 记失败。隧道里的内容不读 |
+| 不解密转发的隧道（`disable://intercept`、`--no-intercept-https`、非 HTTP 流量） | 一条 `CONNECT`，Policy（`target`）末尾带 `(tunnel)`，状态 `200`；连不上远端时按 `dns`/`connect`/`proxy` 记失败。隧道里的内容不读。`--no-intercept-https` 和命中 CONNECT 地址的 `disable://intercept` 是先连远端、连上了才回 `200`（和 whistle 一样），所以连不上时 CONNECT 没有任何回复，这一条的状态是 `0` |
 | SOCKS5 入口 | 和 CONNECT 隧道走同一段代码，记法相同 |
 | WebSocket | 握手一条；握手转发失败按普通请求记失败 |
 | Composer / Replay | 请求从代理自己的端口发出，按普通请求记会话，失败的也记。接口接下任务就回答（Composer 回 `ok`，Replay 回 `replayed`），不等请求结果，也不返回会话号：去列表里找最新的那条 |
 
-不记的只有三种：控制台自己的请求、`enable://hide` 命中的请求、客户端开了隧道一个字节没发就关掉的（什么都没请求）。
+不记的只有三种：控制台自己的请求、`enable://hide` 命中的请求、客户端开了隧道一个字节没发就关掉的（什么都没请求）。第三种有个例外：上面说的"先连远端再回 `200`"的隧道，连上就记一条，不管客户端后来发没发数据。
 
 ## 没生效的规则
 

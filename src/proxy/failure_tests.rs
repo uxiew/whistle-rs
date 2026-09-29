@@ -557,16 +557,28 @@ async fn a_client_that_refuses_the_certificate_fails_at_client_tls() {
 }
 
 /// A tunnel the rules say not to read is relayed; one whose far end will not
-/// answer fails where it failed, like any request would.
+/// answer fails where it failed, like any request would — and, decided on the
+/// CONNECT, is dialled before the CONNECT is answered, so the client is told by
+/// silence rather than by a `200` and a hang-up (`tunnel::relay_before_reply`).
 #[tokio::test]
 async fn a_relayed_tunnel_that_cannot_connect_fails_at_connect() {
     let dead = refused().await;
     let (state, proxy) = proxy_with(&format!("relay.test disable://intercept host://{dead}")).await;
-    let mut client = tunnel(proxy, "relay.test:443").await;
-    client.write_all(&client_hello("relay.test")).await.unwrap();
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client
+        .write_all(b"CONNECT relay.test:443 HTTP/1.1\r\nHost: relay.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    client.read_to_end(&mut got).await.ok();
+    assert!(
+        got.is_empty(),
+        "expected silence, got {:?}",
+        String::from_utf8_lossy(&got)
+    );
     let s = one_failure(&state, "", Phase::Connect).await;
     assert_eq!(s.method, "CONNECT");
-    assert_eq!(s.status, 200, "the CONNECT itself was answered");
+    assert_eq!(s.status, 0, "the CONNECT was never answered");
     assert_eq!(s.target, dead.to_string());
     assert_eq!(s.rules.len(), 2, "{:?}", s.rules);
 }

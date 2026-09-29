@@ -90,6 +90,7 @@ client ── TCP ──▶ hyper http1 serve_connection ──▶ top_level(req
    │                   │                              │ name          │
    ▼                   ▼                              ▼               ▼
 handle_connect     serve(Forward)                serve(Forward)   local_ui
+   ├─ relayed_unread ─ dial, then 200 (no reply if the dial fails) ──▶ relay_before_reply
    │ 200 + upgrade     │                              │            (status page,
    ▼                   │                              │             /rootCA.crt)
 serve_tunnel           │                              │
@@ -151,10 +152,20 @@ hyper also drops a body it has finished without polling it to the end, once a
 `content-length` is written; `settle` counts the bytes so that is not mistaken
 for a client leaving.
 
-A tunnel whose contents are not read has no request inside it to do this, so
-`serve_tunnel` records the CONNECT itself through a `Tunnel`: when it is relayed
-(`relay_recorded` — shown once connected, complete when it closes), when it
-cannot be routed, and when the client refuses the certificate (`client-tls`).
+A tunnel whose contents are not read has no request inside it to do this, so the
+CONNECT itself is recorded through a `Tunnel`: when it is relayed (shown once
+connected, complete when it closes), when it cannot be routed or its far end
+cannot be reached, and when the client refuses the certificate (`client-tls`).
+
+A relay decided on the CONNECT alone — interception off, or `disable://intercept`
+on the address the client asked for — goes through `relay_before_reply`, which
+dials first and answers `200` only once the far end has, as whistle does
+(`_original/lib/tunnel.js:637-695`). A far end that cannot be reached leaves the
+CONNECT unanswered and the row at status 0, so the client's own CONNECT fails
+rather than succeeding and then hanging up. Every other tunnel has to be
+answered before its ClientHello can be read; a relay decided there
+(`serve_tunnel` → `relay_recorded`) dials after the `200`, which is also what
+whistle does on that path.
 
 ### Why we open our own upstream connection
 

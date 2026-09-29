@@ -1033,6 +1033,7 @@ whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
 | 源站日志里请求变成了 HTTP/2，或者源站说收不到 `Host` 头 | 浏览器经本代理解密的 HTTPS 请求走的是 h2，现在转给源站时也用 h2（源站支持的话），和 whistle 一样。h2 里没有 `Host` 头，主机名在 `:authority` 里；`Connection`、`Keep-Alive`、`Transfer-Encoding` 这类头也不会发。源站在 h2 下有问题，就对它用 `disable://h2`。见 [`RULES.md`](RULES.md#h2--which-http-version-reaches-an-https-origin) |
 | 请求的时间里没有 DNS、Connect、TLS，瀑布图写着 `Origin connection #N — reused` | 同一个客户端连接上前一个请求留下的源站连接被接着用了，没有重新连，所以没有这几段。复用只发生在同一条客户端连接之内，不跨客户端。想让每个请求都新建连接：`disable://keepAlive`。见 [`ARCHITECTURE.md`](ARCHITECTURE.md#reusing-origin-connections) |
 | `CONNECT` 行的 Policy 列带 `(tunnel)` | 这条隧道没解密就转发了 —— `disable://intercept` 规则、`--no-intercept-https`，或者里面跑的不是 HTTP。这一行就是全部记录：转发的隧道里面什么都不读 |
+| 开了 `--no-intercept-https` 或 `disable://intercept`，浏览器报 `ERR_TUNNEL_CONNECTION_FAILED`，控制台有一条状态为 0 的 `CONNECT` | 代理连不上那个网站，这一行写着停在 `dns` 还是 `connect`。不解密的隧道要先连上远端才回复 CONNECT（和 whistle 一样），所以失败直接落在 CONNECT 上。见 [`RULES.md`](RULES.md#not-decrypting-a-connection) |
 | 直连控制台却返回带 `Proxy-Connection` 的 `502` | 你的 shell 设了 `http_proxy`。`curl --noproxy '*'` |
 | `/api/rules` 里有规则却不生效，而且抓包为空 | 先检查 curl 是否绕过代理；用 `--noproxy '' -x http://127.0.0.1:8899` 明确走代理。到过代理的请求哪怕失败了也在抓包里，所以列表为空说明请求没到 —— 或者被 `enable://hide` 挡在记录之外。控制台的检索框和 Capture filter 只是把行从列表里藏起来，`/sessions.json` 里还在 |
 | 拿到一个 `502`，分不清是谁回的 | 看它有没有 `x-whistle-rs-error` 头：有，就是本代理生成的，头的值就是停在哪一步（`dns`、`connect`、`tls`……）；没有，就是源站自己回的 `502` |
