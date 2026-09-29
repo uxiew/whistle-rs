@@ -170,3 +170,49 @@ async fn a_hidden_request_is_not_recorded_anywhere() {
     assert_eq!(lines, 1, "one history line, the shown request's");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--no-persist` (here its builder spelling) is the other promise about what
+/// is kept: the console still shows the traffic, and no history is written.
+/// The root certificate and the rules are still written — they are not
+/// traffic — so the check is on history files and on the traffic's own bytes.
+#[tokio::test]
+async fn nothing_of_the_traffic_is_written_when_persistence_is_off() {
+    let dir = std::env::temp_dir().join(format!("whistle-rs-no-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let site = origin().await;
+    let proxy = whistle_rs::embed::Proxy::builder()
+        .host("127.0.0.1".parse().unwrap())
+        .storage_dir(&dir)
+        .persist_sessions(false)
+        .start()
+        .await
+        .expect("proxy starts");
+    let addr = proxy.addr();
+    let answer = get(
+        addr,
+        &format!("http://{site}/kept-in-memory"),
+        &site.to_string(),
+    )
+    .await;
+    assert!(answer.ends_with("body-secret-9f2"), "{answer}");
+    let list = get(addr, "/sessions.json", &addr.to_string()).await;
+    assert!(body(&list).contains("/kept-in-memory"), "shown: {list}");
+    proxy.shutdown().await;
+
+    let written = files(&dir);
+    assert!(
+        written
+            .iter()
+            .all(|(p, _)| p.extension().is_none_or(|e| e != "jsonl")),
+        "{:?}",
+        written.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+    for (path, text) in &written {
+        assert!(
+            !text.contains("kept-in-memory") && !text.contains("body-secret-9f2"),
+            "{} holds the traffic",
+            path.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
