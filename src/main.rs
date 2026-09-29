@@ -558,6 +558,7 @@ async fn main() -> Result<()> {
     tracing::info!("plugins: {}", registry.names().join(", "));
 
     whistle_rs::proxy::upstream::set_request_timeout(cli.timeout);
+    whistle_rs::proxy::upstream::set_dns_order(config.dns_order);
     whistle_rs::proxy::upstream::set_insecure_upstream(cli.insecure_upstream);
     if cli.insecure_upstream {
         tracing::warn!(

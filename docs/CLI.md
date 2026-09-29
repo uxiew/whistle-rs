@@ -94,6 +94,15 @@ compatibility certificate for every current upstream version.
 | `strict` | refuse to read the rules headers after all. Visible only beside one of the two above, which is how upstream's `admin` preset composes | ✅ |
 | `x-forwarded-host` | believe a front proxy about the host the client asked for, and send the request there | ✅ |
 | `x-forwarded-proto` | believe it about the scheme, which decides whether `https://` patterns match a request that arrived in the clear | ✅ |
+| `ipv4first`, `ipv6first`, `verbatim` (also `ipv4First`, `ipv6First`) | which address to dial first when a name has both an IPv4 and an IPv6 one. **IPv4 first is the default**, as in whistle 2.10.10; `verbatim` is the resolver's own order, which was the default up to 2.10.8 | ✅ |
+
+The DNS order switches do not change anything a request carries, so the mode
+bench cannot see them; `src/proxy/upstream.rs` tests them by dialling
+`localhost` with a listener on each family. The symptom they are about: a site
+that opens in the browser but, through the proxy, fails with a connect timeout
+after 16 seconds — on a network whose IPv6 route drops packets, the IPv6 address
+used to be tried first and took the whole connect budget. `-M ipv6first` or
+`-M verbatim` brings that back on such a network. `ipv6Only` is not honoured.
 
 > **`-M multiEnv` lets whoever sends a request decide where it goes.** The
 > headers name a destination, a rules text, and values to expand into it. That

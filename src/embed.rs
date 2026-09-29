@@ -278,6 +278,9 @@ impl Builder {
         if let Some(list) = &self.mode {
             config.apply_modes(list);
         }
+        // Process-wide, as upstream's `dns.setDefaultResultOrder` is: two
+        // proxies in one program share the last one's order.
+        crate::proxy::upstream::set_dns_order(config.dns_order);
 
         let ca = CertAuthority::load_or_create(&config)?;
         // `with_includes`: an embedded proxy's rules are as long-lived as the

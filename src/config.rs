@@ -79,6 +79,9 @@ pub struct Config {
     /// `-M keepXFF`. Off by default in both proxies, so a client cannot hand
     /// the origin an address the proxy appears to vouch for.
     pub keep_client_xff: bool,
+    /// Which address family is tried first when a name resolves to both —
+    /// `-M ipv4first|ipv6first|verbatim`. See [`DnsOrder`].
+    pub dns_order: DnsOrder,
     /// Whether this proxy reads rules out of a request's **own headers**, and
     /// whose rules win when it does — `-M enableRequestHeaderRules` and
     /// `-M multiEnv`/`nohost`. Off in both proxies by default; see
@@ -218,6 +221,7 @@ impl Default for Config {
             console: true,
             console_hostnames: true,
             keep_client_xff: false,
+            dns_order: DnsOrder::default(),
             header_rules: HeaderRules::Off,
             multi_env: false,
             trust_forwarded_host: false,
@@ -320,6 +324,29 @@ pub struct ModeReport {
     pub inert: Vec<String>,
     /// Tokens neither program knows — almost certainly a typo.
     pub unknown: Vec<String>,
+}
+
+/// Which address family to try first when a name resolves to both.
+///
+/// **IPv4 first by default**, as whistle 2.10.10 (`feat: default DNS order to
+/// ipv4-first`; `setDefaultResultOrder`, `lib/config.js`). Before it, this port
+/// tried addresses in the resolver's order — IPv6 first on most machines — and
+/// with no time limit per address, so on a network whose IPv6 route swallows
+/// packets the first attempt spent the whole 16-second connect budget and the
+/// IPv4 address that would have answered was never tried. `localhost` was also
+/// dialled at `::1` while both upstream releases ask IPv4 first for it
+/// (`IPV4_FIRST`, `lib/rules/dns.js`), so a dev server on each family got a
+/// different backend here than through whistle.
+///
+/// The other two are upstream's own switches, `-M ipv6first` and `-M verbatim`
+/// (the resolver's order, which was the default up to 2.10.8). Within a family
+/// the resolver's order always stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnsOrder {
+    #[default]
+    Ipv4First,
+    Ipv6First,
+    Verbatim,
 }
 
 /// Upstream's composite modes, expanded before anything else looks at the list
@@ -462,13 +489,10 @@ const INERT_MODES: &[&str] = &[
     "INADDR_ANY",
     "buildIn",
     "build-in",
-    // DNS resolution order — `gui/online.md`'s three radio buttons.
+    // DNS: IPv6 only, and which resolver call to make. The order switches are
+    // honoured — see `DnsOrder`.
     "ipv6Only",
     "ipv6only",
-    "ipv4First",
-    "ipv4first",
-    "ipv6first",
-    "verbatim",
     "dnsResolve",
     "dnsResolve4",
     "dnsResolve6",
@@ -499,7 +523,9 @@ impl Config {
     /// set was measured rather than chosen: `tests/differential/mode-bench.js`
     /// runs one whistle per token and reports which ones move any of nine
     /// probes. Fifteen of the fifty-six do; they collapse into six behaviours,
-    /// four of which this port has something to apply them to.
+    /// four of which this port has something to apply them to. The DNS order
+    /// switches are honoured as well, though no probe there can see them: they
+    /// decide which address a name is dialled at, not what is sent ([`DnsOrder`]).
     pub fn apply_modes(&mut self, list: &str) -> ModeReport {
         let mut report = ModeReport::default();
         let mut saw_strict = false;
@@ -588,6 +614,20 @@ impl Config {
                 // the rules half.
                 "notAllowEnableHTTPS" | "notAllowedEnableHTTPS" => {
                     self.capture_locked_off = true;
+                    true
+                }
+                // Which family to dial first. The first is the default, and
+                // says so, as the HTTPS switch's `on` spellings do.
+                "ipv4first" | "ipv4First" => {
+                    self.dns_order = DnsOrder::Ipv4First;
+                    true
+                }
+                "ipv6first" | "ipv6First" => {
+                    self.dns_order = DnsOrder::Ipv6First;
+                    true
+                }
+                "verbatim" => {
+                    self.dns_order = DnsOrder::Verbatim;
                     true
                 }
                 // Handled after the loop: what `strict` does is take away what
@@ -713,7 +753,7 @@ mod tests {
         assert_eq!(clamp_frame_cache_size(5000), 5000);
     }
 
-    /// The four modes this port honours, and that each is honoured for every
+    /// The modes this port honours, and that each is honoured for every
     /// spelling upstream gives it.
     #[test]
     fn the_modes_that_change_something_do() {
@@ -752,6 +792,20 @@ mod tests {
         for token in ["keepXFF", "forwardedFor"] {
             let (c, _) = with(token);
             assert!(c.keep_client_xff, "{token}");
+        }
+        // Upstream's spellings, both cases of the `F` (`DNS_ORDERS`,
+        // `lib/config.js`); IPv4 first is also what nothing at all means.
+        assert_eq!(Config::default().dns_order, DnsOrder::Ipv4First);
+        for (token, order) in [
+            ("ipv4first", DnsOrder::Ipv4First),
+            ("ipv4First", DnsOrder::Ipv4First),
+            ("ipv6first", DnsOrder::Ipv6First),
+            ("ipv6First", DnsOrder::Ipv6First),
+            ("verbatim", DnsOrder::Verbatim),
+        ] {
+            let (c, r) = with(token);
+            assert_eq!(c.dns_order, order, "{token}");
+            assert_eq!(r.honoured, [token]);
         }
     }
 

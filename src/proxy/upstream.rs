@@ -1108,6 +1108,37 @@ pub fn set_request_timeout(timeout_ms: u64) {
     );
 }
 
+/// Which family [`dial`] tries first — [`crate::config::DnsOrder`]. Process-wide,
+/// as upstream's is (`dns.setDefaultResultOrder`), and set the same way as the
+/// connect budget: once, before serving.
+static DNS_ORDER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Set the family [`dial`] tries first. Call before serving.
+pub fn set_dns_order(order: crate::config::DnsOrder) {
+    DNS_ORDER.store(order as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn dns_order() -> crate::config::DnsOrder {
+    use crate::config::DnsOrder;
+    match DNS_ORDER.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => DnsOrder::Ipv6First,
+        2 => DnsOrder::Verbatim,
+        _ => DnsOrder::Ipv4First,
+    }
+}
+
+/// The resolver's answers in the order to try them. A stable sort, so within a
+/// family the resolver's own order stands.
+fn in_dns_order(mut addrs: Vec<SocketAddr>, order: crate::config::DnsOrder) -> Vec<SocketAddr> {
+    use crate::config::DnsOrder;
+    match order {
+        DnsOrder::Ipv4First => addrs.sort_by_key(SocketAddr::is_ipv6),
+        DnsOrder::Ipv6First => addrs.sort_by_key(SocketAddr::is_ipv4),
+        DnsOrder::Verbatim => {}
+    }
+    addrs
+}
+
 /// Open a TCP connection, timing the name lookup apart from the connect.
 ///
 /// `TcpStream::connect((host, port))` does both and reports one duration, so
@@ -1124,12 +1155,23 @@ pub fn set_request_timeout(timeout_ms: u64) {
 /// different fixes, and the session says which. A timeout belongs to whichever
 /// half was still running when the budget ran out.
 async fn dial(host: &str, port: u16, timings: &Timings) -> Result<(TcpStream, Instant)> {
+    dial_in(host, port, dns_order(), timings).await
+}
+
+/// [`dial`], with the family order given rather than read from the process.
+async fn dial_in(
+    host: &str,
+    port: u16,
+    order: crate::config::DnsOrder,
+    timings: &Timings,
+) -> Result<(TcpStream, Instant)> {
     let deadline = tokio::time::Instant::now() + connect_budget();
     let looking_up = Instant::now();
     let addrs: Vec<SocketAddr> = within(deadline, tokio::net::lookup_host((host, port)))
         .await
         .map_err(outcome::at(Phase::Dns))?
         .collect();
+    let addrs = in_dns_order(addrs, order);
     timings.dns(looking_up);
     if addrs.is_empty() {
         // `connect` would say "could not resolve to any addresses", which is
@@ -2785,5 +2827,78 @@ mod tests {
                 Some(format!("127.0.0.1:{origin_port}"))
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod dns_order_tests {
+    use super::*;
+    use crate::config::DnsOrder;
+
+    fn at(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn one_family_goes_first_and_each_keeps_the_resolver_s_order() {
+        let resolved = vec![
+            at("[::1]:80"),
+            at("10.0.0.2:80"),
+            at("[fe80::1]:80"),
+            at("10.0.0.1:80"),
+        ];
+        assert_eq!(
+            in_dns_order(resolved.clone(), DnsOrder::Ipv4First),
+            vec![
+                at("10.0.0.2:80"),
+                at("10.0.0.1:80"),
+                at("[::1]:80"),
+                at("[fe80::1]:80")
+            ]
+        );
+        assert_eq!(
+            in_dns_order(resolved.clone(), DnsOrder::Ipv6First),
+            vec![
+                at("[::1]:80"),
+                at("[fe80::1]:80"),
+                at("10.0.0.2:80"),
+                at("10.0.0.1:80")
+            ]
+        );
+        assert_eq!(in_dns_order(resolved.clone(), DnsOrder::Verbatim), resolved);
+        assert_eq!(
+            DnsOrder::default(),
+            DnsOrder::Ipv4First,
+            "whistle 2.10.10's default"
+        );
+    }
+
+    /// `localhost` with a listener on each family: the order decides which one
+    /// the connection reaches. Skipped, and says so, where the resolver does not
+    /// return both families or `::1` cannot be bound — some containers have no
+    /// IPv6 at all.
+    #[tokio::test]
+    async fn localhost_is_dialled_in_the_order_asked_for() {
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let Ok(v6) = tokio::net::TcpListener::bind(("::1", port)).await else {
+            eprintln!("skipped: cannot bind [::1]:{port}");
+            return;
+        };
+        let answers: Vec<SocketAddr> = tokio::net::lookup_host(("localhost", port))
+            .await
+            .unwrap()
+            .collect();
+        if !(answers.iter().any(SocketAddr::is_ipv4) && answers.iter().any(SocketAddr::is_ipv6)) {
+            eprintln!("skipped: localhost resolves to {answers:?} here");
+            return;
+        }
+        for (order, ipv4) in [(DnsOrder::Ipv4First, true), (DnsOrder::Ipv6First, false)] {
+            let (tcp, _) = dial_in("localhost", port, order, &Timings::new())
+                .await
+                .unwrap();
+            assert_eq!(tcp.peer_addr().unwrap().is_ipv4(), ipv4, "{order:?}");
+        }
+        drop((v4, v6));
     }
 }
