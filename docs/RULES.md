@@ -1453,9 +1453,10 @@ a `b:` inside a `rulesFile://` include, which is resolved after the decision —
 condition is unknown and fails closed, exactly as upstream's does when
 `req._reqBody` is not a string (`rules.js:1903-1906`).
 
-Unlike upstream there is no ceiling on how much is buffered: whistle stops at
-`MAX_REQ_SIZE` (2 MB, or 16 MB under `reqMergeBigData`) and matches against the
-prefix.
+Buffering for a `b:` stops at 2 MB, and the condition is matched against the
+prefix read — as upstream's does at `MAX_REQ_SIZE`. Unlike the body operators,
+`b:` cannot use `reqMergeBigData` to raise it: the flag is a rule, and `b:` is
+deciding which rules apply. See [Request bodies have a ceiling](#request-bodies-have-a-ceiling).
 
 #### Origin markers
 
@@ -3485,15 +3486,26 @@ already answers that question everywhere else, since `statusCode://abc`,
 failing anything.
 
 The two halves of the value are read independently, so an unusable cipher string
-does not take a usable `maxVersion` with it.
+does not take a usable `maxVersion` with it. Suites that exist but that no
+allowed version can use — only TLS 1.3 ones under a `maxVersion` of TLS 1.2 — are
+dropped the same way and the version kept; building a connection for them used
+to panic the request.
+
+A dropped pin is on the session, not only in the log: `unapplied` names the
+`cipher://` operator with the kind `cipher-unusable` and why
+([`API.md`](API.md#没生效的规则)). Nothing is said over plain HTTP, which has no
+handshake for a pin to be missing from. **A `cipher://` pin is a debugging aid,
+not a security policy**: when it cannot be used the connection goes ahead with
+the default suites, so it guarantees nothing about what an origin was reached
+with.
 
 ```
 # evaluated; the origin really negotiates from this set
 example.com cipher://{"ciphers":"ECDHE+AESGCM:!AES128"}
 # TLS 1.3 pinned by name; the TLS 1.2 list is emptied, as OpenSSL empties it
 example.com cipher://{"ciphers":"TLS_AES_128_GCM_SHA256"}
-# connects, unpinned, and logs `no cipher match: 3DES names no cipher suite
-# this build has` — rustls has no 3DES and cannot be argued into one
+# connects, unpinned; the session says `no cipher match: 3DES names no cipher
+# suite this build has` — rustls has no 3DES and cannot be argued into one
 example.com cipher://{"ciphers":"3DES"}
 # the ciphers half is dropped; the version half still holds
 example.com cipher://{"ciphers":"3DES","maxVersion":"TLSv1.2"}
@@ -3822,8 +3834,26 @@ Bounded at **16 MiB** now (`--body-rewrite-limit`), which is upstream's own
 "big data" number (`BIG_MAX_RES_SIZE`, `res.js:22`) and generous for the pages,
 bundles and JSON payloads rewriting is aimed at. Past it the response streams
 through **untouched**: the body operators, `enable://gzip` and any plugin
-`responseBody` hook do not apply, and a `WARN` names the request and the limit.
-The same 800 MB download now peaks at **33 MB** and arrives byte-complete.
+`responseBody` hook do not apply. The session says so: its `unapplied` list
+names each operator that did not run, with the kind `body-over-limit` and the
+limit ([`API.md`](API.md#没生效的规则)), and the console's Rules tab marks
+them "not applied". A `WARN` names the request too. The same 800 MB download
+now peaks at **33 MB** and arrives byte-complete.
+
+The limit counts bytes on the wire, and **undoing a compression counts too**: a
+gzip that would inflate past the limit is not inflated. It is forwarded as it
+arrived, as `decoded-over-limit` — a 16 MiB gzip of one repeated byte is
+gigabytes once inflated. A body whose `content-encoding` will not undo at all —
+bytes that are not what the header says (`undecodable`), or `zstd` and stacked
+codings (`unsupported-coding`) — is also forwarded untouched rather than have
+the operators run over compressed bytes: a `resAppend` there wrote plain text
+after the end of a gzip stream, which no client could read.
+
+`--body-rewrite-limit` is reported by `/api/status` (`body_rewrite_cap`) and on
+the console's Status pane, and an embedder sets it with `body_rewrite_cap`.
+`enable://resMergeBigData`, or `lineProps://enableBigData` on the `resMerge://`
+line, raises one request's limit to at least 16 MiB — which only matters when
+the knob was set lower.
 
 This is one of the few places where the port needs a knob upstream does not,
 and the reason is architectural rather than a preference — see
@@ -3870,9 +3900,12 @@ streams on to the origin byte for byte, and only the rewriting stops —
 `reqBody`, `reqReplace`, `params`, `reqWrite`/`reqWriteRaw` and `reqSpeed` do not
 apply. That is upstream's `interrupt` (`handleParams`, `req.js:169-185`), and it
 is the right failure for a debugging proxy: traffic must not be damaged by the
-inspection of it. whistle-rs logs a `WARN` naming the request when it happens,
-so a rule that stopped applying above some size does not look like a rule that
-never matched.
+inspection of it. whistle-rs records it on the session — `unapplied`, kind
+`request-body-over-limit`, naming the operators (`params://` only when it would
+have rewritten a form or JSON body) — and logs a `WARN`, so a rule that stopped
+applying above some size does not look like a rule that never matched. A
+request body whose `content-encoding` will not undo reaches the origin as sent,
+the same way.
 
 `b:` body filters read the body too, in order to decide *which* rules apply, so
 they cannot consult a rule for the raised ceiling — they always use the plain
@@ -3920,6 +3953,12 @@ upstream's HTML-injection machinery and an event stream is not HTML.
 
 `disable://trailers` applies to an event stream; `resWriteRaw://` and
 `trailers://` do not.
+
+The session names what did not run, as `unapplied` with the kind
+`event-stream`: `resMerge`, the typed `html*`/`js*`/`css*` families,
+`resSpeed`, `resScript`, `weinre`, `resWrite`/`resWriteRaw`, `trailers` and
+`enable://gzip`, and `resReplace` when the stream is compressed. The four that
+travel with a stream are not named, because they ran.
 
 
 ## Origin certificate verification

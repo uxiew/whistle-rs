@@ -53,7 +53,7 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8899/api/replay -d '{"id": 999999
 
 这几条读接口其实不看方法，用 GET 就行。
 
-**列表行上有什么：** `id`、`time_ms`、`method`、`url`、`status`、`client_ip`、`target`、`duration_ms`、`log`、`rules`、`up`/`down`（body 字节数，不含头）、`has_req_body`/`has_res_body`/`has_frames`、`type`（响应的 `content-type`）。另外三个字段只在成立时出现：`error`（没完成，见下文）、`composer: true`（Composer 或 Replay 发的）、`open: true`（响应还在传，见下文）。
+**列表行上有什么：** `id`、`time_ms`、`method`、`url`、`status`、`client_ip`、`target`、`duration_ms`、`log`、`rules`、`up`/`down`（body 字节数，不含头）、`has_req_body`/`has_res_body`/`has_frames`、`type`（响应的 `content-type`）。另外四个字段只在成立时出现：`error`（没完成，见下文）、`composer: true`（Composer 或 Replay 发的）、`open: true`（响应还在传，见下文）、`unapplied`（有命中的规则没生效，见[没生效的规则](#没生效的规则)）。
 
 **当游标轮询：** 列表永远是整个内存里的会话（上限 `-R`，最少 600 条）。程序要持续跟踪时：
 
@@ -147,6 +147,35 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | Composer / Replay | 请求从代理自己的端口发出，按普通请求记会话，失败的也记。接口接下任务就回答（Composer 回 `ok`，Replay 回 `replayed`），不等请求结果，也不返回会话号：去列表里找最新的那条 |
 
 不记的只有三种：控制台自己的请求、`enable://hide` 命中的请求、客户端开了隧道一个字节没发就关掉的（什么都没请求）。
+
+## 没生效的规则
+
+`rules` 列的是**命中**的算子，不等于**生效**的算子。代理有意不执行某些算子时（body 太大、是事件流、解不开压缩……），会在会话上记一个 `unapplied` 列表，列表行和 `/session.json` 里都有，也写进磁盘历史；全部生效时没有这个字段：
+
+```json
+{ "rules": [ {"protocol": "resReplace", "value": "a=b", "raw": "resReplace://a=b"},
+             {"protocol": "resHeaders", "value": "x=1", "raw": "resHeaders://x=1"} ],
+  "unapplied": [ { "kind": "body-over-limit",
+                   "ops": ["resReplace://a=b"],
+                   "reason": "the response body is over 16777216 bytes, the rewrite limit, so it was forwarded as it arrived. --body-rewrite-limit raises it" } ] }
+```
+
+`ops` 里每一项就是 `rules` 里某一条的 `raw`，拿它对上是哪条；`reason` 是给人看的原因，带上当时的数字；`kind` 给程序判断用：
+
+| `kind` | 什么情况 | 怎么处理的 |
+| --- | --- | --- |
+| `body-over-limit` | 响应 body 超过 `--body-rewrite-limit`（默认 16 MiB） | 原样转发，响应 body 算子都不执行 |
+| `request-body-over-limit` | 请求 body 超过 2 MB（`enable://reqMergeBigData` 等可提到 16 MB） | 原样发给源站 |
+| `event-stream` | 响应是事件流（SSE），不会被整个收下来 | 边到边转发；`resReplace`/`resBody`/`resPrepend`/`resAppend` 照常执行（压缩的流上 `resReplace` 不执行），其余需要完整 body 的不执行 |
+| `decoded-over-limit` | 压缩的 body 解开后会超过改写上限 | 不解压，原样转发 |
+| `undecodable` | `content-encoding` 解不开（字节和头说的不一致） | 原样转发，不在压缩字节上跑算子 |
+| `unsupported-coding` | 本代理不支持的编码（`zstd`、叠加编码） | 原样转发 |
+| `plugin-failed` | 插件的 request/response 钩子连不上、回了错误状态码、或 30 秒没回答 | 请求照常继续，当作钩子什么都没说 |
+| `cipher-unusable` | `cipher://` 选不出可用的套件，或套件和允许的 TLS 版本对不上 | 不带套件限制建连（版本限制保留） |
+
+这些都是**降级**：请求照常完成，只是这些算子没执行。只有插件的认证网关（auth）失败时会拦截请求，那是请求失败，记在 `error` 里（阶段 `plugin`），不在这里。控制台的 Rules 标签页会把这些算子划掉并标 "not applied"。
+
+还没覆盖的情况（算子会命中但实际不起作用，而 `unapplied` 里不会有）：按内容类型跳过的（如 `resMerge` 对非 JSON/JS/HTML、`html*` 对非 HTML 响应）、隧道和 WebSocket 升级上的响应阶段算子、写不进去的非法头、`statusCode://abc` 这类无效值。
 
 ## 规则与 Values
 
