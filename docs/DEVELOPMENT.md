@@ -71,6 +71,26 @@ scripts/check-console.sh target/debug/whistle-rs placeholder  # 没有前端产�
 
 链接检查只认 git 跟踪的文件：`_original/` 在本机存在，但在 GitHub 上是 404，指向它的链接会被报出来。外链不联网检查。`check-console.sh` 只用 sh 和 curl，所以也能在没装 Node 的环境里跑；它对 curl 加了 `--noproxy '*'`——本机设了 `http_proxy` 又没设 `no_proxy` 时，curl 连 127.0.0.1 也会走代理，检查会一直卡住。
 
+## 在一台机器上实际用一遍
+
+```sh
+node scripts/smoke.mjs target/release/whistle-rs --console built          # macOS、Linux
+node scripts\smoke.mjs target\release\whistle-rs.exe --console built      # Windows
+node scripts/smoke.mjs <二进制> --json smoke.json --keep                    # 另存报告，留下数据目录
+```
+
+本机约 4 秒，把一个人会做的事按顺序做一遍，29 步（Windows 24 步，其中 1 步跳过），每步一行 `ok`/`FAIL`/`skip`，全部通过退出码 0，有失败 1，参数不对 2：
+
+1. 在全新目录上启动，确认生成了根证书，控制台页面是 `ui-src/dist` 那一版（`--console built`；`placeholder` 要求占位页，默认 `any` 不管）。
+2. 通过 API 改规则、设一个 Value；HTTP、HTTPS（拦截，客户端只信任刚生成的 CA）、WebSocket、TLS 里的 WebSocket、一个 `--node-plugin` 插件，各经代理发一次，确认规则和 Value 都生效，控制台列出了这些请求。
+3. 按 Ctrl+C（SIGINT）停下，确认端口已释放、插件进程也没了。
+4. 在同一目录、同一端口再启动：根证书没变，规则、Value、历史都回来了而且照样生效，新会话号接着旧的往上数；SIGTERM 停下，再查一遍端口和插件。
+5. 仅 Unix：第三次启动后 `kill -9`，确认插件照样退出（靠 stdin 管道，见 [PLUGINS](PLUGINS.md#注册插件)）。
+
+它只连自己在 127.0.0.1 上起的源站，不需要联网，也不碰系统代理和信任库；需要 Node 20.19 以上，`node` 要在 `PATH` 上（插件用）。Windows 没有能从外部发给别的进程的信号，那里的"停下"都是 TerminateProcess，等同于 `taskkill /F`，所以第 3、4 步在 Windows 上测的其实是强杀后的数据和插件。Unix 上 `root.key` 须是 `0600`、`certs/`、`rules/`、`sessions/` 须是 `0700`，Windows 上跳过这一步（没有 Unix 权限位，由用户目录的 ACL 决定）。
+
+这是 D1 在各平台上验收用的脚本；每个平台最近一次的结果记在 [STATUS](STATUS.md)。
+
 ## 与上游的差分
 
 ```sh
