@@ -100,6 +100,16 @@ node matrix.js ../../target/differential/<基线那次> ../../target/differentia
 
 **上游自带的测试**也是 `network` 里的一步（`upstream-suite`，约 4 分钟）：拿所测上游版本那个 tag 的 `test/` 原样跑 whistle-rs（2.10.8 与 2.10.10 的 `test/` 完全相同），第一次运行会从 GitHub 按提交号取到 `target/upstream-suite/`。它用上游固定的端口（6666、18080、5566、1080 等），跟 `--port-base` 无关，端口被占会直接报出来。单独跑：`node upstream-suite.js`；某个单元挂了，用 `node upstream-suite.js --target rs --only <单元名> --verbose` 看每条调用的状态和错误页。它评判哪些调用、怎么声明例外，只写在[差分 README](../tests/differential/README.md#upstreams-own-test-suite)。
 
+**性能对比**不是门禁，`run.js` 不跑它，要手动跑。它测的是 release 二进制，改了连接或数据通路之后跑一次，和 [STATUS 的 PERF1 记录](STATUS.md#2026-09-29-perf1-源站连接复用与源站-h2)里的数字比较：
+
+```sh
+cargo build --release
+node perf-bench.js                   # 在 tests/differential 里；回环，约 2 分钟
+RTT_MS=20 node perf-bench.js         # 源站前面加 20 ms 往返时延
+```
+
+每个场景报告源站连接数、TLS 握手数、延迟、吞吐、峰值内存和取消后的释放时间；参数和它模拟不了什么，只写在[差分 README](../tests/differential/README.md#what-a-request-costs-the-network)。
+
 **Node 版本会影响结果。** 对照组是跑在 Node 上的 whistle，有些答案随 Node 版本变（`cases-compose.js` 记录过 gzip 头的一个字节）。当前声明是在 Node 26 上测的，CI 的差分任务也用 26；换版本要重新测量。
 
 几条不要做的事：不要把官网示例直接当网络用例跑（真实 URL 会产生外部请求）；测试 CA 只给测试客户端信任，不导入系统；`npm audit fix` 会悄悄换掉对照组，别跑（原因见差分 README）。各语料、专项 bench 和锁文件审阅的细节只写在 [tests/differential/README.md](../tests/differential/README.md)。
