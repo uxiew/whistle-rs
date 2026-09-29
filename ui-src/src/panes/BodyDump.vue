@@ -40,6 +40,9 @@ const note = computed(() => {
   const b = props.body;
   if (!b) return '';
   if (!b.truncated) return `${b.len} bytes`;
+  if (b.undecodable) {
+    return `${b.len} bytes — its content-encoding would not decode; this is what came out before it broke`;
+  }
   return `${fmtBytes(bytes.value?.bytes.length)} of ${b.len} bytes — the rest was not captured`;
 });
 

@@ -546,6 +546,11 @@ pub struct CaptureState {
     decoder: BodyDecoder,
     /// Preview byte cap (`None` → [`BODY_PREVIEW_CAP`] default).
     cap: Option<usize>,
+    /// For a capture read back from history: whether it was short of the body
+    /// when it was written. What decided that then — the cap it was taken
+    /// under, whether it arrived compressed — is not stored, and re-deriving it
+    /// from what is got it wrong both ways (see [`Capture::restored`]).
+    restored_truncated: Option<bool>,
 }
 
 impl CaptureState {
@@ -587,14 +592,19 @@ impl CaptureState {
         }
     }
 
-    /// Whether the preview falls short of the body: it either hit the cap, or
-    /// bytes went past uncompressed after it was full.
+    /// Whether the preview falls short of the body: it either hit the cap,
+    /// bytes went past uncompressed after it was full, or decoding failed and
+    /// nothing after the failure was kept.
     ///
     /// One predicate rather than three, because [`Capture::snapshot`],
     /// [`Capture::preview_bytes`] and [`Capture::replay_body`] each have to
     /// answer it and three copies of it would drift.
     fn is_truncated(&self) -> bool {
+        if let Some(truncated) = self.restored_truncated {
+            return truncated;
+        }
         self.data.len() >= self.cap()
+            || matches!(self.decoder, BodyDecoder::Failed)
             || (matches!(self.decoder, BodyDecoder::Identity) && self.total > self.data.len())
     }
 
@@ -651,6 +661,35 @@ impl Capture {
         c
     }
 
+    /// A capture read back from history, with the facts about it that were
+    /// written down with it rather than re-derived.
+    ///
+    /// Rebuilding one by feeding the kept bytes through [`Capture::from_bytes`]
+    /// derived `truncated` from them, under a cap made up for the occasion: a
+    /// body cut at the preview limit came back whole, and a whole body that had
+    /// arrived gzipped — kept decoded, and so longer than its wire length —
+    /// came back cut short.
+    pub(crate) fn restored(
+        bytes: &[u8],
+        content_type: Option<String>,
+        total: usize,
+        truncated: bool,
+        undecodable: bool,
+    ) -> Self {
+        Capture(Arc::new(Mutex::new(CaptureState {
+            data: bytes.to_vec(),
+            total,
+            content_type,
+            decoder: if undecodable {
+                BodyDecoder::Failed
+            } else {
+                BodyDecoder::Done
+            },
+            cap: None,
+            restored_truncated: Some(truncated),
+        })))
+    }
+
     /// The body has ended, so no further bytes can arrive. Releases the
     /// decompressor for a body that finished before filling the preview —
     /// without this, every small compressed response leaves an inflate state
@@ -685,6 +724,12 @@ impl Capture {
     /// Whether [`Capture::snapshot`]'s `text` is a marker rather than the body.
     pub fn is_binary(&self) -> bool {
         !is_textual(self.0.lock().unwrap().content_type.as_deref())
+    }
+
+    /// Whether undoing the body's `Content-Encoding` failed part-way, so what
+    /// was kept is the decoder's output up to the failure and nothing after.
+    pub fn is_undecodable(&self) -> bool {
+        matches!(self.0.lock().unwrap().decoder, BodyDecoder::Failed)
     }
 
     /// The preview as **bytes**, with what is needed to serve them.
@@ -723,7 +768,9 @@ impl Capture {
             // length header would make look deliberate.
             return ReplayBody::Undecodable;
         }
-        if st.data.is_empty() {
+        // Nothing kept of a body that had bytes is not an empty body: a preview
+        // limit of 0, or a body from history none of which was written down.
+        if st.data.is_empty() && !st.is_truncated() {
             return ReplayBody::Empty;
         }
         let bytes = Bytes::copy_from_slice(&st.data);
@@ -802,7 +849,7 @@ impl serde::Serialize for Capture {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let (len, truncated, text) = self.snapshot();
-        let mut o = s.serialize_struct("BodyCapture", 4)?;
+        let mut o = s.serialize_struct("BodyCapture", 5)?;
         o.serialize_field("len", &len)?;
         o.serialize_field("truncated", &truncated)?;
         o.serialize_field("text", &text)?;
@@ -812,6 +859,9 @@ impl serde::Serialize for Capture {
         // — the kind that drifts silently and is only noticed as a body that
         // renders as mojibake.
         o.serialize_field("binary", &self.is_binary())?;
+        // Why a `truncated` body is short when it is not the preview limit: its
+        // encoding would not decode, so `text` is what came out before it broke.
+        o.serialize_field("undecodable", &self.is_undecodable())?;
         o.end()
     }
 }

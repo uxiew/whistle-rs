@@ -57,11 +57,79 @@ pub struct PersistedSession {
     pub error: Option<super::outcome::Failure>,
 }
 
+/// A body preview as written to history: what the API showed for it, and the
+/// kept bytes when the text cannot carry them.
+///
+/// Every flag is written down rather than re-derived on load, because the state
+/// that decided it — the decoder, the cap — is not written; see
+/// [`Capture::restored`](super::Capture::restored).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BodySnapshot {
+    /// Raw (wire) bytes the body had.
     pub len: usize,
     pub truncated: bool,
+    /// The preview as text, or the `[binary, N bytes]` marker for a body that
+    /// is not text — what anything reading the file as text wants.
     pub text: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub binary: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub undecodable: bool,
+    /// The kept bytes, when `text` is not them: a body that is not text, or
+    /// text that is not UTF-8 (a GBK page). Absent when `text` is exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base64: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl BodySnapshot {
+    fn of(c: &super::Capture) -> Self {
+        use base64::Engine;
+        let (len, truncated, text) = c.snapshot();
+        let binary = c.is_binary();
+        let bytes = c.preview_bytes().bytes;
+        let exact = !binary && text.as_bytes() == bytes.as_ref();
+        BodySnapshot {
+            len,
+            truncated,
+            text,
+            binary,
+            undecodable: c.is_undecodable(),
+            base64: (!exact).then(|| base64::engine::general_purpose::STANDARD.encode(&bytes)),
+        }
+    }
+
+    /// Back into a capture. `content_type` is the one the session's headers
+    /// carry, which is where the live capture got it from too.
+    fn restore(self, content_type: Option<String>) -> super::Capture {
+        use base64::Engine;
+        let kept = self
+            .base64
+            .as_deref()
+            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok());
+        // A line written before the bytes were kept has only the marker for a
+        // body that is not text: none of that body was kept, and saying it was
+        // whole would make its marker its content.
+        let marker_only =
+            kept.is_none() && (self.binary || !super::is_textual(content_type.as_deref()));
+        let (bytes, truncated) = match (kept, marker_only) {
+            (Some(bytes), _) => (bytes, self.truncated),
+            (None, true) => (Vec::new(), self.len > 0),
+            (None, false) => (self.text.into_bytes(), self.truncated),
+        };
+        super::Capture::restored(&bytes, content_type, self.len, truncated, self.undecodable)
+    }
+}
+
+/// A header's value, by name in any case.
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
 }
 
 impl PersistedSession {
@@ -80,31 +148,17 @@ impl PersistedSession {
             rules: s.rules.clone(),
             req_headers: s.req_headers.clone(),
             res_headers: s.res_headers.clone(),
-            req_body_preview: s.req_body.as_ref().map(|c| {
-                let (len, truncated, text) = c.snapshot();
-                BodySnapshot {
-                    len,
-                    truncated,
-                    text,
-                }
-            }),
-            res_body_preview: s.res_body.as_ref().map(|c| {
-                let (len, truncated, text) = c.snapshot();
-                BodySnapshot {
-                    len,
-                    truncated,
-                    text,
-                }
-            }),
+            req_body_preview: s.req_body.as_ref().map(BodySnapshot::of),
+            res_body_preview: s.res_body.as_ref().map(BodySnapshot::of),
             timings: s.timings.clone(),
             error: s.error.get(),
         }
     }
 
-    /// Reconstruct a (partial) live [`Session`] from persisted data. Body
-    /// captures are rebuilt from the snapshot text so the UI can display them.
+    /// Reconstruct a (partial) live [`Session`] from persisted data.
     pub fn into_session(self) -> Session {
-        use super::Capture;
+        let req_type = header_value(&self.req_headers, "content-type");
+        let res_type = header_value(&self.res_headers, "content-type");
         Session {
             id: self.id,
             time_ms: self.time_ms,
@@ -119,22 +173,8 @@ impl PersistedSession {
             timings: self.timings,
             req_headers: self.req_headers,
             res_headers: self.res_headers,
-            req_body: self.req_body_preview.map(|snap| {
-                Capture::from_bytes(
-                    snap.text.as_bytes(),
-                    None,
-                    None,
-                    snap.text.len().max(snap.len),
-                )
-            }),
-            res_body: self.res_body_preview.map(|snap| {
-                Capture::from_bytes(
-                    snap.text.as_bytes(),
-                    None,
-                    None,
-                    snap.text.len().max(snap.len),
-                )
-            }),
+            req_body: self.req_body_preview.map(|snap| snap.restore(req_type)),
+            res_body: self.res_body_preview.map(|snap| snap.restore(res_type)),
             error: self
                 .error
                 .map(super::outcome::Outcome::failed)
@@ -354,6 +394,7 @@ fn prune_old_files(dir: &Path, retain_days: u32) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Capture;
     use super::*;
 
     #[test]
@@ -389,6 +430,9 @@ mod tests {
                 len: 5,
                 truncated: false,
                 text: "hello".into(),
+                binary: false,
+                undecodable: false,
+                base64: None,
             }),
             error: Some(super::super::outcome::Failure::new(
                 super::super::outcome::Phase::Connect,
@@ -410,6 +454,110 @@ mod tests {
         // an ordinary one would be the exact confusion the field exists to end.
         let failure = session.error.get().expect("the failure survives");
         assert_eq!(failure.phase, super::super::outcome::Phase::Connect);
+    }
+
+    /// A body as the console and the API show it, as `/body.bin` serves it and
+    /// as a replay would re-send it.
+    fn seen(c: &Capture) -> (serde_json::Value, Vec<u8>, &'static str) {
+        (
+            serde_json::to_value(c).unwrap(),
+            c.preview_bytes().bytes.to_vec(),
+            c.replay_body().kind(),
+        )
+    }
+
+    /// `c` as a response body, written to a history line and read back.
+    fn reloaded(c: Capture, content_type: &str) -> Capture {
+        let session = Session {
+            res_headers: vec![("content-type".into(), content_type.into())],
+            res_body: Some(c),
+            ..Session::default()
+        };
+        let line = serde_json::to_string(&PersistedSession::from_session(&session)).unwrap();
+        let back: PersistedSession = serde_json::from_str(&line).unwrap();
+        back.into_session().res_body.expect("the body comes back")
+    }
+
+    /// History used to keep only the preview's text and re-derive the rest on
+    /// load, and each derivation was wrong for some body: a PNG came back as
+    /// the text of its `[binary, N bytes]` marker, a GBK page as U+FFFD, a body
+    /// cut at the preview limit as whole (so a replay sent the prefix as the
+    /// body), and a whole gzipped body as cut short.
+    #[test]
+    fn a_body_reads_back_from_history_as_it_was_written() {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(b"{\"whole\":true}").unwrap();
+        let gz = gz.finish().unwrap();
+        let body = |bytes: &[u8], ct: &str, enc: Option<&str>, cap: usize| {
+            (
+                Capture::from_bytes(bytes, Some(ct.into()), enc, cap),
+                ct.to_string(),
+            )
+        };
+        let cases = [
+            ("whole text", body(b"hello", "text/plain", None, 64)),
+            (
+                "cut at the limit",
+                body(&[b'a'; 100], "text/plain", None, 10),
+            ),
+            (
+                "gzipped, whole",
+                body(&gz, "application/json", Some("gzip"), 64),
+            ),
+            (
+                "binary",
+                body(&[0x89, b'P', b'N', b'G', 0, 1, 2], "image/png", None, 64),
+            ),
+            (
+                "not UTF-8",
+                body(
+                    &[0xc4, 0xe3, 0xba, 0xc3],
+                    "text/html; charset=gbk",
+                    None,
+                    64,
+                ),
+            ),
+            (
+                "undecodable",
+                body(b"this is not gzip", "text/plain", Some("gzip"), 64),
+            ),
+        ];
+        for (name, (c, ct)) in cases {
+            let before = seen(&c);
+            assert_eq!(
+                before.0["undecodable"],
+                name == "undecodable",
+                "{name}: {}",
+                before.0
+            );
+            // A body that would not decode is short of itself: nothing after
+            // the failure was kept, whatever the limit.
+            let short = matches!(name, "cut at the limit" | "undecodable");
+            assert_eq!(before.0["truncated"], short, "{name}: {}", before.0);
+            assert_eq!(seen(&reloaded(c, &ct)), before, "{name}");
+        }
+    }
+
+    /// A line written before the bytes were kept has only the marker for a body
+    /// that is not text. It comes back as what it is — a binary body none of
+    /// which was kept — and not as a text body reading `[binary, 7 bytes]`.
+    #[test]
+    fn an_older_binary_body_comes_back_as_not_kept() {
+        let line = r#"{"id":1,"time_ms":0,"method":"GET","url":"http://a/","status":200,
+            "client_ip":null,"target":"a:80","duration_ms":1,
+            "res_headers":[["content-type","image/png"]],
+            "res_body_preview":{"len":7,"truncated":false,"text":"[binary, 7 bytes]"}}"#;
+        let back: PersistedSession = serde_json::from_str(line).expect("an older session");
+        let body = back.into_session().res_body.expect("body");
+        let (json, bytes, replay) = seen(&body);
+        assert_eq!(json["binary"], true, "{json}");
+        assert_eq!(json["truncated"], true, "none of it was kept: {json}");
+        assert_eq!(json["len"], 7, "{json}");
+        assert!(bytes.is_empty());
+        // Not "empty": that says the request had no body, and a replay would
+        // then report nothing amiss while sending none.
+        assert_eq!(replay, "partial");
     }
 
     /// A JSONL file written before `rules` existed still loads. Sessions are

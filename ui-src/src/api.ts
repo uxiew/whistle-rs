@@ -90,6 +90,11 @@ export interface BodyCapture {
    * that rule would drift. The bytes themselves come from `/body.bin`.
    */
   binary: boolean;
+  /**
+   * Undoing the body's `content-encoding` failed part-way, so `text` is what
+   * came out before it broke. `truncated` is set too; this says why.
+   */
+  undecodable: boolean;
 }
 
 /** The captured bytes of one body, as `/body.bin` hands them over. */
