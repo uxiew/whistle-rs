@@ -1,0 +1,6 @@
+compat.test/refused http://127.0.0.1:56126
+compat.test http://127.0.0.1:56125
+compat.test/text resHeaders://x-compat=1
+compat.test/sse resBody://replaced
+compat.test/badgz resReplace://gzip/zipped
+compat.test/valued resBody://{compat-token}

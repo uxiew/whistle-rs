@@ -1,0 +1,12 @@
+{
+  "groups": [
+    {
+      "name": "default",
+      "enabled": true
+    },
+    {
+      "name": "extra",
+      "enabled": false
+    }
+  ]
+}
