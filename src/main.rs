@@ -568,26 +568,8 @@ async fn main() -> Result<()> {
 
     let mut state = AppState::with_plugins(config, manager, ca, registry);
 
-    // Session persistence: load history and enable runtime writes.
     if state.config.persist_sessions {
-        let sessions_dir = state.config.sessions_dir();
-        let loaded = whistle_rs::proxy::persist::SessionStore::load(
-            &sessions_dir,
-            state.config.req_cache_size,
-            state.config.persist_days,
-        );
-        if !loaded.is_empty() {
-            let max_id = loaded.iter().map(|s| s.id).max().unwrap_or(0);
-            let mut q = state.sessions.lock().unwrap();
-            for s in loaded {
-                q.push_back(s);
-            }
-            state.set_next_id(max_id + 1);
-            tracing::info!("loaded {} sessions from disk", q.len());
-        }
-        let store =
-            whistle_rs::proxy::persist::SessionStore::new(sessions_dir, state.config.persist_days);
-        state.enable_persistence(store);
+        state.start_history();
     }
 
     let state = Arc::new(state);

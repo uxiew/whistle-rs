@@ -285,7 +285,11 @@ impl Builder {
             registry.register_rust(plugin);
         }
 
-        let state = Arc::new(AppState::with_plugins(config, rules, ca, registry));
+        let mut state = AppState::with_plugins(config, rules, ca, registry);
+        if state.config.persist_sessions {
+            state.start_history();
+        }
+        let state = Arc::new(state);
         if let Some(observer) = self.observer {
             state.observe(observer);
         }

@@ -272,6 +272,29 @@ impl AppState {
         self.session_store = Some(store);
     }
 
+    /// Bring back the sessions on disk that are within `persist_days`, and
+    /// write every session completed from now on — what `persist_sessions`
+    /// promises. Needs a tokio runtime: the writer is a task.
+    ///
+    /// One place for it, because there are two ways to start a proxy and the
+    /// embedding one did not do it at all: `.persist_sessions(true)` set the
+    /// flag and nothing read it.
+    pub fn start_history(&mut self) {
+        let dir = self.config.sessions_dir();
+        let loaded =
+            persist::SessionStore::load(&dir, self.config.req_cache_size, self.config.persist_days);
+        if !loaded.is_empty() {
+            let max_id = loaded.iter().map(|s| s.id).max().unwrap_or(0);
+            let mut q = self.sessions.lock().unwrap();
+            q.extend(loaded);
+            tracing::info!("loaded {} sessions from disk", q.len());
+            drop(q);
+            self.set_next_id(max_id + 1);
+        }
+        let store = persist::SessionStore::new(dir, self.config.persist_days);
+        self.enable_persistence(store);
+    }
+
     /// Set the next session ID counter (used after loading history).
     pub fn set_next_id(&self, id: u64) {
         self.next_id.store(id, Ordering::Relaxed);
