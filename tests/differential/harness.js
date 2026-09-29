@@ -14,7 +14,7 @@ const http = require('http');
 const path = require('path');
 const zlib = require('zlib');
 const { judge, fieldOf } = require('./declared.js');
-const { forVersion } = require('./whistle-pkg');
+const { forVersion, MEASURED } = require('./whistle-pkg');
 
 // Ports and corpus come from the environment so several benches can run at
 // once — one per area under audit — without colliding on a port or on a file.
@@ -95,7 +95,7 @@ const EXPECTED = [
     // and all seventeen body operators are in `pureResProtocols`, which the
     // request pass skips. So its own rewrite vanishes on a browser reload.
     id: 'cache-bust',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^req\.header\.(pragma|cache-control|if-none-match)$/,
     anyCase: 'every response-body operator busts the request cache here, in whichever corpus it appears',
     match: (p) => /req\.header\.(pragma|cache-control): whistle=undefined rs="no-cache"/.test(p)
@@ -110,7 +110,7 @@ const EXPECTED = [
     // whistle-rs marks every response it made itself, which is the whole point
     // of the header.
     id: 'x-server',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.header\.x-server$/,
     anyCase: 'every answer this port makes itself carries the header, whatever the rule',
     match: (p) => /res\.header\.x-server: whistle=("Whistle"|undefined) rs="whistle-rs"/.test(p),
@@ -123,7 +123,7 @@ const EXPECTED = [
     // neither, and `x-server` alone cannot tell it from an origin's own 502.
     // Only ever on this port's side, and only on a failed request.
     id: 'failure-headers',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.header\.x-whistle-rs-(error|session)$/,
     anyCase: 'every request that fails here gets them, in whichever corpus it fails',
     match: (p) => /res\.header\.x-whistle-rs-(error|session): whistle=undefined rs="/.test(p),
@@ -133,7 +133,7 @@ const EXPECTED = [
     // The `Server` header a served local file carries (`file-proxy.js:315-318`).
     // Same header, same reason as above: naming whistle would be a lie.
     id: 'server',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.header\.server$/,
     anyCase: 'any case that serves a local file',
     match: (p) => /res\.header\.server: whistle="Whistle" rs="whistle-rs"/.test(p),
@@ -143,7 +143,7 @@ const EXPECTED = [
     // Both fail to find the file and say so; only the wording differs, and
     // matching another program's error prose is not worth pinning.
     id: 'not-found-prose',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.body$/,
     anyCase: 'any file-family or value case can end in this 404; the match requires whistle\'s own wording',
     match: (p) => /res\.body: whistle="Not found (file|key) /.test(p),
@@ -156,7 +156,7 @@ const EXPECTED = [
     // Node sends them regardless. With `TE: trailers` the two agree exactly —
     // origin trailers forwarded, `trailers://` merged over the top.
     id: 'trailers-need-te',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.trailer\./,
     anyCase: 'a property of the two HTTP servers, not of any rule; a case that sends TE: trailers compares them',
     match: (p) => /^res\.trailer\./.test(p),
@@ -168,7 +168,7 @@ const EXPECTED = [
     // no headers, no body. This port tries zlib first and raw second, and
     // answers.
     id: 'raw-deflate',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /./,
     cases: /raw-deflate/,
     match: (p) => /whistle=(0|undefined|"ERR HUNG")/.test(p),
@@ -182,7 +182,7 @@ const EXPECTED = [
     // header misdescribes. This port refuses the force instead — see
     // `coding::reencode`.
     id: 'forced-coding-undecodable',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.(body|header\.content-encoding)$/,
     rules: /enable:\/\/(gzip|br|deflate)/,
     match: (p) => /res\.body: whistle="<undecodable (gzip|br|deflate)>"/.test(p)
@@ -194,7 +194,7 @@ const EXPECTED = [
     // which has no body to encode. This port sets the header from the bytes
     // that actually went out.
     id: 'forced-coding-no-body',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.header\.content-encoding$/,
     rules: /enable:\/\/(gzip|br|deflate)/,
     match: (p) => /res\.header\.content-encoding: whistle="(gzip|br|deflate)" rs=undefined/.test(p),
@@ -207,7 +207,7 @@ const EXPECTED = [
     // `charset=` and leaves an undeclared non-UTF-8 body alone. Documented in
     // docs/RULES.md.
     id: 'charset-guess',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.body$/,
     anyCase: 'any text rewrite of the one origin body that is not UTF-8 (/notutf8); the match requires its bytes',
     match: (p) => /res\.body: whistle="X.*INAL"/.test(p),
@@ -220,7 +220,7 @@ const EXPECTED = [
     // bytes, corrupting a body it could not read. This port decodes it, rewrites
     // it, and puts the origin's own spelling of the header back.
     id: 'x-gzip',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.body$/,
     anyCase: 'any rewrite of the x-gzip origin body; the match requires whistle to have failed to decode it',
     match: (p) => /res\.body: whistle="<undecodable x-gzip>"/.test(p),
@@ -232,7 +232,7 @@ const EXPECTED = [
     // the response is forwarded byte-complete but unrewritten. Measured at the
     // boundary: identical at 16,777,199 bytes, diverging at 16,777,299.
     id: 'rewrite-ceiling',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^res\.body$/,
     cases: /over the rewrite ceiling/,
     match: () => true,
@@ -248,7 +248,7 @@ const EXPECTED = [
     // and "whistle reset the connection, this port said 200" anywhere else is
     // exactly the difference a real regression would make.
     id: 'rawfile-no-status-line',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^(status|res\.body)$/,
     rules: /rawfile:\/\//,
     match: (p) => /status: whistle=0 rs=200/.test(p)
@@ -263,7 +263,7 @@ const EXPECTED = [
     // mangles. The cases that exercise them carry this header and no other case
     // uses it; `cases-patterns.js` names all three at the top.
     id: 'pattern-deviations',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^req\.header\.x-pattern-dev$/,
     rules: /x-pattern-dev/,
     match: () => true,
@@ -276,7 +276,7 @@ const EXPECTED = [
     // with it. Declared in `docs/RULES.md`; the cases that exercise it carry
     // this header and no other case uses it.
     id: 'host-filter',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^req\.header\.x-host-filter$/,
     rules: /x-host-filter/,
     match: () => true,
@@ -292,7 +292,7 @@ const EXPECTED = [
     // and this port's is the error chain as plain text, the same pair
     // `cases-proxy.js` declares for every other gateway error.
     id: 'not-a-transport',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /^(res\.body|res\.header\.content-type)$/,
     cases: /^doc: (ws|wss|tunnel|location):\/\/ is not a transport/,
     match: () => true,
@@ -306,7 +306,7 @@ const EXPECTED = [
     // mock, no replacement for `replaceStatus://` — which is upstream's own
     // `rule || 200` applied to a case upstream never reaches.
     id: 'unusable-status',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /./,
     cases: /^unusable status value:/,
     match: () => true,
@@ -319,7 +319,7 @@ const EXPECTED = [
     // Measured for `GET;`, a JSON object and a block of lines; a value that
     // *is* a token — including an unknown verb and digits — agrees.
     id: 'unusable-method',
-    upstream: '2.10.8',
+    upstream: MEASURED,
     fields: /./,
     cases: /^unusable method value:/,
     match: () => true,

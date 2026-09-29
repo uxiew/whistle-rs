@@ -31,12 +31,16 @@ function fieldOf(problem) {
   return m ? m[1] : problem.split(': ')[0];
 }
 
-const { forVersion } = require('./whistle-pkg');
+const { forVersion, MEASURED } = require('./whistle-pkg');
 
-const UPSTREAM = '2.10.8';
+/**
+ * One declared difference, measured against every release in `MEASURED`. The
+ * full reasoning lives in the corpus header `why` points at.
+ */
+const d = (name, fields, why) => ({ case: name, fields, upstream: MEASURED, why });
 
-/** One declared difference. The full reasoning lives in the corpus header `why` points at. */
-const d = (name, fields, why) => ({ case: name, fields, upstream: UPSTREAM, why });
+/** One that only some releases have: upstream changed its answer between them. */
+const only = (versions, name, fields, why) => ({ case: name, fields, upstream: versions, why });
 
 // Shared reasons, each written once.
 const GATEWAY = 'a 502 on both sides; only the page differs — whistle\'s is HTML holding a Node stack '
@@ -69,6 +73,13 @@ const DECLARED = {
     // on the session (docs/API.md, 没生效的规则; docs/RULES.md).
     d('resReplace on a zstd page', ['res.body'],
       'a coding this port cannot undo is forwarded untouched and the session says so; upstream rewrites it as if uncompressed'),
+    // 2.10.8 classifies by substring with `xml` ahead of `image/`, so an SVG
+    // is text and the substitution runs, here and there. 2.10.10 checks
+    // `image/` first (avwo/whistle@ca15b3f) and leaves it alone. Kept at
+    // 2.10.8's answer: recolouring an icon is a real use, and following would
+    // make a matching rule do nothing without a word.
+    only(['2.10.10'], 'resReplace on an svg image', ['res.body'],
+      'an SVG is text here, as in 2.10.8; 2.10.10 counts it as an image and skips text operators. STATUS, U1'),
   ],
 
   'cases-delete.js': [
@@ -76,11 +87,11 @@ const DECLARED = {
       'upstream appends the query twice (/?a=1?a=1), a request line no origin parses. Header'),
     ...['delete bare body on a post', 'delete res.body empties the response',
       'delete res.body discards resBody the operator', 'delete res.body discards resPrepend and resAppend']
-      .map((n) => d(n, ['res.body'], 'EMPTY_BUFFER is undefined in 2.10.8, so upstream forwards the real body; '
+      .map((n) => d(n, ['res.body'], 'EMPTY_BUFFER is undefined in 2.10.8 and 2.10.10, so upstream forwards the real body; '
         + 'delete://body asks for an empty one and gets it here. Header')),
     ...['delete req.body on a post', 'delete req.body discards reqBody the operator',
       'delete req.body discards reqPrepend and reqAppend']
-      .map((n) => d(n, ['req.body'], 'EMPTY_BUFFER is undefined in 2.10.8, so upstream forwards the real body; '
+      .map((n) => d(n, ['req.body'], 'EMPTY_BUFFER is undefined in 2.10.8 and 2.10.10, so upstream forwards the real body; '
         + 'delete://body asks for an empty one and gets it here. Header')),
   ],
 
@@ -99,6 +110,10 @@ const DECLARED = {
       'an https:// file source against a plaintext origin: whistle fetches it anyway, this port refuses. Header'),
     d('angle brackets name a path, not a url', ['status', 'res.header.server', 'res.header.content-type', 'res.body'],
       '<…> names a path here and is fetched by upstream when the pattern leaves nothing to append. Header'),
+    // The same reclassification as cases-bodies' SVG case: `isText` is false
+    // for an image, so 2.10.10 serves the file without a charset.
+    only(['2.10.10'], 'file svg content type', ['res.header.content-type'],
+      'an SVG is text here, as in 2.10.8, and carries charset=utf-8; 2.10.10 counts it as an image. STATUS, U1'),
   ],
 
   'cases-flags.js': [
@@ -190,6 +205,32 @@ const DECLARED = {
       + 'hyper refuses it. See the case\'s comment'),
     d('json5: an unquoted dashed key on trailers', ['res.header.trailer'],
       'the same {x-t header name on the trailer road. See the case\'s comment'),
+  ],
+
+  'frames-bench.js': [
+    // With a separator header and no enable://captureStream, 2.10.10 frames a
+    // GET's response anyway: it no longer records that a bodiless request was
+    // sent before the response arrives, and its capture code reads "request
+    // still streaming" into that (data.js, `requestTime == null`). Measured
+    // with the capture code instrumented. Its changelog and FAQ still ask for
+    // the flag, and so does this port.
+    only(['2.10.10'], 'a response separator without the flag', ['frames'],
+      'a side effect in 2.10.10, not a change it announced; the flag is still required here. STATUS, U1'),
+    // 2.10.9 frames an event stream whose type carries a parameter; 2.10.8
+    // compared the header whole. This port follows the newer answer.
+    only(['2.10.8'], 'an event stream with a charset parameter', ['frames'],
+      'fixed upstream in 2.10.9 (text/event-stream; charset=utf-8); followed here. STATUS, U1'),
+  ],
+
+  'ws-bench.js': [
+    // Up to 2.10.9, a client's frame on a plain WebSocket went to
+    // handleSendToClientFrame — the other direction's handler — so a script
+    // for the client's frames did nothing and one with both handlers applied
+    // the wrong one. 2.10.10 fixed it (avwo/whistle#1358); this port always
+    // routed frames by direction.
+    ...['a frame script with both handlers', 'a frame script for the client\'s frames only']
+      .map((n) => only(['2.10.8'], n, ['origin', 'back'],
+        '2.10.8 hands a client frame to the handler for server frames; fixed in 2.10.10, and right here. ws-bench.js header')),
   ],
 
   'write-bench.js': [

@@ -21,6 +21,15 @@ const path = require('path');
 /** The version `package.json` locks — the one every declaration was first measured on. */
 const BASELINE = require('./package.json').dependencies.whistle;
 
+/**
+ * Every release the **whole** bench has been run against, each declaration
+ * checked on each (U1, 2026-09-29: none of 2.10.8's went stale on 2.10.10).
+ * Adding a release here is a claim about every entry that does not say
+ * otherwise, so it comes after that release's `--assume-baseline` run, not
+ * before.
+ */
+const MEASURED = [BASELINE, '2.10.10'];
+
 const dir = (() => {
   const asked = process.env.WHISTLE_PKG
     ? path.resolve(process.env.WHISTLE_PKG)
@@ -50,8 +59,8 @@ const ASSUME_BASELINE = process.env.DIFF_ASSUME_BASELINE === '1';
  *
  * An entry's `upstream` is the version, or the list of versions, whose answer it
  * was measured against; `'any'` is for a divergence that is about this port
- * alone (a proxy naming itself, a clock read twice). An entry without one was
- * written before there were two versions, and means `BASELINE`.
+ * alone (a proxy naming itself, a clock read twice). An entry without one means
+ * `MEASURED`; one that holds for some releases only says which.
  *
  * An entry for another version is left out entirely — it neither excuses a
  * difference nor counts as stale. So a run against a version no one has
@@ -59,11 +68,11 @@ const ASSUME_BASELINE = process.env.DIFF_ASSUME_BASELINE === '1';
  */
 function forVersion(entries) {
   return entries.filter((e) => {
-    const u = e.upstream === undefined ? BASELINE : e.upstream;
+    const u = e.upstream === undefined ? MEASURED : e.upstream;
     if (u === 'any') return true;
     const measured = Array.isArray(u) ? u : [u];
     return measured.includes(version) || (ASSUME_BASELINE && measured.includes(BASELINE));
   });
 }
 
-module.exports = { dir, version, BASELINE, ASSUME_BASELINE, forVersion };
+module.exports = { dir, version, BASELINE, MEASURED, ASSUME_BASELINE, forVersion };
