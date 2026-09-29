@@ -1,8 +1,8 @@
 # 自有 HTTP API
 
-基线：`702486d` / 2026-09-25，2026-09-28 按 S1 更新访问规则。接口来自 `src/proxy/webui.rs`，现有调用与类型见 `ui-src/src/api.ts`。
+基线：`702486d` / 2026-09-25，2026-09-28 按 S1 更新访问规则，2026-09-29 按 O1 补上失败会话。接口来自 `src/proxy/webui.rs`，现有调用与类型见 `ui-src/src/api.ts`。
 
-这是 whistle-rs 的控制接口，**不是官方 `/cgi-bin/*` 或 Node Local Agent API 的兼容层**。以下是现有路由与主要参数，不代表已承诺独立稳定的版本化 API；错误模型、分页和诊断补强见 [ROADMAP.md](ROADMAP.md) 的 O1/O2。
+这是 whistle-rs 的控制接口，**不是官方 `/cgi-bin/*` 或 Node Local Agent API 的兼容层**。以下是现有路由与主要参数，不代表已承诺独立稳定的版本化 API；分页、检索字段等补强见 [ROADMAP.md](ROADMAP.md) 的 O2。
 
 ## 地址与认证
 
@@ -41,6 +41,46 @@ curl --noproxy '*' 'http://127.0.0.1:8899/session.json?id=1'
 
 Body 详情包含 `len`、`truncated`、`text`、`binary`。`len` 不是可下载预览的保证长度；二进制内容取 `/body.bin`，不要把 `text` 中的标记当原始字节。
 
+## 失败的请求
+
+**每个经过代理的请求记一条会话，只记一次，失败的也记。** 没完成的请求多一个字段：
+
+```json
+{ "id": 12, "status": 502, "target": "127.0.0.1:9",
+  "error": { "phase": "connect", "message": "connecting to 127.0.0.1:9: Connection refused (os error 61)" } }
+```
+
+`phase` 是请求停在哪一步，取值和各自的意思见 [Cookbook 的排查一节](COOKBOOK.zh-CN.md#规则不生效时)；`message` 是完整的错误链，和客户端收到的 502 正文是同一段。`error` 出现在 `/sessions.json` 的行上（没有失败的行不带这个字段）、`/session.json` 详情里、磁盘历史里；HAR 导出写成 Chrome 导出用的 `_error` 字符串，形如 `"connect: connecting to …"`。
+
+本代理替失败的请求生成的响应是 `502`，带两个头：
+
+| 头 | 值 |
+| --- | --- |
+| `x-whistle-rs-error` | 停在哪一步，同 `error.phase` |
+| `x-whistle-rs-session` | 记成的会话号，拿它查 `/session.json?id=N` |
+
+**判断一个 502 是谁回的，看有没有 `x-whistle-rs-error`**：没有就是源站自己回的，那条会话也没有 `error`。`x-server: whistle-rs` 分不出来 —— `statusCode://502` 这类规则回的也带它。规则主动丢弃的请求（`enable://abort` 等）不回任何响应，会话的 `phase` 是 `abort`、`status` 是 `0`。
+
+**一条会话什么时候出现、什么时候算完成：**
+
+- 响应头一到就出现在列表里，这时 body 可能还在传。本地应答的、失败的，出现时就已完成。
+- body 传完、出错或客户端中途离开，才算完成。**完成时才写进磁盘历史，嵌入 API 的 `on_session` 也在这时调用**，每条只调一次。所以历史里存的是完整的 body 预览和全部耗时阶段；中途断掉的会在这时补上 `response` 或 `client`。
+- 一直不结束的流（长连着的 SSE）结束前不会写盘；代理进程被直接杀掉时，这类还开着的会话不会进历史。
+- WebSocket 握手完成就算完成，之后的帧另外记（`/frames.json`），不属于会话本身。
+
+**各入口的范围：**
+
+| 入口 | 记什么 |
+| --- | --- |
+| 普通 HTTP 代理请求 | 每个请求一条，失败的也有 |
+| 解密的 HTTPS（MITM） | 隧道里每个请求各一条，和普通请求一样。隧道本身没有自己的一条 —— 除非 TLS 握手就失败了：客户端不接受本代理的证书时，记一条 `CONNECT`，`phase` 是 `client-tls` |
+| 不解密转发的隧道（`disable://intercept`、`--no-intercept-https`、非 HTTP 流量） | 一条 `CONNECT`，Policy（`target`）末尾带 `(tunnel)`，状态 `200`；连不上远端时按 `dns`/`connect`/`proxy` 记失败。隧道里的内容不读 |
+| SOCKS5 入口 | 和 CONNECT 隧道走同一段代码，记法相同 |
+| WebSocket | 握手一条；握手转发失败按普通请求记失败 |
+| Composer / Replay | 请求从代理自己的端口发出，按普通请求记会话，失败的也记。接口接下任务就回答（Composer 回 `ok`，Replay 回 `replayed`），不等请求结果，也不返回会话号：去列表里找最新的那条 |
+
+不记的只有三种：控制台自己的请求、`enable://hide` 命中的请求、客户端开了隧道一个字节没发就关掉的（什么都没请求）。
+
 ## 规则与 Values
 
 除特别注明外，写接口的请求体是 JSON。服务端不检查 `Content-Type`；防跨站靠的是上面的 `Origin` 检查，不是内容类型。
@@ -78,7 +118,7 @@ Body 详情包含 `len`、`truncated`、`text`、`binary`。`len` 不是可下�
 | `POST /api/ws/release` | `{ "id": 1, "dir": "send" }`；方向为 send/receive，按该方向批量放行 |
 | `POST /api/ws/send` | `{ "id": 1, "dir": "send", "data": "hello" }`；确实向活动连接发送数据 |
 
-Composer/Replay 的调用会产生网络请求并经过代理规则；不能当作只读查询。Composer 接受任务的响应不是源站已经成功完成的证明，应结合流量结果和日志判断。重复调用执行接口可能重复产生业务副作用，当前不要假定提供幂等键。
+Composer/Replay 的调用会产生网络请求并经过代理规则；不能当作只读查询。Composer 接受任务的响应不是源站已经成功完成的证明：结果看它在列表里的那条会话，失败时那条会话的 `error` 说明原因。重复调用执行接口可能重复产生业务副作用，当前不要假定提供幂等键。
 
 ## 启动辅助与插件页面
 
