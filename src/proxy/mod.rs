@@ -2987,7 +2987,7 @@ pub(crate) mod tunnel_abort_tests {
         rules: &str,
         plugins: crate::plugins::Plugins,
     ) -> (Arc<AppState>, SocketAddr) {
-        serve_state(state_with_plugins(rules, plugins)).await
+        serve(state_with_plugins(rules, plugins)).await
     }
 
     /// [`proxy_with`], with the config adjusted by `tweak`.
@@ -2995,7 +2995,7 @@ pub(crate) mod tunnel_abort_tests {
         rules: &str,
         tweak: impl FnOnce(&mut crate::config::Config),
     ) -> (Arc<AppState>, SocketAddr) {
-        serve_state(state_with_config(
+        serve(state_with_config(
             rules,
             crate::plugins::Plugins::new(),
             tweak,
@@ -3004,7 +3004,7 @@ pub(crate) mod tunnel_abort_tests {
     }
 
     /// Serve `state` on an ephemeral port.
-    async fn serve_state(state: Arc<AppState>) -> (Arc<AppState>, SocketAddr) {
+    pub(crate) async fn serve(state: Arc<AppState>) -> (Arc<AppState>, SocketAddr) {
         let (listener, addr) = bind(&state).await.expect("bind");
         let serving = state.clone();
         tokio::spawn(async move {
@@ -4244,6 +4244,31 @@ struct ResHooks<'a> {
     req_id: u64,
     /// The client address, as the request hook reported it.
     client_ip: Option<String>,
+    /// Where a hook that failed is noted — the ledger's list, so it reaches
+    /// the session. See [`plugin_hook_failed`].
+    notes: Option<&'a mut Vec<unapplied::Unapplied>>,
+}
+
+/// A plugin hook that failed, as the session records it: the `plugin://` or
+/// `pipe://` operators naming that plugin did not take effect in that hook.
+fn plugin_hook_failed(
+    resolved: &Resolved,
+    name: &str,
+    hook: &str,
+    why: &str,
+) -> Option<unapplied::Unapplied> {
+    unapplied::Unapplied::over(
+        &matched_ops(resolved),
+        |op| {
+            matches!(op.protocol.as_str(), "plugin" | "pipe")
+                && crate::plugins::match_name(&op.value, op.protocol == "pipe").as_deref()
+                    == Some(name)
+        },
+        unapplied::Kind::PluginFailed,
+        format!(
+            "plugin {name}'s {hook} hook failed ({why}); the request went on as if it had said nothing"
+        ),
+    )
 }
 
 /// Serve an [`auth`](crate::plugins::auth) gate's refusal exactly as the gate
@@ -4299,7 +4324,7 @@ async fn finish_local_response(
     merged_rules: &[crate::rules::RuleManager],
     is_internal_req: bool,
     res: Response<Bytes>,
-    hooks: ResHooks<'_>,
+    mut hooks: ResHooks<'_>,
 ) -> (Response<DynBody>, Option<Capture>) {
     let (mut parts, bytes) = res.into_parts();
     resolve_response_phase(
@@ -4346,11 +4371,16 @@ async fn finish_local_response(
             param: param.clone(),
             body: None,
         };
-        if let Some(result) = state.plugins.on_response(name, &pres).await
-            && let Some(new) = apply_plugin_res_result(&mut parts, result)
-        {
-            bytes = Bytes::from(new);
-            hook_replaced = true;
+        if let Some(result) = state.plugins.on_response(name, &pres).await {
+            if let Some(why) = &result.hook_failed
+                && let Some(notes) = hooks.notes.as_deref_mut()
+            {
+                notes.extend(plugin_hook_failed(resolved, name, "response", why));
+            }
+            if let Some(new) = apply_plugin_res_result(&mut parts, result) {
+                bytes = Bytes::from(new);
+                hook_replaced = true;
+            }
         }
     }
 
@@ -4438,11 +4468,16 @@ async fn finish_local_response(
                 param: param.clone(),
                 body: Some(new.to_vec()),
             };
-            if let Some(result) = state.plugins.on_response(name, &pres).await
-                && let Some(replaced) = apply_plugin_res_result(&mut parts, result)
-            {
-                new = Bytes::from(replaced);
-                hook_replaced = true;
+            if let Some(result) = state.plugins.on_response(name, &pres).await {
+                if let Some(why) = &result.hook_failed
+                    && let Some(notes) = hooks.notes.as_deref_mut()
+                {
+                    notes.extend(plugin_hook_failed(resolved, name, "response", why));
+                }
+                if let Some(replaced) = apply_plugin_res_result(&mut parts, result) {
+                    new = Bytes::from(replaced);
+                    hook_replaced = true;
+                }
             }
         }
         let new = inject_res_body(state, &mut parts, new, &ops, info);
@@ -5166,6 +5201,9 @@ async fn serve(
             let Some(result) = state.plugins.on_request(name, &preq).await else {
                 continue;
             };
+            if let Some(why) = &result.hook_failed {
+                ledger.unapplied(plugin_hook_failed(&resolved, name, "request", why));
+            }
             if let Some(rules) = result.rules {
                 merged_rules.push(apply::merge_rules_text(
                     &mut resolved,
@@ -5216,6 +5254,7 @@ async fn serve(
                             pipes: &pipe_matches,
                             req_id: plugin_req_id,
                             client_ip: client_ip.clone(),
+                            notes: Some(&mut ledger.unapplied),
                         },
                     )
                     .await
@@ -5349,6 +5388,7 @@ async fn serve(
                 pipes: &pipe_matches,
                 req_id: plugin_req_id,
                 client_ip: client_ip.clone(),
+                notes: Some(&mut ledger.unapplied),
             },
         )
         .await;
@@ -5862,10 +5902,13 @@ async fn serve(
             param: param.clone(),
             body: None,
         };
-        if let Some(result) = state.plugins.on_response(name, &pres).await
-            && let Some(new) = apply_plugin_res_result(&mut parts, result)
-        {
-            plugin_res_override = Some(new);
+        if let Some(result) = state.plugins.on_response(name, &pres).await {
+            if let Some(why) = &result.hook_failed {
+                ledger.unapplied(plugin_hook_failed(&resolved, name, "response", why));
+            }
+            if let Some(new) = apply_plugin_res_result(&mut parts, result) {
+                plugin_res_override = Some(new);
+            }
         }
     }
 
@@ -6068,10 +6111,13 @@ async fn serve(
                 param: param.clone(),
                 body: Some(new.to_vec()),
             };
-            if let Some(result) = state.plugins.on_response(name, &pres).await
-                && let Some(replaced) = apply_plugin_res_result(&mut parts, result)
-            {
-                new = Bytes::from(replaced);
+            if let Some(result) = state.plugins.on_response(name, &pres).await {
+                if let Some(why) = &result.hook_failed {
+                    ledger.unapplied(plugin_hook_failed(&resolved, name, "response", why));
+                }
+                if let Some(replaced) = apply_plugin_res_result(&mut parts, result) {
+                    new = Bytes::from(replaced);
+                }
             }
         }
         let new = inject_res_body(&state, &mut parts, new, &ops, &info);
@@ -7907,6 +7953,7 @@ mod local_response_tests {
                     pipes: &pipes,
                     req_id: 7,
                     client_ip: Some("127.0.0.1".to_string()),
+                    notes: None,
                 },
             )
             .await;

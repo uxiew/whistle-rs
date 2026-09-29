@@ -380,3 +380,69 @@ async fn a_cipher_pin_that_cannot_be_used_is_named() {
     ask(proxy, &format!("http://{plain}/x"), "", b"").await;
     assert!(session(&state).await.unapplied.is_empty());
 }
+
+/// A plugin whose hooks fail — here each answers with an error status — is
+/// passed by: the request goes on as if the hooks had said nothing. That was a
+/// `debug` log line; each failure is now on the session, naming the plugin's
+/// operator and the hook.
+#[tokio::test]
+async fn a_plugin_hook_that_fails_is_named() {
+    let plugin = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let reply = if head.starts_with("GET /manifest") {
+                        let m = r#"{"name":"p","version":"1","hooks":["request","response"]}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{m}",
+                            m.len()
+                        )
+                    } else if head.starts_with("POST /request") {
+                        "HTTP/1.1 500 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into()
+                    } else {
+                        "HTTP/1.1 503 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into()
+                    };
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    };
+    let site = origin(TEXT, b"from the origin".to_vec()).await;
+    let mut plugins = crate::plugins::Plugins::new();
+    plugins.register_remote("p", &plugin.to_string());
+    let rules = format!("http://{site} plugin://p");
+    let state = super::tunnel_abort_tests::state_with_config(&rules, plugins, |_| {});
+    let (state, proxy) = super::tunnel_abort_tests::serve(state).await;
+    let (head, body) = ask(proxy, &format!("http://{site}/x"), "", b"").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"from the origin");
+    let s = session(&state).await;
+    let hooks: Vec<(Kind, &[String], bool, bool)> = s
+        .unapplied
+        .iter()
+        .map(|u| {
+            (
+                u.kind,
+                u.ops.as_slice(),
+                u.reason.contains("request hook") && u.reason.contains("500"),
+                u.reason.contains("response hook") && u.reason.contains("503"),
+            )
+        })
+        .collect();
+    let op = ["plugin://p".to_string()];
+    assert_eq!(
+        hooks,
+        [
+            (Kind::PluginFailed, &op[..], true, false),
+            (Kind::PluginFailed, &op[..], false, true),
+        ],
+        "{:?}",
+        s.unapplied
+    );
+}

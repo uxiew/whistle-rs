@@ -435,6 +435,10 @@ pub struct PluginResult {
     /// refused. The request's session carries it as a failure, where a refusal
     /// is the plugin's answer and is not one.
     pub failure: Option<String>,
+    /// Why the request hook itself failed — unreachable, an error status, no
+    /// answer within [`HOOK_TIMEOUT`] — when it did. The request goes on as if
+    /// the hook had said nothing, and the session says it did not run.
+    pub hook_failed: Option<String>,
 }
 
 /// What a plugin's response hook returns. All fields optional — an empty result
@@ -445,6 +449,23 @@ pub struct PluginResResult {
     pub set_headers: Vec<(String, String)>,
     pub remove_headers: Vec<String>,
     pub body: Option<Vec<u8>>,
+    /// Why the response hook failed, when it did — see
+    /// [`PluginResult::hook_failed`].
+    pub hook_failed: Option<String>,
+}
+
+/// How long a request or response hook may take before the request goes on
+/// without it.
+///
+/// There was no bound: a plugin that accepted the call and never answered held
+/// the request forever, while the documentation said a timeout was treated as
+/// "no-op". Longer than the gates' 5 s ([`auth::AUTH_TIMEOUT`]), because these
+/// hooks may be handed a whole body to work on.
+pub const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The plugin name a `plugin://` or `pipe://` rule value names, if any.
+pub fn match_name(value: &str, via_pipe: bool) -> Option<String> {
+    parse_match(value, via_pipe).map(|m| m.name)
 }
 
 impl PluginResResult {
@@ -547,6 +568,8 @@ pub struct RemotePlugin {
     /// Fetched lazily on first use — a plugin spawned alongside us may not be
     /// listening yet at registration time.
     manifest: OnceCell<PluginManifest>,
+    /// [`HOOK_TIMEOUT`], except in a test that cannot wait thirty seconds.
+    hook_timeout: std::time::Duration,
 }
 
 impl RemotePlugin {
@@ -560,6 +583,7 @@ impl RemotePlugin {
             name: name.into(),
             base_url: base,
             manifest: OnceCell::new(),
+            hook_timeout: HOOK_TIMEOUT,
         }
     }
 
@@ -661,8 +685,12 @@ impl RemotePlugin {
         }
 
         let mut result = match self.post(path, &payload.to_string()).await {
-            Some(bytes) => parse_request_result(&bytes),
-            None => PluginResult::default(),
+            Ok(Some(bytes)) => parse_request_result(&bytes),
+            Ok(None) => PluginResult::default(),
+            Err(why) => PluginResult {
+                hook_failed: Some(why),
+                ..Default::default()
+            },
         };
         // The gate's headers go on first, so a plugin's own request hook can
         // still override what its auth hook set — the narrower hook wins.
@@ -728,30 +756,33 @@ impl RemotePlugin {
         }
 
         match self.post("/response", &payload.to_string()).await {
-            Some(bytes) => parse_response_result(&bytes),
-            None => PluginResResult::default(),
+            Ok(Some(bytes)) => parse_response_result(&bytes),
+            Ok(None) => PluginResResult::default(),
+            Err(why) => PluginResResult {
+                hook_failed: Some(why),
+                ..Default::default()
+            },
         }
     }
 
-    /// POST to the plugin, returning a body only when there is one to act on.
+    /// POST to a hook: `Ok(Some(body))` for a `200` to act on, `Ok(None)` for
+    /// the idiomatic `204`/`304` "nothing to do", and `Err` saying why for
+    /// anything else — unreachable, another status, no answer within
+    /// [`HOOK_TIMEOUT`].
     ///
-    /// Collapses every other outcome — transport error, non-200, the idiomatic
-    /// `204`/`304` "nothing to do" — into `None`, because for these hooks they
-    /// all mean the same thing: leave the request alone.
-    async fn post(&self, path: &str, body: &str) -> Option<bytes::Bytes> {
-        match self.post_status(path, body).await {
-            Ok((200, bytes)) => Some(bytes),
-            Ok((status, _)) => {
-                if status != 204 && status != 304 {
-                    tracing::debug!("plugin {} {path} returned status {status}", self.name);
-                }
-                None
-            }
-            Err(e) => {
-                tracing::debug!("plugin {} {path} failed: {e:#}", self.name);
-                None
-            }
-        }
+    /// The request goes on without the hook either way; the difference is that
+    /// a failure is recorded on its session, where "nothing to do" is not.
+    async fn post(&self, path: &str, body: &str) -> Result<Option<bytes::Bytes>, String> {
+        let why = match tokio::time::timeout(self.hook_timeout, self.post_status(path, body)).await
+        {
+            Ok(Ok((200, bytes))) => return Ok(Some(bytes)),
+            Ok(Ok((204 | 304, _))) => return Ok(None),
+            Ok(Ok((status, _))) => format!("answered {status}"),
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(_) => format!("no answer within {:?}", self.hook_timeout),
+        };
+        tracing::debug!("plugin {} {path} failed: {why}", self.name);
+        Err(why)
     }
 
     /// POST to the plugin, retrying briefly: a freshly spawned plugin process
@@ -823,6 +854,7 @@ fn parse_request_result(bytes: &[u8]) -> PluginResult {
         // route with a verdict of its own.
         blocked: false,
         failure: None,
+        hook_failed: None,
     }
 }
 
@@ -848,6 +880,7 @@ fn parse_response_result(bytes: &[u8]) -> PluginResResult {
         set_headers: parse_headers_value(v.get("setHeaders")),
         remove_headers: parse_string_list(v.get("removeHeaders")),
         body,
+        hook_failed: None,
     }
 }
 
@@ -1667,6 +1700,44 @@ mod tests {
             assert!(out.rules.is_none(), "a blocked request gets no rules");
             // The request hook must not have run behind a failed gate.
             assert!(!fake.paths().iter().any(|p| p == "/request"));
+        });
+    }
+
+    /// A request hook that accepts the call and never answers is given up on,
+    /// and the request goes on: there was no bound at all, and such a plugin
+    /// held every request it matched for as long as it stayed silent.
+    #[test]
+    fn a_hook_that_never_answers_is_given_up_on() {
+        rt().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = l.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        if buf[..n].starts_with(b"GET /manifest") {
+                            let m = r#"{"name":"p","version":"1","hooks":["request"]}"#;
+                            let reply = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{m}",
+                                m.len()
+                            );
+                            let _ = sock.write_all(reply.as_bytes()).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                }
+            });
+            let mut plugin = RemotePlugin::new("p", &addr.to_string());
+            plugin.hook_timeout = std::time::Duration::from_millis(200);
+            let started = std::time::Instant::now();
+            let out = plugin.on_request(&req()).await;
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            let why = out.hook_failed.expect("the silence is reported");
+            assert!(why.contains("no answer within"), "{why}");
+            assert!(out.response.is_none() && out.rules.is_none(), "and nothing applied");
         });
     }
 
