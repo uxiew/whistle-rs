@@ -3132,8 +3132,12 @@ async fn resolve_response_phase(
     // The same map the request pass used. Reading `state.values` alone here made
     // a response-phase operator the only place a ``` block in the rules text was
     // invisible, so `resBody://{mock} includeFilter://s:404` served the six
-    // characters `{mock}`.
-    let values = effective_values(state);
+    // characters `{mock}` — and the values a produced text carries are part of
+    // it, or its response-phase lines would lose them.
+    let mut values = effective_values(state);
+    for mgr in merged {
+        values.extend(mgr.carried_values().clone());
+    }
     // Rules merged in mid-request get the same second pass. Upstream re-resolves
     // its `pRules`/`fRules`/`hRules` here too
     // (`_original/lib/plugins/index.js:1326-1335`); each manager answers from
@@ -3174,7 +3178,8 @@ async fn resolve_response_phase(
     // It substitutes against `values`, the same map every other pass here uses.
     // Reading `state.values` directly is what made a response-phase operator the
     // one place a ``` block in the rules text was invisible.
-    if apply::merge_res_rules(resolved, info, &values, is_internal_req) {
+    if let Some(carried) = apply::merge_res_rules(resolved, info, &values, is_internal_req) {
+        values.extend(carried);
         apply::substitute_values(resolved, &values, tpl_ctx(&host, state.config.port, info));
         apply::substitute_config_vars(resolved, state.config.port, crate::config::VERSION);
         added = true;
@@ -4386,6 +4391,9 @@ async fn serve(
         apply::substitute_values(&mut resolved, &values, tpl);
         let mut managers =
             apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
+        for mgr in &managers {
+            values.extend(mgr.carried_values().clone());
+        }
         apply::substitute_values(&mut resolved, &values, tpl);
         // Kept for the response phase, exactly as upstream re-resolves `hRules`
         // there (`_original/lib/plugins/index.js:1326-1335`).

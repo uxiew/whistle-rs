@@ -1332,6 +1332,10 @@ pub struct RuleManager {
     /// `rulesFile://` and a plugin's rules are parsed into, and the mode has
     /// nothing to say about those.
     default_group_only: bool,
+    /// The values private to a text produced mid-request, under the scope its
+    /// operators answer to — see [`RuleManager::adopt_scope`]. Empty for every
+    /// long-lived rule set.
+    carried_values: HashMap<String, String>,
 }
 
 impl RuleManager {
@@ -1345,6 +1349,7 @@ impl RuleManager {
             groups: Vec::new(),
             includes: include::Includes::default(),
             default_group_only: false,
+            carried_values: HashMap::new(),
         }
     }
 
@@ -1357,6 +1362,7 @@ impl RuleManager {
             groups: Vec::new(),
             includes: include::Includes::resolving(),
             default_group_only: false,
+            carried_values: HashMap::new(),
         }
     }
 
@@ -1391,6 +1397,39 @@ impl RuleManager {
         {
             op.group = group.clone();
         }
+    }
+
+    /// Give a text produced mid-request — by a `rulesFile://`, or by a script —
+    /// values of its own: `values` first, what a script set, then the text's
+    /// own ``` blocks over them, all filed under `scope`, which its operators
+    /// then answer to.
+    ///
+    /// Upstream's `resolveRulesFile` parses the produced text into a rule set
+    /// constructed with the script's `values` (`_original/lib/rules/index.js:520-529`),
+    /// and `Rules#parse` lifts the text's blocks and lays them over those
+    /// (`rules.js:2033-2059`). That set is its own: the including file's blocks
+    /// are not in it. `scope` has to be one no rules file uses, so that none of
+    /// theirs can answer.
+    ///
+    /// The caller lays [`carried_values`](Self::carried_values) into the map it
+    /// substitutes against — in the request pass and again in the response pass.
+    pub fn adopt_scope(&mut self, scope: &str, values: HashMap<String, String>) {
+        let mut carried: HashMap<String, String> = values
+            .into_iter()
+            .map(|(name, value)| (inline_key(&name, scope), value))
+            .collect();
+        for (key, value) in self.inline_values() {
+            if let Some(name) = inline_key_name(&key) {
+                carried.insert(inline_key(name, scope), value);
+            }
+        }
+        self.carried_values = carried;
+        self.adopt_group(Some(Arc::from(scope)));
+    }
+
+    /// See [`adopt_scope`](Self::adopt_scope).
+    pub fn carried_values(&self) -> &HashMap<String, String> {
+        &self.carried_values
     }
 
     /// Does this rule set resolve `@` lines? Answered before anything is spent

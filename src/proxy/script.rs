@@ -199,10 +199,11 @@ pub struct RulesScriptRes<'a> {
 /// * **an error discards everything** — a script that pushes a rule and then
 ///   throws produces no rules at all, because `execScriptSync` returns
 ///   `undefined` from its catch and the caller turns that into `''`;
-/// * **`values` set by the script do not resolve `{name}` references in the
-///   rules it pushed** — whistle sends the literal `{name}` through. The
-///   `values` global exists here so a script writing to it does not throw, and
-///   is then ignored, which is the measured behaviour.
+/// * **what the script sets on `values` answers the `{name}` references in the
+///   rules it pushed**, and nothing else's — see [`produce_rules`]. (This used to
+///   say the opposite, from a probe that wrote `x-v={m}`: a reference only
+///   resolves as the *whole* operator value, so that line proved nothing, and
+///   upstream's own suite — `test/units/script.test.js` — asks exactly this.)
 ///
 /// Omitted from the context, and what that costs: `Buffer`, `decodeBuffer`,
 /// `encodeString` and `encodingExists` — the four that exist to move bytes
@@ -212,6 +213,24 @@ pub struct RulesScriptRes<'a> {
 /// `docs/RULES.md`. `pattern` is `''` because a resolved operator does not
 /// carry the pattern that matched it in this port.
 pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String> {
+    produce_rules(src, input).map(|produced| produced.rules)
+}
+
+/// What a rules script left behind.
+pub struct Produced {
+    /// The lines it pushed, joined — upstream's `rules.join('\n').trim()`.
+    pub rules: String,
+    /// What it set on `values`, private to `rules`: upstream parses the pushed
+    /// text into a rule set constructed with them (`resolveRulesFile`,
+    /// `_original/lib/rules/index.js:520-529`), and this port gives the text a
+    /// scope of its own ([`crate::rules::RuleManager::adopt_scope`]). An object
+    /// is its JSON, as `getValueFor` serialises one (`rules.js:785-796`); `null`
+    /// and `undefined` are no entry.
+    pub values: HashMap<String, String>,
+}
+
+/// [`run_rules_script`], with the values the script set.
+pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> {
     let mut ctx = Context::default();
 
     let headers: serde_json::Map<String, serde_json::Value> = input
@@ -399,7 +418,26 @@ pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String>
             other => other.to_string(),
         })
         .collect();
-    Some(lines.join("\n").trim().to_string())
+    let values = ctx
+        .global_object()
+        .get(js_string!("values"), &mut ctx)
+        .ok()
+        .and_then(|v| v.to_json(&mut ctx).ok().flatten());
+    let values = match values {
+        Some(serde_json::Value::Object(map)) => map
+            .into_iter()
+            .filter_map(|(name, value)| match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some((name, s)),
+                other => Some((name, other.to_string())),
+            })
+            .collect(),
+        _ => HashMap::new(),
+    };
+    Some(Produced {
+        rules: lines.join("\n").trim().to_string(),
+        values,
+    })
 }
 
 /// What a `frameScript` decided about one frame.

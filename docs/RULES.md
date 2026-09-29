@@ -752,13 +752,30 @@ contain.
 not answered by it, and another group's block of the same name cannot shadow it —
 the name is filed under `key + '\n\r' + <group>` and looked up that way, which is
 upstream's `getInlineKey` / `getValueFor` (`util/index.js:205-209`,
-`rules.js:785-796`). Rules **produced** mid-request — by a `rule://`, a
-`rulesFile://`, a `resRules://` or a plugin — belong to no group at all and see
-the [values store](#flags-includes--values) alone, as they do upstream: the
-produced text is parsed into a rule set of its own, and the naming file's blocks
-live in a different one. So a block three lines above a `reqRules://` does not
-reach what that line produces. The *name* on the line itself is read where it was
-written, so `rule://more` beside a ```` ```more ```` block still finds it.
+`rules.js:785-796`). Rules **produced** mid-request are parsed into a rule set
+of their own, and the naming file's blocks live in a different one — so a block
+three lines above a `reqRules://` does not reach what that line produces. What a
+`rulesFile://`/`reqScript://` family text or a `resRules://`/`resScript://` one
+*can* read, besides the [values store](#flags-includes--values), is its own:
+
+- the ``` blocks inside the produced text itself;
+- what the script that produced it set on `values` (an object as its JSON) —
+  the text's own blocks win over those.
+
+````
+```mock.js
+values.body = 'from the script';
+rules.push('example.com resBody://{body}');
+```
+example.com reqScript://{mock.js}
+````
+
+That is upstream's `resolveRulesFile`, which constructs the produced rule set with
+the script's `values` and lets `Rules#parse` lay the text's blocks over them
+(`rules/index.js:520-529`, `rules.js:2033-2059`) — measured on both proxies. A
+`rule://` text and a plugin's rules read the store alone. The *name* on the
+including line is read where it was written, so `rule://more` beside a block
+fenced as ```` ```more ```` still finds it.
 
 **A block beats a values store entry of the same name**, as it does upstream —
 `getValueFor` asks the inline map first and falls back to the store. Values set
@@ -1898,9 +1915,10 @@ empty strings in the request pass. `render` is whistle's own `<% … %>` /
 `<%= … %>` micro-template (`rules/index.js:304-347`), ported as the same source
 transformation.
 
-Divergences, all measured: a `values` object the script writes does **not**
-resolve `{name}` references in the rules it pushed (upstream sends the literal
-`{name}` too); the context omits `Buffer`, `decodeBuffer`, `encodeString` and
+What the script writes to `values` answers the `{name}` references in the rules
+it pushed — see [Values declared in the rules text](#values-declared-in-the-rules-text).
+
+Divergences, all measured: the context omits `Buffer`, `decodeBuffer`, `encodeString` and
 `encodingExists`, the four that move bytes between encodings, so a script
 calling one throws here and produces nothing where upstream would have run it;
 `isLocalAddress` knows the loopback range, the unspecified addresses and this

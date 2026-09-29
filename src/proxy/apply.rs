@@ -686,6 +686,7 @@ pub fn merge_included_rules(
     // of `extra` as a path, found nothing, and silently produced no rules at
     // all — the value form of the whole family (`reqRules`, `rulesFile`,
     // `ruleFile`, `ruleScript`, `rulesScript`, `reqScript`) was inert.
+    let mut script_values = HashMap::new();
     let joined = rules_file_ops(resolved)
         .iter()
         .filter_map(|op| match op.value_is_content {
@@ -699,54 +700,60 @@ pub fn merge_included_rules(
         // contributes nothing, not even the lines it pushed before throwing.
         .filter_map(|text| match crate::proxy::script::is_rules_content(&text) {
             true => Some(text),
-            false => crate::proxy::script::run_rules_script(
-                &text,
-                &crate::proxy::script::RulesScriptCtx {
-                    method: &info.method,
-                    full_url: &info.full_url,
-                    headers: &info.headers,
-                    body: info.req_body.as_deref().unwrap_or(""),
-                    client_ip: info.client_ip.as_deref(),
-                    client_port: info.client_port,
-                    res: None,
-                    values,
-                },
-            ),
+            false => {
+                let produced = crate::proxy::script::produce_rules(
+                    &text,
+                    &crate::proxy::script::RulesScriptCtx {
+                        method: &info.method,
+                        full_url: &info.full_url,
+                        headers: &info.headers,
+                        body: info.req_body.as_deref().unwrap_or(""),
+                        client_ip: info.client_ip.as_deref(),
+                        client_port: info.client_port,
+                        res: None,
+                        values,
+                    },
+                )?;
+                script_values.extend(produced.values);
+                Some(produced.rules)
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if !joined.trim().is_empty() {
-        texts.push(joined);
+    let mut managers = Vec::new();
+    for text in texts {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(&text);
+        // What `rule://<name>` pulls in belongs to no group's ``` blocks — not
+        // the throwaway manager's own `default` (a different text sharing a
+        // name with the console's Default), and not the group of the line that
+        // named it; it reads the shared store alone. The *name of the entry*
+        // is read from the including line's own text, which is where it was
+        // written. Done before either resolution, so the response pass over
+        // the same manager agrees. See [`RuleManager::adopt_group`].
+        mgr.adopt_group(None);
+        merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+        managers.push(mgr);
     }
-    texts
-        .into_iter()
-        .map(|text| {
-            let mut mgr = RuleManager::new();
-            mgr.set_text(&text);
-            // The operators this text produces belong to no group's ``` blocks —
-            // not the throwaway manager's own `default` (which is a different
-            // text sharing a name with the console's Default) and **not the
-            // group of the line that pulled them in**. Measured, because reading
-            // `toPrivateValues(vals, rule.file)` at `_original/lib/rules/index.js:525`
-            // suggests the opposite: upstream re-keys the produced text's *own*
-            // values under the including file, but the including file's inline
-            // map lives in a different `Rules` instance and the produced manager
-            // never sees it. A rules text that declares `{mock}` and produces a
-            // rule using it gets nothing there; this port used to serve it, from
-            // whichever group happened to declare that name.
-            //
-            // The `rule://<name>` lookup above is a different question and does
-            // use the group: the *name of the entry to pull in* is read from the
-            // including line's own text, which is where it was written.
-            //
-            // Done before either resolution, so the response pass over the same
-            // manager agrees. See [`RuleManager::adopt_group`].
-            mgr.adopt_group(None);
-            merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
-            mgr
-        })
-        .collect()
+    if !joined.trim().is_empty() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(&joined);
+        // The produced text answers its `{name}` from values of its own: what a
+        // script set, and its own ``` blocks over them — and not from the
+        // including file's blocks, which live in a different rule set upstream
+        // (measured, both halves). The caller lays them into its map from
+        // [`RuleManager::carried_values`].
+        mgr.adopt_scope(PRODUCED_SCOPE, script_values);
+        merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+        managers.push(mgr);
+    }
+    managers
 }
+
+/// The private scope a request's `rulesFile://` text answers its `{name}` in —
+/// see [`RuleManager::adopt_scope`]. A request has at most one such text, and no
+/// rules file can be called this.
+const PRODUCED_SCOPE: &str = "\u{1}rulesFile";
 
 /// The `rulesFile://` operators whose contents make up the included rules text.
 pub fn rules_file_ops(resolved: &Resolved) -> Vec<&RuleOp> {
@@ -791,12 +798,15 @@ pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
 /// `{name}` and inline forms and a path otherwise, exactly as
 /// [`merge_included_rules`] reads its own. Nothing here was applied before —
 /// `resRules://` parsed, resolved, and then went nowhere.
+///
+/// `None` when nothing was merged; otherwise the values the merged texts carry,
+/// for the caller to lay into the map it substitutes against.
 pub fn merge_res_rules(
     resolved: &mut Resolved,
     info: &ReqInfo,
     values: &HashMap<String, String>,
     is_internal_req: bool,
-) -> bool {
+) -> Option<HashMap<String, String>> {
     let texts = accumulated_script_ops(resolved, "resScript", "resRules")
         .into_iter()
         .filter_map(|op| {
@@ -818,7 +828,7 @@ pub fn merge_res_rules(
                         server_ip: r.server_ip.as_deref(),
                         headers: &r.headers,
                     });
-                return crate::proxy::script::run_rules_script(
+                let produced = crate::proxy::script::produce_rules(
                     &text,
                     &crate::proxy::script::RulesScriptCtx {
                         method: &info.method,
@@ -830,19 +840,20 @@ pub fn merge_res_rules(
                         res,
                         values,
                     },
-                );
+                )?;
+                return Some((produced.rules, produced.values));
             }
-            (raw_protocol(op) == Some("resRules")).then_some(text)
+            (raw_protocol(op) == Some("resRules")).then(|| (text, HashMap::new()))
         })
         .collect::<Vec<_>>();
-    let mut merged = false;
-    for text in texts {
+    let mut carried: Option<HashMap<String, String>> = None;
+    for (i, (text, script_values)) in texts.into_iter().enumerate() {
         let mut mgr = RuleManager::new();
         mgr.set_text(&text);
-        // Produced rules belong to no group's ``` blocks, as an included text
-        // does not — see [`merge_included_rules`] and
-        // [`RuleManager::adopt_group`].
-        mgr.adopt_group(None);
+        // Values of its own, as a request-phase produced text has — see
+        // [`merge_included_rules`]. One scope per text: upstream parses each
+        // into a rule set of its own.
+        mgr.adopt_scope(&format!("\u{1}resRules {i}"), script_values);
         // Both passes, as the top-level rules get: a `resHeaders://x=1
         // includeFilter://s:404` line inside the text is withheld by the first
         // and answered by the second.
@@ -862,9 +873,11 @@ pub fn merge_res_rules(
             continue;
         }
         merge_resolved(resolved, sub);
-        merged = true;
+        carried
+            .get_or_insert_with(HashMap::new)
+            .extend(mgr.carried_values().clone());
     }
-    merged
+    carried
 }
 
 /// The entries upstream keeps for `rulesFile` / `resScript`
@@ -10163,6 +10176,84 @@ mod tests {
         );
         assert_eq!(header.as_deref(), Some("inner"));
         assert_eq!(resolved.value("host"), Some("9.9.9.9"));
+    }
+
+    /// A produced text answers its `{name}` from values of its own: what the
+    /// script that produced it set on `values`, with the text's own ``` blocks
+    /// laid over them — never from the including text's blocks. Each half
+    /// measured against whistle 2.10.8; upstream's own suite asks the first
+    /// (`test/units/script.test.js`), where this port served a 404.
+    #[test]
+    fn a_produced_text_answers_from_its_own_values() {
+        let body_of = |text: &str, status: Option<u16>| {
+            let mut mgr = RuleManager::new();
+            mgr.set_text(text);
+            let mut info = build_req_info(
+                "GET",
+                "http",
+                "example.com",
+                80,
+                "/x",
+                &HeaderMap::new(),
+                None,
+            );
+            let mut resolved = mgr.resolve(&info);
+            let mut values = mgr.inline_values();
+            fn tpl(info: &ReqInfo) -> TplCtx<'_> {
+                TplCtx {
+                    info,
+                    env: test_env(),
+                }
+            }
+            substitute_values(&mut resolved, &values, tpl(&info));
+            let merged = merge_included_rules(&mut resolved, &info, &values, false);
+            for m in &merged {
+                values.extend(m.carried_values().clone());
+            }
+            substitute_values(&mut resolved, &values, tpl(&info));
+            if let Some(status) = status {
+                info.res = Some(build_res_info(status, &HeaderMap::new(), None, None));
+                if let Some(carried) = merge_res_rules(&mut resolved, &info, &values, false) {
+                    values.extend(carried);
+                }
+                substitute_values(&mut resolved, &values, tpl(&info));
+            }
+            resolved.value("resBody").map(str::to_string)
+        };
+        let f = "```";
+        let script =
+            |body: &str, how: &str| format!("{f}s.js\n{body}\n{f}\nexample.com {how}://{{s.js}}\n");
+        // What the script set…
+        let set = "values.v = 'FROM-SCRIPT'; rules.push('example.com resBody://{v}');";
+        assert_eq!(
+            body_of(&script(set, "reqScript"), None).as_deref(),
+            Some("FROM-SCRIPT")
+        );
+        // …an object as its JSON…
+        let object = "values.o = {a: 1}; rules.push('example.com resBody://{o}');";
+        assert_eq!(
+            body_of(&script(object, "reqScript"), None).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        // …and in the response phase too, for a `resScript` that produces rules.
+        assert_eq!(
+            body_of(&script(set, "resScript"), Some(200)).as_deref(),
+            Some("FROM-SCRIPT")
+        );
+        // The produced text's own block beats what the script set.
+        let block = "values.v = 'FROM-SCRIPT'; rules.push('```v'); \
+                     rules.push('FROM-BLOCK'); rules.push('```'); \
+                     rules.push('example.com resBody://{v}');";
+        assert_eq!(
+            body_of(&script(block, "reqScript"), None).as_deref(),
+            Some("FROM-BLOCK")
+        );
+        // The including text's block is not the produced text's to read.
+        let unseen = format!(
+            "{f}v\nFROM-INCLUDING\n{f}\n{}",
+            script("rules.push('example.com resBody://{v}');", "reqScript")
+        );
+        assert_eq!(body_of(&unseen, None).as_deref(), Some("{v}"));
     }
 
     /// `reqRules://{name}` names a **value**, not a path, and every other
