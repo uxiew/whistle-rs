@@ -1,0 +1,11 @@
+# Link the C runtime into the Windows binary instead of loading it from
+# VCRUNTIME140.dll. That DLL comes with the Visual C++ Redistributable, not
+# with Windows, so a whistle-rs.exe copied to a machine that never installed
+# the redistributable would stop before main with "VCRUNTIME140.dll was not
+# found". CI checks the release binary no longer names the DLL (ci.yml,
+# "platforms").
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
