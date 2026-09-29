@@ -1,7 +1,7 @@
 //! The response head: `apply_response` and everything it applies that is not a
 //! body, a cookie, CORS or caching — status codes and `userLogin`, `disable://`
 //! on response properties, `showHost`, `responseFor`, `attachment`, `csp`, and
-//! the `x-whistle-rule` report of which rules matched.
+//! the `x-whistle-matched-rules` report of which rules matched.
 
 use super::*;
 
