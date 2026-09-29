@@ -797,30 +797,68 @@ fn sessions_json(state: &Arc<AppState>) -> Response<DynBody> {
         .unwrap()
 }
 
-/// A captured body as a HAR field carries it: `(size, text, base64)`.
-///
+/// A captured body as a HAR field carries it.
+#[derive(Default)]
+struct HarBody {
+    /// The whole body's (wire) size, which the kept part may fall short of.
+    size: usize,
+    text: String,
+    /// `text` is the kept bytes, base64-encoded.
+    base64: bool,
+    /// Why `text` is not the whole body, when it is not — for HAR's own
+    /// `comment` field, which is the one a viewer shows.
+    short: Option<String>,
+}
+
 /// A body that is not text goes out **base64-encoded**, which is what HAR 1.2
 /// defines `content.encoding` for. Until this did that, a binary body was
 /// exported as the console's own `[binary, N bytes]` marker, written into the
 /// `text` field where every tool that reads a HAR would take it for the body —
-/// a sentence delivered as if it were an image.
+/// a sentence delivered as if it were an image. Text that is not UTF-8 goes
+/// the same way: as `text` it would be U+FFFD.
 ///
 /// The same key is used on `postData`, which HAR 1.2 does not define it for. It
 /// is the least surprising extension available: a reader that ignores it still
 /// receives the body, recoverable, rather than a sentence that never was one.
-fn har_body(cap: Option<&Capture>) -> (usize, String, bool) {
+fn har_body(cap: Option<&Capture>) -> HarBody {
     let Some(cap) = cap else {
-        return (0, String::new(), false);
+        return HarBody::default();
     };
-    let (len, _, text) = cap.snapshot();
-    if !cap.is_binary() {
-        return (len, text, false);
+    let (size, truncated, text) = cap.snapshot();
+    let bytes = cap.preview_bytes().bytes;
+    let short = truncated.then(|| match cap.is_undecodable() {
+        true => format!(
+            "whistle-rs: its content-encoding would not decode; this is the {} bytes that came out before it broke",
+            bytes.len()
+        ),
+        false => format!(
+            "whistle-rs kept {} of {size} bytes; the rest was not captured",
+            bytes.len()
+        ),
+    });
+    if !cap.is_binary() && text.as_bytes() == bytes.as_ref() {
+        return HarBody {
+            size,
+            text,
+            base64: false,
+            short,
+        };
     }
-    let encoded = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        cap.preview_bytes().bytes,
-    );
-    (len, encoded, true)
+    HarBody {
+        size,
+        text: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+        base64: true,
+        short,
+    }
+}
+
+/// The two keys that say a HAR body is not the whole body: `comment` for a
+/// person, `_truncated` for a program. Absent from a body that is whole.
+fn har_mark_short(field: &mut serde_json::Value, body: &HarBody) {
+    if let (Some(why), Some(obj)) = (&body.short, field.as_object_mut()) {
+        obj.insert("comment".into(), serde_json::json!(why));
+        obj.insert("_truncated".into(), serde_json::json!(true));
+    }
 }
 
 /// One HAR 1.2 entry for one session. Separate from [`sessions_har`] so the
@@ -844,17 +882,26 @@ fn har_entry(s: &Session) -> serde_json::Value {
         false => serde_json::Value::Null,
     };
 
-    let (req_len, req_text, req_b64) = har_body(s.req_body.as_ref());
-    let (res_len, res_text, res_b64) = har_body(s.res_body.as_ref());
-    let post_data = if req_len > 0 {
+    let req = har_body(s.req_body.as_ref());
+    let res = har_body(s.res_body.as_ref());
+    let (req_len, res_len) = (req.size, res.size);
+    let mut post_data = if req_len > 0 {
         serde_json::json!({
             "mimeType": mime_of(&s.req_headers),
-            "text": req_text,
-            "encoding": encoding(req_b64),
+            "text": req.text,
+            "encoding": encoding(req.base64),
         })
     } else {
         serde_json::Value::Null
     };
+    har_mark_short(&mut post_data, &req);
+    let mut content = serde_json::json!({
+        "size": res_len,
+        "mimeType": mime_of(&s.res_headers),
+        "text": res.text,
+        "encoding": encoding(res.base64),
+    });
+    har_mark_short(&mut content, &res);
     serde_json::json!({
         "startedDateTime": super::iso8601_utc(s.time_ms),
         "time": s.duration_ms,
@@ -875,12 +922,7 @@ fn har_entry(s: &Session) -> serde_json::Value {
             "httpVersion": "HTTP/1.1",
             "cookies": [],
             "headers": har_headers(&s.res_headers),
-            "content": {
-                "size": res_len,
-                "mimeType": mime_of(&s.res_headers),
-                "text": res_text,
-                "encoding": encoding(res_b64),
-            },
+            "content": content,
             "redirectURL": "",
             "headersSize": -1,
             "bodySize": res_len,
@@ -2701,6 +2743,76 @@ mod body_tests {
         let post = &har_entry(&s)["request"]["postData"];
         assert_eq!(post["text"], r#"{"name":"third"}"#);
         assert!(post["encoding"].is_null());
+    }
+
+    /// A body the capture holds only part of is exported as that part — and
+    /// says so. It used to go out with the whole body's `size` beside a prefix
+    /// in `text` and nothing else, which every HAR reader takes for the body.
+    #[test]
+    fn a_body_that_was_not_all_kept_says_so_in_the_export() {
+        let cut = Session {
+            res_headers: vec![("content-type".into(), "text/plain".into())],
+            res_body: Some(Capture::from_bytes(
+                &[b'a'; 100],
+                Some("text/plain".into()),
+                None,
+                10,
+            )),
+            ..session("https://example.com/big.txt", 1)
+        };
+        let content = &har_entry(&cut)["response"]["content"];
+        assert_eq!(content["size"], 100);
+        assert_eq!(content["text"], "a".repeat(10));
+        assert_eq!(content["_truncated"], true);
+        let comment = content["comment"].as_str().expect("a comment");
+        assert!(comment.contains("10 of 100 bytes"), "{comment}");
+
+        let broken = Session {
+            req_headers: vec![("content-type".into(), "text/plain".into())],
+            req_body: Some(Capture::from_bytes(
+                b"this is not gzip",
+                Some("text/plain".into()),
+                Some("gzip"),
+                64,
+            )),
+            ..session("https://example.com/upload", 2)
+        };
+        let post = &har_entry(&broken)["request"]["postData"];
+        assert_eq!(post["_truncated"], true);
+        let comment = post["comment"].as_str().expect("a comment");
+        assert!(comment.contains("would not decode"), "{comment}");
+
+        let whole = &har_entry(&session("https://example.com/", 3))["response"]["content"];
+        assert!(whole.get("_truncated").is_none(), "{whole}");
+        assert!(whole.get("comment").is_none(), "{whole}");
+    }
+
+    /// Text that is not UTF-8 — a GBK page — goes out as its bytes, base64, as
+    /// a binary body does. As `text` it would be U+FFFD, which no reader can
+    /// turn back into the page.
+    #[test]
+    fn text_that_is_not_utf8_is_exported_as_its_bytes() {
+        let gbk = [0xc4, 0xe3, 0xba, 0xc3];
+        let s = Session {
+            res_headers: vec![("content-type".into(), "text/html; charset=gbk".into())],
+            res_body: Some(Capture::from_bytes(
+                &gbk,
+                Some("text/html; charset=gbk".into()),
+                None,
+                64,
+            )),
+            ..session("https://example.com/gbk.html", 1)
+        };
+        let content = &har_entry(&s)["response"]["content"];
+        assert_eq!(content["encoding"], "base64");
+        assert_eq!(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                content["text"].as_str().unwrap()
+            )
+            .unwrap(),
+            gbk
+        );
     }
 
     /// A session with no bodies still exports, with the fields a HAR requires
