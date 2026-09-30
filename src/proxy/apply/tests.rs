@@ -3999,7 +3999,9 @@ fn a_directory_rule_maps_the_rest_of_the_path_onto_it() {
         Some((status, body))
     };
 
-    let rules = format!("static.test file://{}\n", dir.trim_end_matches('/'));
+    // `join("")` ends the path in a separator, `\` on Windows; either one
+    // would turn the rule into the index-serving form tested last.
+    let rules = format!("static.test file://{}\n", dir.trim_end_matches(['/', '\\']));
     assert_eq!(
         served(&rules, "http://static.test/js/app.js"),
         Some((200, b"console.log(1)".to_vec()))
