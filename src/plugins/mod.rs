@@ -28,9 +28,14 @@
 //!   "requestBody": false, "responseBody": true }
 //! ```
 //!
-//! A plugin that does not serve `/manifest` is treated as **protocol v1**:
-//! request hook only, no bodies, dispatched to `POST /`. Existing plugins
-//! therefore keep working untouched.
+//! A plugin that does not serve `/manifest` — it answers the route with `404` —
+//! is treated as **protocol v1**: request hook only, no bodies, dispatched to
+//! `POST /`. Existing plugins therefore keep working untouched.
+//!
+//! Anything else that is not a manifest — no answer, a `5xx`, a body that is
+//! not a JSON object — is **not** v1. It is a plugin whose capabilities are
+//! unknown, and the requests matched against it are blocked until it says what
+//! it is: see [`RemotePlugin::manifest`].
 //!
 //! The hooks fall into families, and which family runs is chosen by the *rule*,
 //! not the plugin:
@@ -222,6 +227,12 @@ impl PluginManifest {
     /// Parse a manifest document; every missing field defaults to "not supported".
     fn parse(name: &str, bytes: &[u8]) -> Option<Self> {
         let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        // `"ok"` and `[]` are JSON too, and every lookup below would answer
+        // "not declared" for them — a manifest declaring nothing, where the
+        // truth is that the plugin said something unintelligible.
+        if !v.is_object() {
+            return None;
+        }
         let hooks: Vec<String> = v
             .get("hooks")
             .and_then(|h| h.as_array())
@@ -463,6 +474,19 @@ pub struct PluginResResult {
 /// hooks may be handed a whole body to work on.
 pub const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a plugin has to answer `GET /manifest`. The gate's own budget: an
+/// unanswered manifest blocks the request just as an unanswered verdict does.
+const MANIFEST_TIMEOUT: std::time::Duration = auth::AUTH_TIMEOUT;
+
+/// How long a manifest fetch that learned nothing is remembered before the
+/// plugin is asked again.
+///
+/// One request asks several times — does any plugin want the body, then the
+/// request phase itself — and a plugin that accepts connections and never
+/// answers would otherwise cost each of them [`MANIFEST_TIMEOUT`]. Short,
+/// because the other side of it is how long a recovered plugin stays blocked.
+const MANIFEST_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The plugin name a `plugin://` or `pipe://` rule value names, if any.
 pub fn match_name(value: &str, via_pipe: bool) -> Option<String> {
     parse_match(value, via_pipe).map(|m| m.name)
@@ -566,8 +590,14 @@ pub struct RemotePlugin {
     name: String,
     base_url: String,
     /// Fetched lazily on first use — a plugin spawned alongside us may not be
-    /// listening yet at registration time.
+    /// listening yet at registration time. Set only by a fetch that learned
+    /// something; see [`RemotePlugin::manifest`].
     manifest: OnceCell<PluginManifest>,
+    /// The last fetch that learned nothing, and when. Answers the callers that
+    /// ask again within [`MANIFEST_RETRY`] without dialling the plugin again.
+    manifest_failed: std::sync::Mutex<Option<(std::time::Instant, String)>>,
+    /// [`MANIFEST_RETRY`], except in a test of recovery.
+    manifest_retry: std::time::Duration,
     /// [`HOOK_TIMEOUT`], except in a test that cannot wait thirty seconds.
     hook_timeout: std::time::Duration,
 }
@@ -583,54 +613,109 @@ impl RemotePlugin {
             name: name.into(),
             base_url: base,
             manifest: OnceCell::new(),
+            manifest_failed: std::sync::Mutex::new(None),
+            manifest_retry: MANIFEST_RETRY,
             hook_timeout: HOOK_TIMEOUT,
         }
     }
 
-    /// The plugin's manifest, fetched once and cached. A plugin that does not
-    /// serve `/manifest` (or is unreachable) is treated as protocol v1.
-    async fn manifest(&self) -> &PluginManifest {
-        self.manifest
-            .get_or_init(|| async {
-                match upstream::simple_get(&format!("{}/manifest", self.base_url)).await {
-                    Ok((200, bytes)) => match PluginManifest::parse(&self.name, &bytes) {
-                        Some(m) => {
-                            tracing::info!(
-                                "plugin {} manifest: request={} response={} reqBody={} resBody={}",
-                                self.name,
-                                m.on_request,
-                                m.on_response,
-                                m.request_body,
-                                m.response_body,
-                            );
-                            if m.has_pipe_hook() {
-                                tracing::info!(
-                                    "plugin {} streaming hooks: pipeRequest={} pipeResponse={}",
-                                    self.name,
-                                    m.pipe_request,
-                                    m.pipe_response
-                                );
-                            }
-                            if m.ws_frame {
-                                tracing::info!("plugin {} hooks WebSocket frames", self.name);
-                            }
-                            m
-                        }
-                        None => {
-                            tracing::warn!(
-                                "plugin {} served an unparseable manifest; assuming v1",
-                                self.name
-                            );
-                            PluginManifest::v1_fallback(&self.name)
-                        }
-                    },
-                    _ => {
-                        tracing::debug!("plugin {} has no manifest; assuming v1", self.name);
-                        PluginManifest::v1_fallback(&self.name)
-                    }
+    /// The plugin's manifest: fetched on first use, cached once it is known,
+    /// and `Err` saying why while it is not.
+    ///
+    /// Three answers, and only two of them are knowledge:
+    ///
+    /// * `200` with a JSON object — the manifest. Cached for good.
+    /// * `404` — the plugin has no such route, which is what protocol v1 looks
+    ///   like. Cached for good as [`PluginManifest::v1_fallback`].
+    /// * anything else — refused connection, no answer in [`MANIFEST_TIMEOUT`],
+    ///   a `5xx`, a body that is not a JSON object — is **not cached as
+    ///   anything**. The plugin is asked again, at most once per
+    ///   [`MANIFEST_RETRY`].
+    ///
+    /// The third used to be cached as v1, forever. A plugin that declares
+    /// `auth` and answered its first `/manifest` with a `503` — still starting,
+    /// briefly overloaded — was from then on a plugin with no gate: every
+    /// request it was matched against went to the origin, and `/auth` was never
+    /// called again, however healthy the plugin became. The gate's own
+    /// fail-closed rule ([`auth`]) was sound and unreachable.
+    async fn manifest(&self) -> Result<&PluginManifest, String> {
+        if let Some(known) = self.manifest.get() {
+            return Ok(known);
+        }
+        if let Some((at, why)) = self.manifest_failed.lock().unwrap().as_ref()
+            && at.elapsed() < self.manifest_retry
+        {
+            return Err(why.clone());
+        }
+        match self.manifest.get_or_try_init(|| self.discover()).await {
+            Ok(known) => {
+                *self.manifest_failed.lock().unwrap() = None;
+                Ok(known)
+            }
+            Err(why) => {
+                tracing::warn!("plugin {}: manifest unavailable: {why}", self.name);
+                *self.manifest_failed.lock().unwrap() =
+                    Some((std::time::Instant::now(), why.clone()));
+                Err(why)
+            }
+        }
+    }
+
+    /// Ask the plugin what it is. `Err` is "could not find out".
+    async fn discover(&self) -> Result<PluginManifest, String> {
+        let url = format!("{}/manifest", self.base_url);
+        let fetched = tokio::time::timeout(MANIFEST_TIMEOUT, async {
+            // The same brief retry every other call to a plugin gets: one that
+            // was spawned a moment ago may still be binding its port.
+            let mut last = None;
+            for attempt in 0..3 {
+                match upstream::simple_get(&url).await {
+                    Ok(pair) => return Ok(pair),
+                    Err(e) => last = Some(e),
                 }
-            })
-            .await
+                if attempt + 1 < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+            Err(last.expect("three attempts, three errors"))
+        })
+        .await;
+        match fetched {
+            Ok(Ok((200, bytes))) => {
+                let m = PluginManifest::parse(&self.name, &bytes)
+                    .ok_or_else(|| "the manifest is not a JSON object".to_string())?;
+                tracing::info!(
+                    "plugin {} manifest: request={} response={} reqBody={} resBody={}",
+                    self.name,
+                    m.on_request,
+                    m.on_response,
+                    m.request_body,
+                    m.response_body,
+                );
+                if m.has_pipe_hook() {
+                    tracing::info!(
+                        "plugin {} streaming hooks: pipeRequest={} pipeResponse={}",
+                        self.name,
+                        m.pipe_request,
+                        m.pipe_response
+                    );
+                }
+                if m.ws_frame {
+                    tracing::info!("plugin {} hooks WebSocket frames", self.name);
+                }
+                Ok(m)
+            }
+            // "No such route" is an answer about the plugin, and the one a v1
+            // plugin gives. Nothing else is: a plugin that is starting, broken
+            // or overloaded answers `5xx` or not at all.
+            Ok(Ok((404, _))) => {
+                tracing::info!("plugin {} serves no /manifest; assuming v1", self.name);
+                Ok(PluginManifest::v1_fallback(&self.name))
+            }
+            Ok(Ok((status, _))) => Err(format!("/manifest answered {status}")),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(_) => Err(format!("no manifest within {MANIFEST_TIMEOUT:?}")),
+        }
     }
 
     /// Run the request phase: the gate, then the ping, then the hook.
@@ -638,8 +723,24 @@ impl RemotePlugin {
     /// The order is upstream's (`lib/plugins/index.js:929-960`) and it is the
     /// only one that makes sense: a blocked request has no rules to inject and
     /// nothing downstream to tell about.
+    ///
+    /// A plugin whose manifest could not be learned **blocks**: whether it has
+    /// a gate is exactly what is not known, and guessing "no" is how a request
+    /// gets past one. It is the [`auth`] rule — every failure blocks — applied
+    /// one step earlier, to the question the gate depends on.
     async fn on_request(&self, req: &PluginReq) -> PluginResult {
-        let manifest = self.manifest().await;
+        let manifest = match self.manifest().await {
+            Ok(manifest) => manifest,
+            Err(why) => {
+                let denial = auth::Denial::unavailable(format!("manifest unavailable: {why}"));
+                return PluginResult {
+                    response: Some(auth::deny_response(&self.name, &denial).await),
+                    blocked: true,
+                    failure: denial.reason.clone(),
+                    ..Default::default()
+                };
+            }
+        };
         let mut admitted: Vec<(String, String)> = Vec::new();
         if manifest.auth {
             match self.auth(req).await {
@@ -736,7 +837,12 @@ impl RemotePlugin {
     }
 
     async fn on_response(&self, res: &PluginRes) -> PluginResResult {
-        let manifest = self.manifest().await;
+        // The request phase blocked if the manifest was unknown, so a response
+        // only gets here without one when no request phase ran — and then there
+        // is nothing this plugin is known to want from it.
+        let Ok(manifest) = self.manifest().await else {
+            return PluginResResult::default();
+        };
         if manifest.res_stats {
             stats::post(&self.name, &self.base_url, stats::response_payload(res));
         }
@@ -940,7 +1046,7 @@ fn value_to_string(v: &serde_json::Value) -> String {
 /// borrowing the registry.
 enum PluginKind {
     Rust(Arc<dyn RustPlugin>),
-    Remote(RemotePlugin),
+    Remote(Box<RemotePlugin>),
 }
 
 /// The plugin registry held in shared server state.
@@ -974,7 +1080,7 @@ impl Plugins {
     pub fn register_remote(&mut self, name: &str, host_port: &str) {
         self.map.insert(
             name.to_string(),
-            PluginKind::Remote(RemotePlugin::new(name, host_port)),
+            PluginKind::Remote(Box::new(RemotePlugin::new(name, host_port))),
         );
     }
 
@@ -989,11 +1095,17 @@ impl Plugins {
         n
     }
 
-    /// The capability manifest for `name`, if registered.
+    /// The capability manifest for `name`: `None` when nothing by that name is
+    /// registered, or when a remote plugin has not been able to say what it is.
+    ///
+    /// Every caller reads `None` as "do not run this hook", which is the right
+    /// answer for the optional ones — a body nobody asked for is not buffered,
+    /// a pipe nobody declared is not opened. The request phase does not go
+    /// through here: [`Plugins::on_request`] blocks on an unknown manifest.
     pub async fn manifest(&self, name: &str) -> Option<PluginManifest> {
         match self.map.get(name)? {
             PluginKind::Rust(p) => Some(p.manifest()),
-            PluginKind::Remote(r) => Some(r.manifest().await.clone()),
+            PluginKind::Remote(r) => r.manifest().await.ok().cloned(),
         }
     }
 
@@ -1110,7 +1222,9 @@ impl Plugins {
                 sni::SniVerdict::Generated
             }),
             PluginKind::Remote(r) => {
-                if !r.manifest().await.sni {
+                // Could not ask, which the caller treats differently from
+                // "asked, nothing to say".
+                if !r.manifest().await?.sni {
                     return Ok(sni::SniVerdict::Generated);
                 }
                 r.sni_cert(req).await
@@ -1168,7 +1282,7 @@ impl Plugins {
                 Some(p.ui(&ureq).into_response())
             }
             PluginKind::Remote(r) => {
-                if !r.manifest().await.ui {
+                if !r.manifest().await.ok()?.ui {
                     return None;
                 }
                 Some(match ui::forward(name, &r.base_url, req).await {
@@ -1220,7 +1334,7 @@ impl Plugins {
                 }
             }
             PluginKind::Remote(r) => {
-                if r.manifest().await.serves_pipe(dir) {
+                if matches!(r.manifest().await, Ok(m) if m.serves_pipe(dir)) {
                     pipe::transform(name, &r.base_url, dir, meta, body).await
                 } else {
                     body
@@ -1247,7 +1361,7 @@ impl Plugins {
                 meta: meta.clone(),
             }),
             PluginKind::Remote(r) => {
-                if !r.manifest().await.ws_frame {
+                if !r.manifest().await.ok()?.ws_frame {
                     return None;
                 }
                 match wsframe::connect(name, &r.base_url, meta).await {
@@ -1593,30 +1707,44 @@ mod tests {
     struct FakePlugin {
         url: String,
         seen: Arc<std::sync::Mutex<Vec<String>>>,
+        routes: Arc<std::sync::Mutex<Routes>>,
     }
+
+    /// What a fake plugin answers: `(path, status, body)`.
+    type Routes = Vec<(&'static str, u16, String)>;
 
     impl FakePlugin {
         fn paths(&self) -> Vec<String> {
             self.seen.lock().unwrap().clone()
         }
+
+        /// Change what `path` answers from now on — a plugin that was starting
+        /// and has now started.
+        fn set(&self, path: &'static str, status: u16, body: &str) {
+            let mut routes = self.routes.lock().unwrap();
+            routes.retain(|(p, _, _)| *p != path);
+            routes.push((path, status, body.to_string()));
+        }
     }
 
     /// Start a fake plugin. `routes` maps a path to `(status, body)`; anything
     /// else gets a 404.
-    async fn fake_plugin(routes: Vec<(&'static str, u16, String)>) -> FakePlugin {
+    async fn fake_plugin(routes: Routes) -> FakePlugin {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let url = format!("http://{}", listener.local_addr().expect("addr"));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
+        let routes = Arc::new(std::sync::Mutex::new(routes));
+        let served = routes.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
-                let routes = routes.clone();
+                let routes = served.clone();
                 let recorder = recorder.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
@@ -1643,6 +1771,8 @@ mod tests {
                     let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
                     recorder.lock().unwrap().push(path.clone());
                     let (status, body) = routes
+                        .lock()
+                        .unwrap()
                         .iter()
                         .find(|(p, _, _)| *p == path)
                         .map(|(_, s, b)| (*s, b.clone()))
@@ -1656,7 +1786,122 @@ mod tests {
                 });
             }
         });
-        FakePlugin { url, seen }
+        FakePlugin { url, seen, routes }
+    }
+
+    /// `hooks: ["auth","request"]`, whose gate refuses everything.
+    const GATED: &str = r#"{"name":"p","version":"1","hooks":["auth","request"]}"#;
+
+    /// A remote plugin that asks again at once after a failed manifest fetch,
+    /// so a test of recovery does not have to wait out [`MANIFEST_RETRY`].
+    fn impatient(url: &str) -> RemotePlugin {
+        let mut plugin = RemotePlugin::new("p", url);
+        plugin.manifest_retry = std::time::Duration::ZERO;
+        plugin
+    }
+
+    /// The defect this guards against: the first `/manifest` answered `503`,
+    /// that was cached as "protocol v1, no gate", and from then on every
+    /// request matched against the plugin reached the origin — `/auth` was
+    /// never called, however long the plugin had been healthy.
+    #[test]
+    fn a_manifest_that_fails_first_blocks_and_is_asked_again() {
+        rt().block_on(async {
+            for (status, body) in [(503, ""), (200, "<html>starting</html>"), (200, "[]")] {
+                let fake = fake_plugin(vec![
+                    ("/manifest", status, body.to_string()),
+                    ("/auth", 200, r#"{"allow":false}"#.into()),
+                    ("/request", 200, r#"{"rules":"* resHeaders://x=1"}"#.into()),
+                    // A v1 plugin answers here; nothing may be sent to it.
+                    ("/", 200, r#"{"rules":"* resHeaders://v1=1"}"#.into()),
+                ])
+                .await;
+                let plugin = impatient(&fake.url);
+
+                let out = plugin.on_request(&req()).await;
+                let resp = out.response.expect("an unknown plugin must block");
+                assert_eq!(resp.status, 502, "manifest {status} {body:?}");
+                assert!(out.blocked && out.rules.is_none());
+                let why = out.failure.expect("and the session says why");
+                assert!(why.contains("manifest unavailable"), "{why}");
+                assert_eq!(
+                    fake.paths(),
+                    vec!["/manifest"],
+                    "no hook may run before the plugin has said what it is"
+                );
+
+                // The plugin comes up. It declares a gate, and the gate refuses.
+                fake.set("/manifest", 200, GATED);
+                let out = plugin.on_request(&req()).await;
+                let resp = out.response.expect("the gate refuses");
+                assert_eq!(resp.status, 403, "the plugin's own refusal, not a failure");
+                assert!(out.blocked && out.failure.is_none());
+                assert!(
+                    fake.paths().iter().any(|p| p == "/auth"),
+                    "the gate was asked"
+                );
+                assert!(
+                    !fake.paths().iter().any(|p| p == "/request" || p == "/"),
+                    "and nothing ran behind it: {:?}",
+                    fake.paths()
+                );
+            }
+        });
+    }
+
+    /// A plugin that is not there at all is the same case: nothing is known
+    /// about it, so nothing gets past it.
+    #[test]
+    fn an_unreachable_plugin_blocks_until_it_appears() {
+        rt().block_on(async {
+            // Bind a port, note it, and let it go: nothing is listening there.
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            drop(l);
+            let plugin = impatient(&addr);
+            let out = plugin.on_request(&req()).await;
+            assert_eq!(out.response.expect("blocked").status, 502);
+            assert!(out.blocked && out.failure.is_some());
+        });
+    }
+
+    /// `404` is the one non-manifest answer that *is* knowledge: the plugin has
+    /// no such route, which is what the first protocol looks like. It keeps
+    /// working, and it is asked only once.
+    #[test]
+    fn a_plugin_with_no_manifest_route_is_the_first_protocol() {
+        rt().block_on(async {
+            let fake = fake_plugin(vec![(
+                "/",
+                200,
+                r#"{"rules":"* resHeaders://v1=1"}"#.into(),
+            )])
+            .await;
+            let plugin = impatient(&fake.url);
+            for _ in 0..2 {
+                let out = plugin.on_request(&req()).await;
+                assert!(out.response.is_none() && !out.blocked);
+                assert_eq!(out.rules.as_deref(), Some("* resHeaders://v1=1"));
+            }
+            assert_eq!(fake.paths(), vec!["/manifest", "/", "/"]);
+        });
+    }
+
+    /// A failed fetch is remembered for [`MANIFEST_RETRY`], so the several
+    /// questions one request asks cost one dial between them — and a plugin
+    /// that accepts and never answers cannot charge each of them the timeout.
+    #[test]
+    fn a_failed_manifest_fetch_is_not_repeated_at_once() {
+        rt().block_on(async {
+            let fake = fake_plugin(vec![("/manifest", 503, String::new())]).await;
+            let mut p = Plugins::new();
+            p.register_remote("p", &fake.url);
+            assert!(p.manifest("p").await.is_none());
+            assert!(!p.any_wants_request_body(&["p".to_string()]).await);
+            let out = p.on_request("p", &req()).await.expect("registered");
+            assert!(out.blocked);
+            assert_eq!(fake.paths(), vec!["/manifest"]);
+        });
     }
 
     fn manifest_route(hooks: &str) -> (&'static str, u16, String) {

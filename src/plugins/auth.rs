@@ -145,6 +145,21 @@ impl Denial {
     }
 }
 
+impl Denial {
+    /// The plugin could not say what it *is*, so nothing is known about whether
+    /// it has a gate. Blocked like a failed gate, and worded so the page does
+    /// not blame an auth hook the plugin may not even have.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Denial {
+            status: Some(502),
+            login: false,
+            page: DenyPage::Html(format!("Plugin unavailable: {reason}").into_bytes()),
+            reason: Some(reason),
+        }
+    }
+}
+
 /// Whether an auth plugin may set this request header on a request it admits.
 ///
 /// Upstream restricts the same set twice — once when the plugin calls
