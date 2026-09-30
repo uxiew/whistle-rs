@@ -189,7 +189,7 @@ fn pattern_accepts<'r>(
             // `$0` means the request.
             groups: Some(std::array::from_fn(|i| match i {
                 0 => req.full_url.clone(),
-                n => caps.get(n).map_or("", |m| m.as_str()).to_string(),
+                n => caps.get(n).unwrap_or("").to_string(),
             })),
             ..Default::default()
         }),

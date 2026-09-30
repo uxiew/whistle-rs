@@ -130,6 +130,13 @@ pub struct Explanation {
     pub url: String,
     /// The matching operators, in resolution order.
     pub ops: Vec<Op>,
+    /// What in the rules text could not be read as it was written — today, a
+    /// `/…/` that is not a regular expression. The rule it sat on matched
+    /// nothing, or its filter was dropped; without this the answer is an
+    /// operator that is simply missing, and a reader looks for a typo in the
+    /// host name. Absent from the JSON when there is nothing to say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
 }
 
 /// Answer one [`Query`].
@@ -137,6 +144,14 @@ pub struct Explanation {
 /// The error is a sentence for a human: the only way to fail here is a URL
 /// this port cannot read, and the caller wrote it.
 pub fn explain(query: &Query) -> Result<Explanation, String> {
+    let (answer, problems) = crate::rules::regexp::collect(|| explain_inner(query));
+    answer.map(|explanation| Explanation {
+        problems,
+        ..explanation
+    })
+}
+
+fn explain_inner(query: &Query) -> Result<Explanation, String> {
     let (scheme, host, port, path) = split_url(&query.url)?;
 
     let mut manager = RuleManager::new();
@@ -230,6 +245,7 @@ pub fn explain(query: &Query) -> Result<Explanation, String> {
     Ok(Explanation {
         url: info.full_url,
         ops,
+        problems: Vec::new(),
     })
 }
 
@@ -312,6 +328,10 @@ fn split_url(url: &str) -> Result<(String, String, u16, String), String> {
 pub fn to_text(explanation: &Explanation) -> String {
     let mut out = String::new();
     out.push_str(&format!("{}\n", explanation.url));
+    // First, because it is the likeliest reason for whatever follows.
+    for problem in &explanation.problems {
+        out.push_str(&format!("  ! {problem}\n"));
+    }
     if explanation.ops.is_empty() {
         out.push_str("  (no rule matches)\n");
         return out;
@@ -365,6 +385,39 @@ mod tests {
         assert_eq!(protocols(&e), ["reqHeaders", "resHeaders"]);
         assert_eq!(e.ops[0].value, "a=1");
         assert_eq!(e.ops[0].pattern, "example.com");
+    }
+
+    /// A pattern written with lookaround is a JavaScript regexp and matches as
+    /// one; a `/…/` that is no regexp at all drops its rule, and says so.
+    #[test]
+    fn a_regexp_pattern_is_javascript_and_a_broken_one_is_named() {
+        let e = ask(
+            "/example\\.com\\/(?!admin)/ reqHeaders://a=1",
+            "http://example.com/x",
+        );
+        assert_eq!(protocols(&e), ["reqHeaders"]);
+        assert!(e.problems.is_empty(), "{e:?}");
+        let e = ask(
+            "/example\\.com\\/(?!admin)/ reqHeaders://a=1",
+            "http://example.com/admin",
+        );
+        assert!(e.ops.is_empty(), "{e:?}");
+
+        let e = ask(
+            "/example(/ reqHeaders://a=1\nexample.com resHeaders://b=2 excludeFilter:///x[/",
+            "http://example.com/x",
+        );
+        // The first line is gone; the second survives without its filter.
+        assert_eq!(protocols(&e), ["resHeaders"]);
+        assert_eq!(e.problems.len(), 2, "{:?}", e.problems);
+        assert!(e.problems[0].contains("/example(/"), "{:?}", e.problems);
+        assert!(e.problems[1].contains("/x[/"), "{:?}", e.problems);
+        assert!(to_text(&e).contains("  ! /example(/"));
+        // …and the JSON carries them only when there are some.
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["problems"].as_array().map(Vec::len), Some(2));
+        let clean = serde_json::to_value(ask("a.com x://y", "http://a.com/")).unwrap();
+        assert!(clean.get("problems").is_none());
     }
 
     #[test]

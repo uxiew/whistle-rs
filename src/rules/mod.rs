@@ -17,12 +17,14 @@
 pub mod include;
 pub mod matcher;
 pub mod protocols;
+pub mod regexp;
 pub mod replace;
 pub mod storage;
 pub mod url;
 pub mod wildcard;
 
 use regex::Regex;
+use regexp::Regexp;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -342,8 +344,9 @@ pub fn token_order(line: u64, at: usize) -> u64 {
 /// How a rule's pattern decides whether a request matches.
 #[derive(Debug, Clone)]
 pub enum Pattern {
-    /// `/regexp/flags` — tested against the full request URL.
-    Regex(Regex),
+    /// `/regexp/flags` — tested against the full request URL. JavaScript's
+    /// syntax when the user wrote it; see [`regexp`].
+    Regex(Regexp),
     /// A host wildcard (`*.example.com/api`): a regexp for the host part and an
     /// ordinary prefix for the path. See [`wildcard`].
     Wildcard(Box<wildcard::Wildcard>),
@@ -749,7 +752,7 @@ impl Cond {
 #[derive(Debug, Clone)]
 pub enum CondValue {
     /// `/re/[i]`.
-    Regex(Regex),
+    Regex(Regexp),
     /// A literal, lowercased — all literal comparisons are case-insensitive.
     Literal(String),
 }
@@ -763,23 +766,23 @@ impl CondValue {
             .unwrap_or_else(|| CondValue::Literal(raw.to_lowercase()))
     }
 
-    /// `/body/flags` → a compiled regexp, or `None` when this is a literal (or
-    /// a regexp Rust's engine cannot compile — JS-only constructs such as
-    /// lookbehind degrade to a literal rather than dropping the rule).
+    /// `/body/flags` → a compiled regexp, or `None` when this is a literal —
+    /// or an expression JavaScript would not compile either, which whistle
+    /// reads as a literal (`toRegExp` returns `null`) and this port reports.
     fn as_regex(raw: &str, always_ignore_case: bool) -> Option<Self> {
         let rest = raw.strip_prefix('/')?;
         let end = rest.rfind('/')?;
         let (body, flags) = (&rest[..end], &rest[end + 1..]);
-        // `(.+)` — an empty body is not a regexp, and `u` is implied in Rust.
+        // `(.+)` — an empty body is not a regexp.
         if body.is_empty() || !matches!(flags, "" | "i" | "u" | "iu" | "ui") {
             return None;
         }
-        let src = if always_ignore_case || flags.contains('i') {
-            format!("(?i){body}")
-        } else {
-            body.to_string()
-        };
-        Regex::new(&src).ok().map(CondValue::Regex)
+        // `new RegExp(RegExp.$1, ignoreCase ? 'i' : RegExp.$2)`
+        // (`_original/lib/util/index.js:727`): a forced `i` *replaces* the
+        // flags written, `u` included.
+        let flags = if always_ignore_case { "i" } else { flags };
+        Regexp::parsed(body, flags, "filter condition; read as a literal instead")
+            .map(CondValue::Regex)
     }
 
     /// Scalar comparison (`m:`, `i:`, `host:`): whistle compares the whole
@@ -2480,15 +2483,12 @@ fn is_url_filter_payload(spec: &str) -> bool {
 ///
 /// That rebuild is why a `/re/u` is case-**in**sensitive here: upstream tests
 /// the captured flags for truthiness, not for `i`.
-fn compile_url_regexp(body: &str, ignore_case: bool) -> Option<Regex> {
+fn compile_url_regexp(body: &str, ignore_case: bool) -> Option<Regexp> {
     if body.is_empty() {
         return None;
     }
-    let src = match ignore_case {
-        true => format!("(?i){body}"),
-        false => body.to_string(),
-    };
-    Regex::new(&src).ok()
+    let flags = if ignore_case { "i" } else { "" };
+    Regexp::parsed(body, flags, "filter; the filter is dropped")
 }
 
 /// The URL filter that `filter://` and `ignore://` share — the first and third
@@ -2511,7 +2511,7 @@ fn parse_pattern_url_filter(spec: &str) -> Option<(Cond, bool)> {
         None => wild_filter_split(spec)?,
     };
     let re = wildcard::parse_filter(body)?;
-    Some((Cond::Url(Pattern::Regex(re)), negate))
+    Some((Cond::Url(Pattern::Regex(re.into())), negate))
 }
 
 /// The URL filter `includeFilter://` and `excludeFilter://` take — the second
@@ -2535,7 +2535,7 @@ fn parse_url_filter(spec: &str) -> Option<(Cond, bool)> {
     // not the way a rule's own pattern is: every filter is read as if it carried
     // a `^`, so its stars wildcard the path too ([`wildcard::parse_filter`]).
     let re = wildcard::parse_filter(body)?;
-    Some((Cond::Url(Pattern::Regex(re)), negate))
+    Some((Cond::Url(Pattern::Regex(re.into())), negate))
 }
 
 /// Is this token a filter condition (as opposed to an operator or a pattern)?
@@ -3142,12 +3142,12 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
     // is consulted before anything else in `parseRule` (`rules.js:1226-1234`) —
     // and the result is a plain regexp over the whole URL.
     if let Some(re) = wildcard::parse_reg_url(tok) {
-        return done(Pattern::Regex(re));
+        return done(Pattern::Regex(re.into()));
     }
 
     // Port pattern: `:8080` scopes the rule to one port.
     if let Some(re) = port_pattern(tok) {
-        return done(Pattern::Regex(re));
+        return done(Pattern::Regex(re.into()));
     }
 
     // `//host/path` is scheme-relative: the `//` comes off and any scheme
@@ -3158,9 +3158,15 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
         _ => tok,
     };
 
-    // Regexp pattern: /body/flags
-    if let Some(re) = slash_regexp(tok) {
-        return done(Pattern::Regex(re));
+    // Regexp pattern: /body/flags. One that is shaped like a regexp and is
+    // not one drops the rule, as upstream's does: `(isRegExp =
+    // util.isRegExp(pattern)) && !(pattern = util.toRegExp(pattern))` returns
+    // (`rules.js:1253-1259`). It used to fall through to the literal patterns
+    // below, where `/a(/` became a path prefix.
+    match slash_regexp(tok) {
+        Slash::Regexp(re) => return done(Pattern::Regex(re)),
+        Slash::Invalid => return None,
+        Slash::NotOne => {}
     }
 
     // A host wildcard. Asked before the negation check below because upstream
@@ -3241,21 +3247,35 @@ fn parse_pattern(tok: &str) -> Option<ParsedPattern> {
 /// which `FILE_RE` will not take and `parse_pattern`'s `//` strip leaves alone.
 /// The second is the only shape whose rejection is observable, and the one the
 /// bench caught the bug with.
-fn slash_regexp(tok: &str) -> Option<Regex> {
-    let body_and_flags = tok.strip_prefix('/')?;
-    let end = body_and_flags.rfind('/')?;
+fn slash_regexp(tok: &str) -> Slash {
+    let Some(body_and_flags) = tok.strip_prefix('/') else {
+        return Slash::NotOne;
+    };
+    let Some(end) = body_and_flags.rfind('/') else {
+        return Slash::NotOne;
+    };
     let (body, flags) = (&body_and_flags[..end], &body_and_flags[end + 1..]);
     // `(.+)` demands a body, and `$` demands the flags be one of the four.
     if body.is_empty() || !matches!(flags, "" | "i" | "u" | "iu" | "ui") {
-        return None;
+        return Slash::NotOne;
     }
-    // `u` is Unicode mode, which this regexp engine is always in; only `i`
-    // changes what matches.
-    let prefix = match flags.contains('i') {
-        true => "(?i)",
-        false => "",
-    };
-    Regex::new(&format!("{prefix}{body}")).ok()
+    // The flags go to the engine as written: `u` is JavaScript's Unicode
+    // mode, which is stricter about escapes as well as wider about characters.
+    match Regexp::parsed(body, flags, "pattern; the rule is dropped") {
+        Some(re) => Slash::Regexp(re),
+        None => Slash::Invalid,
+    }
+}
+
+/// What [`slash_regexp`] made of a pattern token.
+enum Slash {
+    /// A regular expression.
+    Regexp(Regexp),
+    /// Spelled as one — `REG_EXP_RE` accepts it — and JavaScript cannot
+    /// compile it.
+    Invalid,
+    /// Not spelled as one at all; some other kind of pattern.
+    NotOne,
 }
 
 /// Compile a `:8080`-style port pattern.
@@ -3967,19 +3987,41 @@ mod filter_parse_tests {
     }
 
     /// `REG_EXP_RE` is `^/(.+)/(i?u?|ui)$`: an empty body or an unknown flag is
-    /// a literal, and so is a pattern Rust's engine cannot compile.
+    /// a literal, and so is an expression JavaScript cannot compile.
     #[test]
     fn near_misses_degrade_to_literals() {
         for token in [
-            "filter://m:／/",      // not a slash at all
-            "filter://m://",       // empty body
-            "filter://m:/GET/g",   // flag whistle's regex does not accept
-            "filter://m:/(?<=x)/", // valid in JS, unsupported by Rust's engine
+            "filter://m:／/",    // not a slash at all
+            "filter://m://",     // empty body
+            "filter://m:/GET/g", // flag whistle's regex does not accept
+            "filter://m:/GE(T/", // not a regexp in any engine
         ] {
             assert!(
                 matches!(cond_of(token).cond, Cond::Method(CondValue::Literal(_))),
                 "{token} should be a literal"
             );
+        }
+    }
+
+    /// A condition written with lookaround is a regexp, as it is in whistle.
+    /// It used to be one of the literals above — `m:/^GET(?=$)/` compared the
+    /// method with the text `/^get(?=$)/` and so never matched, which for an
+    /// `excludeFilter://` means it never excluded anything.
+    #[test]
+    fn a_condition_may_use_lookaround() {
+        match cond_of("includeFilter://m:/^GET(?=$)/").cond {
+            Cond::Method(v @ CondValue::Regex(_)) => {
+                assert!(v.matches("GET"));
+                assert!(!v.matches("GETX"));
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+        match cond_of("filter://host:/(?<!dev\\.)example\\.com$/").cond {
+            Cond::Host(v @ CondValue::Regex(_)) => {
+                assert!(v.matches("www.example.com"));
+                assert!(!v.matches("dev.example.com"));
+            }
+            other => panic!("parsed as {other:?}"),
         }
     }
 

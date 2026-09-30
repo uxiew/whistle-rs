@@ -1512,29 +1512,19 @@ pub(super) fn replace_once_or_all(text: &str, pattern: &str, value: &str) -> Str
     if matches!(source, ".*" | ".+") {
         return value.to_string();
     }
-    let mut prefix = String::new();
-    if flags.contains('i') {
-        prefix.push_str("(?i)");
-    }
-    if flags.contains('m') {
-        prefix.push_str("(?m)");
-    }
-    let Ok(re) = regex::Regex::new(&format!("{prefix}{source}")) else {
+    // JavaScript's expression, compiled as JavaScript's — see
+    // [`crate::rules::regexp`]. One it refuses replaces nothing, which is what
+    // upstream's `toOriginalRegExp` returning `null` comes to.
+    let Some(re) = crate::proxy::restream::compile(source, flags) else {
         return text.to_string();
     };
-    // Expanded by hand rather than through the `regex` crate's own replacement
-    // syntax: `$$1` has to percent-encode the group, and no replacement string
-    // can express that. See [`crate::rules::replace::expand`].
-    let expand = |caps: &regex::Captures<'_>| {
-        let groups: Vec<&str> = (0..=9)
-            .map(|n| caps.get(n).map_or("", |m| m.as_str()))
-            .collect();
+    // Expanded by hand rather than through an engine's own replacement syntax:
+    // `$$1` has to percent-encode the group, and no replacement string can
+    // express that. See [`crate::rules::replace::expand`].
+    re.replace(text, flags.contains('g'), |caps| {
+        let groups: Vec<&str> = (0..=9).map(|n| caps.get(n).unwrap_or("")).collect();
         crate::rules::replace::expand(value, &groups)
-    };
-    match flags.contains('g') {
-        true => re.replace_all(text, expand).into_owned(),
-        false => re.replace(text, expand).into_owned(),
-    }
+    })
 }
 
 /// Split `/source/flags` into its two halves, or `None` when the pattern is not

@@ -49,6 +49,7 @@ use std::task::{Context, Poll};
 use hyper::body::{Body, Frame};
 
 use super::body::{BodyError, DynBody};
+use crate::rules::regexp::{Caps, Regexp};
 
 /// How much of the tail a regexp stage keeps in hand
 /// (`LENGTH`, `_original/lib/util/replace-pattern-transform.js:4`). A pattern
@@ -75,21 +76,16 @@ pub fn split_regexp(pattern: &str) -> Option<(&str, &str)> {
     ok.then_some((source, flags))
 }
 
-/// Compile the `/source/flags` half of a `*Replace` pattern, translating the
-/// JavaScript flags this port honours into the `regex` crate's inline form.
+/// Compile the `/source/flags` half of a `*Replace` pattern, as JavaScript's
+/// `new RegExp(source, flags)` would — `toOriginalRegExp`,
+/// `_original/lib/util/index.js:623-631`.
 ///
-/// `u` is absent because Rust's `regex` is Unicode-aware already, and `g` is not
-/// a compilation flag — it decides how many matches are replaced, which is the
-/// caller's business.
-pub fn compile(source: &str, flags: &str) -> Option<regex::Regex> {
-    let mut prefix = String::new();
-    if flags.contains('i') {
-        prefix.push_str("(?i)");
-    }
-    if flags.contains('m') {
-        prefix.push_str("(?m)");
-    }
-    regex::Regex::new(&format!("{prefix}{source}")).ok()
+/// `g` is not a compilation flag — it decides how many matches are replaced,
+/// which is the caller's business. `None` is an expression JavaScript refuses
+/// too; upstream then makes no substitution and neither does this, but the
+/// expression is named in the log.
+pub fn compile(source: &str, flags: &str) -> Option<Regexp> {
+    Regexp::parsed(source, flags, "replace pattern; nothing is replaced by it")
 }
 
 /// The largest index `<= at` that falls on a character boundary of `s`.
@@ -120,7 +116,7 @@ enum Stage {
     },
     /// A `/source/flags` pattern — upstream's `ReplacePatternTransform`.
     Pattern {
-        re: regex::Regex,
+        re: Regexp,
         value: String,
         global: bool,
         rest: String,
@@ -258,14 +254,7 @@ impl Stage {
                 // No tail guard on the last pass: there is nothing left to
                 // extend a match, so every match is final
                 // (`replace-pattern-transform.js:52-56`).
-                match global {
-                    true => re
-                        .replace_all(&held, |caps: &regex::Captures<'_>| expand(value, caps))
-                        .into_owned(),
-                    false => re
-                        .replace(&held, |caps: &regex::Captures<'_>| expand(value, caps))
-                        .into_owned(),
-                }
+                re.replace(&held, *global, |caps| expand(value, caps))
             }
         }
     }
@@ -323,10 +312,8 @@ fn event_cut(chunk: &str, sse: bool) -> usize {
 /// Expand a replacement string against one match — the same expander the
 /// buffered path uses, so `$1`, `$$1` and the backslash escapes mean one thing
 /// in this port. See [`crate::rules::replace::expand`].
-fn expand(value: &str, caps: &regex::Captures<'_>) -> String {
-    let groups: Vec<&str> = (0..=9)
-        .map(|n| caps.get(n).map_or("", |m| m.as_str()))
-        .collect();
+fn expand(value: &str, caps: &Caps<'_>) -> String {
+    let groups: Vec<&str> = (0..=9).map(|n| caps.get(n).unwrap_or("")).collect();
     crate::rules::replace::expand(value, &groups)
 }
 
@@ -339,7 +326,7 @@ fn expand(value: &str, caps: &regex::Captures<'_>) -> String {
 /// `event` is [`event_cut`]: a match ending at or before it is inside bytes that
 /// are going out regardless, so there is no later chunk that could extend it.
 fn replace_streaming(
-    re: &regex::Regex,
+    re: &Regexp,
     value: &str,
     global: bool,
     chunk: &str,
@@ -353,14 +340,13 @@ fn replace_streaming(
     let mut last = 0usize;
     let mut settled = 0usize;
     for caps in re.captures_iter(chunk) {
-        let m = caps.get(0).expect("group 0 always matches");
-        let (start, end) = (m.start(), m.end());
+        let (start, end) = (caps.start(), caps.end());
         // How far past the near-end mark this match reaches — upstream's
         // `subLen`. It leaves a match alone when it ends in that zone *and* is
         // short enough that a longer one could still be found there
         // (`replace-pattern-transform.js:34-38`).
         let over = end as isize - near;
-        if end > event && over >= 0 && m.len() as isize <= TAIL as isize - over {
+        if end > event && over >= 0 && (end - start) as isize <= TAIL as isize - over {
             continue;
         }
         out.push_str(&chunk[last..start]);

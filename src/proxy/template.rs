@@ -37,6 +37,7 @@ use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
 
 use crate::rules::ReqInfo;
+use crate::rules::regexp::Regexp;
 
 /// Gate matching whistle's `VAR_RE`: skip both passes unless the body holds a
 /// `{...}` with no whitespace inside.
@@ -201,10 +202,7 @@ fn interpolate_vars(body: &str, info: &ReqInfo, query: &Query, env: ProxyEnv<'_>
             let name = &caps[3];
             // A trailing `.replace(...)` modifies the value, so it has to come
             // off the key before the variable is resolved (`rules.js:725-733`).
-            let (key, modifier) = match split_modifier(caps.get(4).map(|m| m.as_str())) {
-                Modifier::Parsed(key, modifier) => (key, modifier),
-                Modifier::Unsupported => return all.to_string(),
-            };
+            let (key, modifier) = split_modifier(caps.get(4).map(|m| m.as_str()));
             let Some(mut value) = resolve_var(info, query, raw, name, key, env) else {
                 return all.to_string();
             };
@@ -477,33 +475,24 @@ fn random_int_bounds(lname: &str) -> Option<u64> {
 // The `.replace(pattern,replacement)` modifier
 // ---------------------------------------------------------------------------
 
-/// What splitting a `.replace(...)` suffix off a variable key produced.
-enum Modifier<'a> {
-    /// The key with the suffix removed — `None` once nothing is left, which is
-    /// how whistle's falsy `''` behaves — and the modifier, when one was written.
-    Parsed(Option<&'a str>, Option<Replace>),
-    /// A `/…/flags` pattern JavaScript accepts and the `regex` crate does not
-    /// (look-around, back-references). The placeholder is then left verbatim
-    /// rather than rendered with the modifier silently dropped.
-    Unsupported,
-}
-
-/// Split a trailing `.replace(pattern,replacement)` off a variable key.
-fn split_modifier(key: Option<&str>) -> Modifier<'_> {
+/// Split a trailing `.replace(pattern,replacement)` off a variable key: the
+/// key with the suffix removed — `None` once nothing is left, which is how
+/// whistle's falsy `''` behaves — and the modifier, when one was written.
+fn split_modifier(key: Option<&str>) -> (Option<&str>, Option<Replace>) {
     let Some(key) = key else {
-        return Modifier::Parsed(None, None);
+        return (None, None);
     };
     let Some(caps) = REPLACE_SUFFIX.captures(key) else {
-        return Modifier::Parsed(Some(key), None);
+        return (Some(key), None);
     };
     // The suffix is anchored at the end, so what precedes the match is the key
     // (`key.substring(0, key.length - 9 - dot.length - pattern.length)`,
     // `rules.js:729`).
     let rest = &key[..caps.get(0).expect("group 0 always exists").start()];
-    match Replace::parse(&caps[2]) {
-        Some(replace) => Modifier::Parsed((!rest.is_empty()).then_some(rest), Some(replace)),
-        None => Modifier::Unsupported,
-    }
+    (
+        (!rest.is_empty()).then_some(rest),
+        Some(Replace::parse(&caps[2])),
+    )
 }
 
 /// A parsed `.replace(pattern,replacement)` modifier (`rules.js:725-752`).
@@ -512,18 +501,16 @@ struct Replace {
     /// the modifier then supplies a default value instead of replacing anything.
     pattern: String,
     replacement: String,
-    /// Set when the pattern was written as `/…/flags`.
-    regex: Option<Regex>,
+    /// Set when the pattern was written as `/…/flags` and JavaScript compiles
+    /// it.
+    regex: Option<Regexp>,
     /// The `g` flag — replace every match rather than only the first.
     global: bool,
 }
 
 impl Replace {
     /// Parse the raw text between `replace(` and `)`.
-    ///
-    /// `None` means the pattern is a regex whistle-rs cannot compile; see
-    /// [`Modifier::Unsupported`].
-    fn parse(arg: &str) -> Option<Replace> {
+    fn parse(arg: &str) -> Replace {
         // Pattern and replacement are separated by the first *unescaped* comma.
         // whistle parks escaped commas on control characters while it splits
         // (`COMMA1_RE`/`COMMA2_RE` and `resetComma`, `rules.js:711-713,730-736`),
@@ -545,34 +532,28 @@ impl Replace {
         let mut global = false;
         if let Some(caps) = JS_REGEX.captures(&pattern) {
             let flags = &caps[2];
-            // Repeated flags make `new RegExp` throw, and whistle's
-            // `toOriginalRegExp` then returns null — i.e. a literal replace of
-            // the `/…/` text itself (`util/index.js:623-631`).
+            // Repeated flags make `new RegExp` throw, and so does a source that
+            // is not a regexp; whistle's `toOriginalRegExp` then returns null —
+            // i.e. a literal replace of the `/…/` text itself
+            // (`util/index.js:623-631`).
             let repeated = flags.char_indices().any(|(i, c)| flags[..i].contains(c));
-            if !repeated {
-                let mut inline = String::new();
-                if flags.contains('i') {
-                    inline.push('i');
-                }
-                if flags.contains('m') {
-                    inline.push('m');
-                }
-                // `u` needs no translation: the `regex` crate is Unicode-aware
-                // by default.
-                let source = match inline.is_empty() {
-                    true => caps[1].to_string(),
-                    false => format!("(?{inline}){}", &caps[1]),
-                };
-                regex = Some(Regex::new(&source).ok()?);
+            if !repeated
+                && let Some(re) = Regexp::parsed(
+                    &caps[1],
+                    flags,
+                    "template .replace(); replaced as literal text instead",
+                )
+            {
+                regex = Some(re);
                 global = flags.contains('g');
             }
         }
-        Some(Replace {
+        Replace {
             pattern,
             replacement,
             regex,
             global,
-        })
+        }
     }
 
     /// Apply the modifier to a resolved variable value.
@@ -620,26 +601,18 @@ impl Replace {
     /// Run a compiled pattern over `value`, honouring the `g` flag.
     fn replace_with(
         &self,
-        re: &Regex,
+        re: &Regexp,
         value: &str,
         expand: fn(&str, &MatchParts<'_>) -> String,
     ) -> String {
-        let substitute = |caps: &Captures| {
-            let whole = caps.get(0).expect("group 0 always exists");
+        re.replace(value, self.global, |caps| {
             let parts = MatchParts {
-                groups: caps
-                    .iter()
-                    .map(|g| g.map(|g| g.as_str().to_string()))
-                    .collect(),
-                before: &value[..whole.start()],
-                after: &value[whole.end()..],
+                groups: caps.iter().map(|g| g.map(str::to_string)).collect(),
+                before: &value[..caps.start()],
+                after: &value[caps.end()..],
             };
             expand(&self.replacement, &parts)
-        };
-        match self.global {
-            true => re.replace_all(value, substitute).into_owned(),
-            false => re.replace(value, substitute).into_owned(),
-        }
+        })
     }
 }
 
@@ -1334,11 +1307,35 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_regexp_leaves_the_placeholder_verbatim() {
-        // Look-around has no `regex`-crate equivalent; rendering it as a no-op
-        // would silently lie about what the template did.
-        let body = "${url.replace(/(?=a)/g,-)}";
-        assert_eq!(render_url(body, "http://x.com/?a=1"), body);
+    fn a_replace_pattern_is_a_javascript_regexp() {
+        // Look-around and backreferences are JavaScript's, and these used to
+        // leave the whole `${…}` in the output, unrendered.
+        assert_eq!(
+            render_url("${url.replace(/(?=a)/g,-)}", "http://x.com/?a=1"),
+            "http://x.com/?-a=1"
+        );
+        assert_eq!(
+            render_url("${query.v.replace(/(?<=a)b/,X)}", "http://x.com/?v=abcb"),
+            "aXcb"
+        );
+        assert_eq!(
+            render_url("${query.v.replace(/(o)\\1/g,0)}", "http://x.com/?v=foo-boo"),
+            "f0-b0"
+        );
+    }
+
+    /// An expression JavaScript refuses makes `toOriginalRegExp` return null,
+    /// and the pattern is then the literal text between the slashes and all.
+    #[test]
+    fn a_pattern_that_is_not_a_regexp_is_literal_text() {
+        assert_eq!(
+            render_url("${query.v.replace(/a(/,X)}", "http://x.com/?v=1/a(/2"),
+            "1X2"
+        );
+        assert_eq!(
+            render_url("${query.v.replace(/a(/,X)}", "http://x.com/?v=aaa"),
+            "aaa"
+        );
     }
 
     #[test]

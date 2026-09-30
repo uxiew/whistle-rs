@@ -33,6 +33,7 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/rules/mod.rs` | `lib/rules/rules.js` | Line parsing, pattern kinds, operator parsing |
 | `src/rules/matcher.rs` | `lib/rules/rules.js` (`resolveRules`) | Match a request, resolve per-protocol winners |
 | `src/rules/wildcard.rs` | `lib/rules/rules.js` (`parseWildcard`, `isRegUrl`) | The two wildcard pattern kinds, and a filter's own |
+| `src/rules/regexp.rs` | `lib/util/index.js` (`toRegExp`, `toOriginalRegExp`) | One regexp type for every `/…/` a user writes — pattern, filter, `*Replace`, template — compiled by regress as JavaScript; and the report when one does not compile |
 | `src/rules/url.rs` | `lib/rules/rules.js` (`joinUrl`, `setProtocol`) | Where a destination's path comes from, and the bracket forms |
 | `src/rules/replace.rs` | `lib/util/replace-pattern-transform.js` | `$0`–`$9` expansion, for pattern captures and `*Replace` alike |
 | `src/rules/storage.rs` | `lib/rules/util.js` (`rulesStorage`) | Rule groups and values on disk, and which of them were switched on |
@@ -335,7 +336,8 @@ that nothing is retained.
 | `rustls` (ring provider) + `tokio-rustls` | TLS accept (MITM) and connect (upstream) |
 | `rcgen` | root CA + leaf certificate generation |
 | `webpki-roots` | trust anchors for verifying upstream servers |
-| `regex` | wildcard/regex patterns |
+| `regex` | the patterns this port generates (wildcards, port patterns) and its own internal parsing |
+| `regress` | the regular expressions a user writes — ECMAScript syntax, so a `/…/` means what it means in whistle (`src/rules/regexp.rs`) |
 | `serde` / `serde_json` | JSON header-operator values |
 | `clap` | CLI |
 | `tracing` / `tracing-subscriber` | logging |

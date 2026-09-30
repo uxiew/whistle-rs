@@ -356,6 +356,43 @@ The only flags are `i` and `u`, in either order — upstream's `REG_EXP_RE` is
 `/echo/s` are **not** regexps; they fall through to the pattern kinds above,
 where they have no host and so match nothing.
 
+**The syntax is JavaScript's**, because whistle's is: everything between the
+slashes is handed to an ECMAScript engine ([regress](https://docs.rs/regress),
+the one the script engine here uses for `RegExp`). Lookahead, lookbehind,
+backreferences and named groups all work, in a pattern, in a
+[filter](#filter-conditions), in the [`*Replace` family](#replace-details) and in a
+template's `.replace(/…/)`:
+
+```
+/\/api\/(?!internal\/)/        proxy://127.0.0.1:8888   # everything under /api but /api/internal
+/(?<=\/v)\d+\/users/           resHeaders://x-versioned=1
+example.com  resReplace://{r}  excludeFilter://m:/^(?!GET$)/   # GET only
+```
+
+Until 2026-09-30 these were compiled by Rust's `regex` crate, which has none
+of the four. An expression it could not compile was quietly read as something
+else, and the three lines above then did: nothing, nothing, and — the dangerous
+one — the opposite (an `excludeFilter` that never excluded, so the rule applied
+to every method).
+
+What follows from "it is JavaScript's":
+
+- `\d`, `\w` and `\b` are ASCII, as in JavaScript. (`regex` made them Unicode.)
+- `u` is JavaScript's Unicode mode and is **stricter**: `/a\-b/u` is a syntax
+  error there and here.
+- A `/…/` that JavaScript cannot compile either — `/a(/` — drops its rule
+  (pattern), is read as literal text (a filter condition's value, a template
+  `.replace()`), or replaces nothing (`*Replace`), each as upstream does. It is
+  no longer silent: the log says `rules: /a(/ (pattern; the rule is dropped) is
+  not a regular expression: …` once, and `whistle-rs explain` prints the same
+  line under the URL.
+- A pathological expression costs what it costs in Node. `/(a+)+$/` against a
+  long run of `a` is exponential in both; the engine backtracks, as V8 does.
+
+Patterns this port *generates* — a [wildcard](#3-wildcard)'s expansion, a
+[port](#6-port) pattern — are not the user's text and stay on the linear-time
+engine.
+
 ### 6. Port
 
 A bare `:<port>` scopes a rule to a port, whatever the host:
