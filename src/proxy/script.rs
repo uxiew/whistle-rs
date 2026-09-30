@@ -36,6 +36,373 @@ use boa_engine::{Context, JsResult, JsString, JsValue, NativeFunction, Source, j
 use once_cell::sync::Lazy;
 use serde_json::json;
 
+// ── the engine every script runs in ────────────────────────────────────────
+
+/// `Buffer`, `parseUrl`, `parseQuery` and the three `iconv` helpers, written in
+/// JavaScript to the behaviour of Node's — see the file's own header.
+const NODE_PRELUDE: &str = include_str!("script_prelude.js");
+
+/// How many times one loop may go round before the engine stops the script
+/// with an error.
+///
+/// whistle gives a script 60 ms of wall clock (`VM_OPTIONS.timeout`,
+/// `_original/lib/util/index.js:423-426`). This engine cannot be interrupted
+/// from outside, so the bound is on what it can count: a `while (true) {}`
+/// used to hold its request — and, for a `frameScript`, its connection — for
+/// ever. Three million iterations of an empty loop take 21 ms in a release
+/// build on an M4 (`tests::cost_of_starting_a_script`), and a loop that does
+/// something takes several times that — generous for a script that is building
+/// a few rules, and far short of for ever.
+///
+/// It is per loop, not per script: two nested loops of two thousand each pass.
+/// That is a hole a hostile script walks through and an honest one does not
+/// find; the rules a script runs under are its author's own.
+const LOOP_LIMIT: u64 = 3_000_000;
+
+/// What every engine gets before anything else runs: the `RegExp` statics,
+/// and the Node parts as **stubs that load on first use**.
+///
+/// Evaluating [`NODE_PRELUDE`] takes about 3 ms in a release build — it is
+/// twelve hundred lines, and this engine compiles them every time, because a
+/// compiled script cannot leave the thread it was compiled on. Most scripts
+/// push a rule and never name `Buffer`; charging each of them that is how a
+/// `reqScript` would come to cost more than the request it decorates. So each
+/// name starts as a small function that, the first time it is called, compiles
+/// the real thing and hands over to it.
+const BOOTSTRAP: &str = r#"
+(function (global) {
+  'use strict';
+
+  // ── RegExp.$1 and its relatives ─────────────────────────────────────────
+  //
+  // The legacy statics V8 keeps and this engine does not. whistle's own source
+  // leans on them throughout (`REG_EXP_RE.test(x); … RegExp.$1`), and a script
+  // written beside it does the same. Every way of running a regexp — `test`,
+  // `match`, `replace`, `split`, `search` — reaches `exec` through the
+  // property, so recording there covers them all.
+  var exec = RegExp.prototype.exec;
+  var R = RegExp;
+  var statics = ['input', '$_', 'lastMatch', '$&', 'lastParen', '$+', 'leftContext', '$`', 'rightContext', "$'"];
+  var i;
+  for (i = 0; i < statics.length; i++) {
+    R[statics[i]] = '';
+  }
+  for (i = 1; i <= 9; i++) {
+    R['$' + i] = '';
+  }
+  RegExp.prototype.exec = function (str) {
+    var m = exec.call(this, str);
+    if (m) {
+      var text = m.input;
+      R.input = R.$_ = text;
+      R.lastMatch = R['$&'] = m[0];
+      for (var n = 1; n <= 9; n++) {
+        R['$' + n] = m[n] === undefined ? '' : m[n];
+      }
+      var last = m.length > 1 ? m[m.length - 1] : '';
+      R.lastParen = R['$+'] = last === undefined ? '' : last;
+      R.leftContext = R['$`'] = text.slice(0, m.index);
+      R.rightContext = R["$'"] = text.slice(m.index + m[0].length);
+    }
+    return m;
+  };
+
+  // ── the Node parts, on demand ───────────────────────────────────────────
+  //
+  // Every name is an ordinary data property from the start, holding a stub
+  // that loads the real thing and calls it; loading then only changes values.
+  // (Accessors that replaced themselves were tried first, and tripped the
+  // engine's inline caches: the second call from one call site threw.)
+  var source = global.__nodePrelude;
+  delete global.__nodePrelude;
+  // Indirect `eval`, so the source runs at global scope. It is the engine's
+  // own way of compiling more code mid-script; evaluating from a native
+  // function instead re-enters the VM in a way this engine panics on.
+  var indirectEval = eval;
+  var stubs = {};
+  var loaded = false;
+  var host = {
+    Buffer: Buffer,
+    construct: null,
+    define: function (real) {
+      Object.keys(real).forEach(function (name) {
+        // A name the script took for itself stays the script's.
+        if (global[name] === stubs[name]) {
+          global[name] = real[name];
+        }
+      });
+    }
+  };
+  function load() {
+    if (!loaded) {
+      loaded = true;
+      indirectEval(source)(global, host);
+    }
+  }
+
+  function Buffer(value, encodingOrOffset, length) {
+    load();
+    return host.construct(value, encodingOrOffset, length);
+  }
+  Buffer.prototype = Object.create(Uint8Array.prototype, {
+    constructor: { value: Buffer, writable: true, configurable: true }
+  });
+  Object.setPrototypeOf(Buffer, Uint8Array);
+  ['from', 'alloc', 'allocUnsafe', 'allocUnsafeSlow', 'isBuffer', 'isEncoding', 'byteLength', 'concat', 'compare'].forEach(
+    function (name) {
+      var stub = function () {
+        load();
+        var real = Buffer[name];
+        if (real === stub) {
+          throw new Error('Buffer.' + name + ' is not available');
+        }
+        return real.apply(Buffer, arguments);
+      };
+      Buffer[name] = stub;
+    }
+  );
+  global.Buffer = Buffer;
+
+  ['decodeBuffer', 'encodeString', 'encodingExists', 'parseQuery', 'parseUrl'].forEach(function (name) {
+    var stub = function () {
+      load();
+      var real = global[name];
+      if (real === stub) {
+        throw new Error(name + ' is not available');
+      }
+      return real.apply(this, arguments);
+    };
+    stubs[name] = stub;
+    global[name] = stub;
+  });
+})(this);
+"#;
+
+/// A fresh engine with the loop bound set and the Node parts a script is
+/// written against — [`BOOTSTRAP`].
+///
+/// `None` only if the bootstrap itself fails, which is a bug here rather than
+/// in anyone's script; it is logged as one.
+pub(crate) fn script_engine() -> Option<Context> {
+    let mut ctx = Context::default();
+    ctx.runtime_limits_mut()
+        .set_loop_iteration_limit(LOOP_LIMIT);
+    type Native = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
+    let natives: [(&str, usize, Native); 5] = [
+        ("__utf8Encode", 1, js_utf8_encode),
+        ("__utf8Decode", 1, js_utf8_decode),
+        ("__iconvEncode", 2, js_iconv_encode),
+        ("__iconvDecode", 2, js_iconv_decode),
+        ("__encodingExists", 1, js_encoding_exists),
+    ];
+    for (name, length, function) in natives {
+        ctx.register_global_callable(
+            JsString::from(name),
+            length,
+            NativeFunction::from_fn_ptr(function),
+        )
+        .ok()?;
+    }
+    ctx.global_object()
+        .set(
+            js_string!("__nodePrelude"),
+            JsString::from(NODE_PRELUDE),
+            false,
+            &mut ctx,
+        )
+        .ok()?;
+    if let Err(err) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
+        tracing::error!("the script bootstrap does not evaluate: {err}");
+        return None;
+    }
+    Some(ctx)
+}
+
+/// Bytes as a JavaScript "binary string": one code unit per byte. The form
+/// bytes take between this side and `script_prelude.js`.
+fn binary_string(bytes: &[u8]) -> JsString {
+    let units: Vec<u16> = bytes.iter().map(|b| u16::from(*b)).collect();
+    JsString::from(&units[..])
+}
+
+/// The bytes of a binary string. A code unit above 255 cannot come from the
+/// prelude; if one arrives it is truncated, as `Buffer.from(s, 'latin1')` does.
+fn binary_bytes(text: &JsString) -> Vec<u8> {
+    text.to_vec().into_iter().map(|unit| unit as u8).collect()
+}
+
+fn arg_string(args: &[JsValue], at: usize, ctx: &mut Context) -> JsResult<JsString> {
+    args.get(at).cloned().unwrap_or_default().to_string(ctx)
+}
+
+/// `Buffer.from(str, 'utf8')`: a lone surrogate becomes U+FFFD, as in Node.
+fn js_utf8_encode(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let text = arg_string(args, 0, ctx)?.to_std_string_lossy();
+    Ok(binary_string(text.as_bytes()).into())
+}
+
+/// `buf.toString('utf8')`: a byte sequence that is not UTF-8 becomes U+FFFD.
+fn js_utf8_decode(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let bytes = binary_bytes(&arg_string(args, 0, ctx)?);
+    Ok(JsString::from(String::from_utf8_lossy(&bytes).as_ref()).into())
+}
+
+/// An `iconv-lite` encoding, as far as this port can serve one.
+#[derive(Clone, Copy)]
+enum Codec {
+    /// One of the Encoding Standard's, by `encoding_rs`.
+    Standard(&'static encoding_rs::Encoding),
+    /// ISO-8859-1 proper: a byte is its own code point. Not the Encoding
+    /// Standard's `latin1`, which is windows-1252 and puts `€` at 0x80.
+    Latin1,
+    /// Seven bits. A byte above 0x7F decodes to U+FFFD.
+    Ascii,
+}
+
+/// The codec for an `iconv-lite` encoding name, where there is one.
+///
+/// iconv-lite squeezes a name down to its letters and digits before looking it
+/// up, so `GB-2312`, `gb_2312` and `gb2312` are one name; the WHATWG labels
+/// `encoding_rs` answers to are stricter, and its spellings of the Windows
+/// code pages differ. The few aliases here are the ones people type.
+fn codec_for(label: &str) -> Option<Codec> {
+    let label = label.trim().to_ascii_lowercase();
+    let squeezed: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    // Before the standard labels, which call all of these windows-1252.
+    match squeezed.as_str() {
+        "latin1" | "iso88591" | "l1" | "cp819" | "ibm819" => return Some(Codec::Latin1),
+        "ascii" | "usascii" | "ascii8bit" | "ansix341968" | "646" => return Some(Codec::Ascii),
+        _ => {}
+    }
+    if let Some(found) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+        return Some(Codec::Standard(found));
+    }
+    let digits = |prefix: &str| {
+        squeezed
+            .strip_prefix(prefix)
+            .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+            .map(str::to_string)
+    };
+    let alias = match squeezed.as_str() {
+        "cp936" | "ms936" | "windows936" | "gb2312" | "gbk" => "gbk".to_string(),
+        "cp950" | "big5" | "big5hkscs" => "big5".to_string(),
+        "cp932" | "ms932" | "sjis" | "shiftjis" | "windows31j" => "shift_jis".to_string(),
+        "cp949" | "euckr" | "ksc56011987" => "euc-kr".to_string(),
+        "eucjp" => "euc-jp".to_string(),
+        "gb18030" => "gb18030".to_string(),
+        "utf16" | "utf16le" | "ucs2" => "utf-16le".to_string(),
+        "utf16be" => "utf-16be".to_string(),
+        "utf8" => "utf-8".to_string(),
+        "koi8r" => "koi8-r".to_string(),
+        "koi8u" => "koi8-u".to_string(),
+        "macintosh" | "macroman" => "macintosh".to_string(),
+        _ => {
+            if let Some(n) = digits("win").or_else(|| digits("windows")) {
+                format!("windows-{n}")
+            } else if let Some(n) = digits("cp125") {
+                format!("windows-125{n}")
+            } else {
+                format!("iso-8859-{}", digits("iso8859")?)
+            }
+        }
+    };
+    encoding_rs::Encoding::for_label(alias.as_bytes()).map(Codec::Standard)
+}
+
+/// `iconv.encode(text, encoding)`: a character the encoding cannot hold is a
+/// `?`, which is iconv-lite's default (`encoding_rs`'s own is an HTML numeric
+/// reference, the right answer for a form submission and the wrong one here).
+fn iconv_encode(codec: Codec, text: &str) -> Vec<u8> {
+    let encoding = match codec {
+        Codec::Standard(encoding) => encoding,
+        Codec::Latin1 | Codec::Ascii => {
+            let top = if matches!(codec, Codec::Ascii) {
+                0x7f
+            } else {
+                0xff
+            };
+            return text
+                .chars()
+                .map(|c| if c as u32 <= top { c as u8 } else { b'?' })
+                .collect();
+        }
+    };
+    // `encoding_rs` follows the Encoding Standard, under which nothing is ever
+    // *encoded* as UTF-16 — asking gets UTF-8 back. iconv does encode it.
+    if encoding == encoding_rs::UTF_16LE {
+        return text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    }
+    if encoding == encoding_rs::UTF_16BE {
+        return text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    }
+    let mut encoder = encoding.new_encoder();
+    let mut out = Vec::new();
+    let mut rest = text;
+    loop {
+        let need = encoder
+            .max_buffer_length_from_utf8_without_replacement(rest.len())
+            .unwrap_or(rest.len() * 4 + 16);
+        out.reserve(need);
+        let (result, read) =
+            encoder.encode_from_utf8_to_vec_without_replacement(rest, &mut out, true);
+        rest = &rest[read..];
+        match result {
+            encoding_rs::EncoderResult::InputEmpty => return out,
+            encoding_rs::EncoderResult::OutputFull => {}
+            encoding_rs::EncoderResult::Unmappable(_) => out.push(b'?'),
+        }
+    }
+}
+
+/// `iconv.decode(bytes, encoding)`. Bytes the encoding cannot explain become
+/// U+FFFD.
+fn iconv_decode(codec: Codec, bytes: &[u8]) -> String {
+    match codec {
+        Codec::Standard(encoding) => encoding.decode_without_bom_handling(bytes).0.into_owned(),
+        Codec::Latin1 => bytes.iter().map(|b| char::from(*b)).collect(),
+        Codec::Ascii => bytes
+            .iter()
+            .map(|b| {
+                if b.is_ascii() {
+                    char::from(*b)
+                } else {
+                    '\u{fffd}'
+                }
+            })
+            .collect(),
+    }
+}
+
+/// `__iconvEncode(text, encoding)` → a binary string, or `null` for an
+/// encoding nobody knows.
+fn js_iconv_encode(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let text = arg_string(args, 0, ctx)?.to_std_string_lossy();
+    let label = arg_string(args, 1, ctx)?.to_std_string_lossy();
+    Ok(match codec_for(&label) {
+        Some(codec) => binary_string(&iconv_encode(codec, &text)).into(),
+        None => JsValue::null(),
+    })
+}
+
+/// `__iconvDecode(bytes, encoding)` → the text, or `null` for an encoding
+/// nobody knows.
+fn js_iconv_decode(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let bytes = binary_bytes(&arg_string(args, 0, ctx)?);
+    let label = arg_string(args, 1, ctx)?.to_std_string_lossy();
+    Ok(match codec_for(&label) {
+        Some(codec) => JsString::from(iconv_decode(codec, &bytes).as_str()).into(),
+        None => JsValue::null(),
+    })
+}
+
+fn js_encoding_exists(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let label = arg_string(args, 0, ctx)?.to_std_string_lossy();
+    Ok(codec_for(&label).is_some().into())
+}
+
 /// What a response script changed.
 pub struct ScriptResult {
     pub status: Option<u16>,
@@ -67,7 +434,7 @@ pub fn run_res_script(
     headers: &[(String, String)],
     body: &str,
 ) -> Option<ScriptResult> {
-    let mut ctx = Context::default();
+    let mut ctx = script_engine()?;
 
     let hdr_obj: serde_json::Map<String, serde_json::Value> = headers
         .iter()
@@ -188,8 +555,7 @@ fn has_word(text: &str, words: &[&str]) -> bool {
 }
 
 /// What a rules-producing script gets to look at — upstream's
-/// `getScriptContext` (`_original/lib/rules/index.js:349-416`), the parts this
-/// port can honestly fill.
+/// `getScriptContext` (`_original/lib/rules/index.js:349-416`).
 pub struct RulesScriptCtx<'a> {
     pub method: &'a str,
     pub full_url: &'a str,
@@ -205,6 +571,12 @@ pub struct RulesScriptCtx<'a> {
     pub values: &'a std::collections::HashMap<String, String>,
     /// The request's `reqScriptData` — see [`crate::rules::ReqInfo::script_data`].
     pub script_data: &'a Mutex<serde_json::Value>,
+    /// The pattern of the rule line the script was written on — upstream's
+    /// `script.rawPattern`. `example.com/api` for
+    /// `example.com/api reqScript://{x.js}`.
+    pub pattern: &'a str,
+    /// What the script may know about the proxy it runs in.
+    pub env: &'a crate::rules::ScriptEnv,
 }
 
 /// The response third of the context, present only in the `resScript` pass.
@@ -230,13 +602,13 @@ pub struct RulesScriptRes<'a> {
 ///   resolves as the *whole* operator value, so that line proved nothing, and
 ///   upstream's own suite — `test/units/script.test.js` — asks exactly this.)
 ///
-/// Omitted from the context, and what that costs: `Buffer`, `decodeBuffer`,
-/// `encodeString` and `encodingExists` — the four that exist to move bytes
-/// between encodings, which need an `iconv` this port does not carry. A script
-/// calling one of them throws a `ReferenceError` here and produces nothing,
-/// where upstream would have run it — a real, narrow divergence, declared in
-/// `docs/RULES.md`. `pattern` is `''` because a resolved operator does not
-/// carry the pattern that matched it in this port.
+/// The context is upstream's, name for name. `Buffer`, `parseUrl`,
+/// `parseQuery`, `decodeBuffer`, `encodeString` and `encodingExists` come from
+/// [`script_engine`]; the rest is filled in here. Until 2026-09-30 the first
+/// and the last three were missing (a script naming one threw and produced
+/// nothing), `parseQuery` kept only the last of a repeated key and left `+`
+/// alone, `parseUrl` left `user:pw@` in the host name, and `pattern` and `port`
+/// were `''` and `0`.
 pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String> {
     produce_rules(src, input).map(|produced| produced.rules)
 }
@@ -254,10 +626,118 @@ pub struct Produced {
     pub values: HashMap<String, String>,
 }
 
-/// [`run_rules_script`], with the values the script set.
-pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> {
-    let mut ctx = Context::default();
+/// The values a script's `getValue` reads, as the two maps upstream asks in
+/// turn: the ``` blocks of the rules text, then the Values store
+/// (`_original/lib/rules/index.js:398-401`). `getValue(key, true)` skips the
+/// first.
+///
+/// An inline block's key carries the group it was declared in
+/// (`crate::rules::inline_key`) and a script asks by the plain name, so a
+/// block is offered under its plain name. A block `--value` overrides is
+/// already gone from the map.
+fn value_maps(values: &HashMap<String, String>) -> (serde_json::Value, serde_json::Value) {
+    let mut store = serde_json::Map::new();
+    for (name, content) in values {
+        if crate::rules::inline_key_name(name).is_none() {
+            store.insert(name.clone(), serde_json::Value::String(content.clone()));
+        }
+    }
+    // Sorted, so that two groups declaring the same name settle it the same
+    // way every time rather than by hash order.
+    let mut blocks: Vec<(&str, &String)> = values
+        .iter()
+        .filter_map(|(key, content)| Some((crate::rules::inline_key_name(key)?, content)))
+        .collect();
+    blocks.sort();
+    blocks.dedup_by_key(|(name, _)| *name);
+    let inline: serde_json::Map<String, serde_json::Value> = blocks
+        .into_iter()
+        .map(|(plain, content)| {
+            (
+                plain.to_string(),
+                serde_json::Value::String(content.clone()),
+            )
+        })
+        .collect();
+    (
+        serde_json::Value::Object(inline),
+        serde_json::Value::Object(store),
+    )
+}
 
+/// The helpers a script may call that are about *this request* rather than
+/// about Node — everything else is [`NODE_PRELUDE`].
+const REQUEST_GLUE: &str = r#"
+    var console = { log: function(){}, info: function(){}, warn: function(){},
+                    error: function(){}, debug: function(){}, fatal: function(){} };
+    // `ctx.value = req.globalValue`: there, and `undefined`, unless the request
+    // carries one. Reading it must not be a ReferenceError.
+    var value;
+    function getValue(key, onlyValues) {
+        var v = onlyValues ? undefined : __inlineValues[key];
+        if (typeof v !== 'string') v = __storeValues[key];
+        return typeof v === 'string' ? v : undefined;
+    }
+    function isLocalAddress(addr) {
+        addr = String(addr == null || addr === '' ? ip : addr).toLowerCase();
+        if (addr[0] === '[') addr = addr.slice(1, -1);
+        return addr === '127.0.0.1' || addr === '0.0.0.0' || addr === 'localhost'
+            || addr === '::1' || addr === '0:0:0:0:0:0:0:1' || addr === '::'
+            || /^127\./.test(addr) || (!!__localIp && addr === __localIp);
+    }
+    // whistle's `tpl` (`_original/lib/rules/index.js:304-347`), the same
+    // source transformation: `<% … %>` is code, `<%= … %>` interpolates,
+    // and a string with no `<%` and `%>` in it is returned as it came. The
+    // newline dance is upstream's — lines become tabs so the generated
+    // function is one line, and the tabs come back at the end.
+    var __tplCache = {};
+    function tpl(str, data) {
+        if (typeof str !== 'string' || str.indexOf('<%') === -1 || str.indexOf('%>') === -1) {
+            return str + '';
+        }
+        var fn = __tplCache[str];
+        if (!fn) {
+            var body = str
+                .replace(/[\u2028\u2029]/g, '')
+                .replace(/\t/g, ' ')
+                .replace(/\r?\n|\r/g, '\t')
+                .split('<%')
+                .join('\u2028')
+                .replace(/((^|%>)[^\u2028]*)'/g, '$1\r')
+                .replace(/\u2028=(.*?)%>/g, '\',$1,\'')
+                .split('\u2028')
+                .join('\');')
+                .split('%>')
+                .join('p.push(\'')
+                .split('\r')
+                .join('\\\'');
+            fn = new Function(
+                'obj',
+                'var p=[],print=function(){p.push.apply(p,arguments);};'
+                    + 'with(obj){p.push(\'' + body + '\');}return p.join(\'\');'
+            );
+            __tplCache[str] = fn;
+        }
+        return fn(data || {}).replace(/\t/g, '\n');
+    }
+    var render = tpl;
+"#;
+
+/// Put each property of `globals` on the engine's global object.
+fn set_globals(ctx: &mut Context, globals: &serde_json::Value) -> Option<()> {
+    let obj = JsValue::from_json(globals, ctx).ok()?;
+    let obj = obj.as_object()?.clone();
+    for key in obj.own_property_keys(ctx).ok()? {
+        let val = obj.get(key.clone(), ctx).ok()?;
+        ctx.global_object().set(key, val, false, ctx).ok()?;
+    }
+    Some(())
+}
+
+/// The part of upstream's script context that describes the request — shared
+/// by the rules scripts and by `frameScript`, which upstream builds from the
+/// same `getScriptContext`.
+fn request_globals(input: &RulesScriptCtx<'_>) -> serde_json::Value {
     let headers: serde_json::Map<String, serde_json::Value> = input
         .headers
         .iter()
@@ -284,150 +764,44 @@ pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> 
         Ok(data @ serde_json::Value::Object(_)) => data,
         _ => json!({}),
     };
-    let globals = json!({
+    let (inline, store) = value_maps(input.values);
+    let env = input.env;
+    json!({
         "url": input.full_url,
         "fullUrl": input.full_url,
-        "method": if input.method.is_empty() { "GET" } else { input.method },
-        "httpVersion": "1.1",
+        "method": if input.method.is_empty() { "GET".to_string() } else { input.method.to_ascii_uppercase() },
+        // `req.httpVersion || '1.1'`: what the *client* spoke.
+        "httpVersion": if env.http_version.is_empty() { "1.1" } else { env.http_version },
         "headers": headers,
         "reqHeaders": headers,
         "body": input.body,
         "ip": ip,
         "clientIp": ip,
         "clientPort": input.client_port.unwrap_or(0),
-        "pattern": "",
+        "pattern": input.pattern,
         "version": crate::config::VERSION,
-        "port": 0,
-        "uiPort": 0,
+        "port": env.proxy_port,
+        "uiPort": env.ui_port,
         "uiHost": "local.wproxy.org",
-        "value": "",
         "reqScriptData": script_data,
+        "res": null,
         "statusCode": status,
         "serverIp": server_ip,
         "resHeaders": res_headers,
-        "rules": [],
-        "values": {},
-    });
-    let mut globals = globals;
-    // `getValue` reads them by name. An inline block's key carries the group it
-    // was declared in (`crate::rules::inline_key`), and a script asks by the
-    // plain name, so a block is offered under its plain name — over the
-    // store's entry, as upstream's `getValue` asks `req._inlineValues` first
-    // (`_original/lib/rules/index.js:399-402`) and as `value_for` does
-    // everywhere else. A block `--value` overrides is already gone from the map.
-    let mut store = serde_json::Map::new();
-    for (name, content) in input.values {
-        if crate::rules::inline_key_name(name).is_none() {
-            store.insert(name.clone(), serde_json::Value::String(content.clone()));
-        }
-    }
-    // Sorted, so that two groups declaring the same name settle it the same
-    // way every time rather than by hash order.
-    let mut blocks: Vec<(&str, &String)> = input
-        .values
-        .iter()
-        .filter_map(|(key, content)| Some((crate::rules::inline_key_name(key)?, content)))
-        .collect();
-    blocks.sort();
-    blocks.dedup_by_key(|(name, _)| *name);
-    for (plain, content) in blocks {
-        store.insert(
-            plain.to_string(),
-            serde_json::Value::String(content.clone()),
-        );
-    }
-    globals["__values"] = serde_json::Value::Object(store);
-    globals["__localIp"] =
-        json!(crate::proxy::upstream::primary_local_ip().map(|ip| ip.to_string()));
-    let obj = JsValue::from_json(&globals, &mut ctx).ok()?;
-    let obj = obj.as_object()?.clone();
-    for key in obj.own_property_keys(&mut ctx).ok()? {
-        let val = obj.get(key.clone(), &mut ctx).ok()?;
-        ctx.global_object().set(key, val, false, &mut ctx).ok()?;
-    }
-    // The helpers a script may call, as JavaScript rather than native hooks:
-    // `getValue` answers from the values map the caller passed in via `values`
-    // upstream — this port resolves `{name}` references before the operator is
-    // read, so the map a script could usefully ask for is already folded into
-    // the source text; an unknown key answers `undefined` in both.
-    const PRELUDE: &str = r#"
-        var console = { log: function(){}, info: function(){}, warn: function(){},
-                        error: function(){}, debug: function(){}, fatal: function(){} };
-        function getValue(key) {
-            var v = __values[key];
-            return typeof v === 'string' ? v : undefined;
-        }
-        function isLocalAddress(addr) {
-            addr = String(addr == null ? ip : addr).toLowerCase();
-            if (addr[0] === '[') addr = addr.slice(1, -1);
-            return addr === '127.0.0.1' || addr === '0.0.0.0' || addr === 'localhost'
-                || addr === '::1' || addr === '0:0:0:0:0:0:0:1' || addr === '::'
-                || /^127\./.test(addr) || (!!__localIp && addr === __localIp);
-        }
-        function parseQuery(s) {
-            var out = {};
-            String(s == null ? '' : s).replace(/^[?#]/, '').split('&').forEach(function (kv) {
-                if (!kv) return;
-                var i = kv.indexOf('=');
-                var k = i === -1 ? kv : kv.substring(0, i);
-                var v = i === -1 ? '' : kv.substring(i + 1);
-                try { k = decodeURIComponent(k); } catch (e) {}
-                try { v = decodeURIComponent(v); } catch (e) {}
-                out[k] = v;
-            });
-            return out;
-        }
-        function parseUrl(u) {
-            u = String(u == null ? '' : u);
-            var m = /^([a-z][\w.+-]*:)\/\/([^/?#]*)([^?#]*)(\??[^#]*)/i.exec(u) || [];
-            var host = m[2] || '';
-            var at = host.lastIndexOf(':');
-            var hostname = at === -1 ? host : host.substring(0, at);
-            var port = at === -1 ? null : host.substring(at + 1);
-            var search = m[4] || '';
-            return { protocol: (m[1] || '').toLowerCase(), host: host,
-                     hostname: hostname, port: port, path: (m[3] || '') + search,
-                     pathname: m[3] || '', search: search,
-                     query: search.replace(/^\?/, ''), href: u, hash: '' };
-        }
-        // whistle's `tpl` (`_original/lib/rules/index.js:304-347`), the same
-        // source transformation: `<% … %>` is code, `<%= … %>` interpolates,
-        // and a string with no `<%` and `%>` in it is returned as it came. The
-        // newline dance is upstream's — lines become tabs so the generated
-        // function is one line, and the tabs come back at the end.
-        var __tplCache = {};
-        function tpl(str, data) {
-            if (typeof str !== 'string' || str.indexOf('<%') === -1 || str.indexOf('%>') === -1) {
-                return str + '';
-            }
-            var fn = __tplCache[str];
-            if (!fn) {
-                var body = str
-                    .replace(/[\u2028\u2029]/g, '')
-                    .replace(/\t/g, ' ')
-                    .replace(/\r?\n|\r/g, '\t')
-                    .split('<%')
-                    .join('\u2028')
-                    .replace(/((^|%>)[^\u2028]*)'/g, '$1\r')
-                    .replace(/\u2028=(.*?)%>/g, '\',$1,\'')
-                    .split('\u2028')
-                    .join('\');')
-                    .split('%>')
-                    .join('p.push(\'')
-                    .split('\r')
-                    .join('\\\'');
-                fn = new Function(
-                    'obj',
-                    'var p=[],print=function(){p.push.apply(p,arguments);};'
-                        + 'with(obj){p.push(\'' + body + '\');}return p.join(\'\');'
-                );
-                __tplCache[str] = fn;
-            }
-            return fn(data || {}).replace(/\t/g, '\n');
-        }
-        var render = tpl;
-    "#;
-    ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).ok()?;
+        "__inlineValues": inline,
+        "__storeValues": store,
+        "__localIp": crate::proxy::upstream::primary_local_ip().map(|ip| ip.to_string()),
+    })
+}
+
+/// [`run_rules_script`], with the values the script set.
+pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> {
+    let mut ctx = script_engine()?;
+    let mut globals = request_globals(input);
+    globals["rules"] = json!([]);
+    globals["values"] = json!({});
+    set_globals(&mut ctx, &globals)?;
+    ctx.eval(Source::from_bytes(REQUEST_GLUE.as_bytes())).ok()?;
 
     let ran = ctx.eval(Source::from_bytes(src.as_bytes()));
     // Kept whether or not the script finished: upstream's context is the same
@@ -865,6 +1239,10 @@ fn register_pac_natives(ctx: &mut Context) -> Result<()> {
 /// the two alike is how a request slips past the proxy it was pinned to.
 pub fn eval_pac(pac_src: &str, url: &str, host: &str) -> Result<String> {
     let mut ctx = Context::default();
+    // A PAC file that loops for ever is an error like any other, rather than a
+    // thread of the blocking pool gone for good.
+    ctx.runtime_limits_mut()
+        .set_loop_iteration_limit(LOOP_LIMIT);
     register_pac_natives(&mut ctx)?;
     ctx.eval(Source::from_bytes(PAC_HELPERS.as_bytes()))
         .map_err(|e| anyhow!("PAC helper environment: {e}"))?;
@@ -1056,6 +1434,12 @@ mod tests {
         std::sync::LazyLock::new(std::collections::HashMap::new);
     /// No script has run yet.
     static NO_DATA: Mutex<serde_json::Value> = Mutex::new(serde_json::Value::Null);
+    /// No proxy around the script: what a unit test and `explain` have.
+    static NO_ENV: crate::rules::ScriptEnv = crate::rules::ScriptEnv {
+        proxy_port: 0,
+        ui_port: 0,
+        http_version: "",
+    };
 
     /// A rules script pushes lines; an error discards them; `values` set by the
     /// script does not resolve a `{name}` reference. All measured against
@@ -1073,6 +1457,8 @@ mod tests {
                 res: None,
                 values: &NO_VALUES,
                 script_data: &NO_DATA,
+                pattern: "",
+                env: &NO_ENV,
             }
         }
         assert_eq!(
@@ -1128,6 +1514,8 @@ mod tests {
             res: None,
             values: &NO_VALUES,
             script_data: data,
+            pattern: "",
+            env: &NO_ENV,
         };
         let this_request = Mutex::new(serde_json::Value::Null);
         run_rules_script(
@@ -1166,6 +1554,8 @@ mod tests {
             res: None,
             values: &store,
             script_data: &NO_DATA,
+            pattern: "",
+            env: &NO_ENV,
         };
         let push = |expr: &str| {
             run_rules_script(
@@ -1240,6 +1630,8 @@ mod tests {
             res: Some(res),
             values: &NO_VALUES,
             script_data: &NO_DATA,
+            pattern: "",
+            env: &NO_ENV,
         };
         assert_eq!(
             run_rules_script(
@@ -1259,6 +1651,8 @@ mod tests {
             res: None,
             values: &NO_VALUES,
             script_data: &NO_DATA,
+            pattern: "",
+            env: &NO_ENV,
         };
         assert_eq!(
             run_rules_script(
@@ -1267,6 +1661,489 @@ mod tests {
             )
             .as_deref(),
             Some(""),
+        );
+    }
+
+    /// Evaluate `expr` in a fresh script engine and hand back its value as JSON.
+    fn node(expr: &str) -> serde_json::Value {
+        let mut ctx = script_engine().expect("engine");
+        let src = format!("JSON.stringify((function () {{ return {expr}; }})())");
+        let out = ctx
+            .eval(Source::from_bytes(src.as_bytes()))
+            .unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let text = out.to_string(&mut ctx).unwrap().to_std_string_escaped();
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{expr} gave {text}: {e}"))
+    }
+
+    /// `querystring.parse`, by the answers Node gives. The first three are the
+    /// ones `tests/differential/core-bench.js` asks whistle itself.
+    #[test]
+    fn parse_query_is_nodes_querystring_parse() {
+        for (input, want) in [
+            // A repeated key is an array; `+` is a space; a bare key is ''.
+            (
+                "a=1&a=2&q=a+b&e=%E4%B8%AD&bare",
+                json!({"a": ["1", "2"], "q": "a b", "e": "中", "bare": ""}),
+            ),
+            ("", json!({})),
+            // A broken escape is left as written, not thrown on.
+            ("a=%zz&b=%41", json!({"a": "%zz", "b": "A"})),
+            // An empty pair is skipped; a third value joins the array.
+            ("a=1&&a=2&a=3", json!({"a": ["1", "2", "3"]})),
+            // Only the first `=` splits; an empty key is a key.
+            ("a=b=c&=x", json!({"a": "b=c", "": "x"})),
+            // `%2B` is a plus, which `+` is not; a leading `?` is part of the key.
+            ("?a%20b=c+d%2B", json!({"?a b": "c d+"})),
+        ] {
+            assert_eq!(node(&format!("parseQuery({input:?})")), want, "{input}");
+        }
+        // Not a string: an empty object, as Node answers.
+        assert_eq!(node("parseQuery(null)"), json!({}));
+    }
+
+    /// `url.parse`, by the answers Node gives — the quirks included.
+    #[test]
+    fn parse_url_is_nodes_legacy_url_parse() {
+        let fields = "[u.protocol, u.slashes, u.auth, u.host, u.port, u.hostname, u.hash, u.search, u.query, u.pathname, u.path, u.href]";
+        let parse = |url: &str| {
+            node(&format!(
+                "(function (u) {{ return {fields}; }})(parseUrl({url:?}))"
+            ))
+        };
+        // Userinfo is `auth`, not part of the host; an IPv6 literal keeps its
+        // brackets in `host` and loses them in `hostname`; the hash is kept.
+        assert_eq!(
+            parse("http://user:pw@[::1]:8080/p/a?x=1#frag"),
+            json!([
+                "http:",
+                true,
+                "user:pw",
+                "[::1]:8080",
+                "8080",
+                "::1",
+                "#frag",
+                "?x=1",
+                "x=1",
+                "/p/a",
+                "/p/a?x=1",
+                "http://user:pw@[::1]:8080/p/a?x=1#frag"
+            ])
+        );
+        // The host is lower-cased and the path is not; a space is escaped; no
+        // query is `null`, not ''.
+        assert_eq!(
+            parse("https://Example.COM/a b"),
+            json!([
+                "https:",
+                true,
+                null,
+                "example.com",
+                null,
+                "example.com",
+                null,
+                null,
+                null,
+                "/a%20b",
+                "/a%20b",
+                "https://example.com/a%20b"
+            ])
+        );
+        // No scheme, no host.
+        assert_eq!(
+            parse("/p/a?x=1#h"),
+            json!([
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                "#h",
+                "?x=1",
+                "x=1",
+                "/p/a",
+                "/p/a?x=1",
+                "/p/a?x=1#h"
+            ])
+        );
+        // A host with no path gets `/`; a default port is still a port.
+        assert_eq!(
+            parse("http://a.com:80"),
+            json!([
+                "http:",
+                true,
+                null,
+                "a.com:80",
+                "80",
+                "a.com",
+                null,
+                null,
+                null,
+                "/",
+                "/",
+                "http://a.com:80/"
+            ])
+        );
+        // A scheme the parser does not know is opaque after the colon.
+        assert_eq!(
+            parse("mailto:a@b.c"),
+            json!([
+                "mailto:",
+                null,
+                "a",
+                "b.c",
+                null,
+                "b.c",
+                null,
+                null,
+                null,
+                null,
+                null,
+                "mailto:a@b.c"
+            ])
+        );
+        // A name that is not ASCII is punycoded, as `url.parse` does.
+        assert_eq!(
+            node("parseUrl('http://中文.com/').hostname"),
+            json!("xn--fiq228c.com")
+        );
+        // Not a string: whistle's own lenient parser answers instead of a throw.
+        assert_eq!(node("parseUrl(undefined).pathname"), json!("/"));
+    }
+
+    /// `Buffer`, in the uses a rule script has for one.
+    #[test]
+    fn buffer_is_nodes_buffer() {
+        assert_eq!(
+            node("Buffer.from('A中').toString('hex')"),
+            json!("41e4b8ad")
+        );
+        assert_eq!(
+            node("Buffer.from('e4b8ad41', 'hex').toString()"),
+            json!("中A")
+        );
+        assert_eq!(
+            node(
+                "[Buffer.from('hello').toString('base64'), Buffer.from('aGVsbG8=', 'base64').toString('utf8')]"
+            ),
+            json!(["aGVsbG8=", "hello"])
+        );
+        // URL-safe input is read by the same decoder; padding is optional.
+        assert_eq!(
+            node("Buffer.from('_-8', 'base64').toString('hex')"),
+            json!("ffef")
+        );
+        assert_eq!(
+            node("Buffer.from([255, 239]).toString('base64url')"),
+            json!("_-8")
+        );
+        assert_eq!(
+            node(
+                "(function (b) { return [b.length, Buffer.isBuffer(b), Buffer.isBuffer('x'), Buffer.byteLength('中'), b[0], b.toString()]; })(Buffer.concat([Buffer.from('ab'), Buffer.from('c')]))"
+            ),
+            json!([3, true, false, 3, 97, "abc"])
+        );
+        // It is a Uint8Array, and it serialises as Node's does.
+        assert_eq!(node("Buffer.from('a') instanceof Uint8Array"), json!(true));
+        assert_eq!(
+            node("Buffer.from('ab')"),
+            json!({"type": "Buffer", "data": [97, 98]})
+        );
+        // Concatenation with a string is `toString()`, which is what makes
+        // `'x' + buf` work in a frame handler.
+        assert_eq!(node("'x' + Buffer.from('yz')"), json!("xyz"));
+        // Bytes that are not UTF-8 become U+FFFD rather than an error.
+        assert_eq!(
+            node("Buffer.from([0x61, 0xff]).toString()"),
+            json!("a\u{fffd}")
+        );
+        assert_eq!(
+            node("Buffer.from([0x61, 0xff]).toString('latin1')"),
+            json!("a\u{ff}")
+        );
+        // Slices share memory; searching and the fixed-width readers work.
+        assert_eq!(
+            node(
+                "(function (b) { var s = b.slice(1, 3); s[0] = 0x58; return [b.toString(), s.toString(), b.indexOf('c'), b.includes('zz'), b.readUInt16BE(0), b.equals(Buffer.from('aXcd'))]; })(Buffer.from('abcd'))"
+            ),
+            json!(["aXcd", "Xc", 2, false, 0x6158, true])
+        );
+        assert_eq!(
+            node(
+                "(function (b) { b.writeUInt32LE(0x01020304, 0); b.write('hi', 4); return b.toString('hex'); })(Buffer.alloc(6))"
+            ),
+            json!("040302016869")
+        );
+        assert_eq!(node("Buffer.alloc(3, 'ab').toString()"), json!("aba"));
+        assert_eq!(
+            node(
+                "(function () { try { Buffer.from('x', 'nope'); } catch (e) { return e.name; } })()"
+            ),
+            json!("TypeError")
+        );
+    }
+
+    /// The three `iconv` helpers whistle hands a script.
+    #[test]
+    fn the_iconv_helpers_move_text_between_encodings() {
+        assert_eq!(
+            node(
+                "[encodeString('中', 'gbk').toString('hex'), decodeBuffer(Buffer.from('d6d0', 'hex'), 'gbk'), encodingExists('gbk'), encodingExists('no-such')]"
+            ),
+            json!(["d6d0", "中", true, false])
+        );
+        // The default is UTF-8, in both directions.
+        assert_eq!(
+            node(
+                "[encodeString('中').toString('hex'), decodeBuffer(Buffer.from('e4b8ad', 'hex'))]"
+            ),
+            json!(["e4b8ad", "中"])
+        );
+        // Names as iconv-lite accepts them, which is looser than the WHATWG labels.
+        assert_eq!(
+            node(
+                "['GB2312', 'win1252', 'cp936', 'Shift_JIS', 'utf16le', 'latin1', 'big5', 'EUC-KR'].map(encodingExists)"
+            ),
+            json!([true, true, true, true, true, true, true, true])
+        );
+        // A character the encoding cannot hold is `?`, iconv-lite's default.
+        assert_eq!(
+            node("encodeString('a中', 'windows-1252').toString()"),
+            json!("a?")
+        );
+        assert_eq!(
+            node("encodeString('ab', 'utf-16be').toString('hex')"),
+            json!("00610062")
+        );
+        // `latin1` is ISO-8859-1 to iconv, a table like any other — not
+        // `Buffer`'s latin1, which would have kept the low byte (0x2d) — and
+        // not the Encoding Standard's either, which is windows-1252.
+        assert_eq!(
+            node(
+                "[encodeString('a中é', 'latin1').toString('hex'), encodeString('€', 'latin1').toString('hex'), decodeBuffer(Buffer.from([0x80, 0xe9]), 'latin1').length]"
+            ),
+            json!(["613fe9", "3f", 2])
+        );
+        assert_eq!(
+            node(
+                "[encodeString('aé', 'ascii').toString('hex'), encodeString('a中', 'binary').toString('hex')]"
+            ),
+            json!(["613f", "612d"])
+        );
+        // An encoding nobody knows is an error the script can catch.
+        assert_eq!(
+            node(
+                "(function () { try { decodeBuffer(Buffer.from('a'), 'nope'); } catch (e) { return 'threw'; } })()"
+            ),
+            json!("threw")
+        );
+    }
+
+    /// The legacy corners of the language a whistle script takes for granted:
+    /// `substr`, `escape`/`unescape`, and the `RegExp.$1` statics whistle's own
+    /// source is written with. The first three were a `TypeError` here.
+    #[test]
+    fn the_legacy_corners_of_the_language_are_there() {
+        assert_eq!(
+            node("['abcdef'.substr(1, 3), escape('a b+c'), unescape('%41')]"),
+            json!(["bcd", "a%20b+c", "A"])
+        );
+        assert_eq!(
+            node(
+                "(/(b)(c)/.test('abcd'), [RegExp.$1, RegExp.$2, RegExp.$3, RegExp.lastMatch, RegExp.leftContext, RegExp.rightContext])"
+            ),
+            json!(["b", "c", "", "bc", "a", "d"])
+        );
+        // Through `replace` and `match` too, and a failed match leaves the
+        // statics as they were.
+        assert_eq!(
+            node("('x-1'.replace(/(\\d)/, 'n'), 'zz'.match(/(q)/), RegExp.$1)"),
+            json!("1")
+        );
+    }
+
+    /// The Node parts load the first time one is used, and nothing a script
+    /// can do around that moment shows. The first case is the one that broke
+    /// an earlier design: the *second* call from one call site.
+    #[test]
+    fn the_node_parts_load_on_first_use_without_showing() {
+        // Called twice from one call site, the first of which triggers the load.
+        assert_eq!(
+            node("['a=1', 'b=2'].map(function (q) { return parseQuery(q); })"),
+            json!([{"a": "1"}, {"b": "2"}])
+        );
+        assert_eq!(
+            node("['gbk', 'nope', 'big5'].map(function (e) { return encodingExists(e); })"),
+            json!([true, false, true])
+        );
+        // A reference taken before the load still works after it, and is the
+        // same `Buffer` as the one instances are made by.
+        assert_eq!(
+            node(
+                "(function () { var B = Buffer, pq = parseQuery; var b = B.from('ab'); return [b instanceof B, b instanceof Buffer, B === Buffer, Buffer.isBuffer(b), pq('x=1').x, typeof B.from]; })()"
+            ),
+            json!([true, true, true, true, "1", "function"])
+        );
+        // The constructor forms, which are also what the inherited typed-array
+        // methods call.
+        assert_eq!(
+            node(
+                "[new Buffer(2).length, Buffer('hi').toString('hex'), Buffer.from('abc').map(function (x) { return x + 1; }).toString()]"
+            ),
+            json!([2, "6869", "bcd"])
+        );
+        // A script's own function by one of these names stays the script's,
+        // whether it was there before the load or not.
+        let mut ctx = script_engine().expect("engine");
+        let out = ctx
+            .eval(Source::from_bytes(
+                b"function parseQuery() { return 'mine'; } Buffer.from('a'); parseQuery('a=1') + '|' + typeof parseUrl('http://a/').host",
+            ))
+            .expect("runs");
+        assert_eq!(
+            out.to_string(&mut ctx).unwrap().to_std_string_escaped(),
+            "mine|string"
+        );
+    }
+
+    /// What it costs to start a script: an engine, the prelude, nothing else.
+    /// `cargo test --release --lib script::tests::cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn cost_of_starting_a_script() {
+        let n = 200u32;
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(script_engine().expect("engine"));
+        }
+        let each = started.elapsed() / n;
+        println!("script_engine(): {each:?} each");
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(Context::default());
+        }
+        println!("Context::default(): {:?} each", started.elapsed() / n);
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(JsString::from(NODE_PRELUDE));
+        }
+        println!("the prelude as a string: {:?} each", started.elapsed() / n);
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            let mut ctx = script_engine().expect("engine");
+            ctx.eval(Source::from_bytes(b"Buffer.alloc(1)"))
+                .expect("loads");
+        }
+        println!(
+            "script_engine() and the Node parts: {:?} each",
+            started.elapsed() / n
+        );
+        let mut ctx = script_engine().expect("engine");
+        let started = std::time::Instant::now();
+        let _ = ctx.eval(Source::from_bytes(b"while (true) {}"));
+        println!(
+            "a loop cut at {LOOP_LIMIT} iterations: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `pattern`, `port`, `uiPort` and `httpVersion` say what they say in
+    /// whistle; they were `''`, `0`, `0` and always `1.1`.
+    #[test]
+    fn a_script_knows_its_pattern_and_the_proxy() {
+        let env = crate::rules::ScriptEnv {
+            proxy_port: 8899,
+            ui_port: 8900,
+            http_version: "2.0",
+        };
+        let ctx = RulesScriptCtx {
+            method: "post",
+            full_url: "http://a.com/",
+            headers: &[],
+            body: "",
+            client_ip: None,
+            client_port: None,
+            res: None,
+            values: &NO_VALUES,
+            script_data: &NO_DATA,
+            pattern: "a.com/api",
+            env: &env,
+        };
+        assert_eq!(
+            run_rules_script(
+                "rules.push([pattern, port, uiPort, httpVersion, method, typeof value, res].join('|'))",
+                &ctx
+            )
+            .as_deref(),
+            Some("a.com/api|8899|8900|2.0|POST|undefined|")
+        );
+    }
+
+    /// `getValue(key, true)` skips the ``` blocks and asks the Values store.
+    #[test]
+    fn get_value_can_ask_the_store_alone() {
+        let mut store = std::collections::HashMap::new();
+        store.insert("k".to_string(), "from-store".to_string());
+        store.insert(
+            crate::rules::inline_key("k", "Default"),
+            "from-fence".to_string(),
+        );
+        let ctx = RulesScriptCtx {
+            method: "GET",
+            full_url: "http://a.com/",
+            headers: &[],
+            body: "",
+            client_ip: None,
+            client_port: None,
+            res: None,
+            values: &store,
+            script_data: &NO_DATA,
+            pattern: "",
+            env: &NO_ENV,
+        };
+        assert_eq!(
+            run_rules_script(
+                "rules.push(getValue('k') + '|' + getValue('k', true))",
+                &ctx
+            )
+            .as_deref(),
+            Some("from-fence|from-store")
+        );
+    }
+
+    /// A loop that never ends is stopped, and its script produces nothing —
+    /// it used to hold the request for ever.
+    #[test]
+    fn a_script_that_never_ends_is_stopped() {
+        let ctx = RulesScriptCtx {
+            method: "GET",
+            full_url: "http://a.com/",
+            headers: &[],
+            body: "",
+            client_ip: None,
+            client_port: None,
+            res: None,
+            values: &NO_VALUES,
+            script_data: &NO_DATA,
+            pattern: "",
+            env: &NO_ENV,
+        };
+        assert_eq!(
+            run_rules_script("rules.push('a'); while (true) {}", &ctx),
+            None
+        );
+        assert_eq!(
+            run_rules_script("rules.push('a'); (function f() { f(); })()", &ctx),
+            None
+        );
+        // …and an honest loop is not.
+        assert_eq!(
+            run_rules_script(
+                "var n = 0; for (var i = 0; i < 100000; i++) n++; rules.push('n=' + n)",
+                &ctx
+            )
+            .as_deref(),
+            Some("n=100000")
         );
     }
 

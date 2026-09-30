@@ -1983,26 +1983,73 @@ example.com   reqScript://{probe.js}
 ````
 
 The context is upstream's `getScriptContext`
-(`_original/lib/rules/index.js:349-416`): `url`/`fullUrl`, `method`,
-`httpVersion`, `headers`/`reqHeaders`, `body`, `ip`/`clientIp`, `clientPort`,
-`rules`, `values`, `value`, `reqScriptData`, `version`, `uiHost`,
-`getValue(name)`, `parseUrl`, `parseQuery`, `tpl`/`render`, `isLocalAddress`,
-and — in a `resScript` — `statusCode`, `serverIp` and `resHeaders`, which are
-empty strings in the request pass. `render` is whistle's own `<% … %>` /
-`<%= … %>` micro-template (`rules/index.js:304-347`), ported as the same source
-transformation. `reqScriptData` is one object for the whole request: what a
-`reqScript` puts there, the same request's `resScript` reads.
+(`_original/lib/rules/index.js:349-416`), name for name:
+
+| Name | What it is |
+|------|------------|
+| `url` / `fullUrl`, `method`, `headers` / `reqHeaders`, `body` | the request. `method` is upper-cased; `body` is at most the preview |
+| `ip` / `clientIp`, `clientPort` | who sent it |
+| `httpVersion` | what the **client** spoke: `1.0`, `1.1`, `2.0` |
+| `pattern` | the pattern of the rule line the script sits on (`example.com/api` for `example.com/api reqScript://{x.js}`) |
+| `port`, `uiPort`, `uiHost`, `version` | the proxy: its port, the console's (`-P`, else the same), `local.wproxy.org`, this build's version |
+| `rules`, `values` | what the script produces — see above and below |
+| `value` | `undefined` (upstream: the request's `G://` value, which this port does not have) |
+| `reqScriptData` | one object for the whole request: what a `reqScript` puts there, the same request's `resScript` reads |
+| `statusCode`, `serverIp`, `resHeaders` | the response head in a `resScript`; empty strings in the request pass |
+| `getValue(name[, onlyValues])` | a ``` block of that name, else the Values store; with `true`, the store alone |
+| `render(tpl, data)` / `tpl` | whistle's `<% … %>` / `<%= … %>` micro-template (`rules/index.js:304-347`), the same source transformation |
+| `isLocalAddress(ip)` | loopback, the unspecified addresses, this machine's primary address |
+| `parseUrl(url)` | Node's legacy `url.parse(url)` |
+| `parseQuery(str)` | Node's `querystring.parse(str)` |
+| `Buffer` | Node's `Buffer` |
+| `decodeBuffer(buf, enc)`, `encodeString(str, enc)`, `encodingExists(enc)` | `iconv-lite`'s `decode`, `encode` and `encodingExists` |
+
+The last four rows are **Node's behaviour, not a summary of it**, because
+[`reqScript.md`](https://wproxy.org/docs/rules/reqScript.html) says "同 Node.js
+的 `url.parse`" and a script copied from a whistle setup leans on the details:
+
+```js
+parseQuery('a=1&a=2&q=a+b')          // { a: ['1', '2'], q: 'a b' }   — not { a: '2', q: 'a+b' }
+parseUrl('http://u:p@[::1]:81/a b#h') // auth 'u:p', host '[::1]:81', hostname '::1',
+                                      // pathname '/a%20b', hash '#h', search null
+Buffer.from('中').toString('hex')      // 'e4b8ad'
+encodeString('中', 'gbk')              // <Buffer d6 d0>
+```
+
+They are written in JavaScript on top of the engine (`src/proxy/script_prelude.js`)
+and compared with whistle 2.10.10 case by case in
+`tests/differential/core-bench.js` — 55 script comparisons, 24 of them URLs,
+all equal. `Buffer` has the methods a rule script uses (`from`, `alloc`,
+`concat`, `isBuffer`, `byteLength`, `toString` in `utf8`/`hex`/`base64`/
+`base64url`/`latin1`/`ascii`/`utf16le`, `slice`, `indexOf`, `write`, `copy`,
+`equals`, the fixed-width `read…`/`write…` integers); it is not the whole of
+Node's. The `iconv` three know the Encoding Standard's set — `gbk`, `gb18030`,
+`big5`, `shift_jis`, `euc-kr`, the `windows-125x` and `iso-8859-x` families —
+under the names iconv-lite accepts (`GB2312`, `win1252`, `cp936`); an encoding
+outside that set (`cp437`, `utf7`) is not there.
+
+Until 2026-09-30 `Buffer` and the `iconv` three did not exist (a script naming
+one threw and produced nothing), `parseQuery` and `parseUrl` were ten-line
+approximations, and `pattern` and `port` were `''` and `0`.
+
+Also there, because whistle scripts assume them: `substr`, `escape` /
+`unescape`, and the `RegExp.$1`…`$9` / `lastMatch` statics.
+
+**What a script may cost.** whistle stops a script after 60 ms. This engine
+cannot be interrupted, so the bound is on what it can count: a single loop is
+stopped after 3,000,000 iterations (about 20 ms for an empty one) and recursion
+after a few hundred frames, and the script then produces nothing, as any script
+that throws does. Nested loops that each stay under the bound are not caught.
+Starting a script costs about 0.5 ms; the first use of `Buffer`, `parseUrl`,
+`parseQuery` or an `iconv` helper adds about 3 ms, once per script run.
 
 What the script writes to `values` answers the `{name}` references in the rules
 it pushed — see [Values declared in the rules text](#values-declared-in-the-rules-text).
 
-Divergences, all measured: the context omits `Buffer`, `decodeBuffer`, `encodeString` and
-`encodingExists`, the four that move bytes between encodings, so a script
-calling one throws here and produces nothing where upstream would have run it;
-`isLocalAddress` knows the loopback range, the unspecified addresses and this
-machine's primary address, where whistle also consults a cache of every name it
-has resolved; and `pattern` is `''` because a resolved operator does not carry
-the pattern that matched it in this port.
+Divergences that remain: `isLocalAddress` does not consult a cache of every name
+the proxy has resolved, which whistle's does; and there is no `require`,
+`process` or `setTimeout` — there is none upstream either, a `vm` context being
+JavaScript and nothing else.
 
 `frameScript` may be written in either of two shapes, and both work.
 

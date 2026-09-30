@@ -853,6 +853,27 @@ pub struct ReqInfo {
     /// suite's `script.test.js` passes a value across. Shared, not copied, by
     /// the clones the proxy makes of these facts; `Null` until a script runs.
     pub script_data: Arc<std::sync::Mutex<serde_json::Value>>,
+    /// What a script is told about the proxy itself — see [`ScriptEnv`].
+    pub script_env: ScriptEnv,
+}
+
+/// The facts a script's context carries that are not about the request's
+/// content: `port`, `uiPort` and `httpVersion`
+/// (`_original/lib/rules/index.js:356-363`).
+///
+/// They ride on [`ReqInfo`] because that is what reaches the place a script is
+/// run; the default — zero and empty — is what a test or `explain` has, where
+/// there is no proxy and no connection. A script then sees `port === 0` and
+/// `httpVersion === '1.1'`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScriptEnv {
+    /// The port the proxy listens on.
+    pub proxy_port: u16,
+    /// The console's port: `-P` when given, the proxy's otherwise.
+    pub ui_port: u16,
+    /// The HTTP version the client spoke, as Node spells it: `1.0`, `1.1`,
+    /// `2.0`. Empty when unknown.
+    pub http_version: &'static str,
 }
 
 /// The origin markers `from:` tests (`_original/lib/rules/rules.js:1834-1859`).

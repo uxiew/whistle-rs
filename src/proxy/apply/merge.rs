@@ -204,36 +204,43 @@ pub fn merge_included_rules(
     let mut script_values = HashMap::new();
     let joined = rules_file_ops(resolved)
         .iter()
-        .filter_map(|op| match op.value_is_content {
-            true => Some(op.value.clone()),
-            false => std::fs::read_to_string(&op.value).ok(),
+        .filter_map(|op| {
+            let text = match op.value_is_content {
+                true => Some(op.value.clone()),
+                false => std::fs::read_to_string(&op.value).ok(),
+            }?;
+            Some((text, op.raw_pattern.as_str()))
         })
         // A text that is JavaScript rather than rules is executed, and what it
         // pushed into `rules` takes its place in the list — upstream's
         // `handleDynamicRules` (`_original/lib/rules/index.js:459-476`), with
         // `isRulesContent` deciding which is which. A script that errors
         // contributes nothing, not even the lines it pushed before throwing.
-        .filter_map(|text| match crate::proxy::script::is_rules_content(&text) {
-            true => Some(text),
-            false => {
-                let produced = crate::proxy::script::produce_rules(
-                    &text,
-                    &crate::proxy::script::RulesScriptCtx {
-                        method: &info.method,
-                        full_url: &info.full_url,
-                        headers: &info.headers,
-                        body: info.req_body.as_deref().unwrap_or(""),
-                        client_ip: info.client_ip.as_deref(),
-                        client_port: info.client_port,
-                        res: None,
-                        values,
-                        script_data: &info.script_data,
-                    },
-                )?;
-                script_values.extend(produced.values);
-                Some(produced.rules)
-            }
-        })
+        .filter_map(
+            |(text, pattern)| match crate::proxy::script::is_rules_content(&text) {
+                true => Some(text),
+                false => {
+                    let produced = crate::proxy::script::produce_rules(
+                        &text,
+                        &crate::proxy::script::RulesScriptCtx {
+                            method: &info.method,
+                            full_url: &info.full_url,
+                            headers: &info.headers,
+                            body: info.req_body.as_deref().unwrap_or(""),
+                            client_ip: info.client_ip.as_deref(),
+                            client_port: info.client_port,
+                            res: None,
+                            values,
+                            script_data: &info.script_data,
+                            pattern,
+                            env: &info.script_env,
+                        },
+                    )?;
+                    script_values.extend(produced.values);
+                    Some(produced.rules)
+                }
+            },
+        )
         .collect::<Vec<_>>()
         .join("\n");
     let mut managers = Vec::new();
@@ -364,6 +371,8 @@ pub fn merge_res_rules(
                         res,
                         values,
                         script_data: &info.script_data,
+                        pattern: &op.raw_pattern,
+                        env: &info.script_env,
                     },
                 )?;
                 return Some((produced.rules, produced.values));

@@ -386,6 +386,17 @@ pub(super) async fn serve(
     );
     // The accepted socket's port, for `clientPort:` / `remotePort:` filters.
     info.client_port = Some(peer.port());
+    // What a `reqScript` reads as `port`, `uiPort` and `httpVersion`.
+    info.script_env = crate::rules::ScriptEnv {
+        proxy_port: state.config.port,
+        ui_port: state.config.ui_port.unwrap_or(state.config.port),
+        http_version: match req.version() {
+            hyper::Version::HTTP_10 => "1.0",
+            hyper::Version::HTTP_2 => "2.0",
+            hyper::Version::HTTP_3 => "3.0",
+            _ => "1.1",
+        },
+    };
     // Where the request came from, for `from:`. All of it is known before the
     // rules resolve — which is what makes `from:!tunnel` a real answer rather
     // than a filter that fails closed.

@@ -133,6 +133,7 @@ pub fn build_req_info(
         res: None,
         req_body: None,
         script_data: Default::default(),
+        script_env: Default::default(),
     }
 }
 

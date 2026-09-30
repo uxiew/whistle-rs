@@ -403,6 +403,30 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
     ['httpVersion', `httpVersion`],
     ['headers and method', `[method, headers['x-h'], typeof reqHeaders, typeof body]`],
     ['the type of every documented global', `[typeof url, typeof fullUrl, typeof ip, typeof clientIp, typeof clientPort, typeof version, typeof uiHost, typeof uiPort, typeof value, typeof getValue, typeof render, typeof tpl, typeof isLocalAddress, typeof reqScriptData, typeof statusCode, typeof serverIp, typeof resHeaders]`],
+    // A vm context is JavaScript and nothing else: none of Node's own globals.
+    ['what a vm context does not have', `[typeof require, typeof process, typeof setTimeout, typeof module, typeof global, typeof globalThis]`],
+    ['parseQuery: the corners', `['a=1&&b=2', '=x', 'a=b=c', '?a=1', 'a[]=1&a[]=2', 'a%zz=1', 'a=%E4%B8', 'a=1;b=2', '&', 'a'].map(function (q) { return parseQuery(q); })`],
+    ['parseQuery: not a string', `[parseQuery(), parseQuery(null), parseQuery(12), parseQuery({})]`],
+    ...[
+      'HTTP://A.com:8080/p?q#h', 'http://a.com', '//a.com/x', 'a.com/x', 'http://a.com/p?q=1?r=2#h#i',
+      'file:///tmp/x', 'http://[::1]/', 'http://a_b.com:/x', 'mailto:a@b.c', `http://x.com/a'b"c`,
+      'http://user@a.com', 'http://a.com?x=1', 'javascript:alert(1)', ' http://a.com/ ', 'http://a.com\\\\b\\\\c?d\\\\e',
+      'http://a.com/p#', 'http://a.com/?', 'ws://h:81/s', 'http://a.com:0080/x', 'http://a b.com/x', 'x:y', '',
+      'http://us%20er:p%40w@a.com/', 'HTTP://USER:PW@HOST.COM/PATH',
+    ].map((u) => [`parseUrl: ${u || '(empty)'}`,
+      `(function (u) { return [u.protocol, u.slashes, u.auth, u.host, u.port, u.hostname, u.hash, u.search, u.query, u.pathname, u.path, u.href]; })(parseUrl(${JSON.stringify(u)}))`]),
+    ['parseUrl: not a string', `[typeof parseUrl(), typeof parseUrl(null), parseUrl(12).pathname]`],
+    ['Buffer: slices, searches and integers', `(function (b) { var s = b.slice(1, 3); s[0] = 0x58; return [b.toString(), s.toString(), b.indexOf('c'), b.includes('zz'), b.readUInt16BE(0), b.equals(Buffer.from('aXcd')), JSON.stringify(s), b.toString('latin1', 1), Buffer.compare(b, s)]; })(Buffer.from('abcd'))`],
+    ['Buffer: bytes that are not text', `(function (b) { return [b.toString(), b.toString('latin1'), b.toString('base64'), b.toString('hex'), b.length]; })(Buffer.from([0x61, 0xff, 0xfe, 0x00]))`],
+    ['Buffer: alloc and write', `(function (b) { b.writeUInt32LE(0x01020304, 0); b.write('hi', 4); return [b.toString('hex'), Buffer.alloc(3, 'ab').toString(), Buffer.byteLength('aGk=', 'base64')]; })(Buffer.alloc(6))`],
+    ['Buffer: an unknown encoding', `Buffer.from('x', 'nope')`],
+    ['Buffer in a string', `'x' + Buffer.from('yz') + String(Buffer.from('!'))`],
+    ['decodeBuffer / encodeString: more names', `['GB2312', 'win1252', 'Shift_JIS', 'utf16le', 'latin1', 'big5', 'EUC-KR', 'nope', ''].map(function (e) { return encodingExists(e); })`],
+    ['encodeString: a character the encoding cannot hold', `[encodeString('a中', 'latin1').toString('hex'), encodeString('ab', 'utf16le').toString('hex')]`],
+    ['render with data', `render('<% for (var i = 0; i < n; i++) { %>[<%= i %>]<% } %>', { n: 3 })`],
+    ['isLocalAddress', `[isLocalAddress(), isLocalAddress('8.8.8.8'), isLocalAddress('127.0.0.1'), isLocalAddress('::1')]`],
+    ['the older string methods', `['abcdef'.substr(1, 3), escape('a b+c'), unescape('%41%u4E2D'), 'x'.padStart(3, '-'), [1, [2, [3]]].flat(2).join()]`],
+    ['RegExp statics', `(/(b)(c)/.test('abcd'), [RegExp.$1, RegExp.$2, RegExp.lastMatch])`],
   ];
   for (const [name, expr] of SCRIPTS) {
     list.push({ group: 'script', name, rulesFor: (port) => SCRIPT(expr.replace('__PORT__', String(port))), ask: scriptOut });
