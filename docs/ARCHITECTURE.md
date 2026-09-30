@@ -433,7 +433,7 @@ curl -x http://127.0.0.1:8899 --cacert ~/.whistle-rs/certs/root.crt https://exam
 whistle-rs/
 ├── Cargo.toml
 ├── build.rs               # inlines the built console into the binary
-├── README.md              # + README.zh-CN.md
+├── README.md              # README.zh-CN.md is only a redirect to it
 ├── rules.txt              # example rules
 ├── docs/
 │   ├── COOKBOOK.md        # task-oriented recipes (+ .zh-CN)

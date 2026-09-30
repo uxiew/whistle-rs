@@ -1,6 +1,6 @@
 # 模板与本地文件 / Templates
 
-[English README](../README.md) · [简体中文 README](../README.zh-CN.md) · [规则](RULES.md)
+[项目说明](../README.md) · [规则](RULES.md)
 
 用本地文件 mock 响应，并在其中插入请求相关的变量。
 

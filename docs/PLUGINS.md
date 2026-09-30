@@ -1,6 +1,6 @@
 # 插件系统 / Plugins
 
-[English README](../README.md) · [简体中文 README](../README.zh-CN.md) · [架构](ARCHITECTURE.md) · [规则](RULES.md)
+[项目说明](../README.md) · [架构](ARCHITECTURE.md) · [规则](RULES.md)
 
 whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 

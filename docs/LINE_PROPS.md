@@ -1,6 +1,6 @@
 # 规则行级属性 / Line properties (`lineProps://`)
 
-[English README](../README.md) · [简体中文 README](../README.zh-CN.md) · [规则总览](RULES.md)
+[项目说明](../README.md) · [规则总览](RULES.md)
 
 `lineProps://` 是 whistle 的**行作用域修饰符**：它声明的开关只影响**同一行**上写的算子，
 是全局 `enable://` / `disable://` 的行内对应物。

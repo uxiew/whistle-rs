@@ -5,7 +5,7 @@
 > 当前结论见 [STATUS.md](STATUS.md)，活动计划见 [ROADMAP.md](ROADMAP.md)。
 > 历史实验不能代替新提交、新工具链或新上游版本的复验。
 
-[English README](../README.md) · [简体中文 README](../README.zh-CN.md)
+[项目说明](../README.md)
 
 本文件诚实记录 **whistle-rs 相对原版 whistle 的对齐进度**：已完成的工作，以及仍
 **有意简化 / 尚未移植 / 架构受限**的更大子系统与少数边缘算子。
