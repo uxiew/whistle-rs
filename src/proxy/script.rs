@@ -788,6 +788,13 @@ fn resolve_ipv4(host: &str) -> Option<String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Some(ip.to_string());
     }
+    // Answered here, not by the resolver: Linux and macOS reject an empty
+    // name, but Windows' getaddrinfo answers it with this machine's own
+    // addresses, so `isResolvable('')` was true there alone. whistle's Node
+    // `dns.lookup('')` answers null without asking anyone.
+    if host.is_empty() {
+        return None;
+    }
     (host, 0u16)
         .to_socket_addrs()
         .ok()?
@@ -1341,7 +1348,8 @@ mod tests {
             // of its own (a captive portal, or the fake-IP mode every desktop
             // VPN client ships) resolves it, and the test would then fail on the
             // network rather than on the code. An empty host never reaches a
-            // resolver at all: `getaddrinfo` rejects it locally.
+            // resolver at all (`resolve_ipv4` answers it; Windows' resolver
+            // would have said "this machine").
             ("dnsResolve('') === null", "true"),
             ("isResolvable('')", "false"),
             ("typeof myIpAddress()", "'string'"),
