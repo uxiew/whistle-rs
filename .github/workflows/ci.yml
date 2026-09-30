@@ -160,9 +160,11 @@ jobs:
         run: cargo build --locked --release
       # --release, to reuse the dependencies just built rather than compile
       # everything a second time for the debug profile.
+      # --no-fail-fast: cargo otherwise stops at the first test binary that
+      # fails, and on a new platform every failure is worth seeing at once.
       - name: Tests on this platform
         if: matrix.test
-        run: cargo test --locked --release --all-targets
+        run: cargo test --locked --release --all-targets --no-fail-fast
       # This and the smoke test run even when a test failed, so one run shows
       # both; packaging below still needs every step to have passed.
       - name: Where the binary is, and what it needs from the system
