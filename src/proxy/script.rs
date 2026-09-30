@@ -855,150 +855,474 @@ pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> 
     })
 }
 
-/// What a `frameScript` decided about one frame.
-#[derive(Debug, PartialEq, Eq)]
-pub enum FrameAction {
-    /// Deliver it as it came — the script said nothing about it.
-    Keep,
-    /// Deliver this instead.
-    Replace(String),
-    /// Deliver nothing: upstream's handler returned a falsy value, and
-    /// `cb(null, chunk || null)` then writes nothing
-    /// (`_original/lib/socket-mgr.js:198-206`).
-    Drop,
+// ── frameScript ────────────────────────────────────────────────────────────
+
+/// A `frameScript` that has not started: its text, and what it will see.
+///
+/// Built where the request is known and carried into the tunnel, which starts
+/// it once the connection is up ([`FrameScript::start`]).
+pub struct FrameScriptSpec {
+    src: String,
+    globals: serde_json::Value,
 }
 
-/// The two shapes a `frameScript` may be written in, as JavaScript.
+impl FrameScriptSpec {
+    /// `None` when `src` never says `ctx` — upstream's `CTX_RE`
+    /// (`_original/lib/rules/index.js:449-453`): a frame script can do nothing
+    /// without the object its handlers hang on, so a text without the word is
+    /// not one.
+    pub fn new(src: String, input: &RulesScriptCtx<'_>) -> Option<Self> {
+        has_word(&src, &["ctx"]).then(|| FrameScriptSpec {
+            src,
+            globals: request_globals(input),
+        })
+    }
+
+    /// [`FrameScriptSpec::new`] for the request a connection began as.
+    /// `pattern` is the pattern of the rule line the script was written on.
+    pub fn for_request(
+        src: String,
+        info: &crate::rules::ReqInfo,
+        pattern: &str,
+        values: &HashMap<String, String>,
+    ) -> Option<Self> {
+        Self::new(
+            src,
+            &RulesScriptCtx {
+                method: &info.method,
+                full_url: &info.full_url,
+                headers: &info.headers,
+                body: "",
+                client_ip: info.client_ip.as_deref(),
+                client_port: info.client_port,
+                res: None,
+                values,
+                script_data: &info.script_data,
+                pattern,
+                env: &info.script_env,
+            },
+        )
+    }
+}
+
+/// A frame as the script left it, or made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptFrame {
+    /// Toward the server (the client's side of the conversation) or toward the
+    /// client.
+    pub to_server: bool,
+    pub data: Vec<u8>,
+    /// A binary frame rather than a text one. Meaningless on a TCP tunnel,
+    /// where there are only bytes.
+    pub binary: bool,
+}
+
+/// What a `frameScript` made of one frame.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FrameOutcome {
+    /// Frames the handler sent of its own while it ran — `ctx.sendToClient`,
+    /// `ctx.sendToServer` — in the order it sent them. They go out **before**
+    /// the frame that was being handled, as they do upstream.
+    pub sent: Vec<ScriptFrame>,
+    /// The frame to deliver in place of the one that arrived; `None` delivers
+    /// nothing (the handler returned a falsy value — upstream's
+    /// `cb(null, chunk || null)`, `_original/lib/socket-mgr.js:198-206`).
+    pub frame: Option<ScriptFrame>,
+}
+
+/// One connection's `frameScript`, running.
 ///
-/// **Upstream's** is a pair of handlers installed on `ctx`
-/// (`frameScript.md`, and `execHandleFrame`,
-/// `_original/lib/socket-mgr.js:303-323`): `handleSendToServerFrame` for the
-/// client's frames and `handleSendToClientFrame` for the server's, each
-/// receiving `(data, opts)` and returning the frame to deliver — or a falsy
-/// value to deliver nothing. `ctx.sendToServer` / `ctx.sendToClient` inject a
-/// frame of their own; see [`frame_script_injections`].
+/// The script is evaluated **once**, when the connection opens, and its
+/// handlers are called for each frame after that — so a counter in a closure
+/// counts, which is what upstream's per-connection `frameCtx` gives a script
+/// (`getFrameCtx`, `_original/lib/socket-mgr.js:657-663`). It used to be
+/// evaluated afresh for every frame, and `var n = 0; … ++n` answered 1 for
+/// ever.
 ///
-/// **This port's** is `ctx.frame.data`, assigned in place. Both are supported:
-/// a script that installs a handler is read as upstream reads it, and one that
-/// assigns `ctx.frame.data` is read as this port's own documentation describes.
-/// A script doing both gets the handler's answer, because that is the one the
-/// other program would honour.
-const FRAME_CTX: &str = r#"
-    var __injected = [];
-    var ctx = {
-        direction: __direction,
-        frame: { data: __data },
-        sendToServer: function (d) { __injected.push(['send', String(d)]); },
-        sendToClient: function (d) { __injected.push(['receive', String(d)]); },
-        handleSendToServerFrame: null,
-        handleSendToClientFrame: null
+/// The engine is not `Send`, and a connection's two directions are two tasks,
+/// so the script lives on a thread of its own and the legs talk to it over a
+/// channel. One thread per *scripted* connection: a connection with no
+/// `frameScript` never reaches this type.
+#[derive(Clone)]
+pub struct FrameScript {
+    jobs: std::sync::mpsc::Sender<FrameJob>,
+    /// Which directions have a handler right now: bit 0 toward the server,
+    /// bit 1 toward the client. Read by a leg before it bothers the script.
+    handles: Arc<std::sync::atomic::AtomicU8>,
+}
+
+struct FrameJob {
+    frame: ScriptFrame,
+    reply: tokio::sync::oneshot::Sender<FrameOutcome>,
+}
+
+/// What starting a script produced.
+#[derive(Default)]
+pub struct FrameScriptStart {
+    /// The running script, when it has anything left to do: a handler for
+    /// either direction. A script that only sent a greeting is finished.
+    pub script: Option<FrameScript>,
+    /// What the script sent while it was being evaluated —
+    /// `ctx.sendToServer('hello')` at the top of the file.
+    pub sent: Vec<ScriptFrame>,
+}
+
+impl FrameScript {
+    /// Evaluate the script on a thread of its own and wait for it to finish
+    /// starting.
+    ///
+    /// A script that throws while it is evaluated is no script at all: nothing
+    /// it sent is delivered and no handler is kept, which is upstream's
+    /// `execScriptSync` returning false.
+    pub async fn start(spec: FrameScriptSpec) -> FrameScriptStart {
+        let (jobs, inbox) = std::sync::mpsc::channel::<FrameJob>();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let handles = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let flags = handles.clone();
+        let spawned = std::thread::Builder::new()
+            .name("frame-script".into())
+            // The engine's parser recurses; the default two megabytes are what
+            // a deeply nested script would find first.
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || frame_script_thread(spec, inbox, ready, flags));
+        if let Err(err) = spawned {
+            tracing::warn!("frameScript: no thread to run it on: {err}");
+            return FrameScriptStart::default();
+        }
+        let Ok(Some(sent)) = started.await else {
+            return FrameScriptStart::default();
+        };
+        let script = (handles.load(std::sync::atomic::Ordering::Acquire) != 0)
+            .then_some(FrameScript { jobs, handles });
+        FrameScriptStart { script, sent }
+    }
+
+    /// Whether the script has anything to say about frames going this way.
+    pub fn handles(&self, to_server: bool) -> bool {
+        let bit = if to_server { 1 } else { 2 };
+        self.handles.load(std::sync::atomic::Ordering::Acquire) & bit != 0
+    }
+
+    /// Hand one frame to the script. A script that has died — its thread is
+    /// gone — leaves the frame as it came.
+    pub async fn relay(&self, frame: ScriptFrame) -> FrameOutcome {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let job = FrameJob {
+            frame: frame.clone(),
+            reply,
+        };
+        if self.jobs.send(job).is_err() {
+            return FrameOutcome {
+                sent: Vec::new(),
+                frame: Some(frame),
+            };
+        }
+        answer.await.unwrap_or(FrameOutcome {
+            sent: Vec::new(),
+            frame: Some(frame),
+        })
+    }
+}
+
+/// What a frame script's `ctx` is, and how frames get in and out of it.
+///
+/// `ctx` has upstream's four members (`sendToServer`, `sendToClient`, and the
+/// two handler slots, `getScriptContext` with `frameOpts`,
+/// `_original/lib/rules/index.js:387-393`) and this port's own two, `frame` and
+/// `direction`, for the one-line shape described on [`FrameScript`]'s caller.
+///
+/// `__frame.handle` is upstream's `execHandleFrame`
+/// (`_original/lib/socket-mgr.js:303-323`), including its two surprises: the
+/// handler's return value goes through `util.toBuffer` — so an object is its
+/// JSON, and `0` and `''` are "nothing" — and **a handler that throws replaces
+/// the frame with the error's message**. That last one is how a script's author
+/// finds out: the text turns up in the Frames panel and at the peer.
+///
+/// A frame the script sends (`sendToServer`/`sendToClient`) is passed through
+/// the handler for the direction it is going, marked `opts.frameScript = true`
+/// so the handler can tell — `formatFrameScriptArgs` and `ctx.sendToServer`,
+/// `socket-mgr.js:633-636,:347-362`.
+///
+/// Where this departs from upstream, on purpose:
+///
+/// * **`ctx` and `Buffer` are still there when a handler runs.** Upstream
+///   empties the script's globals once it has been evaluated (`clearContext`,
+///   `_original/lib/util/index.js:473-480`), so a handler that says
+///   `ctx.sendToClient(…)` throws `ctx is not defined` there unless the script
+///   kept a reference. Here both work.
+/// * **A frame keeps its type.** Upstream re-sends whatever a handler returns
+///   as *text* unless the handler set `opts.binary` — the frame it was handed
+///   says `opcode: 2` but has no `binary` key, and the sender reads
+///   `opts.binary ? 2 : 1`. A binary frame the handler merely looked at arrives
+///   as a text frame of bytes that are not UTF-8. Here `opts.binary` is
+///   honoured when the handler sets it either way; otherwise a **string** (or
+///   an object, which becomes JSON) is text, and a **Buffer** keeps the type of
+///   the frame that came in.
+const FRAME_GLUE: &str = r#"
+var ctx = {
+    sendToServer: function (data, opts) { return __frame.send(true, data, opts); },
+    sendToClient: function (data, opts) { return __frame.send(false, data, opts); },
+    handleSendToClientFrame: null,
+    handleSendToServerFrame: null,
+    direction: '',
+    frame: { data: '' }
+};
+var __frame = (function (global) {
+    'use strict';
+    var ctx = global.ctx;
+    var indirectEval = eval;
+    // What the script has sent since the last time anyone asked.
+    var sent = [];
+    // The script's own text, kept for the one-line shape, which is evaluated
+    // again for each frame.
+    var source = '';
+    var legacy = false;
+    var starting = true;
+    // Frames sent while the script is still being evaluated wait here: its
+    // handlers are not installed yet, and upstream passes them through the
+    // handlers once they are (`cleanCacheFrames`).
+    var early = [];
+
+    function bin(buf) { return buf.toString('latin1'); }
+    function fromBin(str) { return Buffer.from(str, 'latin1'); }
+
+    // `util.toBuffer` (`_original/lib/util/common.js`).
+    function toBuffer(data, charset) {
+        if (data == null || Buffer.isBuffer(data)) { return data; }
+        if (typeof data === 'object') {
+            try { data = JSON.stringify(data); } catch (e) {}
+        } else {
+            data = String(data);
+        }
+        if (!data) { return; }
+        if (charset && typeof charset === 'string' && !/^utf-?8$/i.test(charset)) {
+            try {
+                charset = charset.toLowerCase();
+                return charset === 'base64' ? Buffer.from(data, 'base64') : encodeString(data, charset);
+            } catch (e) {}
+        }
+        return Buffer.from(data);
+    }
+
+    function handlerFor(toServer) {
+        var fn = ctx[toServer ? 'handleSendToServerFrame' : 'handleSendToClientFrame'];
+        return typeof fn === 'function' ? fn : null;
+    }
+
+    // One frame through the handler for its direction. Returns what to
+    // deliver as [binaryString, isBinary], or null for nothing.
+    function handle(toServer, data, opts, wasBinary) {
+        var filter = handlerFor(toServer);
+        var textual = false;
+        if (data && filter) {
+            var name = toServer ? 'handleSendToServerFrame' : 'handleSendToClientFrame';
+            try {
+                var out = filter(data, opts);
+                textual = out != null && !Buffer.isBuffer(out);
+                data = out;
+                if (data) {
+                    data = toBuffer(data, opts.charset);
+                    if (data) { opts.length = data.length; }
+                }
+            } catch (e) {
+                textual = true;
+                data = Buffer.from(((e && e.message) || 'Error: unknown') + ' (' + name + ')');
+            }
+        }
+        if (!data) { return null; }
+        var binary = 'binary' in opts ? !!opts.binary : textual ? false : wasBinary;
+        return [bin(data), binary];
+    }
+
+    function deliver(toServer, data, opts) {
+        var frame = handle(toServer, data, opts, false);
+        if (!frame) { return false; }
+        sent.push([toServer, frame[0], frame[1]]);
+    }
+
+    function handlers() {
+        if (legacy) { return 3; }
+        return (handlerFor(true) ? 1 : 0) | (handlerFor(false) ? 2 : 0);
+    }
+
+    function take() {
+        var out = sent;
+        sent = [];
+        return out;
+    }
+
+    return {
+        // `ctx.sendToServer` / `ctx.sendToClient`.
+        send: function (toServer, data, opts) {
+            data = toBuffer(data, opts && opts.charset);
+            if (!data) { return; }
+            var own = {};
+            if (opts) { for (var k in opts) { own[k] = opts[k]; } }
+            own.frameScript = true;
+            own.length = data.length;
+            if (toServer) { own.mask = true; }
+            if (starting) { early.push([toServer, data, own]); return; }
+            return deliver(toServer, data, own);
+        },
+        // Called once the script has been evaluated: [handlers, sent].
+        started: function (text) {
+            source = text;
+            starting = false;
+            legacy = handlers() === 0 && /\bctx\.frame\b/.test(text);
+            // The one-line shape is evaluated per frame, and would send its
+            // greeting again each time; its sends count once, here.
+            var first = early;
+            early = [];
+            for (var i = 0; i < first.length; i++) { deliver(first[i][0], first[i][1], first[i][2]); }
+            return [handlers(), take()];
+        },
+        // One frame that arrived: [handlers, sent, frame-or-null].
+        relay: function (toServer, data, binary) {
+            if (legacy) {
+                if (binary) { return [handlers(), [], [data, binary]]; }
+                var text = fromBin(data).toString();
+                ctx.direction = toServer ? 'send' : 'receive';
+                ctx.frame = { data: text };
+                var quiet = ctx.sendToServer, quieter = ctx.sendToClient;
+                ctx.sendToServer = ctx.sendToClient = function () {};
+                try { indirectEval(source); } catch (e) { ctx.frame = { data: text }; }
+                ctx.sendToServer = quiet;
+                ctx.sendToClient = quieter;
+                return [handlers(), [], [bin(Buffer.from(String(ctx.frame.data))), false]];
+            }
+            var buf = fromBin(data);
+            var opts = { opcode: binary ? 2 : 1, mask: !!toServer, compressed: false, length: buf.length };
+            var frame = handle(toServer, buf, opts, binary);
+            return [handlers(), take(), frame];
+        }
     };
+})(this);
 "#;
 
-/// Run a `frameScript` against one WebSocket text frame.
-///
-/// `direction` is `"send"` (client → server) or `"receive"`.
-pub fn run_frame_script(src: &str, direction: &str, data: &str) -> FrameAction {
-    let mut ctx = Context::default();
-    let set = |ctx: &mut Context, name: &str, value: &str| {
-        let v = boa_engine::JsValue::from_json(&json!(value), ctx).ok()?;
-        ctx.global_object()
-            .set(js_string!(name), v, false, ctx)
-            .ok()
+/// The thread a [`FrameScript`] lives on: evaluate the script, say how that
+/// went, then answer frames until every leg has let go of the channel.
+fn frame_script_thread(
+    spec: FrameScriptSpec,
+    inbox: std::sync::mpsc::Receiver<FrameJob>,
+    ready: tokio::sync::oneshot::Sender<Option<Vec<ScriptFrame>>>,
+    handles: Arc<std::sync::atomic::AtomicU8>,
+) {
+    let Some((mut ctx, sent)) = start_frame_script(&spec, &handles) else {
+        let _ = ready.send(None);
+        return;
     };
-    if set(&mut ctx, "__direction", direction).is_none() || set(&mut ctx, "__data", data).is_none()
-    {
-        return FrameAction::Keep;
+    if ready.send(Some(sent)).is_err() {
+        return;
     }
-    if ctx.eval(Source::from_bytes(FRAME_CTX.as_bytes())).is_err() {
-        return FrameAction::Keep;
-    }
-    if ctx.eval(Source::from_bytes(src.as_bytes())).is_err() {
-        return FrameAction::Keep;
-    }
-    // The handler shape first: it is the one a script copied from the whistle
-    // documentation uses, and the one whose falsy answer means "drop".
-    let handler = match direction {
-        "send" => "handleSendToServerFrame",
-        _ => "handleSendToClientFrame",
-    };
-    let call = format!(
-        "(function () {{
-            var f = ctx.{handler};
-            if (typeof f !== 'function') return null;
-            var out = f(ctx.frame.data, {{}});
-            return out ? String(out) : '';
-        }})()"
-    );
-    if let Ok(value) = ctx.eval(Source::from_bytes(call.as_bytes()))
-        && !value.is_null()
-        && let Ok(text) = value.to_string(&mut ctx)
-    {
-        let text = text.to_std_string_escaped();
-        return match text.is_empty() {
-            true => FrameAction::Drop,
-            false => FrameAction::Replace(text),
-        };
-    }
-    // …and otherwise this port's own shape. Read by evaluating the path rather
-    // than by serialising `ctx`: it now carries functions, and an object with a
-    // function in it is not JSON.
-    let Ok(value) = ctx.eval(Source::from_bytes(b"ctx.frame.data")) else {
-        return FrameAction::Keep;
-    };
-    let Ok(text) = value.to_string(&mut ctx) else {
-        return FrameAction::Keep;
-    };
-    let text = text.to_std_string_escaped();
-    match text != data {
-        true => FrameAction::Replace(text),
-        false => FrameAction::Keep,
+    while let Ok(job) = inbox.recv() {
+        let outcome = relay_frame(&mut ctx, &job.frame, &handles).unwrap_or(FrameOutcome {
+            sent: Vec::new(),
+            frame: Some(job.frame),
+        });
+        let _ = job.reply.send(outcome);
     }
 }
 
-/// The frames a `frameScript` injects on its own, evaluated **once** when the
-/// connection opens.
-///
-/// `ctx.sendToServer(data)` / `ctx.sendToClient(data)` at the top of a script
-/// send a frame nobody asked for, which is how `frameScript.md`'s own example
-/// opens. Returned as `(direction, payload)` pairs in the order they were
-/// called, for the leg that writes each one.
-pub fn frame_script_injections(src: &str) -> Vec<(String, String)> {
-    let mut ctx = Context::default();
-    let set = |ctx: &mut Context, name: &str, value: &str| {
-        let v = boa_engine::JsValue::from_json(&json!(value), ctx).ok()?;
-        ctx.global_object()
-            .set(js_string!(name), v, false, ctx)
-            .ok()
-    };
-    // The connection has no frame yet, and a script that reads `ctx.frame.data`
-    // here sees an empty one rather than failing.
-    if set(&mut ctx, "__direction", "").is_none() || set(&mut ctx, "__data", "").is_none() {
-        return Vec::new();
+/// Build the engine, evaluate the script, and collect what it sent.
+fn start_frame_script(
+    spec: &FrameScriptSpec,
+    handles: &std::sync::atomic::AtomicU8,
+) -> Option<(Context, Vec<ScriptFrame>)> {
+    let mut ctx = script_engine()?;
+    // The request's half of the context, as a rules script has it — minus
+    // `rules` and `values`, which a frame script is not given
+    // (`getScriptContext`'s `frameOpts` branch).
+    set_globals(&mut ctx, &spec.globals)?;
+    ctx.eval(Source::from_bytes(REQUEST_GLUE.as_bytes())).ok()?;
+    ctx.eval(Source::from_bytes(FRAME_GLUE.as_bytes()))
+        .inspect_err(|err| tracing::error!("the frame-script glue does not evaluate: {err}"))
+        .ok()?;
+    if let Err(err) = ctx.eval(Source::from_bytes(spec.src.as_bytes())) {
+        tracing::debug!("frameScript error: {err}");
+        return None;
     }
-    if ctx.eval(Source::from_bytes(FRAME_CTX.as_bytes())).is_err()
-        || ctx.eval(Source::from_bytes(src.as_bytes())).is_err()
-    {
-        return Vec::new();
-    }
-    let Ok(value) = ctx.global_object().get(js_string!("__injected"), &mut ctx) else {
-        return Vec::new();
-    };
-    let Ok(Some(json)) = value.to_json(&mut ctx) else {
-        return Vec::new();
-    };
-    json.as_array()
-        .map(|pairs| {
-            pairs
+    let started = call_frame(
+        &mut ctx,
+        "started",
+        &[JsString::from(spec.src.as_str()).into()],
+    )?;
+    let started = started.as_array()?;
+    handles.store(
+        started.first()?.as_u64()? as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    Some((ctx, script_frames(started.get(1)?)))
+}
+
+/// Run one frame through the script.
+fn relay_frame(
+    ctx: &mut Context,
+    frame: &ScriptFrame,
+    handles: &std::sync::atomic::AtomicU8,
+) -> Option<FrameOutcome> {
+    let answer = call_frame(
+        ctx,
+        "relay",
+        &[
+            frame.to_server.into(),
+            binary_string(&frame.data).into(),
+            frame.binary.into(),
+        ],
+    )?;
+    let answer = answer.as_array()?;
+    // A handler may install or remove a handler.
+    handles.store(
+        answer.first()?.as_u64()? as u8,
+        std::sync::atomic::Ordering::Release,
+    );
+    let delivered = answer.get(2)?.as_array().and_then(|pair| {
+        Some(ScriptFrame {
+            to_server: frame.to_server,
+            data: bytes_of(pair.first()?.as_str()?),
+            binary: pair.get(1)?.as_bool()?,
+        })
+    });
+    Some(FrameOutcome {
+        sent: script_frames(answer.get(1)?),
+        frame: delivered,
+    })
+}
+
+/// Call `__frame.<method>(…)` and read its answer back as JSON. `None` when
+/// the glue itself failed, which leaves the frame as it came.
+fn call_frame(ctx: &mut Context, method: &str, args: &[JsValue]) -> Option<serde_json::Value> {
+    let glue = ctx.global_object().get(js_string!("__frame"), ctx).ok()?;
+    let glue = glue.as_object()?.clone();
+    let function = glue.get(JsString::from(method), ctx).ok()?;
+    let function = function.as_callable()?;
+    let answer = function
+        .call(&JsValue::from(glue.clone()), args, ctx)
+        .inspect_err(|err| tracing::debug!("frameScript {method}: {err}"))
+        .ok()?;
+    answer.to_json(ctx).ok()?
+}
+
+/// `[[toServer, binaryString, isBinary], …]` as the frames they are.
+fn script_frames(list: &serde_json::Value) -> Vec<ScriptFrame> {
+    list.as_array()
+        .map(|items| {
+            items
                 .iter()
-                .filter_map(|pair| {
-                    let dir = pair.get(0)?.as_str()?.to_string();
-                    let data = pair.get(1)?.as_str()?.to_string();
-                    Some((dir, data))
+                .filter_map(|item| {
+                    Some(ScriptFrame {
+                        to_server: item.get(0)?.as_bool()?,
+                        data: bytes_of(item.get(1)?.as_str()?),
+                        binary: item.get(2)?.as_bool()?,
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The bytes of a binary string that has been through JSON: one `char` each.
+fn bytes_of(text: &str) -> Vec<u8> {
+    text.chars().map(|c| c as u32 as u8).collect()
 }
 
 // ── PAC ────────────────────────────────────────────────────────────────────

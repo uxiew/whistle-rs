@@ -318,7 +318,8 @@ function tcpVia(port, chunks) {
       if (resp.statusCode !== 200) return done(sock);
       sock.on('data', (d) => out.client.push(d.toString('latin1')));
       sock.on('error', () => {});
-      chunks.forEach((c, i) => setTimeout(() => sock.write(c), 150 * (i + 1)));
+      // As bytes: a string would go out as UTF-8, and a chunk here may not be text.
+      chunks.forEach((c, i) => setTimeout(() => sock.write(Buffer.from(c, 'latin1')), 150 * (i + 1)));
       setTimeout(() => done(sock), 150 * (chunks.length + 1) + 1200);
     });
     r.on('error', () => done());
@@ -468,6 +469,42 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
   add('frame', 'the client-bound handler',
     FRAME(`var n = 0;\nctx.handleSendToClientFrame = function (buf) { return 'C' + (++n) + ':' + buf; };`),
     ws('down', [{ data: 'a' }, { data: 'b' }]));
+  // Upstream empties the script's globals once it has run, so a handler that
+  // names `ctx` or `Buffer` throws there; one that kept a reference does not.
+  // These keep one, so both proxies are asked the same thing.
+  add('frame', 'what a handler is handed',
+    FRAME(`var c = ctx;\nc.handleSendToServerFrame = function (buf, opts) { return [typeof buf, buf && buf.constructor && buf.constructor.name, buf.length, typeof opts, Object.keys(opts).sort().join('+')].join(','); };`),
+    ws('type2', [{ data: 'abc' }, { data: 'xy', binary: true }]));
+  add('frame', 'a frame the script sends is passed to its own handler',
+    FRAME(`var c = ctx;\nc.sendToServer('hello');\nc.handleSendToServerFrame = function (buf, opts) { return 'S(' + buf + ')' + (opts && opts.frameScript ? '!' : ''); };`),
+    ws('topwrap', [{ data: 'a' }]));
+  add('frame', 'sendToClient from a handler, through the other handler',
+    FRAME(`var c = ctx;\nc.handleSendToServerFrame = function (buf) { c.sendToClient('ack:' + buf); return buf; };\nc.handleSendToClientFrame = function (buf, opts) { return 'C(' + buf + ')' + (opts && opts.frameScript ? '!' : ''); };`),
+    ws('inject2', [{ data: 'a' }, { data: 'b' }]));
+  add('frame', 'sendToServer from the handler for that direction',
+    FRAME(`var c = ctx;\nc.handleSendToServerFrame = function (buf, opts) { if (!opts.frameScript && String(buf) === 'a') { c.sendToServer('extra'); } return buf; };`),
+    ws('inject3', [{ data: 'a' }, { data: 'b' }]));
+  add('frame', 'a handler that asks for a binary frame',
+    FRAME(`var c = ctx;\nc.handleSendToServerFrame = function (buf, opts) { opts.binary = true; return buf; };`),
+    ws('tobin', [{ data: 'text' }, { data: '\x00\xffraw', binary: true }]));
+  add('frame', 'a handler that asks for a text frame',
+    FRAME(`var c = ctx;\nc.handleSendToServerFrame = function (buf, opts) { opts.binary = false; return buf; };`),
+    ws('totext', [{ data: 'plain', binary: true }]));
+  add('frame', 'what a handler may return',
+    FRAME(`var c = ctx;\nvar n = 0;\nc.handleSendToServerFrame = function (buf) { n++; return n === 1 ? { a: 1 } : n === 2 ? 7 : n === 3 ? 0 : n === 4 ? '' : n === 5 ? [1, 2] : undefined; };`),
+    ws('returns', [{ data: '1' }, { data: '2' }, { data: '3' }, { data: '4' }, { data: '5' }, { data: '6' }]));
+  add('frame', 'frames the script sends: a Buffer, an object, options',
+    FRAME(`ctx.sendToServer(Buffer.from([0x41, 0x42]), { binary: true });\nctx.sendToServer({ k: 'v' });\nctx.sendToClient('to-client');\nctx.sendToServer('');`),
+    ws('topkinds', [{ data: 'a' }]));
+  add('frame', 'what the script sees while it runs',
+    FRAME(`ctx.sendToServer([typeof url, typeof method, typeof headers, typeof rules, typeof values, typeof Buffer, typeof parseUrl, typeof parseQuery, typeof getValue, typeof render, typeof ctx.sendToClient, typeof ctx.frame, typeof ctx.direction].join(','));`),
+    ws('topsees', []));
+  add('frame', 'a script that does not say ctx',
+    FRAME(`var unused = 1;`),
+    ws('noctx', [{ data: 'a' }]));
+  add('frame', 'a script that throws while it runs',
+    FRAME(`ctx.handleSendToServerFrame = function (buf) { return 'X' + buf; };\nthrow new Error('early');`),
+    ws('throwtop', [{ data: 'a' }]));
 
   // ── frameScript over a plain TCP tunnel ──
   const T = `127.0.0.1:${TCP}`;
@@ -482,6 +519,13 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
   add('tcp', 'frameScript without enable://inspect',
     block('t.js', `ctx.handleSendToServerFrame = function (buf) { return 'X' + buf; };`)
     + `${T} frameScript://{t.js}`, tcp(['RAW_AUDIT']));
+  add('tcp', 'a tunnel script that sends data of its own',
+    block('t.js', `var c = ctx;\nc.sendToServer('hello-server');\nc.sendToClient('hello-client');\nc.handleSendToServerFrame = function (buf, opts) { return opts.frameScript ? buf : null; };`)
+    + `${T} enable://inspect frameScript://{t.js}`, tcp(['dropped']));
+  add('tcp', 'bytes that are not text, through a handler that returns them',
+    block('t.js', `var c = ctx;\nc.handleSendToServerFrame = function (buf) { return buf; };`)
+    + `${T} enable://inspect frameScript://{t.js}`, tcp(['\x00\xff\x80\xfe']));
+  add('tcp', 'an inspected tunnel with no script', `${T} enable://inspect`, tcp(['RAW_AUDIT']));
 
   // ── log:// ──
   const page = async (port) => {

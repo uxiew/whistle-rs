@@ -244,6 +244,7 @@ async fn relay_before_reply(
 ) -> Result<Response<DynBody>, Destroyed> {
     let started = Instant::now();
     let session = tunnel_session_of(&info, &resolved, peer, now_ms());
+    let inspect = inspect_of(&state, &info, &resolved);
     // Not answered, and now never will be.
     let refused = |session: Session| Tunnel {
         state: &state,
@@ -252,6 +253,7 @@ async fn relay_before_reply(
             ..session
         },
         started,
+        inspect: None,
     };
     let target = match sni::relay_target(&state, &info, &resolved).await {
         Ok(target) => target,
@@ -279,6 +281,7 @@ async fn relay_before_reply(
                     state: &state,
                     session,
                     started,
+                    inspect,
                 };
                 if let Err(err) =
                     relay_dialled(client, origin, &target, timings, Some(tunnel)).await
@@ -421,10 +424,15 @@ where
         // The session a tunnel leaves when nothing inside it is read — relayed,
         // refused, or turned away at the handshake. Built only then: it costs a
         // second rule resolution, which an intercepted tunnel never pays.
-        let session = || Tunnel {
-            state: &state,
-            session: tunnel_session(&state, &servername, port, peer, has_sni, time_ms),
-            started,
+        let session = || {
+            let (session, inspect) =
+                tunnel_session(&state, &servername, port, peer, has_sni, time_ms);
+            Tunnel {
+                state: &state,
+                session,
+                started,
+                inspect,
+            }
         };
         let acceptor =
             match sni::decide(&state, &servername, &host, port, peer, has_sni, carried).await {
@@ -524,6 +532,57 @@ pub(super) struct Tunnel<'a> {
     pub(super) state: &'a Arc<AppState>,
     pub(super) session: Session,
     pub(super) started: Instant,
+    /// Set when a rule asked for this tunnel's bytes to be shown — see
+    /// [`Inspect`]. Only a tunnel that is relayed has any use for it.
+    pub(super) inspect: Option<Inspect>,
+}
+
+/// `enable://inspect` on a tunnel: show what goes through it, chunk by chunk,
+/// and offer each chunk to this `frameScript` if there is one.
+///
+/// Upstream's `isInspect` (`_original/lib/util/index.js:3336-3344`) also takes
+/// `pauseSend`, `pauseReceive`, `ignoreSend` and `ignoreReceive` for the same
+/// thing, and so does this; on a tunnel they do nothing more than that here.
+pub(super) struct Inspect {
+    script: Option<script::FrameScriptSpec>,
+}
+
+/// Whether the rules on this connection ask to inspect it, and with what.
+pub(super) fn inspect_of(
+    state: &AppState,
+    info: &crate::rules::ReqInfo,
+    resolved: &crate::rules::Resolved,
+) -> Option<Inspect> {
+    if !inspects(resolved) {
+        return None;
+    }
+    // A connection's rules are resolved without the values pass a request's
+    // get, because nothing else on this path reads a value. The script is
+    // usually a `{name}`, so it gets that pass here.
+    let mut resolved = resolved.clone();
+    let host = bind_host(state);
+    apply::substitute_values(
+        &mut resolved,
+        &effective_values(state),
+        tpl_ctx(&host, state.config.port, info),
+    );
+    Some(Inspect {
+        script: frame_script_of(state, info, &resolved),
+    })
+}
+
+/// Does a rule ask for this connection's bytes to be shown?
+pub(super) fn inspects(resolved: &crate::rules::Resolved) -> bool {
+    let enabled = apply::enabled_flags(resolved);
+    [
+        "inspect",
+        "pauseSend",
+        "pauseReceive",
+        "ignoreSend",
+        "ignoreReceive",
+    ]
+    .iter()
+    .any(|flag| enabled.contains(*flag))
 }
 
 impl Tunnel<'_> {
@@ -555,14 +614,17 @@ pub(super) fn tunnel_session(
     peer: SocketAddr,
     has_sni: bool,
     time_ms: u128,
-) -> Session {
+) -> (Session, Option<Inspect>) {
     let (info, resolved) = {
         let rules = state.rules.read().unwrap();
         let info = sni::connection_req_info(servername, port, peer, has_sni);
         let resolved = rules.resolve(&info);
         (info, resolved)
     };
-    tunnel_session_of(&info, &resolved, peer, time_ms)
+    (
+        tunnel_session_of(&info, &resolved, peer, time_ms),
+        inspect_of(state, &info, &resolved),
+    )
 }
 
 /// [`tunnel_session`], from a resolution already made.
@@ -639,16 +701,30 @@ async fn relay_dialled<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let mut inspect = None;
     let open = tunnel.and_then(|t| {
-        let (_, open) = t.state.record_open(Session {
+        let (id, open) = t.state.record_open(Session {
             target: format!("{} (tunnel)", target_desc(target)),
             duration_ms: t.started.elapsed().as_millis(),
             timings: Some(timings),
             ..t.session
         });
+        // A hidden tunnel's script still runs; its chunks are just not kept,
+        // there being no row to show them under.
+        inspect = t
+            .inspect
+            .map(|inspect| (inspect, t.state.clone(), open.is_some().then_some(id)));
         open.map(|session| (t.state, session))
     });
-    let relayed = sni::relay(client, origin).await;
+    let relayed = match inspect {
+        // Chunk by chunk, each one a frame of this tunnel's session.
+        Some((inspect, state, id)) => {
+            ws::inspected_relay(client, origin, inspect.script, state, id)
+                .await
+                .map_err(Into::into)
+        }
+        None => sni::relay(client, origin).await,
+    };
     if let Some((state, session)) = open {
         state.complete(&session);
     }

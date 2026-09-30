@@ -4,8 +4,10 @@
 //! frame can be captured for the Network view (whistle surfaces every frame).
 //! Two hooks may also sit in that path, and they run in this order:
 //!
-//! 1. **`frameScript`** — the rule operator, on text frames only. It is a rule,
-//!    and rules run before plugins everywhere else in this proxy.
+//! 1. **`frameScript`** — the rule operator, on whole text and binary frames.
+//!    It is a rule, and rules run before plugins everywhere else in this proxy.
+//!    One script per connection, evaluated once: see
+//!    [`crate::proxy::script::FrameScript`].
 //! 2. **A plugin's frame hook** ([`crate::plugins::wsframe`]) — every data
 //!    frame, both directions, may rewrite or drop it. Several plugins chain in
 //!    rule order, each seeing the previous one's output.
@@ -37,6 +39,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::plugins::wsframe::{Dir, FrameHook, FrameMeta, HookFrame, Verdict};
 use crate::plugins::{PluginMatch, Plugins};
+use crate::proxy::script::{FrameScript, FrameScriptSpec, FrameScriptStart, ScriptFrame};
 use crate::proxy::{AppState, WsFrame};
 use crate::rules::{ReqInfo, Resolved};
 
@@ -236,12 +239,12 @@ impl FramePlan {
 }
 
 /// Frame-aware bidirectional tunnel: captures every frame into `state` under
-/// `session`, runs `script` on each text frame, and offers each data frame to
-/// the plugins in `plan`.
+/// `session`, offers each data frame to `script`, and then to the plugins in
+/// `plan`.
 pub async fn capturing_tunnel<A, B>(
     client: A,
     upstream: B,
-    script: Option<String>,
+    script: Option<FrameScriptSpec>,
     plan: FramePlan,
     flow: FrameFlow,
     state: Arc<AppState>,
@@ -263,22 +266,18 @@ pub async fn capturing_tunnel<A, B>(
         state.ws_pause.lock().unwrap().insert(session, gate.clone());
         gate
     });
-    // Frames the script sends on its own, before either side has said anything
-    // — `ctx.sendToServer` / `ctx.sendToClient`, which is how
-    // `frameScript.md`'s example opens. Evaluated once here rather than per
-    // frame, as upstream evaluates the script once per connection.
-    let injections = script
-        .as_deref()
-        .map(crate::proxy::script::frame_script_injections)
-        .unwrap_or_default();
-    let mut inject_send: Vec<String> = Vec::new();
-    let mut inject_receive: Vec<String> = Vec::new();
-    for (dir, data) in injections {
-        match dir.as_str() {
-            "send" => inject_send.push(data),
-            _ => inject_receive.push(data),
-        }
-    }
+    // The script is evaluated here, once, for the life of the connection — as
+    // upstream evaluates it (`getFrameCtx`). What it sends while it is being
+    // evaluated — `ctx.sendToServer` / `ctx.sendToClient` at the top of the
+    // file, which is how `frameScript.md`'s example opens — goes out before
+    // either side has said anything.
+    let started = match script {
+        Some(spec) => FrameScript::start(spec).await,
+        None => FrameScriptStart::default(),
+    };
+    let script = started.script;
+    let (inject_send, inject_receive): (Vec<ScriptFrame>, Vec<ScriptFrame>) =
+        started.sent.into_iter().partition(|frame| frame.to_server);
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
     // The two writers, shared with the console so it can send a frame into a
@@ -305,6 +304,7 @@ pub async fn capturing_tunnel<A, B>(
             // This leg writes toward the server, so its keep-alive is the pong.
             keepalive: !flow.no_pong,
             inject: inject_send,
+            writers: writers.clone(),
         },
         state.clone(),
         session,
@@ -321,6 +321,7 @@ pub async fn capturing_tunnel<A, B>(
             // …and this one writes toward the client, so it is the ping.
             keepalive: !flow.no_ping,
             inject: inject_receive,
+            writers: writers.clone(),
         },
         state.clone(),
         session,
@@ -379,13 +380,25 @@ impl SessionWriters {
     /// way to the client. The frame is masked exactly as a real one from that
     /// side would be, so neither end can tell it apart from traffic.
     pub async fn send(&self, dir: &str, data: &[u8]) -> bool {
-        let (half, to_server) = match dir {
-            "send" => (&self.to_server, true),
-            "receive" => (&self.to_client, false),
+        let to_server = match dir {
+            "send" => true,
+            "receive" => false,
             _ => return false,
         };
+        self.send_frame(to_server, OPCODE_TEXT, data).await
+    }
+
+    /// Write one whole frame toward either end, holding that end's lock for
+    /// all of it. How a `frameScript` handler on one leg sends a frame the
+    /// other leg's writer has to carry.
+    async fn send_frame(&self, to_server: bool, opcode: u8, data: &[u8]) -> bool {
+        let half = if to_server {
+            &self.to_server
+        } else {
+            &self.to_client
+        };
         let mut w = half.lock().await;
-        write_frame(&mut *w, true, OPCODE_TEXT, data, to_server)
+        write_frame(&mut *w, true, opcode, data, to_server)
             .await
             .is_ok()
     }
@@ -647,8 +660,8 @@ impl DirPause {
 /// rather than as positional arguments that could be crossed over.
 struct Leg {
     dir: Dir,
-    /// `frameScript://`, applied to text frames.
-    script: Option<String>,
+    /// `frameScript://`, running — shared by both legs.
+    script: Option<FrameScript>,
     /// The plugin hooks watching this direction, in rule order.
     hooks: Vec<FrameHook>,
     /// What `enable://` asked for this direction.
@@ -658,9 +671,11 @@ struct Leg {
     /// False when `disable://ping` / `disable://pong` asked for no keep-alive on
     /// this leg — see [`crate::proxy::apply::ws_keepalive_disabled`].
     keepalive: bool,
-    /// Text frames the `frameScript` asked to send on this leg the moment the
+    /// Frames the `frameScript` asked to send on this leg the moment the
     /// connection opened, before anything was read.
-    inject: Vec<String>,
+    inject: Vec<ScriptFrame>,
+    /// Both write halves, for a frame a handler sends the other way.
+    writers: Arc<SessionWriters>,
 }
 
 async fn pump<R, W>(r: R, w: W, leg: Leg, state: Arc<AppState>, session: u64)
@@ -676,6 +691,7 @@ where
         pause,
         keepalive,
         inject,
+        writers,
     } = leg;
     let ctx = FrameCtx {
         direction: dir.label(),
@@ -685,6 +701,7 @@ where
         mode,
         state,
         session,
+        writers,
     };
     match (mode, pause) {
         (DirMode::Pause, Some(gate)) => pump_held(r, w, ctx, gate, dir, keepalive, inject).await,
@@ -694,22 +711,36 @@ where
     }
 }
 
-/// Write the frames a `frameScript` asked to send on this leg, and record them.
+/// Write the frames a `frameScript` sent on this leg while it was starting,
+/// and record them.
 ///
-/// They are the script's own, not the peer's, so they are not filtered by it —
-/// upstream's `sendToServer` writes straight to the sender
-/// (`_original/lib/socket-mgr.js`, the `ctx` a frame script is handed).
-async fn write_injections<W: AsyncWrite + Unpin>(w: &mut W, ctx: &FrameCtx, inject: &[String]) {
-    for data in inject {
-        if deliver(w, true, OPCODE_TEXT, data.as_bytes(), ctx.to_server).await != Sent::Ok {
+/// They have already been through the script's own handler for this direction
+/// — upstream passes a frame the script sends through `execHandleFrame` like
+/// any other, marked `opts.frameScript` (`_original/lib/socket-mgr.js:347-362`).
+async fn write_injections<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    ctx: &FrameCtx,
+    inject: &[ScriptFrame],
+) {
+    for frame in inject {
+        let opcode = opcode_of(frame);
+        if deliver(w, true, opcode, &frame.data, ctx.to_server).await != Sent::Ok {
             return;
         }
         ctx.state.record_frame(WsFrame::new(
             ctx.session,
             ctx.direction,
-            OPCODE_TEXT,
-            data.as_bytes(),
+            opcode,
+            &frame.data,
         ));
+    }
+}
+
+/// The opcode a script's frame goes out under.
+fn opcode_of(frame: &ScriptFrame) -> u8 {
+    match frame.binary {
+        true => OPCODE_BINARY,
+        false => OPCODE_TEXT,
     }
 }
 
@@ -719,47 +750,70 @@ struct FrameCtx {
     /// `"send"` or `"receive"` — the capture's own spelling of the direction.
     direction: &'static str,
     to_server: bool,
-    script: Option<String>,
+    script: Option<FrameScript>,
     hooks: Vec<FrameHook>,
     mode: DirMode,
     state: Arc<AppState>,
     session: u64,
+    writers: Arc<SessionWriters>,
 }
 
 impl FrameCtx {
     /// Run the script and the hooks over one frame and record it, returning the
-    /// payload to deliver — or `None` when it is not to be delivered at all: a
-    /// hook dropped it, or `enable://ignore…` discarded it.
+    /// opcode and payload to deliver — or `None` when it is not to be delivered
+    /// at all: the script or a hook dropped it, or `enable://ignore…` discarded
+    /// it.
     ///
     /// `held` marks the capture as waiting for a release rather than delivered.
-    async fn process(&mut self, frame: Frame, held: bool) -> Option<Bytes> {
+    async fn process(&mut self, frame: Frame, held: bool) -> Option<(u8, Bytes)> {
         let mut payload = Bytes::from(frame.payload);
-        if frame.opcode == OPCODE_TEXT {
-            // Text frame: the script may rewrite it, or refuse it. A handler
-            // that answers with nothing drops the frame, which is what
-            // upstream's `cb(null, chunk || null)` does with a falsy return
-            // (`_original/lib/socket-mgr.js:198-206`).
-            use crate::proxy::script::FrameAction;
-            if let Some(script) = &self.script
-                && let Ok(text) = std::str::from_utf8(&payload)
-            {
-                match crate::proxy::script::run_frame_script(script, self.direction, text) {
-                    FrameAction::Keep => {}
-                    FrameAction::Replace(new) => payload = Bytes::from(new),
-                    FrameAction::Drop => return None,
+        let mut opcode = frame.opcode;
+        // A whole text or binary message: the script may rewrite it, retype it,
+        // or refuse it, and may send frames of its own while it decides. A
+        // handler that answers with nothing drops the frame, which is what
+        // upstream's `cb(null, chunk || null)` does with a falsy return
+        // (`_original/lib/socket-mgr.js:198-206`).
+        //
+        // A *fragment* is not offered. Upstream reassembles a fragmented
+        // message before its handler sees it; this port relays frame by frame,
+        // and a handler that rewrote one fragment of a message would be
+        // rewriting something its author never saw whole.
+        if let Some(script) = &self.script
+            && frame.fin
+            && matches!(opcode, OPCODE_TEXT | OPCODE_BINARY)
+            && script.handles(self.to_server)
+        {
+            let outcome = script
+                .relay(ScriptFrame {
+                    to_server: self.to_server,
+                    data: payload.to_vec(),
+                    binary: opcode == OPCODE_BINARY,
+                })
+                .await;
+            // What the handler sent goes first, whichever way it is going —
+            // upstream's `sendToClient` writes before the handler has returned.
+            for sent in &outcome.sent {
+                let code = opcode_of(sent);
+                if self
+                    .writers
+                    .send_frame(sent.to_server, code, &sent.data)
+                    .await
+                {
+                    let direction = if sent.to_server { "send" } else { "receive" };
+                    self.state.record_frame(WsFrame::new(
+                        self.session,
+                        direction,
+                        code,
+                        &sent.data,
+                    ));
                 }
             }
+            let kept = outcome.frame?;
+            opcode = opcode_of(&kept);
+            payload = Bytes::from(kept.data);
         }
-        if !self.hooks.is_empty() && is_data_frame(frame.opcode) {
-            match run_hooks(
-                &mut self.hooks,
-                self.direction,
-                frame.fin,
-                frame.opcode,
-                payload,
-            )
-            .await
-            {
+        if !self.hooks.is_empty() && is_data_frame(opcode) {
+            match run_hooks(&mut self.hooks, self.direction, frame.fin, opcode, payload).await {
                 Some(kept) => payload = kept,
                 // Dropped: it reaches neither the peer nor the capture, because
                 // it never happened as far as the other end is concerned.
@@ -772,7 +826,7 @@ impl FrameCtx {
         // that a frame was dropped instead of just not showing it. A held frame
         // is flagged the same way for the same reason: what is waiting is worth
         // more than a count of it.
-        let mut record = WsFrame::new(self.session, self.direction, frame.opcode, &payload);
+        let mut record = WsFrame::new(self.session, self.direction, opcode, &payload);
         record.held = held;
 
         // `enable://ignoreSend|ignoreReceive` discards this direction's data
@@ -781,13 +835,13 @@ impl FrameCtx {
         // `ping`/`pong` breaks the keep-alive the endpoints agreed on —
         // upstream's ignore path likewise only ever withholds data
         // (`opts.data`, `_original/lib/socket-mgr.js:249-274`).
-        if self.mode == DirMode::Ignore && is_data_frame(frame.opcode) {
+        if self.mode == DirMode::Ignore && is_data_frame(opcode) {
             record.ignored = true;
             self.state.record_frame(record);
             return None;
         }
         self.state.record_frame(record);
-        Some(payload)
+        Some((opcode, payload))
     }
 }
 
@@ -823,7 +877,7 @@ async fn deliver<W: AsyncWrite + Unpin>(
 }
 
 /// The ordinary leg: read a frame, decide about it, write it.
-async fn pump_direct<R, W>(mut r: R, mut w: W, mut ctx: FrameCtx, inject: Vec<String>)
+async fn pump_direct<R, W>(mut r: R, mut w: W, mut ctx: FrameCtx, inject: Vec<ScriptFrame>)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -834,8 +888,8 @@ where
             Ok(Some(f)) => f,
             _ => break,
         };
-        let (fin, opcode) = (frame.fin, frame.opcode);
-        let Some(payload) = ctx.process(frame, false).await else {
+        let fin = frame.fin;
+        let Some((opcode, payload)) = ctx.process(frame, false).await else {
             continue;
         };
         if deliver(&mut w, fin, opcode, &payload, ctx.to_server).await != Sent::Ok {
@@ -861,7 +915,7 @@ async fn pump_held<R, W>(
     pause: Arc<SessionPause>,
     dir: Dir,
     keepalive: bool,
-    inject: Vec<String>,
+    inject: Vec<ScriptFrame>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
@@ -930,9 +984,9 @@ async fn pump_held<R, W>(
                 }
             }
         };
-        let (fin, opcode) = (frame.fin, frame.opcode);
+        let fin = frame.fin;
         let holding = gate.paused();
-        let Some(payload) = ctx.process(frame, holding).await else {
+        let Some((opcode, payload)) = ctx.process(frame, holding).await else {
             continue;
         };
         if holding {
@@ -1082,6 +1136,159 @@ fn dropped(fin: bool, opcode: u8) -> Option<Bytes> {
     fragment.then(Bytes::new)
 }
 
+// ── a tunnel a rule asked to see ───────────────────────────────────────────
+
+/// How much one read of an inspected tunnel takes at most — and so the most a
+/// handler is handed at once. Node's socket reads are 64 KiB.
+const CHUNK: usize = 64 * 1024;
+
+/// Relay a tunnel **chunk by chunk**, because a rule said `enable://inspect`.
+///
+/// A tunnel that is not read — anything that is not HTTP or a TLS handshake
+/// this proxy intercepts, or one a rule said to leave alone — is ordinarily a
+/// `copy_bidirectional`, and nothing about it is visible. With
+/// `enable://inspect` upstream shows each chunk in the Frames panel and hands
+/// it to the connection's `frameScript` (`handleConnSend` / `handleConnReceive`,
+/// `_original/lib/socket-mgr.js:125-205`): [`frameScript.md`] is for
+/// "WebSocket 和普通 TCP 请求数据帧", and until 2026-09-30 only the first half
+/// was true here.
+///
+/// A "frame" on a tunnel is whatever one read returned. TCP has no message
+/// boundaries, so a handler that needs a whole message has to reassemble it
+/// itself — upstream's does too.
+///
+/// `enable://pauseSend` and the other three are not honoured on a tunnel; they
+/// imply `inspect` upstream and do here, and that is all they do.
+///
+/// [`frameScript.md`]: https://wproxy.org/docs/rules/frameScript.html
+pub async fn inspected_relay<C, O>(
+    client: C,
+    origin: O,
+    script: Option<FrameScriptSpec>,
+    state: Arc<AppState>,
+    session: Option<u64>,
+) -> io::Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    O: AsyncRead + AsyncWrite + Unpin,
+{
+    let started = match script {
+        Some(spec) => FrameScript::start(spec).await,
+        None => FrameScriptStart::default(),
+    };
+    let (client_read, client_write) = tokio::io::split(client);
+    let (origin_read, origin_write) = tokio::io::split(origin);
+    // Each write half behind a lock: a handler running for one direction may
+    // send bytes the other way, and a chunk must not land inside another.
+    let pipe = TunnelPipe {
+        to_server: tokio::sync::Mutex::new(origin_write),
+        to_client: tokio::sync::Mutex::new(client_write),
+        script: started.script,
+        state,
+        session,
+    };
+    // What the script sent while it was being evaluated goes first. The CONNECT
+    // has been answered by now, so bytes toward the client are tunnel bytes —
+    // upstream writes them *before* its `200`, and the client's CONNECT then
+    // fails on a status line it cannot read.
+    for frame in &started.sent {
+        pipe.write(frame.to_server, &frame.data).await?;
+    }
+    let up = pipe.pump(client_read, true);
+    let down = pipe.pump(origin_read, false);
+    let (up, down) = tokio::join!(up, down);
+    up.and(down)
+}
+
+/// The two write halves of an inspected tunnel, and what looks at its chunks.
+struct TunnelPipe<S, C> {
+    to_server: tokio::sync::Mutex<S>,
+    to_client: tokio::sync::Mutex<C>,
+    script: Option<FrameScript>,
+    state: Arc<AppState>,
+    /// The session the chunks are filed under; `None` for a hidden tunnel,
+    /// whose script runs and whose chunks are not kept.
+    session: Option<u64>,
+}
+
+impl<S, C> TunnelPipe<S, C>
+where
+    S: AsyncWrite + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    /// Write one chunk toward either end, and record it as a frame.
+    async fn write(&self, to_server: bool, data: &[u8]) -> io::Result<()> {
+        if to_server {
+            let mut w = self.to_server.lock().await;
+            w.write_all(data).await?;
+            w.flush().await?;
+        } else {
+            let mut w = self.to_client.lock().await;
+            w.write_all(data).await?;
+            w.flush().await?;
+        }
+        let Some(session) = self.session else {
+            return Ok(());
+        };
+        // Filed as text when it is text, so the Frames panel shows it as
+        // written rather than as hex; a tunnel's bytes have no type of their
+        // own.
+        let opcode = match std::str::from_utf8(data) {
+            Ok(_) => OPCODE_TEXT,
+            Err(_) => OPCODE_BINARY,
+        };
+        let direction = if to_server { "send" } else { "receive" };
+        self.state
+            .record_frame(WsFrame::new(session, direction, opcode, data));
+        Ok(())
+    }
+
+    /// No more bytes will come this way: tell the far end, as a plain relay's
+    /// half-close does.
+    async fn finish(&self, to_server: bool) {
+        if to_server {
+            let _ = self.to_server.lock().await.shutdown().await;
+        } else {
+            let _ = self.to_client.lock().await.shutdown().await;
+        }
+    }
+
+    /// One direction: read a chunk, let the script see it, write what is left.
+    async fn pump<R: AsyncRead + Unpin>(&self, mut from: R, to_server: bool) -> io::Result<()> {
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let n = match from.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) => {
+                    self.finish(to_server).await;
+                    return Err(err);
+                }
+            };
+            let chunk = &buf[..n];
+            let Some(script) = self.script.as_ref().filter(|s| s.handles(to_server)) else {
+                self.write(to_server, chunk).await?;
+                continue;
+            };
+            let outcome = script
+                .relay(ScriptFrame {
+                    to_server,
+                    data: chunk.to_vec(),
+                    binary: true,
+                })
+                .await;
+            for sent in &outcome.sent {
+                self.write(sent.to_server, &sent.data).await?;
+            }
+            if let Some(kept) = outcome.frame {
+                self.write(to_server, &kept.data).await?;
+            }
+        }
+        self.finish(to_server).await;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,6 +1370,19 @@ mod tests {
     ) -> Wire {
         let (client, client_io) = tokio::io::duplex(1 << 16);
         let (server, upstream_io) = tokio::io::duplex(1 << 16);
+        // The script as a request for `ws://chat.test/room` would carry it.
+        let script = script.and_then(|src| {
+            let info = apply::build_req_info(
+                "GET",
+                "ws",
+                "chat.test",
+                80,
+                "/room",
+                &hyper::HeaderMap::new(),
+                Some("10.0.0.7".to_string()),
+            );
+            FrameScriptSpec::for_request(src, &info, "chat.test", &Default::default())
+        });
         let tunnel = tokio::spawn(capturing_tunnel(
             client_io,
             upstream_io,
@@ -2201,6 +2421,328 @@ mod tests {
                 .expect("frame");
             assert_eq!(got.payload, b"hello server");
             finish(wire).await;
+        });
+    }
+
+    /// Send `frames` from the client and collect what the server is handed.
+    async fn through(wire: &mut Wire, frames: &[(u8, &[u8])]) -> Vec<(u8, Vec<u8>)> {
+        let mut seen = Vec::new();
+        for (opcode, payload) in frames {
+            write_frame(&mut wire.client, true, *opcode, payload, true)
+                .await
+                .expect("client write");
+            let got = read_frame(&mut wire.server)
+                .await
+                .expect("read")
+                .expect("frame");
+            seen.push((got.opcode, got.payload));
+        }
+        seen
+    }
+
+    /// The defect this guards against: the script was evaluated afresh for
+    /// every frame, so a counter in it answered 1 for ever. It is one script
+    /// per connection — and a second connection starts from its own zero.
+    #[test]
+    fn a_frame_script_keeps_its_state_for_the_life_of_the_connection() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let script = "var n = 0; ctx.handleSendToServerFrame = function (buf) { \
+                          return 'N' + (++n) + ':' + buf; };";
+            for _ in 0..2 {
+                let plan = plan_for(&state, "ws.test enable://websocket\n");
+                let mut wire = spawn_tunnel(&state, plan, Some(script.to_string()));
+                let seen = through(
+                    &mut wire,
+                    &[
+                        (OPCODE_TEXT, b"a"),
+                        (OPCODE_TEXT, b"b"),
+                        (OPCODE_TEXT, b"c"),
+                    ],
+                )
+                .await;
+                let texts: Vec<&[u8]> = seen.iter().map(|(_, p)| p.as_slice()).collect();
+                assert_eq!(texts, [&b"N1:a"[..], b"N2:b", b"N3:c"]);
+                finish(wire).await;
+            }
+        });
+    }
+
+    /// A binary frame reaches the handler, as a `Buffer`, and what comes back
+    /// decides the type that goes out: a string is text, a `Buffer` keeps the
+    /// frame's own type, and `opts.binary` overrides either.
+    #[test]
+    fn a_frame_script_sees_binary_frames_and_may_retype_them() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            // The handler's body; the frame sent; the frame that must arrive.
+            type Case = (&'static str, u8, &'static [u8], u8, &'static [u8]);
+            let cases: [Case; 6] = [
+                // A string built from the bytes: text.
+                ("return 'X' + buf;", OPCODE_BINARY, b"BIN", OPCODE_TEXT, b"XBIN"),
+                // The bytes handed straight back, not text at all: still binary,
+                // and still those bytes.
+                ("return buf;", OPCODE_BINARY, &[0x00, 0xff, 0x80], OPCODE_BINARY, &[0x00, 0xff, 0x80]),
+                // A Buffer in place of a text frame: still text.
+                ("return Buffer.from('new');", OPCODE_TEXT, b"old", OPCODE_TEXT, b"new"),
+                // The handler says which, either way.
+                ("opts.binary = true; return buf;", OPCODE_TEXT, b"t", OPCODE_BINARY, b"t"),
+                ("opts.binary = false; return buf;", OPCODE_BINARY, b"b", OPCODE_TEXT, b"b"),
+                // What it is handed: a Buffer, and the frame's particulars.
+                (
+                    "return [Buffer.isBuffer(buf), buf.length, opts.opcode, opts.mask, opts.length].join();",
+                    OPCODE_BINARY,
+                    b"ab",
+                    OPCODE_TEXT,
+                    b"true,2,2,true,2",
+                ),
+            ];
+            for (body, opcode, payload, want_opcode, want) in cases {
+                let plan = plan_for(&state, "ws.test enable://websocket\n");
+                let script = format!("ctx.handleSendToServerFrame = function (buf, opts) {{ {body} }};");
+                let mut wire = spawn_tunnel(&state, plan, Some(script));
+                let seen = through(&mut wire, &[(opcode, payload)]).await;
+                assert_eq!(seen, [(want_opcode, want.to_vec())], "{body}");
+                finish(wire).await;
+            }
+        });
+    }
+
+    /// A handler may send frames of its own, either way, while it decides about
+    /// the one it was handed. They go out first, and each passes through the
+    /// handler for the direction it travels, marked `opts.frameScript`.
+    #[test]
+    fn a_handler_may_send_frames_of_its_own() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://websocket\n");
+            let script = "\
+                ctx.handleSendToServerFrame = function (buf, opts) {\
+                    if (opts.frameScript) { return 'S!' + buf; }\
+                    ctx.sendToClient('ack:' + buf);\
+                    ctx.sendToServer('also:' + buf);\
+                    return buf;\
+                };\
+                ctx.handleSendToClientFrame = function (buf, opts) {\
+                    return 'C(' + buf + ')' + (opts.frameScript ? '!' : '');\
+                };";
+            let mut wire = spawn_tunnel(&state, plan, Some(script.to_string()));
+            write_frame(&mut wire.client, true, OPCODE_TEXT, b"a", true)
+                .await
+                .expect("client write");
+            // Toward the server: what the handler sent, then the frame itself.
+            for want in [&b"S!also:a"[..], b"a"] {
+                let got = read_frame(&mut wire.server)
+                    .await
+                    .expect("read")
+                    .expect("frame");
+                assert_eq!(got.payload, want);
+            }
+            // Toward the client: the acknowledgement, through the other handler.
+            let got = read_frame(&mut wire.client)
+                .await
+                .expect("read")
+                .expect("frame");
+            assert_eq!(got.payload, b"C(ack:a)!");
+            // Both are in the capture, each under the direction it went.
+            let kept: Vec<(&str, String)> = state
+                .ws_frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.session == 7)
+                .map(|f| (f.dir, f.preview.clone()))
+                .collect();
+            let kept: Vec<(&str, &str)> = kept.iter().map(|(d, p)| (*d, p.as_str())).collect();
+            assert_eq!(
+                kept,
+                [
+                    ("receive", "C(ack:a)!"),
+                    ("send", "S!also:a"),
+                    ("send", "a")
+                ]
+            );
+            finish(wire).await;
+        });
+    }
+
+    /// What a handler returns, as upstream's `util.toBuffer` reads it: an
+    /// object is its JSON, a number its digits, and nothing — `undefined`,
+    /// `null`, `0`, `''` — drops the frame. A handler that throws puts its
+    /// message where the frame was, which is how its author finds out.
+    #[test]
+    fn what_a_handler_returns_is_what_is_delivered() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let plan = plan_for(&state, "ws.test enable://websocket\n");
+            let script = "var n = 0; ctx.handleSendToServerFrame = function (buf) { \
+                n++; \
+                if (n === 1) return { a: 1 }; \
+                if (n === 2) return 7; \
+                if (n === 3) return 0; \
+                if (n === 4) return ''; \
+                if (n === 5) return undefined; \
+                if (n === 6) throw new Error('boom'); \
+                return 'last'; };";
+            let mut wire = spawn_tunnel(&state, plan, Some(script.to_string()));
+            for payload in [b"1", b"2", b"3", b"4", b"5", b"6", b"7"] {
+                write_frame(&mut wire.client, true, OPCODE_TEXT, payload, true)
+                    .await
+                    .expect("client write");
+            }
+            let mut seen = Vec::new();
+            for _ in 0..4 {
+                let got = read_frame(&mut wire.server)
+                    .await
+                    .expect("read")
+                    .expect("frame");
+                seen.push(String::from_utf8(got.payload).unwrap());
+            }
+            assert_eq!(
+                seen,
+                ["{\"a\":1}", "7", "boom (handleSendToServerFrame)", "last"]
+            );
+            finish(wire).await;
+        });
+    }
+
+    /// A script with nothing to say about a direction is not asked about it,
+    /// and a script that throws while it is evaluated is no script at all.
+    #[test]
+    fn a_script_that_installs_nothing_leaves_the_frames_alone() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            for script in [
+                // Only the other direction.
+                "ctx.handleSendToClientFrame = function (buf) { return 'C' + buf; };",
+                // Threw before it finished: its handler is not kept.
+                "ctx.handleSendToServerFrame = function (buf) { return 'X' + buf; }; throw new Error('early');",
+                // Does not say `ctx`.
+                "var unused = 1;",
+                // Never ends: stopped, and then no script.
+                "ctx.handleSendToServerFrame = function (buf) { return 'X' + buf; }; while (true) {}",
+            ] {
+                let plan = plan_for(&state, "ws.test enable://websocket\n");
+                let mut wire = spawn_tunnel(&state, plan, Some(script.to_string()));
+                let seen = through(&mut wire, &[(OPCODE_TEXT, b"same"), (OPCODE_BINARY, b"\x01")]).await;
+                assert_eq!(
+                    seen,
+                    [(OPCODE_TEXT, b"same".to_vec()), (OPCODE_BINARY, vec![1])],
+                    "{script}"
+                );
+                finish(wire).await;
+            }
+        });
+    }
+
+    // ── an inspected tunnel ──
+
+    /// `enable://inspect` on a plain tunnel: each chunk is a frame, offered to
+    /// the script, which keeps its state and may send bytes of its own.
+    #[test]
+    fn an_inspected_tunnel_runs_the_script_over_each_chunk() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let (mut client, client_io) = tokio::io::duplex(1 << 16);
+            let (mut origin, origin_io) = tokio::io::duplex(1 << 16);
+            let info = apply::build_req_info(
+                "",
+                "https",
+                "db.test",
+                5432,
+                "/",
+                &hyper::HeaderMap::new(),
+                None,
+            );
+            let script = "\
+                var n = 0;\
+                ctx.sendToClient('greeting');\
+                ctx.handleSendToServerFrame = function (buf, opts) {\
+                    if (String(buf) === 'secret') { return null; }\
+                    return 'N' + (++n) + ':' + buf;\
+                };\
+                ctx.handleSendToClientFrame = function (buf, opts) {\
+                    return opts.frameScript ? buf : Buffer.concat([Buffer.from('<'), buf, Buffer.from('>')]);\
+                };";
+            let spec = FrameScriptSpec::for_request(script.to_string(), &info, "db.test", &Default::default());
+            assert!(spec.is_some());
+            let relay = tokio::spawn(inspected_relay(client_io, origin_io, spec, state.clone(), Some(9)));
+
+            async fn read_some(from: &mut DuplexStream) -> Vec<u8> {
+                let mut buf = vec![0u8; 256];
+                let n = from.read(&mut buf).await.expect("read");
+                buf.truncate(n);
+                buf
+            }
+            // What the script sent while starting arrives first.
+            assert_eq!(read_some(&mut client).await, b"greeting");
+            for (chunk, want) in [(&b"one"[..], &b"N1:one"[..]), (b"two", b"N2:two")] {
+                client.write_all(chunk).await.expect("write");
+                assert_eq!(read_some(&mut origin).await, want);
+            }
+            // A chunk the handler refuses does not arrive; the next one does.
+            client.write_all(b"secret").await.expect("write");
+            // Bytes that are not text come back as the bytes they were.
+            origin.write_all(&[0x00, 0xff]).await.expect("write");
+            assert_eq!(read_some(&mut client).await, [b'<', 0x00, 0xff, b'>']);
+            client.write_all(b"three").await.expect("write");
+            assert_eq!(read_some(&mut origin).await, b"N3:three");
+
+            // Closing one side closes the other, as a plain relay's would.
+            drop(client);
+            assert_eq!(read_some(&mut origin).await, b"");
+            drop(origin);
+            relay.await.expect("task").expect("relay");
+
+            // Each chunk that was delivered is a frame of the tunnel's session.
+            let frames = state.ws_frames.lock().unwrap();
+            let kept: Vec<(&str, &str, &str)> = frames
+                .iter()
+                .filter(|f| f.session == 9)
+                .map(|f| (f.dir, f.opcode, f.preview.as_str()))
+                .collect();
+            assert_eq!(
+                kept,
+                [
+                    ("receive", "text", "greeting"),
+                    ("send", "text", "N1:one"),
+                    ("send", "text", "N2:two"),
+                    ("receive", "binary", "3c00ff3e"),
+                    ("send", "text", "N3:three"),
+                ]
+            );
+        });
+    }
+
+    /// With no script an inspected tunnel is a relay that shows what it
+    /// carried; with no session to show it under, it keeps nothing.
+    #[test]
+    fn an_inspected_tunnel_with_no_script_only_records() {
+        rt().block_on(async {
+            for session in [Some(11u64), None] {
+                let state = state_with(crate::plugins::Plugins::new());
+                let (mut client, client_io) = tokio::io::duplex(1 << 16);
+                let (mut origin, origin_io) = tokio::io::duplex(1 << 16);
+                let relay = tokio::spawn(inspected_relay(
+                    client_io,
+                    origin_io,
+                    None,
+                    state.clone(),
+                    session,
+                ));
+                client.write_all(b"ping").await.expect("write");
+                let mut buf = [0u8; 16];
+                let n = origin.read(&mut buf).await.expect("read");
+                assert_eq!(&buf[..n], b"ping");
+                origin.write_all(b"pong").await.expect("write");
+                let n = client.read(&mut buf).await.expect("read");
+                assert_eq!(&buf[..n], b"pong");
+                drop(client);
+                drop(origin);
+                relay.await.expect("task").expect("relay");
+                let kept = state.ws_frames.lock().unwrap().len();
+                assert_eq!(kept, if session.is_some() { 2 } else { 0 });
+            }
         });
     }
 

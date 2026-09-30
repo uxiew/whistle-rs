@@ -1925,7 +1925,7 @@ Three consequences worth knowing:
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `resScript` | path to a `.js` file (or inline JS) | Run JavaScript against the response |
-| `frameScript` | path to a `.js` file (or inline JS) | Run JavaScript on each WebSocket text frame |
+| `frameScript` | path to a `.js` file, a `{value}`, or inline JS | Run JavaScript over each WebSocket frame — and, with `enable://inspect`, each chunk of a plain tunnel |
 
 The script runs in an embedded JS engine with a global `ctx`:
 
@@ -2051,45 +2051,100 @@ the proxy has resolved, which whistle's does; and there is no `require`,
 `process` or `setTimeout` — there is none upstream either, a `vm` context being
 JavaScript and nothing else.
 
-`frameScript` may be written in either of two shapes, and both work.
-
-**Upstream's**, which is what [`frameScript.md`](https://wproxy.org/docs/rules/frameScript.html)
-prints: install a handler per direction on `ctx`, and send frames of your own.
+`frameScript` runs JavaScript over the frames of a **WebSocket** and the chunks
+of a **plain TCP tunnel** — [`frameScript.md`](https://wproxy.org/docs/rules/frameScript.html):
+"操作 WebSocket 和普通 TCP 请求数据帧".
 
 ```js
-ctx.sendToServer('hello');                       // sent when the connection opens
-ctx.handleSendToServerFrame = (buf, opts) => String(buf).replace(/1/g, '***');
-ctx.handleSendToClientFrame = (buf, opts) => String(buf).replace(/1/g, '+++');
+var seen = 0;                                     // kept for the life of the connection
+ctx.sendToServer('hello');                        // sent when the connection opens
+ctx.handleSendToServerFrame = function (buf, opts) {
+  seen++;
+  if (seen > 100) return null;                    // nothing delivered
+  return String(buf).replace(/1/g, '***');
+};
+ctx.handleSendToClientFrame = function (buf, opts) {
+  ctx.sendToServer('got ' + buf.length + ' bytes'); // a frame of the script's own
+  return buf;                                     // unchanged
+};
 ```
 
-A handler's return value is the frame to deliver; a falsy one delivers
-**nothing**, which is upstream's `cb(null, chunk || null)`
-(`_original/lib/socket-mgr.js:198-206,:303-323`).
+```
+chat.example.com        frameScript://{frame.js}
+db.internal:5432        frameScript://{frame.js} enable://inspect
+```
 
-The client's frames go to `handleSendToServerFrame` here, as the name says. On
-a plain WebSocket, whistle up to 2.10.9 gave them to `handleSendToClientFrame`
-instead, so a script with only the first handler did nothing there and one with
-both applied the wrong one; 2.10.10 fixed it (avwo/whistle#1358).
-`tests/differential/ws-bench.js` measures it through both proxies: two
-differences against 2.10.8, none against 2.10.10.
+**One script per connection.** It is evaluated once, when the connection opens,
+and its two handlers are then called for each frame — so `seen` above counts.
+Until 2026-09-30 the script was evaluated afresh for every frame and the counter
+answered 1 for ever.
 
-**This port's**, which is shorter for a one-liner: `ctx.frame.data`, assigned in
-place, with `ctx.direction` naming the direction.
+**What a handler is handed**: the frame as a `Buffer` (text frames too — say
+`String(buf)`), and `opts`: `{ opcode, mask, compressed, length }`, where
+`opcode` is 1 for text and 2 for binary. While it runs the script sees what a
+`reqScript` sees — `url`, `method`, `headers`, `getValue`, `parseUrl`, `Buffer`,
+and so on — except `rules` and `values`.
+
+**What it returns** is what is delivered, read as upstream's `util.toBuffer`
+reads it (`_original/lib/socket-mgr.js:303-323`):
+
+| Returned | Delivered |
+|----------|-----------|
+| a string, a number | that text |
+| an object or array | its JSON |
+| a `Buffer` | those bytes |
+| `undefined`, `null`, `0`, `''` | **nothing** — the frame is dropped |
+| *(it threw)* | the error's message, as `boom (handleSendToServerFrame)` — which is how you find out, in the Frames panel and at the peer |
+
+**Frames the script sends** — `ctx.sendToServer(data, opts)`,
+`ctx.sendToClient(data, opts)`, at the top of the script or from inside a
+handler — go out before the frame being handled, and each passes through the
+handler for the direction it travels with `opts.frameScript === true`, so a
+handler can let its own frames by. `{ binary: true }` sends a binary frame.
+
+**A plain tunnel needs `enable://inspect`.** A `CONNECT` tunnel this proxy does
+not read — anything that is neither HTTP nor a TLS handshake it intercepts, or
+one a rule said to leave alone — and an `Upgrade:` to something other than
+WebSocket are relayed as bytes. With `enable://inspect` each chunk read from
+either side is shown as a frame under the tunnel's row and handed to the script.
+A chunk is whatever one read returned: TCP has no message boundaries, and a
+handler that needs a whole message reassembles it, as it must upstream.
+`enable://pauseSend` and its three relatives imply `inspect` and do nothing more
+on a tunnel.
+
+Where this differs from whistle 2.10.10, each measured by
+`tests/differential/core-bench.js` (28 frame and tunnel cases, 22 equal):
+
+| | whistle | here | why |
+|---|---|---|---|
+| `ctx` and `Buffer` inside a handler | a `ReferenceError`, delivered as the frame — upstream empties the script's globals once it has run, so only a saved reference (`var c = ctx`) works | both work | the documented example reads `ctx.` inside nothing, but every script one would actually write does |
+| a binary frame through a handler that returns the `Buffer` | re-sent as a **text** frame (the frame's options say `opcode: 2` and the sender reads `opts.binary`) — bytes that are not UTF-8 then arrive mangled | stays binary | `opts.binary` is honoured when the handler sets it either way; otherwise a string is text and a `Buffer` keeps the frame's type |
+| `sendToServer` at the top of a script that also installs that direction's handler | the frame never arrives | it arrives, through the handler | — |
+| `sendToClient` at the top of a **tunnel** script | written before the `200` that answers the CONNECT; the client's CONNECT fails | written after it | — |
+| `typeof ctx.frame`, `typeof ctx.direction` | `undefined` | an object and a string | this port's one-line shape, below |
+| a fragmented WebSocket message | reassembled, then handed over | each fragment is relayed untouched | this port relays frame by frame; a handler is only handed whole messages |
+| `enable://pauseSend` … on a tunnel | holds or drops the chunks | shows them, nothing more | not built |
+
+The client's frames go to `handleSendToServerFrame`, as the name says. On a
+plain WebSocket, whistle up to 2.10.9 gave them to `handleSendToClientFrame`
+instead; 2.10.10 fixed it (avwo/whistle#1358), and `tests/differential/ws-bench.js`
+measures it through both proxies.
+
+**This port's one-line shape** still works: a script that installs no handler
+and names `ctx.frame` is evaluated for each *text* frame, with the frame in
+`ctx.frame.data` and the direction in `ctx.direction`.
 
 ```js
 if (ctx.direction === 'send') ctx.frame.data = ctx.frame.data.toUpperCase();
 ```
 
-```
-chat.example.com   frameScript:///abs/path/frame.js
-```
+It runs in the same engine each time, so a global it sets is still there for the
+next frame.
 
-A script that does both gets the handler's answer, because that is the one the
-other program would honour. One narrowing: the script is evaluated **per frame**
-here and once per connection there, so state kept in a closure between frames
-does not survive — `ctx.sendToServer` and `ctx.sendToClient` are collected from
-a single evaluation when the connection opens, so they fire once, as they do
-upstream.
+**Cost.** A scripted connection has a thread of its own for the script — the
+engine cannot move between threads, and a connection's two directions are two
+tasks. A connection with no `frameScript` has none. A loop in a handler is cut
+at three million iterations, like any script's.
 
 ### weinre (HTML debug injection)
 

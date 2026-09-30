@@ -84,6 +84,21 @@ pub(super) fn is_websocket(req: &Request<DynBody>, resolved: &Resolved) -> bool 
         .unwrap_or(false)
 }
 
+/// The `frameScript://` a connection's rules name, read and ready to start —
+/// or `None` when there is none, or its text never says `ctx`.
+///
+/// The script sees the request the way a `reqScript` does, so it is built here,
+/// where the request is known, and started later, inside the tunnel.
+pub(super) fn frame_script_of(
+    state: &AppState,
+    info: &ReqInfo,
+    resolved: &Resolved,
+) -> Option<script::FrameScriptSpec> {
+    let op = resolved.get("frameScript")?;
+    let src = script::load_script(&op.value)?;
+    script::FrameScriptSpec::for_request(src, info, &op.raw_pattern, &effective_values(state))
+}
+
 /// Forward an upgrade handshake and, on `101`, tunnel bytes both ways.
 /// This is how WebSocket (`ws://`/`wss://`) traffic is proxied. WebSocket
 /// upgrades are tunnelled frame-by-frame so each frame is captured; any other
@@ -111,7 +126,7 @@ pub(super) async fn serve_upgrade(
         .map_err(outcome::at(outcome::Phase::Rules))?;
     ledger.note(|s| s.target = target_desc(&target));
     note_cipher_dropped(ledger, &target, resolved);
-    let frame_script = resolved.value("frameScript").and_then(script::load_script);
+    let frame_script = frame_script_of(state, info, resolved);
     let websocket = is_websocket(&req, resolved);
     // Which plugins may hook this session's frames. Resolving the plan contacts
     // nothing and allocates nothing unless a rule named a registered plugin;
@@ -126,6 +141,9 @@ pub(super) async fn serve_upgrade(
     // collapses to its default when no plugin is named, and these flags have to
     // survive that.
     let frame_flow = ws::FrameFlow::of(resolved);
+    // An upgrade to something other than WebSocket is relayed as bytes, and
+    // `enable://inspect` asks for those to be shown — see `ws::inspected_relay`.
+    let inspected = !websocket && inspects(resolved);
     let client_upgrade = hyper::upgrade::on(&mut req);
 
     // Build the upstream handshake request (upgrades carry no body, so
@@ -249,6 +267,14 @@ pub(super) async fn serve_upgrade(
                         session_id,
                     )
                     .await;
+                } else if inspected {
+                    // Some other protocol, which a rule asked to see: chunk by
+                    // chunk, each one a frame and each one offered to the script.
+                    let relayed =
+                        ws::inspected_relay(c, u, frame_script, state, Some(session_id)).await;
+                    if let Err(err) = relayed {
+                        tracing::debug!("upgrade tunnel closed: {err}");
+                    }
                 } else {
                     // Non-WebSocket upgrade: opaque byte passthrough.
                     let mut c = c;

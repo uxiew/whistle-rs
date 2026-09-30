@@ -52,8 +52,8 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/proxy/outcome.rs` | `lib/inspectors/data.js` (`reqError`/`resError`) | How a request ended when it did not complete: the phase, the reason, the error tag that carries them out of `upstream`, and the body wrapper that notices a response breaking off |
 | `src/proxy/sni.rs` | `lib/https/index.js:1281`, `lib/https/load-cert.js` | The SNI stage: peek the ClientHello, pick the certificate, or relay the connection untouched |
 | `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
-| `src/proxy/script.rs` | `lib/inspectors` (script hooks) | JS engine for `resScript`/`frameScript` + PAC eval |
-| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks |
+| `src/proxy/script.rs`, `src/proxy/script_prelude.js` | `lib/rules/index.js` (`getScriptContext`, `execRulesScript`), `lib/socket-mgr.js` (`execHandleFrame`) | The JS engine (boa) and what a script sees in it: the rules scripts, a connection's `frameScript` on a thread of its own, PAC. The prelude is Node's `Buffer`, `url.parse`, `querystring.parse` and `iconv` helpers, in JavaScript |
+| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks. Also `inspected_relay`, the chunk-by-chunk relay an `enable://inspect` tunnel gets |
 | `src/proxy/webui.rs`, `src/proxy/webui/` | `biz/webui` | The console: the route table (`handle`, in `webui.rs`) and its API, one area per file — `access`, `sessions`, `har`, `rules`, `values`, `bundle`, `composer`, `console_hosts`, `plugin_pages` |
 | `ui-src/` | `biz/webui/htdocs` | The console: a Vue 3 / Vite / TypeScript app built to one file and inlined at compile time; `build.rs` substitutes a placeholder when it has not been built, so no Node is needed to build the proxy |
 | `ui-src/src/editor/whistle-classify.js` | — | The rules classifier; shares `index_of_pattern` with the parser, and a Rust test holds the two together |
