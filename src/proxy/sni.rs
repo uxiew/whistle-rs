@@ -1558,6 +1558,7 @@ mod tests {
                 // A tunnel this port agreed not to intercept performs its own
                 // handshake; no suite of ours is offered on it.
                 tls_ciphers: None,
+                tls_extras: None,
                 cipher_dropped: None,
                 no_proxy_ua: false,
                 proxy_connection_close: false,

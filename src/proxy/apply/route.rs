@@ -331,6 +331,33 @@ pub async fn resolve_target(
         }
         fits
     });
+    // Who this proxy is to the origin, and whom it trusts there — the client
+    // certificate `tlsOptions://key=…&cert=…` names. Material that cannot be
+    // used stops the request here, with the reason: the alternative is a
+    // connection made without the identity the rule asked for.
+    let tls_extras = match tls {
+        true => super::super::tls_options::extras_of(&cipher)
+            .await
+            .map_err(|why| anyhow!(why))?,
+        false => None,
+    };
+    // The options Node would hand to OpenSSL and rustls has no place for.
+    let ignored = super::super::tls_options::unsupported(&cipher);
+    if !ignored.is_empty() {
+        let note = format!(
+            "this build's TLS library has no equivalent of `{}`; {} ignored",
+            ignored.join("`, `"),
+            if ignored.len() == 1 {
+                "it was"
+            } else {
+                "they were"
+            }
+        );
+        cipher_dropped = Some(match cipher_dropped {
+            Some(why) => format!("{why}; {note}"),
+            None => note,
+        });
+    }
     let disabled = disabled_flags(resolved);
     // `checkAuto2Http` (`_original/lib/util/index.js:3191-3198`): a `host://`
     // rule, a local address, or the flag said so out loud — and `disable://`
@@ -364,6 +391,7 @@ pub async fn resolve_target(
         auto2http,
         h2,
         tls_ciphers,
+        tls_extras,
         // Only where there is a handshake for a pin to be missing from.
         cipher_dropped: cipher_dropped.filter(|_| tls),
         // Read straight off `disable`, as upstream reads them.

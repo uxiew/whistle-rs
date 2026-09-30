@@ -40,6 +40,7 @@ pub mod sni;
 pub mod socks;
 pub mod template;
 pub mod timing;
+pub mod tls_options;
 pub mod unapplied;
 #[cfg(test)]
 mod unapplied_tests;

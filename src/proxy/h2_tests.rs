@@ -93,6 +93,7 @@ async fn origin(alpn: &[&[u8]]) -> Origin {
 fn tls_target(port: u16) -> Target {
     Target {
         tls_ciphers: None,
+        tls_extras: None,
         cipher_dropped: None,
         no_proxy_ua: false,
         proxy_connection_close: false,

@@ -70,6 +70,12 @@ hyper = { version = "1.10.1", features = ["http1", "server", "client", "http2"] 
 hyper-util = { version = "0.1.20", features = ["tokio", "server", "client-legacy", "http1", "http2"] }
 json5 = "1.3.1"
 once_cell = "1.21.4"
+# `tlsOptions://pfx=client.p12&passphrase=…` — a client certificate as the
+# PKCS#12 bundle Windows and the macOS Keychain export. Opening one takes an
+# ASN.1 reader, a key derivation and three ciphers (3DES and RC2 for old
+# bundles, AES for OpenSSL 3's), which is what this and the ~40 RustCrypto
+# crates under it are. rustls reads PEM and nothing else.
+p12-keystore = "0.3.2"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 regex = "1.12.4"
 # Already here as boa's regexp engine; named directly so the search box's

@@ -161,9 +161,14 @@ pub struct Target {
     /// rule named none — see [`super::ciphers`].
     pub tls_ciphers: Option<Arc<super::ciphers::CipherPolicy>>,
     /// Why the rule's `ciphers` were not pinned when it named some: none this
-    /// build has, or none the allowed TLS versions can use. The session says
-    /// so — see [`super::unapplied`].
+    /// build has, or none the allowed TLS versions can use — and which of its
+    /// other options this build cannot honour at all. The session says so —
+    /// see [`super::unapplied`].
     pub cipher_dropped: Option<String>,
+    /// The client certificate and the trust a `tlsOptions://` rule named for
+    /// this origin — see [`super::tls_options`]. `None` for nearly every
+    /// request.
+    pub tls_extras: Option<Arc<super::tls_options::TlsExtras>>,
     /// `disable://proxyUA` — do not echo the client's `User-Agent` on the
     /// CONNECT to an upstream proxy (`_original/lib/inspectors/res.js:329-333`).
     pub no_proxy_ua: bool,
@@ -503,7 +508,7 @@ pub fn insecure_upstream() -> bool {
 /// A verifier that accepts any certificate. Only reachable behind
 /// `--insecure-upstream`; see [`INSECURE_UPSTREAM`] for why that is opt-in.
 #[derive(Debug)]
-struct AcceptAnyServerCert(Arc<rustls::crypto::CryptoProvider>);
+pub(super) struct AcceptAnyServerCert(pub(super) Arc<rustls::crypto::CryptoProvider>);
 
 impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
     fn verify_server_cert(
@@ -713,6 +718,55 @@ static H2_CONFIGS: Lazy<AlpnConfigCache> = Lazy::new(|| RwLock::new(HashMap::new
 /// that did not ask for h2 should get; so the offer is a copy of the plain
 /// config rather than a change to it.
 fn origin_config(
+    versions: TlsVersions,
+    ciphers: Option<&Arc<super::ciphers::CipherPolicy>>,
+    h2: bool,
+    extras: Option<&Arc<super::tls_options::TlsExtras>>,
+) -> Arc<ClientConfig> {
+    let Some(extras) = extras else {
+        return shared_origin_config(versions, ciphers, h2);
+    };
+    // A rule named a client certificate, or whom to trust: a configuration of
+    // its own, kept by everything that went into it. Its sessions are its own
+    // too — see `TlsExtras::apply` for why that is not optional.
+    let key = (
+        versions,
+        ciphers.map(|p| (**p).clone()),
+        h2,
+        extras.id.clone(),
+    );
+    if let Some(cfg) = EXTRAS_CONFIGS.read().unwrap().get(&key) {
+        return cfg.clone();
+    }
+    let cfg = Arc::new(extras.apply(&shared_origin_config(versions, ciphers, h2)));
+    let mut kept = EXTRAS_CONFIGS.write().unwrap();
+    // Bounded by starting again: an identity in use is rebuilt on its next
+    // request, at the cost of one handshake that cannot resume.
+    if kept.len() >= 64 {
+        kept.clear();
+    }
+    kept.insert(key, cfg.clone());
+    cfg
+}
+
+/// Configurations carrying a rule's [`super::tls_options::TlsExtras`], by the
+/// pins they were copied from and the extras' own digest.
+type ExtrasConfigCache = RwLock<
+    HashMap<
+        (
+            TlsVersions,
+            Option<super::ciphers::CipherPolicy>,
+            bool,
+            String,
+        ),
+        Arc<ClientConfig>,
+    >,
+>;
+static EXTRAS_CONFIGS: Lazy<ExtrasConfigCache> = Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// [`origin_config`] for a request no rule gave an identity or a trust store:
+/// one of a handful of shared configurations.
+fn shared_origin_config(
     versions: TlsVersions,
     ciphers: Option<&Arc<super::ciphers::CipherPolicy>>,
     h2: bool,
@@ -1301,6 +1355,7 @@ fn pool_key(target: &Target, hop: &Hop, h2: bool) -> super::pool::Key {
         tls: target.tls.then(|| TlsPolicy {
             versions: target.tls_versions,
             ciphers: target.tls_ciphers.as_deref().cloned(),
+            extras: target.tls_extras.as_ref().map(|e| e.id.clone()),
         }),
         tls_stripped: target.origin_tls_stripped,
         proxy: target.proxy.as_ref().map(|p| ProxyRoute {
@@ -1721,6 +1776,7 @@ async fn origin_stream(
             target.tls_versions,
             target.tls_ciphers.as_ref(),
             offer_h2,
+            target.tls_extras.as_ref(),
         ));
         let server_name = ServerName::try_from(target.sni.clone())
             .map_err(|_| stopped(Phase::Tls, anyhow!("invalid SNI host {}", target.sni)))?;
@@ -2068,6 +2124,7 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
     let (host, port) = split_host_port(authority, if tls { 443 } else { 80 });
     let target = Target {
         tls_ciphers: None,
+        tls_extras: None,
         cipher_dropped: None,
         no_proxy_ua: false,
         proxy_connection_close: false,
@@ -2372,6 +2429,7 @@ mod tests {
     fn target(host: &str, port: u16, proxy: Option<ProxyConfig>) -> Target {
         Target {
             tls_ciphers: None,
+            tls_extras: None,
             cipher_dropped: None,
             no_proxy_ua: false,
             proxy_connection_close: false,
@@ -3399,3 +3457,8 @@ mod pool_tests;
 #[cfg(test)]
 #[path = "h2_tests.rs"]
 mod h2_tests;
+
+/// A client certificate on the origin leg — see the file.
+#[cfg(test)]
+#[path = "mtls_tests.rs"]
+mod mtls_tests;

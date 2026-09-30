@@ -41,8 +41,10 @@ pub enum Kind {
     /// A plugin's hook failed — could not be reached, answered an error, or
     /// did not answer in time — and the request went on without it.
     PluginFailed,
-    /// The `cipher://` pin could not be used, so the connection was made
-    /// without it.
+    /// Part of a `cipher://` / `tlsOptions://` rule could not be used — a
+    /// suite pin this build has no suite for, or an option (`dhparam`,
+    /// `secureOptions`, …) its TLS library has no equivalent of — and the
+    /// connection was made without that part.
     CipherUnusable,
 }
 

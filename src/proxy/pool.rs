@@ -116,6 +116,11 @@ pub(crate) struct Key {
 pub(crate) struct TlsPolicy {
     pub versions: TlsVersions,
     pub ciphers: Option<CipherPolicy>,
+    /// The client certificate presented and the roots trusted, as the digest
+    /// [`crate::proxy::tls_options::TlsExtras`] computes. A connection the
+    /// origin authenticated as one client must never carry a request made
+    /// under a rule that named another, or none.
+    pub extras: Option<String>,
 }
 
 /// The proxy half of a [`Key`]: the hop, and what was said to it.

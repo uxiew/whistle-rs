@@ -3619,6 +3619,75 @@ file; `{name}` in any operator value is
 substituted from the values store. `cipher` carries Node's TLS options and honours
 what rustls can express — see [What `cipher://` can pin](#what-cipher-can-pin).
 
+### A client certificate for the origin (`tlsOptions://`)
+
+`tlsOptions://` is `cipher://` by its other name, and the first thing
+[`cipher.md`](https://wproxy.org/docs/rules/cipher.html) says it is for is
+mutual TLS: an origin that asks *this proxy* to prove who it is.
+
+```
+# PEM: a key and its certificate, as two files…
+api.example.com   tlsOptions://key=/certs/client.key&cert=/certs/client.crt
+
+# …or as text, in a value
+api.example.com   tlsOptions://{client.json}
+
+# PKCS#12 (.pfx / .p12) and its passphrase
+api.example.com   tlsOptions://passphrase=123456&pfx=/certs/client.p12
+
+# and whom to trust there
+internal.example.com   tlsOptions://ca=/certs/corp-root.pem
+staging.example.com    tlsOptions://rejectUnauthorized=false
+```
+
+````
+``` client.json
+{ "key": "-----BEGIN PRIVATE KEY-----\n…", "cert": "-----BEGIN CERTIFICATE-----\n…" }
+```
+````
+
+| Option | What it does |
+|--------|--------------|
+| `key` + `cert` | The client certificate: PEM, each a path or the text itself (a value beginning `-----`). `cert` may hold a chain, leaf first. The key must be unencrypted |
+| `pfx` + `passphrase` (or `pwd`) | The same identity as a PKCS#12 file. Both the old (3DES) and the current (AES, PBKDF2) encryptions are read |
+| `base` | A directory the paths above are relative to |
+| `ca` | PEM, a path or the text. The roots the **origin's** certificate must chain to, *instead of* the built-in ones — Node's meaning of the option |
+| `rejectUnauthorized=false` | Do not verify this origin's certificate |
+| `minVersion`, `maxVersion`, `secureProtocol`, `ciphers` | See [below](#what-cipher-can-pin) |
+| `crl`, `dhparam`, `ecdhCurve`, `sigalgs`, `secureOptions`, `sessionTimeout`, `sessionIdContext`, `honorCipherOrder`, `allowPartialTrustChain` | **Not supported**: rustls has no equivalent. The request goes ahead, and its session lists the option under `unapplied` |
+
+Several lines merge, as for every `cipher://` option, so the certificate can be
+on one line and the version on another.
+
+**A certificate that cannot be used fails the request**, with the reason, before
+anything is dialled: `502`, `x-whistle-rs-error: rules`, and a body such as
+`tlsOptions: cannot read key /certs/client.key: No such file or directory`,
+`tlsOptions: the private key does not belong to the certificate`, or
+`tlsOptions: pfx could not be opened (wrong passphrase, or not PKCS#12)`.
+whistle connects without the certificate in those cases and leaves the origin to
+refuse; the client sees a 502 either way, but here it says which file.
+
+**Connections are kept apart by identity.** A connection the origin
+authenticated as one client is never reused for a request made under a rule
+that names another certificate, or none — the certificate and the trust are
+part of what a pooled connection is keyed by, and a rule with an identity has
+TLS sessions of its own, so nothing resumes into somebody else's.
+
+`ca` and `rejectUnauthorized` matter more here than in whistle, which verifies
+no origin unless started with `--safe`: they are how one rule reaches an origin
+with a private CA without `--insecure-upstream` switching verification off for
+every origin.
+
+Until 2026-09-30 none of the first five rows was read: the options parsed, and
+every origin connection was made with no client certificate.
+`tests/differential/core-bench.js` asks both proxies nine ways — PEM by path and
+inline, a PFX, a certificate the origin does not trust, a key that is not the
+certificate's, a wrong passphrase, a missing file — and they agree on all nine.
+
+Not to be confused with `enable://clientCert` / `requestCert`, which make the
+*forged server* ask the **client** for a certificate; that is still
+[not implemented](#flags-includes--values).
+
 ### What `cipher://` can pin
 
 `minVersion` / `maxVersion` / `secureProtocol` (or a bare `cipher://TLSv1.2`

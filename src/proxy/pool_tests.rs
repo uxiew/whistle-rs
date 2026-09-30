@@ -96,6 +96,7 @@ async fn read_request(sock: &mut TcpStream) -> bool {
 fn direct(port: u16) -> Target {
     Target {
         tls_ciphers: None,
+        tls_extras: None,
         cipher_dropped: None,
         no_proxy_ua: false,
         proxy_connection_close: false,
@@ -434,6 +435,16 @@ fn every_part_of_the_route_is_in_the_key() {
             key_of(
                 &Target {
                     tls_ciphers: Some(Arc::new(policy)),
+                    ..tls.clone()
+                },
+                &hop,
+            ),
+        ),
+        (
+            "client certificate",
+            key_of(
+                &Target {
+                    tls_extras: Some(super::super::tls_options::TlsExtras::named("alice")),
                     ..tls.clone()
                 },
                 &hop,
