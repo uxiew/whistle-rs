@@ -1,0 +1,5 @@
+# A storage directory exactly as a release wrote it (tests/data_compat.rs).
+# Without this, a Windows checkout with core.autocrlf — GitHub's runners have
+# it on — turns its line endings into CRLF, and the test would be reading
+# files no version of whistle-rs ever wrote.
+tests/data/** -text
