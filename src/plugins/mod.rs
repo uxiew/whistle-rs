@@ -1621,8 +1621,6 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut byte = [0u8; 1];
-                    // Head only: the payloads here are small and we never need
-                    // to read them back.
                     while sock.read_exact(&mut byte).await.is_ok() {
                         buf.push(byte[0]);
                         if buf.ends_with(b"\r\n\r\n") {
@@ -1630,6 +1628,18 @@ mod tests {
                         }
                     }
                     let head = String::from_utf8_lossy(&buf).into_owned();
+                    // The body is read too, though nothing looks at it: a
+                    // socket closed with unread bytes is reset, and Windows
+                    // then drops the answer the client had not read yet —
+                    // every POST here failed there as "connection reset".
+                    let length = head
+                        .lines()
+                        .filter_map(|l| l.split_once(':'))
+                        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; length];
+                    sock.read_exact(&mut body).await.ok();
                     let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
                     recorder.lock().unwrap().push(path.clone());
                     let (status, body) = routes
