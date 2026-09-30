@@ -651,11 +651,21 @@ whistle 一列取自最后一轮，三轮之间它自己在 h2 页面加载上�
 
 四个通过的平台上，冒烟测试的每一步都通过了（任何一步失败都会让 job 失败）。几个事先担心的点也有了答案：ARM Linux 和 Intel macOS 的镜像都自带 rustup，Toolchain 这一步没走安装分支。各包里 `BUILD-INFO.txt` 记的最低系统版本在构件里，构件要登录下载，本文还没核对。
 
-`3ad90fa` 改为测试失败时照样跑冒烟测试（打包仍要求全部通过），下一次运行一次就能同时看到两边。
+**Windows 失败的是哪些（维护者取来的日志）：** 库的单元测试 1051 个通过、5 个失败；cargo 遇到第一个失败的测试程序就停了，集成测试（`tests/*.rs`）和冒烟测试都没跑到。5 个失败都是 Windows 上才有的行为，推送日志之前按读代码逐条找到并修了，日志逐条对上：
+
+| 失败的测试 | 日志里的现象 | 原因 | 修复 |
+| --- | --- | --- | --- |
+| `plugins::tests` 里认证钩子的 3 个 | 期望 403 得到 502；`/request` 被记了 3 次 | 测试里的假插件没读请求体就回答并关连接，连接被重置；Windows 会丢掉客户端还没读的回答，客户端重试两次后放弃 | `1dd9d0f`（测试） |
+| `a_directory_rule_maps_the_rest_of_the_path_onto_it` | 期望 404 得到 200 | `Path::join("")` 在 Windows 上以 `\` 结尾，测试只去掉了 `/`，规则变成了"带结尾分隔符、给 index.html"的写法 | `6cb752b`（测试） |
+| `the_pac_helpers_a_corporate_file_uses_all_exist` | `dnsResolve('') === null` 为 false | **产品缺陷**：空主机名交给了系统解析器，Windows 的 getaddrinfo 对空名字回本机地址；Linux、macOS 拒绝，whistle（Node）直接回 null | `5ac6690`（代码） |
+
+**第二次运行（run `36652460988`，提交 `6735aff`，带上了 `3ad90fa`，还没有上面三个修复）：** 其余 11 个 job 全过；Windows 的测试步骤照旧是那 5 个失败，但这次冒烟测试跑到了，**Windows 上冒烟测试通过**（2 秒），"二进制对系统的要求"那一步也过了，即二进制里没有 `VCRUNTIME140`，静态链接 C 运行库生效。Windows 上的两次"停下"都是 TerminateProcess，插件进程两次都跟着退出，说明 stdin 管道那条路在 Windows 上确实管用。打包因为测试失败被跳过，所以还没有 Windows 的包。
+
+另外：`3ad90fa` 让测试失败时照样跑冒烟测试（打包仍要求全部通过）；`15cc70d` 给平台测试加 `--no-fail-fast`，一次看到全部失败；`8f4b3c8` 用 `.gitattributes` 让 `tests/data/` 在 Windows 上按原字节检出（runner 开着 `core.autocrlf`；把它们转成 CRLF 后测试照样通过，但那就不是 0.1.0 写出的文件了）。
 
 **没做 / 剩余风险：**
 
-- **Windows 还没通过。** 测试失败的具体用例要看日志（需要登录，已请维护者取）；冒烟测试的 24 步、`grep vcruntime140` 这个检查都还没在 Windows 上跑到。
+- **Windows 还没全绿。** 冒烟测试和 `VCRUNTIME140` 检查已在 Windows 上通过；单元测试的 5 个失败已修但还没推送验证，集成测试（`tests/*.rs`）还从没在 Windows 上跑到过，Windows 的包也还没打出来。
 - CI 的机器是虚拟机，冒烟测试不碰系统代理和信任库；"设成系统代理、浏览器信任根证书后能上网"要在真机上按 CERTIFICATES 做，没做过。
 - Windows 上 Ctrl+C / Ctrl+Break / 关窗口的处理有代码、类型检查过，没有运行过；SmartScreen、防火墙询问、macOS Gatekeeper 在普通用户机器上的表现都没实测（本机终端有开发者工具豁免，给二进制加上隔离属性照样能跑，说明不了什么）。
 - 没有代码签名和 macOS 公证：没有 Apple Developer ID，也没有 Windows 代码签名证书。校验和只能证明文件没坏，证明不了来源。
