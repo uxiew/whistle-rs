@@ -704,6 +704,41 @@ Windows 上这次单元测试全过，集成测试（`tests/*.rs`）第一次跑
 - 全量差分（`run.js`）靠进程组清理，仍不支持 Windows，只在 Linux 上跑。
 - 规则组、Values 仍由整份覆盖保存，同一目录跑两个实例时后保存的覆盖先保存的；不加锁，文档写明了。
 
+## 2026-09-30 核心覆盖复核
+
+一份独立复审（代码 `bd378ec`）指出：路线图做完了，但六处同名规则的效果只做了一部分。这一节记录逐条复现的结果。复现用的脚本留在仓库里：
+
+```sh
+cargo build
+cd tests/differential
+WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-bench.js
+```
+
+它自己起上游 whistle 2.10.10、whistle-rs、一个 HTTP/WebSocket 源站、一个 TCP 回显、一个强制要求客户端证书的 HTTPS 源站和一个假插件，同一条规则问两边，比较**源站收到的东西**。证书是当场用 `openssl` 生成的一次性 CA，不装进系统。
+
+**结论：六条全部属实。** 环境 macOS arm64、Node v26.4.0、Rust 1.98.1。修之前 61 个对照里 38 个不一致，4 个插件断言里 3 个不过：
+
+| 编号 | 复审说的 | 复现结果（上游 → whistle-rs） |
+| --- | --- | --- |
+| A01 | 插件 `/manifest` 第一次失败后，认证永久失效 | 首次 503：请求 200 到达源站；插件恢复后仍然 200，`/auth` 调用 0 次 |
+| A02 | `tlsOptions://` 不带客户端证书 | `key=…&cert=…`：200 且源站 `authorized=true` → 502。pfx、内联 PEM 同样 |
+| A03 | 规则正则不是 JS 正则 | `/probe(?=\.test)/` 命中 → 不命中。前瞻、否定前瞻、后顾、反向引用在 pattern、过滤器、`resReplace`、`pathReplace`、模板 `.replace()` 里全部如此，13 个对照不一致 |
+| A04 | 脚本函数和 Node 不一致 | `parseQuery('a=1&a=2&q=a+b')`：`{a:['1','2'],q:'a b'}` → `{a:'2',q:'a+b'}`；`parseUrl` 把 `user:pw@` 留在主机名里、`hash` 为空；`Buffer` 不存在；`pattern` 是空串、`port` 是 0 |
+| A05 | frameScript 没有状态、不管二进制和 TCP | 同一连接发 a/b/c：N1、N2、N3 → N1、N1、N1；二进制帧、`enable://inspect` 的 TCP 隧道都没经过处理函数 |
+| A06 | `log://` 不注入页面脚本 | 31 字节的页面：上游注入了采集脚本 → 原样返回 |
+
+**复审没说、复现时顺带看到的：**
+
+- 带前瞻的 `excludeFilter` 是**反向失效**：上游排除了这条规则，whistle-rs 照样应用。正则编译不了就当成字面量，字面量当然匹配不上，于是排除条件永远不成立。
+- 上游自己有两处怪行为，对照时要知道：脚本跑完后上游会清空全局变量，所以处理函数里直接写 `ctx.sendToClient(...)` 或 `Buffer.from(...)` 会报 `ctx is not defined`，要先 `var c = ctx` 存下来；处理函数只要存在，上游就把二进制帧当文本帧重发（收到的帧选项里没有 `binary`，发送时按 `opts.binary ? 2 : 1` 取操作码）。这两处 whistle-rs 不照抄，见 CORE-04 的记录。
+- 上游把规则里的主机当 TLS 的 server name 发出去，Node 26 不接受 IP 地址当 server name，所以 `http://x https://127.0.0.1:端口` 这种映射在上游握手前就失败。对照 mTLS 要用 `localhost`。
+
+**复审里没有逐条复现的部分：** 第 4 节的插件能力矩阵和第 5 节的控制接口，按源码抽查了 `@whistle.xxx` 引入（`src/rules/include.rs`）、短协议（`src/rules/mod.rs` 的 `plugin_package`）、控制台路由表（`src/proxy/webui.rs`），描述与代码一致。它们是"自有插件协议"这个既定方向的边界，不是缺陷，归 ROADMAP 的 EXT-01 / CTRL-01。
+
+**为什么原来的门禁看不见：** 解析差分只回答"命中了哪条规则"；网络差分一次看一个请求。合法 JS 正则被静默当成字面量、脚本函数的返回值、帧与帧之间的状态、页面里的脚本、客户端证书，都不在这两个问题里。复审提到的"上游自带测试 160 条通过里有 6 条只因为 404 也是 JSON"也属实，见 O2 记录。
+
+修复计划在 [ROADMAP 的第二轮](ROADMAP.md#第二轮同名规则的实际效果2026-09-30-立项)，每项做完在下面追加记录。
+
 ## 真实缺口与风险
 
 | 优先级 | 发现 | 后续任务 |

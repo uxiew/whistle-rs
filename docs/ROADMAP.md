@@ -1,6 +1,6 @@
 # 后续实施计划
 
-更新：2026-09-30（全部任务完成，最后一项是 D1）。审查时的代码基线：`702486d`。依据：[对齐审查与实测](STATUS.md)。旧实验/已完成记录移至 [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md)，不再作为活动待办。
+更新：2026-09-30（第一轮任务全部完成，最后一项是 D1；同日立项[第二轮](#第二轮同名规则的实际效果2026-09-30-立项)）。审查时的代码基线：`702486d`。依据：[对齐审查与实测](STATUS.md)。旧实验/已完成记录移至 [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md)，不再作为活动待办。
 
 ## 目标与约束
 
@@ -155,9 +155,84 @@
 
 没验证的：真机上设系统代理、信任根证书后的浏览器使用；Windows 上 Ctrl+C 这条路径；SmartScreen、Gatekeeper。详见 [STATUS 的 D1 记录](STATUS.md#2026-09-29-d1-跨平台构建与验证)。
 
+## 第二轮：同名规则的实际效果（2026-09-30 立项）
+
+上面的任务做完不等于上游的核心能力都有了。2026-09-30 一份独立复审指出六处"规则名字认得、效果没做全"，逐条用 `tests/differential/core-bench.js` 对上游 2.10.10 复现，六条全部属实：61 个对照里 38 个不一致，4 个插件断言里 3 个不过。复现结果见 [STATUS 的复核记录](STATUS.md#2026-09-30-核心覆盖复核)。
+
+为什么原来的门禁全绿却看不见这些：解析差分只问"命中了哪条规则"，网络差分一次只看一个请求到源站的样子。合法的 JS 正则被静默当成字面量、脚本函数的返回值、一条连接上帧与帧之间的状态、页面里被注入的脚本、交给源站的客户端证书，都不在这两个问题里。
+
+这一轮的每一项都以官网文档为准写验收，并且必须用**源站那一侧**的证据验收（源站收到了什么、有没有被访问），不能只看代理回了 200。
+
+### CORE-01 — 插件说不清自己是什么时，请求不能放行（P0）
+
+依据：本项目自己的认证契约（[PLUGINS 的「失败即拦截」](PLUGINS.md#失败即拦截fail-closed)）。
+
+- [ ] 远程插件的 `/manifest` 取不到（连不上、超时、5xx、不是 JSON 对象）时不再缓存成"v1、没有认证"，而是下次再问。
+- [ ] 能力未知期间，命中该插件的请求一律 502，不访问源站。
+- [ ] 只有 `404`（插件确实没有这个路由）才按 v1 处理。
+
+**验收：** 首次 503、首次返回非 JSON、连接被拒，三种情况下第一个请求都到不了源站；插件恢复后下一次请求走认证钩子；404 的老插件照常工作。断言看的是源站被访问的次数和 `/auth` 被调用的次数。
+
+### CORE-03 — 规则里的正则就是 JavaScript 正则；脚本函数和 Node 的一致（P1）
+
+依据：[匹配模式](https://wproxy.org/docs/rules/pattern.html)（正则按 JS 语法）、[reqScript](https://wproxy.org/docs/rules/reqScript.html)（`parseUrl` 同 Node `url.parse`，`parseQuery` 同 `querystring.parse`）。
+
+- [ ] pattern、过滤器、`reqReplace`/`resReplace`、`pathReplace`、模板里的 `.replace(/…/)`，用户写的 `/…/` 一律交给 ECMAScript 正则引擎（regress，已经是依赖）。前瞻、后顾、反向引用都要能用。
+- [ ] 编译不了的正则不再悄悄当字面量：规则照旧不生效，但日志和 `explain` 要说出是哪条、为什么。
+- [ ] `parseQuery`：重复的键得到数组，`+` 是空格。`parseUrl`：`auth`、`hostname`、`hash`、`slashes` 分开，主机名转小写。
+- [ ] 提供 `Buffer`、`decodeBuffer`、`encodeString`、`encodingExists`。
+- [ ] `pattern` 是命中这条脚本规则的模式，`port` 是代理端口，`httpVersion` 是客户端实际用的版本。
+- [ ] 脚本有执行上限：死循环不能拖住请求。
+
+**验收：** `core-bench.js` 的 `regexp`、`script` 两组与上游逐条一致，剩下的逐条声明原因。每个正例旁边有一个必须不命中的反例。
+
+### CORE-04 — frameScript 在一条连接上是同一个脚本（P1）
+
+依据：[frameScript](https://wproxy.org/docs/rules/frameScript.html)（"操作 WebSocket 和普通 TCP 请求数据帧"）。
+
+- [ ] 脚本每条连接只执行一次，处理函数之间的变量保留（现在每帧重新执行，计数器永远是 1）。
+- [ ] 二进制帧也交给处理函数，收到的是 `Buffer`。
+- [ ] 处理函数里可以调用 `ctx.sendToClient` / `ctx.sendToServer`。
+- [ ] `enable://inspect` 的普通 TCP 隧道按数据块走脚本，并在控制台里记成帧。
+
+**验收：** 同一连接依次发 a、b、c，源站收到 N1:a、N2:b、N3:c；两条连接各自从 1 数起；二进制帧和 TCP 数据被处理函数改写后到达源站。
+
+### CORE-02 — `tlsOptions://` 能带客户端证书（P1）
+
+依据：[tlsOptions](https://wproxy.org/docs/rules/cipher.html)（"配置双向认证（mTLS）所需的客户端证书"）。
+
+- [ ] `key` + `cert`（文件路径或直接写 PEM 内容）、`pfx` + `passphrase`。
+- [ ] 连接复用按客户端证书隔离：带证书的连接不能被不带证书的请求借用，反过来也不行。
+- [ ] 读不了的证书、对不上的私钥：请求失败并说明原因，不是悄悄不带证书去连。
+- [ ] rustls 做不了的字段（`dhparam`、`secureOptions` 等）记进会话的 `unapplied`。
+
+**验收：** 对一个强制要求客户端证书的源站：不带证书 502；正确证书 200 且源站确认 `authorized`；别的 CA 签的证书、私钥不匹配、密码错的 pfx 都被拒绝。
+
+### CORE-05 — `log://` 是页面日志，不是标签（P1）
+
+依据：[log](https://wproxy.org/docs/rules/log.html)（"在页面中注入 JavaScript 代码，捕获异常及 console.xxx 日志，并在管理界面中实时显示"）、[weinre](https://wproxy.org/docs/rules/weinre.html)。
+
+- [ ] 命中 `log://id` 的 HTML 页面被注入一段脚本，把 `console.*`、未捕获异常、未处理的 Promise 拒绝发回代理。
+- [ ] 控制台新增 Console 面板：按 id 分组、按级别筛选、关键字搜索。
+- [ ] 支持 `window.onBeforeWhistleLogSend` 预处理。
+- [ ] `weinre://`：本项目不带 weinre 服务。没有指定外部服务地址时不再注入一个指向自己的死链接，改为记进 `unapplied` 并说明怎么配。
+
+**验收：** 用真实浏览器打开被注入的页面，`console.log` 和一个抛出的异常出现在控制台的 Console 面板里；只检查标签被注入不算。
+
+### QA-01 — 把这些反例变成门禁（与上面同步）
+
+- [ ] `core-bench.js` 接进 `run.js network`，差异走 `declared.js`。
+- [ ] 上游自带测试里 6 条"只因为 404 也是 JSON 而通过"的调用，改回声明为未实现。
+
+### EXT-01 / CTRL-01 — 插件能力与控制接口（P2，按需要挑）
+
+本项目的插件是自有协议（Rust 原生，或任何语言的 HTTP 服务，Node 有 SDK），不加载上游的 `whistle.xxx` npm 包——这是已定的方向，不在这一轮推翻。要做的是把"上游插件能做、这里做不了"的能力逐项分类：补上、给替代办法、或写明不支持。
+
+候选（做之前先确认有人用）：钩子返回 `values`；响应阶段的动态规则（上游的 `resRulesServer`）；插件自带静态规则；已注册插件的短协议 `name://`；HTTPS 拦截的运行时开关；规则总开关；插件的运行时启停。
+
 ## 执行顺序与交接
 
-Q1–Q3、S1、U0、O1、O2、R1、U1、PERF1、M1 与 D1 都已完成，P0、P1、P2 全部做完，本文件没有待办。
+Q1–Q3、S1、U0、O1、O2、R1、U1、PERF1、M1 与 D1 都已完成。第二轮的顺序：CORE-01 → CORE-03 → CORE-04 → CORE-02 → CORE-05，QA-01 跟着每一项走。
 
 以后的新任务照上面的格式加进来：写清验收条件和依赖，有证据再勾选，并同步 STATUS。各项留下的剩余风险在 STATUS 各自的记录里，挑出来做时单独立项，不要直接改旧项的勾选。
 
