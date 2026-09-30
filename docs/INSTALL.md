@@ -24,7 +24,7 @@ whistle-rs 是单个可执行文件：没有安装程序，不注册服务，不
 
 最低系统版本写在包里 `BUILD-INFO.txt` 的 `runs on:` 一行，由 CI 从二进制本身读出来：Linux 是它链接的最高 glibc 符号版本，glibc 更老的发行版上启动就报 `version 'GLIBC_2.xx' not found`；macOS 是 `minos`；Windows 不需要另装 Visual C++ 运行库。各平台实测到的值和 CI 结果记在 [STATUS](STATUS.md)。Windows ARM、32 位系统、musl（Alpine）没有包。
 
-也可以自己构建，见 [README](../README.md#构建)。
+也可以自己构建，见 [README](../README.md#从源码构建)。
 
 ## 校验
 

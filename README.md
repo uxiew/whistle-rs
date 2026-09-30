@@ -1,55 +1,77 @@
 # whistle-rs
 
-用 Rust 实现的 Whistle 核心调试代理：规则改写、HTTP/HTTPS 抓包、WebSocket 检查、内嵌 Web 控制台，也可作为 Rust 库嵌入应用。
+用 Rust 写的 HTTP/HTTPS 调试代理，规则写法沿用 [Whistle](https://github.com/avwo/whistle)：转发请求、mock 响应、改请求头和 body、解密 HTTPS、查看 WebSocket 消息，自带网页控制台，也能作为 Rust 库嵌进你的程序。
 
-**0.1.0，不是官方 Whistle，也不是完整的直接替代品。** 行为以 Whistle 2.10.8 为对照基线，并用同一批差分用例复验了 2.10.10（两版不同的几处及取舍见 [STATUS 的 U1 记录](docs/STATUS.md#2026-09-29-u1-上游版本矩阵)）；插件协议、控制台 API 和部分 CLI 语义不同。依赖现成 `whistle.*` npm 插件、官方 `/cgi-bin/*` API 或 `w2 start/stop` 的工作流不能直接迁移。
+版本 0.1.0，**不是官方 Whistle**，也不是能直接替换它的版本。区别见下文[和 Whistle 的区别](#和-whistle-的区别)。
 
-**进度：** 质量门禁（Q1）、可复现差分门禁与 CI（Q2）、许可与来源（Q3）、安全运行契约（S1）已完成；上游 whistle 自带的测试已成为门禁（U0：可评判的 180 条中现在 160 条通过、20 条逐条声明原因）；失败的请求（DNS、连接、TLS、中途断开、客户端不信任证书）也会在控制台留下一条会话，写明停在哪一步（O1）。控制台检索能查请求头和 body（由代理查，只查已存下的部分），body 没存全时接口、HAR 和重放都会写明，只有 `enable://hide` 真正不记录请求（O2）。命中了但没执行的规则（body 超上限、事件流、压缩解不开、插件钩子失败）会在会话和控制台里写明原因（R1）。同一批差分用例对 whistle 2.10.10 也复验过（U1）。源站连接按客户端连接复用，浏览器走 h2 时对源站也用 h2：20 ms 往返时延下，经 TLS 的请求从 67.7 ms 降到 23.5 ms，一次加载 50 个资源从 90.7 ms 降到 30.0 ms（PERF1）。三个过大的源文件按职责拆开了，只搬不改（M1）。跨平台（D1）：Linux x86_64/arm64、macOS arm64/Intel、Windows x86_64 五个平台在 CI 上构建、跑全部测试、把代理实际用一遍（HTTP、HTTPS、WebSocket、插件、改规则、重启后数据还在、停下后不留进程），并打包带校验和，全部通过；安装、升级、卸载见 [INSTALL](docs/INSTALL.md)。详见[当前状态](docs/STATUS.md)与[计划](docs/ROADMAP.md)。
+## 安装
 
-## 构建
+**下载现成的包：** Linux（x86_64、arm64）、macOS（Apple 芯片、Intel）、Windows（x86_64）都有，由 CI 构建。去哪下、怎么校验、装到哪、怎么升级和卸载，见 [INSTALL](docs/INSTALL.md)。
 
-需要 rustup（按 `rust-toolchain.toml` 自动安装 Rust 1.98.1，最低可编译 1.95）；构建控制台另需 Node.js `^20.19.0 || >=22.12.0`。
+### 从源码构建
 
-```sh
-npm ci --prefix ui-src && npm run build --prefix ui-src   # 控制台，Rust 编译时嵌入
-cargo build --locked --release                            # 产物 target/release/whistle-rs
-```
-
-不想自己构建：CI 给五个平台打好的包和校验、数据目录、升级卸载，见[安装、升级与卸载](docs/INSTALL.md)。
-
-只跑 `cargo build` 也能得到可用的代理，但首页是"控制台未构建"的占位页。运行代理不需要 Node（Node 插件除外）。改代码后要过的检查见[开发与验证](docs/DEVELOPMENT.md)。
-
-## 使用
+需要 [rustup](https://rustup.rs)（第一次执行 `cargo` 时按 `rust-toolchain.toml` 自动装 Rust 1.98.1），网页控制台还需要 Node.js（20.x 要 20.19 以上，或者 22.12 以上）。
 
 ```sh
-./target/release/whistle-rs -p 8899 --no-persist   # 默认只监听本机；--no-persist 不保存历史
+npm ci --prefix ui-src && npm run build --prefix ui-src   # 先构建控制台
+cargo build --locked --release                            # 再编译，控制台会被嵌进二进制
+./target/release/whistle-rs --version
 ```
 
-控制台在 `http://127.0.0.1:8899/`；把客户端的 HTTP/HTTPS 代理设为 `127.0.0.1:8899`（根证书在首次启动时生成）：
+跳过第一行也能编译出能用的代理，只是打开控制台看到的是"控制台未构建"的占位页。运行代理本身不需要 Node。
+
+## 快速开始
 
 ```sh
-curl --noproxy '' -x http://127.0.0.1:8899 http://example.com/
-curl --noproxy '' -x http://127.0.0.1:8899 --cacert "$HOME/.whistle-rs/certs/root.crt" https://example.com/
+whistle-rs -p 8899
 ```
 
-规则在控制台里编辑（或启动时 `-r rules.txt`）：
+1. 浏览器打开控制台 `http://127.0.0.1:8899/`。
+2. 把要调试的程序或浏览器的 HTTP/HTTPS 代理设成 `127.0.0.1:8899`。用 curl 试：
 
-```text
-api.example.com/mock statusCode://503
-api.example.com http://127.0.0.1:3000
-example.com resHeaders://x-debug=1
-```
+   ```sh
+   curl -x http://127.0.0.1:8899 http://example.com/
+   curl -x http://127.0.0.1:8899 --cacert ~/.whistle-rs/certs/root.crt https://example.com/
+   ```
 
-具体的 mock 写在宽泛的转发之前——转发、文件、重定向、`statusCode` 共用一个规则槽，先匹配的生效。完整写法见[规则手册](docs/RULES.md)。
+   第二条去掉 `--cacert` 会报 `curl: (60) SSL certificate problem`：要看 HTTPS 内容，客户端得先信任 whistle-rs 首次启动时生成的根证书，各系统怎么装、用完怎么撤销见 [CERTIFICATES](docs/CERTIFICATES.md)。环境里设了 `NO_PROXY` 时 curl 可能绕过代理，加 `--noproxy ''` 强制走代理。
+3. 在控制台的 Rules 里写规则，保存后立即生效（也可以启动时用 `-r rules.txt` 读文件）：
+
+   ```text
+   api.example.com/mock statusCode://503
+   api.example.com http://127.0.0.1:3000
+   example.com resHeaders://x-debug=1
+   ```
+
+   第一行让 `/mock` 直接回 503，第二行把 `api.example.com` 其余请求转到本机 3000 端口，第三行给 `example.com` 的响应加一个头。具体的写在宽泛的前面：转发、本地文件、重定向和 `statusCode` 共用一个位置，先匹配到的那条生效。规则写了却没效果，先看控制台里那条请求的 Rules 标签页，写法见[规则手册](docs/RULES.md)和[使用手册](docs/COOKBOOK.zh-CN.md)。
+
+停止：Ctrl+C。它会先把已完成的请求记录写完再退出。
+
+## 和 Whistle 的区别
+
+- **规则**：同一批用例同时发给 Whistle（2.10.8 和 2.10.10）和 whistle-rs 比对结果，没有说明原因的差异会让测试失败；已知的不同写在[规则手册](docs/RULES.md)里。
+- **插件**：用本项目自己的协议和 [JS/TS SDK](docs/PLUGINS.md)，装不了 npm 上的 `whistle.*` 插件。
+- **命令行**：没有 `w2 start/stop`，whistle-rs 在前台运行，每条 `w2` 命令的替代做法见 [CLI](docs/CLI.md#coming-from-w2)。
+- **控制台接口**：本项目自己的 [HTTP API](docs/API.md)，不是 Whistle 的 `/cgi-bin/*`。
+- **默认更保守**：只监听本机（Whistle 默认所有网卡），校验源站证书，客户端发给代理的 `Proxy-Authorization` 不转给源站。
 
 ## 注意
 
-**默认只监听 `127.0.0.1`、控制台无口令、开启 HTTPS 拦截、会话保存 7 天。** 给手机或别的机器用要显式 `-H 0.0.0.0`，而且先用 `-n/-w` 设控制台口令——能改规则的人就能让代理读写本机文件；本项目也不提供代理本身的访问控制，局域网里要靠防火墙限制谁能连。HTTPS 拦截要求客户端信任代理 CA，只用于获授权的流量，不用时撤销信任。完整的安全契约见[安全运行](docs/OPERATIONS.md)。
+- **默认只有本机能用。** 给手机或别的电脑用要加 `-H 0.0.0.0`，并且先用 `-n 用户名 -w 密码` 给控制台设口令：能改规则的人就能让代理读写这台机器上的文件。
+- **代理本身没有访问控制。** 局域网里能连上端口的设备都能用它转发，要靠防火墙限制谁能连。
+- **记录里有敏感信息。** 请求记录默认在 `~/.whistle-rs` 保存 7 天，里面原样存着 Cookie 和 `Authorization`；`--no-persist` 不写盘。分享导出的 HAR 前先检查。
+- **只拦截你有权调试的流量**，用完撤销对根证书的信任。
+
+完整的安全说明见 [OPERATIONS](docs/OPERATIONS.md)。
+
+## 现状
+
+每次推送和 PR 都在 Linux、macOS、Windows 上跑全部测试，并把打好的二进制实际用一遍（HTTP、HTTPS、WebSocket、插件、改规则、重启后数据还在）；每周和 Whistle 两个版本做一次全量对照。测了什么、结果如何、还有哪些没验证，见 [STATUS](docs/STATUS.md)。
 
 ## 文档
 
-[文档导航](docs/README.md) · [安装与卸载](docs/INSTALL.md) · [使用手册](docs/COOKBOOK.zh-CN.md) · [CLI](docs/CLI.md) · [API](docs/API.md) · [证书](docs/CERTIFICATES.md) · [插件](docs/PLUGINS.md) · [上游基线](docs/UPSTREAM.md)
+[文档导航](docs/README.md) · [安装](docs/INSTALL.md) · [使用手册](docs/COOKBOOK.zh-CN.md) · [规则](docs/RULES.md) · [命令行](docs/CLI.md) · [证书](docs/CERTIFICATES.md) · [插件](docs/PLUGINS.md) · [API](docs/API.md) · [开发](docs/DEVELOPMENT.md)
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。核心行为来自 [avwo/whistle](https://github.com/avwo/whistle)（MIT），哪些内容来自上游、发布包附带哪些第三方许可，见 [NOTICE.md](NOTICE.md)。感谢上游作者与贡献者。
+MIT，见 [LICENSE](LICENSE)。核心行为来自 [avwo/whistle](https://github.com/avwo/whistle)（MIT）；哪些来自上游、发布包附带哪些第三方许可，见 [NOTICE.md](NOTICE.md)。感谢上游作者和贡献者。
