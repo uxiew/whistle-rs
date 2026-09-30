@@ -73,6 +73,7 @@ export type UnappliedKind =
   | 'undecodable'
   | 'unsupported-coding'
   | 'plugin-failed'
+  | 'no-weinre-server'
   | 'cipher-unusable';
 
 export interface Unapplied {
@@ -368,6 +369,31 @@ export interface ComposeResult {
   error?: string;
 }
 
+/**
+ * One thing a page wrote to its console — `console.warn(…)`, or an error
+ * nothing caught — sent back by the script a `log://` rule put in the page.
+ */
+export interface PageLog {
+  /** Only grows; `/api/logs?after=` is asked with the last one seen. */
+  seq: number;
+  /** The page's own clock, Unix milliseconds. */
+  time_ms: number;
+  level: 'log' | 'info' | 'warn' | 'error' | 'debug';
+  /** The rule's id — `audit` for `log://audit`. Empty for a rule with none. */
+  id: string;
+  /** Each argument as text: a string as it was, anything else as JSON. */
+  args: string[];
+  page: string;
+  client_ip?: string;
+}
+
+export interface PageLogs {
+  logs: PageLog[];
+  /** Every group that has an entry, whatever was asked for. */
+  ids: string[];
+  last: number;
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: ${res.status}`);
@@ -479,4 +505,10 @@ export const api = {
   importBundle: (bundle: unknown) => postJson<ImportResult>('/api/import', bundle),
 
   status: () => getJson<ProxyStatus>('/api/status'),
+
+  /** What pages under a `log://` rule have written since `after`. */
+  logs: (after: number) => getJson<PageLogs>(`/api/logs?after=${after}`),
+  /** Forget them: one group's, or with no id all of them. */
+  clearLogs: (id?: string) =>
+    postJson<OkResult & { cleared?: number }>('/api/logs/clear', id === undefined ? {} : { id }),
 };

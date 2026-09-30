@@ -56,7 +56,7 @@ const DECLARED = {
       'whistle\'s script sees the body only up to the first chunk past 16 KB. Header, divergence 9'),
     ...['weinre injects into html', 'weinre on an empty html body', 'weinre on a gzipped html body',
       'weinre with a url value', 'weinre with no value at all'].map((n) => d(n, ['res.body'],
-      'whistle inlines its own bundled weinre agent; this port injects a <script src>. Header, weinre://')),
+      'whistle inlines its own bundled weinre agent; this port contains no weinre, so it injects a <script src> when the rule or --weinre names one and nothing otherwise. Header, weinre://')),
     d('weinre reaches javascript upstream', ['res.header.cache-control', 'res.header.expires', 'res.header.pragma', 'res.body'],
       'whistle appends its agent to JavaScript responses too; this port leaves a .js body alone. Header, weinre://'),
     d('intercept written as a protocol', PROSE,

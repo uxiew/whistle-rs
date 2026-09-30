@@ -230,6 +230,12 @@ pub(super) async fn serve(
     if let Some(host) = console {
         return Ok(webui::handle_proxied(&state, req, &host).await);
     }
+    // A page this proxy put the `log://` collector into, reporting what its
+    // console said. The path is on the page's own origin and means nothing
+    // there: it is answered here, reaches no origin and leaves no session.
+    if req.uri().path() == pagelog::PATH {
+        return Ok(pagelog::accept(&state, req, peer).await);
+    }
     let client_ip = Some(peer.ip().to_string());
     // Consumed before anything else looks at the headers, exactly like whistle
     // deletes its own marker on arrival: rule filters, plugins, the capture and
@@ -917,6 +923,7 @@ pub(super) async fn serve(
         .map_err(outcome::at(outcome::Phase::Rules))?;
     ledger.note(|s| s.target = target_desc(&target));
     note_cipher_dropped(ledger, &target, &resolved);
+    note_weinre_unserved(ledger, &resolved, &state.config);
 
     // A proxy rule that names this proxy would send the request back to us, be
     // matched by the same rule, and recurse until the sockets run out. whistle
@@ -1367,7 +1374,8 @@ pub(super) async fn serve(
         response_has_body(parts.status.as_u16(), &info.method),
         parts.status.as_u16(),
         res_ct.as_deref(),
-    );
+    )
+    .for_config(&state.config);
     let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     // A plugin that asked for the body of an event stream cannot have it, and
     // says so rather than leaving the hook mysteriously un-run: `responseBody`

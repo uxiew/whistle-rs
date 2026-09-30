@@ -301,8 +301,34 @@ interface Group {
   text: string;
 }
 
+/**
+ * What two pages under `log://` rules wrote: every level, an argument that is
+ * JSON, an uncaught error with its several lines, and a second id.
+ */
+const PAGE_LOGS = [
+  { level: 'log', id: 'shop', args: ['cart loaded', '{"items":2,"total":59.8}'] },
+  { level: 'info', id: 'shop', args: ['user', 'u_1024'] },
+  { level: 'warn', id: 'shop', args: ['price missing for sku', 'A-77'] },
+  {
+    level: 'error',
+    id: 'shop',
+    args: [
+      'TypeError: Cannot read properties of undefined (reading \'price\')\n    at total (cart.js:41:18)\n    at render (cart.js:88:5)\nPage URL: https://shop.example.com/cart\nUser Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+    ],
+  },
+  { level: 'debug', id: 'news', args: ['feed poll', '200', '18ms'] },
+  { level: 'error', id: 'news', args: ['Failed to load <img> https://news.example.com/hero.webp'] },
+].map((log, i) => ({
+  ...log,
+  seq: i + 1,
+  time_ms: Date.now() - (6 - i) * 1500,
+  page: log.id === 'shop' ? 'https://shop.example.com/cart' : 'https://news.example.com/',
+  client_ip: '192.168.1.23',
+}));
+
 // ── mutable state ──────────────────────────────────────────────────────────
 
+let pageLogs = PAGE_LOGS.slice();
 let sessions = FIXTURE.slice();
 let nextId = 100;
 let rules = RULES_DEFAULT;
@@ -504,6 +530,22 @@ export function mockApi(): Plugin {
         await readBody(req);
         sessions = [];
         return reply({ ok: true, files_deleted: 2 });
+      }
+      case '/api/logs': {
+        // The Console pane's cursor: only what is newer than `after`.
+        const after = Number(url.searchParams.get('after')) || 0;
+        return reply({
+          ok: true,
+          logs: pageLogs.filter((l) => l.seq > after),
+          ids: [...new Set(pageLogs.map((l) => l.id))].sort(),
+          last: PAGE_LOGS.length,
+        });
+      }
+      case '/api/logs/clear': {
+        const { id } = JSON.parse((await readBody(req)) || '{}');
+        const before = pageLogs.length;
+        pageLogs = id === undefined ? [] : pageLogs.filter((l) => l.id !== id);
+        return reply({ ok: true, cleared: before - pageLogs.length });
       }
       case '/api/replay': {
         const body = JSON.parse((await readBody(req)) || '{}');

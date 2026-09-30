@@ -31,6 +31,7 @@ mod failure_tests;
 pub mod forwarded;
 pub mod header_rules;
 pub mod outcome;
+pub mod pagelog;
 pub mod persist;
 pub mod pool;
 pub mod restream;

@@ -34,6 +34,9 @@ pub struct AppState {
     /// capture cannot tell you: what the *other* side does with a message you
     /// have not seen it receive. See [`ws::SessionWriters`].
     pub ws_write: Mutex<HashMap<u64, Arc<ws::SessionWriters>>>,
+    /// What the pages a `log://` rule matched have written to their consoles —
+    /// see [`pagelog`]. Bounded; the console's Console pane reads it.
+    pub page_logs: Mutex<pagelog::PageLogs>,
     pub(super) next_id: AtomicU64,
     /// Optional session persistence (JSONL on disk).
     pub(super) session_store: Option<persist::SessionStore>,
@@ -73,6 +76,7 @@ impl AppState {
             ws_frames: Mutex::new(VecDeque::new()),
             ws_pause: Mutex::new(HashMap::new()),
             ws_write: Mutex::new(HashMap::new()),
+            page_logs: Mutex::new(pagelog::PageLogs::default()),
             next_id: AtomicU64::new(1),
             session_store: None,
             observer: std::sync::OnceLock::new(),

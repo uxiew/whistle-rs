@@ -18,6 +18,7 @@ import type {
   Composition,
   ExplainQuery,
   Explanation,
+  PageLog,
   ProxyStatus,
   ReplayedSession,
   RuleGroup,
@@ -29,7 +30,7 @@ import type {
 import { COLUMNS } from './columns';
 import { clientOf, fmtBytes } from './format';
 
-export type Pane = 'requests' | 'composer' | 'rules' | 'values' | 'test' | 'status';
+export type Pane = 'requests' | 'composer' | 'console' | 'rules' | 'values' | 'test' | 'status';
 export type DetailTab =
   | 'general'
   | 'rules'
@@ -63,6 +64,14 @@ const CAPTURE_KEY = 'whistle-rs-capture-filter';
 const COMPOSE_HISTORY_MAX = 20;
 
 interface State {
+  /** What pages under a `log://` rule have written, oldest first. */
+  pageLogs: PageLog[];
+  /** Every `log://` id the proxy holds entries for. */
+  pageLogIds: string[];
+  /** The highest sequence number seen — the cursor the next poll asks after. */
+  pageLogLast: number;
+  /** The group being shown; `null` = all of them. */
+  pageLogId: string | null;
   pane: Pane;
   theme: Theme;
   filter: string;
@@ -178,6 +187,10 @@ function writeStored(key: string, value: unknown): void {
 }
 
 export const state = reactive<State>({
+  pageLogs: [],
+  pageLogIds: [],
+  pageLogLast: 0,
+  pageLogId: null,
   pane: 'requests',
   theme: 'light',
   filter: '',
@@ -1252,8 +1265,47 @@ export async function loadStatus(): Promise<void> {
 
 // ── panes ──────────────────────────────────────────────────────────────────
 
+// ── the Console pane: what pages wrote to their consoles ───────────────────
+
+/** How many entries the pane keeps. The proxy keeps 2000; so does this. */
+const PAGE_LOGS_MAX = 2000;
+
+/**
+ * Fetch what arrived since the last call and append it.
+ *
+ * Incremental on purpose: the pane polls, and re-fetching two thousand entries
+ * every two seconds to show the three that are new would make the console the
+ * busiest client the proxy has.
+ */
+export async function loadPageLogs(): Promise<void> {
+  const answer = await reach(() => api.logs(state.pageLogLast));
+  if (!answer) return;
+  // The proxy restarted: its numbering began again below what this has seen.
+  if (answer.last < state.pageLogLast) {
+    state.pageLogs = [];
+    state.pageLogLast = 0;
+    return void loadPageLogs();
+  }
+  state.pageLogIds = answer.ids;
+  state.pageLogLast = answer.last;
+  if (answer.logs.length) {
+    const all = state.pageLogs.concat(answer.logs);
+    state.pageLogs = all.length > PAGE_LOGS_MAX ? all.slice(all.length - PAGE_LOGS_MAX) : all;
+  }
+  if (state.pageLogId !== null && !answer.ids.includes(state.pageLogId)) state.pageLogId = null;
+}
+
+/** Forget the group being shown, or everything when all groups are. */
+export async function clearPageLogs(): Promise<void> {
+  const id = state.pageLogId;
+  if (!(await reach(() => api.clearLogs(id === null ? undefined : id)))) return;
+  state.pageLogs = id === null ? [] : state.pageLogs.filter((log) => log.id !== id);
+  await loadPageLogs();
+}
+
 export function showPane(name: Pane): void {
   state.pane = name;
+  if (name === 'console') void loadPageLogs();
   if (name === 'rules') void loadRules();
   if (name === 'values') void loadValues();
   if (name === 'status') void loadStatus();

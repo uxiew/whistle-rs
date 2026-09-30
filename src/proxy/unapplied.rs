@@ -41,6 +41,9 @@ pub enum Kind {
     /// A plugin's hook failed — could not be reached, answered an error, or
     /// did not answer in time — and the request went on without it.
     PluginFailed,
+    /// `weinre://id` with no weinre server to load the debug agent from: this
+    /// port does not contain one, and `--weinre` was not given.
+    NoWeinreServer,
     /// Part of a `cipher://` / `tlsOptions://` rule could not be used — a
     /// suite pin this build has no suite for, or an option (`dhparam`,
     /// `secureOptions`, …) its TLS library has no equivalent of — and the
@@ -137,6 +140,7 @@ const RES_BODY: &[&str] = &[
     "resSpeed",
     "resScript",
     "weinre",
+    "log",
     "resWrite",
     "resWriteRaw",
     "trailers",

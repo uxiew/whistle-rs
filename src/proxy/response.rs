@@ -113,6 +113,9 @@ pub(super) struct ResBodyOps {
     pub(super) script: Option<String>,
     /// `weinre://` — debug-agent id to inject.
     pub(super) weinre: Option<String>,
+    /// `log://` — the rule whose collector goes into a page or a script. Set
+    /// only where there is one to put it in: see [`LogRule`].
+    pub(super) log: Option<LogRule>,
     /// `resWrite://` / `resWriteRaw://` — dump paths, already carrying the
     /// `.<status>` suffix a non-200 gets.
     pub(super) write: Option<String>,
@@ -300,6 +303,45 @@ pub(super) fn stream_injection(
         .flatten()
 }
 
+/// A matched `log://` rule, as far as the response needs it.
+pub(super) struct LogRule {
+    /// The rule's value: an id or `{name}` as written — or, once the values
+    /// pass has been over it, what `name` holds.
+    value: String,
+    /// `name`, when `value` is already what the store holds for it. The values
+    /// pass replaces `{name}` with the content, and `log://{name}` needs both
+    /// halves: the name is the group, the content is the user's script.
+    key: Option<String>,
+    /// The group the rule was written in, for a `{name}` that is a ``` block.
+    group: Option<String>,
+    /// `!disable://interceptConsole || enable://interceptConsole`.
+    intercept_console: bool,
+}
+
+impl LogRule {
+    /// The first `log://` on the request, when the response is one the
+    /// collector can stand in.
+    ///
+    /// `streaming_ct` is the type of a body still arriving, and decides whether
+    /// it is collected at all: a rule over a whole host matches its images and
+    /// its downloads too, and none of those should be buffered for a script
+    /// that has nowhere to go. A body already in memory (`None`) costs nothing
+    /// to look at, and is asked again when it is injected.
+    fn of(resolved: &Resolved, streaming_ct: Option<&str>) -> Option<Self> {
+        let op = resolved.all("log").first()?;
+        if streaming_ct.is_some() && !pagelog::injects_into(streaming_ct) {
+            return None;
+        }
+        Some(LogRule {
+            value: op.value.clone(),
+            key: op.value_key.clone().filter(|_| op.value_is_content),
+            group: op.group.as_deref().map(str::to_string),
+            intercept_console: !apply::disabled_flags(resolved).contains("interceptConsole")
+                || apply::enabled_flags(resolved).contains("interceptConsole"),
+        })
+    }
+}
+
 impl ResBodyOps {
     /// The body operators in force, given what the response *is*.
     ///
@@ -372,6 +414,7 @@ impl ResBodyOps {
                 .map(|op| op.value.as_str())
                 .and_then(script::load_script),
             weinre: resolved.value("weinre").map(|s| s.to_string()),
+            log: LogRule::of(resolved, streaming_ct),
             write: apply::res_write_path(resolved, status),
             write_raw: apply::res_write_raw_path(resolved, status),
             force_write: apply::forces_write(resolved),
@@ -386,6 +429,19 @@ impl ResBodyOps {
         }
     }
 
+    /// Forget a `weinre://` that has no script to inject — see [`weinre_src`] —
+    /// so that a response is not collected for a tag that will not be written.
+    pub(super) fn for_config(mut self, config: &Config) -> Self {
+        if self
+            .weinre
+            .as_deref()
+            .is_some_and(|id| weinre_src(id, config).is_none())
+        {
+            self.weinre = None;
+        }
+        self
+    }
+
     /// True when at least one of these needs the whole body in memory. A
     /// response no operator touches never gets collected — that is what keeps
     /// the streaming path streaming.
@@ -394,6 +450,7 @@ impl ResBodyOps {
             || self.speed.is_some()
             || self.script.is_some()
             || self.weinre.is_some()
+            || self.log.is_some()
             || self.write.is_some()
             || self.write_raw.is_some()
             || !self.trailers.is_empty()
@@ -516,10 +573,31 @@ pub(super) fn inject_res_body(
     // weinre: inject a debug <script> into HTML responses.
     if let Some(id) = &ops.weinre
         && is_html(&parts.headers)
+        && let Some(src) = weinre_src(id, &state.config)
     {
-        let src = weinre_src(id, &state.config);
         let tag = format!("<script src=\"{src}\"></script>");
         new = inject_into_html(&new, &tag);
+    }
+    // log: put the console collector into a page or a script.
+    if let Some(rule) = &ops.log {
+        let content_type = parts
+            .headers
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        let (id, user_script) = match &rule.key {
+            Some(name) => (name.clone(), Some(rule.value.clone())),
+            None => {
+                pagelog::id_and_script(&rule.value, rule.group.as_deref(), &effective_values(state))
+            }
+        };
+        let injection = pagelog::Injection {
+            id,
+            user_script,
+            intercept_console: rule.intercept_console,
+        };
+        if let Some(injected) = pagelog::inject(&new, content_type, &injection) {
+            new = injected;
+        }
     }
     if let Some(path) = &ops.write {
         write_body_file(path, &new, ops.force_write);
@@ -844,7 +922,8 @@ pub(super) async fn finish_local_response(
         // `None`: the body is already collected on this path, so even an event
         // stream is a finite `Bytes` here and every operator can be applied.
         None,
-    );
+    )
+    .for_config(&state.config);
     let res_ct = parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
@@ -936,26 +1015,37 @@ pub(super) fn is_html(headers: &hyper::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Build the weinre target-script URL. If `id` is already a URL/path use it as-is;
-/// otherwise build the conventional weinre target URL served on the proxy host.
-pub(super) fn weinre_src(id: &str, config: &Config) -> String {
+/// The URL a `weinre://` rule's `<script>` loads, or `None` when there is none
+/// to give.
+///
+/// * a value that is already a URL or a path is the script's own address and
+///   is used as written;
+/// * a bare id is `<server>/target/target-script-min.js#<id>` on the weinre
+///   server `--weinre` named;
+/// * a bare id with no server named is **nothing**. whistle bundles weinre and
+///   serves it from its own port, so there a bare id always works; this port
+///   contains no weinre, and it used to emit the same URL anyway — a script
+///   tag pointing at this proxy, which answers it `404`. The page loaded, no
+///   debugger ever connected, and nothing said why.
+pub(super) fn weinre_src(id: &str, config: &Config) -> Option<String> {
     let id = id.trim();
     if id.contains("://") || id.starts_with('/') {
-        return id.to_string();
+        return Some(id.to_string());
     }
-    let host = config
-        .host
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let anchor = if id.is_empty() {
-        String::new()
-    } else {
-        format!("#{id}")
+    let server = config
+        .weinre_server
+        .as_deref()?
+        .trim()
+        .trim_end_matches('/');
+    let server = match server.contains("://") || server.starts_with("//") {
+        true => server.to_string(),
+        false => format!("//{server}"),
     };
-    format!(
-        "//{host}:{port}/weinre/target/target-script-min.js{anchor}",
-        port = config.port
-    )
+    let anchor = match id.is_empty() {
+        true => String::new(),
+        false => format!("#{id}"),
+    };
+    Some(format!("{server}/target/target-script-min.js{anchor}"))
 }
 
 /// Inject `tag` into HTML: before `</head>`, else after `<body>`, else prepend.
@@ -1131,7 +1221,12 @@ pub(super) mod forced_encoding_tests {
             "a compressed stream cannot be searched for a plaintext pattern"
         );
         assert!(
-            stream_replace(&resolved_for("log://x"), Some("text/event-stream"), None).is_none(),
+            stream_replace(
+                &resolved_for("reqHeaders://x=1"),
+                Some("text/event-stream"),
+                None
+            )
+            .is_none(),
             "no substitutions means no transform to install"
         );
         // `identity` is the spelling of "no coding", so it is not a refusal.
@@ -1199,7 +1294,10 @@ pub(super) mod forced_encoding_tests {
     /// A line with none of these operators installs nothing.
     #[test]
     fn a_stream_no_operator_touches_gets_no_injection() {
-        assert!(stream_injection(&resolved_for("log://x"), Some("text/event-stream")).is_none());
+        assert!(
+            stream_injection(&resolved_for("reqHeaders://x=1"), Some("text/event-stream"))
+                .is_none()
+        );
     }
 
     /// `disable://trailers` costs no buffering, so an event stream keeps it
@@ -1223,7 +1321,7 @@ pub(super) mod forced_encoding_tests {
         // …and the gate is only about event streams: an ordinary response is
         // still collected for the hook that asked for it.
         let html = Some("text/html");
-        let ops = ops_ct("log://x", true, html);
+        let ops = ops_ct("reqHeaders://x=1", true, html);
         assert!(must_collect_body(&ops, true, false, html));
     }
 
@@ -1233,7 +1331,7 @@ pub(super) mod forced_encoding_tests {
     #[test]
     fn an_overridden_body_is_collected_even_for_an_event_stream() {
         let sse = Some("text/event-stream");
-        let ops = ops_ct("log://x", true, sse);
+        let ops = ops_ct("reqHeaders://x=1", true, sse);
         assert!(must_collect_body(&ops, false, true, sse));
     }
 
@@ -1267,7 +1365,37 @@ pub(super) mod forced_encoding_tests {
     /// pull it onto the buffered one.
     #[test]
     fn a_response_no_operator_touches_still_streams() {
-        assert!(!ops("log://x", true).needs_body());
+        assert!(!ops("reqHeaders://x=1", true).needs_body());
+    }
+
+    /// `log://` collects a body only where its script has somewhere to go: a
+    /// page or a script. A rule over a whole host matches its images and its
+    /// downloads too, and those keep streaming.
+    #[test]
+    fn a_log_rule_collects_pages_and_scripts_and_nothing_else() {
+        for (ct, collected) in [
+            ("text/html; charset=utf-8", true),
+            ("application/javascript", true),
+            ("image/png", false),
+            ("application/octet-stream", false),
+            ("application/json", false),
+            ("text/event-stream", false),
+        ] {
+            assert_eq!(
+                ops_ct("log://app", true, Some(ct)).needs_body(),
+                collected,
+                "{ct}"
+            );
+        }
+        // A body already in hand is looked at when it is injected.
+        assert!(ops("log://app", true).log.is_some());
+        // Nothing to inject into a response with no body.
+        assert!(ops("log://app", false).log.is_none());
+        // `disable://interceptConsole` is read off the same request.
+        let quiet = ops("log://app disable://interceptConsole", true)
+            .log
+            .expect("a rule");
+        assert!(!quiet.intercept_console);
     }
 
     /// A body that could not be decoded goes out exactly as it arrived,

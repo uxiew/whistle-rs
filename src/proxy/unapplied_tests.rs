@@ -513,3 +513,54 @@ async fn a_client_leaving_a_stream_releases_the_origin() {
         .expect("the origin's connection is closed once the client has gone")
         .unwrap();
 }
+
+const HTML: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n";
+
+/// `weinre://id` loads its debug agent from a weinre server, and this port
+/// does not contain one. With no server named the rule used to inject a
+/// `<script>` pointing at this proxy's own port — which answers it 404 — and
+/// say nothing. Now the page is left alone and the session says why; with a
+/// server named, or the script's address written in the rule, it is injected.
+#[tokio::test]
+async fn a_weinre_rule_with_nowhere_to_load_from_is_named() {
+    let page = b"<html><head></head><body>hi</body></html>".to_vec();
+    for (rule, server, src) in [
+        ("weinre://phone", None, None),
+        (
+            "weinre://phone",
+            Some("http://10.0.0.5:8080"),
+            Some("http://10.0.0.5:8080/target/target-script-min.js#phone"),
+        ),
+        // The script's own address, as the rule. (No `#id` on it here: in a
+        // rules file a `#` begins a comment.)
+        (
+            "weinre://http://debug.test/target/target-script-min.js",
+            None,
+            Some("http://debug.test/target/target-script-min.js"),
+        ),
+    ] {
+        let site = origin(HTML, page.clone()).await;
+        let rules = format!("http://{site} {rule}");
+        let (state, proxy) =
+            proxy_with_config(&rules, |c| c.weinre_server = server.map(str::to_string)).await;
+        let (_, body) = ask(proxy, &format!("http://{site}/x"), "", b"").await;
+        let body = String::from_utf8(body).unwrap();
+        let noted = session(&state).await.unapplied;
+        match src {
+            Some(src) => {
+                assert!(
+                    body.contains(&format!("<script src=\"{src}\"></script>")),
+                    "{body}"
+                );
+                assert!(noted.is_empty(), "{noted:?}");
+            }
+            None => {
+                assert_eq!(body.as_bytes(), &page[..], "nothing injected");
+                assert_eq!(noted.len(), 1, "{noted:?}");
+                assert_eq!(noted[0].kind, Kind::NoWeinreServer);
+                assert_eq!(noted[0].ops, ["weinre://phone"]);
+                assert!(noted[0].reason.contains("--weinre"), "{}", noted[0].reason);
+            }
+        }
+    }
+}

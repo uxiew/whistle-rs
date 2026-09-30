@@ -95,7 +95,8 @@ The operators worth knowing before the rest are
     [Short-circuit](#short-circuit-no-upstream-request-is-made)
   - [Request rewriting](#request-rewriting) — [`auth://`](#auth-in-four-spellings)
   - [Plugins](#plugins) · [Choosing the MITM certificate](#choosing-the-mitm-certificate) ·
-    [Scripting](#scripting) · [weinre](#weinre-html-debug-injection)
+    [Scripting](#scripting) · [`log://`](#log--a-pages-console-in-this-one) ·
+    [weinre](#weinre-html-debug-injection)
   - [Flags, includes & values](#flags-includes--values) — [trailers](#trailers) ·
     [`enable://abort`](#enableabort-is-two-gates-not-one) ·
     [several `rulesFile://` lines](#how-several-rulesfile-lines-combine)
@@ -2146,15 +2147,160 @@ engine cannot move between threads, and a connection's two directions are two
 tasks. A connection with no `frameScript` has none. A loop in a handler is cut
 at three million iterations, like any script's.
 
+### `log://` — a page's console, in this one
+
+| Operator | Value | Effect |
+|----------|-------|--------|
+| `log` | an id, or `{name}` | Inject a script into matching pages that sends what they write to `console` — and their uncaught errors — to this proxy's **Console** pane |
+
+It is for a page you cannot open developer tools on: a WebView inside an app, a
+browser on a phone.
+
+```
+m.example.com   log://shop
+```
+
+1. Open the page on the device, through the proxy.
+2. Open this proxy's console and click **Console** in the toolbar.
+3. Everything the page passes to `console.log` / `info` / `warn` / `error` /
+   `debug` is there, newest at the bottom, with the page's address. So is an
+   uncaught exception (with its stack), an unhandled promise rejection, and a
+   `<script>` or `<img>` that failed to load — each as an `error`.
+
+The id (`shop`) is a group. Several rules with different ids give several
+groups, listed at the left of the pane; clicking one shows only its entries.
+`log://` with no id files under `(no id)`.
+
+**If nothing shows up**, in the order worth checking:
+
+| What you see | What it is |
+|---|---|
+| The page's session is in Network, but with a lock and no body | HTTPS to that host is not being intercepted, so there is no page to inject into. The root certificate is not trusted on the device, or interception is off |
+| The session's Rules tab shows `log://…` as "not applied" | The body was over `--body-rewrite-limit`, or under a `content-encoding` that could not be undone — the reason is written there |
+| The response is `304` | The browser used its cached copy, which has no script in it. Reload once: a `log://` rule removes the request's cache validators, so the next one is a full `200` |
+| Entries from `console` are missing but errors arrive | `disable://interceptConsole` matched the request — see below |
+| The page has a `<meta http-equiv="Content-Security-Policy">` tag | A CSP in a *header* is removed for you; one written into the HTML is not, and it stops an inline script. Remove it with `resReplace://` |
+
+**What is injected, and where.** Into an HTML response, a `<script>` element as
+the first thing in `<head>`, so it runs before any script of the page's own.
+Into a JavaScript response, the same source at the front of the file — a page
+whose HTML the rule does not match, but whose scripts it does, still reports.
+Nothing else is touched: a rule over a whole host also matches its images and
+downloads, and those are neither collected nor changed. The script is about
+4 KB, is written in ES5 for old WebViews, and does nothing on a second copy.
+
+It is **one line, with no line break after it**, so the line numbers in a stack
+are still your source's: `cart.js:41` is line 41 of `cart.js`. Only columns on
+the first line move. (A `log://{name}` script of your own — below — is as many
+lines as you wrote, and moves everything after it down by that many.)
+
+The script reports by `POST`ing to `/.whistle-rs/log` **on the page's own
+origin**. The page's requests come through this proxy, so the proxy answers that
+path itself (`204`) and the origin never sees it. That is why it works on an
+`https://` page without mixed-content errors and needs no CORS. It also means
+the path is taken: a site that really serves `/.whistle-rs/log` cannot be
+reached through this proxy at that path.
+
+Like the `html*`/`js*` operators, injecting removes the response's
+`Content-Security-Policy` header and makes it uncacheable
+(`_original/lib/inspectors/log.js:47-48`); `enable://keepCSP` and
+`enable://keepCache` opt out of each.
+
+**Only errors, not `console`.** `disable://interceptConsole` on the same request
+leaves `console` alone and still reports uncaught errors:
+
+```
+m.example.com   log://shop disable://interceptConsole
+```
+
+**Editing or dropping entries before they are sent.** Define
+`window.onBeforeWhistleLogSend(args, level)` in the page. `args` is the array of
+arguments as the page passed them; change it in place. Empty it, or return
+`false`, and that entry is not sent. `log://{name}` injects the value `name` as
+a second script right after the collector, which is where to define it without
+touching the site:
+
+````
+``` strip-tokens
+window.onBeforeWhistleLogSend = function (args, level) {
+  if (level === 'debug') { return false; }
+  for (var i = 0; i < args.length; i++) {
+    if (typeof args[i] === 'string') { args[i] = args[i].replace(/token=\w+/g, 'token=***'); }
+  }
+};
+```
+m.example.com   log://{strip-tokens}
+````
+
+The group is then called `strip-tokens`.
+
+**Limits, all of them on purpose.** An argument is sent as text: a string as it
+is, an `Error` as its stack, a DOM node as `<div#id.class>`, anything else as
+JSON with repeated objects written `[Circular]`. One argument is cut at 64 KiB
+and one string inside an object at 8 KiB. The proxy keeps the newest 2000
+entries, 8 MiB at most, **in memory** — a restart empties the pane. Entries
+written while the page is being closed are sent with `navigator.sendBeacon`
+where the browser has it, and lost where it does not.
+
+**How this differs from whistle.** The rule, the id, `{name}`,
+`interceptConsole` and `onBeforeWhistleLogSend` are whistle's
+([log](https://wproxy.org/docs/rules/log.html)). The script is this port's own
+rather than whistle's `assets/js/log.js`: whistle posts to a `cgi-bin` route
+under its internal path and shows objects as an expandable tree; this port
+shows each argument as text. whistle writes the script at the very top of the
+document, before the doctype; this port puts it inside `<head>`.
+`tests/differential/core-bench.js` (`CASES=log`) checks the part a client can
+see against whistle — a page under the rule comes back with a collector in it,
+the same page without the rule does not, a plain-text body is left alone — and
+`tests/page_log_e2e.rs` checks the round trip to the Console pane's API.
+
+The same entries are readable over HTTP: [`GET /api/logs`](API.md#页面日志).
+
 ### weinre (HTML debug injection)
 
 | Operator | Value | Effect |
 |----------|-------|--------|
 | `weinre` | id, or a script URL/path | Inject a weinre `<script>` into HTML responses |
 
-Injected before `</head>` (or after `<body>`). A plain id builds the conventional
-`//host:port/weinre/target/target-script-min.js#id` URL; a URL/path value is used
-verbatim. The weinre inspector server itself is external (not bundled).
+[weinre](https://www.npmjs.com/package/weinre) is a remote
+DOM inspector: a server you run, a script the page loads from it, and an
+inspector page you open on that server. **whistle-rs does not contain weinre**
+— whistle bundles the whole of it and serves it from its own port. So here you
+start the server yourself and say where it is:
+
+```sh
+npx weinre --boundHost -all- --httpPort 8080     # the weinre server
+whistle-rs --weinre http://192.168.1.5:8080      # …and where the proxy finds it
+```
+
+```
+.example.com   weinre://mysession
+```
+
+The page then loads `http://192.168.1.5:8080/target/target-script-min.js#mysession`,
+and the inspector is at `http://192.168.1.5:8080/client/#mysession`. Use an
+address the **device** can reach, not `127.0.0.1`.
+
+Without `--weinre`, a bare id has nowhere to load the script from. Nothing is
+injected, and the session says so: its Rules tab shows the `weinre://` rule as
+"not applied", with the kind `no-weinre-server` in `unapplied`. (It used to
+inject a `<script>` pointing at this proxy's own port, which answered `404`:
+the page loaded, no inspector ever connected, and nothing said why.)
+
+A rule can also name the script itself, which needs no `--weinre`:
+
+```
+example.com    weinre://https://debug.example.com/target/target-script-min.js
+```
+
+> A `#` in a rules line starts a comment, so `weinre://https://…/script.js#id`
+> loses its `#id` before the rule is read. To pass an id with a full URL, put
+> the URL in a value and reference it: `weinre://{agent}`.
+
+The tag is injected before `</head>` (or after `<body>`). An `https://` page
+will refuse a script from an `http://` weinre server as mixed content; weinre
+itself has no TLS, so put it behind something that does, or debug the page over
+`http://`.
 
 Injecting costs the response its `Content-Security-Policy` and its cacheability,
 exactly as the `html*`/`js*`/`css*` operators do — an agent a page's own CSP
@@ -2166,16 +2312,11 @@ it (`_original/lib/inspectors/weinre.js:37-38`). `enable://keepCSP` and
 `tests/differential/cases-compose.js`: whistle appends its **own bundled agent**
 — the whole of `assets/js/weinre.js`, inline, at the *end* of the body — pointed
 at a weinre server whistle runs itself. whistle-rs bundles neither, so it emits a
-`<script src>` naming the conventional URL and puts it in the `<head>`. Two
+`<script src>` naming the server `--weinre` gave and puts it in the `<head>`. Two
 further consequences: whistle also reaches **JavaScript** responses, appending
 the agent bare (`weinre.js:33-35`), where a `<script src>` tag would mean
 nothing; and whistle rewrites a **gzipped** body, where this port leaves a
 compressed response alone.
-
-```
-.example.com   weinre://mysession
-example.com    weinre://https://debug.example.com/target/target-script-min.js#s1
-```
 
 ### `locationHref://` — a page that redirects itself
 
@@ -2528,9 +2669,9 @@ with the reason. They parse and do nothing.
 
 | Flag | What it does upstream | Why not here |
 |---|---|---|
-| `interceptConsole`, `hideComposer`, `hideCaptureError`, `customParser`, `bigData` | shape what whistle's own console shows — the Log panel, which rows are hidden, who renders a capture, and a 2 MB → 16 MB display cap | this port has its own console; the capture cap is `--body-preview-limit` |
+| `hideComposer`, `hideCaptureError`, `customParser`, `bigData` | shape what whistle's own console shows — which rows are hidden, who renders a capture, and a 2 MB → 16 MB display cap | this port has its own console; the capture cap is `--body-preview-limit`. (`interceptConsole` **is** read — see [`log://`](#log--a-pages-console-in-this-one)) |
 | `clientId`, `multiClient` | whistle's `x-whistle-client-id` — a header it stamps so an upstream can tell clients apart | there is no client-id concept here, and inventing one to honour a flag is the wrong way round. `keepClientId` **is** implemented, for the one thing it can mean here: keeping a client-id the *client* sent — see [Rules in a request header](#rules-in-a-request-header) |
-| `useLocalHost`, `useSafePort` | rewrite `log://` and `weinre://` URLs to whistle's own built-in host and port | those two rules point at whistle's own servers, which this port does not run |
+| `useLocalHost`, `useSafePort` | rewrite `log://` and `weinre://` URLs to whistle's own built-in host and port | neither rule points at a server of this port's: `log://` reports to the page's own origin, and `weinre://` loads from the server `--weinre` names |
 | `authCapture`, `tunnelHeadersFirst`, `tunnelAuthHeader` | order a plugin's `auth` hook against the HTTPS upgrade, and decide whose headers win when a plugin passed some through a tunnel | all three are about whistle's plugin API; this port's is its own — see [`PLUGINS.md`](PLUGINS.md) |
 | `flushHeaders`, `secureOptions` | Node plumbing — `response.flushHeaders()` and the TLS socket's `secureOptions` | there is no Node here to flush or configure |
 | `httpH2` | HTTP/2 without TLS (h2c) to a plain `http://` origin | not implemented: HTTP/2 to an origin is offered over TLS only — see [`h2`](#h2--which-http-version-reaches-an-https-origin) |

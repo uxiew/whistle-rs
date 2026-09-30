@@ -41,6 +41,14 @@ pub struct Config {
     /// only way to supply one: `gui/https.md` says the console will not accept a
     /// root through its upload form.
     pub cert_dir: Option<PathBuf>,
+    /// `--weinre`: where a weinre server is running, as `http://host:port`.
+    ///
+    /// `weinre://id` injects a `<script>` that loads the debug agent **from a
+    /// weinre server**, and this port does not contain one — whistle bundles
+    /// the whole of weinre and serves it itself. Without this, a bare id has
+    /// nowhere to load from and is not injected; see
+    /// [`crate::proxy::unapplied::Kind::NoWeinreServer`].
+    pub weinre_server: Option<String>,
     /// Inline rules text loaded at startup (`-r`/`--rules`), whistle's
     /// `config.rules`.
     pub rules: Option<String>,
@@ -212,6 +220,7 @@ impl Default for Config {
             intercept_https: true,
             allow_origins: AllowedOrigins::default(),
             cert_dir: None,
+            weinre_server: None,
             rules: None,
             ui_username: None,
             ui_password: None,

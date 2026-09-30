@@ -8,6 +8,7 @@
 //! | `access` | who may use the console: Host/Origin checks, `--allow-origin`, the login and guest account |
 //! | `console_hosts` | the hostnames the console answers through the proxy (`rootca.pro` …) |
 //! | `sessions`, `har` | captured traffic: list, search, detail, bodies, frames, status; HAR export |
+//! | `logs` | what `log://` pages wrote to their consoles |
 //! | `rules`, `values`, `bundle` | rules and rule groups, the Values store, both as one file |
 //! | `composer` | replay, the Composer, Test Rules |
 //! | `plugin_pages` | a plugin's own pages under `/plugin/<name>/` |
@@ -32,6 +33,7 @@ mod bundle;
 mod composer;
 mod console_hosts;
 mod har;
+mod logs;
 mod plugin_pages;
 mod rules;
 mod sessions;
@@ -42,6 +44,7 @@ use bundle::*;
 use composer::*;
 pub(super) use console_hosts::*;
 use har::*;
+use logs::*;
 use plugin_pages::*;
 use rules::*;
 use sessions::*;
@@ -115,6 +118,8 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/sessions/clear") => sessions_clear(state, req).await,
         // Clear only tidies memory; this deletes what persistence wrote too.
         ("POST", "/api/sessions/purge") => sessions_purge(state).await,
+        ("GET", "/api/logs") => logs_get(state, &req),
+        ("POST", "/api/logs/clear") => logs_clear(state, req).await,
         ("GET", "/api/status") => status_json(state, status_body_restricted(state, &req)).await,
         ("GET", "/plugin") => redirect_to("/plugin/"),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),

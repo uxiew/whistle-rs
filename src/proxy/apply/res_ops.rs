@@ -437,6 +437,13 @@ pub(super) fn injects_into_body(
     if families.html && resolved.value("weinre").is_some() {
         return true;
     }
+    // `log://` injects too — an inline script into a page, the source itself
+    // into a script — and upstream clears the same two things for it
+    // (`_original/lib/inspectors/log.js:47-48`), for the same reason: a CSP
+    // that forbids inline script would stop the collector before it started.
+    if families.js && !resolved.all("log").is_empty() {
+        return true;
+    }
     ["Body", "Prepend", "Append"].iter().any(|slot| {
         writes(format!("res{slot}"))
             || (families.html && writes(format!("html{slot}")))

@@ -10,6 +10,8 @@ import RequestSources from './sidebar/RequestSources.vue';
 import RuleGroups from './sidebar/RuleGroups.vue';
 import ValueKeys from './sidebar/ValueKeys.vue';
 import ComposerPane from './panes/ComposerPane.vue';
+import ConsolePane from './panes/ConsolePane.vue';
+import LogGroups from './sidebar/LogGroups.vue';
 import RequestsPane from './panes/RequestsPane.vue';
 import RulesPane from './panes/RulesPane.vue';
 import TestRulesPane from './panes/TestRulesPane.vue';
@@ -18,6 +20,7 @@ import ValuesPane from './panes/ValuesPane.vue';
 import {
   actingOn,
   clearSelection,
+  loadPageLogs,
   loadSessions,
   moveSelection,
   sendComposition,
@@ -82,6 +85,9 @@ onMounted(() => {
   void loadSessions();
   timer = setInterval(() => {
     if (state.pane === 'requests' && state.autoRefresh) void loadSessions();
+    // A page being debugged is being watched: the Console pane follows it for
+    // as long as it is the pane on screen.
+    if (state.pane === 'console') void loadPageLogs();
   }, 2000) as unknown as number;
 });
 
@@ -98,6 +104,7 @@ onBeforeUnmount(() => {
     <aside class="sidebar">
       <RequestSources v-if="state.pane === 'requests'" />
       <ComposerHistory v-else-if="state.pane === 'composer'" />
+      <LogGroups v-else-if="state.pane === 'console'" />
       <RuleGroups v-else-if="state.pane === 'rules'" />
       <ValueKeys v-else-if="state.pane === 'values'" />
       <PluginList v-else />
@@ -106,6 +113,7 @@ onBeforeUnmount(() => {
     <div class="work">
       <RequestsPane v-show="state.pane === 'requests'" />
       <ComposerPane v-if="visited.has('composer')" v-show="state.pane === 'composer'" />
+      <ConsolePane v-if="visited.has('console')" v-show="state.pane === 'console'" />
       <RulesPane v-if="visited.has('rules')" v-show="state.pane === 'rules'" />
       <ValuesPane v-if="visited.has('values')" v-show="state.pane === 'values'" />
       <TestRulesPane v-if="visited.has('test')" v-show="state.pane === 'test'" />

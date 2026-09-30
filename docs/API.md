@@ -171,7 +171,8 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | `undecodable` | `content-encoding` 解不开（字节和头说的不一致） | 原样转发，不在压缩字节上跑算子 |
 | `unsupported-coding` | 本代理不支持的编码（`zstd`、叠加编码） | 原样转发 |
 | `plugin-failed` | 插件的 request/response 钩子连不上、回了错误状态码、或 30 秒没回答 | 请求照常继续，当作钩子什么都没说 |
-| `cipher-unusable` | `cipher://` 选不出可用的套件，或套件和允许的 TLS 版本对不上 | 不带套件限制建连（版本限制保留） |
+| `no-weinre-server` | `weinre://id` 只写了 id，而启动时没用 `--weinre` 指明 weinre 服务在哪（本代理不自带 weinre） | 不注入任何东西，页面原样返回 |
+| `cipher-unusable` | `cipher://` 选不出可用的套件，或套件和允许的 TLS 版本对不上；或 `tlsOptions://` 里有本代理的 TLS 库做不了的选项（`dhparam`、`secureOptions` 等） | 不带那一部分建连（版本限制和其余选项保留） |
 
 这些都是**降级**：请求照常完成，只是这些算子没执行。只有插件的认证网关（auth）失败时会拦截请求，那是请求失败，记在 `error` 里（阶段 `plugin`），不在这里。控制台的 Rules 标签页会把这些算子划掉并标 "not applied"。
 
@@ -213,6 +214,23 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | `GET /api/ws/status?id=N` | 当前连接的扣留/放行状态 |
 | `POST /api/ws/release` | `{ "id": 1, "dir": "send" }`；方向为 send/receive，按该方向批量放行 |
 | `POST /api/ws/send` | `{ "id": 1, "dir": "send", "data": "hello" }`；确实向活动连接发送数据 |
+
+## 页面日志
+
+`log://id` 规则会往命中的页面里注入一段脚本，把页面的 `console.log`、未捕获的异常等发回代理（怎么用见 [RULES 的 log 一节](RULES.md#log--a-pages-console-in-this-one)）。这两个接口读和清这些日志。
+
+| 方法 / 路径 | 含义 |
+| --- | --- |
+| `GET /api/logs` | 返回 `{ "ok": true, "logs": [...], "ids": [...], "last": N }`，旧的在前。可带 `?after=N`（只要序号大于 N 的）和 `?id=名字`（只要这一组的） |
+| `POST /api/logs/clear` | `{}` 清空全部；`{ "id": "名字" }` 只清这一组。返回 `{ "ok": true, "cleared": N }` |
+
+每条日志：`seq`（只增不减的序号）、`time_ms`（页面那边的时间）、`level`（`log`/`info`/`warn`/`error`/`debug`）、`id`（规则里写的组名）、`args`（每个参数一段文本：字符串原样，其它是 JSON）、`page`（哪个页面）、`client_ip`。
+
+要持续跟着看：记下上次返回的 `last`，下次请求 `/api/logs?after=那个数`。`ids` 永远是当前所有有日志的组，不受 `id` 参数影响。
+
+只存在内存里：最多 2000 条、总共 8 MiB，超了丢最旧的；重启就没了。
+
+页面是往自己域名下的 `/.whistle-rs/log` 发 POST 的，代理拦下来直接回 `204`，不转给源站，也不产生会话。这个路径不是给人调的。
 
 Composer/Replay 的调用会产生网络请求并经过代理规则；不能当作只读查询。Composer 接受任务的响应不是源站已经成功完成的证明：结果看它在列表里的那条会话，失败时那条会话的 `error` 说明原因。重复调用执行接口可能重复产生业务副作用，当前不要假定提供幂等键。
 

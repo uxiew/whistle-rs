@@ -52,9 +52,12 @@
 // `weinre://` (`_original/lib/inspectors/weinre.js`) appends whistle's **own
 // bundled debug agent** — the whole of `assets/js/weinre.js`, inline, at the end
 // of the body — and points it at a weinre server whistle serves itself. This
-// port does not bundle that agent and does not run that server, so it injects a
-// `<script src>` naming the conventional target URL instead. Everything
-// downstream of that choice differs and is meant to:
+// port does not bundle that agent and does not run that server. A rule that
+// names the script's URL gets a `<script src>` for it; a bare id gets one only
+// when `--weinre` says where a weinre server is, and otherwise nothing is
+// injected and the session's `unapplied` says why — it used to be a tag pointing
+// at this proxy's own port, which answered 404. Everything downstream of that
+// choice differs and is meant to:
 //
 //   * the script text, and its placement (`<head>` here, end of body there);
 //   * whistle reaches **JavaScript** responses too, appending the agent bare

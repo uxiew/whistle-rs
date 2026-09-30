@@ -117,6 +117,16 @@ struct Cli {
     #[arg(short = 'z', long = "cert-dir", alias = "certDir")]
     cert_dir: Option<PathBuf>,
 
+    /// Where a weinre server is running (`http://host:port`), for `weinre://id`
+    /// rules.
+    ///
+    /// whistle-rs does not contain weinre. `weinre://mysession` injects a script
+    /// that loads the debug agent from this address; without the option a bare
+    /// id is not injected, and the session says so. A rule may always name the
+    /// script itself: `weinre://http://host:8080/target/target-script-min.js#id`.
+    #[arg(long = "weinre", value_name = "URL")]
+    weinre: Option<String>,
+
     /// Also run an inbound SOCKS5 server on this port.
     #[arg(long, alias = "socksPort")]
     socks_port: Option<u16>,
@@ -427,6 +437,7 @@ async fn main() -> Result<()> {
         timeout_ms: cli.timeout,
         intercept_https: !cli.no_intercept_https,
         cert_dir: cli.cert_dir,
+        weinre_server: cli.weinre.clone().filter(|s| !s.trim().is_empty()),
         allow_origins: cli
             .allow_origin
             .as_deref()
