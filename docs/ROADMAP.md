@@ -142,7 +142,7 @@
 - [x] 一个在每个平台上都能跑的验收脚本，覆盖 HTTP、HTTPS、WS、规则编辑、持久化与退出：`scripts/smoke.mjs`，本机 29/29；对修复前的二进制按预期失败 3 步。
 - [x] 安装/卸载与升级数据策略：[INSTALL](INSTALL.md)；0.1.0 的数据目录由 `tests/data_compat.rs` 守着；保存改为整文件替换，读不懂的存储挪开而不覆盖。
 - [x] 签名/公证：没有 Apple Developer ID 和 Windows 代码签名证书，不做，INSTALL 与 STATUS 已写明。
-- [ ] Linux x86_64/arm64、macOS arm64/x86_64、Windows x86_64 的 CI `platforms` 任务全部通过：构建、全部测试、冒烟测试、带控制台的制品与校验和。——已写好，待推送后首跑。
+- [ ] Linux x86_64/arm64、macOS arm64/x86_64、Windows x86_64 的 CI `platforms` 任务全部通过：构建、全部测试、冒烟测试、带控制台的制品与校验和。——首跑（`a81f73e`）Linux 两个、macOS 两个通过；Windows 测试失败，待看日志修。
 - [ ] 维护者决定 GitHub 的虚拟机算不算"真机"；不算的话，在真机上跑 `node scripts/smoke.mjs <二进制> --console built`，并按 CERTIFICATES 做一遍系统代理 + 信任根证书。
 
 **验收：** 编译通过不算真机通过；各平台至少验证 HTTP、HTTPS、WS、规则编辑、持久化与退出；签名/公证有条件时单独说明。依赖 Q1/Q2/Q3/S1。
@@ -153,6 +153,6 @@
 
 Q1–Q3、S1、U0、O1、O2、R1、U1、PERF1 与 M1 已完成，P0、P1 全部做完。
 
-剩下 P2 的 D1，本机部分已做完；下一步是推送，看 CI 的五个 `platforms` 任务，结果记进 STATUS 的 D1 记录，再由维护者决定虚拟机的结果算不算数。
+剩下 P2 的 D1：本机部分已做完，CI 上四个平台通过；下一步是按日志修 Windows 上失败的测试、看 Windows 的冒烟测试，再由维护者决定虚拟机的结果算不算数。
 
 每个任务交接必须记录：代码提交、变更范围、采用/拒绝的兼容决策、测试命令和结果、未执行项、剩余风险。只有验收条件有证据才勾选，并同步 STATUS；历史实验追加历史档案，不把 ROADMAP 再堆成流水账。不要自动更新用户系统代理、信任根证书、开放防火墙或发布制品。

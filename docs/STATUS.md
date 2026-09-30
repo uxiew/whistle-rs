@@ -608,7 +608,7 @@ whistle 一列取自最后一轮，三轮之间它自己在 h2 页面加载上�
 
 ## 2026-09-29 D1 跨平台构建与验证（进行中）
 
-**结论：** 本机能做的都做完并实测了，五个平台的 CI 还没跑过：要推送后看 `platforms` 那五个 job。CI 用的是 GitHub 的虚拟机，ROADMAP 写的是"真机，或维护者同意使用的虚拟机"，算不算数由维护者定。
+**结论：** 本机能做的都做完并实测了。CI 首跑（`a81f73e`）五个平台过了四个，Windows 的测试有失败，冒烟测试因此没跑到，见下文 CI 首跑。CI 用的是 GitHub 的虚拟机，ROADMAP 写的是"真机，或维护者同意使用的虚拟机"，算不算数由维护者定。
 
 环境：macOS / Apple M4 / Darwin 25.3.0 arm64，Rust 1.98.1，Node.js v26.4.0。
 
@@ -639,9 +639,23 @@ whistle 一列取自最后一轮，三轮之间它自己在 h2 页面加载上�
 | `data_compat.rs` 的变异检查 | 给会话记录改一个字段名、加 `deny_unknown_fields`，三个测试挂两个；复原后全过 |
 | `cargo test --all-targets` / `--doc` | 1063 单元 + 38 集成 + 2 doc 全过；fmt、Clippy 通过 |
 
+**CI 首跑（2026-09-29，run `36633289340`，提交 `a81f73e`）：** 原有的 7 个 job 全过；`platforms` 五个里过了四个。
+
+| 平台 | 结果 | 用时 |
+| --- | --- | --- |
+| Linux x86_64（ubuntu-24.04） | 通过：release 构建、冒烟测试、打包（测试在 `rust` job 里跑，也通过） | 4 分钟 |
+| Linux arm64（ubuntu-24.04-arm） | 通过：构建、全部测试、冒烟测试、打包 | 6 分钟 |
+| macOS arm64（macos-15） | 通过，同上 | 9 分钟 |
+| macOS x86_64（macos-15-intel） | 通过，同上 | 27 分钟 |
+| Windows x86_64（windows-2025） | **失败**：release 构建通过；`cargo test` 以 101 退出（有测试 panic）；之后的冒烟测试和打包被跳过 | 16 分钟 |
+
+四个通过的平台上，冒烟测试的每一步都通过了（任何一步失败都会让 job 失败）。几个事先担心的点也有了答案：ARM Linux 和 Intel macOS 的镜像都自带 rustup，Toolchain 这一步没走安装分支。各包里 `BUILD-INFO.txt` 记的最低系统版本在构件里，构件要登录下载，本文还没核对。
+
+`3ad90fa` 改为测试失败时照样跑冒烟测试（打包仍要求全部通过），下一次运行一次就能同时看到两边。
+
 **没做 / 剩余风险：**
 
-- **五个平台一个都还没在 CI 上跑过。** 推送后要看：Windows 上的全部测试（有 Unix 假设的测试可能挂）、Windows 上 `smoke.mjs` 的 24 步、Linux arm64 和 macOS Intel 镜像上有没有 rustup、`grep vcruntime140` 这个检查会不会误报。
+- **Windows 还没通过。** 测试失败的具体用例要看日志（需要登录，已请维护者取）；冒烟测试的 24 步、`grep vcruntime140` 这个检查都还没在 Windows 上跑到。
 - CI 的机器是虚拟机，冒烟测试不碰系统代理和信任库；"设成系统代理、浏览器信任根证书后能上网"要在真机上按 CERTIFICATES 做，没做过。
 - Windows 上 Ctrl+C / Ctrl+Break / 关窗口的处理有代码、类型检查过，没有运行过；SmartScreen、防火墙询问、macOS Gatekeeper 在普通用户机器上的表现都没实测（本机终端有开发者工具豁免，给二进制加上隔离属性照样能跑，说明不了什么）。
 - 没有代码签名和 macOS 公证：没有 Apple Developer ID，也没有 Windows 代码签名证书。校验和只能证明文件没坏，证明不了来源。
