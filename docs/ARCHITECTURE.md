@@ -433,19 +433,31 @@ curl -x http://127.0.0.1:8899 --cacert ~/.whistle-rs/certs/root.crt https://exam
 whistle-rs/
 ├── Cargo.toml
 ├── build.rs               # inlines the built console into the binary
+├── .cargo/config.toml     # Windows: link the C runtime in (no VCRUNTIME140.dll)
+├── .github/workflows/     # ci.yml (every push/PR, five platforms), differential.yml (weekly)
 ├── README.md              # README.zh-CN.md is only a redirect to it
 ├── rules.txt              # example rules
-├── docs/
+├── docs/                  # docs/README.md is the index
+│   ├── INSTALL.md         # packages, checksums, data directory, upgrade, uninstall
 │   ├── COOKBOOK.md        # task-oriented recipes (+ .zh-CN)
 │   ├── RULES.md           # rule syntax reference
 │   ├── CLI.md             # the command line, flag by flag, against whistle's
+│   ├── API.md             # the console's HTTP API
+│   ├── OPERATIONS.md      # safe defaults, what is stored, how long
 │   ├── TEMPLATES.md       # local files + template rendering
 │   ├── PLUGINS.md         # plugin system + wire protocol
 │   ├── LINE_PROPS.md      # per-line rule properties
-│   ├── CERTIFICATES.md    # root CA install guide
+│   ├── CERTIFICATES.md    # root CA: install, trust, remove
+│   ├── DEVELOPMENT.md     # toolchain, checks, differential, CI
 │   ├── UPSTREAM.md        # which whistle tree the `_original/…` citations mean
-│   ├── ROADMAP.md         # what is and isn't ported (Chinese)
+│   ├── STATUS.md          # what was measured, per task, and what was not
+│   ├── ROADMAP.md         # the task plan (Chinese)
 │   └── ARCHITECTURE.md    # this file
+├── scripts/
+│   ├── smoke.mjs          # use a binary the way a person does, on any OS
+│   ├── check-console.sh   # which console page a binary embeds
+│   ├── check-links.mjs    # relative links and anchors in the Markdown
+│   └── third-party-licenses.mjs # license texts shipped with a release
 ├── sdk/                   # JS/TS plugin SDK (zero deps) + .d.ts types
 ├── examples/plugins/      # hello.js, body-rewrite.js, typed.ts
 ├── ui-src/                # the console: Vue 3 + Vite, built to one file
@@ -453,6 +465,8 @@ whistle-rs/
 │   └── src/               # panes/, sidebar/, components/, editor/, filter/
 ├── tests/
 │   ├── *_e2e.rs           # end-to-end, over a real socket, no node needed
+│   ├── data_compat.rs     # data an older release wrote must still load
+│   ├── data/<version>/    # …that data, as the release left it
 │   └── differential/      # the benches — see its own README
 └── src/
     ├── main.rs            # CLI
@@ -462,6 +476,7 @@ whistle-rs/
     ├── embed.rs           # the library facade
     ├── explain.rs         # `whistle-rs explain`
     ├── qr.rs              # the console's QR encoder
+    ├── private_fs.rs      # owner-only files, replaced whole on save
     ├── rules/
     │   ├── mod.rs
     │   ├── protocols.rs
