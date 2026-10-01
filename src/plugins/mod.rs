@@ -169,6 +169,11 @@ pub struct PluginManifest {
     /// Serves `GET|POST /ui/…` — the plugin's own pages, routed from the web UI
     /// at `/plugin/<name>/`.
     pub ui: bool,
+    /// Rules that apply to **every** request while the plugin is on, with no
+    /// line of the user's naming it — upstream's `rules.txt` in a plugin's
+    /// package. They rank below the console's rules: see
+    /// [`Plugins::static_rules`].
+    pub rules: Option<Arc<str>>,
 }
 
 impl PluginManifest {
@@ -211,6 +216,7 @@ impl PluginManifest {
             req_stats: false,
             res_stats: false,
             ui: false,
+            rules: None,
         }
     }
 
@@ -270,6 +276,11 @@ impl PluginManifest {
             req_stats,
             res_stats,
             ui: has("ui"),
+            rules: v
+                .get("rules")
+                .and_then(|r| r.as_str())
+                .filter(|r| !r.trim().is_empty())
+                .map(Arc::from),
         })
     }
 }
@@ -667,6 +678,11 @@ pub struct RemotePlugin {
 }
 
 impl RemotePlugin {
+    /// The manifest, if a fetch has already learned it. Never dials.
+    fn known_manifest(&self) -> Option<&PluginManifest> {
+        self.manifest.get()
+    }
+
     pub fn new(name: impl Into<String>, host_port: &str) -> Self {
         let base = if host_port.contains("://") {
             host_port.trim_end_matches('/').to_string()
@@ -1198,6 +1214,59 @@ impl Plugins {
             return true;
         }
         !self.off.all.load(Relaxed) && !self.off.names.read().unwrap().contains(name)
+    }
+
+    /// The rules every plugin that is on brings with it, by name — see
+    /// [`PluginManifest::rules`].
+    ///
+    /// **Never waits.** It is asked on every request, so a remote plugin's rules
+    /// count once its manifest is known — fetched by a hook, or by
+    /// [`Plugins::warm_up`] at start — and not before: asking here would hang
+    /// every request on a plugin that is not answering, where today only the
+    /// requests that name it wait.
+    pub fn static_rules(&self) -> Vec<(String, Arc<str>)> {
+        let mut out: Vec<(String, Arc<str>)> = self
+            .map
+            .iter()
+            .filter(|(name, _)| self.is_on(name))
+            .filter_map(|(name, kind)| {
+                let rules = match kind {
+                    PluginKind::Rust(p) => p.manifest().rules,
+                    PluginKind::Remote(r) => r.known_manifest()?.rules.clone(),
+                }?;
+                Some((name.clone(), rules))
+            })
+            .collect();
+        // One order, whatever the map's: when two plugins' rules compete for
+        // one slot, the same one wins every time.
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The remote plugins, by name — the ones whose manifest has to be fetched.
+    pub fn remote_names(&self) -> Vec<String> {
+        self.map
+            .iter()
+            .filter(|(_, kind)| matches!(kind, PluginKind::Remote(_)))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Ask remote plugin `name` for its manifest now, rather than on the first
+    /// request that names it — so that the rules it brings
+    /// ([`Plugins::static_rules`]) apply from the start. One that is not up yet
+    /// is asked again: every second for a minute, then every thirty seconds,
+    /// until it answers. See `AppState::warm_up_plugins`.
+    pub async fn warm_up(&self, name: &str) {
+        let Some(PluginKind::Remote(r)) = self.map.get(name) else {
+            return;
+        };
+        let mut tries = 0u32;
+        while r.manifest().await.is_err() {
+            tries += 1;
+            let wait = if tries < 60 { 1 } else { 30 };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        }
     }
 
     /// [`claim_short_protocol`] against this registry.
@@ -1811,6 +1880,33 @@ mod tests {
         assert_eq!(parse_match("whistle.x", false).unwrap().name, "whistle.x");
         assert_eq!(parse_match("p(v)", false).unwrap().name, "p(v)");
         assert!(parse_match("  ", false).is_none());
+    }
+
+    /// A manifest may bring rules; blank is none.
+    #[test]
+    fn a_manifest_may_bring_rules() {
+        let m =
+            PluginManifest::parse("p", br#"{"hooks":[],"rules":"* resHeaders://x=1"}"#).unwrap();
+        assert_eq!(m.rules.as_deref(), Some("* resHeaders://x=1"));
+        let m = PluginManifest::parse("p", br#"{"hooks":["request"],"rules":"  "}"#).unwrap();
+        assert!(m.rules.is_none());
+    }
+
+    /// Asked on every request, so it must never dial: a remote plugin whose
+    /// manifest is not known yet contributes nothing, at once.
+    #[test]
+    fn static_rules_never_wait_for_a_plugin() {
+        let mut p = Plugins::new();
+        // A port nothing listens on, and a plugin that would take seconds to
+        // say so if anyone asked.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        p.register_remote("dead", &dead.to_string());
+        let started = std::time::Instant::now();
+        assert!(p.static_rules().iter().all(|(name, _)| name != "dead"));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 
     /// `values` off the wire: a string as it is, anything else as its JSON

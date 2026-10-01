@@ -363,13 +363,19 @@ export type UiHook = (
 ) => BodyInit | undefined | Promise<BodyInit | undefined>;
 
 /**
- * A whistle-rs plugin. Define at least one hook — which ones you define is what
- * the capability manifest advertises to the proxy.
+ * A whistle-rs plugin. Define at least one hook, or `rules` — which hooks you
+ * define is what the capability manifest advertises to the proxy.
  */
 export interface Plugin {
   /** Defaults to `$WHISTLE_RS_PLUGIN_NAME`. Matched by `plugin://<name>`. */
   name?: string;
   version?: string;
+  /**
+   * Rules applied to every request while the plugin is on, with no line of the
+   * user's naming the plugin — upstream's `rules.txt`. They rank below the
+   * console's rules. Read once, when the proxy first fetches the manifest.
+   */
+  rules?: string;
   /**
    * Ask for the request body to be delivered on `ctx.body`.
    * Off by default: buffering defeats streaming, so only opt in if you read it.

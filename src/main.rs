@@ -607,6 +607,7 @@ async fn main() -> Result<()> {
     }
 
     let state = Arc::new(state);
+    state.warm_up_plugins();
 
     // Asked to stop, finish writing history and take the Node plugins down
     // before going. Without a handler the signal's default action ended the

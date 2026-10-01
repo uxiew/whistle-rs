@@ -543,6 +543,27 @@ pub(super) async fn serve(
         managers
     };
     apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
+    // The rules plugins bring with them (a plugin's `rules.txt` upstream),
+    // ranked below the console's — see `apply::merge_below`. Nothing to do —
+    // one check per plugin — unless a plugin declared some.
+    let brought = state.plugins.static_rules();
+    if !brought.is_empty() {
+        for (_, text) in &brought {
+            merged_rules.push(apply::merge_brought_rules(
+                &mut resolved,
+                &info,
+                text,
+                is_internal_req,
+            ));
+        }
+        let values = state.values.read().unwrap().clone();
+        apply::substitute_values(
+            &mut resolved,
+            &values,
+            tpl_ctx(&bind_host, state.config.port, &info),
+        );
+        apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
+    }
     // `abc://value` for a plugin called `abc` — before anything reads the
     // destination slot it was parsed into.
     state.plugins.claim_short_protocol(&mut resolved);

@@ -262,7 +262,14 @@ impl whistle_rs::plugins::RustPlugin for Mocks {
         values.insert("who".to_string(), "the plugin".to_string());
         values.insert("body".to_string(), "mocked by the plugin".to_string());
         whistle_rs::plugins::PluginResult {
-            rules: Some("* resHeaders://x-who=${who} resBody://{body}".into()),
+            // The two `includeFilter://s:` lines are decided once the response
+            // is in — PLUGINS.md offers that in place of `resRulesServer`.
+            rules: Some(
+                "* resHeaders://x-who=${who} resBody://{body}\n\
+                 * resHeaders://x-on-200=1 includeFilter://s:200\n\
+                 * resHeaders://x-on-404=1 includeFilter://s:404"
+                    .into(),
+            ),
             values,
             ..Default::default()
         }
@@ -293,6 +300,8 @@ async fn a_plugins_rules_read_the_values_it_sent_with_them() {
     let (head, body) = get(p.addr(), &format!("http://{at}/")).await;
     assert!(head.contains("x-who: the plugin"), "{head}");
     assert_eq!(body, "mocked by the plugin");
+    assert!(head.contains("x-on-200: 1"), "{head}");
+    assert!(!head.contains("x-on-404"), "{head}");
     // What reached the origin carried the store's value: the plugin's are
     // private to the plugin's rules.
     let sent = p
@@ -308,5 +317,87 @@ async fn a_plugins_rules_read_the_values_it_sent_with_them() {
         sent.iter().any(|(k, v)| k == "x-store" && v == "the store"),
         "{sent:?}"
     );
+    p.shutdown().await;
+}
+
+/// A plugin that is nothing but the rules it brings — upstream's `rules.txt`.
+struct Brings(std::net::SocketAddr);
+
+impl whistle_rs::plugins::RustPlugin for Brings {
+    fn name(&self) -> &str {
+        "brings"
+    }
+
+    fn manifest(&self) -> whistle_rs::plugins::PluginManifest {
+        let at = self.0;
+        whistle_rs::plugins::PluginManifest {
+            rules: Some(
+                format!(
+                    "* resHeaders://x-brought=1\n\
+                     {at}/slot file://(from-the-plugin)\n\
+                     {at}/only file://(only-the-plugin)\n\
+                     {at}/imp file://(important-in-the-plugin) lineProps://important\n"
+                )
+                .into(),
+            ),
+            ..whistle_rs::plugins::PluginManifest::none("brings")
+        }
+    }
+
+    fn on_request(
+        &self,
+        _req: &whistle_rs::plugins::PluginReq,
+    ) -> whistle_rs::plugins::PluginResult {
+        Default::default()
+    }
+}
+
+/// The rules a plugin brings apply with no line naming it, rank below the
+/// console's own (the slot `/slot` is the console's) unless they are
+/// `important`, and go when the plugin is switched off.
+#[tokio::test]
+async fn a_plugins_own_rules_apply_below_the_consoles() {
+    let at = origin().await;
+    let p = whistle_rs::embed::Proxy::builder()
+        .port(0)
+        .persist_sessions(false)
+        .storage_dir(std::env::temp_dir().join(format!(
+            "whistle-rs-switches-e2e-brings-{}",
+            std::process::id()
+        )))
+        .rules(format!(
+            "{at}/slot file://(from-the-console)\n{at}/imp file://(plain-in-the-console)\n"
+        ))
+        .plugin(Brings(at))
+        .start()
+        .await
+        .expect("proxy starts");
+    let (head, body) = get(p.addr(), &format!("http://{at}/")).await;
+    assert!(head.contains("x-brought: 1"), "{head}");
+    assert_eq!(body, "origin");
+    assert_eq!(
+        get(p.addr(), &format!("http://{at}/slot")).await.1,
+        "from-the-console"
+    );
+    assert_eq!(
+        get(p.addr(), &format!("http://{at}/only")).await.1,
+        "only-the-plugin"
+    );
+    // As in one rules file: `important` outranks a plain line wherever it is.
+    assert_eq!(
+        get(p.addr(), &format!("http://{at}/imp")).await.1,
+        "important-in-the-plugin"
+    );
+
+    api(
+        p.addr(),
+        "POST",
+        "/api/plugin/switch",
+        r#"{"name":"brings","on":false}"#,
+    )
+    .await;
+    let (head, body) = get(p.addr(), &format!("http://{at}/only")).await;
+    assert!(!head.contains("x-brought"), "{head}");
+    assert_eq!(body, "origin");
     p.shutdown().await;
 }

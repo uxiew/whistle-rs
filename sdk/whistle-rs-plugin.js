@@ -104,7 +104,9 @@ const HOOKS = [
 function start(plugin, opts) {
   plugin = unwrapDefault(plugin);
   const defined = HOOKS.filter(([method]) => plugin && typeof plugin[method] === 'function');
-  if (!defined.length) {
+  // A plugin may be nothing but the rules it brings — upstream's `rules.txt`.
+  const rules = plugin && typeof plugin.rules === 'string' && plugin.rules.trim() ? plugin.rules : undefined;
+  if (!defined.length && !rules) {
     throw new TypeError(
       `whistle-rs plugin: define at least one of ${HOOKS.map(([m]) => m).join(' / ')}`
     );
@@ -120,6 +122,9 @@ function start(plugin, opts) {
     hooks: defined.map(([, hook]) => hook),
     requestBody: plugin.requestBody === true,
     responseBody: plugin.responseBody === true,
+    // Applied to every request while the plugin is on, below the console's
+    // own rules. Read once, when the proxy first fetches this manifest.
+    ...(rules ? { rules } : {}),
   };
 
   const server = http.createServer((req, res) => {

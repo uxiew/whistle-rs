@@ -131,6 +131,16 @@ impl AppState {
         self.enable_persistence(store);
     }
 
+    /// Fetch every remote plugin's manifest in the background, one task each,
+    /// so the rules a plugin brings apply from the first request — see
+    /// [`crate::plugins::Plugins::static_rules`]. Needs a tokio runtime.
+    pub fn warm_up_plugins(self: &Arc<Self>) {
+        for name in self.plugins.remote_names() {
+            let state = self.clone();
+            tokio::spawn(async move { state.plugins.warm_up(&name).await });
+        }
+    }
+
     /// Is HTTPS intercepted for connections no rule speaks for? The console's
     /// switch as it stands now, unless `-M multiEnv` or
     /// `-M notAllowedEnableHTTPS` has taken it away — see

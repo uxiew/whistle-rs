@@ -305,6 +305,7 @@ impl Builder {
             state.start_history();
         }
         let state = Arc::new(state);
+        state.warm_up_plugins();
         if let Some(observer) = self.observer {
             state.observe(observer);
         }

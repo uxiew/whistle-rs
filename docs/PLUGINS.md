@@ -934,6 +934,39 @@ onRequest(ctx) {
 
 ---
 
+## 插件自带的规则
+
+插件可以带一段规则，只要插件开着就对**每个请求**生效，用户不用写任何一行去点它的名字。这就是上游插件包里的 `rules.txt`。
+
+```js
+start({
+  name: 'cors-everywhere',
+  rules: '* resCors://enable',
+});
+```
+
+不写任何钩子、只有 `rules` 也行。Rust 插件在 `manifest()` 里设 `rules`，自己实现协议的在 `/manifest` 里多一个 `"rules": "…"` 字段（见[线上协议](#get-manifest--能力声明)）。
+
+**优先级和上游一样：排在控制台的规则后面。** 同一个 URL 上，用户写了 `file://` 而插件也写了 `file://`，用用户的；插件里标了 `lineProps://important` 的行例外，它照样压过用户没标 important 的行，就像这两行写在同一个规则文件里。多个插件之间按插件名排序。
+
+**什么时候生效：**
+
+- 内置插件和 Rust 插件：启动就生效。
+- 远程插件（`--plugin`、`--node-plugin`）：代理拿到它的 `/manifest` 之后。启动时会在后台去要，插件还没起来就每秒再要一次，一分钟后改成每 30 秒一次。在拿到之前，它的规则**不生效**，请求也不会为此等它。不这么做的话，一个连不上的插件会拖慢所有请求，而现在只拖慢点名它的那些。
+- 规则是随 manifest 一起拿到并缓存的，插件改了规则要**重启代理**才会生效。
+- 插件被关掉（见[被关掉的插件](#被关掉的插件)）时，它的规则也一起失效。
+
+**管不到的地方**（这几处只看控制台的规则）：决定 HTTPS 隧道拦不拦的那一步（`disable://intercept`、`sniCallback://` 写在插件规则里不起作用）、控制台的 Test Rules 和 `whistle-rs explain`。
+
+### 上游的 `resRulesServer`，在这里怎么做
+
+上游插件可以在**响应阶段**再返回一次规则。这里没有单独的钩子，下面两种写法能覆盖它的用途：
+
+- **规则要看响应才决定生效的**：照样在 `onRequest` 里 `setRules`，用响应条件过滤。插件返回的规则在响应到达后会再解析一次，所以 `* resHeaders://x-not-found=1 includeFilter://s:404` 只在 404 时生效。
+- **要直接改响应的**：用 `onResponse` 改状态码、响应头和 body，见[上下文 API](#上下文-api)。
+
+---
+
 ## 执行顺序
 
 HTTPS 的话，第 0 步发生在**连接**上而不是请求上：CONNECT（或 SOCKS）之后、任何请求存在之前，
@@ -1079,9 +1112,12 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
   "hooks": ["request", "response", "pipeRequest", "pipeResponse", "wsFrame",
             "auth", "sni", "reqStats", "resStats", "ui"],
   "requestBody": false,
-  "responseBody": true
+  "responseBody": true,
+  "rules": "* resHeaders://x-via=my-plugin"
 }
 ```
+
+`rules` 可选，见[插件自带的规则](#插件自带的规则)。
 
 `hooks` 决定哪些端点会被调用；两个 body 开关决定是否缓冲并投递 body（只对 `request` / `response` 有意义 —— 流式钩子、帧钩子、认证钩子和统计钩子都不缓冲，也就无需声明）。
 

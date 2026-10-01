@@ -32,6 +32,24 @@ pub fn merge_rules_text(
     mgr
 }
 
+/// The rules a plugin brings with it — see
+/// [`crate::plugins::PluginManifest::rules`] — merged beneath the request's own
+/// ([`merge_below`]). They read the console's values store, as a plugin's
+/// returned rules without values do.
+#[must_use = "the caller must keep this for the response phase"]
+pub fn merge_brought_rules(
+    resolved: &mut Resolved,
+    info: &ReqInfo,
+    text: &str,
+    is_internal_req: bool,
+) -> RuleManager {
+    let mut mgr = RuleManager::new();
+    mgr.set_text(text);
+    mgr.adopt_group(None);
+    merge_below(resolved, mgr.resolve_scoped(info, is_internal_req));
+    mgr
+}
+
 /// [`merge_rules_text`] for the rules a plugin's request hook returned, with
 /// the values it returned beside them.
 ///
@@ -188,6 +206,58 @@ pub(crate) fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
     // `statusCode://` inside an included file beat the `file://` that included
     // it — `mergeRule` returning the new rule for a single-value protocol, with
     // `rule` being one.
+    if let Some(mut op) = sub.slot {
+        op.order = key(&op);
+        resolved.insert(op);
+    }
+}
+
+/// Merge `sub` **beneath** `resolved` — the opposite of [`merge_resolved`] —
+/// for the rules a plugin brings with it (its `rules.txt` upstream).
+///
+/// Upstream appends those to the very rule set the user's rules are in, after
+/// them (`rulesMgr.append(rules, plugin.path, true)`,
+/// `_original/lib/plugins/index.js:214`; `Rules#append`, `rules/rules.js:2078`).
+/// In one set the first match wins, so the user's line beats the plugin's —
+/// except that an `important` line beats every plain one wherever it stands, the
+/// plugin's included. The keys say exactly that: the plugin's important
+/// operators go after every important key a rules file of ordinary length can
+/// have (`order_key` keeps those under `1 << 32`) and before every plain one
+/// (`1 << 48` and up); its plain operators go after all of those. Within each
+/// class they keep their own order.
+///
+/// Merged with [`merge_resolved`] instead, a plugin installed for one purpose
+/// overrode the user's `file://` on the same URL — measured, by the test that
+/// asks for `/slot` in `tests/switches_e2e.rs`.
+pub(crate) fn merge_below(resolved: &mut Resolved, sub: Resolved) {
+    const BELOW_IMPORTANT: u64 = 1 << 40;
+    const BELOW_ALL: u64 = 1 << 62;
+    let key = |op: &RuleOp| match op.props.has("important") {
+        true => BELOW_IMPORTANT + (op.order & ((1 << 32) - 1)),
+        false => BELOW_ALL + (op.order & ((1 << 48) - 1)),
+    };
+    for (k, mut v) in sub.single {
+        v.order = key(&v);
+        match resolved.single.get(&k) {
+            Some(cur) if cur.order <= v.order => {}
+            _ => {
+                resolved.single.insert(k, v);
+            }
+        }
+    }
+    for (k, vs) in sub.multi {
+        let list = resolved.multi.entry(k).or_default();
+        let mut from = 0;
+        for mut op in vs {
+            op.order = key(&op);
+            let at = list[from..]
+                .iter()
+                .position(|cur| cur.order > op.order)
+                .map_or(list.len(), |i| from + i);
+            list.insert(at, op);
+            from = at + 1;
+        }
+    }
     if let Some(mut op) = sub.slot {
         op.order = key(&op);
         resolved.insert(op);
