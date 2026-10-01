@@ -844,6 +844,19 @@ function report(W) {
 // ── the gate ──────────────────────────────────────────────────────────────
 
 /**
+ * The judged calls to `/cgi-bin/*`, which this port answers `404`. Filled in
+ * from a run: `node upstream-suite.js` prints each as `FAIL … answered 404`.
+ */
+const CGI_BIN_CALLS = [
+  'ui POST http://local.whistlejs.com/cgi-bin/values/add #1',
+  'ui POST http://local.wproxy.org:1234/cgi-bin/values/add #1',
+  'ui POST http://local.whistle.com/cgi-bin/values/add #1',
+  'ui POST http://local.whistlejs.com/cgi-bin/values/rename #1',
+  'ui POST http://local.wproxy.org:1234/cgi-bin/values/rename #1',
+  'ui POST http://local.whistle.com/cgi-bin/values/rename #1',
+];
+
+/**
  * Calls the gate judges and whistle-rs fails, each for a stated reason — named
  * one by one, as `indexCalls` keys them, because a category is too wide: some
  * calls in these same families pass here on assertions loose enough not to
@@ -877,12 +890,25 @@ const DECLARED = forVersion([
     ],
   },
   // Upstream's console API, `/cgi-bin/*`, is a stated non-goal — this port has
-  // its own (docs/API.md) — and it is *not* declared here, because none of the
-  // judged calls to it fails any more. The `values/add` and `values/rename`
-  // calls have no callback of their own: `util.request` asserts only that the
-  // answer parses as JSON, and since every refusal here is `{ok:false, error}`
-  // (`d37777c`) a 404 does. They pass without `/cgi-bin` existing; they were
-  // declared while the 404 was the text `not found`.
+  // its own (docs/API.md). The units that call `values/add` and `values/rename`
+  // assert nothing about the answer beyond what `util.request` does, which is
+  // that it parses as JSON — and since every refusal here is `{ok:false, error}`
+  // (`d37777c`), a 404 does. For a while that read as six calls passing. They
+  // do not: see `hollow` in `gate`.
+  {
+    why: 'upstream\'s console API (`/cgi-bin/*`) is a stated non-goal; this port answers 404 '
+      + 'and has its own (docs/API.md). The unit does not look at the status',
+    calls: CGI_BIN_CALLS,
+  },
+  {
+    why: 'this port contains no weinre server, so a bare `weinre://id` injects nothing unless '
+      + '`--weinre` names one — it used to inject a link to its own port, which answered 404. '
+      + 'docs/RULES.md, "weinre"',
+    calls: [
+      'weinre GET http://weinre1.test.whistlejs.com/index.html?resBody=_ #1',
+      'weinre GET https://weinre1.test.whistlejs.com:1234/index.html?resBody=_ #1',
+    ],
+  },
   {
     why: 'an interim (`100`) or out-of-range (`1000`) status: upstream breaks the '
       + 'connection, this port answers — docs/RULES.md, "A status value that is '
@@ -964,8 +990,16 @@ async function gate() {
       continue;
     }
     const why = DECLARED.find((d) => d.calls.includes(key))?.why;
-    const row = { key, state: got.state, at: got.at, error: got.error, why };
-    if (got.state === 'pass') {
+    // A unit whose callback never looks at the status "passes" on anything
+    // that parses — including this port's `{ok:false}` for a route it does not
+    // have. An error status where whistle gave none is not the feature
+    // working, whatever the assertions made of it.
+    const ref = network.get(key);
+    const hollow = got.state === 'pass' && got.status >= 400 && !(ref.status >= 400);
+    const row = hollow
+      ? { key, state: 'hollow', at: got.at, error: `answered ${got.status} where whistle answered ${ref.status || 'without an error'}; the unit did not check`, why }
+      : { key, state: got.state, at: got.at, error: got.error, why };
+    if (got.state === 'pass' && !hollow) {
       verdict.passed++;
       if (why) verdict.stale.push(row);
     } else if (why) {

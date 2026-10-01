@@ -192,17 +192,24 @@ A clean run ends:
 
 ```
 judged 180 calls — the ones whistle passes under the flattened rules, with and without the network
-  160 pass on whistle-rs
+  152 pass on whistle-rs
   18 declared: rules set through upstream's embedding API …
   2 declared: an interim (`100`) or out-of-range (`1000`) status …
+  2 declared: this port contains no weinre server …
+  6 declared: upstream's console API (`/cgi-bin/*`) is a stated non-goal …
 
-upstream suite: judged 180, passed 160, declared 20, differing 0, stale 0 — passed
+upstream suite: judged 180, passed 152, declared 28, differing 0, stale 0 — passed
 ```
 
-Six of the 160 pass without the feature they call: the `/cgi-bin/values/add`
-and `rename` calls assert only that the answer is JSON, and this port's 404 for
-a path it does not have is JSON. `/cgi-bin/*` is still not implemented; the
-comment in `DECLARED` says the same.
+(Measured 2026-10-01, against 2.10.8 and 2.10.10 alike.)
+
+**A pass on an error status is not a pass.** The units that call
+`/cgi-bin/values/add` and `rename` check only that the answer is JSON, and this
+port's 404 for a route it does not have is `{ok:false, error}` — JSON. For a
+while that counted as six calls passing. The gate now fails any call this port
+answered with a 4xx/5xx where whistle did not, whatever the unit asserted, and
+names it `answered 404 where whistle answered 200; the unit did not check`.
+Those six are declared, because `/cgi-bin/*` is a stated non-goal.
 
 **Why 180 and not 280.** Two thirds of the calls go through the suite's eight
 Node plugins (`test/plugins/`): most of the rules live in their `rules.txt` and
