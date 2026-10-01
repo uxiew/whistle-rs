@@ -329,6 +329,13 @@ const PAGE_LOGS = [
 // ── mutable state ──────────────────────────────────────────────────────────
 
 let pageLogs = PAGE_LOGS.slice();
+/** The console's switches; `inspector` is off one by one, to have something to show. */
+let switches = {
+  intercept_https: true, intercept_https_locked: false,
+  rules: true, rules_locked: false,
+  plugins: true, plugins_locked: false,
+  plugins_off: ['remote-auth'] as string[],
+};
 let sessions = FIXTURE.slice();
 let nextId = 100;
 let rules = RULES_DEFAULT;
@@ -547,6 +554,23 @@ export function mockApi(): Plugin {
         pageLogs = id === undefined ? [] : pageLogs.filter((l) => l.id !== id);
         return reply({ ok: true, cleared: before - pageLogs.length });
       }
+      case '/api/switches': {
+        if (req.method === 'POST') {
+          const patch = JSON.parse((await readBody(req)) || '{}');
+          for (const key of ['intercept_https', 'rules', 'plugins'] as const) {
+            if (typeof patch[key] === 'boolean') switches[key] = patch[key];
+          }
+        }
+        return reply({ ok: true, ...switches });
+      }
+      case '/api/plugin/switch': {
+        const { name, on } = JSON.parse((await readBody(req)) || '{}');
+        const off = new Set(switches.plugins_off);
+        if (on) off.delete(name);
+        else off.add(name);
+        switches = { ...switches, plugins_off: [...off].sort() };
+        return reply({ ok: true, ...switches });
+      }
       case '/api/replay': {
         const body = JSON.parse((await readBody(req)) || '{}');
         const want: number[] = body.ids ?? (body.id === undefined ? [] : [body.id]);
@@ -699,8 +723,10 @@ export function mockApi(): Plugin {
           sessions: sessions.length,
           frames: FRAMES.length,
           plugins: [
-            { name: 'inspector', hooks: ['request', 'response', 'ws/frames'], remote: null },
-            { name: 'remote-auth', hooks: null, remote: 'http://127.0.0.1:9001' },
+            { name: 'inspector', hooks: ['request', 'response', 'ws/frames'], remote: null,
+              on: switches.plugins && !switches.plugins_off.includes('inspector') },
+            { name: 'remote-auth', hooks: null, remote: 'http://127.0.0.1:9001',
+              on: switches.plugins && !switches.plugins_off.includes('remote-auth') },
           ],
         });
       case '/api/qr': {

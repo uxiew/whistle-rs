@@ -24,6 +24,8 @@ import type {
   RuleGroup,
   SessionDetail,
   SessionSummary,
+  SwitchPatch,
+  Switches,
   WsFrame,
   WsPauseStatus,
 } from './api';
@@ -134,6 +136,8 @@ interface State {
   composeHistory: Composition[];
 
   status: ProxyStatus | null;
+  /** HTTPS, every rule, the plugins — see `api.Switches`. */
+  switches: Switches | null;
 
   /** Test Rules: the question, and the last answer. */
   /** The frame the Frames panel's composer is holding. */
@@ -238,6 +242,7 @@ export const state = reactive<State>({
   composeHistory: readStored<Composition[]>(COMPOSE_HISTORY_KEY, []),
 
   status: null,
+  switches: null,
 });
 
 watch(
@@ -998,6 +1003,7 @@ async function revealComposed(sent: Composition, url: string, after: number): Pr
 // ── rules ──────────────────────────────────────────────────────────────────
 
 export async function loadRules(): Promise<void> {
+  void loadSwitches();
   const groups = await reach(api.ruleGroups);
   if (!groups) {
     state.rulesStatus = 'Could not reach the proxy';
@@ -1259,8 +1265,34 @@ export async function importFile(file: File): Promise<void> {
 // ── status ─────────────────────────────────────────────────────────────────
 
 export async function loadStatus(): Promise<void> {
+  void loadSwitches();
   const status = await reach(api.status);
   if (status) state.status = status;
+}
+
+// ── switches: HTTPS, every rule, the plugins ───────────────────────────────
+
+export async function loadSwitches(): Promise<void> {
+  const switches = await reach(api.switches);
+  if (switches) state.switches = switches;
+}
+
+/** Set some switches; a refusal is said, and nothing is changed. */
+export async function setSwitches(patch: SwitchPatch): Promise<void> {
+  const res = await reach(() => api.setSwitches(patch));
+  if (!res) return;
+  if (!res.ok) alert(res.error || 'Refused');
+  await loadSwitches();
+  // The status card's "Intercept HTTPS" row reads the same switch.
+  if ('intercept_https' in patch) void loadStatus();
+}
+
+export async function togglePlugin(name: string): Promise<void> {
+  const on = !(state.switches?.plugins_off ?? []).includes(name);
+  const res = await reach(() => api.switchPlugin(name, !on));
+  if (!res) return;
+  if (!res.ok) alert(res.error || 'Refused');
+  await loadSwitches();
 }
 
 // ── panes ──────────────────────────────────────────────────────────────────

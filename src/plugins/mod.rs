@@ -1052,6 +1052,23 @@ enum PluginKind {
 /// The plugin registry held in shared server state.
 pub struct Plugins {
     map: HashMap<String, PluginKind>,
+    /// Which plugins are switched off — see [`Plugins::is_on`].
+    off: Off,
+}
+
+/// The console's plugin switches: every plugin at once, or one by name.
+///
+/// Upstream's `disabledAllPlugins` and `disabledPlugins` properties
+/// (`_original/lib/plugins/index.js:695-705`). A plugin switched off is, to
+/// every rule that names it, a plugin that is not there: its hooks do not run,
+/// and `plugin://name` does nothing — **including its `auth` hook**, which is
+/// what turning it off means. `-M notAllowedDisablePlugins` (and `-M admin`)
+/// takes the switches away, as upstream's does.
+#[derive(Default)]
+struct Off {
+    all: std::sync::atomic::AtomicBool,
+    names: std::sync::RwLock<std::collections::BTreeSet<String>>,
+    locked: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Plugins {
@@ -1065,6 +1082,7 @@ impl Plugins {
     pub fn new() -> Self {
         let mut p = Plugins {
             map: HashMap::new(),
+            off: Off::default(),
         };
         for plugin in builtin::all() {
             p.register_rust(plugin);
@@ -1088,6 +1106,95 @@ impl Plugins {
         self.map.contains_key(name)
     }
 
+    /// Is plugin `name` switched on? Says nothing about whether one is
+    /// registered — [`Plugins::contains`] does.
+    pub fn is_on(&self, name: &str) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.off.locked.load(Relaxed) {
+            return true;
+        }
+        !self.off.all.load(Relaxed) && !self.off.names.read().unwrap().contains(name)
+    }
+
+    /// Is `name` registered **and** switched on — can a rule reach it?
+    pub fn reachable(&self, name: &str) -> bool {
+        self.live(name).is_some()
+    }
+
+    /// `name`, if it is registered **and switched on**. Every hook goes through
+    /// here, so a plugin that is off is one no rule can reach.
+    fn live(&self, name: &str) -> Option<&PluginKind> {
+        self.map.get(name).filter(|_| self.is_on(name))
+    }
+
+    /// Take the switches away for good: `-M notAllowedDisablePlugins`. What
+    /// was switched off before is on again, and stays on.
+    pub fn lock_switches(&self) {
+        self.off
+            .locked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Are the switches taken away? See [`Plugins::lock_switches`].
+    pub fn switches_locked(&self) -> bool {
+        self.off.locked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every plugin off at once, or back to each one's own switch.
+    pub fn set_all_on(&self, on: bool) -> Result<(), String> {
+        self.unlocked()?;
+        self.off
+            .all
+            .store(!on, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Is every plugin off at once? Reads `false` while the switches are
+    /// locked, because then none is.
+    pub fn all_off(&self) -> bool {
+        !self.switches_locked() && self.off.all.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Switch one plugin. A name nothing is registered under is refused, so a
+    /// typo does not quietly sit in the list waiting for a plugin of that name.
+    pub fn set_on(&self, name: &str, on: bool) -> Result<(), String> {
+        self.unlocked()?;
+        if !self.contains(name) {
+            return Err(format!("no plugin named {name}"));
+        }
+        let mut names = self.off.names.write().unwrap();
+        match on {
+            true => names.remove(name),
+            false => names.insert(name.to_string()),
+        };
+        Ok(())
+    }
+
+    /// The plugins switched off one by one, sorted — what is saved, and what
+    /// the console shows. Empty while the switches are locked.
+    pub fn switched_off(&self) -> Vec<String> {
+        if self.switches_locked() {
+            return Vec::new();
+        }
+        self.off.names.read().unwrap().iter().cloned().collect()
+    }
+
+    /// Put back switches saved by an earlier run. Names no longer registered
+    /// are kept, so a plugin left off and missing from one start is still off
+    /// when it comes back.
+    pub fn restore_switches(&self, all_off: bool, names: impl IntoIterator<Item = String>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.off.all.store(all_off, Relaxed);
+        self.off.names.write().unwrap().extend(names);
+    }
+
+    fn unlocked(&self) -> Result<(), String> {
+        match self.switches_locked() {
+            true => Err("-M notAllowedDisablePlugins is on: plugins cannot be switched off".into()),
+            false => Ok(()),
+        }
+    }
+
     /// Sorted plugin names (for logging / the UI).
     pub fn names(&self) -> Vec<String> {
         let mut n: Vec<String> = self.map.keys().cloned().collect();
@@ -1103,6 +1210,16 @@ impl Plugins {
     /// a pipe nobody declared is not opened. The request phase does not go
     /// through here: [`Plugins::on_request`] blocks on an unknown manifest.
     pub async fn manifest(&self, name: &str) -> Option<PluginManifest> {
+        match self.live(name)? {
+            PluginKind::Rust(p) => Some(p.manifest()),
+            PluginKind::Remote(r) => r.manifest().await.ok().cloned(),
+        }
+    }
+
+    /// What plugin `name` declares, whether or not it is switched on — for
+    /// saying what a plugin is (the console's list, its pages), never for
+    /// deciding whether to run one: that is [`Plugins::manifest`].
+    pub async fn declared(&self, name: &str) -> Option<PluginManifest> {
         match self.map.get(name)? {
             PluginKind::Rust(p) => Some(p.manifest()),
             PluginKind::Remote(r) => r.manifest().await.ok().cloned(),
@@ -1147,7 +1264,7 @@ impl Plugins {
     /// and which already ends the plugin chain — the same stop upstream gets by
     /// abandoning the remaining plugins' rules (`lib/plugins/index.js:929-936`).
     pub async fn on_request(&self, name: &str, req: &PluginReq) -> Option<PluginResult> {
-        match self.map.get(name)? {
+        match self.live(name)? {
             PluginKind::Rust(p) => {
                 let manifest = p.manifest();
                 let mut admitted: Vec<(String, String)> = Vec::new();
@@ -1184,7 +1301,7 @@ impl Plugins {
 
     /// Run plugin `name`'s response phase. Returns `None` if no such plugin.
     pub async fn on_response(&self, name: &str, res: &PluginRes) -> Option<PluginResResult> {
-        match self.map.get(name)? {
+        match self.live(name)? {
             PluginKind::Rust(p) => {
                 let manifest = p.manifest();
                 if manifest.res_stats {
@@ -1212,8 +1329,11 @@ impl Plugins {
     /// name a plugin that has no `sni` hook, and that means the same thing as
     /// having no opinion.
     pub async fn sni_cert(&self, name: &str, req: &sni::SniReq) -> Result<sni::SniVerdict, String> {
-        let Some(plugin) = self.map.get(name) else {
-            return Err(format!("no plugin named {name}"));
+        let Some(plugin) = self.live(name) else {
+            return Err(match self.contains(name) {
+                true => format!("plugin {name} is switched off"),
+                false => format!("no plugin named {name}"),
+            });
         };
         match plugin {
             PluginKind::Rust(p) => Ok(if p.manifest().sni {
@@ -1303,7 +1423,9 @@ impl Plugins {
     pub async fn ui_names(&self) -> Vec<String> {
         let mut out = Vec::new();
         for name in self.names() {
-            if matches!(self.manifest(&name).await, Some(m) if m.ui) {
+            // Not `manifest`, which answers for plugins that are on: a plugin
+            // switched off keeps its pages, which may be where it is set up.
+            if matches!(self.declared(&name).await, Some(m) if m.ui) {
                 out.push(name);
             }
         }
@@ -1322,7 +1444,7 @@ impl Plugins {
         meta: &pipe::PipeMeta,
         body: DynBody,
     ) -> DynBody {
-        let Some(plugin) = self.map.get(name) else {
+        let Some(plugin) = self.live(name) else {
             return body;
         };
         match plugin {
@@ -1354,7 +1476,7 @@ impl Plugins {
         name: &str,
         meta: &wsframe::FrameMeta,
     ) -> Option<wsframe::FrameHook> {
-        match self.map.get(name)? {
+        match self.live(name)? {
             PluginKind::Rust(p) => p.manifest().ws_frame.then(|| wsframe::FrameHook::Native {
                 name: name.to_string(),
                 plugin: p.clone(),

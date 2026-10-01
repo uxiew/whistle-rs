@@ -2,6 +2,7 @@
 //! CA, plugins, and the in-memory session list with its observers.
 
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 /// Maximum number of captured transactions kept in memory, when nothing says
 /// otherwise — [`crate::config::Config::req_cache_size`] is what the running
@@ -37,6 +38,12 @@ pub struct AppState {
     /// What the pages a `log://` rule matched have written to their consoles —
     /// see [`pagelog`]. Bounded; the console's Console pane reads it.
     pub page_logs: Mutex<pagelog::PageLogs>,
+    /// The console's HTTPS switch, as it stands now: starts at what the command
+    /// line said (`config.intercept_https`) and can be flipped while running —
+    /// upstream's `interceptHttpsConnects`. Read through
+    /// [`AppState::intercepts_https`], which also knows when a mode has taken
+    /// the switch away.
+    pub(super) intercept_https: AtomicBool,
     pub(super) next_id: AtomicU64,
     /// Optional session persistence (JSONL on disk).
     pub(super) session_store: Option<persist::SessionStore>,
@@ -66,6 +73,17 @@ impl AppState {
         plugins: crate::plugins::Plugins,
     ) -> Self {
         let values = RwLock::new(config.values.clone());
+        // The locks are the command line's, and outrank anything a previous run
+        // switched off and saved: they are applied here, last, so the order the
+        // caller restored things in cannot get round them.
+        let mut rules = rules;
+        if config.rules_switch_locked {
+            rules.set_all_off(false);
+        }
+        if config.plugins_switch_locked {
+            plugins.lock_switches();
+        }
+        let intercept_https = AtomicBool::new(config.intercept_https);
         AppState {
             config,
             rules: RwLock::new(rules),
@@ -77,6 +95,7 @@ impl AppState {
             ws_pause: Mutex::new(HashMap::new()),
             ws_write: Mutex::new(HashMap::new()),
             page_logs: Mutex::new(pagelog::PageLogs::default()),
+            intercept_https,
             next_id: AtomicU64::new(1),
             session_store: None,
             observer: std::sync::OnceLock::new(),
@@ -110,6 +129,31 @@ impl AppState {
         }
         let store = persist::SessionStore::new(dir, self.config.persist_days);
         self.enable_persistence(store);
+    }
+
+    /// Is HTTPS intercepted for connections no rule speaks for? The console's
+    /// switch as it stands now, unless `-M multiEnv` or
+    /// `-M notAllowedEnableHTTPS` has taken it away — see
+    /// [`Config::intercepts_https`], which answers the same question about the
+    /// command line alone.
+    pub fn intercepts_https(&self) -> bool {
+        self.intercept_https.load(Ordering::Relaxed) && !self.config.capture_locked_off
+    }
+
+    /// Flip the HTTPS switch. Refused while a mode has taken it away, rather
+    /// than recording a setting nothing would read.
+    ///
+    /// Only for this run: a restart goes back to what the command line says.
+    /// Connections already open keep what they were given when they opened —
+    /// a tunnel is decided once, at its `CONNECT`.
+    pub fn set_intercept_https(&self, on: bool) -> Result<(), &'static str> {
+        if self.config.capture_locked_off {
+            return Err(
+                "a mode has taken the HTTPS switch away (-M multiEnv or -M notAllowedEnableHTTPS)",
+            );
+        }
+        self.intercept_https.store(on, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Set the next session ID counter (used after loading history).

@@ -587,6 +587,19 @@ async fn main() -> Result<()> {
         );
     }
 
+    // The console's switches from the last run: every rule off, plugins off.
+    // A `-M notAllowedDisable*` lock outranks them, and `with_plugins` applies
+    // it last.
+    let switches = whistle_rs::rules::storage::load_switches(config.data_dir());
+    if switches.rules_off {
+        tracing::warn!(
+            "every rule is switched off (saved by the console); switch them back on there \
+             or with POST /api/switches {{\"rules\":true}}"
+        );
+    }
+    manager.set_all_off(switches.rules_off);
+    registry.restore_switches(switches.plugins_off, switches.plugins_switched_off);
+
     let mut state = AppState::with_plugins(config, manager, ca, registry);
 
     if state.config.persist_sessions {

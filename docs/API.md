@@ -202,6 +202,29 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 
 调用方同时检查 HTTP 状态与响应 `ok/error`，不要因为成功解析出 JSON 就认为写入成功。导入、删除及覆盖规则前应保存自己的备份。
 
+## 开关：HTTPS、全部规则、插件
+
+控制台 Status 页的「Switches」和左侧栏的勾选框用的就是这三个接口。对应上游菜单里的 "Enable HTTPS"、"Disable all rules"、"Disable all plugins" 和每个插件前的勾。
+
+```sh
+# 先关掉全部规则看看问题还在不在，再打开
+curl -s -X POST http://127.0.0.1:8899/api/switches -d '{"rules":false}'
+curl -s -X POST http://127.0.0.1:8899/api/switches -d '{"rules":true}'
+```
+
+| 方法 / 路径 | 输入 / 返回 |
+| --- | --- |
+| `GET /api/switches` | 返回 `{ "ok": true, "intercept_https": true, "intercept_https_locked": false, "rules": true, "rules_locked": false, "plugins": true, "plugins_locked": false, "plugins_off": ["audit"] }` |
+| `POST /api/switches` | 设 `intercept_https`、`rules`、`plugins` 里的任意几个（`true` 是开）；没写的不动。返回同上 |
+| `POST /api/plugin/switch` | `{ "name": "audit", "on": false }` 单独关一个插件。返回同上 |
+
+- **`rules: false`**：所有规则组一起不生效，请求原样转发；每个组自己的开关不变，打开后各回各的状态（一个个手动关，再打开时就不记得原来哪些是开的了）。请求头里带的规则（`-M multiEnv`）和插件返回的规则不受影响。
+- **`plugins: false` 或单个插件关掉**：对规则来说，这个插件就当不存在——`plugin://名字` 什么也不做，它的钩子都不跑，**包括认证钩子 `onAuth`**，所以关掉一个认证插件就等于放开它守的门。插件自己的页面 `/plugin/名字/` 照常能打开。关掉之后各次请求的 `rules` 里还会列出 `plugin://名字`（规则确实命中了），只是没有插件去执行它。
+- **`intercept_https`**：只影响之后新建的连接，已经开着的隧道不变。**只管这次运行**，重启后回到命令行的设置（默认开，`--no-intercept-https` 是关）。全部规则和插件开关会存进数据目录的 `switches.json`，重启后还在；规则全关时启动日志会有一行 WARN 提醒。
+- **被模式锁住**：`-M multiEnv` / `-M notAllowedEnableHTTPS` 锁 HTTPS 开关，`-M notAllowedDisableRules` 锁规则总开关，`-M notAllowedDisablePlugins`（`-M admin` 也带它）锁插件开关。对应的 `*_locked` 是 `true`，想动它会得到 **409** 和原因；一次请求里只要有一项动不了，**整个请求都不生效**，不会只改一半。参数写错（比如 `"rules": "no"`）是 400，插件名不存在是 404。
+
+`GET /api/status` 的 `plugins` 列表里每项多一个 `on`，就是上面算下来这个插件此刻开没开。
+
 ## 诊断与执行
 
 | 方法 / 路径 | 输入 / 注意 |

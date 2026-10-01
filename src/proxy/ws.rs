@@ -178,7 +178,7 @@ impl FramePlan {
     pub fn new(plugins: &Plugins, resolved: &Resolved, info: &ReqInfo) -> Self {
         let mut matches: Vec<PluginMatch> = Vec::new();
         for m in crate::plugins::matched(resolved) {
-            if plugins.contains(&m.name) && !matches.iter().any(|o| o.name == m.name) {
+            if plugins.reachable(&m.name) && !matches.iter().any(|o| o.name == m.name) {
                 matches.push(m);
             }
         }

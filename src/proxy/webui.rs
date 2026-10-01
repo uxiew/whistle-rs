@@ -37,6 +37,7 @@ mod logs;
 mod plugin_pages;
 mod rules;
 mod sessions;
+mod switches;
 mod values;
 
 pub(super) use access::*;
@@ -48,6 +49,7 @@ use logs::*;
 use plugin_pages::*;
 use rules::*;
 use sessions::*;
+use switches::*;
 use values::*;
 
 /// Route a direct (non-proxied) request to the UI / API.
@@ -120,6 +122,9 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/sessions/purge") => sessions_purge(state).await,
         ("GET", "/api/logs") => logs_get(state, &req),
         ("POST", "/api/logs/clear") => logs_clear(state, req).await,
+        ("GET", "/api/switches") => switches_get(state),
+        ("POST", "/api/switches") => switches_set(state, req).await,
+        ("POST", "/api/plugin/switch") => plugin_switch(state, req).await,
         ("GET", "/api/status") => status_json(state, status_body_restricted(state, &req)).await,
         ("GET", "/plugin") => redirect_to("/plugin/"),
         ("GET", "/") | ("GET", "/index.html") => html_ok(index_html(state)),

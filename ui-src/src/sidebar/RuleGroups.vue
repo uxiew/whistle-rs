@@ -5,13 +5,32 @@
 import { computed } from 'vue';
 import SideItem from '../components/SideItem.vue';
 import SideTransfer from '../components/SideTransfer.vue';
-import { addGroup, exportGroup, selectGroup, state, toggleGroup } from '../store';
+import { addGroup, exportGroup, selectGroup, setSwitches, state, toggleGroup } from '../store';
 
 const named = computed(() => state.groups.filter((g) => g.name !== 'default'));
+const sw = computed(() => state.switches);
 </script>
 
 <template>
   <div class="side-title">Rule Groups</div>
+  <label
+    v-if="sw"
+    class="side-switch"
+    :title="sw.rules_locked
+      ? '-M notAllowedDisableRules: rules cannot all be switched off'
+      : 'Every group at once. Each group keeps its own switch underneath.'"
+  >
+    <input
+      type="checkbox"
+      :checked="sw.rules"
+      :disabled="sw.rules_locked"
+      @change="setSwitches({ rules: !sw.rules })"
+    />
+    All rules on
+  </label>
+  <div v-if="sw && !sw.rules" class="side-warn">
+    Every rule is off: requests go through untouched, whatever the groups below say.
+  </div>
   <SideItem
     label="Default"
     :selected="state.group === 'default'"

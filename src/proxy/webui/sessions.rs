@@ -487,8 +487,9 @@ pub(super) async fn status_json(state: &Arc<AppState>, restricted: bool) -> Resp
     let plugins: Vec<serde_json::Value> = {
         let mut out = Vec::new();
         for name in state.plugins.names() {
-            let manifest = state.plugins.manifest(&name).await;
+            let manifest = state.plugins.declared(&name).await;
             out.push(serde_json::json!({
+                "on": state.plugins.is_on(&name),
                 "name": name,
                 // A remote plugin that has never answered has no manifest yet,
                 // which is itself worth seeing.
@@ -516,7 +517,7 @@ pub(super) async fn status_json(state: &Arc<AppState>, restricted: bool) -> Resp
         // What a connection actually meets, so the console does not claim to be
         // decrypting when `-M multiEnv` has taken the switch away — see
         // `Config::intercepts_https`.
-        "intercept_https": cfg.intercepts_https(),
+        "intercept_https": state.intercepts_https(),
         // Why, when the two disagree: the switch is on and a mode overrode it.
         "capture_locked_off": cfg.capture_locked_off,
         // Whether a request may carry its own rules, and whose win when it does.

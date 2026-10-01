@@ -9,10 +9,11 @@ import { computed } from 'vue';
 import InfoCard from '../components/InfoCard.vue';
 import type { Pair } from '../components/InfoCard.vue';
 import { fmtBytes } from '../format';
-import { state } from '../store';
+import { setSwitches, state } from '../store';
 
 const yesNo = (v: boolean) => (v ? 'yes' : 'no');
 const st = computed(() => state.status);
+const sw = computed(() => state.switches);
 const host = computed(() => st.value?.host || '127.0.0.1');
 const onLan = computed(() => !!st.value?.listening_on_lan);
 
@@ -80,6 +81,46 @@ const rules = computed<Pair[]>(() => [
           <InfoCard title="Capture" :pairs="capture" />
           <InfoCard title="Rules" :pairs="rules" />
         </div>
+        <section v-if="sw" class="switches">
+          <h3>Switches</h3>
+          <label :title="sw.intercept_https_locked ? 'A -M mode took this switch away' : ''">
+            <input
+              type="checkbox"
+              :checked="sw.intercept_https"
+              :disabled="sw.intercept_https_locked"
+              @change="setSwitches({ intercept_https: !sw.intercept_https })"
+            />
+            Intercept HTTPS
+            <span class="hint">
+              {{ sw.intercept_https_locked
+                ? '— a -M mode turned it off'
+                : '— for new connections; a restart goes back to the command line' }}
+            </span>
+          </label>
+          <label :title="sw.rules_locked ? '-M notAllowedDisableRules' : ''">
+            <input
+              type="checkbox"
+              :checked="sw.rules"
+              :disabled="sw.rules_locked"
+              @change="setSwitches({ rules: !sw.rules })"
+            />
+            All rules on
+            <span class="hint">— off, every group is skipped; each keeps its own switch</span>
+          </label>
+          <label :title="sw.plugins_locked ? '-M notAllowedDisablePlugins' : ''">
+            <input
+              type="checkbox"
+              :checked="sw.plugins"
+              :disabled="sw.plugins_locked"
+              @change="setSwitches({ plugins: !sw.plugins })"
+            />
+            All plugins on
+            <span class="hint">
+              — one by one: double-click a plugin on the left{{ sw.plugins_off.length
+                ? ` (off now: ${sw.plugins_off.join(', ')})` : '' }}
+            </span>
+          </label>
+        </section>
         <p class="hint">
           Certificate: <a href="/rootCA.crt">download</a> ·
           PAC: <a href="/proxy.pac">/proxy.pac</a> ·

@@ -79,6 +79,10 @@ each. **Sixteen** move anything a client can see (fifteen against whistle's own
 defaults, and a sixteenth that only shows once HTTPS interception is on), and
 they collapse into six behaviours — **all six of which are honoured here**. The
 other forty tokens are console options, deployment shapes and Node concerns.
+Two of the console options are honoured as well, because this console has the
+switches they lock: `notAllowedDisableRules` (no "all rules off") and
+`notAllowedDisablePlugins` (no switching a plugin off; `admin` carries it) —
+see [the switches](API.md#开关https全部规则插件).
 
 The historical full run reported `ran: 57, differing: 0, declared: 0`.
 It was not repeated in the 2026-09-25 documentation audit and is not a fresh
@@ -378,6 +382,10 @@ whistle-rs -p 8899 -M keepXFF
 ```sh
 whistle-rs -p 8899 --no-intercept-https      # or: -M disableCapture
 ```
+
+That is where a run starts. The console's Status page can switch it while
+running (`POST /api/switches {"intercept_https":false}`), for new connections
+only, and a restart goes back to the command line.
 
 **One console for several proxies** — give each its own port and directory, and
 put the console somewhere predictable:

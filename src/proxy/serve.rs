@@ -563,7 +563,7 @@ pub(super) async fn serve(
     let mut plugin_matches: Vec<(String, String)> = Vec::new();
     let mut pipe_matches: Vec<crate::plugins::PluginMatch> = Vec::new();
     for m in crate::plugins::matched(&resolved) {
-        if !state.plugins.contains(&m.name) {
+        if !state.plugins.reachable(&m.name) {
             continue;
         }
         let streams = m.via_pipe

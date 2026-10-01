@@ -206,7 +206,7 @@ fn relayed_unread(
     peer: SocketAddr,
     asked: bool,
 ) -> Option<(crate::rules::ReqInfo, crate::rules::Resolved)> {
-    let decided = asked || !state.config.intercepts_https();
+    let decided = asked || !state.intercepts_https();
     let rules = state.rules.read().unwrap();
     // One `bool` per group when none applies, which is the default setup.
     if !decided && !rules.has_no_intercept() {
@@ -1246,6 +1246,55 @@ pub(crate) mod tunnel_abort_tests {
         let mut echo = [0u8; 4];
         relayed.read_exact(&mut echo).await.unwrap();
         assert_eq!(&echo, b"ping", "relayed, not read");
+    }
+
+    /// The console's HTTPS switch is read at each `CONNECT`, so flipping it
+    /// changes the next tunnel without a restart. What tells the two apart from
+    /// outside: intercepting, the proxy answers `200` before dialling anything;
+    /// relaying, it dials first, and a far end that is not there gets no answer.
+    #[tokio::test]
+    async fn the_https_switch_is_read_at_each_connect() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let (state, addr) = proxy_with_config("", |_| {}).await;
+        let reply = |dead: SocketAddr| async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!("CONNECT {dead} HTTP/1.1\r\nHost: {dead}\r\n\r\n");
+            client.write_all(req.as_bytes()).await.unwrap();
+            let mut got = vec![0u8; 12];
+            match tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut got))
+                .await
+            {
+                Ok(Ok(n)) => String::from_utf8_lossy(&got[..n]).into_owned(),
+                _ => String::new(),
+            }
+        };
+        assert!(
+            reply(dead).await.starts_with("HTTP/1.1 200"),
+            "on by default"
+        );
+        state.set_intercept_https(false).unwrap();
+        assert_eq!(
+            reply(dead).await,
+            "",
+            "off: dialled first, and nothing there"
+        );
+        state.set_intercept_https(true).unwrap();
+        assert!(
+            reply(dead).await.starts_with("HTTP/1.1 200"),
+            "and on again"
+        );
+    }
+
+    /// A mode that took the switch away keeps it away.
+    #[tokio::test]
+    async fn a_locked_https_switch_refuses_to_move() {
+        let (state, _) = proxy_with_config("", |c| c.capture_locked_off = true).await;
+        assert!(!state.intercepts_https());
+        assert!(state.set_intercept_https(true).is_err());
+        assert!(!state.intercepts_https());
     }
 
     /// An aborted *request* is recorded too, for the same reason an aborted

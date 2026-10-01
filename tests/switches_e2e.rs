@@ -1,0 +1,211 @@
+//! The console's switches, through its API, as a request sees them: every rule
+//! off and on again, a plugin off by name and all of them at once, and the
+//! answers when a switch is not there to move.
+//!
+//! The HTTPS switch is tested where a tunnel decides, in `src/proxy/tunnel.rs`
+//! (`the_https_switch_is_read_at_each_connect`); here only its API.
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+/// An origin that answers every request `origin`.
+async fn origin() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let addr = listener.local_addr().expect("origin addr");
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while sock.read_exact(&mut byte).await.is_ok() {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\nConnection: close\r\n\r\norigin",
+                    )
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// `GET url` through the proxy; the head and the body.
+async fn get(proxy: std::net::SocketAddr, url: &str) -> (String, String) {
+    let mut sock = TcpStream::connect(proxy).await.expect("connect proxy");
+    let host = url.split('/').nth(2).unwrap_or("");
+    let req = format!("GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    sock.write_all(req.as_bytes()).await.expect("write");
+    let mut out = Vec::new();
+    sock.read_to_end(&mut out).await.expect("read");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    (head.to_ascii_lowercase(), body.to_string())
+}
+
+/// The console's API; the status and the JSON.
+async fn api(
+    proxy: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (u16, serde_json::Value) {
+    let mut sock = TcpStream::connect(proxy).await.expect("connect");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {proxy}\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).await.expect("write");
+    let mut out = Vec::new();
+    sock.read_to_end(&mut out).await.expect("read");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    let status = text
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let json = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    (
+        status,
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("{path}: {text:?}: {e}")),
+    )
+}
+
+async fn proxy(rules: String, mode: Option<&str>) -> whistle_rs::embed::Proxy {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut builder = whistle_rs::embed::Proxy::builder()
+        .port(0)
+        .persist_sessions(false)
+        .storage_dir(std::env::temp_dir().join(format!(
+            "whistle-rs-switches-e2e-{}-{n}",
+            std::process::id()
+        )))
+        .rules(rules);
+    if let Some(mode) = mode {
+        builder = builder.mode(mode);
+    }
+    builder.start().await.expect("proxy starts")
+}
+
+#[tokio::test]
+async fn every_rule_off_and_on_again() {
+    let at = origin().await;
+    let p = proxy(format!("{at} resHeaders://x-rule=1\n"), None).await;
+    let url = format!("http://{at}/");
+
+    assert!(get(p.addr(), &url).await.0.contains("x-rule: 1"));
+    let (status, s) = api(p.addr(), "POST", "/api/switches", r#"{"rules":false}"#).await;
+    assert_eq!(status, 200, "{s}");
+    assert_eq!(s["rules"], false);
+    let (head, body) = get(p.addr(), &url).await;
+    assert!(!head.contains("x-rule"), "{head}");
+    assert_eq!(body, "origin", "the request still goes through, untouched");
+
+    // Saved, for the next start.
+    let saved = whistle_rs::rules::storage::load_switches(&p.state().config.storage_dir);
+    assert!(saved.rules_off);
+
+    api(p.addr(), "POST", "/api/switches", r#"{"rules":true}"#).await;
+    assert!(get(p.addr(), &url).await.0.contains("x-rule: 1"));
+    // The groups' own switches were never touched.
+    let (_, groups) = api(p.addr(), "GET", "/api/rule-groups", "").await;
+    assert!(groups.to_string().contains("\"enabled\":true"), "{groups}");
+    p.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_plugin_off_is_a_plugin_that_is_not_there() {
+    let at = origin().await;
+    // `echo` is built in: it answers the request itself.
+    let p = proxy(format!("{at} plugin://echo\n"), None).await;
+    let url = format!("http://{at}/");
+    assert!(get(p.addr(), &url).await.1.contains("echo (rust)"));
+
+    let (status, s) = api(
+        p.addr(),
+        "POST",
+        "/api/plugin/switch",
+        r#"{"name":"echo","on":false}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{s}");
+    assert_eq!(s["plugins_off"], serde_json::json!(["echo"]));
+    assert_eq!(get(p.addr(), &url).await.1, "origin");
+
+    api(
+        p.addr(),
+        "POST",
+        "/api/plugin/switch",
+        r#"{"name":"echo","on":true}"#,
+    )
+    .await;
+    assert!(get(p.addr(), &url).await.1.contains("echo (rust)"));
+
+    // All at once, without forgetting which were off one by one.
+    api(p.addr(), "POST", "/api/switches", r#"{"plugins":false}"#).await;
+    assert_eq!(get(p.addr(), &url).await.1, "origin");
+    api(p.addr(), "POST", "/api/switches", r#"{"plugins":true}"#).await;
+    assert!(get(p.addr(), &url).await.1.contains("echo (rust)"));
+
+    // A name nothing is registered under is refused, not remembered.
+    let (status, s) = api(
+        p.addr(),
+        "POST",
+        "/api/plugin/switch",
+        r#"{"name":"ehco","on":false}"#,
+    )
+    .await;
+    assert_eq!(status, 404, "{s}");
+    p.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_switch_a_mode_took_away_answers_409_and_changes_nothing() {
+    let at = origin().await;
+    let p = proxy(
+        format!("{at} plugin://echo\n"),
+        Some("notAllowedDisableRules|notAllowedDisablePlugins|notAllowedEnableHTTPS"),
+    )
+    .await;
+    let (_, s) = api(p.addr(), "GET", "/api/switches", "").await;
+    assert_eq!(s["rules_locked"], true);
+    assert_eq!(s["plugins_locked"], true);
+    assert_eq!(s["intercept_https_locked"], true);
+    assert_eq!(s["intercept_https"], false);
+
+    // Refused whole: the plugin half would have been allowed alone.
+    for body in [
+        r#"{"rules":false}"#,
+        r#"{"plugins":false}"#,
+        r#"{"intercept_https":true}"#,
+        r#"{"plugins":true,"rules":false}"#,
+    ] {
+        let (status, s) = api(p.addr(), "POST", "/api/switches", body).await;
+        assert_eq!(status, 409, "{body}: {s}");
+    }
+    let (status, _) = api(
+        p.addr(),
+        "POST",
+        "/api/plugin/switch",
+        r#"{"name":"echo","on":false}"#,
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert!(
+        get(p.addr(), &format!("http://{at}/"))
+            .await
+            .1
+            .contains("echo (rust)")
+    );
+
+    // Malformed is 400, not 409.
+    let (status, _) = api(p.addr(), "POST", "/api/switches", r#"{"rules":"no"}"#).await;
+    assert_eq!(status, 400);
+    p.shutdown().await;
+}

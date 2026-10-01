@@ -178,9 +178,62 @@ pub fn save_values(dir: &Path, values: &std::collections::HashMap<String, String
     }
 }
 
+/// The console's switches that outlive a restart, in `switches.json`.
+///
+/// The rule groups' own switches are in `groups.json`; these are the ones
+/// over all of them, and over the plugins. The HTTPS switch is not here: it
+/// starts from the command line every time (see `AppState::intercepts_https`).
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Switches {
+    /// Every rule group off at once — [`RuleManager::set_all_off`].
+    #[serde(default)]
+    pub rules_off: bool,
+    /// Every plugin off at once.
+    #[serde(default)]
+    pub plugins_off: bool,
+    /// Plugins switched off one by one, by name.
+    #[serde(default)]
+    pub plugins_switched_off: Vec<String>,
+}
+
+fn switches_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("switches.json")
+}
+
+/// The switches an earlier run saved; all on when there is no file.
+pub fn load_switches(dir: &Path) -> Switches {
+    read_store(&switches_path(dir))
+}
+
+/// Save the switches. `dir` is the storage root, as for the values.
+pub fn save_switches(dir: &Path, switches: &Switches) {
+    crate::private_fs::create_dir(dir).ok();
+    if let Ok(json) = serde_json::to_string_pretty(switches) {
+        crate::private_fs::write(&switches_path(dir), json.as_bytes()).ok();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switches_round_trip_and_default_to_on() {
+        let dir = std::env::temp_dir().join(format!("whistle-rs-switches-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(load_switches(&dir), Switches::default(), "no file: all on");
+        let saved = Switches {
+            rules_off: true,
+            plugins_off: false,
+            plugins_switched_off: vec!["audit".into()],
+        };
+        save_switches(&dir, &saved);
+        assert_eq!(load_switches(&dir), saved);
+        // A file from before a field existed still reads.
+        fs::write(switches_path(&dir), r#"{"rules_off":true}"#).unwrap();
+        assert!(load_switches(&dir).rules_off);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn safe_filename_sanitises() {

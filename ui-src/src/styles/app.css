@@ -291,6 +291,43 @@ body {
 
 .side-add:hover { color: var(--accent); border-color: var(--accent); }
 
+/* The Status pane's switches: one per line, the checkbox in front. */
+.switches label {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 4px 0;
+  font-size: 13px;
+}
+
+.switches .hint { margin: 0; }
+
+/* A switch over a whole list — "All rules on", "All plugins on". */
+.side-switch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 6px 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+
+.side-switch:has(input:disabled) { cursor: not-allowed; }
+
+/* Said where it cannot be missed: with every rule off, nothing in the list
+   below applies, whatever its own dot says. */
+.side-warn {
+  margin: 0 6px 6px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 /* Import and export, below the "+ New …" button. Set back from it: creating a
    group is the everyday act, moving one between machines is not. */
 .side-transfer {

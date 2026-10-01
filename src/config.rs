@@ -133,6 +133,14 @@ pub struct Config {
     /// the rules and never consults this, exactly as upstream's per-rule
     /// enable does.
     pub capture_locked_off: bool,
+    /// `-M notAllowedDisableRules`: the console's "disable all rules" switch
+    /// is taken away, and one saved by an earlier run is ignored — upstream's
+    /// `!config.notAllowedDisableRules && disabledAllRules`
+    /// (`_original/lib/rules/util.js:59-61`).
+    pub rules_switch_locked: bool,
+    /// `-M notAllowedDisablePlugins` (and `-M admin`): no plugin can be
+    /// switched off — see [`crate::plugins::Plugins::lock_switches`].
+    pub plugins_switch_locked: bool,
     /// Extra hostnames that **are** the console rather than somewhere to
     /// forward to — whistle's `-l/--localUIHost`, which appends to a built-in
     /// list rather than replacing it (`uiHostList`,
@@ -236,6 +244,8 @@ impl Default for Config {
             trust_forwarded_host: false,
             trust_forwarded_proto: false,
             capture_locked_off: false,
+            rules_switch_locked: false,
+            plugins_switch_locked: false,
             local_ui_hosts: Vec::new(),
             socks_port: None,
             plugins: HashMap::new(),
@@ -464,16 +474,12 @@ const INERT_MODES: &[&str] = &[
     "useMultipleRules",
     "enableMultipleRules",
     "disableMultipleRules",
-    "notAllowDisableRules",
-    "notAllowedDisableRules",
     "disableBackOption",
     "disabledBackOption",
     "disableMultipleOption",
     "disabledMultipleOption",
     "disableRulesOptions",
     "disabledRulesOptions",
-    "notAllowDisablePlugins",
-    "notAllowedDisablePlugins",
     "disableUpdateTips",
     "disableCustomCerts",
     "showPluginReq",
@@ -623,6 +629,16 @@ impl Config {
                 // the rules half.
                 "notAllowEnableHTTPS" | "notAllowedEnableHTTPS" => {
                     self.capture_locked_off = true;
+                    true
+                }
+                // Take the console's switches away: no "disable all rules", no
+                // switching a plugin off. What an earlier run saved is ignored.
+                "notAllowDisableRules" | "notAllowedDisableRules" => {
+                    self.rules_switch_locked = true;
+                    true
+                }
+                "notAllowDisablePlugins" | "notAllowedDisablePlugins" => {
+                    self.plugins_switch_locked = true;
                     true
                 }
                 // Which family to dial first. The first is the default, and

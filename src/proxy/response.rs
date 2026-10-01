@@ -1948,7 +1948,7 @@ pub(super) mod local_response_tests {
             let mut plugins: Vec<(String, String)> = Vec::new();
             let mut pipes: Vec<crate::plugins::PluginMatch> = Vec::new();
             for m in crate::plugins::matched(&resolved) {
-                if !state.plugins.contains(&m.name) {
+                if !state.plugins.reachable(&m.name) {
                     continue;
                 }
                 let streams = m.via_pipe

@@ -235,6 +235,8 @@ export interface PluginInfo {
   /** `null` for a remote plugin that has never answered: no manifest yet. */
   hooks: string[] | null;
   remote: string | null;
+  /** Switched on — `false` when off one by one or all at once. */
+  on: boolean;
 }
 
 export interface ProxyStatus {
@@ -387,6 +389,27 @@ export interface PageLog {
   client_ip?: string;
 }
 
+/**
+ * The console's switches — `src/proxy/webui/switches.rs`. Each `*_locked` is a
+ * `-M` mode that took that switch away; the API refuses to move it (409).
+ */
+export interface Switches {
+  ok: boolean;
+  error?: string;
+  intercept_https: boolean;
+  intercept_https_locked: boolean;
+  /** Every rule on — false is "disable all rules". */
+  rules: boolean;
+  rules_locked: boolean;
+  /** Every plugin on — false is "disable all plugins". */
+  plugins: boolean;
+  plugins_locked: boolean;
+  /** Plugins switched off one by one. */
+  plugins_off: string[];
+}
+
+export type SwitchPatch = Partial<Pick<Switches, 'intercept_https' | 'rules' | 'plugins'>>;
+
 export interface PageLogs {
   logs: PageLog[];
   /** Every group that has an entry, whatever was asked for. */
@@ -511,4 +534,9 @@ export const api = {
   /** Forget them: one group's, or with no id all of them. */
   clearLogs: (id?: string) =>
     postJson<OkResult & { cleared?: number }>('/api/logs/clear', id === undefined ? {} : { id }),
+  switches: () => getJson<Switches>('/api/switches'),
+  /** A refusal (a mode took the switch away) comes back `{ok: false, error}`. */
+  setSwitches: (patch: SwitchPatch) => postJson<Switches>('/api/switches', patch),
+  switchPlugin: (name: string, on: boolean) =>
+    postJson<Switches>('/api/plugin/switch', { name, on }),
 };

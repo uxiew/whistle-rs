@@ -483,7 +483,7 @@ pub async fn decide(
     // the answer is the same one a plugin's `false` produces — the connection is
     // still *routed* by its rules, it is simply not read. whistle spells this
     // `-M pureProxy`; here it is `--no-intercept-https`.
-    if !state.config.intercepts_https() {
+    if !state.intercepts_https() {
         let (info, resolved) = {
             let rules = state.rules.read().unwrap();
             let info = connection_req_info(servername, port, peer, has_sni);
@@ -547,6 +547,13 @@ pub async fn decide(
     let Some((plugin, value)) = matched else {
         return Decision::Generated;
     };
+    // A plugin switched off in the console is not there: the connection gets
+    // what it would with no `sniCallback` rule at all. Without this it went to
+    // the "could not be asked" branch below, kept serving the certificate the
+    // plugin last supplied, and logged a warning per connection.
+    if !state.plugins.is_on(&plugin) {
+        return Decision::Generated;
+    }
 
     let cached = state.ca.plugin_cert(servername, &plugin);
     let req = SniReq {
@@ -1764,6 +1771,32 @@ mod tests {
                 .ca
                 .set_plugin_cert("example.com", "certs", &cert_pem, &key_pem, 5)
                 .unwrap();
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Plugin(_)
+            ));
+        });
+    }
+
+    /// A plugin switched off in the console is not there: the generated
+    /// certificate, not the one it last supplied — which is what a plugin that
+    /// merely failed would still get, above.
+    #[test]
+    fn a_plugin_switched_off_supplies_nothing() {
+        rt().block_on(async {
+            let plugin = FakeSni::start(500, "boom").await;
+            let state = state_with("example.com sniCallback://certs", Some(&plugin));
+            let (cert_pem, key_pem) = plugin_pem("from before it was switched off");
+            state
+                .ca
+                .set_plugin_cert("example.com", "certs", &cert_pem, &key_pem, 5)
+                .unwrap();
+            state.plugins.set_on("certs", false).unwrap();
+            assert!(matches!(
+                decide_for(&state, "example.com").await,
+                Decision::Generated
+            ));
+            state.plugins.set_on("certs", true).unwrap();
             assert!(matches!(
                 decide_for(&state, "example.com").await,
                 Decision::Plugin(_)

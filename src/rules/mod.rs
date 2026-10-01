@@ -1369,6 +1369,12 @@ pub struct RuleManager {
     /// `rulesFile://` and a plugin's rules are parsed into, and the mode has
     /// nothing to say about those.
     default_group_only: bool,
+    /// Every group off at once, without touching any group's own switch —
+    /// the console's "disable all rules" (upstream's `disabledAllRules`
+    /// property, `_original/lib/rules/util.js:59-66`). Turned back on, each
+    /// group is as it was, which is the point of it being a separate switch:
+    /// switching every group off by hand loses which ones were on.
+    all_off: bool,
     /// The values private to a text produced mid-request, under the scope its
     /// operators answer to — see [`RuleManager::adopt_scope`]. Empty for every
     /// long-lived rule set.
@@ -1386,6 +1392,7 @@ impl RuleManager {
             groups: Vec::new(),
             includes: include::Includes::default(),
             default_group_only: false,
+            all_off: false,
             carried_values: HashMap::new(),
         }
     }
@@ -1399,6 +1406,7 @@ impl RuleManager {
             groups: Vec::new(),
             includes: include::Includes::resolving(),
             default_group_only: false,
+            all_off: false,
             carried_values: HashMap::new(),
         }
     }
@@ -1618,9 +1626,7 @@ impl RuleManager {
     /// overwhelmingly common answer — "no rule mentions the response" — costs
     /// one comparison per group and the response pass is skipped outright.
     pub fn may_need_response_phase(&self) -> bool {
-        self.groups
-            .iter()
-            .any(|g| g.enabled && !g.res_candidates.is_empty())
+        self.live_groups().any(|g| !g.res_candidates.is_empty())
     }
 
     /// Could any enabled rule choose the certificate for an intercepted TLS
@@ -1633,13 +1639,13 @@ impl RuleManager {
     /// takes exactly the path it took before the hook existed. See
     /// [`crate::proxy::sni::decide`].
     pub fn has_sni_callback(&self) -> bool {
-        self.groups.iter().any(|g| g.enabled && g.has_sni_callback)
+        self.live_groups().any(|g| g.has_sni_callback)
     }
 
     /// Does any enabled group ask for connections not to be intercepted?
     /// See [`RuleGroup::has_no_intercept`].
     pub fn has_no_intercept(&self) -> bool {
-        self.groups.iter().any(|g| g.enabled && g.has_no_intercept)
+        self.live_groups().any(|g| g.has_no_intercept)
     }
 
     /// Must this request's body be buffered before the rules resolve?
@@ -1655,7 +1661,7 @@ impl RuleManager {
     /// `b:` in it answers `false` after one `is_empty()` per group and the body
     /// keeps streaming. A file that does have one pays for those lines only.
     pub fn needs_request_body(&self, req: &ReqInfo, is_internal_req: bool) -> bool {
-        self.groups.iter().filter(|g| g.enabled).any(|group| {
+        self.live_groups().any(|group| {
             group.body_candidates.iter().any(|&i| {
                 matcher::matches_but_for_body(&group.rules[i as usize], req, is_internal_req)
             })
@@ -1717,14 +1723,32 @@ impl RuleManager {
     /// and answered with the default group's here.
     fn resolution_order(&self) -> impl Iterator<Item = &RuleGroup> {
         let named = !self.default_group_only;
-        self.groups
-            .iter()
-            .filter(move |g| named && g.enabled && g.name != "default")
-            .chain(
-                self.groups
-                    .iter()
-                    .filter(|g| g.enabled && g.name == "default"),
-            )
+        self.live_groups()
+            .filter(move |g| named && g.name != "default")
+            .chain(self.live_groups().filter(|g| g.name == "default"))
+    }
+
+    /// The groups that resolve: switched on, and not all switched off at once
+    /// — see [`all_off`](Self::all_off). Every question about "the enabled
+    /// rules" goes through here, so the one switch reaches all of them: the
+    /// passes, the body and response-phase pre-checks, the certificate hook.
+    fn live_groups(&self) -> impl Iterator<Item = &RuleGroup> {
+        let on = !self.all_off;
+        self.groups.iter().filter(move |g| on && g.enabled)
+    }
+
+    /// Switch every group off at once, or back to what each one says.
+    ///
+    /// Rules a request brings in its own headers (`-M multiEnv`) are not in a
+    /// group and are not affected, nor is anything a plugin returns: the switch
+    /// is over the console's rules, as upstream's is over its rules files.
+    pub fn set_all_off(&mut self, off: bool) {
+        self.all_off = off;
+    }
+
+    /// Is every group switched off at once? See [`set_all_off`](Self::set_all_off).
+    pub fn all_off(&self) -> bool {
+        self.all_off
     }
 
     /// Resolve the default group alone from here on — see
@@ -1786,7 +1810,7 @@ impl RuleManager {
     /// key does not change it: see [`crate::proxy::apply::value_for`].
     pub fn inline_values(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
-        for group in self.groups.iter().filter(|g| g.enabled) {
+        for group in self.live_groups() {
             for (name, value) in &group.inline_values {
                 out.insert(inline_key(name, &group.name), value.clone());
             }
@@ -3439,6 +3463,33 @@ mod group_tests {
 
         mgr.toggle_group("main");
         assert!(mgr.resolve(&req("http://example.com/")).single.is_empty());
+    }
+
+    /// Every group off at once reaches every question about "the enabled
+    /// rules" — not only the request pass — and coming back on leaves each
+    /// group as its own switch says.
+    #[test]
+    fn all_off_reaches_every_question_and_forgets_nothing() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text(
+            "``` v\nx\n```\nexample.com host://1.1.1.1 sniCallback://certs\n\
+             example.com resHeaders://x=1 includeFilter://s:200",
+        );
+        mgr.add_group("off", "example.com host://2.2.2.2", false);
+        let on = |mgr: &RuleManager| {
+            (
+                !mgr.resolve(&req("http://example.com/")).single.is_empty(),
+                mgr.has_sni_callback(),
+                mgr.may_need_response_phase(),
+                !mgr.inline_values().is_empty(),
+            )
+        };
+        assert_eq!(on(&mgr), (true, true, true, true));
+        mgr.set_all_off(true);
+        assert_eq!(on(&mgr), (false, false, false, false));
+        mgr.set_all_off(false);
+        assert_eq!(on(&mgr), (true, true, true, true));
+        assert!(!mgr.groups()[1].enabled, "a group that was off stays off");
     }
 
     #[test]
