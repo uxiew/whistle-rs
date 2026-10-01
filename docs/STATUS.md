@@ -21,6 +21,8 @@
 | 2026-09-29 | M1 拆分大文件 | 三个文件拆成 41 个，只搬不改，测试与性能不变 | [M1](#2026-09-29-m1-拆分三个大文件) |
 | 2026-09-29 | 全量差分上 GitHub | 第一次失败（两个名字解析不了时才出现的隧道问题），修后通过 | [记录](#2026-09-29-全量差分第一次在-github-上跑) |
 | 2026-09-30 | D1 跨平台 | 五个平台在 CI 上构建、全部测试、冒烟测试、打包通过 | [D1](#2026-09-29-d1-跨平台构建与验证) |
+| 2026-10-01 | 第二轮 CORE-01…05、QA-01 | 复审的六处全部修掉：插件认证不再被一次失败绕过、JS 正则、Node 一致的脚本环境、有状态的 frameScript、mTLS 客户端证书、`log://` 的 Console 面板；core-bench 进门禁，114 个对照无未声明差异 | [第二轮](#2026-10-01-第二轮同名规则的实际效果) |
+| 2026-10-01 | 第二轮 EXT-01 / CTRL-01 | HTTPS / 全部规则 / 插件三个运行时开关，插件短协议、返回 values、自带规则；`resRulesServer` 给替代写法 | [第二轮](#2026-10-01-第二轮同名规则的实际效果) |
 
 ## 结论
 
@@ -29,6 +31,8 @@
 不能用「70/73 个算子」或一个百分比表示完善程度：名字被解析、运行时被调用、特定用例一致、与官方全部工作流兼容，是四种不同的证据。当前更准确的定位是：**可用于受控开发调试、可嵌入的 Rust 调试代理，兼容范围有边界，发布门禁仍待补齐**。
 
 **2026-09-30：** ROADMAP 所列任务全部完成，上面那句"发布门禁仍待补齐"已不是现状：每个 PR 跑 fmt/Clippy/测试/MSRV/前端/文档/快速差分和五个平台的构建、测试、冒烟测试与打包，每周对两个上游版本跑全量差分，都在 GitHub 上通过。仍然没有正式发布：版本是 0.1.0，GitHub Releases 是空的，二进制没有签名，macOS 版没有公证；兼容范围的边界照旧，见下文和各记录的剩余风险。
+
+**2026-10-01：** 一份独立复审发现六处"规则名字认得、效果只做了一部分"，第二轮全部修掉，并把比对规则实际效果的 `core-bench.js` 加进了门禁，见[第二轮记录](#2026-10-01-第二轮同名规则的实际效果)。这些改动在 `core-parity` 分支上，还没合进 main。
 
 ### 对照对象
 
@@ -49,15 +53,15 @@
 | --- | --- | --- |
 | 代理核心 | HTTP 正向代理、CONNECT、HTTPS MITM、入站 SOCKS5、HTTP/HTTPS/SOCKS 上游代理与 PAC 已有实现 | `src/proxy/{tunnel,serve,upstream,socks,sni}.rs` |
 | HTTP/2 / 连接 | 客户端到 MITM 侧支持 h2；客户端走 h2 时对 HTTPS 源站也用 h2（与 whistle 默认一致，`enable://h2`/`disable://h2` 可改），明文源站（`httpH2`）不支持。源站连接按客户端连接复用，不跨客户端 | `src/proxy/{pool,upstream}.rs`；`tests/differential/{h2,perf}-bench.js` |
-| CA / TLS | 动态 CA、自备证书和 SNI 插件钩子已实现；默认验证源站证书是有意的安全差异。证书安装仍由用户完成 | `src/ca.rs`、`src/proxy/sni.rs`、`src/main.rs` |
-| 规则语义 | 模式、优先级、Values、includes、改写与响应阶段等有广泛实现；特定语料的差分通过，不代表所有输入和上游版本一致 | `src/rules/`、`src/proxy/apply/`、`tests/differential/` |
-| WebSocket / 流 | 有 ws/wss 帧抓取、发送、扣留/放行及自有插件钩子；不代表复刻上游全部 TCP/帧工作流 | `src/proxy/ws.rs`、`src/plugins/wsframe.rs` |
-| 控制台 | Vue 3 + CodeMirror；已有规则/Values、Composer/重放、时间线、二进制预览/下载、HAR 与配置导入导出，**不是缺失项** | `ui-src/src/panes/`；`src/proxy/webui.rs` 路由表、`src/proxy/webui/` |
+| CA / TLS | 动态 CA、自备证书和 SNI 插件钩子已实现；`tlsOptions://` 能给源站出示客户端证书（PEM、PFX）、指定信任的 CA（2026-10-01）；默认验证源站证书是有意的安全差异。证书安装仍由用户完成 | `src/ca.rs`、`src/proxy/{sni,tls_options}.rs`、`src/main.rs` |
+| 规则语义 | 模式、优先级、Values、includes、改写与响应阶段等有广泛实现；规则里的 `/…/` 按 JavaScript 正则解释，脚本环境的 `parseUrl`/`parseQuery`/`Buffer` 与 Node 一致（2026-10-01）；特定语料的差分通过，不代表所有输入和上游版本一致 | `src/rules/`、`src/proxy/apply/`、`src/proxy/script.rs`、`tests/differential/` |
+| WebSocket / 流 | 有 ws/wss 帧抓取、发送、扣留/放行及自有插件钩子；`frameScript` 每条连接一个脚本，管二进制帧和 `enable://inspect` 的 TCP 隧道（2026-10-01）；分片消息不交给脚本 | `src/proxy/{ws,script,tunnel}.rs`、`src/plugins/wsframe.rs` |
+| 控制台 | Vue 3 + CodeMirror；已有规则/Values、Composer/重放、时间线、二进制预览/下载、HAR 与配置导入导出，**不是缺失项**；2026-10-01 加了 `log://` 的 Console 面板，和 HTTPS / 全部规则 / 插件三个运行时开关 | `ui-src/src/panes/`；`src/proxy/webui.rs` 路由表、`src/proxy/webui/` |
 | 检索与错误观测 | 检索框支持 `h:`、`b:`（由代理查，`b:` 只查已存的预览）、`fc:`；`app:` 明确不支持。失败的请求各有一条会话，带失败阶段和原因，本代理生成的 502 带阶段和会话号；命中了但没执行的算子记在会话的 `unapplied` 里（超上限、事件流、压缩解不开、插件钩子失败、cipher 用不了） | `ui-src/src/filter/session-filter.js`；`src/proxy/search.rs`；`src/proxy/outcome.rs`、`src/proxy/ledger.rs` 的 `Ledger`、`src/proxy/serve.rs` 的 `guard` |
 | 持久化 | JSONL 会话历史与按天保留；内存/体预览有界，没存全的 body 在接口、HAR、重放里都有标记，写盘读回不变。控制台隐藏不等于没采集，只有 `enable://hide` 不记录 | `src/proxy/{persist,body}.rs`、`src/proxy/webui/{sessions,har}.rs`、`src/config.rs` |
-| 插件生态 | 自有 Rust/HTTP/Node 插件协议与 SDK；**不直接运行现成 `whistle.*` npm 插件** | `src/plugins/`、`sdk/`、[PLUGINS.md](PLUGINS.md) |
+| 插件生态 | 自有 Rust/HTTP/Node 插件协议与 SDK；**不直接运行现成 `whistle.*` npm 插件**。上游的短协议 `name://`、钩子返回 `values`、插件自带规则、运行时启停都有对应（2026-10-01） | `src/plugins/`、`sdk/`、[PLUGINS.md](PLUGINS.md) |
 | CLI / Agent 接口 | `explain`、`qr` 及自有 HTTP API；没有 `w2 start/stop` 兼容层，`-r` 是可编辑的 Default 规则组而不是上游隐藏 shadowRules | `src/main.rs`；`src/proxy/webui/` |
-| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；差分依赖有审阅过的锁文件，`run.js` 一条命令跑全量差分并归档；CI 首跑 8 个 job 全部通过，全量差分在 Linux 容器里通过；MIT 许可、来源说明、Cargo 元数据齐备，发布构件附带第三方许可原文；上游自带测试已成为门禁（可评判的 180 条中 160 条通过、20 条逐条声明）；全量差分对 2.10.8、2.10.10 两个上游版本各跑一遍 | 本文 Q1、Q2、U0、U1 记录；`.github/workflows/`；`tests/differential/` |
+| 工程与发布 | 格式、Clippy、单元/集成/doc 测试和前端构建在钉住的工具链（Rust 1.98.1）上全部通过，MSRV 1.95 实测；差分依赖有审阅过的锁文件，`run.js` 一条命令跑全量差分并归档；CI 首跑 8 个 job 全部通过，全量差分在 Linux 容器里通过；MIT 许可、来源说明、Cargo 元数据齐备，发布构件附带第三方许可原文；上游自带测试已成为门禁（可评判的 180 条中 152 条通过、28 条逐条声明；2026-10-01 前是 160 / 20，差的 8 条是 6 条假通过和 2 条有意改掉的 weinre 行为）；`core-bench.js` 比对规则的实际效果；全量差分对 2.10.8、2.10.10 两个上游版本各跑一遍 | 本文 Q1、Q2、U0、U1、第二轮记录；`.github/workflows/`；`tests/differential/` |
 
 上游插件契约见[官方插件开发](https://wproxy.org/docs/extensions/dev.html)；上游 Local Agent API 见[官方接口文档](https://wproxy.org/docs/extensions/api.html)。同名能力不意味着 URL、数据模型或插件对象兼容。
 
@@ -737,7 +741,67 @@ WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-benc
 
 **为什么原来的门禁看不见：** 解析差分只回答"命中了哪条规则"；网络差分一次看一个请求。合法 JS 正则被静默当成字面量、脚本函数的返回值、帧与帧之间的状态、页面里的脚本、客户端证书，都不在这两个问题里。复审提到的"上游自带测试 160 条通过里有 6 条只因为 404 也是 JSON"也属实，见 O2 记录。
 
-修复计划在 [ROADMAP 的第二轮](ROADMAP.md#第二轮同名规则的实际效果2026-09-30-立项)，每项做完在下面追加记录。
+修复计划在 [ROADMAP 的第二轮](ROADMAP.md#第二轮同名规则的实际效果2026-09-30-立项)，做完的记录在[下一节](#2026-10-01-第二轮同名规则的实际效果)。
+
+## 2026-10-01 第二轮：同名规则的实际效果
+
+**结论：** [复核](#2026-09-30-核心覆盖复核)里的六条全部修掉，复审第 4、5 节的七个插件与控制接口候选做了六个，第七个给了替代写法。`core-bench.js` 进了 `run.js network`：114 个对照，未声明的差异 0 个，声明的差异在 2.10.10 上 6 个、2.10.8 上 16 个，都是有意不照抄上游的地方（见下文）；4 条只问本项目的插件断言全过。上游自带测试从"通过 160"改成"通过 152、声明 28"，**不是变差了**：其中 6 条以前是假通过（本代理回 404 也算过），2 条是这一轮有意改掉的 weinre 行为。代码在 `core-parity` 分支，基于 main 的 `bd378ec`。
+
+| 编号 | 修之前 | 现在 | 提交 | 怎么验证的 |
+| --- | --- | --- | --- | --- |
+| CORE-01 插件说不清自己 | 远程插件第一次 `/manifest` 失败（503、连不上、非 JSON）就被永久当成"v1、没有认证"，之后认证钩子再也不被调用，请求直达源站 | 只缓存 200 + JSON 对象和 404；别的失败记 1 秒后重问，期间命中它的请求 502，会话写 `manifest unavailable: …`；`/manifest` 加 5 秒超时 | `1856bf9` | core-bench 插件 4 条：首次 503、首次非 JSON 时源站访问 0 次；插件恢复后 `/auth` 被调用；404 的老插件照常工作 |
+| CORE-03 正则 | 规则里的 `/…/` 用 `regex` crate 编译，前瞻、后顾、反向引用编译不了就当字面量：模式永不命中，`excludeFilter` 永不排除（**规则反而对所有请求生效**），替换什么也不做 | 交给 regress（JS 正则引擎，boa 已带进来）；编译不了的照上游丢弃，但日志和 `explain` 的 `problems` 会点名 | `107be00` | core-bench 正则 19 个对照与 2.10.10 全部一致（修之前 13 个不一致），每个正例旁有一个必须不命中的反例 |
+| CORE-03 脚本环境 | `parseQuery` 重复键只留最后一个、`+` 不转空格；`parseUrl` 把 `user:pw@` 留在主机名里、丢掉 `#hash`；`Buffer` 和 iconv 三个函数不存在（脚本一用就抛错，整段规则作废）；`pattern` 是空串、`port` 是 0；死循环会一直占着请求 | 按 Node 的 `url.parse`、`querystring.parse` 实现；`Buffer`、`decodeBuffer`、`encodeString`、`encodingExists` 可用；`pattern`、`port`、`uiPort`、`httpVersion` 有值；单个循环超过 300 万次中止 | `23b51fd` | core-bench 脚本 55 个对照（其中 24 个 URL）与 2.10.10 全部一致（修之前 16 个里 9 个不一致） |
+| CORE-04 frameScript | 每一帧重新执行脚本，`var n = 0; … ++n` 永远是 1；二进制帧、TCP 隧道不经过脚本 | 每条连接执行一次，处理函数之间状态保留；二进制帧交给处理函数（`Buffer`）；`enable://inspect` 的 TCP 隧道按数据块走脚本并记成帧；处理函数里能 `ctx.sendToClient/sendToServer` | `b9df78e` | core-bench 帧/隧道 28 个对照，22 个与 2.10.10 一致，6 个有意不同并声明 |
+| CORE-02 tlsOptions | `key`/`cert`/`pfx` 被忽略，所有源站连接都不带客户端证书；强制 mTLS 的源站一律握手失败 | `key`+`cert`（路径或内联 PEM）、`pfx`+`passphrase`、`ca`、`rejectUnauthorized=false`；证书用不了时请求失败并说原因；身份进连接池的键 | `80c8450` | core-bench 9 个 mTLS 对照全部一致（修之前 4 个不一致）；连接池隔离的测试在把身份从键里去掉时会失败 |
+| CORE-05 log | `log://` 只是会话上的一个标签，页面原样返回 | 往 HTML/JS 里注入采集脚本，`console.*`、未捕获异常、未处理的 Promise 拒绝、加载失败的资源发回代理；控制台新增 Console 面板（按 id 分组、按级别筛选、文本过滤）和 `GET /api/logs` | `3207e89` | Chromium 经代理打开测试页，五类条目都出现在 Console 面板；`tests/page_log_e2e.rs` 3 个；core-bench `log` 3 个对照一致（修之前 1 个不一致） |
+| CORE-05 weinre | 只写 id 时注入一个指向本代理端口的 `<script>`，本代理回 404：页面打开了，调试器永远连不上，什么都不说 | 本项目不带 weinre：`--weinre <URL>` 指定外部服务；没指定时不注入，会话记 `no-weinre-server` 并写明怎么配 | `3207e89` | 单元测试；上游自带测试里的 2 条 weinre 调用因此声明 |
+| QA-01 | core-bench 只能手动跑；上游套件把"本代理回 404、单元没检查状态码"算作通过 | `run.js network` 的 `core` 一步，差异走 `declared.js`；上游套件里本代理回 4xx/5xx 而上游没有的调用不算通过 | `2500173` `7dca535` | 把一条声明改名后，`CASES=tcp` 报未声明的差异 1 个并失败 |
+
+**插件与控制接口（EXT-01 / CTRL-01）：** 这七项对照的是上游官网的插件开发文档和控制台菜单。
+
+| 候选 | 结果 | 提交 |
+| --- | --- | --- |
+| HTTPS 拦截的运行时开关 | 做了。`POST /api/switches {"intercept_https":…}`，只影响之后新建的连接；**不存盘**，重启回到命令行的设置 | `e39d2a2` |
+| 规则总开关 | 做了。所有规则组一起关，每组自己的开关不动；存进 `switches.json`，启动时规则全关会打一行 WARN | `e39d2a2` |
+| 插件的运行时启停 | 做了。全部或单个；关掉的插件对规则来说就是不存在，**认证钩子也不跑**；`-M notAllowedDisablePlugins`（`admin` 也带）锁住它 | `e39d2a2` |
+| 短协议 `name://` | 做了。`abc://value` 在 `abc` 已注册时就是它的插件规则，在请求时判定（上游也是），控制台 Test Rules 也认 | `fa985ef` |
+| 钩子返回 `values` | 做了。只给这个插件自己的规则用，和控制台 Values 重名时插件的优先；SDK 是 `ctx.setValues` | `de8142d` |
+| 插件自带静态规则 | 做了。manifest 的 `rules`（SDK 的 `start({ rules })`），排在控制台规则之后，`important` 例外；远程插件在拿到 manifest 后生效，启动时后台去要 | `dd5bc0a` |
+| 响应阶段动态规则 `resRulesServer` | 没单独做。`onRequest` 返回带响应条件的规则（`includeFilter://s:404`）会在响应到达后再判定（已有测试），`onResponse` 能直接改响应；写在 [PLUGINS](PLUGINS.md#上游的-resrulesserver在这里怎么做) | — |
+
+**控制台与接口：** Console 面板（`log://`）；Status 页的 Switches 三个开关，规则组侧栏的 "All rules on" 和关掉时的提示，插件侧栏双击开关单个插件。接口：`/api/logs`、`/api/logs/clear`、`/api/switches`、`/api/plugin/switch`，`/api/status` 的插件多了 `on`；会话 `unapplied` 多了 `no-weinre-server`。都写在 [API](API.md)，路由表和 API.md 由测试双向核对。CLI 多了 `--weinre`。
+
+**与上游的有意偏离（新增），都在 `declared.js` 或文档里逐条写明：**
+
+- frameScript：处理函数里 `ctx`、`Buffer` 照样可用（上游脚本跑完就清空全局变量，处理函数里直接写 `ctx.sendToClient` 是 `ReferenceError`）；处理函数没改的二进制帧保持二进制（上游当文本重发，非 UTF-8 的字节被写坏）；同一方向装了处理函数时，脚本顶层先发的帧照样送达（上游丢掉）；隧道脚本自己发的数据排在 CONNECT 的 200 之后（上游排在前面，客户端拿不到 200，隧道建不起来）；保留了本项目原有的 `ctx.frame` / `ctx.direction`。
+- 脚本的执行上限按循环次数算（300 万次），上游按 60 ms 墙钟时间：这个引擎不能从外面打断。
+- `log://` 的采集脚本是本项目自己的：发回页面自己源站上的 `/.whistle-rs/log`（上游发到它内部的 `cgi-bin`），参数显示成文本（上游是可展开的对象树），注入在 `<head>` 里（上游在文档最前面）。
+- `weinre://` 不带服务，只写 id 又没给 `--weinre` 时什么都不注入。
+- 插件的 `/cgi-bin/*` 控制接口仍然不做，6 条上游测试调用声明。
+
+**实测（代码 `dd5bc0a`，macOS arm64，Rust 1.98.1，Node v26.4.0）：** `cargo fmt --check`、Clippy `-D warnings` 通过；`cargo test --locked --all-targets` 单元 1118（另 10 个 ignored）、集成 47、doc 2 全部通过；前端 `npm run typecheck`、`npm run build` 通过；`node scripts/check-links.mjs` 无断链；`node scripts/third-party-licenses.mjs` 退出 0（新依赖 `p12-keystore` 声明了 MIT/Apache-2.0 但包里没有许可文件，和 boa 一样按名字列出）。差分 `run.js all`（代码 `dd5bc0a`，只有文档未提交）对 2.10.8 和 2.10.10 各 32 步全部通过，各用时约 1240 秒：`core` 一步 114 个对照、未声明差异 0、声明 16 / 6、过期声明 0；上游自带测试评判 180、通过 152、声明 28、未声明 0、过期 0；其余 30 步未声明的差异都是 0（解析差分 17462 + 2023 个问题，16 个语料，各个 bench）。本机没有第二轮之前的全量归档，所以没有逐步核对声明数是否和以前一样。
+
+每一项的关键测试都做了变异检查：把修复去掉或改回旧逻辑，对应测试会失败（HTTPS 开关改回读命令行、规则总开关不生效、短协议不认领、插件 values 被忽略、插件静态规则按"合并的赢"排序、mTLS 身份不进连接池键）。浏览器里看过：Console 面板（Chromium 经代理打开带 `console.log`、抛异常、未处理拒绝的页面）、`onBeforeWhistleLogSend` 丢弃和改写条目、Switches 和规则组侧栏的提示。用 SDK 写的 Node 插件真实跑过 `--node-plugin`：`mocks://deep` + `setValues`、只有 `rules` 的插件。
+
+**顺带发现并修掉的：**
+
+- 合并插件规则时，`log://{name}` 到响应阶段已经被换成了值的内容，名字丢了，规则既没有分组也没有用户脚本（`3207e89`）。
+- 采集脚本原来有 127 行，插在页面前面，页面里每个堆栈行号都偏了 127 行；改成一行、后面不换行（`3207e89`）。
+- 插件静态规则一开始用了"合并进来的赢"的合并方式，插件的 `file://` 盖掉了用户同一 URL 上的 `file://`；上游是追加在用户规则后面，改成 `merge_below`（`dd5bc0a`）。
+- 短协议一开始把请求路径也算进了插件的值（`mocks://deep` 收到 `deep/x`），因为目标 URL 会拼上请求路径；改成取规则里写的原值（`de8142d`）。
+
+**剩余风险 / 没做的：**
+
+- 正则：每次模式匹配从 0.01–0.02 µs 变成 0.25–0.4 µs（release，一个 80 字节 URL）。规则多、流量大时会看得出来，没有做专门的性能对比。
+- 脚本上限只数单个循环的次数，嵌套循环每层都在上限以内时拦不住。
+- frameScript：分片的 WebSocket 消息不交给脚本；`pause`/`ignore` 类开关在 TCP 隧道上只表示"要检查"。
+- tlsOptions：`dhparam`、`secureOptions`、`ecdhCurve` 等 rustls 没有对应的选项丢弃并记 `cipher-unusable`。
+- log：日志只在内存里（2000 条 / 8 MiB），重启就没；`/.whistle-rs/log` 这个路径被代理占用；写在 HTML `<meta>` 里的 CSP 不会被去掉；只写 id、没有 `--weinre` 的 `weinre://` 仍会让响应去掉 CSP 和缓存头（虽然最后没注入）。
+- 插件静态规则管不到隧道拦不拦的决定和 Test Rules；改了要重启代理；远程插件拿到 manifest 之前不生效。
+- HTTPS 运行时开关不存盘，这是有意的，但和上游（存盘）不同。
+- 控制台停在 Console 或 Requests 面板时，代理关掉后它还会每 2 秒请求一次（这次测试时一个标签页 15 小时攒了 2.7 万条失败请求），没有退避。这不是这一轮引入的，没改。
+- 这一轮的提交还没合进 main，也没在 GitHub CI 和五个平台上跑过。
 
 ## 真实缺口与风险
 
@@ -754,6 +818,7 @@ WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-benc
 | ~~P2~~ | ~~上游连接池、源站 h2、长连接资源需要专项验证，不能仅因 Rust 实现就承诺性能更高~~ 2026-09-29 已测已改，见 PERF1 记录；只在本机回环加模拟时延上测过 | PERF1 ✓ |
 | ~~P2~~ | ~~跨平台分发需要专项验证~~ 2026-09-30 已做：五个平台在 CI 虚拟机上构建、测试、冒烟测试、打包全过，维护者确认虚拟机算数；安装/升级/卸载策略已写好。真机上的系统代理与信任库、Windows 的 Ctrl+C 没测，见 D1 记录 | D1 ✓ |
 | ~~P2~~ | ~~`apply.rs`、`mod.rs`、`webui.rs` 体积较大；测试完善后沿责任边界拆分，避免先做无收益重写~~ 2026-09-29 已拆，见 M1 记录；1475 行的 `serve()` 整体搬迁没有拆开 | M1 ✓ |
+| ~~P0/P1~~ | ~~同名规则的效果只做了一部分：插件认证可被一次失败绕过、规则正则不是 JS 正则、脚本环境与 Node 不一致、frameScript 无状态、tlsOptions 不带客户端证书、`log://` 不注入~~ 2026-10-01 已修，见第二轮记录；在 `core-parity` 分支，未合并、未上 CI | CORE-01…05 ✓ |
 
 Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照，不是新功能已经完成的报告。
 

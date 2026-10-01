@@ -1,6 +1,6 @@
 # 后续实施计划
 
-更新：2026-09-30（第一轮任务全部完成，最后一项是 D1；同日立项[第二轮](#第二轮同名规则的实际效果2026-09-30-立项)）。审查时的代码基线：`702486d`。依据：[对齐审查与实测](STATUS.md)。旧实验/已完成记录移至 [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md)，不再作为活动待办。
+更新：2026-10-01（第一轮任务 2026-09-30 全部完成，最后一项是 D1；同日立项的[第二轮](#第二轮同名规则的实际效果2026-09-30-立项) 2026-10-01 完成）。审查时的代码基线：`702486d`。依据：[对齐审查与实测](STATUS.md)。旧实验/已完成记录移至 [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md)，不再作为活动待办。
 
 ## 目标与约束
 
@@ -167,62 +167,74 @@
 
 依据：本项目自己的认证契约（[PLUGINS 的「失败即拦截」](PLUGINS.md#失败即拦截fail-closed)）。
 
-- [ ] 远程插件的 `/manifest` 取不到（连不上、超时、5xx、不是 JSON 对象）时不再缓存成"v1、没有认证"，而是下次再问。
-- [ ] 能力未知期间，命中该插件的请求一律 502，不访问源站。
-- [ ] 只有 `404`（插件确实没有这个路由）才按 v1 处理。
+- [x] 远程插件的 `/manifest` 取不到（连不上、超时、5xx、不是 JSON 对象）时不再缓存成"v1、没有认证"，而是下次再问。
+- [x] 能力未知期间，命中该插件的请求一律 502，不访问源站。
+- [x] 只有 `404`（插件确实没有这个路由）才按 v1 处理。
 
 **验收：** 首次 503、首次返回非 JSON、连接被拒，三种情况下第一个请求都到不了源站；插件恢复后下一次请求走认证钩子；404 的老插件照常工作。断言看的是源站被访问的次数和 `/auth` 被调用的次数。
+
+**完成记录：** 只缓存 200 + JSON 对象和 404；其它失败记 1 秒后重问，期间命中该插件的请求 502，会话写明 `manifest unavailable`。`/manifest` 加了 5 秒超时（以前没有）。core-bench 的 4 条插件断言全过（`1856bf9`）。详见 [STATUS](STATUS.md#2026-10-01-第二轮同名规则的实际效果)。
 
 ### CORE-03 — 规则里的正则就是 JavaScript 正则；脚本函数和 Node 的一致（P1）
 
 依据：[匹配模式](https://wproxy.org/docs/rules/pattern.html)（正则按 JS 语法）、[reqScript](https://wproxy.org/docs/rules/reqScript.html)（`parseUrl` 同 Node `url.parse`，`parseQuery` 同 `querystring.parse`）。
 
-- [ ] pattern、过滤器、`reqReplace`/`resReplace`、`pathReplace`、模板里的 `.replace(/…/)`，用户写的 `/…/` 一律交给 ECMAScript 正则引擎（regress，已经是依赖）。前瞻、后顾、反向引用都要能用。
-- [ ] 编译不了的正则不再悄悄当字面量：规则照旧不生效，但日志和 `explain` 要说出是哪条、为什么。
-- [ ] `parseQuery`：重复的键得到数组，`+` 是空格。`parseUrl`：`auth`、`hostname`、`hash`、`slashes` 分开，主机名转小写。
-- [ ] 提供 `Buffer`、`decodeBuffer`、`encodeString`、`encodingExists`。
-- [ ] `pattern` 是命中这条脚本规则的模式，`port` 是代理端口，`httpVersion` 是客户端实际用的版本。
-- [ ] 脚本有执行上限：死循环不能拖住请求。
+- [x] pattern、过滤器、`reqReplace`/`resReplace`、`pathReplace`、模板里的 `.replace(/…/)`，用户写的 `/…/` 一律交给 ECMAScript 正则引擎（regress，已经是依赖）。前瞻、后顾、反向引用都要能用。
+- [x] 编译不了的正则不再悄悄当字面量：规则照旧不生效，但日志和 `explain` 要说出是哪条、为什么。
+- [x] `parseQuery`：重复的键得到数组，`+` 是空格。`parseUrl`：`auth`、`hostname`、`hash`、`slashes` 分开，主机名转小写。
+- [x] 提供 `Buffer`、`decodeBuffer`、`encodeString`、`encodingExists`。
+- [x] `pattern` 是命中这条脚本规则的模式，`port` 是代理端口，`httpVersion` 是客户端实际用的版本。
+- [x] 脚本有执行上限：死循环不能拖住请求。
 
 **验收：** `core-bench.js` 的 `regexp`、`script` 两组与上游逐条一致，剩下的逐条声明原因。每个正例旁边有一个必须不命中的反例。
+
+**完成记录：** 用户写的 `/…/` 全部交给 regress；编译不了的正则照上游丢弃，但日志和 `explain` 会点名。脚本环境的 `parseUrl`/`parseQuery`/`Buffer`/iconv 三个函数按 Node 实现，`pattern`/`port`/`httpVersion` 有值；单个循环超过 300 万次就中止。core-bench：正则 19 个对照、脚本 55 个对照与 2.10.10 全部一致（修之前分别有 13 个、9 个不一致）。代价：每次模式匹配从 0.01–0.02 µs 变成 0.25–0.4 µs（`107be00` `23b51fd`）。详见 [STATUS](STATUS.md#2026-10-01-第二轮同名规则的实际效果)。
 
 ### CORE-04 — frameScript 在一条连接上是同一个脚本（P1）
 
 依据：[frameScript](https://wproxy.org/docs/rules/frameScript.html)（"操作 WebSocket 和普通 TCP 请求数据帧"）。
 
-- [ ] 脚本每条连接只执行一次，处理函数之间的变量保留（现在每帧重新执行，计数器永远是 1）。
-- [ ] 二进制帧也交给处理函数，收到的是 `Buffer`。
-- [ ] 处理函数里可以调用 `ctx.sendToClient` / `ctx.sendToServer`。
-- [ ] `enable://inspect` 的普通 TCP 隧道按数据块走脚本，并在控制台里记成帧。
+- [x] 脚本每条连接只执行一次，处理函数之间的变量保留（现在每帧重新执行，计数器永远是 1）。
+- [x] 二进制帧也交给处理函数，收到的是 `Buffer`。
+- [x] 处理函数里可以调用 `ctx.sendToClient` / `ctx.sendToServer`。
+- [x] `enable://inspect` 的普通 TCP 隧道按数据块走脚本，并在控制台里记成帧。
 
 **验收：** 同一连接依次发 a、b、c，源站收到 N1:a、N2:b、N3:c；两条连接各自从 1 数起；二进制帧和 TCP 数据被处理函数改写后到达源站。
+
+**完成记录：** 每条连接一个脚本、一个线程，帧与帧之间的状态保留；二进制帧、`enable://inspect` 的 TCP 隧道都经过处理函数。28 个帧/隧道对照里 22 个与 2.10.10 一致，另外 6 个是有意不同（二进制帧保持二进制、处理函数里 `ctx`/`Buffer` 可用等），写进了 `declared.js`（`b9df78e`）。详见 [STATUS](STATUS.md#2026-10-01-第二轮同名规则的实际效果)。
 
 ### CORE-02 — `tlsOptions://` 能带客户端证书（P1）
 
 依据：[tlsOptions](https://wproxy.org/docs/rules/cipher.html)（"配置双向认证（mTLS）所需的客户端证书"）。
 
-- [ ] `key` + `cert`（文件路径或直接写 PEM 内容）、`pfx` + `passphrase`。
-- [ ] 连接复用按客户端证书隔离：带证书的连接不能被不带证书的请求借用，反过来也不行。
-- [ ] 读不了的证书、对不上的私钥：请求失败并说明原因，不是悄悄不带证书去连。
-- [ ] rustls 做不了的字段（`dhparam`、`secureOptions` 等）记进会话的 `unapplied`。
+- [x] `key` + `cert`（文件路径或直接写 PEM 内容）、`pfx` + `passphrase`。
+- [x] 连接复用按客户端证书隔离：带证书的连接不能被不带证书的请求借用，反过来也不行。
+- [x] 读不了的证书、对不上的私钥：请求失败并说明原因，不是悄悄不带证书去连。
+- [x] rustls 做不了的字段（`dhparam`、`secureOptions` 等）记进会话的 `unapplied`。
 
 **验收：** 对一个强制要求客户端证书的源站：不带证书 502；正确证书 200 且源站确认 `authorized`；别的 CA 签的证书、私钥不匹配、密码错的 pfx 都被拒绝。
+
+**完成记录：** 支持 `key`+`cert`（路径或内联 PEM）、`pfx`+`passphrase`、`ca`、`rejectUnauthorized=false`；身份进连接池的键，带证书和不带证书的连接互不借用（测试去掉这一项会失败）。rustls 做不了的字段记 `cipher-unusable`。core-bench 9 个 mTLS 对照全部一致（修之前 4 个不一致）（`80c8450`）。详见 [STATUS](STATUS.md#2026-10-01-第二轮同名规则的实际效果)。
 
 ### CORE-05 — `log://` 是页面日志，不是标签（P1）
 
 依据：[log](https://wproxy.org/docs/rules/log.html)（"在页面中注入 JavaScript 代码，捕获异常及 console.xxx 日志，并在管理界面中实时显示"）、[weinre](https://wproxy.org/docs/rules/weinre.html)。
 
-- [ ] 命中 `log://id` 的 HTML 页面被注入一段脚本，把 `console.*`、未捕获异常、未处理的 Promise 拒绝发回代理。
-- [ ] 控制台新增 Console 面板：按 id 分组、按级别筛选、关键字搜索。
-- [ ] 支持 `window.onBeforeWhistleLogSend` 预处理。
-- [ ] `weinre://`：本项目不带 weinre 服务。没有指定外部服务地址时不再注入一个指向自己的死链接，改为记进 `unapplied` 并说明怎么配。
+- [x] 命中 `log://id` 的 HTML 页面被注入一段脚本，把 `console.*`、未捕获异常、未处理的 Promise 拒绝发回代理。
+- [x] 控制台新增 Console 面板：按 id 分组、按级别筛选、关键字搜索。
+- [x] 支持 `window.onBeforeWhistleLogSend` 预处理。
+- [x] `weinre://`：本项目不带 weinre 服务。没有指定外部服务地址时不再注入一个指向自己的死链接，改为记进 `unapplied` 并说明怎么配。
 
 **验收：** 用真实浏览器打开被注入的页面，`console.log` 和一个抛出的异常出现在控制台的 Console 面板里；只检查标签被注入不算。
 
+**完成记录：** 在 Chromium 里经代理打开被注入的页面，`console.log/info/warn`、一个抛出的异常、一个未处理的 Promise 拒绝都出现在 Console 面板；采集脚本不占行，堆栈里的行号就是源文件的行号；`onBeforeWhistleLogSend` 能丢弃和改写条目。`weinre://` 没有 `--weinre` 时不再注入死链接，记 `no-weinre-server`（`3207e89`）。详见 [STATUS](STATUS.md#2026-10-01-第二轮同名规则的实际效果)。
+
 ### QA-01 — 把这些反例变成门禁（与上面同步）
 
-- [ ] `core-bench.js` 接进 `run.js network`，差异走 `declared.js`。
-- [ ] 上游自带测试里 6 条"只因为 404 也是 JSON 而通过"的调用，改回声明为未实现。
+- [x] `core-bench.js` 接进 `run.js network`，差异走 `declared.js`。
+- [x] 上游自带测试里 6 条"只因为 404 也是 JSON 而通过"的调用，改回声明为未实现。
+
+**完成记录：** `run.js network` 多了 `core` 一步：114 个对照，2.10.8 上声明 16 个、2.10.10 上声明 6 个，未声明的 0 个。上游套件改为"本代理回了 4xx/5xx 而上游没有"的调用不算通过，6 条 `/cgi-bin/values/*` 因此声明；同一次运行还抓出 CORE-05 改掉的 2 条 weinre 调用，也已声明。两个版本都是评判 180、通过 152、声明 28（`2500173` `7dca535`）。详见 [STATUS](STATUS.md#2026-10-01-第二轮同名规则的实际效果)。
 
 ### EXT-01 / CTRL-01 — 插件能力与控制接口（P2，按需要挑）
 
@@ -230,9 +242,11 @@
 
 候选（做之前先确认有人用）：钩子返回 `values`；响应阶段的动态规则（上游的 `resRulesServer`）；插件自带静态规则；已注册插件的短协议 `name://`；HTTPS 拦截的运行时开关；规则总开关；插件的运行时启停。
 
+**完成记录：** 7 个候选里做了 6 个：HTTPS 拦截、全部规则、插件（全部或单个）三个运行时开关，带接口、控制台入口和 `-M notAllowedDisable*` 锁（`e39d2a2`）；已注册插件的短协议 `name://`（`fa985ef`）；钩子返回 `values`（`de8142d`）；插件自带规则，排在用户规则之后（`dd5bc0a`）。`resRulesServer` 没有单独做：`onRequest` 返回的带响应条件的规则会在响应到达后再判定，`onResponse` 能直接改响应，两者覆盖它的用途，写在 [PLUGINS](PLUGINS.md#上游的-resrulesserver在这里怎么做)。详见 [STATUS](STATUS.md#2026-10-01-第二轮同名规则的实际效果)。
+
 ## 执行顺序与交接
 
-Q1–Q3、S1、U0、O1、O2、R1、U1、PERF1、M1 与 D1 都已完成。第二轮的顺序：CORE-01 → CORE-03 → CORE-04 → CORE-02 → CORE-05，QA-01 跟着每一项走。
+Q1–Q3、S1、U0、O1、O2、R1、U1、PERF1、M1 与 D1 都已完成。第二轮（CORE-01 → CORE-03 → CORE-04 → CORE-02 → CORE-05，QA-01 跟着每一项走，最后 EXT-01 / CTRL-01）2026-10-01 全部完成，在 `core-parity` 分支上，还没合进 main、没在 GitHub CI 上跑过。
 
 以后的新任务照上面的格式加进来：写清验收条件和依赖，有证据再勾选，并同步 STATUS。各项留下的剩余风险在 STATUS 各自的记录里，挑出来做时单独立项，不要直接改旧项的勾选。
 
