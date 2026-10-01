@@ -750,6 +750,46 @@ Three things about how it compares, each of which it got wrong first:
 
 A clean run is `differing: 0`.
 
+## What a rule does
+
+`core-bench.js` asks what the corpora above cannot: not "which rule matched" or
+"what reached the origin for one request", but what the rule then **did**.
+
+```sh
+WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-bench.js
+PORT_BASE=21900 CASES=frame,tcp node core-bench.js     # some groups only
+node run.js network --only core                        # as the gate runs it
+```
+
+It starts its own whistle and whistle-rs and four servers of its own, on
+`PORT_BASE` … `PORT_BASE+5` (an HTTP and WebSocket origin, a raw TCP echo, an
+origin that demands a client certificate, a plugin). About three minutes.
+
+| Group | What it asks | Cases |
+|---|---|---|
+| `regexp` | a pattern, filter or replace written with what only JavaScript's regexps read — lookahead, lookbehind, backreferences, named groups — matches the same, and its negative control does not | 19 |
+| `script` | what `reqScript`/`resScript` helpers *return*: `parseQuery`, `parseUrl`, `Buffer`, `iconv`, `RegExp.$1` | 55 |
+| `frame` | a `frameScript` on a WebSocket: state between frames, binary frames, handlers that drop, throw, send | 21 |
+| `tcp` | a `frameScript` on a plain TCP tunnel | 7 |
+| `log` | `log://` puts a collector into a page, and nothing into a page without the rule or into plain text | 3 |
+| `mtls` | `tlsOptions://` hands the origin a client certificate (PEM, PFX); wrong key, wrong CA and wrong passphrase are refused | 9 |
+| `plugin` | one-sided — upstream has no `--plugin` — a plugin whose manifest cannot be read blocks rather than lets through | 4 |
+
+Every case has a negative control next to it, and a case counts only when the
+**origin** saw the effect — a `200` from the proxy proves nothing. The
+differences are declared under `core-bench.js` in `declared.js`: six that this
+port means (a binary frame stays binary, `Buffer` and `ctx` exist inside a
+handler, …), and ten more on 2.10.8 only, all one upstream bug fixed in 2.10.10.
+A clean run ends:
+
+```
+whistle 2.10.10 — ran: 114  differing: 0  declared: 6  stale: 0  one-sided: 4 (0 failed)
+```
+
+`DIFF` in its output is a difference nothing declares, `decl` one that is
+declared, `STALE` a declaration whose difference no longer happens. A `CASES=`
+run never reports stale, because the cases it skipped are not there to check.
+
 ## Which whistle, though
 
 "Agrees with 2.10.8" is not the same claim as "agrees with whistle". Some

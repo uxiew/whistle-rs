@@ -145,6 +145,10 @@ const NETWORK = [
   { name: 'modes', args: ['mode-bench.js'], ports: range(0, 3), timeout: 20 * MINUTE },
   { name: 'forwarded', args: ['forwarded-bench.js'], ports: range(0, 3), timeout: 15 * MINUTE },
   { name: 'header-rules', args: ['header-rules-bench.js'], ports: range(0, 3), timeout: 15 * MINUTE },
+  // What a rule *does*, where the corpora above can only see that it matched:
+  // JavaScript-only regexps, script helpers' return values, frame scripts with
+  // state, page logs, client certificates. Its own proxies and four servers.
+  { name: 'core', args: ['core-bench.js'], ports: range(0, 5), timeout: 15 * MINUTE, json: true },
   // Upstream's own test suite. Its ports are its own and fixed — the units
   // spell them out in their URLs — so this step does not move with --port-base.
   // It fetches upstream's `test/` into `target/` on first use.

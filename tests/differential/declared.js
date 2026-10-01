@@ -247,6 +247,48 @@ const DECLARED = {
     d('an empty write path', ['file cwd:echo'],
       'upstream writes the dump to a path relative to its cwd; this port writes nothing. See the case\'s comment'),
   ],
+
+  // `frameScript://` — RULES.md, "frameScript", says each of these in full.
+  'core-bench.js': [
+    // Where upstream's answer is an accident of its implementation rather than
+    // something a script could want, this port does the thing the documentation
+    // describes. Each is a place a working upstream script keeps working here;
+    // none is a place a script that works here was written against upstream.
+    d('frame: a binary frame the handler leaves alone', ['answer'],
+      'upstream re-sends every frame a handler saw as text (no opts.binary), so a binary frame arrives as mangled text; '
+      + 'this port keeps the opcode the frame came with'),
+    d('frame: the handler is handed a Buffer', ['answer'],
+      'upstream clears the vm context\'s globals once the script has run, so `Buffer` is undefined inside a handler '
+      + '(2.10.10 delivers the ReferenceError as the frame; 2.10.8 never runs the handler); here the globals stay'),
+    d('frame: sendToClient from inside a handler', ['answer'],
+      'the same cleared context: `ctx` is undefined inside an upstream handler unless the script captured it first. '
+      + 'Here `ctx.sendToClient` works from a handler, which is what frameScript.md\'s own example does'),
+    d('frame: a frame the script sends is passed to its own handler', ['answer'],
+      'upstream replaces the top-level sendToServer when that direction\'s handler is installed, and the frame sent '
+      + 'before it is lost; here it is delivered, through the handler like any other'),
+    d('frame: what the script sees while it runs', ['answer'],
+      'this port also offers `ctx.frame` and `ctx.direction` (its older one-shot form, kept for scripts written for it); '
+      + 'everything upstream defines has the same type on both sides'),
+    d('tcp: a tunnel script that sends data of its own', ['answer'],
+      'upstream writes the script\'s sendToClient into the tunnel before its own `200 Connection Established`, so the '
+      + 'client sees bytes where the CONNECT answer should be and the tunnel never opens; here they follow the 200'),
+    // 2.10.8 hands a client's frame to the handler for *server* frames
+    // (ws-bench.js header), so `handleSendToServerFrame` never sees one. Fixed
+    // in 2.10.10, which is what this port follows.
+    ...['frame: state kept between the frames of one connection',
+      'frame: state is per connection, not shared',
+      'frame: a binary frame reaches the handler',
+      'frame: a handler that returns nothing drops the frame',
+      'frame: a handler that throws',
+      'frame: what a handler is handed',
+      'frame: sendToClient from a handler, through the other handler',
+      'frame: sendToServer from the handler for that direction',
+      'frame: a handler that asks for a binary frame',
+      'frame: what a handler may return',
+    ].map((n) => only(['2.10.8'], n, ['answer'],
+      '2.10.8 hands a client frame to the handler for server frames, so handleSendToServerFrame never runs on one; '
+      + 'fixed in 2.10.10, and right here. ws-bench.js header')),
+  ],
 };
 
 /**

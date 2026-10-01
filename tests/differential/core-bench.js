@@ -25,8 +25,12 @@
 // there is nothing to compare, and they assert what whistle-rs must do on its
 // own (see `ONE_SIDED`).
 //
-// Prints `{ ran, differing, declared, stale, report, raw }` like the other JSON
-// benches, and exits 1 on a difference `declared.js` does not name.
+// A difference is excused only when `declared.js` names the case (under
+// `core-bench.js`) for the whistle being measured; anything else exits 1, and
+// so does a declaration whose difference no longer happens. With `--json FILE`
+// it also writes `{ ran, differing, declared, stale, report, raw, oneSided }`.
+// A `CASES=` run is for working on one group: it does not report stale
+// declarations, because the cases they name were not run.
 'use strict';
 
 const crypto = require('crypto');
@@ -43,6 +47,7 @@ const BASE = Number(process.env.PORT_BASE || 21900);
 const [W, RS, ORIGIN, TCP, MTLS, PLUGIN] = [BASE, BASE + 1, BASE + 2, BASE + 3, BASE + 4, BASE + 5];
 const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
 const WHISTLE = require('./whistle-pkg');
+const { judge } = require('./declared');
 const STATE = process.env.DIFF_STATE || fs.mkdtempSync(path.join(os.tmpdir(), 'wrs-core-'));
 const ONLY = process.env.CASES ? new Set(process.env.CASES.split(',')) : null;
 const JSON_OUT = (() => { const i = process.argv.indexOf('--json'); return i > 0 ? process.argv[i + 1] : null; })();
@@ -661,7 +666,7 @@ async function main() {
       }
       const same = answers.whistle === answers.rs;
       raw.push({ case: `${c.group}: ${c.name}`, whistle: answers.whistle, rs: answers.rs, same });
-      if (!same) report.push({ case: `${c.group}: ${c.name}`, field: 'answer', whistle: answers.whistle, rs: answers.rs });
+      if (!same) report.push({ name: `${c.group}: ${c.name}`, problems: [`answer: whistle=${answers.whistle} rs=${answers.rs}`] });
     }
     if (!ONLY || ONLY.has('plugin')) oneSidedResults = await oneSided();
   } finally {
@@ -669,12 +674,20 @@ async function main() {
     for (const s of servers) s.close();
   }
   const failed = oneSidedResults.filter((r) => !r.ok);
-  const out = { ran: raw.length, differing: report.length, report, raw, oneSided: oneSidedResults };
+  const verdict = judge('core-bench.js', report, raw.map((r) => r.case));
+  const news = new Set(verdict.news.map((n) => n.name));
+  const stale = ONLY ? [] : verdict.stale;
+  const out = {
+    ran: raw.length, differing: verdict.news.length, declared: verdict.declared, stale,
+    report: verdict.news, raw, oneSided: oneSidedResults,
+  };
   if (JSON_OUT) fs.writeFileSync(JSON_OUT, JSON.stringify(out, null, 2));
-  for (const r of raw) console.log(`${r.same ? 'same' : 'DIFF'}  ${r.case}${r.same ? `\n        ${r.rs}` : `\n        whistle ${r.whistle}\n        rs      ${r.rs}`}`);
+  const mark = (r) => (r.same ? 'same' : news.has(r.case) ? 'DIFF' : 'decl');
+  for (const r of raw) console.log(`${mark(r)}  ${r.case}${r.same ? `\n        ${r.rs}` : `\n        whistle ${r.whistle}\n        rs      ${r.rs}`}`);
+  for (const e of stale) console.log(`STALE ${e.case}: ${e.why}`);
   for (const r of oneSidedResults) console.log(`${r.ok ? 'ok  ' : 'FAIL'}  plugin: ${r.name}${r.ok ? '' : `\n        got    ${JSON.stringify(r.got)}\n        expect ${JSON.stringify(r.expect)}`}`);
-  console.log(`\n${raw.length} compared against whistle ${WHISTLE.version}: ${report.length} differ; ${oneSidedResults.length} one-sided: ${failed.length} fail`);
-  process.exit(report.length || failed.length ? 1 : 0);
+  console.log(`\nwhistle ${WHISTLE.version} — ran: ${raw.length}  differing: ${verdict.news.length}  declared: ${verdict.declared}  stale: ${stale.length}  one-sided: ${oneSidedResults.length} (${failed.length} failed)`);
+  process.exit(verdict.news.length || stale.length || failed.length ? 1 : 0);
 }
 
 main().catch((e) => { console.error(e); process.exit(2); });
