@@ -1034,6 +1034,7 @@ class RequestCtx extends BaseCtx {
     super(payload);
     this.clientIp = payload.clientIp || undefined;
     this._rules = [];
+    this._values = {};
     this._response = null;
   }
 
@@ -1043,6 +1044,17 @@ class RequestCtx extends BaseCtx {
    */
   setRules(rules) {
     if (rules) this._rules.push(String(rules));
+    return this;
+  }
+
+  /**
+   * Values for the `{name}` / `${name}` references in the rules you set — a
+   * mock body, a header list. They win over the proxy's own values of the same
+   * name, and only your rules see them. A non-string value is sent as JSON.
+   * Call more than once to add more; a later name replaces an earlier one.
+   */
+  setValues(values) {
+    Object.assign(this._values, values || {});
     return this;
   }
 
@@ -1064,6 +1076,7 @@ class RequestCtx extends BaseCtx {
   _result() {
     const out = {};
     if (this._rules.length) out.rules = this._rules.join('\n');
+    if (Object.keys(this._values).length) out.values = this._values;
     if (this._response) out.response = this._response;
     if (Object.keys(this._set).length) out.setHeaders = this._set;
     if (this._remove.length) out.removeHeaders = this._remove;

@@ -350,6 +350,17 @@ pub fn claim_short_protocol(
     if !plugin_like || !registered(name) {
         return;
     }
+    // The value as written, not as resolved: a destination has the request's
+    // path joined onto it (`matcher::joins_tail`), so `abc://deep` on a request
+    // for `/x` reads `abc://deep/x` here — and the plugin's value is `deep`,
+    // as upstream hands it over (`getMatcher`, before any join). `raw` is the
+    // token as written; when a template or a value rewrote it, it no longer
+    // starts with the name, and the resolved value is all there is.
+    let rest = op
+        .raw
+        .strip_prefix(name)
+        .and_then(|r| r.strip_prefix("://"))
+        .unwrap_or(rest);
     let value = match rest.is_empty() {
         true => name.to_string(),
         false => format!("{name}/{rest}"),
@@ -471,6 +482,12 @@ pub struct PluginResp {
 pub struct PluginResult {
     /// whistle rules to merge into the resolved set for this request.
     pub rules: Option<String>,
+    /// Values for those rules' `{name}` references, private to them: they win
+    /// over the console's store of the same name, and no other rule sees them.
+    /// Upstream's rules hook returns `{rules, values}` and files the values
+    /// under the plugin's own name (`util.toPrivateValues`,
+    /// `_original/lib/plugins/index.js:986`).
+    pub values: HashMap<String, String>,
     /// A response that short-circuits the upstream request.
     pub response: Option<PluginResp>,
     /// Headers to set on the outgoing request (replacing any existing value).
@@ -999,6 +1016,7 @@ fn parse_request_result(bytes: &[u8]) -> PluginResult {
     });
     PluginResult {
         rules,
+        values: parse_values(v.get("values")),
         response,
         set_headers: parse_headers_value(v.get("setHeaders")),
         remove_headers: parse_string_list(v.get("removeHeaders")),
@@ -1071,6 +1089,25 @@ fn parse_headers_value(v: Option<&serde_json::Value>) -> Vec<(String, String)> {
 }
 
 /// Accept a list of names as an array, or a single string.
+/// `"values": {"name": …}` — a string as it is, anything else as its JSON,
+/// which is what upstream's `getValueFor` does with an object
+/// (`JSON.stringify(val)`, `_original/lib/rules/rules.js:792`).
+fn parse_values(v: Option<&serde_json::Value>) -> HashMap<String, String> {
+    let Some(serde_json::Value::Object(map)) = v else {
+        return HashMap::new();
+    };
+    map.iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, v)| {
+            let text = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), text)
+        })
+        .collect()
+}
+
 fn parse_string_list(v: Option<&serde_json::Value>) -> Vec<String> {
     match v {
         Some(serde_json::Value::Array(arr)) => arr.iter().map(value_to_string).collect(),
@@ -1776,9 +1813,31 @@ mod tests {
         assert!(parse_match("  ", false).is_none());
     }
 
+    /// `values` off the wire: a string as it is, anything else as its JSON
+    /// (upstream's `JSON.stringify`, so compact), and `null` as nothing.
+    #[test]
+    fn values_are_read_as_text() {
+        let r = parse_request_result(
+            br#"{"rules":"* resBody://{page}","values":{"page":"<p>hi</p>","data":{"ok":true,"n":[1,2]},"gone":null}}"#,
+        );
+        assert_eq!(r.values.get("page").map(String::as_str), Some("<p>hi</p>"));
+        assert_eq!(
+            r.values.get("data").map(String::as_str),
+            // In the order sent, as `JSON.stringify` keeps it.
+            Some(r#"{"ok":true,"n":[1,2]}"#)
+        );
+        assert!(!r.values.contains_key("gone"));
+        assert!(
+            parse_request_result(br#"{"values":"nope"}"#)
+                .values
+                .is_empty()
+        );
+    }
+
     /// `abc://value` is plugin `abc`'s rule when `abc` is registered, and a
     /// destination otherwise — `http://`, a dotted host and an unknown name
-    /// all keep the slot.
+    /// all keep the slot. The value is the one written: the request's path
+    /// (`/x/y` here), which a destination has joined onto it, is not part of it.
     #[test]
     fn a_registered_name_claims_its_own_protocol() {
         let resolve = |rules: &str| {
@@ -1789,7 +1848,7 @@ mod tests {
                 "http",
                 "example.com",
                 80,
-                "/",
+                "/x/y",
                 &hyper::HeaderMap::new(),
                 None,
             );

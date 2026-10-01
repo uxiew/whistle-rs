@@ -244,3 +244,69 @@ async fn a_plugin_name_is_a_protocol_of_its_own() {
     );
     p.shutdown().await;
 }
+
+/// A plugin that hands back rules **and** the values they name — upstream's
+/// `{rules, values}` — the way a mock plugin carries its bodies.
+struct Mocks;
+
+impl whistle_rs::plugins::RustPlugin for Mocks {
+    fn name(&self) -> &str {
+        "mocks"
+    }
+
+    fn on_request(
+        &self,
+        _req: &whistle_rs::plugins::PluginReq,
+    ) -> whistle_rs::plugins::PluginResult {
+        let mut values = std::collections::HashMap::new();
+        values.insert("who".to_string(), "the plugin".to_string());
+        values.insert("body".to_string(), "mocked by the plugin".to_string());
+        whistle_rs::plugins::PluginResult {
+            rules: Some("* resHeaders://x-who=${who} resBody://{body}".into()),
+            values,
+            ..Default::default()
+        }
+    }
+}
+
+/// The plugin's values answer its own rules ahead of the store's entry of the
+/// same name — and only its own: the console's rule on the same request still
+/// reads the store.
+#[tokio::test]
+async fn a_plugins_rules_read_the_values_it_sent_with_them() {
+    let at = origin().await;
+    let p = whistle_rs::embed::Proxy::builder()
+        .port(0)
+        .persist_sessions(false)
+        .storage_dir(std::env::temp_dir().join(format!(
+            "whistle-rs-switches-e2e-values-{}",
+            std::process::id()
+        )))
+        .rules(format!(
+            "{at} plugin://mocks reqHeaders://x-store=${{who}}\n"
+        ))
+        .value("who", "the store")
+        .plugin(Mocks)
+        .start()
+        .await
+        .expect("proxy starts");
+    let (head, body) = get(p.addr(), &format!("http://{at}/")).await;
+    assert!(head.contains("x-who: the plugin"), "{head}");
+    assert_eq!(body, "mocked by the plugin");
+    // What reached the origin carried the store's value: the plugin's are
+    // private to the plugin's rules.
+    let sent = p
+        .state()
+        .sessions
+        .lock()
+        .unwrap()
+        .back()
+        .expect("a session")
+        .req_headers
+        .clone();
+    assert!(
+        sent.iter().any(|(k, v)| k == "x-store" && v == "the store"),
+        "{sent:?}"
+    );
+    p.shutdown().await;
+}

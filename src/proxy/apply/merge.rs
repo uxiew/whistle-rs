@@ -32,6 +32,39 @@ pub fn merge_rules_text(
     mgr
 }
 
+/// [`merge_rules_text`] for the rules a plugin's request hook returned, with
+/// the values it returned beside them.
+///
+/// The values answer the text's `{name}` before the console's store does, and
+/// only the text's: they are filed under a scope of the plugin's own (see
+/// [`RuleManager::adopt_scope`]), which is upstream's `toPrivateValues` under
+/// the plugin's name. A ``` block in the text is the plugin's too, and lies over
+/// them. The caller lays [`RuleManager::carried_values`] into the map it
+/// substitutes against.
+///
+/// Without values this is `merge_rules_text` exactly — the store alone — so a
+/// plugin that returns none sees no change.
+#[must_use = "the caller must keep this for the response phase"]
+pub fn merge_plugin_rules(
+    resolved: &mut Resolved,
+    info: &ReqInfo,
+    plugin: &str,
+    text: &str,
+    values: HashMap<String, String>,
+    is_internal_req: bool,
+) -> RuleManager {
+    if values.is_empty() {
+        return merge_rules_text(resolved, info, text, is_internal_req);
+    }
+    let mut mgr = RuleManager::new();
+    mgr.set_text(text);
+    // `\u{1}` cannot be typed into a rules file, so no group of the user's
+    // can share the scope.
+    mgr.adopt_scope(&format!("\u{1}plugin {plugin}"), values);
+    merge_resolved(resolved, mgr.resolve_scoped(info, is_internal_req));
+    mgr
+}
+
 /// Resolve a rules text merged mid-request a second time, now that the response
 /// head is in, and fold what it withheld into `resolved`.
 ///

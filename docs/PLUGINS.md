@@ -908,6 +908,7 @@ fn ui(&self, req: &UiReq) -> UiResp {
 |------|------|
 | `ctx.clientIp` | 客户端 IP（已知时） |
 | `ctx.setRules(rules)` | 注入 whistle 规则；可多次调用，以换行拼接 |
+| `ctx.setValues({ name: value })` | 给 `setRules` 注入的规则里的 `{name}` / `${name}` 提供值。只有这个插件的规则看得到，和控制台 Values 重名时**插件的优先**；不是字符串的值按 JSON 发送。可多次调用，同名后者覆盖前者 |
 | `ctx.respond({statusCode, headers, body})` | 直接应答，**不触达上游** |
 
 ### `onResponse` 专有
@@ -918,7 +919,18 @@ fn ui(&self, req: &UiReq) -> UiResp {
 | `ctx.setStatus(code)` | 改写状态码 |
 | `ctx.setBody(body)` | 替换响应体（字符串 / Buffer / 可 JSON 序列化的值） |
 
-`setHeader` / `setRules` / `setStatus` / `setBody` 都返回 `ctx`，可以链式调用。
+`setHeader` / `setRules` / `setValues` / `setStatus` / `setBody` 都返回 `ctx`，可以链式调用。
+
+`setValues` 的典型用法是让插件自带 mock 内容，不用让用户先去 Values 里建一项：
+
+```js
+onRequest(ctx) {
+  ctx.setRules('* resBody://{page} resHeaders://x-mocked-by=${who}')
+     .setValues({ page: { ok: true, items: [] }, who: 'mocks' });
+}
+```
+
+注意 `{name}` 只在**整个值**就是它时才替换（`resBody://{page}`），值的中间要写 `${name}`（`x-mocked-by=${who}`）——写成 `x-mocked-by={who}`，响应头里就是字面的 `{who}`。这条规则和上游一样，见 [RULES 的 values 一节](RULES.md#flags-includes--values)。
 
 ---
 
@@ -1088,6 +1100,7 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 
 ```json
 { "rules": "example.com resHeaders://x=1",
+  "values": { "page": "<h1>mock</h1>" },
   "setHeaders": { "x-foo": "bar" },
   "removeHeaders": ["cookie"],
   "response": { "statusCode": 200, "headers": {}, "body": "…" } }

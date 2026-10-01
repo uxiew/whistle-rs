@@ -79,6 +79,12 @@ export interface RequestCtx extends BaseCtx {
    * are joined with newlines.
    */
   setRules(rules: string): this;
+  /**
+   * Values for the `{name}` / `${name}` references in the rules you set. They
+   * win over the proxy's own values of the same name, and only your rules see
+   * them. A non-string value is sent as JSON.
+   */
+  setValues(values: Record<string, string | number | boolean | object>): this;
   /** Answer the request directly, skipping the upstream entirely. */
   respond(response: MockResponse): this;
 }

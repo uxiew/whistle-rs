@@ -635,17 +635,21 @@ pub(super) async fn serve(
                 ledger.unapplied(plugin_hook_failed(&resolved, name, "request", why));
             }
             if let Some(rules) = result.rules {
-                merged_rules.push(apply::merge_rules_text(
+                let mgr = apply::merge_plugin_rules(
                     &mut resolved,
                     &info,
+                    name,
                     &rules,
+                    result.values,
                     is_internal_req,
-                ));
+                );
                 {
-                    let values = state.values.read().unwrap();
+                    let mut values = state.values.read().unwrap().clone();
+                    values.extend(mgr.carried_values().clone());
                     let tpl = tpl_ctx(&bind_host, state.config.port, &info);
                     apply::substitute_values(&mut resolved, &values, tpl);
                 }
+                merged_rules.push(mgr);
                 // A plugin's rules can name a file or a URL too, and its
                 // operators have not been past the loader.
                 apply::load_rule_values(&mut resolved, &info).await;
