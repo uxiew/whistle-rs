@@ -246,7 +246,7 @@
 
 ## 执行顺序与交接
 
-Q1–Q3、S1、U0、O1、O2、R1、U1、PERF1、M1 与 D1 都已完成。第二轮（CORE-01 → CORE-03 → CORE-04 → CORE-02 → CORE-05，QA-01 跟着每一项走，最后 EXT-01 / CTRL-01）2026-10-01 全部完成，在 `core-parity` 分支上，还没合进 main、没在 GitHub CI 上跑过。
+Q1–Q3、S1、U0、O1、O2、R1、U1、PERF1、M1 与 D1 都已完成。第二轮（CORE-01 → CORE-03 → CORE-04 → CORE-02 → CORE-05，QA-01 跟着每一项走，最后 EXT-01 / CTRL-01）2026-10-01 全部完成，同日合进 main，GitHub CI 五个平台全过；全量差分 workflow 还没在 GitHub 上跑过（见 [STATUS](STATUS.md#2026-10-01-第二轮同名规则的实际效果)）。
 
 以后的新任务照上面的格式加进来：写清验收条件和依赖，有证据再勾选，并同步 STATUS。各项留下的剩余风险在 STATUS 各自的记录里，挑出来做时单独立项，不要直接改旧项的勾选。
 
