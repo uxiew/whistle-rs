@@ -80,6 +80,12 @@ pub struct Query {
     /// against it, exactly as [`crate::proxy::resolve_response_phase`] does.
     #[serde(default)]
     pub response: Option<Response>,
+    /// The plugins registered, by name — so that `abc://value` reads as the
+    /// plugin `abc`'s rule, as it does in the proxy (see
+    /// [`crate::plugins::claim_short_protocol`]), rather than as a destination.
+    /// The console fills it in; empty, the line is reported as written.
+    #[serde(default)]
+    pub plugins: Vec<String>,
 }
 
 /// The response head a [`Query`] may carry.
@@ -227,6 +233,10 @@ fn explain_inner(query: &Query) -> Result<Explanation, String> {
             },
         },
     );
+
+    crate::plugins::claim_short_protocol(&mut resolved, |name| {
+        query.plugins.iter().any(|p| p == name)
+    });
 
     let slot_order = resolved.slot().map(|op| op.order);
     let mut ops: Vec<Op> = resolved

@@ -808,6 +808,10 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
         body: args.body.clone(),
         client_ip: args.client_ip.clone(),
         response,
+        // No proxy is running, so only the built-in plugins are known: a
+        // `--plugin` or `--node-plugin` name reads as a destination here, and
+        // as its plugin in the console's Test Rules.
+        plugins: whistle_rs::plugins::Plugins::new().names(),
     };
     let explanation = explain::explain(&query).map_err(|e| anyhow::anyhow!(e))?;
     if args.json {

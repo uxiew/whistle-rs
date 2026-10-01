@@ -1845,22 +1845,35 @@ nothing.
 
 | Operator | Value | Effect |
 |----------|-------|--------|
-| `plugin` | `name[/extra]` | Route the request to a registered plugin server |
+| `plugin` | `name[/extra]` | Run a registered plugin's hooks for the request |
 
-Register plugin servers on the command line (repeatable):
+Three spellings, one rule — the second and third are upstream's:
+
+```
+api.example.com   plugin://mock/extra
+api.example.com   whistle.mock://extra
+api.example.com   mock://extra
+```
+
+The plugin sees `extra` as its `param`. The short one, `mock://`, works only for a
+name that is **registered when the request arrives**: a protocol this port does not
+know is otherwise a destination URL (`example.com http://localhost:5173`), and so is
+`mock://` with no plugin called `mock` — which then fails the request with
+`unsupported protocol mock:`. Upstream decides it the same way, at request time
+(`getPluginByPluginRule`, `_original/lib/plugins/index.js:1406-1421`). The
+console's Test Rules knows the registered names; `whistle-rs explain` runs without a
+proxy and knows only the built-in ones.
+
+Register plugins on the command line (repeatable), or start one from a script:
 
 ```bash
 whistle-rs --plugin echo=127.0.0.1:9300 --plugin mock=127.0.0.1:9400
+whistle-rs --node-plugin mock=./mock-plugin.js
 ```
 
-The matched request is forwarded to the plugin over HTTP with context headers
-`x-whistle-plugin`, `x-whistle-req-url`, and `x-whistle-req-method`; the plugin's
-response is relayed back. (whistle's Node subprocess plugin loader is not ported;
-plugins here are any HTTP server.)
-
-```
-api.example.com   plugin://mock
-```
+What a plugin is asked, and how it answers, is [`PLUGINS.md`](PLUGINS.md). A
+plugin switched off in the console is, to every rule that names it, not there —
+see [the switches](API.md#开关https全部规则插件).
 
 A plugin that answers the request is **not** the last word: the response operators on
 the line still run over its answer, and so does the [response phase](#the-response-phase)

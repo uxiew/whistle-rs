@@ -3,7 +3,9 @@
 //! answers when a switch is not there to move.
 //!
 //! The HTTPS switch is tested where a tunnel decides, in `src/proxy/tunnel.rs`
-//! (`the_https_switch_is_read_at_each_connect`); here only its API.
+//! (`the_https_switch_is_read_at_each_connect`); here only its API. Also here,
+//! because it is how a plugin is most often named: `name://`, upstream's short
+//! spelling of a plugin's rule.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -207,5 +209,38 @@ async fn a_switch_a_mode_took_away_answers_409_and_changes_nothing() {
     // Malformed is 400, not 409.
     let (status, _) = api(p.addr(), "POST", "/api/switches", r#"{"rules":"no"}"#).await;
     assert_eq!(status, 400);
+    p.shutdown().await;
+}
+
+/// `echo://hi` is the built-in `echo` plugin's rule, as `whistle.echo://hi`
+/// is: it used to be read as a destination with the scheme `echo:` and failed
+/// every request. A name no plugin has still is one — and still fails. Switched
+/// off, the plugin is not there and the request reaches its origin.
+#[tokio::test]
+async fn a_plugin_name_is_a_protocol_of_its_own() {
+    let at = origin().await;
+    let p = proxy(
+        format!("{at}/echo echo://hi\n{at}/nosuch nosuch://hi\n"),
+        None,
+    )
+    .await;
+    let (_, body) = get(p.addr(), &format!("http://{at}/echo")).await;
+    assert!(body.contains("echo (rust)"), "{body}");
+
+    let (head, body) = get(p.addr(), &format!("http://{at}/nosuch")).await;
+    assert!(head.starts_with("http/1.1 502"), "{head}");
+    assert!(body.contains("unsupported protocol nosuch:"), "{body}");
+
+    api(
+        p.addr(),
+        "POST",
+        "/api/plugin/switch",
+        r#"{"name":"echo","on":false}"#,
+    )
+    .await;
+    assert_eq!(
+        get(p.addr(), &format!("http://{at}/echo")).await.1,
+        "origin"
+    );
     p.shutdown().await;
 }

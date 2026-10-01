@@ -543,6 +543,9 @@ pub(super) async fn serve(
         managers
     };
     apply::substitute_config_vars(&mut resolved, state.config.port, crate::config::VERSION);
+    // `abc://value` for a plugin called `abc` — before anything reads the
+    // destination slot it was parsed into.
+    state.plugins.claim_short_protocol(&mut resolved);
     // Operator values that name a file or a URL are read here — the one point
     // where the whole resolved set is in hand and the request has gone nowhere
     // yet. A rule set that names no location walks its own operators and

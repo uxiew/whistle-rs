@@ -26,7 +26,7 @@ whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 
 | 规则 | 钩子 | body |
 |------|------|------|
-| `plugin://<name>[/<param>]` | `onRequest` / `onResponse` | 整体缓冲，需显式声明 |
+| `plugin://<name>[/<param>]`，也可写成上游的 `whistle.<name>://<param>` 或 `<name>://<param>`（见 [RULES 的 Plugins](RULES.md#plugins)） | `onRequest` / `onResponse` | 整体缓冲，需显式声明 |
 | `pipe://<name>[(<value>)]` | `pipeRequest` / `pipeResponse` | **流式，永不缓冲** |
 | 两者皆可，命中 WebSocket 时 | `onWsFrame` | 逐帧，一次一帧 |
 

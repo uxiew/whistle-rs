@@ -276,6 +276,10 @@ pub(super) async fn explain_rules(
         query.values = state.values.read().unwrap().clone();
         query.overrides = state.config.value_overrides.clone();
     }
+    // Which `abc://` lines are a plugin's is the registry's to say.
+    if query.plugins.is_empty() {
+        query.plugins = state.plugins.names();
+    }
     match crate::explain::explain(&query) {
         Ok(answer) => {
             let json = serde_json::to_string(&answer).unwrap_or_else(|_| "{}".into());

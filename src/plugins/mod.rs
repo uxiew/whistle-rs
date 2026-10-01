@@ -313,6 +313,53 @@ pub fn matched(resolved: &Resolved) -> Vec<PluginMatch> {
     out
 }
 
+/// `name://value` naming a registered plugin is that plugin's rule:
+/// `plugin://name/value`.
+///
+/// Upstream's own short spelling — a plugin installed as `whistle.abc`
+/// answers `abc://value` (`getPluginByPluginRule`'s `PLUGIN_RULE_RE2`,
+/// `_original/lib/plugins/index.js:1406-1421`). It gets there the way this
+/// does: a protocol nothing else knows lands in the destination slot
+/// (`rules.js:1313-1316`), and the plugin is looked up from the slot at
+/// request time — which is the only time the registry is known. Without
+/// this the slot was forwarded as written, and `abc://value` failed every
+/// request with `unsupported protocol abc:`.
+///
+/// A plugin switched off is still claimed, and is then not there: the
+/// request goes to its origin, which is what it would do with
+/// `plugin://abc`, rather than failing on a scheme nobody serves.
+pub fn claim_short_protocol(
+    resolved: &mut crate::rules::Resolved,
+    registered: impl Fn(&str) -> bool,
+) {
+    let Some(op) = &resolved.slot else {
+        return;
+    };
+    if op.protocol != crate::rules::protocols::URL_REPLACE {
+        return;
+    }
+    let Some((name, rest)) = op.value.split_once("://") else {
+        return;
+    };
+    // `PLUGIN_RULE_RE2`'s name class: an ordinary scheme (`http`, a dotted
+    // host) never is one, and a registered name is asked for besides.
+    let plugin_like = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if !plugin_like || !registered(name) {
+        return;
+    }
+    let value = match rest.is_empty() {
+        true => name.to_string(),
+        false => format!("{name}/{rest}"),
+    };
+    let mut op = resolved.slot.take().expect("checked above");
+    op.protocol = "plugin".into();
+    op.value = value;
+    resolved.multi.entry("plugin".into()).or_default().push(op);
+}
+
 /// Parse one rule value into a [`PluginMatch`]. Returns `None` for an empty name.
 ///
 /// The extra grammar — `(value)` and the package prefixes — is `pipe://`-only,
@@ -1116,6 +1163,11 @@ impl Plugins {
         !self.off.all.load(Relaxed) && !self.off.names.read().unwrap().contains(name)
     }
 
+    /// [`claim_short_protocol`] against this registry.
+    pub fn claim_short_protocol(&self, resolved: &mut crate::rules::Resolved) {
+        claim_short_protocol(resolved, |name| self.contains(name));
+    }
+
     /// Is `name` registered **and** switched on — can a rule reach it?
     pub fn reachable(&self, name: &str) -> bool {
         self.live(name).is_some()
@@ -1722,6 +1774,52 @@ mod tests {
         assert_eq!(parse_match("whistle.x", false).unwrap().name, "whistle.x");
         assert_eq!(parse_match("p(v)", false).unwrap().name, "p(v)");
         assert!(parse_match("  ", false).is_none());
+    }
+
+    /// `abc://value` is plugin `abc`'s rule when `abc` is registered, and a
+    /// destination otherwise — `http://`, a dotted host and an unknown name
+    /// all keep the slot.
+    #[test]
+    fn a_registered_name_claims_its_own_protocol() {
+        let resolve = |rules: &str| {
+            let mut mgr = crate::rules::RuleManager::new();
+            mgr.set_text(rules);
+            let info = crate::proxy::apply::build_req_info(
+                "GET",
+                "http",
+                "example.com",
+                80,
+                "/",
+                &hyper::HeaderMap::new(),
+                None,
+            );
+            let mut resolved = mgr.resolve(&info);
+            claim_short_protocol(&mut resolved, |name| name == "audit");
+            resolved
+        };
+        let r = resolve("example.com audit://deep/param");
+        assert!(r.slot.is_none(), "no longer a destination");
+        let ms = matched(&r);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(
+            (ms[0].name.as_str(), ms[0].param.as_str()),
+            ("audit", "deep/param")
+        );
+        assert_eq!(
+            r.all("plugin")[0].raw,
+            "audit://deep/param",
+            "shown as written"
+        );
+        assert_eq!(matched(&resolve("example.com audit://")).len(), 1);
+        for kept in [
+            "example.com nosuch://x",
+            "example.com http://localhost:5173",
+            "example.com a.b://x",
+        ] {
+            let r = resolve(kept);
+            assert!(r.slot.is_some(), "{kept}");
+            assert!(matched(&r).is_empty(), "{kept}");
+        }
     }
 
     #[test]
