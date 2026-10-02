@@ -437,6 +437,16 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
   for (const [name, expr] of SCRIPTS) {
     list.push({ group: 'script', name, rulesFor: (port) => SCRIPT(expr.replace('__PORT__', String(port))), ask: scriptOut });
   }
+  // A script still running at its limit pushes nothing, and the request goes
+  // on: upstream stops it at 60 ms, this port at a second (its engine is
+  // slower). The loop calls a looping function, which the per-call loop limit
+  // does not stop — before the clock, this request never came back. Its twin,
+  // the same push without the loop, must arrive.
+  const LOOPS = 'function f() { for (var i = 0; i < 2000000; i++) {} }\nfor (var j = 0; j < 2000000; j++) f();\n';
+  add('script', 'a script past its time limit pushes nothing',
+    ROUTE + block('s.js', `${LOOPS}rules.push('* reqHeaders://x-probe=ran');`) + 'probe.test reqScript://{s.js}', header());
+  add('script', 'the same push from a script that finishes',
+    ROUTE + block('s.js', "rules.push('* reqHeaders://x-probe=ran');") + 'probe.test reqScript://{s.js}', header());
 
   // ── frameScript ──
   const FRAME = (body) => block('f.js', body) + `${O} frameScript://{f.js}`;
