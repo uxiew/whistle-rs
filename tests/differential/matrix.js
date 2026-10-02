@@ -60,8 +60,14 @@ function load(dir) {
  */
 function observe(dir, name) {
   const out = readMaybe(path.join(dir, 'steps', `${name}.out`)) || '';
-  const suiteJson = readMaybe(path.join(dir, 'steps', `${name}.json`));
-  if (suiteJson) return fromSuite(JSON.parse(suiteJson));
+  // A step's `--json` file is upstream-suite.js's verdict or a bench's report
+  // (core-bench.js's), told apart by shape: reading a report as a verdict
+  // throws on its `declared`, which is a count there and a list here.
+  const written = readMaybe(path.join(dir, 'steps', `${name}.json`));
+  if (written) {
+    const j = JSON.parse(written);
+    return j.judgedKeys ? fromSuite(j) : fromJson(j);
+  }
   let json = null;
   try { json = JSON.parse(out); } catch {}
   if (json) return fromJson(json);
@@ -87,6 +93,13 @@ function fromJson(j) {
   const cases = new Map();
   const items = [...(j.raw || []), ...(j.report || []), ...(j.excused || [])];
   for (const it of items) {
+    // core-bench.js's `raw` is every case, agreed or not, each side's answer
+    // already JSON text: `{ case, whistle, rs, same }`. Its differences are
+    // spelled the way its `report` spells them, so the two collapse into one.
+    if (it.case !== undefined) {
+      if (!it.same) add(cases, it.case, `answer: whistle=${it.whistle} rs=${it.rs}`);
+      continue;
+    }
     const name = it.name || it.mode || (it.group !== undefined ? `${it.group} ${it.text}` : '?');
     const problems = it.problems
       || (it.why ? [`qr: whistle=- rs=${it.why}`] : [`answer: whistle=${JSON.stringify(it.whistle)} rs=${JSON.stringify(it.rs)}`]);
