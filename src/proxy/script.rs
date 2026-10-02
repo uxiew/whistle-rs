@@ -42,22 +42,122 @@ use serde_json::json;
 /// JavaScript to the behaviour of Node's — see the file's own header.
 const NODE_PRELUDE: &str = include_str!("script_prelude.js");
 
-/// How many times one loop may go round before the engine stops the script
-/// with an error.
+/// How many times the loops of one call go round before the engine stops the
+/// script with an error.
 ///
-/// whistle gives a script 60 ms of wall clock (`VM_OPTIONS.timeout`,
-/// `_original/lib/util/index.js:423-426`). This engine cannot be interrupted
-/// from outside, so the bound is on what it can count: a `while (true) {}`
-/// used to hold its request — and, for a `frameScript`, its connection — for
-/// ever. Three million iterations of an empty loop take 21 ms in a release
-/// build on an M4 (`tests::cost_of_starting_a_script`), and a loop that does
-/// something takes several times that — generous for a script that is building
-/// a few rules, and far short of for ever.
-///
-/// It is per loop, not per script: two nested loops of two thousand each pass.
-/// That is a hole a hostile script walks through and an honest one does not
-/// find; the rules a script runs under are its author's own.
+/// The engine counts per call frame and never resets the count within one, so
+/// two nested loops of two thousand in one function are stopped, but a loop
+/// that calls a function with a loop of its own starts that count at zero on
+/// every call. [`TIME_LIMIT`] is what bounds that one; this stays because it
+/// stops a plain `while (true) {}` with a clearer message, and stops it in
+/// callbacks the clock cannot reach (see [`eval_bounded`]). Three million
+/// iterations of an empty loop take 21 ms in a release build on an M4, 727 ms
+/// in a debug build (`tests::cost_of_starting_a_script`).
 const LOOP_LIMIT: u64 = 3_000_000;
+
+/// How long one evaluation of a user's script may run: a `reqScript`, a
+/// `resScript`, a rules script, a `frameScript`'s top level or one call of
+/// its handler, a PAC file or one `FindProxyForURL`.
+///
+/// whistle gives a script 60 ms (`VM_OPTIONS.timeout`,
+/// `_original/lib/util/index.js:423-426`) and drops what it produced; past this,
+/// so does this port. It is wider than 60 ms because this engine is slower than
+/// V8 by an order of magnitude or more — the empty loop above is about 2 ms
+/// there — and a script that finishes in upstream must not be cut off here.
+///
+/// Before this there was no clock at all. A loop calling a function that loops
+/// held its request for ever, on one of tokio's worker threads; ten such
+/// requests on a ten-core machine stopped every other request, the console,
+/// and the handler that makes SIGTERM exit (STATUS, 2026-10-02).
+pub(crate) const TIME_LIMIT: Duration = Duration::from_secs(1);
+
+/// The engine's "clock cycles" between two looks at the clock. Each look is one
+/// poll and one `Instant::now()`; at this size it is a few microseconds of
+/// script between them, and too few to show in a script's cost.
+const BUDGET: u32 = 8192;
+
+/// Why a script did not finish.
+#[derive(Debug)]
+pub enum Stopped {
+    /// It threw, or did not parse.
+    Threw(boa_engine::JsError),
+    /// It was still running at its deadline, and was abandoned. The engine it
+    /// ran in is in the middle of a call and must not run anything again.
+    OutOfTime,
+    /// It never ran: the engine, or this port's own glue around the script,
+    /// failed to start. A bug here, not in the script; logged where it happens.
+    NotRun,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stopped::Threw(err) => write!(f, "threw: {err}"),
+            Stopped::NotRun => write!(f, "could not be run: the script engine did not start"),
+            Stopped::OutOfTime => write!(
+                f,
+                "was still running after {} ms and was stopped",
+                TIME_LIMIT.as_millis()
+            ),
+        }
+    }
+}
+
+/// Evaluate `src` in `ctx` as `ctx.eval` would, but give up at `deadline`.
+///
+/// The engine cannot be interrupted from outside, but it can be run a slice at
+/// a time: its async evaluation yields every [`BUDGET`] cycles, and between two
+/// slices the clock is read. Nothing here is asynchronous — the future is
+/// polled in place, on this thread, and dropped when time is up.
+///
+/// What a slice covers: the script's own code and every JavaScript function it
+/// calls, which the engine runs in the same loop. What it does not: JavaScript
+/// that a *built-in* calls back into — the callback of `forEach`, `map`,
+/// `sort`, `replace`, and the text `eval` runs, which is how the one-line
+/// `ctx.frame` shape of a `frameScript` runs per frame — which the engine runs
+/// in a nested loop of its own that never yields. A loop inside such a callback is bounded only by
+/// [`LOOP_LIMIT`] per call; that is why scripts also run off the runtime's
+/// workers ([`off_the_runtime`]), so that one that cannot be stopped holds its
+/// own request and nothing else.
+pub(crate) fn eval_bounded(
+    ctx: &mut Context,
+    src: &str,
+    deadline: Instant,
+) -> Result<JsValue, Stopped> {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let script = boa_engine::Script::parse(Source::from_bytes(src.as_bytes()), None, ctx)
+        .map_err(Stopped::Threw)?;
+    let run = script.evaluate_async_with_budget(ctx, BUDGET);
+    let mut run = std::pin::pin!(run);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let Poll::Ready(done) = run.as_mut().poll(&mut cx) {
+            return done.map_err(Stopped::Threw);
+        }
+        if Instant::now() >= deadline {
+            return Err(Stopped::OutOfTime);
+        }
+    }
+}
+
+/// Run `f`, which runs a script, where a slow one cannot stall the runtime.
+///
+/// On a multi-threaded runtime's worker this is `block_in_place`: the worker
+/// hands its other tasks to a fresh thread before `f` starts, so a script that
+/// takes its whole [`TIME_LIMIT`] — or one the clock cannot stop — delays its
+/// own request and no other. Anywhere else (a current-thread runtime, as in
+/// tests; a thread of its own) it is just `f()`: there is no worker to free,
+/// and `block_in_place` would panic.
+pub(crate) fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
 
 /// What every engine gets before anything else runs: the `RegExp` statics,
 /// and the Node parts as **stubs that load on first use**.
@@ -424,8 +524,8 @@ pub fn load_script(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-/// Run a `resScript` against the current response, returning any changes.
-/// Returns `None` if the script errored (the response is then left unchanged).
+/// Run a `resScript` against the current response, returning any changes, or
+/// why there are none — the response is then left as it was.
 pub fn run_res_script(
     src: &str,
     method: &str,
@@ -433,7 +533,22 @@ pub fn run_res_script(
     status: u16,
     headers: &[(String, String)],
     body: &str,
-) -> Option<ScriptResult> {
+) -> Result<ScriptResult, Stopped> {
+    off_the_runtime(|| {
+        res_script_in_place(src, method, url, status, headers, body).unwrap_or(Err(Stopped::NotRun))
+    })
+}
+
+/// [`run_res_script`] on this thread. `None` for this port's own failures;
+/// the script's are the inner `Err`.
+fn res_script_in_place(
+    src: &str,
+    method: &str,
+    url: &str,
+    status: u16,
+    headers: &[(String, String)],
+    body: &str,
+) -> Option<Result<ScriptResult, Stopped>> {
     let mut ctx = script_engine()?;
 
     let hdr_obj: serde_json::Map<String, serde_json::Value> = headers
@@ -450,14 +565,29 @@ pub fn run_res_script(
         .set(js_string!("ctx"), jsval, false, &mut ctx)
         .ok()?;
 
-    if let Err(err) = ctx.eval(Source::from_bytes(src.as_bytes())) {
-        tracing::debug!("resScript error: {err}");
-        return None;
+    if let Err(why) = eval_bounded(&mut ctx, src, Instant::now() + TIME_LIMIT) {
+        tracing::debug!("resScript {why}");
+        return Some(Err(why));
     }
 
-    let ctx_val = ctx.global_object().get(js_string!("ctx"), &mut ctx).ok()?;
-    let out = ctx_val.to_json(&mut ctx).ok()??;
-    let res = out.get("res")?;
+    // A script that replaced `ctx` or `ctx.res` with something unreadable
+    // changed nothing.
+    let unchanged = ScriptResult {
+        status: None,
+        headers: Vec::new(),
+        body: None,
+    };
+    let Some(out) = ctx
+        .global_object()
+        .get(js_string!("ctx"), &mut ctx)
+        .ok()
+        .and_then(|ctx_val| ctx_val.to_json(&mut ctx).ok().flatten())
+    else {
+        return Some(Ok(unchanged));
+    };
+    let Some(res) = out.get("res") else {
+        return Some(Ok(unchanged));
+    };
 
     let status = res
         .get("statusCode")
@@ -478,11 +608,11 @@ pub fn run_res_script(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    Some(ScriptResult {
+    Some(Ok(ScriptResult {
         status,
         headers: new_headers,
         body,
-    })
+    }))
 }
 
 /// Is this text a rules *text*, as opposed to JavaScript that produces one?
@@ -610,7 +740,9 @@ pub struct RulesScriptRes<'a> {
 /// alone, `parseUrl` left `user:pw@` in the host name, and `pattern` and `port`
 /// were `''` and `0`.
 pub fn run_rules_script(src: &str, input: &RulesScriptCtx<'_>) -> Option<String> {
-    produce_rules(src, input).map(|produced| produced.rules)
+    produce_rules(src, input)
+        .ok()
+        .map(|produced| produced.rules)
 }
 
 /// What a rules script left behind.
@@ -794,8 +926,15 @@ fn request_globals(input: &RulesScriptCtx<'_>) -> serde_json::Value {
     })
 }
 
-/// [`run_rules_script`], with the values the script set.
-pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> {
+/// [`run_rules_script`], with the values the script set — or why there are
+/// none, which the caller puts on the request's session.
+pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Result<Produced, Stopped> {
+    off_the_runtime(|| produce_in_place(src, input).unwrap_or(Err(Stopped::NotRun)))
+}
+
+/// [`produce_rules`] on this thread. `None` for this port's own failures; the
+/// script's are the inner `Err`.
+fn produce_in_place(src: &str, input: &RulesScriptCtx<'_>) -> Option<Result<Produced, Stopped>> {
     let mut ctx = script_engine()?;
     let mut globals = request_globals(input);
     globals["rules"] = json!([]);
@@ -803,30 +942,40 @@ pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> 
     set_globals(&mut ctx, &globals)?;
     ctx.eval(Source::from_bytes(REQUEST_GLUE.as_bytes())).ok()?;
 
-    let ran = ctx.eval(Source::from_bytes(src.as_bytes()));
+    let ran = eval_bounded(&mut ctx, src, Instant::now() + TIME_LIMIT);
     // Kept whether or not the script finished: upstream's context is the same
     // object before and after, so a write that happened before a throw stays.
-    if let Some(data @ serde_json::Value::Object(_)) = ctx
-        .global_object()
-        .get(js_string!("reqScriptData"), &mut ctx)
-        .ok()
-        .and_then(|v| v.to_json(&mut ctx).ok().flatten())
+    // Not after a timeout, which upstream keeps too: reading the object back
+    // may run a getter, and this engine was abandoned in the middle of a call.
+    if !matches!(ran, Err(Stopped::OutOfTime))
+        && let Some(data @ serde_json::Value::Object(_)) = ctx
+            .global_object()
+            .get(js_string!("reqScriptData"), &mut ctx)
+            .ok()
+            .and_then(|v| v.to_json(&mut ctx).ok().flatten())
         && let Ok(mut shared) = input.script_data.lock()
     {
         *shared = data;
     }
-    if let Err(err) = ran {
-        tracing::debug!("rules script error: {err}");
-        return None;
+    if let Err(why) = ran {
+        tracing::debug!("rules script {why}");
+        return Some(Err(why));
     }
 
+    // A script that left something other than a list in `rules` produced
+    // nothing, values included — as it always has here.
     let rules = ctx
         .global_object()
         .get(js_string!("rules"), &mut ctx)
-        .ok()?;
-    let rules = rules.to_json(&mut ctx).ok()??;
+        .ok()
+        .and_then(|rules| rules.to_json(&mut ctx).ok().flatten());
+    let Some(serde_json::Value::Array(rules)) = rules else {
+        return Some(Ok(Produced {
+            rules: String::new(),
+            values: HashMap::new(),
+        }));
+    };
     let lines: Vec<String> = rules
-        .as_array()?
         .iter()
         .map(|v| match v {
             serde_json::Value::String(s) => s.clone(),
@@ -849,10 +998,10 @@ pub fn produce_rules(src: &str, input: &RulesScriptCtx<'_>) -> Option<Produced> 
             .collect(),
         _ => HashMap::new(),
     };
-    Some(Produced {
+    Some(Ok(Produced {
         rules: lines.join("\n").trim().to_string(),
         values,
-    })
+    }))
 }
 
 // ── frameScript ────────────────────────────────────────────────────────────
@@ -1215,10 +1364,29 @@ fn frame_script_thread(
         return;
     }
     while let Ok(job) = inbox.recv() {
-        let outcome = relay_frame(&mut ctx, &job.frame, &handles).unwrap_or(FrameOutcome {
-            sent: Vec::new(),
-            frame: Some(job.frame),
-        });
+        let outcome = match relay_frame(&mut ctx, &job.frame, &handles) {
+            Ok(outcome) => outcome,
+            // A handler still running at its limit leaves the engine in the
+            // middle of a call: the script is over for this connection. Every
+            // frame from here on goes through as it came — this one too, and
+            // the legs stop asking once the handlers are gone.
+            Err(Stopped::OutOfTime) => {
+                tracing::warn!(
+                    "frameScript: a handler {}; frames on this connection now pass unscripted",
+                    Stopped::OutOfTime
+                );
+                handles.store(0, std::sync::atomic::Ordering::Release);
+                let _ = job.reply.send(FrameOutcome {
+                    sent: Vec::new(),
+                    frame: Some(job.frame),
+                });
+                return;
+            }
+            Err(_) => FrameOutcome {
+                sent: Vec::new(),
+                frame: Some(job.frame),
+            },
+        };
         let _ = job.reply.send(outcome);
     }
 }
@@ -1237,15 +1405,16 @@ fn start_frame_script(
     ctx.eval(Source::from_bytes(FRAME_GLUE.as_bytes()))
         .inspect_err(|err| tracing::error!("the frame-script glue does not evaluate: {err}"))
         .ok()?;
-    if let Err(err) = ctx.eval(Source::from_bytes(spec.src.as_bytes())) {
-        tracing::debug!("frameScript error: {err}");
+    if let Err(why) = eval_bounded(&mut ctx, &spec.src, Instant::now() + TIME_LIMIT) {
+        tracing::debug!("frameScript {why}");
         return None;
     }
     let started = call_frame(
         &mut ctx,
         "started",
         &[JsString::from(spec.src.as_str()).into()],
-    )?;
+    )
+    .ok()?;
     let started = started.as_array()?;
     handles.store(
         started.first()?.as_u64()? as u8,
@@ -1259,7 +1428,7 @@ fn relay_frame(
     ctx: &mut Context,
     frame: &ScriptFrame,
     handles: &std::sync::atomic::AtomicU8,
-) -> Option<FrameOutcome> {
+) -> Result<FrameOutcome, Stopped> {
     let answer = call_frame(
         ctx,
         "relay",
@@ -1269,37 +1438,58 @@ fn relay_frame(
             frame.binary.into(),
         ],
     )?;
-    let answer = answer.as_array()?;
-    // A handler may install or remove a handler.
-    handles.store(
-        answer.first()?.as_u64()? as u8,
-        std::sync::atomic::Ordering::Release,
-    );
-    let delivered = answer.get(2)?.as_array().and_then(|pair| {
-        Some(ScriptFrame {
-            to_server: frame.to_server,
-            data: bytes_of(pair.first()?.as_str()?),
-            binary: pair.get(1)?.as_bool()?,
+    let read = || {
+        let answer = answer.as_array()?;
+        // A handler may install or remove a handler.
+        handles.store(
+            answer.first()?.as_u64()? as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        let delivered = answer.get(2)?.as_array().and_then(|pair| {
+            Some(ScriptFrame {
+                to_server: frame.to_server,
+                data: bytes_of(pair.first()?.as_str()?),
+                binary: pair.get(1)?.as_bool()?,
+            })
+        });
+        Some(FrameOutcome {
+            sent: script_frames(answer.get(1)?),
+            frame: delivered,
         })
-    });
-    Some(FrameOutcome {
-        sent: script_frames(answer.get(1)?),
-        frame: delivered,
-    })
+    };
+    read().ok_or(Stopped::NotRun)
 }
 
-/// Call `__frame.<method>(…)` and read its answer back as JSON. `None` when
-/// the glue itself failed, which leaves the frame as it came.
-fn call_frame(ctx: &mut Context, method: &str, args: &[JsValue]) -> Option<serde_json::Value> {
-    let glue = ctx.global_object().get(js_string!("__frame"), ctx).ok()?;
-    let glue = glue.as_object()?.clone();
-    let function = glue.get(JsString::from(method), ctx).ok()?;
-    let function = function.as_callable()?;
-    let answer = function
-        .call(&JsValue::from(glue.clone()), args, ctx)
-        .inspect_err(|err| tracing::debug!("frameScript {method}: {err}"))
-        .ok()?;
-    answer.to_json(ctx).ok()?
+/// Call `__frame.<method>(…)` and read its answer back as JSON.
+///
+/// Called from a script, not with `JsObject::call`: a call made from outside
+/// runs to the end in one go, and the handler it reaches could not be stopped
+/// at [`TIME_LIMIT`]. From inside, it is part of the script [`eval_bounded`]
+/// runs a slice at a time. An `Err` other than [`Stopped::OutOfTime`] is the
+/// glue failing, which leaves the frame as it came.
+fn call_frame(
+    ctx: &mut Context,
+    method: &str,
+    args: &[JsValue],
+) -> Result<serde_json::Value, Stopped> {
+    let mut call = format!("__frame.{method}(");
+    for (i, arg) in args.iter().enumerate() {
+        let name = format!("__frameArg{i}");
+        ctx.global_object()
+            .set(JsString::from(name.as_str()), arg.clone(), false, ctx)
+            .map_err(Stopped::Threw)?;
+        if i > 0 {
+            call.push_str(", ");
+        }
+        call.push_str(&name);
+    }
+    call.push(')');
+    let answer = eval_bounded(ctx, &call, Instant::now() + TIME_LIMIT)
+        .inspect_err(|why| tracing::debug!("frameScript {method}: {why}"))?;
+    answer
+        .to_json(ctx)
+        .map_err(Stopped::Threw)?
+        .ok_or(Stopped::NotRun)
 }
 
 /// `[[toServer, binaryString, isBinary], …]` as the frames they are.
@@ -1570,13 +1760,14 @@ pub fn eval_pac(pac_src: &str, url: &str, host: &str) -> Result<String> {
     register_pac_natives(&mut ctx)?;
     ctx.eval(Source::from_bytes(PAC_HELPERS.as_bytes()))
         .map_err(|e| anyhow!("PAC helper environment: {e}"))?;
-    ctx.eval(Source::from_bytes(pac_src.as_bytes()))
-        .map_err(|e| anyhow!("PAC script: {e}"))?;
+    // The file and the call each get [`TIME_LIMIT`]: the loop limit alone let
+    // a loop that calls a looping function keep its request for ever.
+    eval_bounded(&mut ctx, pac_src, Instant::now() + TIME_LIMIT)
+        .map_err(|why| anyhow!("PAC script {why}"))?;
 
     let call = format!("FindProxyForURL({}, {})", js_str(url), js_str(host));
-    let result = ctx
-        .eval(Source::from_bytes(call.as_bytes()))
-        .map_err(|e| anyhow!("FindProxyForURL({url}): {e}"))?;
+    let result = eval_bounded(&mut ctx, &call, Instant::now() + TIME_LIMIT)
+        .map_err(|why| anyhow!("FindProxyForURL({url}) {why}"))?;
     if result.is_null_or_undefined() {
         bail!("FindProxyForURL({url}) returned no proxy string");
     }
@@ -2469,6 +2660,80 @@ mod tests {
             .as_deref(),
             Some("n=100000")
         );
+    }
+
+    /// The loop limit counts per call, so a loop that calls a looping function
+    /// passes it on every call; this one held its request for ever, and ten
+    /// of them stopped the proxy (STATUS, 2026-10-02). The clock stops it, in
+    /// each of the places a script runs.
+    const CALLS_A_LOOP: &str = "function f() { for (var i = 0; i < 2000000; i++) {} }\n\
+                                for (var j = 0; j < 2000000; j++) f();";
+
+    #[test]
+    fn a_loop_of_calls_is_stopped_by_the_clock() {
+        let ctx = RulesScriptCtx {
+            method: "GET",
+            full_url: "http://a.com/",
+            headers: &[],
+            body: "",
+            client_ip: None,
+            client_port: None,
+            res: None,
+            values: &NO_VALUES,
+            script_data: &NO_DATA,
+            pattern: "",
+            env: &NO_ENV,
+        };
+        // Generous: the point is "stops", and a debug build on a busy CI
+        // machine is slow to build the engine before the clock starts.
+        let soon = TIME_LIMIT + Duration::from_secs(3);
+
+        let started = Instant::now();
+        let ran = produce_rules(&format!("rules.push('a'); {CALLS_A_LOOP}"), &ctx);
+        assert!(matches!(ran, Err(Stopped::OutOfTime)), "{:?}", ran.err());
+        assert!(started.elapsed() < soon, "{:?}", started.elapsed());
+
+        let started = Instant::now();
+        let ran = run_res_script(
+            &format!("ctx.res.statusCode = 500; {CALLS_A_LOOP}"),
+            "GET",
+            "http://a.com/",
+            200,
+            &[],
+            "",
+        );
+        assert!(matches!(ran, Err(Stopped::OutOfTime)), "{:?}", ran.err());
+        assert!(started.elapsed() < soon, "{:?}", started.elapsed());
+
+        let started = Instant::now();
+        let pac = format!("function FindProxyForURL(u, h) {{ {CALLS_A_LOOP} return 'DIRECT'; }}");
+        let err = eval_pac(&pac, "http://a.com/", "a.com").expect_err("stopped");
+        assert!(err.to_string().contains("still running"), "{err}");
+        assert!(started.elapsed() < soon, "{:?}", started.elapsed());
+    }
+
+    /// What the clock stopped is said in words a session can carry.
+    #[test]
+    fn why_a_script_stopped_is_readable() {
+        assert_eq!(
+            Stopped::OutOfTime.to_string(),
+            format!(
+                "was still running after {} ms and was stopped",
+                TIME_LIMIT.as_millis()
+            )
+        );
+        let mut ctx = Context::default();
+        let threw =
+            eval_bounded(&mut ctx, "null.x", Instant::now() + TIME_LIMIT).expect_err("throws");
+        assert!(threw.to_string().starts_with("threw: TypeError"), "{threw}");
+        // A script that finishes in time is answered as `eval` answers it.
+        let done = eval_bounded(
+            &mut ctx,
+            "var n = 0; for (var i = 0; i < 1000; i++) n += i; n",
+            Instant::now() + TIME_LIMIT,
+        )
+        .expect("finishes");
+        assert_eq!(done.as_number(), Some(499500.0));
     }
 
     #[test]

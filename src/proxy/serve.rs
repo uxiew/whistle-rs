@@ -392,6 +392,7 @@ pub(super) async fn serve(
     );
     // The accepted socket's port, for `clientPort:` / `remotePort:` filters.
     info.client_port = Some(peer.port());
+    ledger.watch_scripts(info.script_failures.clone());
     // What a `reqScript` reads as `port`, `uiPort` and `httpVersion`.
     info.script_env = crate::rules::ScriptEnv {
         proxy_port: state.config.port,

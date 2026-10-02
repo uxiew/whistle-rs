@@ -2049,11 +2049,30 @@ approximations, and `pattern` and `port` were `''` and `0`.
 Also there, because whistle scripts assume them: `substr`, `escape` /
 `unescape`, and the `RegExp.$1`…`$9` / `lastMatch` statics.
 
-**What a script may cost.** whistle stops a script after 60 ms. This engine
-cannot be interrupted, so the bound is on what it can count: a single loop is
-stopped after 3,000,000 iterations (about 20 ms for an empty one) and recursion
-after a few hundred frames, and the script then produces nothing, as any script
-that throws does. Nested loops that each stay under the bound are not caught.
+**What a script may cost.** whistle stops a script after 60 ms; this port
+after **1 second**, because its engine is an order of magnitude slower than V8
+and a script that finishes there must finish here. A stopped script produces
+nothing, as one that throws does — no rules it pushed, no change it made to a
+response — and the request goes on. Its session says so: an `unapplied` entry
+of kind `script-failed` naming the operator and saying whether it threw (with
+the error) or ran out of time. The same second applies to a `frameScript`'s
+top level and to each call of its handlers (a handler out of time ends the
+script for that connection, and every frame after it passes unscripted), and to
+a PAC file and each `FindProxyForURL`.
+
+Two more bounds stop the common runaways sooner and with a clearer error: the
+loops of one function call are stopped after 3,000,000 iterations in all
+(about 20 ms for an empty loop), and recursion after a few hundred frames.
+
+What the second cannot reach: code a *built-in* calls back into — the callback
+of `forEach`, `map`, `sort`, `replace` — and the text the one-line `ctx.frame`
+shape of a `frameScript` runs through `eval` each frame. Those run to the end,
+bounded only by the loop limit per call. Scripts run off the proxy's worker
+threads, so one that cannot be stopped holds its own request (and a thread)
+and nothing else; before 2026-10-02 they ran on them, and a loop calling a
+looping function — which the per-call loop limit does not see — held its
+request for ever, ten of them stopping the whole proxy.
+
 Starting a script costs about 0.5 ms; the first use of `Buffer`, `parseUrl`,
 `parseQuery` or an `iconv` helper adds about 3 ms, once per script run.
 

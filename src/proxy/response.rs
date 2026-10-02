@@ -109,8 +109,8 @@ pub(super) async fn resolve_response_phase(
 pub(super) struct ResBodyOps {
     /// `resSpeed://` — throttle, in kilobits/s.
     pub(super) speed: Option<f64>,
-    /// `resScript://` — the loaded source, not the rule value.
-    pub(super) script: Option<String>,
+    /// `resScript://` — the operator as written, and the loaded source.
+    pub(super) script: Option<(String, String)>,
     /// `weinre://` — debug-agent id to inject.
     pub(super) weinre: Option<String>,
     /// `log://` — the rule whose collector goes into a page or a script. Set
@@ -411,8 +411,7 @@ impl ResBodyOps {
         ResBodyOps {
             speed: apply::res_speed_kbps(resolved),
             script: apply::res_script_op(resolved)
-                .map(|op| op.value.as_str())
-                .and_then(script::load_script),
+                .and_then(|op| script::load_script(&op.value).map(|src| (op.raw.clone(), src))),
             weinre: resolved.value("weinre").map(|s| s.to_string()),
             log: LogRule::of(resolved, streaming_ct),
             write: apply::res_write_path(resolved, status),
@@ -542,21 +541,29 @@ pub(super) fn inject_res_body(
     ops: &ResBodyOps,
     info: &ReqInfo,
 ) -> Bytes {
-    if let Some(src) = &ops.script {
+    if let Some((raw, src)) = &ops.script {
         let hv: Vec<(String, String)> = parts
             .headers
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
         let body_str = String::from_utf8_lossy(&new).into_owned();
-        if let Some(r) = script::run_res_script(
+        let ran = script::run_res_script(
             src,
             &info.method,
             &info.full_url,
             parts.status.as_u16(),
             &hv,
             &body_str,
-        ) {
+        );
+        // A script that did not finish leaves the response as it was, and
+        // says so on the session.
+        if let Err(why) = &ran
+            && let Ok(mut failures) = info.script_failures.lock()
+        {
+            failures.push((raw.clone(), why.to_string()));
+        }
+        if let Ok(r) = ran {
             if let Some(st) = r.status
                 && let Ok(s) = StatusCode::from_u16(st)
             {

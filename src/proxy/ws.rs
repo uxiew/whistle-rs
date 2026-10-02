@@ -2635,6 +2635,40 @@ mod tests {
         });
     }
 
+    /// A handler still running at the time limit ends the script for its
+    /// connection: that frame, and every one after it, goes through as it
+    /// came. It used to hold the connection — and a thread at full speed —
+    /// for as long as the loop lasted, which here is for ever.
+    #[test]
+    fn a_handler_out_of_time_ends_the_script_and_the_frames_go_through() {
+        rt().block_on(async {
+            let state = state_with(crate::plugins::Plugins::new());
+            let script = "ctx.handleSendToServerFrame = function (buf) {\n\
+                              function f() { for (var i = 0; i < 2000000; i++) {} }\n\
+                              for (var j = 0; j < 2000000; j++) f();\n\
+                              return 'X' + buf;\n\
+                          };";
+            let plan = plan_for(&state, "ws.test enable://websocket\n");
+            let mut wire = spawn_tunnel(&state, plan, Some(script.to_string()));
+            let started = std::time::Instant::now();
+            let seen = through(&mut wire, &[(OPCODE_TEXT, b"one"), (OPCODE_TEXT, b"two")]).await;
+            assert_eq!(
+                seen,
+                [
+                    (OPCODE_TEXT, b"one".to_vec()),
+                    (OPCODE_TEXT, b"two".to_vec())
+                ]
+            );
+            assert!(
+                started.elapsed()
+                    < crate::proxy::script::TIME_LIMIT + std::time::Duration::from_secs(3),
+                "{:?}",
+                started.elapsed()
+            );
+            finish(wire).await;
+        });
+    }
+
     // ── an inspected tunnel ──
 
     /// `enable://inspect` on a plain tunnel: each chunk is a frame, offered to

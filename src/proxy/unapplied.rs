@@ -49,6 +49,10 @@ pub enum Kind {
     /// `secureOptions`, …) its TLS library has no equivalent of — and the
     /// connection was made without that part.
     CipherUnusable,
+    /// A script a rule ran — `reqScript`, `rulesFile`, `resScript`, … — threw,
+    /// or was still running at its time limit, so nothing it did was kept:
+    /// no rules it pushed, no change it made to the response.
+    ScriptFailed,
 }
 
 /// Matched operators that did not take effect, for one reason.

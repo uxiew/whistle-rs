@@ -853,9 +853,19 @@ pub struct ReqInfo {
     /// suite's `script.test.js` passes a value across. Shared, not copied, by
     /// the clones the proxy makes of these facts; `Null` until a script runs.
     pub script_data: Arc<std::sync::Mutex<serde_json::Value>>,
+    /// Scripts this request ran that did not finish — threw, or ran out of
+    /// time — each as the operator that ran it, as written, and what happened.
+    /// Filled where the script runs, deep in rule resolution or the response
+    /// path, and put on the request's session when it is recorded (`unapplied`,
+    /// kind `script-failed`); before, both were a debug line in the log. Shared
+    /// by clones, like `script_data`.
+    pub script_failures: ScriptFailures,
     /// What a script is told about the proxy itself — see [`ScriptEnv`].
     pub script_env: ScriptEnv,
 }
+
+/// See [`ReqInfo::script_failures`]: (the operator as written, what happened).
+pub type ScriptFailures = Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
 /// The facts a script's context carries that are not about the request's
 /// content: `port`, `uiPort` and `httpVersion`

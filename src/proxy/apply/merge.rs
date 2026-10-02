@@ -312,15 +312,16 @@ pub fn merge_included_rules(
                 true => Some(op.value.clone()),
                 false => std::fs::read_to_string(&op.value).ok(),
             }?;
-            Some((text, op.raw_pattern.as_str()))
+            Some((text, op))
         })
         // A text that is JavaScript rather than rules is executed, and what it
         // pushed into `rules` takes its place in the list — upstream's
         // `handleDynamicRules` (`_original/lib/rules/index.js:459-476`), with
-        // `isRulesContent` deciding which is which. A script that errors
-        // contributes nothing, not even the lines it pushed before throwing.
+        // `isRulesContent` deciding which is which. A script that errors, or
+        // runs out of time, contributes nothing, not even the lines it pushed
+        // before it stopped.
         .filter_map(
-            |(text, pattern)| match crate::proxy::script::is_rules_content(&text) {
+            |(text, op)| match crate::proxy::script::is_rules_content(&text) {
                 true => Some(text),
                 false => {
                     let produced = crate::proxy::script::produce_rules(
@@ -335,10 +336,11 @@ pub fn merge_included_rules(
                             res: None,
                             values,
                             script_data: &info.script_data,
-                            pattern,
+                            pattern: &op.raw_pattern,
                             env: &info.script_env,
                         },
-                    )?;
+                    );
+                    let produced = script_failed(info, op, produced)?;
                     script_values.extend(produced.values);
                     Some(produced.rules)
                 }
@@ -374,6 +376,22 @@ pub fn merge_included_rules(
         managers.push(mgr);
     }
     managers
+}
+
+/// What a script run produced, or `None` with the failure noted on the request
+/// for its session — see [`ReqInfo::script_failures`]. `op` is the operator
+/// that ran it.
+pub(in crate::proxy) fn script_failed<T>(
+    info: &ReqInfo,
+    op: &RuleOp,
+    ran: Result<T, crate::proxy::script::Stopped>,
+) -> Option<T> {
+    ran.inspect_err(|why| {
+        if let Ok(mut failures) = info.script_failures.lock() {
+            failures.push((op.raw.clone(), why.to_string()));
+        }
+    })
+    .ok()
 }
 
 /// The private scope a request's `rulesFile://` text answers its `{name}` in —
@@ -477,7 +495,8 @@ pub fn merge_res_rules(
                         pattern: &op.raw_pattern,
                         env: &info.script_env,
                     },
-                )?;
+                );
+                let produced = script_failed(info, op, produced)?;
                 return Some((produced.rules, produced.values));
             }
             let hook = raw_protocol(op) != Some("resRules")
