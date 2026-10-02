@@ -6,8 +6,9 @@
 // control that lets it go: this is the half of a pause that makes it a pause
 // rather than a stall, and without it there would be no reason to have the flag.
 
-import { computed, onUnmounted, watch } from 'vue';
+import { computed, onUnmounted } from 'vue';
 import type { WsFrame } from '../api';
+import { poll } from '../poll';
 import { loadFrames, releaseWsDir, sendWsFrame, state } from '../store';
 
 defineProps<{ frames: WsFrame[] | null }>();
@@ -28,19 +29,13 @@ const holds = computed(() => {
 // and so does an event stream — a body cut into frames arrives for as long as
 // the server keeps writing, which for SSE is often minutes. So this polls for
 // as long as the tab is open, and stops the moment it is not. The cost is one
-// small request every two seconds while somebody is looking at exactly this.
-let timer: number | undefined;
-watch(
-  () => state.selected,
-  () => {
-    clearInterval(timer);
-    timer = setInterval(() => {
-      if (state.selected !== null) void loadFrames(state.selected);
-    }, 2000) as unknown as number;
-  },
-  { immediate: true },
-);
-onUnmounted(() => clearInterval(timer));
+// small request every two seconds while somebody is looking at exactly this —
+// less often while the proxy does not answer, none while the tab is hidden
+// (`poll.ts`).
+const stopPolling = poll(async () => {
+  if (state.selected !== null) await loadFrames(state.selected);
+});
+onUnmounted(stopPolling);
 </script>
 
 <template>

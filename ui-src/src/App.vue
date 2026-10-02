@@ -4,6 +4,7 @@
 
 import { onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import AppToolbar from './components/AppToolbar.vue';
+import { poll } from './poll';
 import ComposerHistory from './sidebar/ComposerHistory.vue';
 import PluginList from './sidebar/PluginList.vue';
 import RequestSources from './sidebar/RequestSources.vue';
@@ -78,22 +79,24 @@ function onKeydown(e: KeyboardEvent): void {
   }
 }
 
-let timer: number | undefined;
+let stopPolling: (() => void) | undefined;
 
 onMounted(() => {
   document.addEventListener('keydown', onKeydown);
   void loadSessions();
-  timer = setInterval(() => {
-    if (state.pane === 'requests' && state.autoRefresh) void loadSessions();
+  // Every two seconds while the proxy answers, less often while it does not,
+  // never while the tab is hidden — see `poll.ts`.
+  stopPolling = poll(async () => {
+    if (state.pane === 'requests' && state.autoRefresh) await loadSessions();
     // A page being debugged is being watched: the Console pane follows it for
     // as long as it is the pane on screen.
-    if (state.pane === 'console') void loadPageLogs();
-  }, 2000) as unknown as number;
+    if (state.pane === 'console') await loadPageLogs();
+  });
 });
 
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', onKeydown);
-  clearInterval(timer);
+  stopPolling?.();
 });
 </script>
 
