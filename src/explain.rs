@@ -126,6 +126,11 @@ pub struct Op {
     pub slot: bool,
     /// Resolution order: important lines first, source order within a pass.
     pub order: u64,
+    /// The `{name}` this operator's whole value named, when no value had it
+    /// and the operator is therefore not applied — it matched, and will do
+    /// nothing (`RuleOp::value_missing`). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_value: Option<String>,
 }
 
 /// What the rules text does to the request.
@@ -239,8 +244,11 @@ fn explain_inner(query: &Query) -> Result<Explanation, String> {
     });
 
     let slot_order = resolved.slot().map(|op| op.order);
+    // The inert ones as well: they matched, as upstream's resolver says they
+    // did, and each is marked with why it will do nothing.
     let mut ops: Vec<Op> = resolved
         .ops()
+        .chain(&resolved.inert)
         .map(|op| to_op(op, slot_order == Some(op.order)))
         .collect();
     // Resolution order is the whole answer for the operators that compete, so
@@ -268,6 +276,7 @@ fn to_op(op: &RuleOp, slot: bool) -> Op {
         content: op.value_is_content,
         slot,
         order: op.order,
+        missing_value: op.value_missing.clone(),
     }
 }
 

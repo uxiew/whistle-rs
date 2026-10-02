@@ -31,22 +31,25 @@
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// Thirteen cases differ, declared case by case in `declared.js`. They are not in `harness.js`'s
+// Nine cases differ, declared case by case in `declared.js`. They are not in `harness.js`'s
 // `EXPECTED` because a matcher wide enough to catch them would hide real news in
 // another corpus; what makes them expected is the rule, which a matcher on the
 // output cannot see. Two deliberate divergences, already declared in the code:
 //
 //   * **A value a text operator cannot read is used as written here.**
-//     (`a value that names nothing …` ×3, `an unterminated fence …`,
-//     `an unbalanced open bracket`, `an unbalanced close bracket`,
+//     (`an unbalanced open bracket`, `an unbalanced close bracket`,
 //     `a payload whose hash is eaten by the comment stripper`,
 //     `angle brackets on a body operator`, `angle brackets around a payload
 //     containing parens`, `a script tag in angle brackets`.)
 //     Upstream has no shape test: for a text operator *every* non-inline value
 //     is a path (`readRuleValue`, `_original/lib/util/index.js:1189-1213`), so
-//     `resBody://{typo}` opens a file called `{typo}`, fails, and the operator
+//     `resBody://hello` opens a file called `hello`, fails, and the operator
 //     does nothing. whistle-rs keeps a bare value as the literal it already is —
-//     declared in `value_source` (`src/proxy/apply/value_sources.rs`). The `<…>` half is the
+//     declared in `value_source` (`src/proxy/apply/value_sources.rs`). A
+//     `{name}` that names nothing used to be on this list too (`a value that
+//     names nothing …`, `an unterminated fence …`), written into the traffic as
+//     `{nope}`; since 2026-10-02 the operator is not applied, as upstream, and the
+//     session says why — a reference is not content the user wrote. The `<…>` half is the
 //     same decision from the other end: upstream's `getValue(matcher,'<','>')`
 //     strips the brackets off **every** operator's value, so
 //     `htmlAppend://<script>x</script>` loses its final `>` and injects nothing;
@@ -145,6 +148,24 @@ module.exports = [
   { name: 'a value that names nothing on a request body', rules: `${A} reqBody://{nope}`, request: { method: 'POST', body: 'original' } },
   { name: 'a value that names nothing on a prepend', rules: `${A} resPrepend://{nope}` },
   { name: 'a value that names nothing on a file rule', rules: `${A} file://{nope}` },
+  // The rest of the body family, each on a page of the type it acts on. Upstream
+  // applies none of them (`getRuleValue` hands back nothing for a key the
+  // values do not have) and so adds none of the cache headers an injection
+  // brings; this port wrote `{nope}` into every one until 2026-10-02.
+  ...[
+    ['resAppend', '/plain.txt'], ['reqPrepend', '/echo'], ['reqAppend', '/echo'],
+    ['htmlPrepend', '/html'], ['htmlBody', '/html'], ['htmlAppend', '/html'],
+    ['jsPrepend', '/script.js'], ['jsBody', '/script.js'], ['jsAppend', '/script.js'], ['jsAppend', '/html'],
+    ['cssPrepend', '/style.css'], ['cssBody', '/style.css'], ['cssAppend', '/style.css'], ['cssAppend', '/html'],
+  ].map(([op, at]) => ({
+    name: `a value that names nothing on ${op}, ${at}`,
+    rules: `${P}${at} ${op}://{nope}`,
+    request: { path: at, ...(at === '/echo' ? { method: 'POST', body: 'original' } : {}) },
+  })),
+  // Beside one that has a value: only the one without is skipped.
+  // On a plain page: `/echo` would print the request's headers into the body,
+  // and this port's request cache-bust (`cache-bust` in harness.js) with them.
+  { name: 'a missing value beside a present one in a list', rules: `${B}v\nHERE\n${B}\n${P}/plain.txt resPrepend://{nope} resPrepend://{v}`, request: { path: '/plain.txt' } },
   { name: 'empty braces are not a reference', rules: `${B}\nX\n${B}\n${A} resBody://{}` },
   { name: 'trailing text after a reference', rules: `${B}v\nVAL\n${B}\n${A} resBody://{v}tail` },
   { name: 'an empty value on a body operator', rules: `${B}e\n${B}\n${A} resBody://{e}` },

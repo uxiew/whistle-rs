@@ -190,14 +190,11 @@ const DECLARED = {
   ],
 
   'cases-values.js': [
-    ...['an unterminated fence declares nothing', 'a value that names nothing, whole-value form',
-      'a value that names nothing on a prepend', 'an unbalanced open bracket', 'an unbalanced close bracket',
+    ...['an unbalanced open bracket', 'an unbalanced close bracket',
       'a payload whose hash is eaten by the comment stripper', 'angle brackets on a body operator',
       'angle brackets around a payload containing parens', 'a script tag in angle brackets',
     ].map((n) => d(n, BUST, 'a value a text operator cannot read is used as written here; upstream opens it as '
       + 'a path, fails, and does nothing. Header, first divergence')),
-    d('a value that names nothing on a request body', ['req.body'],
-      'a value a text operator cannot read is used as written here. Header, first divergence'),
     d('trailing text after a reference', ['res.body'],
       'upstream reads {v}tail as {v} and drops the tail; a reference must end the value here. Header, second divergence'),
     d('json5: an unquoted dashed key on resHeaders', ['status', 'res.header.content-type', 'res.header.x-origin', 'res.body'],

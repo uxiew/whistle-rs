@@ -172,7 +172,8 @@ pub fn response_phase_of(
 /// everything in its own class, behind the class above". Equal keys keep
 /// insertion order, so several merged sets stay in the sequence they were merged
 /// in.
-pub(crate) fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
+pub(crate) fn merge_resolved(resolved: &mut Resolved, mut sub: Resolved) {
+    resolved.inert.append(&mut sub.inert);
     let key = |op: &RuleOp| match op.props.has("important") {
         true => MERGED_ORDER,
         false => MERGED_AFTER_IMPORTANT,
@@ -229,7 +230,8 @@ pub(crate) fn merge_resolved(resolved: &mut Resolved, sub: Resolved) {
 /// Merged with [`merge_resolved`] instead, a plugin installed for one purpose
 /// overrode the user's `file://` on the same URL — measured, by the test that
 /// asks for `/slot` in `tests/switches_e2e.rs`.
-pub(crate) fn merge_below(resolved: &mut Resolved, sub: Resolved) {
+pub(crate) fn merge_below(resolved: &mut Resolved, mut sub: Resolved) {
+    resolved.inert.append(&mut sub.inert);
     const BELOW_IMPORTANT: u64 = 1 << 40;
     const BELOW_ALL: u64 = 1 << 62;
     let key = |op: &RuleOp| match op.props.has("important") {

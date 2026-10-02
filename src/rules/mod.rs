@@ -243,6 +243,11 @@ pub struct RuleOp {
     /// body gets expanded and a body that opens and closes with a backtick loses
     /// one from each end to the backtick-template test.
     pub values_substituted: bool,
+    /// The name, when this operator's whole value was a `{name}` reference
+    /// that no value answered and the operator is one that is then not applied
+    /// at all — see `SKIPPED_WITHOUT_VALUE` in `proxy::apply::substitute`.
+    /// Such an operator is moved to [`Resolved::inert`] as soon as it is found.
+    pub value_missing: Option<String>,
     /// The part of the URL its pattern did not consume, held back because this
     /// operator's value is a **backtick template**.
     ///
@@ -967,9 +972,37 @@ pub struct Resolved {
     /// which is `getProtocolName(rules.rule.url)`, upstream's own way of asking
     /// (`_original/lib/util/index.js:2043-2045`).
     pub slot: Option<RuleOp>,
+    /// Operators that matched and will do nothing: kept here, out of
+    /// [`Resolved::get`], [`Resolved::all`] and [`Resolved::ops`], so that
+    /// nothing applies them, and still listed on the session, so that the
+    /// console can show the line and say why. Today that is a body operator
+    /// whose `{name}` names no value — [`RuleOp::value_missing`].
+    pub inert: Vec<RuleOp>,
 }
 
 impl Resolved {
+    /// Take out every operator `pick` picks, wherever it is held.
+    pub fn take_where(&mut self, mut pick: impl FnMut(&RuleOp) -> bool) -> Vec<RuleOp> {
+        let mut taken = Vec::new();
+        self.single.retain(|_, op| match pick(op) {
+            true => {
+                taken.push(op.clone());
+                false
+            }
+            false => true,
+        });
+        for list in self.multi.values_mut() {
+            let (out, keep): (Vec<RuleOp>, Vec<RuleOp>) = list.drain(..).partition(&mut pick);
+            *list = keep;
+            taken.extend(out);
+        }
+        self.multi.retain(|_, list| !list.is_empty());
+        if self.slot.as_ref().is_some_and(&mut pick) {
+            taken.extend(self.slot.take());
+        }
+        taken
+    }
+
     /// The operator that won `protocol` — for a multi-match protocol, the first
     /// entry of its list, which is upstream's `_rules[name]`.
     ///
@@ -1092,6 +1125,7 @@ impl Resolved {
     /// behind everything either pass resolved, which is where the request phase
     /// already put it.
     pub fn merge_response_phase(&mut self, mut res: Resolved) {
+        self.inert.append(&mut res.inert);
         // Taken out first: an `ignore://` resolved in the response phase has to
         // reach what the *request* phase resolved, which the merge below — an
         // insertion of operators the request phase never saw — does not touch.

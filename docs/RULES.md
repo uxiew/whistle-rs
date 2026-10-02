@@ -635,16 +635,24 @@ is a CORS rule, not a fetch. A *path* there is still read.
 > string (`tryParseMatcher`, `util/index.js:1165-1171,:1303`). The difference
 > only shows for a file whose name contains an `=`.
 >
-> **A `{name}` the store cannot answer is a bare value like any other**, and so
-> it stays literal here: `resBody://{typo}` writes those six characters as the
-> body, where whistle writes nothing — it files the matcher under `rule.key`
-> (`getKey`, `rules.js:263-270`), hands the keyed rule an empty file list
-> (`getRuleFiles`, `util/index.js:1435-1437`), and leaves the response alone.
-> Measured, and left as it is on purpose: telling a failed reference from a
-> literal that happens to be brace-wrapped means deciding that `{typo}` is a
-> *name* and `{"a":1}` is not, which is a grammar neither program has. The
-> same choice is already made one paragraph up for `${name}`, where upstream
-> agrees: a lookup that misses shows as itself rather than as nothing.
+> **A `{name}` no value answers is not applied**, on the body operators —
+> `reqBody`/`reqPrepend`/`reqAppend`, `resBody`/`resPrepend`/`resAppend` and
+> the `html*`, `js*`, `css*` three each — as whistle does not apply it: it
+> files the matcher under `rule.key` (`getKey`, `rules.js:263-270`), the values
+> have nothing under it, and `getRuleValue` hands the operator nothing. The
+> response is left alone, without the cache headers an injection would add.
+> One brace-wrapped value is not a name: a JSON object — `{`, a `:`, `}`, and
+> json5 reads it — is content, as upstream's `isJson` fallback makes it
+> (`getValue`, `rules.js:272-288`), so `resBody://{"a":1}` is that body.
+>
+> The session still lists the operator, with an `unapplied` entry of kind
+> `missing-value` naming the reference, so a typo shows in the console rather
+> than in the traffic. Until 2026-10-02 this port wrote the six characters
+> `{typo}` as the body, on the grounds that telling a reference from a
+> brace-wrapped literal takes a grammar neither program has; upstream has one,
+> `getKey` and then `isJson`, and this is it. A `${name}` *inside* a value is
+> another matter, and there upstream agrees with this port: a lookup that
+> misses shows as itself.
 
 **Details that matter:**
 

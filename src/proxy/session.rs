@@ -345,8 +345,13 @@ pub(super) fn log_labels(resolved: &Resolved) -> Vec<String> {
 /// contributes at most one: a `statusCode://` that lost to a `file://` did
 /// nothing, and reporting it as a match would say the opposite.
 pub(super) fn matched_ops(resolved: &Resolved) -> Vec<MatchedOp> {
-    let mut ops: Vec<(u64, &crate::rules::RuleOp)> =
-        resolved.ops().map(|op| (op.order, op)).collect();
+    // The inert ones too: they matched, and the session says why they did
+    // nothing — see `Resolved::inert`.
+    let mut ops: Vec<(u64, &crate::rules::RuleOp)> = resolved
+        .ops()
+        .chain(&resolved.inert)
+        .map(|op| (op.order, op))
+        .collect();
     ops.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.protocol.cmp(&y.protocol)));
     ops.into_iter()
         .map(|(_, op)| MatchedOp {

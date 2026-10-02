@@ -2052,12 +2052,13 @@ fn a_produced_text_answers_from_its_own_values() {
         body_of(&script(block, "reqScript"), None).as_deref(),
         Some("FROM-BLOCK")
     );
-    // The including text's block is not the produced text's to read.
+    // The including text's block is not the produced text's to read: the
+    // reference is not answered, and the body operator is not applied.
     let unseen = format!(
         "{f}v\nFROM-INCLUDING\n{f}\n{}",
         script("rules.push('example.com resBody://{v}');", "reqScript")
     );
-    assert_eq!(body_of(&unseen, None).as_deref(), Some("{v}"));
+    assert_eq!(body_of(&unseen, None).as_deref(), None);
 }
 
 /// `reqRules://{name}` names a **value**, not a path, and every other
@@ -2219,11 +2220,12 @@ fn a_fenced_block_answers_only_its_own_group() {
     assert_eq!(body_of(&own).as_deref(), Some("FROM-DEFAULT"));
 
     // Declared in one group, referenced from another: not answered, so the
-    // reference is left as written — which is what a missed lookup does.
+    // operator is not applied — which is what a missed lookup does to a body
+    // operator (`SKIPPED_WITHOUT_VALUE`).
     let mut across = RuleManager::new();
     across.set_text("```v\nFROM-DEFAULT\n```\n");
     across.add_group("A", "a.com resBody://{v}\n", true);
-    assert_eq!(body_of(&across).as_deref(), Some("{v}"));
+    assert_eq!(body_of(&across).as_deref(), None);
 
     // And the sharpest form: a group that declares *and* uses `v` keeps its
     // own, whatever another group declares under that name. `A` resolves
@@ -2287,6 +2289,70 @@ fn substituted(text: &str, values: &HashMap<String, String>) -> Resolved {
         },
     );
     resolved
+}
+
+/// A body operator whose `{name}` names no value is not applied, as upstream's
+/// `getRuleValue` hands it nothing; it used to be applied with the reference as
+/// its content, so the origin got `{nope}` as a request body. It stays on the
+/// session's list, marked, and the request is told why.
+#[test]
+fn a_body_operator_whose_value_is_missing_is_not_applied() {
+    let mut values = HashMap::new();
+    values.insert("there".to_string(), "THERE".to_string());
+    let text = "a.com resBody://{nope}\n\
+                a.com resPrepend://{nope} resPrepend://{there}\n\
+                a.com reqHeaders://{nope}\n";
+    let mut mgr = RuleManager::new();
+    mgr.set_text(text);
+    let info = build_req_info("GET", "http", "a.com", 80, "/p", &HeaderMap::new(), None);
+    let mut resolved = mgr.resolve(&info);
+    substitute_values(
+        &mut resolved,
+        &values,
+        TplCtx {
+            info: &info,
+            env: test_env(),
+        },
+    );
+    assert_eq!(resolved.get("resBody").map(|op| op.value.as_str()), None);
+    let prepends: Vec<&str> = resolved
+        .all("resPrepend")
+        .iter()
+        .map(|op| op.value.as_str())
+        .collect();
+    assert_eq!(
+        prepends,
+        ["THERE"],
+        "the one that has a value still applies"
+    );
+    // Not a body operator: it keeps its value as written, as upstream's
+    // `tryParseMatcher` does with a matcher it cannot read.
+    assert_eq!(resolved.value("reqHeaders"), Some("{nope}"));
+
+    let inert: Vec<&str> = resolved.inert.iter().map(|op| op.raw.as_str()).collect();
+    assert_eq!(inert.len(), 2);
+    assert!(inert.contains(&"resBody://{nope}") && inert.contains(&"resPrepend://{nope}"));
+    let listed: Vec<String> = crate::proxy::session::matched_ops(&resolved)
+        .into_iter()
+        .map(|op| op.raw)
+        .collect();
+    assert!(
+        listed.contains(&"resBody://{nope}".to_string()),
+        "{listed:?}"
+    );
+
+    let noted = info.noted.lock().unwrap();
+    assert_eq!(noted.len(), 2);
+    assert!(
+        noted
+            .iter()
+            .all(|u| u.kind == crate::proxy::unapplied::Kind::MissingValue)
+    );
+    assert!(
+        noted[0].reason.contains("`{nope}` names no value"),
+        "{}",
+        noted[0].reason
+    );
 }
 
 /// A value wrapped in backticks is a template rendered against the request

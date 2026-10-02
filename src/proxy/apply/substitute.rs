@@ -49,6 +49,34 @@ pub(super) fn render_backticks(op: &crate::rules::RuleOp, tpl: TplCtx<'_>) -> Op
     ))
 }
 
+/// The operators upstream does not apply at all when their whole value is a
+/// `{name}` that names no value: the body family, whose value `getRuleValue`
+/// reads (`_original/lib/util/index.js:1394-1401`) and, for a `rule.key` the
+/// values do not have, hands back as nothing — and an operator handed nothing
+/// does nothing, down to the cache headers an injection would bring.
+///
+/// This port used to keep the reference as written and apply it: the origin
+/// received `{nope}` as a request body, the client got `{nope}` in front of or
+/// after its page, or instead of it (STATUS, 2026-10-02). A typo in a value's
+/// name changed the traffic it was meant to leave alone.
+const SKIPPED_WITHOUT_VALUE: &[&str] = &[
+    "reqBody",
+    "reqPrepend",
+    "reqAppend",
+    "resBody",
+    "resPrepend",
+    "resAppend",
+    "htmlBody",
+    "htmlPrepend",
+    "htmlAppend",
+    "jsBody",
+    "jsPrepend",
+    "jsAppend",
+    "cssBody",
+    "cssPrepend",
+    "cssAppend",
+];
+
 /// What `{name}` means *to this operator* — upstream's `getValueFor`
 /// (`_original/lib/rules/rules.js:785-796`).
 ///
@@ -190,6 +218,20 @@ pub fn substitute_values(
             op.value_key = Some(name);
             return true;
         }
+        // A reference nothing answered, on an operator that is then not
+        // applied — see [`SKIPPED_WITHOUT_VALUE`]. Moved out of the set below.
+        // Unless the braces are a JSON object's: upstream falls back to the
+        // matcher itself when it `isJson` (`getValue`,
+        // `_original/lib/rules/rules.js:272-288`), so `resBody://{"a":1}` is
+        // that body — `{`, a `:`, `}`, and json5 reads it.
+        if let Some(name) = value.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
+            && !name.is_empty()
+            && SKIPPED_WITHOUT_VALUE.contains(&op.protocol.as_str())
+            && !(name.contains(':') && json5::from_str::<serde_json::Value>(value).is_ok())
+        {
+            op.value_missing = Some(name.to_string());
+            return true;
+        }
         // `${name}` anywhere *inside* a value, which is the other half of
         // `resolveVar` (`VAR_RE = /\${([^{}]+)}/g`,
         // `_original/lib/rules/rules.js:39,:774-783`) and the half this port did
@@ -249,6 +291,23 @@ pub fn substitute_values(
     for op in resolved.ops_mut() {
         did |= sub(op, values, tpl);
     }
+    let missing = resolved.take_where(|op| op.value_missing.is_some());
+    if !missing.is_empty()
+        && let Ok(mut noted) = tpl.info.noted.lock()
+    {
+        for op in &missing {
+            let name = op.value_missing.as_deref().unwrap_or_default();
+            noted.push(super::super::unapplied::Unapplied {
+                kind: super::super::unapplied::Kind::MissingValue,
+                ops: vec![op.raw.clone()],
+                reason: format!(
+                    "`{{{name}}}` names no value — none in this rules text's ``` blocks or in \
+                     the Values store — so the operator was not applied"
+                ),
+            });
+        }
+    }
+    resolved.inert.extend(missing);
     did
 }
 

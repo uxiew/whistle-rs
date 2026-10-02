@@ -75,7 +75,8 @@ export type UnappliedKind =
   | 'plugin-failed'
   | 'no-weinre-server'
   | 'cipher-unusable'
-  | 'script-failed';
+  | 'script-failed'
+  | 'missing-value';
 
 export interface Unapplied {
   kind: UnappliedKind;
