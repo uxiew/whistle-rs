@@ -264,10 +264,12 @@
 
 依据：上游 `getRuleValue` 读不到值时不调用算子（`_original/lib/util/index.js:1394`）。
 
-- [ ] 复核表里 11 个改 body 的算子，以及 `htmlPrepend`/`htmlBody`/`cssPrepend`/`cssBody` 在对应类型页面上：值不存在时 body 不变、不加缓存头，记 `unapplied`。
-- [ ] `statusCode`/`replaceStatus`/`method` 保持现在的行为（不生效），在 `declared.js` 里写明上游会出错。
+- [x] 复核表里 11 个改 body 的算子，以及 `htmlPrepend`/`htmlBody`/`cssPrepend`/`cssBody` 在对应类型页面上：值不存在时 body 不变、不加缓存头，记 `unapplied`。
+- [x] `statusCode`/`replaceStatus`/`method` 保持现在的行为（不生效），在 `declared.js` 里写明上游会出错。
 
 **验收：** 这些用例进差分语料，与上游一致或逐条声明。
+
+**完成记录：** 改 body 的 15 个算子在值不存在时不执行。会话的规则列表和 `explain` 仍列出这一行，并记 `unapplied`，kind `missing-value`。值首尾是花括号、但本身是 JSON 对象的，照上游当内容。`cases-values.js` 增加到 150 个对照，2.10.8、2.10.10 上都没有未声明的差异。旧声明有 6 条随之过期删掉：这个语料 4 条，`cases-groups.js` 2 条（跨规则组的引用）。上游会出错的那 3 个算子在语料里逐字段声明。全量差分（代码 `6935329`）两版各 32 步，31 步通过；失败的那一步就是 `cases-groups` 那 2 条过期声明，删掉后通过（`ca22214` `6935329` `8bfdb2e` `1b015c9`）。这一项推翻了之前"引用不到时按字面量用"的有意偏离，理由见 [STATUS](STATUS.md#2026-10-02-第三轮会伤到人的剩余风险)。
 
 ### R3-03 — 控制台在代理不在时退避（P2）
 
