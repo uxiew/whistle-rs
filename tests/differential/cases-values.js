@@ -31,7 +31,7 @@
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// Nine cases differ, declared case by case in `declared.js`. They are not in `harness.js`'s
+// Twelve cases differ, declared case by case in `declared.js`. They are not in `harness.js`'s
 // `EXPECTED` because a matcher wide enough to catch them would hide real news in
 // another corpus; what makes them expected is the rule, which a matcher on the
 // output cannot see. Two deliberate divergences, already declared in the code:
@@ -162,6 +162,14 @@ module.exports = [
     rules: `${P}${at} ${op}://{nope}`,
     request: { path: at, ...(at === '/echo' ? { method: 'POST', body: 'original' } : {}) },
   })),
+  // Three where upstream itself goes wrong, so this port does not copy it:
+  // `{nope}` reaches Node as a status code or a method, and the request dies
+  // (a reset, or a 502 for an invalid method token). Here `replaceStatus` and
+  // `method` are not applied, and `statusCode` answers an empty 200 — what it
+  // does with any code it cannot read. Declared in `declared.js`.
+  { name: 'a value that names nothing on statusCode', rules: `${A} statusCode://{nope}` },
+  { name: 'a value that names nothing on replaceStatus', rules: `${A} replaceStatus://{nope}` },
+  { name: 'a value that names nothing on method', rules: `${A} method://{nope}` },
   // Beside one that has a value: only the one without is skipped.
   // On a plain page: `/echo` would print the request's headers into the body,
   // and this port's request cache-bust (`cache-bust` in harness.js) with them.

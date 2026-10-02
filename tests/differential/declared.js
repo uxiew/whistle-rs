@@ -191,6 +191,16 @@ const DECLARED = {
       'angle brackets around a payload containing parens', 'a script tag in angle brackets',
     ].map((n) => d(n, BUST, 'a value a text operator cannot read is used as written here; upstream opens it as '
       + 'a path, fails, and does nothing. Header, first divergence')),
+    d('a value that names nothing on statusCode', ['status', 'res.body'],
+      'upstream hands {nope} to Node as a status code and the connection is reset; this port answers its own '
+      + 'empty 200, as it does for any statusCode it cannot read. See the case\'s comment'),
+    d('a value that names nothing on replaceStatus', ['status', 'res.header.content-type', 'res.header.x-origin', 'res.body'],
+      'upstream sets {nope} as the status code and the connection is reset; this port leaves the origin\'s '
+      + 'answer alone. See the case\'s comment'),
+    d('a value that names nothing on method',
+      ['status', 'res.header.content-type', 'res.header.x-server', 'res.header.x-origin', 'res.body'],
+      'upstream sends {nope} as the method, Node refuses the token, and the answer is a 502; this port '
+      + 'sends the request\'s own method. See the case\'s comment'),
     d('trailing text after a reference', ['res.body'],
       'upstream reads {v}tail as {v} and drops the tail; a reference must end the value here. Header, second divergence'),
     d('json5: an unquoted dashed key on resHeaders', ['status', 'res.header.content-type', 'res.header.x-origin', 'res.body'],
