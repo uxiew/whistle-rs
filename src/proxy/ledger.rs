@@ -59,10 +59,10 @@ pub(crate) struct Ledger {
     /// Matched operators that did not take effect, noted as `serve` found
     /// out, for whichever session this request becomes — see [`unapplied`].
     pub(super) unapplied: Vec<unapplied::Unapplied>,
-    /// The request's scripts that did not finish, filled as they run — see
-    /// [`crate::rules::ReqInfo::script_failures`]. Read when the session is
-    /// stamped, which is after the last script a request can run.
-    pub(super) scripts: Option<crate::rules::ScriptFailures>,
+    /// What the request's rules and scripts noted where this ledger cannot be
+    /// reached — see [`crate::rules::ReqInfo::noted`]. Read when the session
+    /// is stamped, which is after the last of them can run.
+    pub(super) noted: Option<crate::rules::Noted>,
 }
 
 impl Ledger {
@@ -74,14 +74,14 @@ impl Ledger {
             time_ms: now_ms(),
             settled: false,
             unapplied: Vec::new(),
-            scripts: None,
+            noted: None,
         }
     }
 
-    /// Put the failures of the request's scripts on its session — see
-    /// [`Ledger::scripts`].
-    pub(super) fn watch_scripts(&mut self, failures: crate::rules::ScriptFailures) {
-        self.scripts = Some(failures);
+    /// Put what the request's rules and scripts note on its session — see
+    /// [`Ledger::noted`].
+    pub(super) fn watch(&mut self, noted: crate::rules::Noted) {
+        self.noted = Some(noted);
     }
 
     /// Note that matched operators did not take effect. `None` notes nothing:
@@ -92,16 +92,10 @@ impl Ledger {
 
     /// Put what was noted on the session this request is recorded as.
     pub(super) fn stamp(&mut self, session: &mut Session) {
-        if let Some(scripts) = &self.scripts
-            && let Ok(mut failures) = scripts.lock()
+        if let Some(noted) = &self.noted
+            && let Ok(mut noted) = noted.lock()
         {
-            for (raw, why) in failures.drain(..) {
-                self.unapplied.push(unapplied::Unapplied {
-                    kind: unapplied::Kind::ScriptFailed,
-                    ops: vec![raw],
-                    reason: format!("the script {why}; nothing it did was kept"),
-                });
-            }
+            self.unapplied.append(&mut noted);
         }
         session.unapplied.append(&mut self.unapplied);
     }

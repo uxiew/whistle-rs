@@ -340,7 +340,7 @@ pub fn merge_included_rules(
                             env: &info.script_env,
                         },
                     );
-                    let produced = script_failed(info, op, produced)?;
+                    let produced = script_failed(info, &op.raw, produced)?;
                     script_values.extend(produced.values);
                     Some(produced.rules)
                 }
@@ -379,16 +379,20 @@ pub fn merge_included_rules(
 }
 
 /// What a script run produced, or `None` with the failure noted on the request
-/// for its session — see [`ReqInfo::script_failures`]. `op` is the operator
-/// that ran it.
+/// for its session — see [`ReqInfo::noted`]. `raw` is the operator that ran
+/// it, as written.
 pub(in crate::proxy) fn script_failed<T>(
     info: &ReqInfo,
-    op: &RuleOp,
+    raw: &str,
     ran: Result<T, crate::proxy::script::Stopped>,
 ) -> Option<T> {
     ran.inspect_err(|why| {
-        if let Ok(mut failures) = info.script_failures.lock() {
-            failures.push((op.raw.clone(), why.to_string()));
+        if let Ok(mut noted) = info.noted.lock() {
+            noted.push(crate::proxy::unapplied::Unapplied {
+                kind: crate::proxy::unapplied::Kind::ScriptFailed,
+                ops: vec![raw.to_string()],
+                reason: format!("the script {why}; nothing it did was kept"),
+            });
         }
     })
     .ok()
@@ -496,7 +500,7 @@ pub fn merge_res_rules(
                         env: &info.script_env,
                     },
                 );
-                let produced = script_failed(info, op, produced)?;
+                let produced = script_failed(info, &op.raw, produced)?;
                 return Some((produced.rules, produced.values));
             }
             let hook = raw_protocol(op) != Some("resRules")

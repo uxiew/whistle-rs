@@ -558,12 +558,7 @@ pub(super) fn inject_res_body(
         );
         // A script that did not finish leaves the response as it was, and
         // says so on the session.
-        if let Err(why) = &ran
-            && let Ok(mut failures) = info.script_failures.lock()
-        {
-            failures.push((raw.clone(), why.to_string()));
-        }
-        if let Ok(r) = ran {
+        if let Some(r) = apply::script_failed(info, raw, ran) {
             if let Some(st) = r.status
                 && let Ok(s) = StatusCode::from_u16(st)
             {
