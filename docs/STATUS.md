@@ -234,7 +234,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 | SDK | 补 `sdk/LICENSE`，`npm pack --dry-run` 显示随包发出 | npm pack 清单 |
 | 发布构件 | CI release job 把 LICENSE、NOTICE.md、THIRD-PARTY-LICENSES.md 与二进制放在一起并算校验和 | 本地按同样步骤手动走过一遍；**CI 本身未运行** |
 
-**剩余风险：** `Cargo.lock` 里的 `num-bigint 0.4.7` 已在 crates.io 被撤回（`cargo package` 报出），未处理；crate 包不含 `ui-src/dist`，从 crates.io 构建得到的是占位控制台；许可判断基于各包声明的 SPDX 标识与自带的许可文件，没有逐个核对声明是否与源码实际许可一致。
+**剩余风险：** ~~`Cargo.lock` 里的 `num-bigint 0.4.7` 已在 crates.io 被撤回（`cargo package` 报出），未处理~~ 2026-10-02 升到 0.4.8，见 R3-04；crate 包不含 `ui-src/dist`，从 crates.io 构建得到的是占位控制台；许可判断基于各包声明的 SPDX 标识与自带的许可文件，没有逐个核对声明是否与源码实际许可一致。
 
 ## 2026-09-28 S1 安全运行契约
 
@@ -867,6 +867,7 @@ for (var j = 0; j < 2000000; j++) f();
 | --- | --- | --- | --- | --- |
 | R3-01 规则脚本 | 循环上限按调用帧计数，"循环里调用带循环的函数"不受约束；脚本在 tokio 工作线程上执行。复核的脚本让单个请求永远不回答，同时 12 个时整个代理停止响应，SIGTERM 无效 | 用户脚本分片执行，每片之间看表，1 秒到点丢弃结果、请求照常转发；脚本在 `block_in_place` 里执行，不占工作线程；抛错或超时记进会话（`unapplied`，kind `script-failed`）。覆盖 `reqScript`、规则脚本、`resScript`、`frameScript` 的顶层和每次处理函数调用、PAC | `283174b` `f195a92` | 复核场景重跑（debug 构建）：单个请求 1.02 秒照常转发，源站没收到脚本推的头；同时 12 个时控制台 1.7 ms 回答，12 个请求各在约 1.01 秒返回 200；这时发 SIGTERM 0.4 秒退出。`tests/script_limit_e2e.rs`：2 个工作线程、4 个这样的请求，控制台和不带脚本的请求在 500 ms 内回答，每个会话有 `script-failed`；去掉 `block_in_place` 时控制台等了 1.008 秒、测试失败，去掉会话记录时也失败。三处单元测试（规则脚本、`resScript`、PAC）和一个 `frameScript` 测试各自在上限内停下。core-bench 新增一对对照（超时的脚本不推规则 / 同样的推送不带循环时生效），2.10.8、2.10.10 都一致 |
 | R3-02 引用不到值 | 改 body 的算子整个值是 `{名字}`、而没有这个值时，把字面量 `{nope}` 写进请求或响应（复核里 11 个算子），并加上 `pragma`/`cache-control`/`expires` | 这类算子不执行：从 `Resolved` 的 `get`/`all`/`ops` 里移到 `inert`，会话的规则列表和 `explain` 仍列出它；会话记 `unapplied`，kind `missing-value`，写明是哪个名字。首尾是花括号、但本身是 JSON 对象的值（有 `:`、json5 读得懂）照上游当内容 | `ca22214` `6935329` `8bfdb2e` `1b015c9` | `cases-values.js` 新增 18 个对照：其余的 body 算子各在对应类型的页面上，一个"缺值和有值并排"，以及上游会出错、逐字段声明的 `statusCode`/`replaceStatus`/`method`。旧的 4 条声明随之过期删掉，`cases-groups.js` 里跨规则组引用的 2 条也是。2.10.8、2.10.10 上 150 个对照都没有未声明的差异。全量差分（代码 `6935329`）：两版各 31 步通过，失败的一步正是那 2 条过期声明，删掉后重跑通过。单元测试覆盖：单值算子不再命中、列表算子只剩有值的那个、`reqHeaders` 这类非 body 算子照旧、会话列表里还有它、记了 `missing-value` |
+| R3-04 被撤回的依赖 | `Cargo.lock` 锁着 crates.io 上已撤回的 `num-bigint 0.4.7`（经 boa 和 rcgen 引入），Q3 时发现、一直没处理 | 0.4.8 | `b6fa034` | 只改锁文件；全部测试通过；第三方许可生成退出 0，列出 MIT OR Apache-2.0 和两份原文 |
 
 **为什么上限是 1 秒而不是上游的 60 ms：** 这个引擎在 release 构建里跑 300 万次空循环要 21 ms，V8 约 2 ms。照抄 60 ms，会把在上游能跑完的脚本误杀。代价是：一个上游会在 60 ms 丢掉的脚本（比如忙等 100 ms），这里会跑完并生效。
 
