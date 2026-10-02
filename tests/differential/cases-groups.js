@@ -36,8 +36,8 @@
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
-// Three cases differ, declared in `declared.js`, from two causes, both named
-// here.
+// One case differs, declared in `declared.js`; a second cause closed on
+// 2026-10-02. Both are named here.
 //
 //  1. `two groups with the same name` — upstream's `add` is a file write, so the
 //     second text **replaces** the first (`rules.add` → `rulesStorage.writeFile`,
@@ -49,8 +49,8 @@
 //     other API can reach, this one can reach too — and the shape that refuses
 //     to overwrite silently is the better of them. Declared, not aligned.
 //
-//  2. Two of the three `values block` cases, and **not for the reason they were
-//     written**. An inline ``` block is now private to the group that declared
+//  2. *(Closed.)* Two of the three `values block` cases, and **not for the
+//     reason they were written**. An inline ``` block is now private to the group that declared
 //     it here as it is upstream — filed under `getInlineKey` = `key + '\n\r' +
 //     file` (`_original/lib/util/index.js:205-209`) and looked up before the
 //     **stored** values fall back (`getValueFor`,
@@ -66,15 +66,17 @@
 //     finds nothing, and leaves the response alone. So whistle answers with the
 //     origin's page and this port answers `{v}` plus the cache headers that come
 //     with a body rewrite. That is the "a bare value stays the literal" choice
-//     `docs/RULES.md` declares under *Values read from a file or a URL*, reached
+//     `docs/RULES.md` declared under *Values read from a file or a URL*, reached
 //     from a new direction — not a group-scoping difference. It is why these two
-//     did not go clean when the third did.
+//     did not go clean when the third did. Since 2026-10-02 an unanswered
+//     `{name}` on a body operator is not applied here either (ROADMAP R3-02),
+//     and both agree with whistle.
 //
 // ── How much of this measures anything ─────────────────────────────────────
 //
-// **41 of the 51 cases change something on the real-whistle side**, and 43 do
-// here — the two extra being two of the values cases above, which is the
-// divergence and not an accident. Measured the only way that means anything:
+// **41 of the 51 cases change something on the real-whistle side**, and the
+// same 41 do here. Until 2026-10-02 it was 43 here — the two extra being two of
+// the values cases above, which was the divergence and not an accident. Measured the only way that means anything:
 // each case's setup run twice per proxy, once with its groups and once with
 // none, and the two answers compared. A group that never applied and a group
 // that applied and changed nothing are the same picture.
@@ -83,8 +85,9 @@
 // test: the empty slate, an unselected group on its own, every group
 // unselected, an empty group on its own, a comment-only group on its own, a
 // deleted group on its own, Default switched off, and an unselected group whose
-// `@` include must not be applied. The other two are the two values cases where
-// upstream doing nothing **is** the divergence.
+// `@` include must not be applied. The other two are the two values cases: the
+// block is out of scope in both proxies, and the operator it would have fed is
+// not applied in either.
 //
 // ── What this file discriminates against ───────────────────────────────────
 //

@@ -133,10 +133,6 @@ const DECLARED = {
   'cases-groups.js': [
     d('two groups with the same name', ['req.method'],
       'upstream\'s add overwrites a group of the same name; this port refuses it and keeps the first. Header, 1'),
-    d('a values block in one group, referenced by another', BUST,
-      'the block is out of scope in both; an unanswered {v} then stays the literal here. Header, 2'),
-    d('a values block in Default, referenced by a named group', BUST,
-      'the block is out of scope in both; an unanswered {v} then stays the literal here. Header, 2'),
   ],
 
   'cases-paths.js': [
