@@ -2322,10 +2322,12 @@ and the inspector is at `http://192.168.1.5:8080/client/#mysession`. Use an
 address the **device** can reach, not `127.0.0.1`.
 
 Without `--weinre`, a bare id has nowhere to load the script from. Nothing is
-injected, and the session says so: its Rules tab shows the `weinre://` rule as
+injected, the response's headers are left as they came (see the CSP note
+below), and the session says so: its Rules tab shows the `weinre://` rule as
 "not applied", with the kind `no-weinre-server` in `unapplied`. (It used to
 inject a `<script>` pointing at this proxy's own port, which answered `404`:
-the page loaded, no inspector ever connected, and nothing said why.)
+the page loaded, no inspector ever connected, and nothing said why. After that
+it injected nothing but still stripped the page's CSP and cache headers.)
 
 A rule can also name the script itself, which needs no `--weinre`:
 
@@ -2343,9 +2345,10 @@ itself has no TLS, so put it behind something that does, or debug the page over
 `http://`.
 
 Injecting costs the response its `Content-Security-Policy` and its cacheability,
-exactly as the `html*`/`js*`/`css*` operators do — an agent a page's own CSP
+exactly as the `html*`/`js*`/`css*` operators do: an agent a page's own CSP
 forbids never runs, and one the browser caches outlives the rule that asked for
-it (`_original/lib/inspectors/weinre.js:37-38`). `enable://keepCSP` and
+it (`_original/lib/inspectors/weinre.js:37-38`). Only injecting does this — a
+`weinre://` that injects nothing leaves both. `enable://keepCSP` and
 `enable://keepCache` opt out of each.
 
 **How this differs from whistle**, measured against 2.10.8 by

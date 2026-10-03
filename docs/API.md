@@ -171,7 +171,7 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | `undecodable` | `content-encoding` 解不开（字节和头说的不一致） | 原样转发，不在压缩字节上跑算子 |
 | `unsupported-coding` | 本代理不支持的编码（`zstd`、叠加编码） | 原样转发 |
 | `plugin-failed` | 插件的 request/response 钩子连不上、回了错误状态码、或 30 秒没回答 | 请求照常继续，当作钩子什么都没说 |
-| `no-weinre-server` | `weinre://id` 只写了 id，而启动时没用 `--weinre` 指明 weinre 服务在哪（本代理不自带 weinre） | 不注入任何东西，页面原样返回 |
+| `no-weinre-server` | `weinre://id` 只写了 id，而启动时没用 `--weinre` 指明 weinre 服务在哪（本代理不自带 weinre） | 不注入任何东西，页面原样返回，CSP 和缓存头也不动 |
 | `cipher-unusable` | `cipher://` 选不出可用的套件，或套件和允许的 TLS 版本对不上；或 `tlsOptions://` 里有本代理的 TLS 库做不了的选项（`dhparam`、`secureOptions` 等） | 不带那一部分建连（版本限制和其余选项保留） |
 | `missing-value` | 改 body 的算子（`resBody`、`resPrepend`、`htmlAppend`、`reqBody` 等）整个值是 `{名字}`，而规则文本的 ``` 块和 Values 里都没有这个名字 | 不执行，body 和缓存头都不动；`reason` 里写着是哪个名字 |
 | `script-failed` | 规则跑的脚本（`reqScript`、`rulesFile`、`resScript` 等）抛了错，或 1 秒还没跑完；`reason` 写明是哪种，抛错时带上错误信息 | 脚本推的规则、对响应的改动都不算数，请求照常继续 |
