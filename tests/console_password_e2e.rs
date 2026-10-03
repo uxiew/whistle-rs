@@ -65,6 +65,18 @@ fn a_password_from_the_environment_guards_the_console() {
         !log.contains("from-env"),
         "the password is not logged: {log}"
     );
+    let token = base64::engine::general_purpose::STANDARD.encode("admin:from-env");
+    let auth = format!("Basic {token}");
+    let (code, body) = request_with(
+        &proxy.addr,
+        "GET",
+        "/api/status",
+        &[("Authorization", auth.as_str())],
+        b"",
+    );
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(code, 200, "{body}");
+    assert!(!body.contains("from-env"), "nor reported: {body}");
 }
 
 #[test]
