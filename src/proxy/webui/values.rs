@@ -23,7 +23,7 @@ pub(super) async fn values_post(
     };
     match serde_json::from_slice::<std::collections::HashMap<String, String>>(&body) {
         Ok(map) => {
-            crate::rules::storage::save_values(&values_dir(state), &map);
+            save_values(state, &map);
             *state.values.write().unwrap() = map;
             Response::builder()
                 .status(StatusCode::OK)
@@ -50,7 +50,7 @@ pub(super) fn edit_values(
     if !edit(&mut values) {
         return false;
     }
-    crate::rules::storage::save_values(&values_dir(state), &values);
+    save_values(state, &values);
     true
 }
 

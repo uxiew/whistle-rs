@@ -114,8 +114,12 @@ fn snapshot(state: &Arc<AppState>) -> serde_json::Value {
     })
 }
 
-/// Write what outlives a restart — see [`crate::rules::storage::Switches`].
+/// Write what outlives a restart — see [`crate::rules::storage::Switches`] —
+/// where there is a restart to outlive (`Config::persist_edits`).
 fn save(state: &Arc<AppState>) {
+    if !state.config.persist_edits {
+        return;
+    }
     let switches = crate::rules::storage::Switches {
         rules_off: state.rules.read().unwrap().all_off(),
         plugins_off: state.plugins.all_off(),

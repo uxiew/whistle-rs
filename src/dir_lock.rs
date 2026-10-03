@@ -51,12 +51,12 @@ impl std::fmt::Display for LockError {
                 if let Some(owner) = owner {
                     write!(f, " ({owner})")?;
                 }
+                // What to do instead is the caller's to say: the binary and an
+                // embedding program have different ways to name a directory.
                 write!(
                     f,
                     ". Two instances on one directory overwrite each other's rule \
-                     groups and values. Stop that one, or give this one a directory \
-                     of its own with --dir; to have both use the same root CA, put \
-                     root.key and root.crt in a directory and pass it to both with -z"
+                     groups, values and history"
                 )
             }
             LockError::Unavailable { dir, error } => write!(
@@ -152,7 +152,6 @@ mod tests {
             "{second:?}"
         );
         assert!(text.contains(&dir.display().to_string()), "{text}");
-        assert!(text.contains("--dir") && text.contains("-z"), "{text}");
         drop(first);
         DirLock::acquire(&dir).expect("free again once the holder lets go");
     }

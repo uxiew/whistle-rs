@@ -167,6 +167,12 @@ pub struct Config {
     pub persist_sessions: bool,
     /// Number of days of session JSONL files to retain.
     pub persist_days: u32,
+    /// Whether the console's edits — rule groups, values, the switches — are
+    /// written to `storage_dir` for the next start to read. The binary reads
+    /// them back; an embedded proxy never does, so it does not write them
+    /// either. It used to, and its default directory is the binary's: one save
+    /// in an embedded console replaced the groups the binary kept there.
+    pub persist_edits: bool,
     /// How many captured transactions to keep in memory — whistle's
     /// `-R/--reqCacheSize`. Floored at 600 there and here
     /// (`_original/lib/util/data-server.js:10-12`).
@@ -255,6 +261,7 @@ impl Default for Config {
             body_rewrite_cap: DEFAULT_BODY_REWRITE_CAP,
             persist_sessions: true,
             persist_days: DEFAULT_PERSIST_DAYS,
+            persist_edits: true,
             req_cache_size: DEFAULT_REQ_CACHE_SIZE,
             frame_cache_size: DEFAULT_FRAME_CACHE_SIZE,
         }

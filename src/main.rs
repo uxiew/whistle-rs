@@ -376,7 +376,11 @@ async fn main() -> Result<()> {
     // history. Held until the process ends.
     let dir_lock = match DirLock::acquire(&storage_dir) {
         Ok(lock) => Some(lock),
-        Err(held @ LockError::Held { .. }) => return Err(held.into()),
+        Err(held @ LockError::Held { .. }) => anyhow::bail!(
+            "{held}. Stop that one, or give this one a directory of its own with \
+             --dir; to have both use the same root CA, put root.key and root.crt \
+             in a directory and pass it to both with -z"
+        ),
         Err(unavailable) => {
             tracing::warn!("{unavailable}");
             None

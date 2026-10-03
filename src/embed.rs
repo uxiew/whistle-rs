@@ -156,8 +156,16 @@ impl Builder {
         self
     }
 
-    /// Where the root CA lives. Two embedders sharing a directory share a CA,
-    /// which is usually right — a client trusts it once.
+    /// Where the root CA lives, and the history with
+    /// [`persist_sessions`](Self::persist_sessions). Without history, proxies
+    /// sharing a directory — embedded ones, or one beside the binary — share
+    /// its root, which is usually right: a client trusts it once. With history
+    /// the directory has to be this proxy's alone, and [`start`](Self::start)
+    /// fails if another process holds it.
+    ///
+    /// The console's edits to rule groups and values are not written here: an
+    /// embedded proxy takes its rules from [`rules`](Self::rules) and never
+    /// reads them back.
     pub fn storage_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.storage_dir = Some(dir.into());
         self
@@ -256,12 +264,33 @@ impl Builder {
             ui_port: None,
             socks_port: self.socks_port,
             persist_sessions: self.persist,
+            persist_edits: false,
             values: self.values.into_iter().collect(),
             ..Config::default()
         };
         if let Some(dir) = self.storage_dir {
             config.storage_dir = dir;
         }
+        // History is written to the directory, so it needs the directory to
+        // itself — see `crate::dir_lock`. Taken before the root CA is read,
+        // as the binary does, so a refused start has touched nothing.
+        let dir_lock = if config.persist_sessions {
+            crate::private_fs::create_dir(&config.storage_dir)?;
+            match crate::dir_lock::DirLock::acquire(&config.storage_dir) {
+                Ok(lock) => Some(lock),
+                Err(held @ crate::dir_lock::LockError::Held { .. }) => anyhow::bail!(
+                    "{held}. Give this proxy a storage_dir of its own, or leave \
+                     persist_sessions off: without history it only reads the root \
+                     CA there, and may share it"
+                ),
+                Err(unavailable) => {
+                    tracing::warn!("{unavailable}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let Some(on) = self.intercept_https {
             config.intercept_https = on;
         }
@@ -304,6 +333,7 @@ impl Builder {
         if state.config.persist_sessions {
             state.start_history();
         }
+        state.dir_lock = dir_lock;
         let state = Arc::new(state);
         state.warm_up_plugins();
         if let Some(observer) = self.observer {
@@ -311,6 +341,9 @@ impl Builder {
         }
 
         let (listener, addr) = crate::proxy::bind(&state).await?;
+        if let Some(lock) = &state.dir_lock {
+            lock.record(Some(&format!("http://{addr}")));
+        }
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(crate::proxy::accept_loop(
             state.clone(),

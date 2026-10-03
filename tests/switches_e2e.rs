@@ -109,9 +109,8 @@ async fn every_rule_off_and_on_again() {
     assert!(!head.contains("x-rule"), "{head}");
     assert_eq!(body, "origin", "the request still goes through, untouched");
 
-    // Saved, for the next start.
-    let saved = whistle_rs::rules::storage::load_switches(&p.state().config.storage_dir);
-    assert!(saved.rules_off);
+    // Kept for the next start by the binary, the one that reads it back; an
+    // embedded proxy like this one keeps it in memory. See `data_dir_e2e.rs`.
 
     api(p.addr(), "POST", "/api/switches", r#"{"rules":true}"#).await;
     assert!(get(p.addr(), &url).await.0.contains("x-rule: 1"));

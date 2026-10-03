@@ -45,6 +45,28 @@ fn command(dir: &Path, extra: &[&str]) -> Command {
 
 /// Start the binary on `dir` and wait for it to say where it listens.
 fn start(dir: &Path, extra: &[&str]) -> Instance {
+    try_start(dir, extra).expect("the instance starts")
+}
+
+/// Start on `dir` once its previous holder, just killed, has let go of it.
+/// Windows releases a dead process's locks "depending on available system
+/// resources", hence a few tries rather than one.
+fn restart(dir: &Path) -> Instance {
+    let began = Instant::now();
+    loop {
+        if let Some(instance) = try_start(dir, &[]) {
+            return instance;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the directory stayed locked after its holder was killed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// [`start`], or `None` when the binary exits instead of listening.
+fn try_start(dir: &Path, extra: &[&str]) -> Option<Instance> {
     let mut child = command(dir, extra)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -64,10 +86,28 @@ fn start(dir: &Path, extra: &[&str]) -> Instance {
             }
         }
     });
-    let addr = rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the instance says where it listens");
-    Instance { child, addr }
+    let addr = match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(addr) => addr,
+        // Its stdout closed without an address: it exited.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = child.wait();
+            return None;
+        }
+        Err(timeout) => panic!("the instance never said where it listens: {timeout}"),
+    };
+    // The log line comes from inside the bind, a moment before the address is
+    // recorded beside the lock for the next instance's message.
+    let owner = dir.join("lock.owner");
+    let began = Instant::now();
+    while !std::fs::read_to_string(&owner).is_ok_and(|line| line.contains(&addr)) {
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{} never named {addr}",
+            owner.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Some(Instance { child, addr })
 }
 
 /// Run the binary on `dir` expecting it to stop by itself; its exit status
@@ -102,10 +142,22 @@ fn run_to_exit(dir: &Path, limit: Duration) -> (std::process::ExitStatus, String
 
 /// `GET path` over HTTP/1.0, so the body comes back unframed.
 fn get(addr: &str, path: &str) -> (u16, Vec<u8>) {
+    request(addr, "GET", path, b"")
+}
+
+/// One request to the console over HTTP/1.0; its status and body.
+fn request(addr: &str, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
     let mut sock = TcpStream::connect(addr).expect("connect");
     sock.set_read_timeout(Some(Duration::from_secs(10)))
         .expect("timeout");
-    write!(sock, "GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").expect("write");
+    write!(
+        sock,
+        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .expect("write head");
+    sock.write_all(body).expect("write body");
     let mut raw = Vec::new();
     sock.read_to_end(&mut raw).expect("read");
     let head_end = raw
@@ -156,6 +208,10 @@ fn a_second_instance_on_the_same_directory_is_refused() {
         stderr.contains(&format!("pid {}", first.child.id())) && stderr.contains(&first.addr),
         "says which instance holds it: {stderr}"
     );
+    assert!(
+        stderr.contains("--dir") && stderr.contains("-z"),
+        "and what to do instead: {stderr}"
+    );
     assert_eq!(snapshot(&dir), before, "touched nothing in the directory");
     assert_eq!(
         get(&first.addr, "/api/values").0,
@@ -164,28 +220,9 @@ fn a_second_instance_on_the_same_directory_is_refused() {
     );
 
     // However the holder ends — here the way `kill -9` and a crash do, with no
-    // code of its own running — the directory is free again. Windows releases
-    // a dead process's locks "depending on available system resources", hence
-    // a few tries rather than one.
+    // code of its own running — the directory is free again.
     drop(first);
-    let began = Instant::now();
-    let next = loop {
-        let mut child = command(&dir, &[])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn");
-        std::thread::sleep(Duration::from_millis(500));
-        if child.try_wait().expect("try_wait").is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
-            break start(&dir, &[]);
-        }
-        assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "the directory stayed locked after its holder was killed"
-        );
-    };
+    let next = restart(&dir);
     assert_eq!(get(&next.addr, "/api/values").0, 200);
 }
 
@@ -214,5 +251,149 @@ fn separate_directories_share_a_root_through_the_certificate_directory() {
         root_a,
         std::fs::read(certs.join("root.crt")).expect("root.crt"),
         "the one in the certificate directory"
+    );
+}
+
+/// A directory as the binary leaves it: a named group, a value.
+fn kept_by_the_binary(name: &str) -> PathBuf {
+    let dir = scratch(name);
+    let rules = dir.join("rules");
+    std::fs::create_dir_all(&rules).expect("rules dir");
+    std::fs::write(
+        rules.join("groups.json"),
+        r#"{"groups":[{"name":"default","enabled":true},{"name":"alpha","enabled":true}]}"#,
+    )
+    .expect("groups.json");
+    std::fs::write(rules.join("default.rules"), "kept.test 1.1.1.1").expect("default");
+    std::fs::write(rules.join("alpha.rules"), "alpha.test 2.2.2.2").expect("alpha");
+    std::fs::write(dir.join("values.json"), r#"{"token":"kept"}"#).expect("values");
+    dir
+}
+
+/// An embedded proxy never reads the rule groups, values or switches on disk —
+/// its rules come from the program embedding it — so it does not write them
+/// either. It used to, on every console save, and its default directory is the
+/// binary's: one save replaced the groups the binary kept there with its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embedded_console_leaves_the_kept_rules_and_values_alone() {
+    let dir = kept_by_the_binary("embedded-edits");
+    let proxy = whistle_rs::embed::Proxy::builder()
+        .port(0)
+        .storage_dir(&dir)
+        .rules("embedded.test 3.3.3.3")
+        .start()
+        .await
+        .expect("embedded proxy");
+    let addr = proxy.addr().to_string();
+    let before = snapshot(&dir);
+
+    let bundle = get(&addr, "/api/export").1;
+    for (method, path, body) in [
+        ("POST", "/api/rules", &b"edited.test 4.4.4.4"[..]),
+        (
+            "POST",
+            "/api/rule-groups",
+            br#"{"name":"beta","text":"b.test 5.5.5.5","enabled":true}"#,
+        ),
+        (
+            "POST",
+            "/api/rule-group/update",
+            br#"{"name":"beta","text":"b.test 6.6.6.6"}"#,
+        ),
+        ("POST", "/api/rule-group/toggle", br#"{"name":"beta"}"#),
+        ("DELETE", "/api/rule-group", br#"{"name":"beta"}"#),
+        ("POST", "/api/value", br#"{"name":"other","value":"b"}"#),
+        (
+            "POST",
+            "/api/value/rename",
+            br#"{"name":"other","to":"renamed"}"#,
+        ),
+        ("DELETE", "/api/value", br#"{"name":"renamed"}"#),
+        ("POST", "/api/values", br#"{"whole":"store"}"#),
+        ("POST", "/api/switches", br#"{"rules":false}"#),
+        ("POST", "/api/import", &bundle[..]),
+    ] {
+        let (status, answer) = request(&addr, method, path, body);
+        assert_eq!(
+            status,
+            200,
+            "{method} {path}: {}",
+            String::from_utf8_lossy(&answer)
+        );
+    }
+
+    assert_eq!(snapshot(&dir), before, "nothing on disk changed");
+    proxy.shutdown().await;
+}
+
+/// History is the one thing an embedded proxy does keep in the directory, when
+/// asked to. Then it needs the directory to itself, as the binary does; without
+/// history it only reads the root there, and may share it with anyone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embedded_proxy_keeping_history_needs_the_directory_to_itself() {
+    let dir = scratch("embedded-history");
+    let binary = start(&dir, &[]);
+
+    let refused = whistle_rs::embed::Proxy::builder()
+        .port(0)
+        .storage_dir(&dir)
+        .persist_sessions(true)
+        .start()
+        .await
+        .err()
+        .expect("refused: the binary holds the directory");
+    let text = refused.to_string();
+    assert!(
+        text.contains(&dir.display().to_string()) && text.contains(&binary.addr),
+        "{text}"
+    );
+    assert!(
+        text.contains("storage_dir") && text.contains("persist_sessions"),
+        "advice in the embedder's terms, not the command line's: {text}"
+    );
+
+    let sharing = whistle_rs::embed::Proxy::builder()
+        .port(0)
+        .storage_dir(&dir)
+        .start()
+        .await
+        .expect("without history it only shares the root");
+    assert_eq!(
+        sharing.root_ca_pem().as_bytes(),
+        get(&binary.addr, "/rootCA.crt").1,
+        "the same root the binary hands out"
+    );
+    sharing.shutdown().await;
+}
+
+/// The other side of the embedded test above: the binary keeps the console's
+/// edits, because it is what reads them back on the next start.
+#[test]
+fn the_binary_keeps_console_edits_for_its_next_start() {
+    let dir = scratch("binary-edits");
+    let first = start(&dir, &[]);
+    for (path, body) in [
+        (
+            "/api/rule-groups",
+            &br#"{"name":"beta","text":"b.test 5.5.5.5","enabled":true}"#[..],
+        ),
+        ("/api/value", br#"{"name":"token","value":"kept"}"#),
+        ("/api/switches", br#"{"rules":false}"#),
+    ] {
+        let (status, answer) = request(&first.addr, "POST", path, body);
+        assert_eq!(status, 200, "{path}: {}", String::from_utf8_lossy(&answer));
+    }
+    drop(first);
+
+    let next = restart(&dir);
+    let text = |path| String::from_utf8(get(&next.addr, path).1).expect("utf-8");
+    assert!(text("/api/rule-groups").contains("beta"), "the group");
+    assert!(
+        text("/api/values").contains("\"token\":\"kept\""),
+        "the value"
+    );
+    assert!(
+        text("/api/switches").contains("\"rules\":false"),
+        "the switch"
     );
 }

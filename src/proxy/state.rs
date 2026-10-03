@@ -51,6 +51,10 @@ pub struct AppState {
     /// this proxy and wants the traffic rather than the console. Set once,
     /// before serving; see [`AppState::observe`].
     pub(super) observer: std::sync::OnceLock<SessionObserver>,
+    /// The storage directory, held for as long as this state lives — which is
+    /// as long as anything can still write history into it. Set by an
+    /// embedded proxy that keeps history; the binary holds its own in `main`.
+    pub(crate) dir_lock: Option<crate::dir_lock::DirLock>,
 }
 
 impl AppState {
@@ -99,6 +103,7 @@ impl AppState {
             next_id: AtomicU64::new(1),
             session_store: None,
             observer: std::sync::OnceLock::new(),
+            dir_lock: None,
         }
     }
 

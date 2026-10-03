@@ -129,8 +129,8 @@ pub(super) async fn bundle_import(
         let mut mgr = state.rules.write().unwrap();
         let mut store = state.values.write().unwrap();
         let counts = apply_bundle(&mut mgr, &mut store, &bundle);
-        crate::rules::storage::save_groups(&rules_dir(state), &mgr);
-        crate::rules::storage::save_values(&values_dir(state), &store);
+        save_groups(state, &mgr);
+        save_values(state, &store);
         counts
     };
     fetch_new_includes(state);

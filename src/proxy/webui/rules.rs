@@ -25,7 +25,7 @@ pub(super) async fn rules_post(state: &Arc<AppState>, req: Request<Incoming>) ->
         // Persist, like every *named* group endpoint already does. Without this
         // the default group — the one the console opens on — was in memory only:
         // edit, restart, gone, having been told "Saved".
-        crate::rules::storage::save_groups(&rules_dir(state), &mgr);
+        save_groups(state, &mgr);
         mgr.len()
     };
     fetch_new_includes(state);
@@ -64,13 +64,31 @@ pub(super) fn fetch_new_includes(state: &Arc<AppState>) {
 
 // ── Rule group management API ──
 
-/// Where the values store is persisted — the storage root, beside `rules/`.
-pub(super) fn values_dir(state: &Arc<AppState>) -> std::path::PathBuf {
-    state.config.data_dir().to_path_buf()
+// The console's saves. Each is skipped where the next start would not read
+// it back — an embedded proxy, see `Config::persist_edits`.
+
+/// Write every rule group, text and all, under `rules/`.
+pub(super) fn save_groups(state: &Arc<AppState>, mgr: &crate::rules::RuleManager) {
+    if state.config.persist_edits {
+        crate::rules::storage::save_groups(&state.config.data_dir().join("rules"), mgr);
+    }
 }
 
-pub(super) fn rules_dir(state: &Arc<AppState>) -> std::path::PathBuf {
-    state.config.data_dir().join("rules")
+/// Write the groups' order and on/off state, not their text.
+pub(super) fn save_meta(state: &Arc<AppState>, mgr: &crate::rules::RuleManager) {
+    if state.config.persist_edits {
+        crate::rules::storage::save_meta(&state.config.data_dir().join("rules"), mgr);
+    }
+}
+
+/// Write the values store, at the storage root beside `rules/`.
+pub(super) fn save_values(
+    state: &Arc<AppState>,
+    values: &std::collections::HashMap<String, String>,
+) {
+    if state.config.persist_edits {
+        crate::rules::storage::save_values(state.config.data_dir(), values);
+    }
 }
 
 pub(super) fn rule_groups_get(state: &Arc<AppState>) -> Response<DynBody> {
@@ -147,7 +165,7 @@ pub(super) async fn rule_groups_add(
         let mut mgr = state.rules.write().unwrap();
         let ok = mgr.add_group(name, text, enabled);
         if ok {
-            crate::rules::storage::save_groups(&rules_dir(state), &mgr);
+            save_groups(state, &mgr);
         }
         ok
     };
@@ -183,7 +201,7 @@ pub(super) async fn rule_group_toggle(
         }
         let r = mgr.toggle_group(name);
         if r.is_some() {
-            crate::rules::storage::save_meta(&rules_dir(state), &mgr);
+            save_meta(state, &mgr);
         }
         r
     };
@@ -217,7 +235,7 @@ pub(super) async fn rule_group_update(
         let mut mgr = state.rules.write().unwrap();
         let ok = mgr.update_group(name, text);
         if ok {
-            crate::rules::storage::save_groups(&rules_dir(state), &mgr);
+            save_groups(state, &mgr);
         }
         ok
     };
@@ -248,7 +266,7 @@ pub(super) async fn rule_group_delete(
         let mut mgr = state.rules.write().unwrap();
         let ok = mgr.remove_group(name);
         if ok {
-            crate::rules::storage::save_groups(&rules_dir(state), &mgr);
+            save_groups(state, &mgr);
         }
         ok
     };
