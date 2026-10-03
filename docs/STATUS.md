@@ -818,7 +818,7 @@ WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-benc
 - ~~脚本上限只数单个循环的次数，嵌套循环每层都在上限以内时拦不住。~~ 不准确：拦不住的是循环里调用带循环的函数，而且后果是整个代理停止响应。2026-10-02 加了 1 秒的墙钟上限，脚本不再占 tokio 工作线程（R3-01）。
 - frameScript：分片的 WebSocket 消息不交给脚本；`pause`/`ignore` 类开关在 TCP 隧道上只表示"要检查"。
 - tlsOptions：`dhparam`、`secureOptions`、`ecdhCurve` 等 rustls 没有对应的选项丢弃并记 `cipher-unusable`。
-- log：日志只在内存里（2000 条 / 8 MiB），重启就没；`/.whistle-rs/log` 这个路径被代理占用；写在 HTML `<meta>` 里的 CSP 不会被去掉；只写 id、没有 `--weinre` 的 `weinre://` 仍会让响应去掉 CSP 和缓存头（虽然最后没注入）。
+- log：日志只在内存里（2000 条 / 8 MiB），重启就没；`/.whistle-rs/log` 这个路径被代理占用；写在 HTML `<meta>` 里的 CSP 不会被去掉；~~只写 id、没有 `--weinre` 的 `weinre://` 仍会让响应去掉 CSP 和缓存头（虽然最后没注入）~~ 2026-10-03 不再改头（R4-03）。
 - 插件静态规则管不到隧道拦不拦的决定和 Test Rules；改了要重启代理；远程插件拿到 manifest 之前不生效。
 - HTTPS 运行时开关不存盘，这是有意的，但和上游（存盘）不同。
 - ~~控制台停在 Console 或 Requests 面板时，代理关掉后它还会每 2 秒请求一次（这次测试时一个标签页 15 小时攒了 2.7 万条失败请求），没有退避。这不是这一轮引入的，没改。~~ 2026-10-02 加了退避（R3-03）。
@@ -932,6 +932,7 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 | ↳ 嵌入时的控制台 | 嵌入的代理启动时不读磁盘上的规则组、Values、开关，控制台一保存却整份写进数据目录；默认目录就是命令行版的 `~/.whistle-rs`，存一次就盖掉命令行版存下的 | 嵌入时这些修改只留在内存（`Config::persist_edits`，嵌入时关） | `d2796bd` | 测试：目录里预先放好命令行版的组和值，嵌入的控制台调遍 11 个会保存的接口（规则、组的增改删和开关、值的增改删和整份替换、开关、导入），目录里的文件一个字节都没变；修之前 `default.rules`、`groups.json`、`values.json` 被改写、多出 `beta.rules` 和 `switches.json`。开了历史的嵌入代理在命令行版占着目录时 `start()` 返回错误，没开的照常启动、拿到同一张根证书。`switches_e2e` 原来用嵌入代理检查开关存盘，改到二进制的重启测试里 |
 | ↳ 并发生成根证书 | 几个进程同时对空目录启动，各生成一张根证书，后写的盖掉先写的；先写的那些继续用自己的私钥签证书，磁盘上还可能是一个进程的证书配另一个进程的私钥 | 生成前锁住 `certs/root.lock`，第一个生成，其余等它写完再读 | `4b41b2a` | 单元测试：8 个线程同时对空目录 `load_or_create`，修之前得到 8 张不同的根证书，修之后 1 张，就是磁盘上那张，`root.key` 的公钥在 `root.crt` 里 |
 | R4-02 口令不上命令行 | `-w`/`-W` 是给口令的唯一办法，命令行在进程列表里，本机任何用户 `ps -A -o args=` 都能看到 | 环境变量 `WHISTLE_RS_PASSWORD`、`WHISTLE_RS_GUEST_PASSWORD`；命令行照旧可用并警告一次，两处都给时命令行优先，空变量当没设。Node 插件进程拿不到这两个变量 | `72b9f48` `d5eb948` `009a53d` | 用环境变量启动，`ps` 里那个进程的参数只有 `-n admin`；不登录 401，登录 200；日志里没有口令。`tests/console_password_e2e.rs` 6 个测试起真实二进制（改之前 3 个失败：环境变量的口令不生效、命令行没有警告）。Node 插件那条是对拉起命令的单元测试（`get_envs` 里这两个变量被移除），没有真的起 Node |
+| R4-03 白改的头 | 只写 id、没给 `--weinre` 的 `weinre://` 什么都不注入，却照样去掉页面的 CSP、把缓存改成 `no-store`：页面平白丢了自己的安全策略 | 这样的 `weinre://` 在响应阶段结束时挪进 `Resolved::inert`，头和 body 都不动，会话仍记 `no-weinre-server`。同一请求另有真会注入的 `log://` 时照它改头；有 `--weinre` 时照旧 | `19c7530` `91b86b4` | 单元测试，源站页面带 CSP、`max-age=600`、`etag`：单独 `weinre://` 时客户端收到的这几个头与没有规则时相同（改之前 CSP 没了、变成 `no-store`）；加上 `log://` 时与单独 `log://` 相同；给了 `--weinre` 时照旧去掉。差分 `cases-compose` 里只写 id 的 4 个对照，原来只有 body 与上游不同，现在 `cache-control`、`expires`、`pragma` 也不同（上游自带 weinre，总会注入），逐个声明；2.10.8、2.10.10 都通过 |
 
 **R4-01 没做到的：** 验收要求 Linux、macOS、Windows 的 CI 都跑这些测试，还没有：这一轮没推送。Windows 只在本机做了类型检查（`cargo clippy --target x86_64-pc-windows-msvc`，C 编译器用存根），代码能编译、没有 lint 警告，但没运行过。Windows 文档说进程死后锁"视系统资源"才释放，测试为此最多重试 5 秒。锁所在的文件系统不支持锁时（某些网络文件系统），记一条 WARN 照常启动，等于没有这层保护。实例运行时删掉 `lock` 能绕过它，INSTALL 写明了别这么做。
 

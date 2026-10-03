@@ -325,10 +325,12 @@
 
 依据：CORE-05 决定没有 `--weinre` 时 `weinre://` 不注入；改头是为了注入的脚本能跑，不注入就没有理由改。
 
-- [ ] `weinre://id` 没有可连的服务时，响应头（CSP、`cache-control`、`pragma`、`expires`、`etag`）和没有这条规则时一样；会话仍记 `no-weinre-server`。
-- [ ] 同一个请求另有 `log://` 等真的会注入的规则时，照那条规则改头；有 `--weinre` 时行为不变。
+- [x] `weinre://id` 没有可连的服务时，响应头（CSP、`cache-control`、`pragma`、`expires`、`etag`）和没有这条规则时一样；会话仍记 `no-weinre-server`。
+- [x] 同一个请求另有 `log://` 等真的会注入的规则时，照那条规则改头；有 `--weinre` 时行为不变。
 
 **验收：** 带 CSP 和 `max-age` 的 HTML 页面，单独 `weinre://id`（没有 `--weinre`）时客户端收到的头与没有规则时逐个相同；`weinre://id` 加 `log://id` 时与单独 `log://id` 相同。
+
+**完成记录：** 没有服务可连的 `weinre://` 在响应阶段结束时挪进 `Resolved::inert`（R3-02 加的那个"命中了但不执行"的位置），改头、收集 body 的代码都看不到它，会话和 `explain` 仍列出这一行。放在响应阶段结束时，是因为带响应条件的 `weinre://` 到这时才命中，而原生和本地生成的响应都要先经过这里。原来请求阶段的记录和 `ResOps::for_config` 各做了一半，一并删掉。单元测试按验收的三种组合比较客户端收到的头，改之前第一条就失败（CSP 没了，`max-age=600` 变成 `no-store`）。差分里只写 id 的 4 个对照多了缓存头的差异（上游总会注入），已声明；`cases-compose` 两版都通过（`19c7530` `91b86b4`）。
 
 ## 执行顺序与交接
 
