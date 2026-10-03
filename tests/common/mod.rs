@@ -112,11 +112,10 @@ pub fn try_start(mut cmd: Command, dir: &Path) -> Option<Instance> {
     Some(Instance { child, addr, log })
 }
 
-/// Run the binary on `dir` expecting it to stop by itself; its exit status
-/// and what it wrote to stderr. A run still going after `limit` is a failure:
-/// it means the second instance started.
-pub fn run_to_exit(dir: &Path, limit: Duration) -> (std::process::ExitStatus, String) {
-    let mut child = command(dir, &[])
+/// Run `cmd` expecting it to stop by itself: refused, not started. Its exit
+/// status and what it wrote to stderr; still running after `limit` fails.
+pub fn run_to_exit(mut cmd: Command, limit: Duration) -> (std::process::ExitStatus, String) {
+    let mut child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -136,7 +135,7 @@ pub fn run_to_exit(dir: &Path, limit: Duration) -> (std::process::ExitStatus, St
         if began.elapsed() > limit {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("still running after {limit:?}: a second instance started on the directory");
+            panic!("still running after {limit:?}: it started instead of refusing");
         }
         std::thread::sleep(Duration::from_millis(20));
     }

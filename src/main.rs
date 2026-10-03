@@ -32,7 +32,9 @@ struct Cli {
     #[arg(short = 'n', long)]
     username: Option<String>,
 
-    /// Console login password (whistle's `-w/--password`).
+    /// Console login password (whistle's `-w/--password`). Better given as
+    /// WHISTLE_RS_PASSWORD: on the command line any user of the machine can
+    /// read it in the process list. The flag wins when both are set.
     #[arg(short = 'w', long)]
     password: Option<String>,
 
@@ -42,6 +44,7 @@ struct Cli {
     guest_name: Option<String>,
 
     /// Password for the read-only account (whistle's `-W/--guestPassword`).
+    /// Better given as WHISTLE_RS_GUEST_PASSWORD, as for -w.
     #[arg(short = 'W', long)]
     guest_password: Option<String>,
 
@@ -387,14 +390,17 @@ async fn main() -> Result<()> {
         }
     };
 
+    let password = console_password(cli.password, "-w", PASSWORD_ENV);
+    let guest_password = console_password(cli.guest_password, "-W", GUEST_PASSWORD_ENV);
+
     // `-N/-W` alone looks like a protected console and is an open one: the
     // read-only account only restricts anything beside an admin account, and
     // with no `-n/-w` nobody is asked to log in at all (upstream's
     // `if (!username && !password) return true`, which it shares). Refused
     // rather than started in a state the operator did not mean.
-    if (cli.guest_name.is_some() || cli.guest_password.is_some())
+    if (cli.guest_name.is_some() || guest_password.is_some())
         && cli.username.is_none()
-        && cli.password.is_none()
+        && password.is_none()
     {
         anyhow::bail!(
             "-N/-W set a read-only account, but without an admin account (-n/-w) \
@@ -436,9 +442,9 @@ async fn main() -> Result<()> {
             })
             .unwrap_or_default(),
         ui_username: cli.username,
-        ui_password: cli.password,
+        ui_password: password,
         guest_username: cli.guest_name,
-        guest_password: cli.guest_password,
+        guest_password,
         ui_port: cli.ui_port,
         socks_port: cli.socks_port,
         plugins,
@@ -561,20 +567,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("invalid --node-plugin '{spec}', expected name=path.js"))?;
         let (name, path) = (name.trim(), path.trim());
         let port = free_port().context("allocating a port for a node plugin")?;
-        // stdin is a pipe only this process holds open, so the plugin can tell
-        // when this process is gone however it went. `kill_on_drop` covers a
-        // shutdown that runs our code; `kill -9`, `taskkill /F` or a crash
-        // runs none, and without this the plugin went on holding its port. The
-        // SDK exits when the pipe closes; `WHISTLE_RS_PLUGIN_STDIN` tells it
-        // the pipe means that, since a plugin started by hand may have a stdin
-        // that closes at once.
-        let child = tokio::process::Command::new("node")
-            .arg(path)
-            .env("WHISTLE_RS_PLUGIN_PORT", port.to_string())
-            .env("WHISTLE_RS_PLUGIN_NAME", name)
-            .env("WHISTLE_RS_PLUGIN_STDIN", "lifeline")
-            .stdin(std::process::Stdio::piped())
-            .kill_on_drop(true)
+        let child = node_plugin(path, name, port)
             .spawn()
             .with_context(|| format!("spawning node plugin '{name}' ({path})"))?;
         children.push(child);
@@ -843,6 +836,53 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
     Ok(())
 }
 
+/// Where `-w` can be given instead of on the command line.
+const PASSWORD_ENV: &str = "WHISTLE_RS_PASSWORD";
+/// Where `-W` can be given instead of on the command line.
+const GUEST_PASSWORD_ENV: &str = "WHISTLE_RS_GUEST_PASSWORD";
+
+/// A console password from its flag, or else from `env`.
+///
+/// The flag still works, with a warning: on the command line the password is
+/// in the process list, where any user of the machine can read it
+/// (`ps -A -o args=`). A process's environment is its owner's alone. The flag
+/// wins when both are set, as a flag beats a setting everywhere else. An empty
+/// variable counts as unset, not as a password nobody can type.
+fn console_password(flag_value: Option<String>, flag: &str, env: &str) -> Option<String> {
+    if flag_value.is_some() {
+        tracing::warn!(
+            "{flag} puts a console password in the process list, where any user of \
+             this machine can read it; set {env} instead"
+        );
+        return flag_value;
+    }
+    std::env::var(env).ok().filter(|v| !v.is_empty())
+}
+
+/// The command that starts a `--node-plugin`.
+fn node_plugin(path: &str, name: &str, port: u16) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg(path)
+        .env("WHISTLE_RS_PLUGIN_PORT", port.to_string())
+        .env("WHISTLE_RS_PLUGIN_NAME", name)
+        .env("WHISTLE_RS_PLUGIN_STDIN", "lifeline")
+        // A child inherits the environment, and a plugin is someone else's
+        // code: the console passwords stay here, as the console's other
+        // credentials do (a plugin's own pages never see them either).
+        .env_remove(PASSWORD_ENV)
+        .env_remove(GUEST_PASSWORD_ENV)
+        // stdin is a pipe only this process holds open, so the plugin can tell
+        // when this process is gone however it went. `kill_on_drop` covers a
+        // shutdown that runs our code; `kill -9`, `taskkill /F` or a crash
+        // runs none, and without this the plugin went on holding its port. The
+        // SDK exits when the pipe closes; `WHISTLE_RS_PLUGIN_STDIN` tells it
+        // the pipe means that, since a plugin started by hand may have a stdin
+        // that closes at once.
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    cmd
+}
+
 /// Grab a free TCP port on localhost (for a spawned plugin to bind).
 fn free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -862,4 +902,23 @@ async fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The variables are taken out of the plugin's environment, not merely not
+    /// added: `get_envs` lists a removed one with no value.
+    #[test]
+    fn a_node_plugin_is_not_handed_the_console_passwords() {
+        let cmd = node_plugin("plugin.js", "p", 1234);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        for name in [PASSWORD_ENV, GUEST_PASSWORD_ENV] {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(name), None)),
+                "{name} is removed: {envs:?}"
+            );
+        }
+    }
 }

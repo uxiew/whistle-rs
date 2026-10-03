@@ -18,7 +18,7 @@ fn a_second_instance_on_the_same_directory_is_refused() {
     let first = start(&dir, &[]);
     let before = snapshot(&dir);
 
-    let (status, stderr) = run_to_exit(&dir, Duration::from_secs(10));
+    let (status, stderr) = run_to_exit(command(&dir, &[]), Duration::from_secs(10));
     assert!(!status.success(), "refused, not started: {stderr}");
     assert!(
         stderr.contains(&dir.display().to_string()),
