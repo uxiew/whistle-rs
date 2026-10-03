@@ -134,6 +134,33 @@ pub struct CertAuthority {
     ca_cert_path: std::path::PathBuf,
 }
 
+/// Hold `certs/root.lock` while deciding whether a root exists and writing one
+/// if not, so starts that race on an empty directory make one root between
+/// them: the first writes it, the rest wait and read it. Without this each wrote
+/// its own and kept using it, while the disk kept only the last.
+///
+/// The binary already has the whole directory to itself (`crate::dir_lock`);
+/// this is for embedders, which may share a directory to share a root. A
+/// filesystem that cannot lock gets the old behaviour rather than no CA.
+fn creation_lock(cert_path: &std::path::Path) -> Option<std::fs::File> {
+    let dir = cert_path.parent()?;
+    crate::private_fs::create_dir(dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("root.lock"))
+        .ok()?;
+    match file.lock() {
+        Ok(()) => Some(file),
+        Err(e) => {
+            tracing::debug!("cannot lock {}: {e}", dir.join("root.lock").display());
+            None
+        }
+    }
+}
+
 impl CertAuthority {
     /// Load the persisted root CA, or generate and persist a fresh one.
     pub fn load_or_create(config: &Config) -> Result<Arc<Self>> {
@@ -152,12 +179,15 @@ impl CertAuthority {
             let key = dir.join("root.key");
             key.exists().then_some((cert, key))
         });
-        let (cert_path, key_path) = match custom_root {
+        let (cert_path, key_path, _creating) = match custom_root {
             Some((cert, key)) => {
                 tracing::info!("root CA supplied by hand: {}", cert.display());
-                (cert, key)
+                (cert, key, None)
             }
-            None => (cert_path, key_path),
+            None => {
+                let lock = creation_lock(&cert_path);
+                (cert_path, key_path, lock)
+            }
         };
 
         let (ca_cert, ca_key, ca_cert_pem) = if cert_path.exists() && key_path.exists() {
@@ -718,6 +748,53 @@ mod tests {
             ..Config::default()
         };
         CertAuthority::load_or_create(&config).expect("root CA")
+    }
+
+    /// Several starts on an empty directory at once — two embedders, or one
+    /// beside the binary — each found no root and wrote its own, the later over
+    /// the earlier. One of them then signed with a key no longer on disk, so the
+    /// certificate a user trusted from disk did not cover it; and the files
+    /// could end up one start's certificate with another's key. Threads stand
+    /// in for processes: the lock is on an open file, not on a pid.
+    #[test]
+    fn concurrent_first_starts_agree_on_one_root() {
+        let dir = std::env::temp_dir().join(format!("whistle-rs-ca-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = Arc::new(Config {
+            storage_dir: dir,
+            ..Config::default()
+        });
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let roots: std::collections::HashSet<String> = (0..8)
+            .map(|_| {
+                let (config, start) = (config.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let ca = CertAuthority::load_or_create(&config).expect("root CA");
+                    ca.root_cert_pem().to_string()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().expect("thread"))
+            .collect();
+        assert_eq!(roots.len(), 1, "every start uses the same root");
+
+        let on_disk = std::fs::read_to_string(config.root_ca_cert_path()).expect("root.crt");
+        assert!(roots.contains(&on_disk), "and it is the one on disk");
+        let key = KeyPair::from_pem(
+            &std::fs::read_to_string(config.root_ca_key_path()).expect("root.key"),
+        )
+        .expect("key");
+        let der = rustls_pemfile::certs(&mut on_disk.as_bytes())
+            .next()
+            .expect("a certificate")
+            .expect("PEM");
+        let spki = key.public_key_der();
+        assert!(
+            der.windows(spki.len()).any(|w| w == spki.as_slice()),
+            "root.key is the key root.crt was issued for"
+        );
     }
 
     /// Nothing cached: the collapsing rule alone decides.
