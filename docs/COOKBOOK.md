@@ -1032,7 +1032,8 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 
 [`examples/embedded.rs`](../examples/embedded.rs) runs all of the above end to
 end — `cargo run --example embedded`. The builder also covers a SOCKS5 port, the
-storage directory (two embedders sharing one share a CA), values, the
+storage directory (proxies sharing one share its root CA; one that keeps history
+needs it to itself, and the console's rule edits are never written there), values, the
 body-capture cap, and `intercept_https(false)` for routing TLS without
 decrypting it. Anything past the facade is reachable through `proxy.state()`.
 

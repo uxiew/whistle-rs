@@ -38,7 +38,7 @@ nothing to apply it to.
 | `-F, --frameCacheSize` | `-F, --frame-cache-size` | ✅ |
 | `--socksPort` | `--socks-port` (and `--socksPort`) | ✅ inbound SOCKS5 |
 | `-r, --shadowRules` | `-r, --rules` | ⚠️ **not the same thing** — see the note below |
-| `-D, --baseDir` / `-S, --storage` | `--dir` | ⚠️ one directory, named in full |
+| `-D, --baseDir` / `-S, --storage` | `--dir` | ⚠️ one directory, named in full; one instance at a time, a second is refused ([why, and how to run two](INSTALL.md#数据目录)) |
 | `-z, --certDir` | `-z, --cert-dir` (and `--certDir`) | ✅ [see below](#hand-supplied-certificates) |
 | `-c, --dnsCache` / `--dnsServer` | — | ➖ DNS is the OS resolver's |
 | `-s, --sockets` | — | ➖ nothing to cap: this never limits how many connections one origin gets; it only keeps idle ones for the client connection that opened them ([how](ARCHITECTURE.md#reusing-origin-connections)). Measured: the flag changes nothing a client can see upstream either — with `sockets: 1`, six concurrent requests still finish in parallel |

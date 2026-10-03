@@ -931,7 +931,7 @@ Proxy::builder().plugin(MockApi).rules("api.test  plugin://mock-api")
 
 [`examples/embedded.rs`](../examples/embedded.rs) 把上面这些端到端跑一遍 ——
 `cargo run --example embedded`。builder 还覆盖 SOCKS5 端口、存储目录
-（两个 embedder 共用同一目录即共用一份 CA）、values、Body 抓取上限，以及
+（共用一个目录就共用它的根证书；开了历史记录的要独占目录；控制台对规则的修改不写进去）、values、Body 抓取上限，以及
 `intercept_https(false)` —— 只路由 TLS 而不解密。facade 之外的东西都可以从
 `proxy.state()` 拿到。
 

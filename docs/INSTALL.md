@@ -66,11 +66,23 @@ Windows 上把 `whistle-rs.exe` 放进一个目录（比如 `%LOCALAPPDATA%\Prog
 | `rules/groups.json`、`rules/<组名>.rules` | 规则组的顺序和开关、每组的文本 | 控制台保存规则时 |
 | `values.json` | Values | 控制台保存 Values 时 |
 | `sessions/sessions-YYYY-MM-DD.jsonl` | 历史会话，一行一条，按 UTC 日期分文件，默认留 7 天 | 每条会话完成时；`--no-persist` 时不写 |
+| `lock`、`lock.owner` | 表示"这个目录有实例在用"，后者写着那个实例的 pid 和地址，见下文 | 每次启动 |
+| `certs/root.lock` | 生成根证书时用，让同时启动的几个进程只生成一张 | 每次启动 |
 | `values.json.unreadable-<毫秒>` 等 | 启动时读不懂的 `groups.json`/`values.json`，挪到这里而不是覆盖，日志里有 WARN | 启动时，只在读不懂时 |
 
 目录外面它只写规则明确要求写的文件（`reqWrite://`、`resWrite://` 等，写到规则给的路径）。`--cert-dir` 里的证书是你自己放的，它只读不写。Node 插件自己写什么由插件决定。
 
-保存规则和 Values 时先写一个新文件再改名换上，进程在写的过程中被杀，留下的也是完整的旧文件或新文件。同一个目录同时只跑一个实例：它不加锁也不检查，两个实例共用一个目录时，后保存规则的会覆盖先保存的。
+保存规则和 Values 时先写一个新文件再改名换上，进程在写的过程中被杀，留下的也是完整的旧文件或新文件。
+
+**一个目录同时只能有一个实例。** 第二个会直接退出（退出码 1），报错写明是哪个目录、被哪个实例占着：
+
+```
+Error: /Users/you/.whistle-rs is in use by another whistle-rs (pid 4242, listening on http://127.0.0.1:8899). ...
+```
+
+不拦的话，两个实例都把整份规则组和 Values 留在内存里、保存时整份写回，后保存的会把先保存的整个盖掉，什么提示都没有。要同时跑两个，各给一个 `--dir`；想让两个用同一张根证书（客户端只信任一次），把 `root.key` 和 `root.crt` 放进一个目录，两个都用 `-z` 指向它。
+
+占用随进程结束释放，`kill -9` 和崩溃也一样，不用手动删任何文件。**别在实例运行时删 `lock`：** Unix 上删了并不释放占用，只会让下一个实例锁上一个同名的新文件，两个又能一起跑了。
 
 **谁能读：** Unix 上私钥、规则、Values、会话文件是 `0600`，本项目自己的子目录是 `0700`（见 [OPERATIONS](OPERATIONS.md#采集与保留)）。Windows 上不单独设权限，文件继承所在目录的 ACL：放在默认的 `%USERPROFILE%` 下时，Windows 默认只有你自己、SYSTEM 和 Administrators 能读；`--dir` 指到别处（比如 `D:\whistle`）时，要自己确认那个目录别人读不到。
 
