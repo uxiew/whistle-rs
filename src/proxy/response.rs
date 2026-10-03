@@ -96,6 +96,41 @@ pub(super) async fn resolve_response_phase(
     if added {
         apply::load_rule_values(resolved, info).await;
     }
+    // Here, where the rules are final: this pass can add a `weinre://` of its
+    // own, and every response — the origin's or a local one — comes through
+    // before any response operator runs.
+    set_aside_unserved_weinre(info, resolved, &state.config);
+}
+
+/// Set aside a `weinre://` that has nothing to inject — it names no script, and
+/// no `--weinre` server was given ([`weinre_src`]) — and say so on the session.
+///
+/// Set aside is moved to [`Resolved::inert`]: nothing applies it, and the
+/// session and `explain` still list the line. It used to stay live, so the
+/// response was collected for a tag never written and, the part that hurt, the
+/// page's CSP and cache headers were cleared for a script that never came.
+/// Before that it injected a `<script>` pointing at this proxy's own port,
+/// where nothing answers.
+fn set_aside_unserved_weinre(info: &ReqInfo, resolved: &mut Resolved, config: &Config) {
+    if resolved
+        .value("weinre")
+        .is_none_or(|id| weinre_src(id, config).is_some())
+    {
+        return;
+    }
+    let unserved = resolved.take_where(|op| op.protocol == "weinre");
+    if let Ok(mut noted) = info.noted.lock() {
+        noted.push(unapplied::Unapplied {
+            kind: unapplied::Kind::NoWeinreServer,
+            ops: unserved.iter().map(|op| op.raw.clone()).collect(),
+            reason: "this proxy does not contain a weinre server, and none was named: start \
+                     one (`npx weinre --boundHost -all-`) and pass `--weinre \
+                     http://<host>:8080`, or write the script's own address in the rule — \
+                     nothing was injected"
+                .to_string(),
+        });
+    }
+    resolved.inert.extend(unserved);
 }
 
 /// The response-side operators that act on the body once it is in hand.
@@ -426,19 +461,6 @@ impl ResBodyOps {
             // nothing produces a header that says "nothing".
             force_encoding: apply::forced_encoding(resolved),
         }
-    }
-
-    /// Forget a `weinre://` that has no script to inject — see [`weinre_src`] —
-    /// so that a response is not collected for a tag that will not be written.
-    pub(super) fn for_config(mut self, config: &Config) -> Self {
-        if self
-            .weinre
-            .as_deref()
-            .is_some_and(|id| weinre_src(id, config).is_none())
-        {
-            self.weinre = None;
-        }
-        self
     }
 
     /// True when at least one of these needs the whole body in memory. A
@@ -924,8 +946,7 @@ pub(super) async fn finish_local_response(
         // `None`: the body is already collected on this path, so even an event
         // stream is a finite `Bytes` here and every operator can be applied.
         None,
-    )
-    .for_config(&state.config);
+    );
     let res_ct = parts
         .headers
         .get(hyper::header::CONTENT_TYPE)

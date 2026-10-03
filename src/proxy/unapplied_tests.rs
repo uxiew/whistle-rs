@@ -564,3 +564,80 @@ async fn a_weinre_rule_with_nowhere_to_load_from_is_named() {
         }
     }
 }
+
+/// A page that guards itself: a CSP and a cache lifetime of its own.
+const GUARDED_HTML: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\
+    content-security-policy: default-src 'self'\r\ncache-control: max-age=600\r\n\
+    etag: \"v1\"\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n";
+
+/// The headers an injection may clear, as a client received them.
+fn guard_headers(head: &str) -> Vec<String> {
+    let mut kept: Vec<String> = head
+        .lines()
+        .map(str::to_ascii_lowercase)
+        // A date of the moment it was sent: whether it is there is the point.
+        .map(|l| match l.starts_with("expires:") {
+            true => "expires:".to_string(),
+            false => l,
+        })
+        .filter(|l| {
+            [
+                "content-security-policy",
+                "cache-control",
+                "pragma",
+                "expires",
+                "etag",
+            ]
+            .iter()
+            .any(|name| l.starts_with(&format!("{name}:")))
+        })
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// The CSP and cache strips exist so an injected script can run and is not
+/// cached. A `weinre://` with nothing to inject used to clear them anyway,
+/// which took a page's security policy away for nothing (STATUS, 2026-10-03).
+/// Beside a `log://`, which does inject, the strip is that rule's and happens.
+#[tokio::test]
+async fn a_weinre_rule_with_nothing_to_inject_leaves_the_headers_alone() {
+    let page = b"<html><head></head><body>hi</body></html>".to_vec();
+    let site = origin(GUARDED_HTML, page).await;
+    let headers = |rule: &'static str, server: Option<&'static str>| async move {
+        let rules = match rule {
+            "" => String::new(),
+            rule => format!("http://{site} {rule}"),
+        };
+        let (state, proxy) =
+            proxy_with_config(&rules, |c| c.weinre_server = server.map(str::to_string)).await;
+        let (head, _) = ask(proxy, &format!("http://{site}/x"), "", b"").await;
+        (guard_headers(&head), session(&state).await.unapplied)
+    };
+
+    let (untouched, _) = headers("", None).await;
+    assert!(
+        untouched
+            .iter()
+            .any(|h| h.starts_with("content-security-policy")),
+        "{untouched:?}"
+    );
+    let (weinre, noted) = headers("weinre://phone", None).await;
+    assert_eq!(weinre, untouched, "as if there were no rule");
+    assert_eq!(noted.len(), 1, "{noted:?}");
+    assert_eq!(noted[0].kind, Kind::NoWeinreServer);
+
+    let (log, _) = headers("log://page", None).await;
+    assert_ne!(log, untouched, "log:// injects, and clears both");
+    let (both, _) = headers("weinre://phone log://page", None).await;
+    assert_eq!(
+        both, log,
+        "the strip is log://'s, as if weinre:// were not there"
+    );
+
+    let (served, _) = headers("weinre://phone", Some("http://10.0.0.5:8080")).await;
+    assert_eq!(
+        served, log,
+        "with a server it injects, and clears both as before"
+    );
+}

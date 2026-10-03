@@ -69,7 +69,10 @@
 // What is *not* a deliberate difference, and was fixed: whistle strips the
 // response's CSP and makes it uncacheable whenever it injects (`weinre.js:37-38`),
 // and this port did neither — so the agent it pushed into the page was blocked
-// by the page's own `Content-Security-Policy` and then cached.
+// by the page's own `Content-Security-Policy` and then cached. It does both now,
+// and only when it injects: a bare id with no `--weinre`, as in this run,
+// leaves the headers as they came, where whistle (which always injects) does
+// not.
 //
 // `intercept://on` is an unknown protocol in both. whistle answers 502 with
 // `Unsupported protocol intercept:` and dials nothing; this port reads it as a

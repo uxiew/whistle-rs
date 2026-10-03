@@ -952,7 +952,6 @@ pub(super) async fn serve(
         .map_err(outcome::at(outcome::Phase::Rules))?;
     ledger.note(|s| s.target = target_desc(&target));
     note_cipher_dropped(ledger, &target, &resolved);
-    note_weinre_unserved(ledger, &resolved, &state.config);
 
     // A proxy rule that names this proxy would send the request back to us, be
     // matched by the same rule, and recurse until the sockets run out. whistle
@@ -1403,8 +1402,7 @@ pub(super) async fn serve(
         response_has_body(parts.status.as_u16(), &info.method),
         parts.status.as_u16(),
         res_ct.as_deref(),
-    )
-    .for_config(&state.config);
+    );
     let res_enc = header_str(&parts.headers, hyper::header::CONTENT_ENCODING);
     // A plugin that asked for the body of an event stream cannot have it, and
     // says so rather than leaving the hook mysteriously un-run: `responseBody`

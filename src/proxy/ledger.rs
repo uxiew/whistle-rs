@@ -207,24 +207,6 @@ impl Drop for Ledger {
     }
 }
 
-/// `weinre://id` that names no script and has no server to load one from, on
-/// the session — see [`weinre_src`]. It used to inject a `<script>` pointing
-/// at this proxy's own port, where nothing answers, and call that done.
-pub(super) fn note_weinre_unserved(ledger: &mut Ledger, resolved: &Resolved, config: &Config) {
-    let Some(id) = resolved.value("weinre") else {
-        return;
-    };
-    if weinre_src(id, config).is_some() {
-        return;
-    }
-    ledger.unapplied(unapplied::Unapplied::over(
-        &matched_ops(resolved),
-        |op| op.protocol == "weinre",
-        unapplied::Kind::NoWeinreServer,
-        "this proxy does not contain a weinre server, and none was named: start one          (`npx weinre --boundHost -all-`) and pass `--weinre http://<host>:8080`, or write          the script's own address in the rule — nothing was injected",
-    ));
-}
-
 /// A `cipher://` pin that could not be used, on the session: the connection
 /// went ahead without it — see [`super::super::ciphers`] for why — and a pin that
 /// silently did not happen is the last thing to find out from a log.

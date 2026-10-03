@@ -54,9 +54,14 @@ const DECLARED = {
       'upstream\'s getValue misses a ``` block declared in the same text; this port serves it. Header, divergence 8'),
     d('script ctx: a body over whistle\'s chunk cap', ['req.header.x-b'],
       'whistle\'s script sees the body only up to the first chunk past 16 KB. Header, divergence 9'),
+    // A bare id, and no --weinre in this run: nothing is injected here, so the
+    // cache headers an injection needs are not written either (R4-03).
     ...['weinre injects into html', 'weinre on an empty html body', 'weinre on a gzipped html body',
-      'weinre with a url value', 'weinre with no value at all'].map((n) => d(n, ['res.body'],
-      'whistle inlines its own bundled weinre agent; this port contains no weinre, so it injects a <script src> when the rule or --weinre names one and nothing otherwise. Header, weinre://')),
+      'weinre with no value at all'].map((n) => d(n,
+      ['res.body', 'res.header.cache-control', 'res.header.expires', 'res.header.pragma'],
+      'whistle inlines its own bundled weinre agent and so makes the page uncacheable; this port contains no weinre, names no server here, injects nothing, and leaves the headers as the origin sent them. Header, weinre://')),
+    d('weinre with a url value', ['res.body'],
+      'whistle inlines its own bundled weinre agent; this port injects a <script src> for the URL the rule names. Header, weinre://'),
     d('weinre reaches javascript upstream', ['res.header.cache-control', 'res.header.expires', 'res.header.pragma', 'res.body'],
       'whistle appends its agent to JavaScript responses too; this port leaves a .js body alone. Header, weinre://'),
     d('intercept written as a protocol', PROSE,
