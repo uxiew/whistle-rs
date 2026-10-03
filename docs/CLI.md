@@ -30,7 +30,7 @@ nothing to apply it to.
 | `-p, --port` | `-p, --port` | ✅ |
 | `-H, --host` | `-H, --host` | ⚠️ defaults to `127.0.0.1`, not every interface — [see below](#listening-beyond-this-machine) |
 | `-P, --uiport` | `-P, --uiport` | ✅ a second port that serves only the console (it stays on the proxy port too) |
-| `-n/-w`, `-N/-W` | same | ⚠️ console login and the read-only account; `-N/-W` without `-n/-w` is refused rather than left open |
+| `-n/-w`, `-N/-W` | same | ⚠️ console login and the read-only account; the passwords are better given as `WHISTLE_RS_PASSWORD`/`WHISTLE_RS_GUEST_PASSWORD` ([why](#listening-beyond-this-machine)); `-N/-W` without `-n/-w` is refused rather than left open |
 | `-l, --localUIHost` | `-l, --local-ui-host` | ✅ adds to the built-in three, as upstream does |
 | `-M, --mode` | `-M, --mode` | ⚠️ support depends on the mode and its combinations — see the mode table below |
 | `-t, --timeout` | `-t, --timeout` | ✅ same default, 360000 ms |
@@ -181,8 +181,17 @@ a console anyone on it could rewrite, and rules can read and write files. To let
 a phone or another machine in, ask for it, and set a login first:
 
 ```sh
-whistle-rs -H 0.0.0.0 -n admin -w "$PASSWORD"
+export WHISTLE_RS_PASSWORD='…'   # from wherever you keep secrets
+whistle-rs -H 0.0.0.0 -n admin
 ```
+
+**The password goes in the environment, not on the command line.**
+`WHISTLE_RS_PASSWORD` is `-w`, `WHISTLE_RS_GUEST_PASSWORD` is `-W`. The flags
+still work, but `-w "$PASSWORD"` is expanded by the shell into the command line,
+and any user of the machine can read a command line with `ps -A -o args=`; a
+process's environment only its owner can read. Startup warns when a password
+came from a flag. A flag wins when both are set; an empty variable counts as
+unset; `--node-plugin` processes are started without these two variables.
 
 Startup says which it is: on loopback, an INFO line with that command; bound
 beyond loopback with no `-n/-w`, a WARN. The console's Status pane shows the
@@ -345,7 +354,8 @@ the process is alive — and everything else on the console port is a 404.
 **A shared proxy on the network, read-only for everyone but you.**
 
 ```sh
-whistle-rs -H 0.0.0.0 -p 8899 -n admin -w "$PASSWORD" -N guest -W look
+export WHISTLE_RS_PASSWORD='…' WHISTLE_RS_GUEST_PASSWORD='…'
+whistle-rs -H 0.0.0.0 -p 8899 -n admin -N guest
 ```
 
 The login gates the console and **not** the traffic — proxying keeps working for

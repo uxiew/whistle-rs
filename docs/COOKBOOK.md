@@ -702,7 +702,8 @@ has to be let in. Set a console login first: anyone who can reach the port can
 open the console, and the rules it edits read and write files on this machine.
 
 ```bash
-whistle-rs -H 0.0.0.0 -n admin -w "$PASSWORD"
+export WHISTLE_RS_PASSWORD='…'   # not -w: see CLI.md, "Listening beyond this machine"
+whistle-rs -H 0.0.0.0 -n admin
 ```
 
 Then find your LAN address:

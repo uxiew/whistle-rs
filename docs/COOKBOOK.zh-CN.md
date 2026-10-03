@@ -634,7 +634,8 @@ whistle-rs 默认只监听 `127.0.0.1`，也就是只有本机能用，所以要
 能连上端口的人都能打开控制台，而它编辑的规则能读写本机文件。
 
 ```bash
-whistle-rs -H 0.0.0.0 -n admin -w "$PASSWORD"
+export WHISTLE_RS_PASSWORD='…'   # 别用 -w：见 CLI.md 的 "Listening beyond this machine"
+whistle-rs -H 0.0.0.0 -n admin
 ```
 
 然后找出局域网地址：
