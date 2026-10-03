@@ -888,6 +888,42 @@ for (var j = 0; j < 2000000; j++) f();
 
 **实测（代码 `f195a92`，macOS arm64，Rust 1.98.1，Node v26.4.0）：** `cargo fmt --check`、Clippy `-D warnings` 通过；`cargo test --all-targets` 单元 1121（另 10 个 ignored）、集成 48 全过，doc 2 个通过；前端 `npm run typecheck` 通过。core-bench 两版各 116 个对照，未声明差异 0，声明的 2.10.10 上 6 个、2.10.8 上 16 个，和以前一样。
 
+## 2026-10-03 剩余风险复核（第四轮）
+
+照第三轮的做法，从各轮剩下的风险里再挑会伤到人的，逐条复现。环境：macOS arm64，debug 构建（代码 `2e6db07`），上游 2.10.8（`oracle.js`），本机回环上的源站。挑了四条，三条属实，一条复现后发现上游也一样，不立项。
+
+**同一个数据目录开两个实例，后保存的那个把先保存的整份覆盖。** 两个实例都用 `--dir shared`，端口 18901、18902：
+
+| 步骤 | `rules/groups.json` 里的组 | `values.json` |
+| --- | --- | --- |
+| A 新建组 `alpha`、加值 `token` | `default`、`alpha` | `token` |
+| B 新建组 `beta`、加值 `other` | `default`、`beta` | `other` |
+
+B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘上，但下次启动不会读它），`token` 整个没了。两个实例都不报错，B 的日志和单独启动时一模一样。原因是每个实例在内存里有一整份组列表和 Values，保存时整份写回。
+
+同一次复现还看到两个后果：
+
+- **根证书对不上。** 两个实例对着空目录同时启动，各生成一张根证书，后写的覆盖了先写的。A 下发的 `rootCA.crt`（sha1 `ac7b3e00…`）和磁盘上的 `certs/root.crt`（`a2f01157…`）不是同一张：用户信任了磁盘上那张，A 签出的 HTTPS 证书照样不被信任。
+- **会话历史混在一起。** 经 A、B 各发一个请求，`sessions/sessions-2026-10-03.jsonl` 里两条记录的 `id` 都是 1。
+
+上游：`w2 start` 按存储目录记 pid，同一个存储目录起第二个会被拒绝（`_original/bin/use.js`、`bin/util.js` 的 `isRunning`）；前台的 `w2 run` 不查。本项目没有任何检查。
+
+**控制台口令只能写在命令行上。** `whistle-rs -n admin -w hunter2-secret` 启动后，`ps -A -o user=,args=` 能看到完整的 `-w hunter2-secret`，本机任何用户都能看。上游有 `--config` 和 `~/.whistlerc` 两种从文件读启动参数的办法，本项目 CLI.md 把它们归为"`w2` 守护进程的东西"没做，于是口令没有命令行以外的给法。
+
+**`weinre://` 没有服务可连时，什么都没注入，却照样改了响应头。** 源站返回一个带 `content-security-policy: default-src 'self'`、`cache-control: max-age=600` 的 HTML 页面：
+
+| 规则 | 上游 2.10.8 | whistle-rs（没有 `--weinre`） |
+| --- | --- | --- |
+| 无 | CSP 在，`max-age=600` | 同左 |
+| `weinre://probe` | 去掉 CSP，`no-store`，`pragma: no-cache`，**注入了脚本** | 去掉 CSP，`no-store`，`pragma: no-cache`，**没注入** |
+| `log://probe` | 去掉 CSP，`no-store`，注入 | 同左 |
+
+上游带着 weinre 服务，去掉 CSP 是为了让注入的脚本能跑。本项目在 CORE-05 里改成没有 `--weinre` 时不注入、记 `no-weinre-server`，但改头的那一步没跟着停：页面平白丢了自己的 CSP 和缓存策略，用户看到的是"weinre 没起作用"，看不到安全策略也没了。
+
+**不立项的一条：值不存在时的写盘算子。** 原以为 `reqWrite://{nope}` 在工作目录写出一个叫 `{nope}` 的文件是本项目独有的问题。实测上游也写：规则写全路径（`127.0.0.1:19602/w1 reqWrite://{nope1}`）时，`reqWrite`、`resWrite`、`reqWriteRaw`、`resWriteRaw` 两边都在工作目录写出同名、同大小的文件。差别只在规则只写域名或路径前缀时：上游把请求路径剩下的部分拼上（`{nope5}/echo`、`{nope5}/x/y.txt`），本项目写成一个 `{nope5}`；值是普通路径（`reqWrite://dump1`）时两边都拼，结果一样。两边写的都是没用的文件，差别只是文件名，不值得为它改代码。
+
+修复计划在 [ROADMAP 的第四轮](ROADMAP.md#第四轮共用目录口令与白改的头2026-10-03-立项)。
+
 ## 真实缺口与风险
 
 | 优先级 | 发现 | 后续任务 |
