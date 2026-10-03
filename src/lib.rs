@@ -30,6 +30,7 @@
 
 pub mod ca;
 pub mod config;
+pub mod dir_lock;
 pub mod embed;
 pub mod explain;
 pub mod plugins;

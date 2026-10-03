@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use whistle_rs::ca::CertAuthority;
 use whistle_rs::config::{Config, DATA_DIRNAME};
+use whistle_rs::dir_lock::{DirLock, LockError};
 use whistle_rs::proxy::{self, AppState};
 use whistle_rs::rules::RuleManager;
 
@@ -370,6 +371,17 @@ async fn main() -> Result<()> {
     });
     whistle_rs::private_fs::create_dir(&storage_dir)
         .with_context(|| format!("creating storage dir {}", storage_dir.display()))?;
+    // One instance per directory (see `whistle_rs::dir_lock`), decided before
+    // anything here reads or writes it: the root CA, the rule groups, the
+    // history. Held until the process ends.
+    let dir_lock = match DirLock::acquire(&storage_dir) {
+        Ok(lock) => Some(lock),
+        Err(held @ LockError::Held { .. }) => return Err(held.into()),
+        Err(unavailable) => {
+            tracing::warn!("{unavailable}");
+            None
+        }
+    };
 
     // `-N/-W` alone looks like a protected console and is an open one: the
     // read-only account only restricts anything beside an admin account, and
@@ -616,8 +628,12 @@ async fn main() -> Result<()> {
     // a service manager's stop do not), and a session completed a moment
     // before was not always on disk. Requests still in flight are not waited
     // for: a long-lived stream would hold the exit open indefinitely.
+    let (listener, addr) = proxy::bind(&state).await?;
+    if let Some(lock) = &dir_lock {
+        lock.record(Some(&format!("http://{addr}")));
+    }
     let result = tokio::select! {
-        result = proxy::run(state.clone()) => result,
+        result = proxy::accept_loop(state.clone(), listener, None) => result,
         signal = shutdown_signal() => {
             tracing::info!("{signal}: shutting down");
             state.flush_history().await;
