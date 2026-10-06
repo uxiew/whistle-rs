@@ -6,7 +6,7 @@
 //! back into memory so the Network view survives restarts.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -296,31 +296,123 @@ impl SessionStore {
     /// Files past `retain_days` are deleted first rather than read: loading
     /// read every file of any age, so the history on screen after a restart
     /// could be months old while the documentation said seven days.
+    ///
+    /// Read from the newest end, and only until `max` sessions are in hand.
+    /// It used to parse every line of every retained file, bodies and all, and
+    /// then keep the last `max`: a gigabyte of history (fifty thousand
+    /// sessions) cost 886 MiB at startup to show six hundred, and the memory
+    /// was never handed back (STATUS, 2026-10-06).
     pub fn load(dir: &Path, max: usize, retain_days: u32) -> Vec<Session> {
         prune_old_files(dir, retain_days);
         let mut files = list_jsonl_files(dir);
-        // Sort by name ascending (date order).
+        // By name, which is by date.
         files.sort();
-        let mut out = Vec::new();
-        for path in &files {
-            if let Ok(f) = File::open(path) {
-                let reader = BufReader::new(f);
-                for line in reader.lines() {
-                    let Ok(line) = line else { continue };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if let Ok(ps) = serde_json::from_str::<PersistedSession>(&line) {
-                        out.push(ps.into_session());
-                    }
+        let mut newest_first = Vec::new();
+        'files: for path in files.iter().rev() {
+            let Ok(lines) = Backward::open(path, READ_BLOCK) else {
+                continue;
+            };
+            for line in lines {
+                if newest_first.len() >= max {
+                    break 'files;
+                }
+                if let Ok(ps) = serde_json::from_slice::<PersistedSession>(&line) {
+                    newest_first.push(ps.into_session());
                 }
             }
         }
-        // Keep only the most recent `max` entries.
-        if out.len() > max {
-            out.drain(..out.len() - max);
+        newest_first.reverse();
+        newest_first
+    }
+}
+
+/// How much of a history file is read at a time, from the end backwards.
+const READ_BLOCK: u64 = 64 * 1024;
+
+/// The lines of a file, last first, read a block at a time from the end — so
+/// taking the last few lines of a large file costs those lines, not the file.
+///
+/// A line is returned without its `\n`. Bytes before the first `\n` of a
+/// block may be the end of a line that started in an earlier block; they wait
+/// in `carry` until that block is read, or until the start of the file shows
+/// they are its first line.
+struct Backward {
+    file: File,
+    /// Where the part of the file not yet read ends.
+    pos: u64,
+    block: u64,
+    /// Bytes read so far that come before the first `\n` in them.
+    carry: Vec<u8>,
+    /// Whole lines from the blocks read, in file order; taken from the back.
+    ready: Vec<Vec<u8>>,
+    /// No block has been read yet: the next one ends the file, and what
+    /// follows a final `\n` there is no line.
+    at_end: bool,
+    /// The first line has been returned, or the file was empty.
+    finished: bool,
+}
+
+impl Backward {
+    fn open(path: &Path, block: u64) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let pos = file.metadata()?.len();
+        Ok(Backward {
+            file,
+            pos,
+            block: block.max(1),
+            carry: Vec::new(),
+            ready: Vec::new(),
+            at_end: true,
+            finished: pos == 0,
+        })
+    }
+
+    /// Read the block before `pos` and file its whole lines. False on a read
+    /// error, which ends the history there rather than returning half a line.
+    fn read_block(&mut self) -> bool {
+        use std::io::{Read, Seek, SeekFrom};
+        let n = self.block.min(self.pos);
+        self.pos -= n;
+        let mut bytes = vec![0; n as usize];
+        if self.file.seek(SeekFrom::Start(self.pos)).is_err()
+            || self.file.read_exact(&mut bytes).is_err()
+        {
+            return false;
         }
-        out
+        bytes.append(&mut self.carry);
+        let mut pieces = bytes.split(|b| *b == b'\n');
+        self.carry = pieces.next().unwrap_or_default().to_vec();
+        let mut lines: Vec<Vec<u8>> = pieces.map(<[u8]>::to_vec).collect();
+        if std::mem::take(&mut self.at_end) && lines.last().is_some_and(Vec::is_empty) {
+            lines.pop();
+        }
+        lines.append(&mut self.ready);
+        self.ready = lines;
+        true
+    }
+}
+
+impl Iterator for Backward {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if let Some(line) = self.ready.pop() {
+                return Some(line);
+            }
+            if self.finished {
+                return None;
+            }
+            if self.pos == 0 {
+                // Nothing before it: what is carried is the file's first line.
+                self.finished = true;
+                return Some(std::mem::take(&mut self.carry));
+            }
+            if !self.read_block() {
+                self.finished = true;
+                return None;
+            }
+        }
     }
 }
 
@@ -658,6 +750,72 @@ mod tests {
         store.persist(&session.into_session());
         // A second purge reports the file the new session went to.
         assert_eq!(store.purge().await, 1);
+    }
+
+    /// A line of history for session `id`, padded to about `len` bytes.
+    fn line_of(id: u64, len: usize) -> String {
+        let pad = "x".repeat(len.saturating_sub(LINE.len()));
+        LINE.replacen("\"id\":1,", &format!("\"id\":{id},"), 1)
+            .replacen(
+                "\"url\":\"http://a/\"",
+                &format!("\"url\":\"http://a/{pad}\""),
+                1,
+            )
+    }
+
+    fn ids(sessions: &[Session]) -> Vec<u64> {
+        sessions.iter().map(|s| s.id).collect()
+    }
+
+    /// Lines come back last first, whatever the block boundaries do to them:
+    /// a line longer than a block, a line ending exactly on one, no newline
+    /// at the end, a blank line, and a last line cut short by a crash.
+    #[test]
+    fn lines_read_backwards_survive_every_block_boundary() {
+        let dir = scratch("backward");
+        let path = dir.join("f");
+        let long = "L".repeat(10);
+        for block in [1, 2, 3, 4, 7, 64] {
+            for (text, want) in [
+                ("a\nbb\nccc\n", vec!["ccc", "bb", "a"]),
+                ("a\nbb\nccc", vec!["ccc", "bb", "a"]),
+                ("a\n\nb\n", vec!["b", "", "a"]),
+                ("", vec![]),
+                ("\n", vec![""]),
+            ] {
+                fs::write(&path, text).expect("write");
+                let got: Vec<String> = Backward::open(&path, block)
+                    .expect("open")
+                    .map(|l| String::from_utf8(l).expect("utf-8"))
+                    .collect();
+                assert_eq!(got, want, "{text:?} in blocks of {block}");
+            }
+            fs::write(&path, format!("a\n{long}\nb\n")).expect("write");
+            let got: Vec<String> = Backward::open(&path, block)
+                .expect("open")
+                .map(|l| String::from_utf8(l).expect("utf-8"))
+                .collect();
+            assert_eq!(got, ["b", long.as_str(), "a"], "blocks of {block}");
+        }
+    }
+
+    /// The newest `max` sessions, oldest first, reaching back into an older
+    /// file only for what the newer one lacks; a half-written last line is
+    /// skipped, as before.
+    #[test]
+    fn loading_takes_the_newest_sessions_across_files_in_order() {
+        let dir = scratch("tail");
+        let older = (1..=5).map(|id| line_of(id, 0) + "\n").collect::<String>();
+        let newer = (6..=8).map(|id| line_of(id, 0) + "\n").collect::<String>() + "{\"id\":9,";
+        fs::write(dir.join("sessions-2026-01-01.jsonl"), older).expect("older");
+        fs::write(dir.join("sessions-2026-01-02.jsonl"), newer).expect("newer");
+        assert_eq!(ids(&SessionStore::load(&dir, 2, 36_500)), [7, 8]);
+        assert_eq!(ids(&SessionStore::load(&dir, 5, 36_500)), [4, 5, 6, 7, 8]);
+        assert_eq!(
+            ids(&SessionStore::load(&dir, 100, 36_500)),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert!(SessionStore::load(&dir, 0, 36_500).is_empty());
     }
 
     /// What was queued before `flush` is in the file when it returns — what
