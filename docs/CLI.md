@@ -54,7 +54,9 @@ Beyond whistle's list: `--rule` (inline rules), `--value`, `--plugin` /
 `--node-plugin`, `--insecure-upstream`, `--no-intercept-https`, `--no-persist`,
 `--persist-days`, `--persist-max-mb`, `--body-preview-limit`, `--body-rewrite-limit`,
 `--weinre <URL>` (where a weinre server is running, for `weinre://id` rules —
-[why it is needed](RULES.md#weinre-html-debug-injection)), `-v/--verbose`.
+[why it is needed](RULES.md#weinre-html-debug-injection)), `-v/--verbose`
+(a line for every request, its URL in full — the default log has none;
+[OPERATIONS](OPERATIONS.md#默认值与共享访问) says what is in each).
 `whistle-rs --help` prints all of them, and `whistle-rs explain` answers "which
 rules would this URL hit" without making a request.
 
