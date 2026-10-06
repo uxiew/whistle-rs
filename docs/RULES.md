@@ -166,7 +166,15 @@ knowing before you rely on it:
 - **Setting rules never waits for the network.** The save returns immediately
   and the include lands when the fetch does — normally within milliseconds, and
   bounded at 16 s and 256 KB per source. Until then the line contributes
-  nothing, which is also upstream's behaviour.
+  nothing, which is also upstream's behaviour. All of a text's sources are
+  fetched at once, so one that hangs holds up no other.
+- **Starting waits for it, but not for long.** A proxy started with includes
+  in its rules waits up to 3 s for them before it answers anything, so a
+  source that answers is in effect for the very first request (upstream does
+  not wait at all). Past 3 s it answers without the rest — the log says
+  `rules includes still loading after 3 s` and names them — and their rules
+  apply when they land. Before this it waited for every source in turn: three
+  on a server that had hung kept it, console included, silent for 48 s.
 - **One level.** An `@` line *inside* an included text is not followed, so
   there is no cycle to guard against. At most 20 `@` lines per rules text are
   resolved (upstream's `MAX_REMOTE_RULES_COUNT`).
