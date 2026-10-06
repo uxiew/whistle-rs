@@ -76,7 +76,10 @@ pub(super) fn forwarded_by_name<B>(state: &Arc<AppState>, req: &Request<B>) -> O
 
 /// `508 Loop Detected` for a request this proxy forwarded to itself.
 pub(super) fn loop_detected(uri: &hyper::Uri) -> Response<DynBody> {
-    tracing::warn!("{uri} came back to this proxy after it forwarded it; refusing");
+    tracing::warn!(
+        "{} came back to this proxy after it forwarded it; refusing",
+        super::without_query(&uri.to_string())
+    );
     Response::builder()
         .status(StatusCode::LOOP_DETECTED)
         .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -355,7 +358,7 @@ pub(super) fn tunnel_aborted(
     if !apply::aborts_request(&resolved) && !apply::aborts_response(&resolved) && !refuses_tunnel {
         return false;
     }
-    tracing::info!("CONNECT {} -> aborted", info.full_url);
+    tracing::debug!("CONNECT {} -> aborted", info.full_url);
     state.record(Session {
         id: 0,
         time_ms,

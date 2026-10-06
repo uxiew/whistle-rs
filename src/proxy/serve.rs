@@ -685,7 +685,7 @@ pub(super) async fn serve(
                 .failure
                 .map(|why| outcome::Failure::new(outcome::Phase::Plugin, format!("{name}: {why}")));
             if let Some(resp) = result.response {
-                tracing::info!("{} {} -> plugin {name}", info.method, info.full_url);
+                tracing::debug!("{} {} -> plugin {name}", info.method, info.full_url);
                 let target = format!("plugin:{name}");
                 // The plugin answered, but it is not the last word: every
                 // response operator still runs, exactly as it does over the
@@ -767,7 +767,7 @@ pub(super) async fn serve(
     // (`_original/lib/inspectors/data.js:534-539`). `abortRes` is *not* here:
     // it lets the request go out and destroys the answer instead, further down.
     if apply::aborts_request(&resolved) {
-        tracing::info!("{} {} -> aborted", info.method, info.full_url);
+        tracing::debug!("{} {} -> aborted", info.method, info.full_url);
         // Recorded, for the same reason an aborted tunnel is (see
         // [`tunnel_aborted`]): upstream emits the session and then marks it
         // aborted (`data.js:534-539` destroys the response, `tunnel.js:31-36`
@@ -819,7 +819,7 @@ pub(super) async fn serve(
     // rule won the slot and named a URL.
     let remote = apply::prefetch_remote_file(&resolved).await;
     if let Some(mut resp) = apply::short_circuit(&info, &resolved, proxy_env, remote.as_ref()) {
-        tracing::info!("{} {} -> short-circuit", info.method, info.full_url);
+        tracing::debug!("{} {} -> short-circuit", info.method, info.full_url);
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS && asks_to_upgrade(req.headers()) {
             accept_upgrade_locally(&mut req, &mut resp);
         }
@@ -977,7 +977,7 @@ pub(super) async fn serve(
         tracing::warn!(
             "{} {} -> self loop via {addr}; redirecting to {location}",
             info.method,
-            info.full_url
+            without_query(&info.full_url)
         );
         let resp = Response::builder()
             .status(StatusCode::FOUND)
@@ -1248,7 +1248,9 @@ pub(super) async fn serve(
     let req_header_pairs = header_pairs(&parts.headers);
     let out_req = Request::from_parts(parts, req_body);
 
-    tracing::info!(
+    // DEBUG, as every line about a request that went through is: upstream logs
+    // none, and a URL's query often carries a token. `-v` shows them.
+    tracing::debug!(
         "{} {} -> {}:{} ({})",
         info.method,
         info.full_url,
@@ -1303,7 +1305,7 @@ pub(super) async fn serve(
     // aborting here rather than before the request is that the origin still
     // sees the traffic; only the client is cut off.
     if apply::aborts_response(&resolved) {
-        tracing::info!("{} {} -> response aborted", info.method, info.full_url);
+        tracing::debug!("{} {} -> response aborted", info.method, info.full_url);
         // Upstream keeps the head it is about to throw away (`req.__resHeaders`
         // / `req.__statusCode`, `res.js:1176-1177`) so the capture still shows
         // what arrived; without this the session reads as if nothing came back.
@@ -1411,7 +1413,7 @@ pub(super) async fn serve(
         tracing::warn!(
             "{} is an event stream; a plugin's responseBody hook is skipped rather \
              than holding the stream shut",
-            info.full_url
+            without_query(&info.full_url)
         );
     }
     // What [`ResBodyOps::of`] dropped for an event stream, on the session: the

@@ -574,7 +574,7 @@ pub async fn decide(
         // `handleTunnel`, `_original/lib/tunnel.js:259-271,:298`), which resolves
         // `host://` and the proxy family through `rules.getProxy`.
         Ok(SniVerdict::Bypass) => {
-            tracing::info!("sniCallback {plugin}: not intercepting {servername}");
+            tracing::debug!("sniCallback {plugin}: not intercepting {servername}");
             relay_decision(state, &info, &resolved).await
         }
         Ok(SniVerdict::Cert(cert)) => {

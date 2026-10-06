@@ -945,7 +945,12 @@ impl RemotePlugin {
                     if let Some(reason) = &denial.reason {
                         tracing::warn!("auth {}: {reason}; request blocked", self.name);
                     } else {
-                        tracing::info!("auth {}: blocked {} {}", self.name, req.method, req.url);
+                        tracing::info!(
+                            "auth {}: blocked {} {}",
+                            self.name,
+                            req.method,
+                            crate::proxy::without_query(&req.url)
+                        );
                     }
                     return PluginResult {
                         response: Some(auth::deny_response(&self.name, &denial).await),
@@ -1579,7 +1584,11 @@ impl Plugins {
                             admitted.retain(|(k, _)| auth::allowed_request_header(k));
                         }
                         auth::AuthVerdict::Deny(denial) => {
-                            tracing::info!("auth {name}: blocked {} {}", req.method, req.url);
+                            tracing::info!(
+                                "auth {name}: blocked {} {}",
+                                req.method,
+                                crate::proxy::without_query(&req.url)
+                            );
                             return Some(PluginResult {
                                 response: Some(auth::deny_response(name, &denial).await),
                                 blocked: true,

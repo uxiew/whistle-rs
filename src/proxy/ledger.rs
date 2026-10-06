@@ -186,10 +186,19 @@ impl Ledger {
 pub(super) fn log_failure(id: Option<u64>, method: &str, url: &str, failure: &outcome::Failure) {
     let id = id.map_or_else(|| "(hidden)".to_string(), |id| format!("#{id}"));
     tracing::info!(
-        "{id} {method} {url} -> failed at {}: {}",
+        "{id} {method} {} -> failed at {}: {}",
+        without_query(url),
         failure.phase,
         failure.message
     );
+}
+
+/// `url` up to its `?` or `#`, for the lines logged without `-v`. A query
+/// often carries a token, and the default log is where it would outlive the
+/// request: a service manager keeps it, and anyone who can read the logs can
+/// read it. The session in the console keeps the whole URL.
+pub(crate) fn without_query(url: &str) -> &str {
+    url.find(['?', '#']).map_or(url, |end| &url[..end])
 }
 
 impl Drop for Ledger {
@@ -237,4 +246,21 @@ pub(super) fn target_desc(target: &upstream::Target) -> String {
 /// The outcome of a request a rule dropped on purpose.
 pub(super) fn aborted(how: &str) -> outcome::Outcome {
     outcome::Outcome::failed(outcome::Failure::new(outcome::Phase::Abort, how))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_query;
+
+    #[test]
+    fn the_logged_url_stops_before_its_query_and_fragment() {
+        assert_eq!(
+            without_query("http://a.test/api?token=secret"),
+            "http://a.test/api"
+        );
+        assert_eq!(without_query("http://a.test/p#frag?x"), "http://a.test/p");
+        assert_eq!(without_query("http://a.test/p?x#y"), "http://a.test/p");
+        assert_eq!(without_query("http://a.test/plain"), "http://a.test/plain");
+        assert_eq!(without_query("a.test:443"), "a.test:443");
+    }
 }

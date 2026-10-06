@@ -171,7 +171,7 @@ pub(super) async fn serve_upgrade(
         .remove(hyper::header::SEC_WEBSOCKET_EXTENSIONS);
     let out_req = Request::from_parts(parts, body::empty());
 
-    tracing::info!(
+    tracing::debug!(
         "{} {} -> upgrade {}:{}",
         info.method,
         info.full_url,
@@ -197,7 +197,7 @@ pub(super) async fn serve_upgrade(
     // response phase on the upgrade path at all, so there is nothing to wait
     // for and nothing to re-resolve — `resolved` is the request pass.
     if apply::aborts_response(resolved) {
-        tracing::info!("{} {} -> upgrade aborted", info.method, info.full_url);
+        tracing::debug!("{} {} -> upgrade aborted", info.method, info.full_url);
         // The head that is being thrown away is still recorded, for the reason
         // the HTTP gate records one: a session that shows nothing coming back
         // reads as if the server never answered, and it did.
