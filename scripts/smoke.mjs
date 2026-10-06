@@ -8,7 +8,8 @@
 // One run starts the binary on a fresh storage directory with a Node plugin
 // (sdk/whistle-rs-plugin.js), edits its rules and values over the API, sends
 // HTTP, HTTPS (intercepted, checked against the CA the binary just generated),
-// WebSocket, WebSocket-over-TLS and a plugin request through it, stops it,
+// WebSocket, WebSocket-over-TLS and a plugin request through it, kills the
+// plugin and checks the next request starts it again, stops it,
 // checks the port is free and the plugin gone, starts it a second time on the
 // same directory and checks that the CA, rules, values and history came back
 // and still work, then stops it again. On Unix a third start ends in SIGKILL,
@@ -531,6 +532,21 @@ async function run() {
     plugin = await pluginPid();
     return `pid ${plugin}`;
   });
+
+  // Killed from outside, as a crash would end it. The next request that needs
+  // it starts it again and waits for it, as upstream does; it used to go
+  // straight to the origin from then on.
+  if (plugin) {
+    await step('a plugin that dies is started again for the next request', async () => {
+      const was = plugin;
+      process.kill(was, 'SIGKILL');
+      for (let i = 0; i < 50 && alive(was); i++) await new Promise((r) => setTimeout(r, 100));
+      check(!alive(was), `plugin process ${was} survived SIGKILL`);
+      plugin = await pluginPid();
+      check(plugin !== was, `the killed process ${was} answered`);
+      return `pid ${was} killed, pid ${plugin} answered`;
+    });
+  }
 
   await step('the console lists those requests', async () => {
     const want = [`http://${HOST}/plain?x=1`, `https://${HOST}/secure`, `ws://${HOST}/ws`, `wss://${HOST}/wss`];

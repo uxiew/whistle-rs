@@ -565,8 +565,7 @@ async fn main() -> Result<()> {
     for (name, addr) in &config.plugins {
         registry.register_remote(name, addr);
     }
-    let mut children = Vec::new();
-    let mut node_ports = Vec::new();
+    let mut node_plugins = Vec::new();
     for spec in &cli.node_plugins {
         let (name, path) = spec
             .split_once('=')
@@ -576,19 +575,38 @@ async fn main() -> Result<()> {
         let child = node_plugin(path, name, port)
             .spawn()
             .with_context(|| format!("spawning node plugin '{name}' ({path})"))?;
-        children.push(child);
-        node_ports.push((name.to_string(), port));
-        registry.register_remote(name, &format!("127.0.0.1:{port}"));
+        let keeper = whistle_rs::plugins::Keeper::new();
+        registry.register_kept(name, &format!("127.0.0.1:{port}"), keeper.clone());
         tracing::info!("spawned node plugin '{name}' -> node {path} on 127.0.0.1:{port}");
+        let plugin = NodePlugin {
+            name: name.to_string(),
+            path: path.to_string(),
+            port,
+            keeper,
+        };
+        node_plugins.push((plugin, child));
     }
     // Wait for spawned plugins to start listening so early requests don't miss
     // them (best-effort, ~5s cap per plugin).
-    for (name, port) in &node_ports {
-        if wait_for_port(*port, std::time::Duration::from_secs(5)).await {
-            tracing::info!("node plugin '{name}' ready on 127.0.0.1:{port}");
+    for (plugin, _) in &node_plugins {
+        if wait_for_port(plugin.port, std::time::Duration::from_secs(5)).await {
+            tracing::info!(
+                "node plugin '{}' ready on 127.0.0.1:{}",
+                plugin.name,
+                plugin.port
+            );
+            plugin.keeper.set_up(true);
         } else {
-            tracing::warn!("node plugin '{name}' not ready after 5s (continuing)");
+            tracing::warn!(
+                "node plugin '{}' not ready after 5s (continuing)",
+                plugin.name
+            );
         }
+    }
+    // Owned by their keepers from here, which hold them until the runtime
+    // ends with `main`; `kill_on_drop` then stops them.
+    for (plugin, child) in node_plugins {
+        tokio::spawn(keep_node_plugin(plugin, child));
     }
     tracing::info!("plugins: {}", registry.names().join(", "));
 
@@ -638,12 +656,12 @@ async fn main() -> Result<()> {
     let result = tokio::select! {
         result = proxy::accept_loop(state.clone(), listener, None) => result,
         signal = shutdown_signal() => {
+            SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("{signal}: shutting down");
             state.flush_history().await;
             Ok(())
         }
     };
-    drop(children); // kill_on_drop
     result
 }
 
@@ -863,6 +881,84 @@ fn console_password(flag_value: Option<String>, flag: &str, env: &str) -> Option
         return flag_value;
     }
     std::env::var(env).ok().filter(|v| !v.is_empty())
+}
+
+/// A `--node-plugin` this proxy keeps going.
+struct NodePlugin {
+    name: String,
+    path: String,
+    port: u16,
+    keeper: whistle_rs::plugins::Keeper,
+}
+
+/// Set when the process has been asked to stop, so that a plugin exiting with
+/// it is not started again.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// At most one start of the same plugin per this long. A plugin that dies as
+/// soon as it starts is then started once a second while requests keep asking
+/// for it, not once per request.
+const RESTART_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Keep a `--node-plugin`'s process going, as upstream keeps its plugins: when
+/// it exits, say so, and start it again when a request needs it
+/// (`_original/lib/plugins/index.js:676-678`). Between the two, a request
+/// that needs it waits for it — see [`whistle_rs::plugins::Keeper`].
+///
+/// Started on demand rather than at once, which is upstream's way too: a
+/// plugin that crashes on start costs nothing while nothing needs it.
+async fn keep_node_plugin(plugin: NodePlugin, child: tokio::process::Child) {
+    let mut child = Some(child);
+    let mut started = tokio::time::Instant::now();
+    loop {
+        if let Some(mut running) = child.take() {
+            // Held while it runs: `wait` closes the child's stdin first, and
+            // that pipe is the plugin's lifeline — the SDK exits when it closes.
+            let _lifeline = running.stdin.take();
+            let exited = {
+                let exit = running.wait();
+                tokio::pin!(exit);
+                tokio::select! {
+                    status = &mut exit => status,
+                    // A start that main did not wait out, or a start again.
+                    listening = wait_for_port(plugin.port, std::time::Duration::from_secs(60)) => {
+                        if listening {
+                            plugin.keeper.set_up(true);
+                        }
+                        exit.await
+                    }
+                }
+            };
+            plugin.keeper.set_up(false);
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            match exited {
+                Ok(status) => tracing::warn!(
+                    "node plugin '{}' exited ({status}); it starts again when a request needs it",
+                    plugin.name
+                ),
+                Err(e) => tracing::warn!("node plugin '{}': {e}", plugin.name),
+            }
+        }
+        plugin.keeper.needed().await;
+        tokio::time::sleep_until(started + RESTART_GAP).await;
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        started = tokio::time::Instant::now();
+        match node_plugin(&plugin.path, &plugin.name, plugin.port).spawn() {
+            Ok(again) => {
+                tracing::info!(
+                    "node plugin '{}' started again on 127.0.0.1:{}",
+                    plugin.name,
+                    plugin.port
+                );
+                child = Some(again);
+            }
+            Err(e) => tracing::warn!("node plugin '{}' did not start again: {e}", plugin.name),
+        }
+    }
 }
 
 /// The command that starts a `--node-plugin`.
