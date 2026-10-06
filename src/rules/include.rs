@@ -174,7 +174,7 @@ impl Includes {
     }
 
     /// The sources no fetch has ever succeeded for.
-    pub(super) fn pending(&self) -> Vec<String> {
+    pub(crate) fn pending(&self) -> Vec<String> {
         self.entries
             .iter()
             .filter(|(_, e)| !e.loaded)
@@ -554,14 +554,26 @@ fn local_path(target: &str) -> PathBuf {
 /// The rules lock is taken three times and held across no `await`: the targets
 /// are read, the fetches happen with nothing locked, and the results are
 /// applied. A console save must never be waiting on someone's intranet.
+///
+/// All at once, each applied as it lands. One after another, a source that
+/// hung held up every source after it for its whole [`FETCH_TIMEOUT`].
 pub async fn load_pending(rules: &RwLock<RuleManager>) -> usize {
     let pending = {
         let mgr = rules.read().unwrap();
         mgr.includes().pending()
     };
-    let mut landed = 0;
+    let mut fetching = tokio::task::JoinSet::new();
     for target in pending {
-        let body = fetch(&target).await;
+        fetching.spawn(async move {
+            let body = fetch(&target).await;
+            (target, body)
+        });
+    }
+    let mut landed = 0;
+    while let Some(done) = fetching.join_next().await {
+        let Ok((target, body)) = done else {
+            continue;
+        };
         let ok = body.is_some();
         let changed = rules.write().unwrap().record_include(&target, body);
         if ok {
@@ -972,6 +984,50 @@ mod tests {
         assert_eq!(url_answer("u", 500, b""), None);
         assert!(url_answer("u", 200, &vec![b'x'; MAX_INCLUDE]).is_some());
         assert_eq!(url_answer("u", 200, &vec![b'x'; MAX_INCLUDE + 1]), None);
+    }
+
+    /// A rules server that answers every request after `delay`.
+    async fn slow_rules_server(delay: std::time::Duration, body: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    tokio::time::sleep(delay).await;
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// Every pending source is fetched at once, and each counts as it lands.
+    /// One after another, three that hung kept a starting proxy from answering
+    /// anything for 48 s (STATUS, 2026-10-06).
+    #[tokio::test]
+    async fn pending_includes_are_fetched_side_by_side() {
+        let delay = std::time::Duration::from_millis(400);
+        let a = slow_rules_server(delay, "a.test host://10.0.0.1\n").await;
+        let b = slow_rules_server(delay, "b.test host://10.0.0.2\n").await;
+        let rules = RwLock::new(RuleManager::with_includes());
+        rules.write().unwrap().set_text(&format!(
+            "c.test host://10.0.0.3\n@http://127.0.0.1:{a}/a.txt\n@http://127.0.0.1:{b}/b.txt\n"
+        ));
+        let started = std::time::Instant::now();
+        assert_eq!(load_pending(&rules).await, 2);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(700),
+            "took {took:?}"
+        );
+        assert_eq!(rules.read().unwrap().len(), 3);
     }
 
     #[tokio::test]
