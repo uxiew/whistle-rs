@@ -562,6 +562,73 @@ const MANIFEST_TIMEOUT: std::time::Duration = auth::AUTH_TIMEOUT;
 /// because the other side of it is how long a recovered plugin stays blocked.
 const MANIFEST_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a call waits for a kept plugin's process to start again — see
+/// [`Keeper`]. A Node plugin is up in a fraction of a second; one that is not
+/// by now is not coming, and the call fails the way any unreachable plugin's
+/// does.
+const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The link between a plugin process this proxy starts (`--node-plugin`) and
+/// whatever keeps it going.
+///
+/// Upstream starts a plugin's process again when the next request needs it
+/// after the old one went away (`_original/lib/plugins/index.js:676-678`).
+/// Here the keeper says when the process is up; a call that finds it down asks
+/// for it and waits. Before this, a plugin that crashed stayed crashed: its
+/// hooks failed, the requests went on without it, and a plugin answering
+/// requests itself sent every one of them to the real origin from then on.
+#[derive(Clone)]
+pub struct Keeper {
+    up: Arc<tokio::sync::watch::Sender<bool>>,
+    wanted: Arc<tokio::sync::Notify>,
+}
+
+impl Keeper {
+    /// Down until [`Keeper::set_up`] says otherwise.
+    pub fn new() -> Self {
+        Keeper {
+            up: Arc::new(tokio::sync::watch::channel(false).0),
+            wanted: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// The process is listening, or has gone.
+    pub fn set_up(&self, up: bool) {
+        self.up.send_replace(up);
+    }
+
+    /// Wait until a call needs the process while it is down. A call made
+    /// before this is awaited still counts: it is remembered, not missed.
+    pub async fn needed(&self) {
+        self.wanted.notified().await;
+    }
+
+    fn is_up(&self) -> bool {
+        *self.up.borrow()
+    }
+
+    /// Ask for the process if it is down, and wait up to `limit` for it.
+    async fn ready(&self, limit: std::time::Duration) -> Result<(), String> {
+        if self.is_up() {
+            return Ok(());
+        }
+        self.wanted.notify_one();
+        let mut up = self.up.subscribe();
+        match tokio::time::timeout(limit, up.wait_for(|up| *up)).await {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(format!(
+                "the plugin's process is not running, and did not start again within {limit:?}"
+            )),
+        }
+    }
+}
+
+impl Default for Keeper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The plugin name a `plugin://` or `pipe://` rule value names, if any.
 pub fn match_name(value: &str, via_pipe: bool) -> Option<String> {
     parse_match(value, via_pipe).map(|m| m.name)
@@ -675,6 +742,10 @@ pub struct RemotePlugin {
     manifest_retry: std::time::Duration,
     /// [`HOOK_TIMEOUT`], except in a test that cannot wait thirty seconds.
     hook_timeout: std::time::Duration,
+    /// Set when this proxy started the plugin's process and keeps it going.
+    keeper: Option<Keeper>,
+    /// [`RESTART_WAIT`], except in a test.
+    restart_wait: std::time::Duration,
 }
 
 impl RemotePlugin {
@@ -696,6 +767,44 @@ impl RemotePlugin {
             manifest_failed: std::sync::Mutex::new(None),
             manifest_retry: MANIFEST_RETRY,
             hook_timeout: HOOK_TIMEOUT,
+            keeper: None,
+            restart_wait: RESTART_WAIT,
+        }
+    }
+
+    /// A plugin whose process this proxy started, and `keeper` keeps going.
+    pub fn kept(name: impl Into<String>, host_port: &str, keeper: Keeper) -> Self {
+        RemotePlugin {
+            keeper: Some(keeper),
+            ..Self::new(name, host_port)
+        }
+    }
+
+    /// Before dialling the plugin: if this proxy keeps its process and it is
+    /// down, ask for it and wait. Anything else is ready as far as is known.
+    async fn ready(&self) -> Result<(), String> {
+        match &self.keeper {
+            Some(keeper) => keeper.ready(self.restart_wait).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Wait, however long, until a kept process is up; at once for any other.
+    /// Does not ask for it.
+    async fn up(&self) {
+        if let Some(keeper) = &self.keeper {
+            let mut up = keeper.up.subscribe();
+            let _ = up.wait_for(|up| *up).await;
+        }
+    }
+
+    /// Ask for a kept process that is down, without waiting: for the
+    /// statistics hooks, which nothing waits on either.
+    fn want(&self) {
+        if let Some(keeper) = &self.keeper
+            && !keeper.is_up()
+        {
+            keeper.wanted.notify_one();
         }
     }
 
@@ -727,7 +836,14 @@ impl RemotePlugin {
         {
             return Err(why.clone());
         }
-        match self.manifest.get_or_try_init(|| self.discover()).await {
+        // Waited for out here, where every caller waits at once: inside the
+        // cell, one fetch runs at a time, and three requests for a kept plugin
+        // that was not coming back took 5, 10 and 15 s to be told so.
+        let fetched = match self.ready().await {
+            Ok(()) => self.manifest.get_or_try_init(|| self.discover()).await,
+            Err(why) => Err(why),
+        };
+        match fetched {
             Ok(known) => {
                 *self.manifest_failed.lock().unwrap() = None;
                 Ok(known)
@@ -841,6 +957,7 @@ impl RemotePlugin {
             }
         }
         if manifest.req_stats {
+            self.want();
             stats::post(&self.name, &self.base_url, stats::request_payload(req));
         }
         if !manifest.request_hook {
@@ -924,6 +1041,7 @@ impl RemotePlugin {
             return PluginResResult::default();
         };
         if manifest.res_stats {
+            self.want();
             stats::post(&self.name, &self.base_url, stats::response_payload(res));
         }
         if !manifest.response_hook {
@@ -977,7 +1095,11 @@ impl RemotePlugin {
     /// Keeps the status and the error, which the gate needs — for [`auth`] a
     /// plugin that answered `403` and a plugin that could not be reached are
     /// both denials, but only one of them is the plugin's own decision.
+    ///
+    /// A kept process is waited for first if it is down, and once more if every
+    /// try failed: it may have died a moment ago, before its keeper noticed.
     async fn post_status(&self, path: &str, body: &str) -> anyhow::Result<(u16, bytes::Bytes)> {
+        self.ready().await.map_err(anyhow::Error::msg)?;
         let url = format!("{}{path}", self.base_url);
         let mut last_err = None;
         for attempt in 0..3 {
@@ -989,6 +1111,12 @@ impl RemotePlugin {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                 }
+            }
+        }
+        if self.keeper.is_some() {
+            self.ready().await.map_err(anyhow::Error::msg)?;
+            if let Ok(pair) = upstream::simple_post_json(&url, body).await {
+                return Ok(pair);
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("plugin {} unreachable", self.name)))
@@ -1202,6 +1330,15 @@ impl Plugins {
         );
     }
 
+    /// A remote plugin whose process this proxy started and `keeper` keeps
+    /// going — see [`Keeper`].
+    pub fn register_kept(&mut self, name: &str, host_port: &str, keeper: Keeper) {
+        self.map.insert(
+            name.to_string(),
+            PluginKind::Remote(Box::new(RemotePlugin::kept(name, host_port, keeper))),
+        );
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.map.contains_key(name)
     }
@@ -1262,7 +1399,14 @@ impl Plugins {
             return;
         };
         let mut tries = 0u32;
-        while r.manifest().await.is_err() {
+        // A kept process is waited for, never asked for: this is the proxy's
+        // own curiosity, not a request's need, and asking started a plugin
+        // that dies on start again every few seconds for as long as the proxy
+        // ran.
+        while {
+            r.up().await;
+            r.manifest().await.is_err()
+        } {
             tries += 1;
             let wait = if tries < 60 { 1 } else { 30 };
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
@@ -1563,6 +1707,8 @@ impl Plugins {
                 if !r.manifest().await.ok()?.ui {
                     return None;
                 }
+                // Not reaching it is answered below, as before.
+                let _ = r.ready().await;
                 Some(match ui::forward(name, &r.base_url, req).await {
                     Ok(resp) => resp,
                     Err(e) => {
@@ -1615,6 +1761,7 @@ impl Plugins {
             }
             PluginKind::Remote(r) => {
                 if matches!(r.manifest().await, Ok(m) if m.serves_pipe(dir)) {
+                    let _ = r.ready().await;
                     pipe::transform(name, &r.base_url, dir, meta, body).await
                 } else {
                     body
@@ -1644,6 +1791,7 @@ impl Plugins {
                 if !r.manifest().await.ok()?.ws_frame {
                     return None;
                 }
+                let _ = r.ready().await;
                 match wsframe::connect(name, &r.base_url, meta).await {
                     Ok(hook) => Some(wsframe::FrameHook::Remote(hook)),
                     Err(e) => {
@@ -2108,6 +2256,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
+        fake_plugin_on(listener, routes)
+    }
+
+    /// [`fake_plugin`] on a listener the test bound — at an address a plugin
+    /// was registered at before anything listened there.
+    fn fake_plugin_on(listener: tokio::net::TcpListener, routes: Routes) -> FakePlugin {
         let url = format!("http://{}", listener.local_addr().expect("addr"));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
@@ -2221,6 +2375,116 @@ mod tests {
                     fake.paths()
                 );
             }
+        });
+    }
+
+    /// A plugin process this proxy keeps (`--node-plugin`) and that has gone
+    /// away is asked for, and the request waits for it, as upstream starts a
+    /// plugin again for the next request that needs it. It used to go on
+    /// without the plugin for good: once a plugin answering requests itself had
+    /// crashed, every request reached the real origin instead.
+    #[test]
+    fn a_kept_plugin_that_is_gone_is_asked_for_and_waited_on() {
+        rt().block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            drop(l);
+            let keeper = Keeper::new();
+            let plugin = RemotePlugin::kept("p", &addr.to_string(), keeper.clone());
+            let starter = keeper.clone();
+            let started = tokio::spawn(async move {
+                starter.needed().await;
+                let fake = fake_plugin_on(
+                    tokio::net::TcpListener::bind(addr).await.unwrap(),
+                    vec![
+                        (
+                            "/manifest",
+                            200,
+                            r#"{"name":"p","version":"1","hooks":["request"]}"#.into(),
+                        ),
+                        ("/request", 200, r#"{"rules":"* resHeaders://x=1"}"#.into()),
+                    ],
+                );
+                starter.set_up(true);
+                fake
+            });
+            let out = plugin.on_request(&req()).await;
+            assert!(
+                out.failure.is_none() && out.hook_failed.is_none(),
+                "{:?} {:?}",
+                out.failure,
+                out.hook_failed
+            );
+            assert_eq!(out.rules.as_deref(), Some("* resHeaders://x=1"));
+            let fake = started.await.unwrap();
+            assert!(
+                fake.paths().iter().any(|p| p == "/request"),
+                "{:?}",
+                fake.paths()
+            );
+        });
+    }
+
+    /// One that does not come back is a failure the session names, after a
+    /// bounded wait — not a request held for ever.
+    #[test]
+    fn a_kept_plugin_that_does_not_come_back_fails_after_a_wait() {
+        rt().block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            drop(l);
+            let mut plugin = RemotePlugin::kept("p", &addr, Keeper::new());
+            plugin.restart_wait = std::time::Duration::from_millis(50);
+            let started = std::time::Instant::now();
+            let out = plugin.on_request(&req()).await;
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            let why = out.failure.expect("blocked, and why");
+            assert!(why.contains("not running"), "{why}");
+        });
+    }
+
+    /// Requests waiting on the same kept plugin wait side by side. Waiting
+    /// inside the manifest's cell made them take turns: three requests for a
+    /// plugin that did not come back were told so after 5, 10 and 15 s.
+    #[test]
+    fn requests_wait_for_a_kept_plugin_together_not_in_turn() {
+        rt().block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            drop(l);
+            let mut plugin = RemotePlugin::kept("p", &addr, Keeper::new());
+            plugin.restart_wait = std::time::Duration::from_millis(300);
+            let started = std::time::Instant::now();
+            let one = req();
+            let (a, b, c) = tokio::join!(
+                plugin.on_request(&one),
+                plugin.on_request(&one),
+                plugin.on_request(&one)
+            );
+            assert!(a.blocked && b.blocked && c.blocked);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(550),
+                "took {took:?}"
+            );
+        });
+    }
+
+    /// Fetching the manifest ahead of time waits for a kept plugin and never
+    /// asks for it: a plugin that died on start was otherwise started again
+    /// every few seconds for as long as the proxy ran, with nothing needing it.
+    #[test]
+    fn warming_up_does_not_ask_for_a_kept_plugin() {
+        rt().block_on(async {
+            let keeper = Keeper::new();
+            let mut plugins = Plugins::new();
+            plugins.register_kept("p", "127.0.0.1:9", keeper.clone());
+            let plugins = Arc::new(plugins);
+            let warming = plugins.clone();
+            tokio::spawn(async move { warming.warm_up("p").await });
+            let asked =
+                tokio::time::timeout(std::time::Duration::from_millis(300), keeper.needed()).await;
+            assert!(asked.is_err(), "warming up asked for the plugin");
         });
     }
 
