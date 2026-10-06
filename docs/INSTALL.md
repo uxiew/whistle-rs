@@ -65,7 +65,7 @@ Windows 上把 `whistle-rs.exe` 放进一个目录（比如 `%LOCALAPPDATA%\Prog
 | `certs/root.key` | 根证书的私钥。拿到它的人可以对信任这个根证书的客户端冒充任何网站 | 第一次启动 |
 | `rules/groups.json`、`rules/<组名>.rules` | 规则组的顺序和开关、每组的文本 | 控制台保存规则时 |
 | `values.json` | Values | 控制台保存 Values 时 |
-| `sessions/sessions-YYYY-MM-DD.jsonl` | 历史会话，一行一条，按 UTC 日期分文件，默认留 7 天 | 每条会话完成时；`--no-persist` 时不写 |
+| `sessions/sessions-YYYY-MM-DD.jsonl` | 历史会话，一行一条，按 UTC 日期分文件，默认留 7 天、最多 1 GiB（[OPERATIONS](OPERATIONS.md#采集与保留)） | 每条会话完成时；`--no-persist` 时不写 |
 | `lock`、`lock.owner` | 表示"这个目录有实例在用"，后者写着那个实例的 pid 和地址，见下文 | 每次启动 |
 | `certs/root.lock` | 生成根证书时用，让同时启动的几个进程只生成一张 | 每次启动 |
 | `values.json.unreadable-<毫秒>` 等 | 启动时读不懂的 `groups.json`/`values.json`，挪到这里而不是覆盖，日志里有 WARN | 启动时，只在读不懂时 |

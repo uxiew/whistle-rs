@@ -52,7 +52,7 @@ nothing to apply it to.
 
 Beyond whistle's list: `--rule` (inline rules), `--value`, `--plugin` /
 `--node-plugin`, `--insecure-upstream`, `--no-intercept-https`, `--no-persist`,
-`--persist-days`, `--body-preview-limit`, `--body-rewrite-limit`,
+`--persist-days`, `--persist-max-mb`, `--body-preview-limit`, `--body-rewrite-limit`,
 `--weinre <URL>` (where a weinre server is running, for `weinre://id` rules —
 [why it is needed](RULES.md#weinre-html-debug-injection)), `-v/--verbose`.
 `whistle-rs --help` prints all of them, and `whistle-rs explain` answers "which

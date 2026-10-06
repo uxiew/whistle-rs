@@ -806,7 +806,7 @@ api.example.com   resHeaders://x-replayed=1   includeFilter://from:composer
 ### 让抓包跨重启保留
 
 会话以 JSONL 写到 `<存储目录>/sessions/`，每日轮转，启动时回加载。
-`--persist-days N` 控制保留天数；`--no-persist` 整个关掉 —— 测试夹具里你要的就是这个。
+`--persist-days N` 控制保留天数，`--persist-max-mb M` 控制最多占多少磁盘（默认 1024）；`--no-persist` 整个关掉 —— 测试夹具里你要的就是这个。
 
 ---
 

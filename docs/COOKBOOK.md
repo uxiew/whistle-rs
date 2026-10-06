@@ -895,7 +895,8 @@ The header lands on the replay and on nothing else.
 ### Keep the capture across restarts
 
 Sessions are written to JSONL under `<storage_dir>/sessions/` with daily
-rotation and reloaded at startup. `--persist-days N` sets the retention;
+rotation and reloaded at startup. `--persist-days N` sets the retention and
+`--persist-max-mb M` the most disk it may take (1024 by default);
 `--no-persist` turns the whole thing off, which is what you want in a test
 harness.
 

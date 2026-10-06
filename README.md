@@ -59,7 +59,7 @@ whistle-rs -p 8899
 
 - **默认只有本机能用。** 给手机或别的电脑用要加 `-H 0.0.0.0`，并且先用 `-n 用户名` 加环境变量 `WHISTLE_RS_PASSWORD` 给控制台设口令（别用 `-w`，[原因](docs/CLI.md#listening-beyond-this-machine)）：能改规则的人就能让代理读写这台机器上的文件。
 - **代理本身没有访问控制。** 局域网里能连上端口的设备都能用它转发，要靠防火墙限制谁能连。
-- **记录里有敏感信息。** 请求记录默认在 `~/.whistle-rs` 保存 7 天，里面原样存着 Cookie 和 `Authorization`；`--no-persist` 不写盘。分享导出的 HAR 前先检查。
+- **记录里有敏感信息。** 请求记录默认在 `~/.whistle-rs` 保存 7 天（最多 1 GiB），里面原样存着 Cookie 和 `Authorization`；`--no-persist` 不写盘。分享导出的 HAR 前先检查。
 - **只拦截你有权调试的流量**，用完撤销对根证书的信任。
 
 完整的安全说明见 [OPERATIONS](docs/OPERATIONS.md)。
