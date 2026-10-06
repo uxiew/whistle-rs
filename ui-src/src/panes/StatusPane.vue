@@ -39,7 +39,12 @@ const capture = computed<Pair[]>(() => [
   ['WS frames held', st.value?.frames],
   ['Body preview cap', fmtBytes(st.value?.body_preview_cap)],
   ['Body rewrite limit', fmtBytes(st.value?.body_rewrite_cap)],
-  ['Persist', st.value?.persist_sessions ? `${st.value.persist_days} days` : 'off'],
+  [
+    'Persist',
+    st.value?.persist_sessions
+      ? `${st.value.persist_days} days, at most ${Math.round(st.value.persist_max_bytes / 1048576)} MiB`
+      : 'off',
+  ],
 ]);
 
 /**

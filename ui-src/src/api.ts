@@ -264,6 +264,8 @@ export interface ProxyStatus {
   body_rewrite_cap: number;
   persist_sessions: boolean;
   persist_days: number;
+  /** The history on disk is cut back to this, oldest first. */
+  persist_max_bytes: number;
   timeout_ms: number;
   rules: number;
   sessions: number;

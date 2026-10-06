@@ -201,6 +201,11 @@ struct Cli {
     #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_DAYS)]
     persist_days: u32,
 
+    /// Most session history kept on disk, in MiB; the oldest goes first.
+    /// Whichever of this and --persist-days is reached first applies.
+    #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_MAX_MB)]
+    persist_max_mb: u64,
+
     /// How many captured requests to keep (whistle's `-R/--reqCacheSize`).
     ///
     /// Values below the default are ignored, as they are upstream — its own
@@ -454,6 +459,7 @@ async fn main() -> Result<()> {
         body_rewrite_cap: cli.body_rewrite_limit,
         persist_sessions: !cli.no_persist,
         persist_days: cli.persist_days,
+        persist_max_bytes: cli.persist_max_mb.max(1) * 1024 * 1024,
         req_cache_size: whistle_rs::config::clamp_req_cache_size(cli.req_cache_size),
         frame_cache_size: whistle_rs::config::clamp_frame_cache_size(cli.frame_cache_size),
         timeout_ms: cli.timeout,

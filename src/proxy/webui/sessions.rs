@@ -535,6 +535,7 @@ pub(super) async fn status_json(state: &Arc<AppState>, restricted: bool) -> Resp
         "body_rewrite_cap": cfg.body_rewrite_cap,
         "persist_sessions": cfg.persist_sessions,
         "persist_days": cfg.persist_days,
+        "persist_max_bytes": cfg.persist_max_bytes,
         "timeout_ms": cfg.timeout_ms,
         "rules": state.rules.read().unwrap().len(),
         "sessions": state.sessions.lock().unwrap().len(),

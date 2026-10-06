@@ -167,6 +167,9 @@ pub struct Config {
     pub persist_sessions: bool,
     /// Number of days of session JSONL files to retain.
     pub persist_days: u32,
+    /// Most bytes of session history kept on disk — see
+    /// [`DEFAULT_PERSIST_MAX_MB`].
+    pub persist_max_bytes: u64,
     /// Whether the console's edits — rule groups, values, the switches — are
     /// written to `storage_dir` for the next start to read. The binary reads
     /// them back; an embedded proxy never does, so it does not write them
@@ -261,6 +264,7 @@ impl Default for Config {
             body_rewrite_cap: DEFAULT_BODY_REWRITE_CAP,
             persist_sessions: true,
             persist_days: DEFAULT_PERSIST_DAYS,
+            persist_max_bytes: DEFAULT_PERSIST_MAX_MB * 1024 * 1024,
             persist_edits: true,
             req_cache_size: DEFAULT_REQ_CACHE_SIZE,
             frame_cache_size: DEFAULT_FRAME_CACHE_SIZE,
@@ -727,6 +731,11 @@ pub const DEFAULT_BODY_REWRITE_CAP: usize = 16 * 1024 * 1024;
 
 /// Default number of days to retain persisted session files.
 pub const DEFAULT_PERSIST_DAYS: u32 = 7;
+
+/// Default limit on the session history on disk, in MiB — about fifty thousand
+/// sessions with full previews (a session is at most ~21 KB written down).
+/// Whichever of this and [`DEFAULT_PERSIST_DAYS`] is reached first applies.
+pub const DEFAULT_PERSIST_MAX_MB: u64 = 1024;
 
 /// The largest request body the console reads, 16 MiB: far above any rules
 /// text, values store or bundle a person writes, and a ceiling on what one

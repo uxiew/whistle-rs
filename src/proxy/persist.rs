@@ -6,7 +6,7 @@
 //! back into memory so the Network view survives restarts.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -241,8 +241,9 @@ pub struct SessionStore {
 
 impl SessionStore {
     /// Create a new store writing to `dir`, retaining `retain_days` days of
-    /// files. Spawns a background tokio task for writes.
-    pub fn new(dir: PathBuf, retain_days: u32) -> Self {
+    /// files and at most `max_bytes` of them. Spawns a background tokio task
+    /// for writes.
+    pub fn new(dir: PathBuf, retain_days: u32, max_bytes: u64) -> Self {
         // Sessions hold cookies and `Authorization` headers verbatim.
         crate::private_fs::create_dir(&dir).ok();
         crate::private_fs::tighten(&dir);
@@ -250,8 +251,9 @@ impl SessionStore {
         // happens to cross midnight UTC: a proxy started for an hour a week
         // never pruned anything.
         prune_old_files(&dir, retain_days);
+        let on_disk = keep_under(&dir, max_bytes, &jsonl_path(&dir, &today_tag()));
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(writer_task(dir, retain_days, rx));
+        tokio::spawn(writer_task(dir, retain_days, max_bytes, on_disk, rx));
         SessionStore { tx }
     }
 
@@ -418,7 +420,17 @@ impl Iterator for Backward {
 
 /// Background task: receives snapshots via channel, appends to today's JSONL,
 /// and periodically prunes old files.
-async fn writer_task(dir: PathBuf, retain_days: u32, mut rx: mpsc::UnboundedReceiver<Msg>) {
+///
+/// `on_disk` is how much history there is, kept up to date by adding what each
+/// write adds, and measured again — and brought back under `max_bytes` — the
+/// moment it goes over.
+async fn writer_task(
+    dir: PathBuf,
+    retain_days: u32,
+    max_bytes: u64,
+    mut on_disk: u64,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+) {
     let mut current_tag = today_tag();
     let mut file = open_append(&jsonl_path(&dir, &current_tag));
     let mut write_count: u64 = 0;
@@ -446,6 +458,7 @@ async fn writer_task(dir: PathBuf, retain_days: u32, mut rx: mpsc::UnboundedRece
                     }
                 }
                 tracing::info!("deleted {removed} persisted session file(s)");
+                on_disk = 0;
                 file = open_append(&jsonl_path(&dir, &current_tag));
                 let _ = done.send(removed);
                 continue;
@@ -457,18 +470,109 @@ async fn writer_task(dir: PathBuf, retain_days: u32, mut rx: mpsc::UnboundedRece
             current_tag = tag;
             file = open_append(&jsonl_path(&dir, &current_tag));
             prune_old_files(&dir, retain_days);
+            on_disk = keep_under(&dir, max_bytes, &jsonl_path(&dir, &current_tag));
         }
         if let Some(f) = &mut file
             && let Ok(line) = serde_json::to_string(&snap)
         {
             let _ = writeln!(f, "{line}");
+            on_disk += line.len() as u64 + 1;
             write_count += 1;
             // Flush every 10 writes for durability without per-line fsync.
             if write_count.is_multiple_of(10) {
                 let _ = f.flush();
             }
         }
+        if on_disk > max_bytes {
+            // Closed first: today's file may be replaced, and Windows will not
+            // replace a file that is open.
+            drop(file.take());
+            on_disk = keep_under(&dir, max_bytes, &jsonl_path(&dir, &current_tag));
+            file = open_append(&jsonl_path(&dir, &current_tag));
+        }
     }
+}
+
+/// Bring the history in `dir` under `max_bytes`; how much is left.
+///
+/// Days are deleted whole, oldest first, never `current` — today's, which the
+/// writer appends to. If `current` alone is still over, it keeps its newest
+/// whole lines, half of `max_bytes`' worth, so that the next write does not
+/// cut it again. Without a limit, a proxy taking a browser's traffic all day
+/// wrote about a gigabyte per fifty thousand requests and kept a week of it.
+fn keep_under(dir: &Path, max_bytes: u64, current: &Path) -> u64 {
+    let mut files: Vec<(PathBuf, u64)> = list_jsonl_files(dir)
+        .into_iter()
+        .filter_map(|p| fs::metadata(&p).ok().map(|m| (p, m.len())))
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, len)| len).sum();
+    if total <= max_bytes {
+        return total;
+    }
+    let mib = |bytes: u64| bytes.div_ceil(1024 * 1024);
+    files.sort();
+    for (path, len) in &files {
+        if total <= max_bytes {
+            break;
+        }
+        if path != current && fs::remove_file(path).is_ok() {
+            total -= len;
+            tracing::info!(
+                "session history over its {} MiB limit: deleted {} ({} MiB)",
+                mib(max_bytes),
+                path.display(),
+                mib(*len)
+            );
+        }
+    }
+    if total > max_bytes
+        && let Some(len) = files.iter().find(|(p, _)| p == current).map(|(_, l)| *l)
+    {
+        match keep_newest(current, max_bytes / 2) {
+            Ok(kept) => {
+                total = total - len + kept;
+                tracing::info!(
+                    "session history over its {} MiB limit: {} cut to its newest {} MiB",
+                    mib(max_bytes),
+                    current.display(),
+                    mib(kept)
+                );
+            }
+            Err(e) => tracing::warn!("cannot cut {} down: {e}", current.display()),
+        }
+    }
+    total
+}
+
+/// Replace `path` with its last `keep` bytes, less the part of a line they
+/// begin in the middle of; the size left. Copied through, not read whole: the
+/// tail of a big history is itself big.
+fn keep_newest(path: &Path, keep: u64) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let mut from = File::open(path)?;
+    let len = from.metadata()?.len();
+    if len <= keep {
+        return Ok(len);
+    }
+    from.seek(SeekFrom::Start(len - keep))?;
+    let mut reader = BufReader::new(from);
+    let mut cut = Vec::new();
+    reader.read_until(b'\n', &mut cut)?;
+    // Not `sessions-*.jsonl`, so nothing lists it while it is written.
+    let tmp = path.with_extension("jsonl.cut");
+    let _ = fs::remove_file(&tmp);
+    let copied = (|| {
+        let mut out = crate::private_fs::open_append(&tmp)?;
+        let n = std::io::copy(&mut reader, &mut out)?;
+        out.sync_all()?;
+        drop(out);
+        fs::rename(&tmp, path)?;
+        Ok(n)
+    })();
+    if copied.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    copied
 }
 
 /// Open (or create) a file for appending.
@@ -736,7 +840,7 @@ mod tests {
     async fn purge_deletes_the_files_and_writing_carries_on() {
         let dir = scratch("purge");
         fs::write(dir.join("sessions-2026-01-01.jsonl"), format!("{LINE}\n")).expect("older");
-        let store = SessionStore::new(dir.clone(), 36_500);
+        let store = SessionStore::new(dir.clone(), 36_500, u64::MAX);
         let session: PersistedSession = serde_json::from_str(LINE).expect("line");
         store.persist(&session.clone().into_session());
         // Round-trip through the writer, so the save is on disk before purge.
@@ -818,12 +922,83 @@ mod tests {
         assert!(SessionStore::load(&dir, 0, 36_500).is_empty());
     }
 
+    fn total(dir: &Path) -> u64 {
+        list_jsonl_files(dir)
+            .iter()
+            .filter_map(|p| fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// History over its limit at startup loses its oldest days first, whole.
+    #[tokio::test]
+    async fn over_the_limit_the_oldest_days_go_first() {
+        let dir = scratch("limit-days");
+        for (day, ids) in [("01", 1..=10), ("02", 11..=20), ("03", 21..=30)] {
+            let text: String = ids.map(|id| line_of(id, 1000) + "\n").collect();
+            fs::write(dir.join(format!("sessions-2026-01-{day}.jsonl")), text).expect("day");
+        }
+        // Room for two days of these (about 10 KB each), not three.
+        let _store = SessionStore::new(dir.clone(), 36_500, 25_000);
+        assert!(
+            !dir.join("sessions-2026-01-01.jsonl").exists(),
+            "oldest gone"
+        );
+        assert!(dir.join("sessions-2026-01-02.jsonl").exists());
+        assert!(dir.join("sessions-2026-01-03.jsonl").exists());
+        assert_eq!(
+            ids(&SessionStore::load(&dir, 100, 36_500)),
+            (11..=30).collect::<Vec<_>>()
+        );
+    }
+
+    /// One day alone over the limit keeps its newest whole lines, half the
+    /// limit's worth, so that it is not cut again at the very next write.
+    #[tokio::test]
+    async fn one_day_over_the_limit_keeps_its_newest_lines() {
+        let dir = scratch("limit-today");
+        let text: String = (1..=50).map(|id| line_of(id, 1000) + "\n").collect();
+        fs::write(jsonl_path(&dir, &today_tag()), text).expect("today");
+        let _store = SessionStore::new(dir.clone(), 36_500, 20_000);
+        let kept = total(&dir);
+        assert!(kept <= 10_000, "kept {kept} bytes");
+        let loaded = SessionStore::load(&dir, 100, 36_500);
+        assert!(!loaded.is_empty());
+        assert_eq!(*ids(&loaded).last().expect("some"), 50, "the newest stays");
+        let ids = ids(&loaded);
+        assert!(
+            ids.windows(2).all(|w| w[1] == w[0] + 1),
+            "contiguous: {ids:?}"
+        );
+        // Every line is whole: as many lines as sessions loaded.
+        let lines = fs::read_to_string(jsonl_path(&dir, &today_tag())).expect("read");
+        assert_eq!(lines.lines().count(), ids.len());
+    }
+
+    /// While the proxy runs, the history stays near its limit however much
+    /// is written.
+    #[tokio::test]
+    async fn writing_stays_under_the_limit() {
+        let dir = scratch("limit-writing");
+        let limit = 40_000;
+        let store = SessionStore::new(dir.clone(), 36_500, limit);
+        for id in 1..=400 {
+            let session: PersistedSession = serde_json::from_str(&line_of(id, 1000)).expect("line");
+            store.persist(&session.into_session());
+        }
+        store.flush().await;
+        let written = total(&dir);
+        assert!(written <= limit, "{written} bytes on disk, limit {limit}");
+        let loaded = SessionStore::load(&dir, 1000, 36_500);
+        assert_eq!(*ids(&loaded).last().expect("some"), 400, "the newest stays");
+    }
+
     /// What was queued before `flush` is in the file when it returns — what
     /// shutting down waits for.
     #[tokio::test]
     async fn flush_returns_once_what_was_queued_is_written() {
         let dir = scratch("flush");
-        let store = SessionStore::new(dir.clone(), 7);
+        let store = SessionStore::new(dir.clone(), 7, u64::MAX);
         let session: PersistedSession = serde_json::from_str(LINE).expect("line");
         for _ in 0..3 {
             store.persist(&session.clone().into_session());

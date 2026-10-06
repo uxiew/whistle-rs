@@ -132,7 +132,11 @@ impl AppState {
             drop(q);
             self.set_next_id(max_id + 1);
         }
-        let store = persist::SessionStore::new(dir, self.config.persist_days);
+        let store = persist::SessionStore::new(
+            dir,
+            self.config.persist_days,
+            self.config.persist_max_bytes,
+        );
         self.enable_persistence(store);
     }
 
