@@ -2651,10 +2651,16 @@ mod tests {
             run_rules_script("rules.push('a'); (function f() { f(); })()", &ctx),
             None
         );
-        // …and an honest loop is not.
+        // …and an honest loop is not. Inside a function, because what is
+        // checked here is the loop limit and not the clock: this engine reads
+        // and writes globals about six times slower than locals, and the same
+        // loop at the top level took 660 ms of the 1 s `TIME_LIMIT` in a debug
+        // build on an M-series Mac and went past it on CI's x86 runners. In a
+        // function it takes 120 ms; in a release build, 6 ms (34 at the top).
         assert_eq!(
             run_rules_script(
-                "var n = 0; for (var i = 0; i < 100000; i++) n++; rules.push('n=' + n)",
+                "rules.push('n=' + (function () { \
+                     var n = 0; for (var i = 0; i < 100000; i++) n++; return n; })())",
                 &ctx
             )
             .as_deref(),
