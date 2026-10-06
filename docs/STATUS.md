@@ -962,7 +962,7 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 - 平台 job 跑 release 构建的全部测试（`--no-fail-fast`）、冒烟测试、打包：Linux x86_64、Linux arm64、macOS arm64、Windows x86_64 通过，包括第四轮新加的 `data_dir_e2e`、`console_password_e2e`；macOS x86_64 写这段时还在跑。
 - 其余 job（只编译代理、两个 Node 版本的控制台、文档链接、快速差分）通过。
 
-`d5fe441` 推送后要看的：两个 debug job 全过，以及这次没跑到的集成测试在 debug 下的结果。
+推送 `6e809fb` 后，CI run `37463917772` 的 12 个 job 全部通过：两个 debug job 这次跑完了全部单元和集成测试，macOS x86_64 也通过（上一次 run 因为有新推送被取消，没跑完）。第三、四轮的代码在 CI 的五个平台上都验证过了。
 
 ## 真实缺口与风险
 
