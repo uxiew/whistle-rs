@@ -160,6 +160,10 @@ pub(super) mod lan_tests {
     }
 }
 
+/// How long a starting proxy waits for the `@` includes in its rules before it
+/// answers without the ones still on their way.
+const INCLUDE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Accept connections until `shutdown` resolves (or forever, if it is `None`).
 ///
 /// The optional shutdown is what lets an embedded proxy be stopped: a binary
@@ -194,19 +198,39 @@ pub async fn accept_loop(
         });
     }
 
-    // `@` includes, before the first connection is answered.
+    // `@` includes, before the first connection is answered — for up to
+    // [`INCLUDE_WAIT`], and then without them.
     //
-    // The socket is already bound, so a client connecting during a slow fetch
-    // waits in the backlog rather than being refused — and a rules file that
-    // says `@https://intra/rules.txt` is *in effect* for the first request
-    // rather than for the second. Each fetch is capped at 16 s and a proxy
-    // whose rules name no include does no work here at all.
+    // The socket is already bound, so a client connecting during a fetch waits
+    // in the backlog rather than being refused, and a rules file that says
+    // `@https://intra/rules.txt` is in effect for the first request when the
+    // server answers. When it does not, the fetches go on in the background
+    // and their rules apply when they land. Waiting them out was 16 s per
+    // source, one after another, with the console silent too; upstream does
+    // not wait at all. A proxy whose rules name no include does nothing here.
     let resolves_includes = state.rules.read().unwrap().resolves_includes();
     if resolves_includes {
-        let landed = crate::rules::include::load_pending(&state.rules).await;
-        tracing::info!("resolved {landed} rules include(s)");
-        let poller = state.clone();
-        tokio::spawn(async move { crate::rules::include::poll(&poller.rules).await });
+        let (loaded, landed) = tokio::sync::oneshot::channel();
+        let loader = state.clone();
+        tokio::spawn(async move {
+            let count = crate::rules::include::load_pending(&loader.rules).await;
+            tracing::info!("resolved {count} rules include(s)");
+            let _ = loaded.send(());
+            crate::rules::include::poll(&loader.rules).await;
+        });
+        if tokio::time::timeout(INCLUDE_WAIT, landed).await.is_err() {
+            let waiting = state.rules.read().unwrap().includes().pending();
+            tracing::warn!(
+                "rules includes still loading after {} s, answering without them until \
+                 they arrive: {}",
+                INCLUDE_WAIT.as_secs(),
+                waiting
+                    .iter()
+                    .map(|t| format!("@{t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
 
     // `Either` rather than a `select!` per iteration: with no shutdown channel
