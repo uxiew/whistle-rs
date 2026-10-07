@@ -1,4 +1,4 @@
-//! whistle-rs plugin system.
+//! whix plugin system.
 //!
 //! A plugin is per-request middleware. It can **inject rules**, **answer the
 //! request directly** (a mock), **rewrite request headers**, and **rewrite the
@@ -8,7 +8,7 @@
 //! * **Remote plugins** — any process exposing an HTTP endpoint that speaks the
 //!   JSON protocol below. In practice that means JavaScript/TypeScript via the
 //!   SDK in `sdk/`, but the protocol is deliberately language-agnostic.
-//!   whistle-rs can spawn the process for you (`--node-plugin name=path.js`) or
+//!   whix can spawn the process for you (`--node-plugin name=path.js`) or
 //!   point at an already-running one (`--plugin name=host:port`).
 //!
 //! Both are triggered by a `plugin://<name>[/<param>]` (or `pipe://…`) rule.
@@ -18,7 +18,7 @@
 //! ### `GET /manifest` — capability declaration
 //!
 //! Fetched once, lazily, on a plugin's first use and then cached. It is what
-//! keeps the fast path fast: whistle-rs only buffers a request or response body
+//! keeps the fast path fast: whix only buffers a request or response body
 //! when a plugin has explicitly asked for it, so plugins that don't care never
 //! cost the proxy its streaming behaviour.
 //!
@@ -127,7 +127,7 @@ use crate::rules::Resolved;
 /// What a plugin can do, so the proxy only pays for what is actually used.
 ///
 /// The body flags are the load-bearing part: buffering a body defeats streaming,
-/// so whistle-rs does it only when a matched plugin declares it needs one.
+/// so whix does it only when a matched plugin declares it needs one.
 #[derive(Debug, Clone)]
 pub struct PluginManifest {
     pub name: String,

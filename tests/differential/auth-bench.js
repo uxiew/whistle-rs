@@ -23,7 +23,7 @@
 //   cargo run -- --port 19801 --no-persist --dir /tmp/rs-auth \
 //     -n admin -w s3cret -N guest -W look &
 //   PORT_BASE=19800 node auth-bench.js
-//     19800 whistle · 19801 whistle-rs · 19802 the echo origin
+//     19800 whistle · 19801 whix · 19802 the echo origin
 
 const http = require('http');
 const { forVersion } = require('./whistle-pkg');

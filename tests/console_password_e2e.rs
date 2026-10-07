@@ -12,8 +12,8 @@ use std::time::Duration;
 use base64::Engine;
 use common::*;
 
-const PASSWORD: &str = "WHISTLE_RS_PASSWORD";
-const GUEST_PASSWORD: &str = "WHISTLE_RS_GUEST_PASSWORD";
+const PASSWORD: &str = "WHIX_PASSWORD";
+const GUEST_PASSWORD: &str = "WHIX_GUEST_PASSWORD";
 
 /// The binary on a scratch directory, with none of the variables set unless
 /// the test sets them — a developer's own shell may have them.

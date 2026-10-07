@@ -13,7 +13,7 @@
 //     shares.
 //   * `pipe://` names a **plugin** (`PIPE_PLUGIN_RE`,
 //     `_original/lib/plugins/index.js:1184`). With no such plugin installed it
-//     is inert in both. It is exercised here only in that shape: whistle-rs
+//     is inert in both. It is exercised here only in that shape: whix
 //     ships demonstration plugins (`upper`, `echo`, `gate`, …) that upstream
 //     does not have, so `pipe://upper` compares a plugin set rather than a rule.
 //   * `intercept://` is **not a protocol**. `enable://intercept` and

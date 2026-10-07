@@ -1,4 +1,4 @@
-//! whistle-rs — a Rust port of the core of [whistle](https://wproxy.org).
+//! whix — a Rust port of the core of [whistle](https://wproxy.org).
 //!
 //! Modules mirror the original layout under `_original/lib`:
 //! * [`config`] — runtime configuration (`lib/config.js`)
@@ -9,13 +9,13 @@
 //!
 //! # Embedding
 //!
-//! whistle-rs is a library first and a binary second. [`embed`] is the facade
+//! whix is a library first and a binary second. [`embed`] is the facade
 //! for running it inside another program — traffic interception and API
 //! debugging as a component rather than a tool you launch beside your
 //! application:
 //!
 //! ```no_run
-//! use whistle_rs::embed::Proxy;
+//! use whix::embed::Proxy;
 //!
 //! # async fn run() -> anyhow::Result<()> {
 //! let proxy = Proxy::builder()

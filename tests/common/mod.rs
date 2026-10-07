@@ -10,10 +10,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_whistle-rs");
+pub const BIN: &str = env!("CARGO_BIN_EXE_whix");
 
 pub fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("whistle-rs-e2e-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("whix-e2e-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
@@ -70,7 +70,7 @@ pub fn try_start(mut cmd: Command, dir: &Path) -> Option<Instance> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn whistle-rs");
+        .expect("spawn whix");
     let stdout = child.stdout.take().expect("stdout");
     let (tx, rx) = std::sync::mpsc::channel();
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -79,7 +79,7 @@ pub fn try_start(mut cmd: Command, dir: &Path) -> Option<Instance> {
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             lines.lock().unwrap().push(line.clone());
-            if let Some(rest) = line.split("whistle-rs listening on http://").nth(1) {
+            if let Some(rest) = line.split("whix listening on http://").nth(1) {
                 let addr: String = rest
                     .chars()
                     .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ':')
@@ -119,7 +119,7 @@ pub fn run_to_exit(mut cmd: Command, limit: Duration) -> (std::process::ExitStat
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn whistle-rs");
+        .expect("spawn whix");
     let began = Instant::now();
     loop {
         if let Some(status) = child.try_wait().expect("try_wait") {

@@ -423,7 +423,7 @@ const LEAF_LIFETIME: Duration = Duration::from_secs(36 * ONE_DAY);
 /// gets the same by emptying its whole cache every 34 days.
 const LEAF_REISSUE_AFTER: Duration = Duration::from_secs(34 * ONE_DAY);
 
-/// Build the TLS acceptor whistle-rs presents to an intercepted client.
+/// Build the TLS acceptor whix presents to an intercepted client.
 ///
 /// One place, so a certificate that came from a plugin is offered under exactly
 /// the same terms as one this CA generated — same ALPN list above all. A plugin
@@ -660,10 +660,10 @@ fn generate_root_ca() -> Result<(Certificate, KeyPair)> {
     let mut params = CertificateParams::new(Vec::<String>::new()).context("root CA params")?;
     params
         .distinguished_name
-        .push(DnType::CommonName, "whistle-rs Root CA");
+        .push(DnType::CommonName, "whix Root CA");
     params
         .distinguished_name
-        .push(DnType::OrganizationName, "whistle-rs");
+        .push(DnType::OrganizationName, "whix");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
@@ -694,8 +694,7 @@ mod key_permission_tests {
     }
 
     fn config(label: &str) -> Config {
-        let dir =
-            std::env::temp_dir().join(format!("whistle-rs-keyperm-{label}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("whix-keyperm-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Config {
             storage_dir: dir,
@@ -741,7 +740,7 @@ mod tests {
     fn ca(label: &str) -> Arc<CertAuthority> {
         let config = Config {
             storage_dir: std::env::temp_dir().join(format!(
-                "whistle-rs-ca-{label}-{}-{:?}",
+                "whix-ca-{label}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             )),
@@ -758,7 +757,7 @@ mod tests {
     /// in for processes: the lock is on an open file, not on a pid.
     #[test]
     fn concurrent_first_starts_agree_on_one_root() {
-        let dir = std::env::temp_dir().join(format!("whistle-rs-ca-race-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("whix-ca-race-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let config = Arc::new(Config {
             storage_dir: dir,

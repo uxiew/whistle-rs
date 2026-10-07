@@ -33,7 +33,7 @@ const { spawn } = require('child_process');
 
 const BASE = Number(process.env.PORT_BASE || 20100);
 /** The binary under test; built by `cargo build` from the repo root. */
-const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whix');
 /** The whistle this run measures — `WHISTLE_PKG`, or the baseline. */
 const WHISTLE = require('./whistle-pkg');
 const { forVersion } = WHISTLE;

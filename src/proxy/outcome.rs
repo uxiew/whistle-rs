@@ -61,7 +61,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// The name the API, the console and the `x-whistle-rs-error` header use.
+    /// The name the API, the console and the `x-whix-error` header use.
     pub fn as_str(self) -> &'static str {
         match self {
             Phase::ClientTls => "client-tls",

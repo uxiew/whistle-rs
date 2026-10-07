@@ -84,7 +84,7 @@ pub(super) fn loop_detected(uri: &hyper::Uri) -> Response<DynBody> {
         .status(StatusCode::LOOP_DETECTED)
         .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(body::full(Bytes::from(format!(
-            "whistle-rs: {uri} resolves to this proxy, which forwarded it to itself\n"
+            "whix: {uri} resolves to this proxy, which forwarded it to itself\n"
         ))))
         .expect("static 508")
 }
@@ -760,11 +760,11 @@ pub(super) fn client_tls_failure(err: &std::io::Error) -> String {
     match (refused, hung_up) {
         (true, _) => format!(
             "the client refused this proxy's certificate ({err}): it does not trust the \
-             whistle-rs root certificate, or it pins the server's own"
+             whix root certificate, or it pins the server's own"
         ),
         (false, true) => format!(
             "the client hung up during the TLS handshake ({err}); a client that does not \
-             trust the whistle-rs root certificate often does"
+             trust the whix root certificate often does"
         ),
         (false, false) => format!("the TLS handshake with the client failed: {err}"),
     }
@@ -870,7 +870,7 @@ pub(crate) mod tunnel_abort_tests {
             port: 0,
             host: Some("127.0.0.1".parse().unwrap()),
             storage_dir: std::env::temp_dir()
-                .join(format!("whistle-rs-abort-{}-{n}", std::process::id())),
+                .join(format!("whix-abort-{}-{n}", std::process::id())),
             persist_sessions: false,
             ..crate::config::Config::default()
         };
@@ -1367,7 +1367,7 @@ pub(crate) mod tunnel_abort_tests {
         let got = String::from_utf8_lossy(&got).to_lowercase();
 
         assert!(got.starts_with("http/1.1 502"), "{got}");
-        assert!(got.contains("x-server: whistle-rs"), "{got}");
+        assert!(got.contains("x-server: whix"), "{got}");
         assert!(
             got.contains("content-type: text/plain; charset=utf-8"),
             "{got}"

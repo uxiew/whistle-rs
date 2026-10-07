@@ -75,7 +75,7 @@ fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
 
 #[tokio::test]
 async fn a_hidden_request_is_not_recorded_anywhere() {
-    let dir = std::env::temp_dir().join(format!("whistle-rs-hide-e2e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("whix-hide-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let site = origin().await;
     let dead = {
@@ -85,7 +85,7 @@ async fn a_hidden_request_is_not_recorded_anywhere() {
 
     let observed: Arc<Mutex<Vec<String>>> = Arc::default();
     let sink = observed.clone();
-    let proxy = whistle_rs::embed::Proxy::builder()
+    let proxy = whix::embed::Proxy::builder()
         .host("127.0.0.1".parse().unwrap())
         .storage_dir(&dir)
         .persist_sessions(true)
@@ -106,8 +106,8 @@ async fn a_hidden_request_is_not_recorded_anywhere() {
     // session, because there is none to look up.
     let failed = get(addr, &format!("http://{dead}/hidden"), &dead.to_string()).await;
     assert!(failed.starts_with("HTTP/1.1 502"), "{failed}");
-    assert_eq!(header(&failed, "x-whistle-rs-error"), Some("connect"));
-    assert_eq!(header(&failed, "x-whistle-rs-session"), None, "{failed}");
+    assert_eq!(header(&failed, "x-whix-error"), Some("connect"));
+    assert_eq!(header(&failed, "x-whix-session"), None, "{failed}");
     // Shown: the control.
     let shown = get(addr, &format!("http://{site}/shown"), &site.to_string()).await;
     assert!(shown.ends_with("body-secret-9f2"), "{shown}");
@@ -177,10 +177,10 @@ async fn a_hidden_request_is_not_recorded_anywhere() {
 /// traffic — so the check is on history files and on the traffic's own bytes.
 #[tokio::test]
 async fn nothing_of_the_traffic_is_written_when_persistence_is_off() {
-    let dir = std::env::temp_dir().join(format!("whistle-rs-no-persist-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("whix-no-persist-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let site = origin().await;
-    let proxy = whistle_rs::embed::Proxy::builder()
+    let proxy = whix::embed::Proxy::builder()
         .host("127.0.0.1".parse().unwrap())
         .storage_dir(&dir)
         .persist_sessions(false)

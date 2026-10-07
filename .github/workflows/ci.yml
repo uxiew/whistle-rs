@@ -84,7 +84,7 @@ jobs:
           test ! -e ui-src/dist
       - run: cargo build --locked
       - name: The binary runs and serves the placeholder console
-        run: scripts/check-console.sh target/debug/whistle-rs placeholder
+        run: scripts/check-console.sh target/debug/whix placeholder
 
   console:
     name: Console — Node ${{ matrix.node }}
@@ -171,7 +171,7 @@ jobs:
         id: info
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
-          exe=target/release/whistle-rs
+          exe=target/release/whix
           if [ "$RUNNER_OS" = Windows ]; then exe=$exe.exe; fi
           echo "EXE=$exe" >> "$GITHUB_ENV"
           case "$RUNNER_OS" in
@@ -193,7 +193,7 @@ jobs:
           if command -v sha256sum >/dev/null; then sum="sha256sum"; else sum="shasum -a 256"; fi
           echo "SUM=$sum" >> "$GITHUB_ENV"
           {
-            echo "whistle-rs: $("$exe" --version)"
+            echo "whix: $("$exe" --version)"
             echo "target: ${{ matrix.target }}"
             echo "commit: $GITHUB_SHA"
             echo "built by: $(rustc --version) on $ImageOS $ImageVersion"
@@ -210,7 +210,7 @@ jobs:
       - name: Package with license texts and checksums
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
-          name="whistle-rs-$version-${{ matrix.target }}"
+          name="whix-$version-${{ matrix.target }}"
           mkdir -p "dist-ci/$name"
           cp "$EXE" LICENSE NOTICE.md BUILD-INFO.txt "dist-ci/$name/"
           node scripts/third-party-licenses.mjs --target ${{ matrix.target }} --out "dist-ci/$name/THIRD-PARTY-LICENSES.md"
@@ -230,7 +230,7 @@ jobs:
           cat "$archive.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: whistle-rs-${{ matrix.target }}
+          name: whix-${{ matrix.target }}
           path: dist-ci/
           retention-days: 14
           if-no-files-found: error

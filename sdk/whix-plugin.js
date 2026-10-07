@@ -1,15 +1,15 @@
 'use strict';
 //
-// whistle-rs plugin SDK — zero dependencies, Node's stdlib only.
+// whix plugin SDK — zero dependencies, Node's stdlib only.
 //
 // A plugin is a plain object with a `name` and one or both hooks:
 //
-//   const { start } = require('whistle-rs-plugin');
+//   const { start } = require('whix-plugin');
 //
 //   start({
 //     name: 'my-plugin',
 //     async onRequest(ctx) { ctx.setRules('example.com resHeaders://x-t=1'); },
-//     async onResponse(ctx) { ctx.setHeader('x-powered-by', 'whistle-rs'); },
+//     async onResponse(ctx) { ctx.setHeader('x-powered-by', 'whix'); },
 //   });
 //
 // `start` speaks the HTTP/JSON protocol for you, including the capability
@@ -72,7 +72,7 @@
 // It is reached by `sniCallback://<name>` and gets no request context, because
 // at that point there is no request.
 //
-// TypeScript users: see whistle-rs-plugin.d.ts. The same entry point works for
+// TypeScript users: see whix-plugin.d.ts. The same entry point works for
 // `export default { … }` — an ES module default export is unwrapped.
 
 const http = require('http');
@@ -84,8 +84,8 @@ const MAX_BODY_BYTES = 16 * 1024 * 1024;
 /**
  * Start the plugin server.
  *
- * The port and name come from the environment whistle-rs spawns us with
- * (`WHISTLE_RS_PLUGIN_PORT`, `WHISTLE_RS_PLUGIN_NAME`); pass `opts.port` to
+ * The port and name come from the environment whix spawns us with
+ * (`WHIX_PLUGIN_PORT`, `WHIX_PLUGIN_NAME`); pass `opts.port` to
  * run standalone, e.g. in tests.
  */
 const HOOKS = [
@@ -108,13 +108,13 @@ function start(plugin, opts) {
   const rules = plugin && typeof plugin.rules === 'string' && plugin.rules.trim() ? plugin.rules : undefined;
   if (!defined.length && !rules) {
     throw new TypeError(
-      `whistle-rs plugin: define at least one of ${HOOKS.map(([m]) => m).join(' / ')}`
+      `whix plugin: define at least one of ${HOOKS.map(([m]) => m).join(' / ')}`
     );
   }
   opts = opts || {};
 
-  const port = opts.port != null ? opts.port : parseInt(process.env.WHISTLE_RS_PLUGIN_PORT || '0', 10);
-  const name = plugin.name || process.env.WHISTLE_RS_PLUGIN_NAME || 'plugin';
+  const port = opts.port != null ? opts.port : parseInt(process.env.WHIX_PLUGIN_PORT || '0', 10);
+  const name = plugin.name || process.env.WHIX_PLUGIN_NAME || 'plugin';
 
   const manifest = {
     name,
@@ -197,26 +197,26 @@ function start(plugin, opts) {
 
   server.listen(port, '127.0.0.1', () => {
     const bound = server.address().port;
-    console.log(`[${name}] whistle-rs plugin listening on 127.0.0.1:${bound} (hooks: ${manifest.hooks.join(', ') || 'none'})`);
+    console.log(`[${name}] whix plugin listening on 127.0.0.1:${bound} (hooks: ${manifest.hooks.join(', ') || 'none'})`);
   });
   exitWithParent(name);
   return server;
 }
 
 /**
- * Leave when the whistle-rs that started us is gone.
+ * Leave when the whix that started us is gone.
  *
  * `--node-plugin` gives us a stdin only it holds open, and the operating
- * system closes it when whistle-rs exits by any route — `kill -9`, `taskkill
- * /F` and a crash included, none of which let whistle-rs stop us itself.
+ * system closes it when whix exits by any route — `kill -9`, `taskkill
+ * /F` and a crash included, none of which let whix stop us itself.
  * Without this, a plugin outlived its proxy and kept its port. Only when
- * whistle-rs says stdin means that: a plugin started by hand may have a stdin
+ * whix says stdin means that: a plugin started by hand may have a stdin
  * that is closed from the start.
  */
 function exitWithParent(name) {
-  if (process.env.WHISTLE_RS_PLUGIN_STDIN !== 'lifeline') return;
+  if (process.env.WHIX_PLUGIN_STDIN !== 'lifeline') return;
   const leave = () => {
-    console.log(`[${name}] whistle-rs has exited; stopping`);
+    console.log(`[${name}] whix has exited; stopping`);
     process.exit(0);
   };
   process.stdin.on('end', leave);
@@ -235,7 +235,7 @@ const UI_PREFIX = '/ui';
 /**
  * Serve one auth decision.
  *
- * Note what happens when the hook throws: a `500`, which whistle-rs reads as
+ * Note what happens when the hook throws: a `500`, which whix reads as
  * "the gate failed" and turns into a `502` block. Every other hook in this SDK
  * answers `200 {}` — "nothing to do" — when it throws, because for those the
  * request is better off proceeding. Not here: a gate that admits a request
@@ -261,14 +261,14 @@ function serveAuth(plugin, name, payload, res) {
  *
  * This hook runs *inside a TLS handshake*, before there is a request — a client
  * is sitting on an open socket waiting for it, so be quick and cache your own
- * certificates. `ctx.certCacheName` tells you what whistle-rs already holds
+ * certificates. `ctx.certCacheName` tells you what whix already holds
  * from you for this name; returning `ctx.reuse()` when it is still good saves
  * both sides the work of shipping and parsing it again.
  *
- * A throwing hook answers `200` with nothing to say, which whistle-rs reads as
+ * A throwing hook answers `200` with nothing to say, which whix reads as
  * "use the certificate you would have generated". That is the same degradation
  * every hook here has except `onAuth` — and unlike `onAuth`, this one is not a
- * gate: falling back means the connection is intercepted with whistle-rs's own
+ * gate: falling back means the connection is intercepted with whix's own
  * certificate, not that anything is let past a check.
  */
 function serveSni(plugin, name, payload, res) {
@@ -315,7 +315,7 @@ class SniCtx {
     this.port = payload.port;
     this.clientIp = payload.clientIp || undefined;
     /**
-     * The plugin whose certificate whistle-rs holds for `servername` — this
+     * The plugin whose certificate whix holds for `servername` — this
      * plugin's own name when it holds one of yours, undefined otherwise.
      */
     this.certCacheName = payload.certCacheName;
@@ -323,7 +323,7 @@ class SniCtx {
     this.certCacheTime = payload.certCacheTime || 0;
   }
 
-  /** Is the certificate whistle-rs already holds for this name ours? */
+  /** Is the certificate whix already holds for this name ours? */
   get hasCachedCert() {
     return this.certCacheName != null;
   }
@@ -396,13 +396,13 @@ function serveUi(plugin, name, req, res) {
 }
 
 /** Header carrying the base64-encoded JSON metadata of a piped body. */
-const PIPE_META_HEADER = 'x-whistle-rs-pipe';
+const PIPE_META_HEADER = 'x-whix-pipe';
 
 /**
  * Serve one streaming hook.
  *
  * The `200` goes out *before* the handler runs, and before a single body byte
- * is asked for. That is the contract: whistle-rs reads nothing from the body
+ * is asked for. That is the contract: whix reads nothing from the body
  * until it sees this head, so answering at once is what starts the stream — and
  * failing to (because we are down, or because we answer anything else) lets the
  * proxy forward the original body untouched instead of losing it.
@@ -549,7 +549,7 @@ function decodeMeta(req, header) {
 // ---------------------------------------------------------------------------
 
 /** Header carrying the metadata of a hooked WebSocket session. */
-const WS_META_HEADER = 'x-whistle-rs-ws';
+const WS_META_HEADER = 'x-whix-ws';
 
 /** Continuation of a fragmented message. */
 const WS_CONTINUATION = 0x0;
@@ -568,7 +568,7 @@ const FLAG_DROP = 0x02;
  * WebSocket session, a record per frame in and a verdict record per frame out.
  *
  * The `200` goes out before anything is read, exactly as for a pipe hook —
- * whistle-rs holds every frame of the session until it sees this head, and
+ * whix holds every frame of the session until it sees this head, and
  * forwards them all unhooked if it never does.
  */
 function serveWsFrames(plugin, name, req, res) {
@@ -983,7 +983,7 @@ class AuthCtx extends BaseCtx {
    *
    * Restricted to `x-whistle-*` and `proxy-authorization`, the same names
    * whistle allows — a gate is there to identify a request, not to rewrite it.
-   * whistle-rs enforces this again on its side, so anything else is dropped
+   * whix enforces this again on its side, so anything else is dropped
    * whether or not this check runs.
    */
   setHeader(name, value) {

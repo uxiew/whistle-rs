@@ -192,7 +192,7 @@ pub(super) fn guard(
                 .status(StatusCode::BAD_GATEWAY)
                 .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
                 .header(ERROR_HEADER, phase.as_str())
-                .body(body::full(Bytes::from(format!("whistle-rs: {message}"))))
+                .body(body::full(Bytes::from(format!("whix: {message}"))))
                 .unwrap();
             if let Some(id) = id {
                 resp.headers_mut().insert(SESSION_HEADER, id.into());
@@ -1902,7 +1902,7 @@ pub(super) mod pipe_wiring_tests {
     use crate::plugins::pipe::{Dir, PipeMeta};
 
     /// Server state backed by a throwaway storage dir, so running the tests
-    /// never touches the developer's real `~/.whistle-rs`.
+    /// never touches the developer's real `~/.whix`.
     /// A private storage dir per call: these tests run in parallel threads, and
     /// sharing one made them race to write the root CA, which surfaced as an
     /// occasional "PEM error: malformed".
@@ -1910,10 +1910,8 @@ pub(super) mod pipe_wiring_tests {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         let config = Config {
-            storage_dir: std::env::temp_dir().join(format!(
-                "whistle-rs-pipe-tests-{}-{unique}",
-                std::process::id()
-            )),
+            storage_dir: std::env::temp_dir()
+                .join(format!("whix-pipe-tests-{}-{unique}", std::process::id())),
             persist_sessions: false,
             ..Config::default()
         };

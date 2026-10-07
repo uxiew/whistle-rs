@@ -7,18 +7,18 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use whistle_rs::ca::CertAuthority;
-use whistle_rs::config::{Config, DATA_DIRNAME};
-use whistle_rs::dir_lock::{DirLock, LockError};
-use whistle_rs::proxy::{self, AppState};
-use whistle_rs::rules::RuleManager;
+use whix::ca::CertAuthority;
+use whix::config::{Config, DATA_DIRNAME};
+use whix::dir_lock::{DirLock, LockError};
+use whix::proxy::{self, AppState};
+use whix::rules::RuleManager;
 
 /// HTTP/HTTPS/WebSocket debugging proxy (Rust port of whistle).
 #[derive(Parser, Debug)]
-#[command(name = "whistle-rs", version, about)]
+#[command(name = "whix", version, about)]
 struct Cli {
     /// Proxy port (whistle default: 8899).
-    #[arg(short = 'p', long, default_value_t = whistle_rs::config::DEFAULT_PORT)]
+    #[arg(short = 'p', long, default_value_t = whix::config::DEFAULT_PORT)]
     port: u16,
 
     /// Bind address (default: 127.0.0.1, this machine only). `-H 0.0.0.0` lets
@@ -33,7 +33,7 @@ struct Cli {
     username: Option<String>,
 
     /// Console login password (whistle's `-w/--password`). Better given as
-    /// WHISTLE_RS_PASSWORD: on the command line any user of the machine can
+    /// WHIX_PASSWORD: on the command line any user of the machine can
     /// read it in the process list. The flag wins when both are set.
     #[arg(short = 'w', long)]
     password: Option<String>,
@@ -44,7 +44,7 @@ struct Cli {
     guest_name: Option<String>,
 
     /// Password for the read-only account (whistle's `-W/--guestPassword`).
-    /// Better given as WHISTLE_RS_GUEST_PASSWORD, as for -w.
+    /// Better given as WHIX_GUEST_PASSWORD, as for -w.
     #[arg(short = 'W', long)]
     guest_password: Option<String>,
 
@@ -124,7 +124,7 @@ struct Cli {
     /// Where a weinre server is running (`http://host:port`), for `weinre://id`
     /// rules.
     ///
-    /// whistle-rs does not contain weinre. `weinre://mysession` injects a script
+    /// whix does not contain weinre. `weinre://mysession` injects a script
     /// that loads the debug agent from this address; without the option a bare
     /// id is not injected, and the session says so. A rule may always name the
     /// script itself: `weinre://http://host:8080/target/target-script-min.js#id`.
@@ -140,8 +140,8 @@ struct Cli {
     #[arg(long = "plugin", value_name = "NAME=HOST:PORT")]
     plugins: Vec<String>,
 
-    /// Spawn a Node plugin as `name=path/to/plugin.js` (repeatable). whistle-rs
-    /// runs `node <path>`, assigns it a port (via `WHISTLE_RS_PLUGIN_PORT`), and
+    /// Spawn a Node plugin as `name=path/to/plugin.js` (repeatable). whix
+    /// runs `node <path>`, assigns it a port (via `WHIX_PLUGIN_PORT`), and
     /// routes `plugin://name` to it.
     #[arg(long = "node-plugin", value_name = "NAME=PATH")]
     node_plugins: Vec<String>,
@@ -171,17 +171,17 @@ struct Cli {
     #[arg(long)]
     rule: Option<String>,
 
-    /// Storage directory for the root CA etc. (default: ~/.whistle-rs).
+    /// Storage directory for the root CA etc. (default: ~/.whix).
     #[arg(long)]
     dir: Option<PathBuf>,
 
     /// Max bytes of each captured body kept for the inspection preview.
-    #[arg(long, default_value_t = whistle_rs::config::DEFAULT_BODY_PREVIEW_CAP)]
+    #[arg(long, default_value_t = whix::config::DEFAULT_BODY_PREVIEW_CAP)]
     body_preview_limit: usize,
 
     /// Max bytes of a response body held in memory to rewrite it. Past this a
     /// response streams through untouched and the body operators do not apply.
-    #[arg(long, default_value_t = whistle_rs::config::DEFAULT_BODY_REWRITE_CAP)]
+    #[arg(long, default_value_t = whix::config::DEFAULT_BODY_REWRITE_CAP)]
     body_rewrite_limit: usize,
 
     /// Disable session persistence to disk.
@@ -190,7 +190,7 @@ struct Cli {
 
     /// Do not verify the origin server's TLS certificate.
     ///
-    /// whistle never verifies unless started with `--safe`; whistle-rs verifies
+    /// whistle never verifies unless started with `--safe`; whix verifies
     /// by default and this opts out. Needed for self-signed or private-CA
     /// origins — and it means this proxy can no longer tell you when the
     /// connection it is inspecting has itself been intercepted.
@@ -198,12 +198,12 @@ struct Cli {
     insecure_upstream: bool,
 
     /// Days of session history to retain on disk.
-    #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_DAYS)]
+    #[arg(long, default_value_t = whix::config::DEFAULT_PERSIST_DAYS)]
     persist_days: u32,
 
     /// Most session history kept on disk, in MiB; the oldest goes first.
     /// Whichever of this and --persist-days is reached first applies.
-    #[arg(long, default_value_t = whistle_rs::config::DEFAULT_PERSIST_MAX_MB)]
+    #[arg(long, default_value_t = whix::config::DEFAULT_PERSIST_MAX_MB)]
     persist_max_mb: u64,
 
     /// How many captured requests to keep (whistle's `-R/--reqCacheSize`).
@@ -211,7 +211,7 @@ struct Cli {
     /// Values below the default are ignored, as they are upstream — its own
     /// floor is `if (!(size > 0) || size < 600) size = 600`
     /// (`_original/lib/util/data-server.js:10-12`).
-    #[arg(short = 'R', long, default_value_t = whistle_rs::config::DEFAULT_REQ_CACHE_SIZE)]
+    #[arg(short = 'R', long, default_value_t = whix::config::DEFAULT_REQ_CACHE_SIZE)]
     req_cache_size: usize,
 
     /// How many captured WebSocket frames to keep (whistle's
@@ -220,7 +220,7 @@ struct Cli {
     /// Upstream compares against **720** and falls back to 600, so a value
     /// between 1 and 719 buys nothing there and nothing here
     /// (`data-server.js:14-16`).
-    #[arg(short = 'F', long, default_value_t = whistle_rs::config::DEFAULT_FRAME_CACHE_SIZE)]
+    #[arg(short = 'F', long, default_value_t = whix::config::DEFAULT_FRAME_CACHE_SIZE)]
     frame_cache_size: usize,
 
     /// Do not decrypt HTTPS: relay every TLS connection untouched.
@@ -239,7 +239,7 @@ struct Cli {
     /// for as long as the operating system's TCP timeout, which is over a
     /// minute. It never cuts short a connection that *did* establish, so a slow
     /// response or a long-lived stream is unaffected.
-    #[arg(short = 't', long, default_value_t = whistle_rs::config::DEFAULT_TIMEOUT_MS)]
+    #[arg(short = 't', long, default_value_t = whix::config::DEFAULT_TIMEOUT_MS)]
     timeout: u64,
 
     /// Verbose (debug) logging.
@@ -377,9 +377,9 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| PathBuf::from("."))
             .join(DATA_DIRNAME)
     });
-    whistle_rs::private_fs::create_dir(&storage_dir)
+    whix::private_fs::create_dir(&storage_dir)
         .with_context(|| format!("creating storage dir {}", storage_dir.display()))?;
-    // One instance per directory (see `whistle_rs::dir_lock`), decided before
+    // One instance per directory (see `whix::dir_lock`), decided before
     // anything here reads or writes it: the root CA, the rule groups, the
     // history. Held until the process ends.
     let dir_lock = match DirLock::acquire(&storage_dir) {
@@ -460,8 +460,8 @@ async fn main() -> Result<()> {
         persist_sessions: !cli.no_persist,
         persist_days: cli.persist_days,
         persist_max_bytes: cli.persist_max_mb.max(1) * 1024 * 1024,
-        req_cache_size: whistle_rs::config::clamp_req_cache_size(cli.req_cache_size),
-        frame_cache_size: whistle_rs::config::clamp_frame_cache_size(cli.frame_cache_size),
+        req_cache_size: whix::config::clamp_req_cache_size(cli.req_cache_size),
+        frame_cache_size: whix::config::clamp_frame_cache_size(cli.frame_cache_size),
         timeout_ms: cli.timeout,
         intercept_https: !cli.no_intercept_https,
         cert_dir: cli.cert_dir,
@@ -469,7 +469,7 @@ async fn main() -> Result<()> {
         allow_origins: cli
             .allow_origin
             .as_deref()
-            .map(whistle_rs::config::AllowedOrigins::parse)
+            .map(whix::config::AllowedOrigins::parse)
             .unwrap_or_default(),
         ..Config::default()
     };
@@ -500,7 +500,7 @@ async fn main() -> Result<()> {
             );
         }
     }
-    whistle_rs::proxy::apply::set_keep_client_xff(config.keep_client_xff);
+    whix::proxy::apply::set_keep_client_xff(config.keep_client_xff);
 
     // Load rules. An `@` line naming a file or a URL is *registered* here and
     // fetched by `rules::include` before the first connection is accepted — the
@@ -520,13 +520,13 @@ async fn main() -> Result<()> {
 
     // Load any persisted rule groups from disk (added via the UI).
     let rules_dir = config.data_dir().join("rules");
-    whistle_rs::rules::storage::load_groups(&rules_dir, &mut manager);
+    whix::rules::storage::load_groups(&rules_dir, &mut manager);
 
     // Values persisted by the console, with anything named on the command line
     // laid over them: `--value` is an instruction for this run and wins — over
     // the store here, and over a rules file's ``` block of the same name
     // (`config.value_overrides`), which the store alone does not beat.
-    let persisted = whistle_rs::rules::storage::load_values(config.data_dir());
+    let persisted = whix::rules::storage::load_values(config.data_dir());
     if !persisted.is_empty() {
         let mut merged = persisted;
         merged.extend(config.values.clone());
@@ -561,7 +561,7 @@ async fn main() -> Result<()> {
 
     // Build the plugin registry: built-in Rust plugins + `--plugin` remotes +
     // spawned `--node-plugin` subprocesses.
-    let mut registry = whistle_rs::plugins::Plugins::new();
+    let mut registry = whix::plugins::Plugins::new();
     for (name, addr) in &config.plugins {
         registry.register_remote(name, addr);
     }
@@ -575,7 +575,7 @@ async fn main() -> Result<()> {
         let child = node_plugin(path, name, port)
             .spawn()
             .with_context(|| format!("spawning node plugin '{name}' ({path})"))?;
-        let keeper = whistle_rs::plugins::Keeper::new();
+        let keeper = whix::plugins::Keeper::new();
         registry.register_kept(name, keeper.clone());
         tracing::info!("spawned node plugin '{name}' -> node {path} on 127.0.0.1:{port}");
         kept.push((name.to_string(), keeper.clone()));
@@ -601,9 +601,9 @@ async fn main() -> Result<()> {
     }
     tracing::info!("plugins: {}", registry.names().join(", "));
 
-    whistle_rs::proxy::upstream::set_request_timeout(cli.timeout);
-    whistle_rs::proxy::upstream::set_dns_order(config.dns_order);
-    whistle_rs::proxy::upstream::set_insecure_upstream(cli.insecure_upstream);
+    whix::proxy::upstream::set_request_timeout(cli.timeout);
+    whix::proxy::upstream::set_dns_order(config.dns_order);
+    whix::proxy::upstream::set_insecure_upstream(cli.insecure_upstream);
     if cli.insecure_upstream {
         tracing::warn!(
             "--insecure-upstream: origin certificates are NOT verified; \
@@ -614,7 +614,7 @@ async fn main() -> Result<()> {
     // The console's switches from the last run: every rule off, plugins off.
     // A `-M notAllowedDisable*` lock outranks them, and `with_plugins` applies
     // it last.
-    let switches = whistle_rs::rules::storage::load_switches(config.data_dir());
+    let switches = whix::rules::storage::load_switches(config.data_dir());
     if switches.rules_off {
         tracing::warn!(
             "every rule is switched off (saved by the console); switch them back on there \
@@ -702,7 +702,7 @@ async fn shutdown_signal() -> &'static str {
     "Ctrl+C"
 }
 
-/// `whistle-rs explain` — see [`whistle_rs::explain`].
+/// `whix explain` — see [`whix::explain`].
 ///
 /// `fallback_rules` is the top-level `--rules`, so that the file a running
 /// proxy was started with can be tested by naming it once.
@@ -713,12 +713,12 @@ async fn shutdown_signal() -> &'static str {
 /// lines tall and twice as wide as it is high, and a phone reads a squashed one
 /// badly or not at all.
 fn run_qr(args: &QrArgs) -> Result<()> {
-    let code = whistle_rs::qr::encode(&args.text).with_context(|| {
+    let code = whix::qr::encode(&args.text).with_context(|| {
         format!(
             "{} bytes is more than this encoder takes ({} bytes at version {})",
             args.text.len(),
             213,
-            whistle_rs::qr::MAX_VERSION
+            whix::qr::MAX_VERSION
         )
     })?;
     if args.matrix {
@@ -761,7 +761,7 @@ fn run_qr(args: &QrArgs) -> Result<()> {
 
 fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> Result<()> {
     use std::io::{BufRead, Write};
-    use whistle_rs::explain::{self, Query};
+    use whix::explain::{self, Query};
 
     let mut rules = String::new();
     if let Some(path) = args.rules.as_deref().or(fallback_rules) {
@@ -819,7 +819,7 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
     let headers = split_headers(&args.headers, "--header")?;
     let response = match args.status {
         None => None,
-        Some(status) => Some(whistle_rs::explain::Response {
+        Some(status) => Some(whix::explain::Response {
             status,
             headers: split_headers(&args.res_headers, "--res-header")?,
             server_ip: None,
@@ -840,7 +840,7 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
         // No proxy is running, so only the built-in plugins are known: a
         // `--plugin` or `--node-plugin` name reads as a destination here, and
         // as its plugin in the console's Test Rules.
-        plugins: whistle_rs::plugins::Plugins::new().names(),
+        plugins: whix::plugins::Plugins::new().names(),
     };
     let explanation = explain::explain(&query).map_err(|e| anyhow::anyhow!(e))?;
     if args.json {
@@ -852,9 +852,9 @@ fn run_explain(args: &ExplainArgs, fallback_rules: Option<&std::path::Path>) -> 
 }
 
 /// Where `-w` can be given instead of on the command line.
-const PASSWORD_ENV: &str = "WHISTLE_RS_PASSWORD";
+const PASSWORD_ENV: &str = "WHIX_PASSWORD";
 /// Where `-W` can be given instead of on the command line.
-const GUEST_PASSWORD_ENV: &str = "WHISTLE_RS_GUEST_PASSWORD";
+const GUEST_PASSWORD_ENV: &str = "WHIX_GUEST_PASSWORD";
 
 /// A console password from its flag, or else from `env`.
 ///
@@ -878,7 +878,7 @@ fn console_password(flag_value: Option<String>, flag: &str, env: &str) -> Option
 struct NodePlugin {
     name: String,
     path: String,
-    keeper: whistle_rs::plugins::Keeper,
+    keeper: whix::plugins::Keeper,
 }
 
 /// Set when the process has been asked to stop, so that a plugin exiting with
@@ -888,7 +888,7 @@ static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// Keep a `--node-plugin`'s process going, as upstream keeps its plugins: when
 /// it exits, say so, and start it again when a request needs it
 /// (`_original/lib/plugins/index.js:676-678`). Between the two, a request
-/// that needs it waits for it — see [`whistle_rs::plugins::Keeper`].
+/// that needs it waits for it — see [`whix::plugins::Keeper`].
 ///
 /// Started on demand rather than at once, which is upstream's way too: a
 /// plugin that crashes on start costs nothing while nothing needs it.
@@ -896,7 +896,7 @@ static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// Each start is on a port free at that moment, never the last one: once the
 /// process is gone its port is anybody's, and a new process that cannot bind
 /// it leaves "the port answers" true of whoever took it. See
-/// [`whistle_rs::plugins::Keeper`].
+/// [`whix::plugins::Keeper`].
 async fn keep_node_plugin(plugin: NodePlugin, child: tokio::process::Child, port: u16) {
     let mut child = Some((child, port));
     let mut started = tokio::time::Instant::now();
@@ -946,7 +946,7 @@ async fn keep_node_plugin(plugin: NodePlugin, child: tokio::process::Child, port
             }
         }
         plugin.keeper.needed().await;
-        tokio::time::sleep_until(started + whistle_rs::plugins::RESTART_GAP).await;
+        tokio::time::sleep_until(started + whix::plugins::RESTART_GAP).await;
         if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
@@ -975,9 +975,9 @@ async fn keep_node_plugin(plugin: NodePlugin, child: tokio::process::Child, port
 fn node_plugin(path: &str, name: &str, port: u16) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("node");
     cmd.arg(path)
-        .env("WHISTLE_RS_PLUGIN_PORT", port.to_string())
-        .env("WHISTLE_RS_PLUGIN_NAME", name)
-        .env("WHISTLE_RS_PLUGIN_STDIN", "lifeline")
+        .env("WHIX_PLUGIN_PORT", port.to_string())
+        .env("WHIX_PLUGIN_NAME", name)
+        .env("WHIX_PLUGIN_STDIN", "lifeline")
         // A child inherits the environment, and a plugin is someone else's
         // code: the console passwords stay here, as the console's other
         // credentials do (a plugin's own pages never see them either).
@@ -987,7 +987,7 @@ fn node_plugin(path: &str, name: &str, port: u16) -> tokio::process::Command {
         // when this process is gone however it went. `kill_on_drop` covers a
         // shutdown that runs our code; `kill -9`, `taskkill /F` or a crash
         // runs none, and without this the plugin went on holding its port. The
-        // SDK exits when the pipe closes; `WHISTLE_RS_PLUGIN_STDIN` tells it
+        // SDK exits when the pipe closes; `WHIX_PLUGIN_STDIN` tells it
         // the pipe means that, since a plugin started by hand may have a stdin
         // that closes at once.
         .stdin(std::process::Stdio::piped())

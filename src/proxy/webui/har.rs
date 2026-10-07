@@ -35,11 +35,11 @@ pub(super) fn har_body(cap: Option<&Capture>) -> HarBody {
     let bytes = cap.preview_bytes().bytes;
     let short = truncated.then(|| match cap.is_undecodable() {
         true => format!(
-            "whistle-rs: its content-encoding would not decode; this is the {} bytes that came out before it broke",
+            "whix: its content-encoding would not decode; this is the {} bytes that came out before it broke",
             bytes.len()
         ),
         false => format!(
-            "whistle-rs kept {} of {size} bytes; the rest was not captured",
+            "whix kept {} of {size} bytes; the rest was not captured",
             bytes.len()
         ),
     });
@@ -180,7 +180,7 @@ pub(super) fn sessions_har(state: &Arc<AppState>, req: &Request<Incoming>) -> Re
     let har = serde_json::json!({
         "log": {
             "version": "1.2",
-            "creator": { "name": "whistle-rs", "version": crate::config::VERSION },
+            "creator": { "name": "whix", "version": crate::config::VERSION },
             "entries": entries,
         }
     });
@@ -190,7 +190,7 @@ pub(super) fn sessions_har(state: &Arc<AppState>, req: &Request<Incoming>) -> Re
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .header(
             hyper::header::CONTENT_DISPOSITION,
-            "attachment; filename=\"whistle-rs.har\"",
+            "attachment; filename=\"whix.har\"",
         )
         .body(body::full(Bytes::from(body)))
         .unwrap()

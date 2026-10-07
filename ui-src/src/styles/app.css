@@ -1,4 +1,4 @@
-/* whistle-rs console — a three-pane inspector in the shape Surge established:
+/* whix console — a three-pane inspector in the shape Surge established:
    a source list on the left, a dense request table above, and the selected
    request's detail below it. Everything here ships inline; the console must
    work with the network it is inspecting switched off. */

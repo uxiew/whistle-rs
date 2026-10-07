@@ -9,7 +9,7 @@
 // the one asymmetry here and it is unavoidable. Everything else is identical.
 //
 //   PORT_BASE=19600 node https-bench.js
-//     19600 whistle · 19601 whistle-rs · 19602 the TLS origin
+//     19600 whistle · 19601 whix · 19602 the TLS origin
 
 const https = require('https');
 const http = require('http');
@@ -31,7 +31,7 @@ const CRT = `${CERT_DIR}/diff-https-crt.pem`;
  *
  * It is valid for two days, and this used to check only that the files existed,
  * so a `/tmp` left from last week served an expired one. Neither proxy verifies
- * this origin today (whistle by default, whistle-rs under `--insecure-upstream`),
+ * this origin today (whistle by default, whix under `--insecure-upstream`),
  * so nothing failed — but that is a launch flag away from every case failing on
  * the handshake for a reason that has nothing to do with the case.
  */
@@ -269,14 +269,14 @@ const norm = (h) => Object.fromEntries(
  *    first, successful handshake never sees them. A bare `tlsOptions://TLSv1.2`
  *    does not even get that far — `SEP_CIPHER_RE = /[^a-z\d:!-]/i` rejects the
  *    dot, so it is not read as a cipher string, and it is not JSON either.
- *    whistle-rs applies the pin on the first attempt, which is what the rule
+ *    whix applies the pin on the first attempt, which is what the rule
  *    says it does. Declared in `docs/RULES.md`.
  * 3. The **suite** half is inert upstream for the same reason, and it only
  *    became visible when the origin started echoing `getCipher().name` — before
  *    that, a rule naming one suite and a rule naming another negotiated the same
  *    version and compared equal, so every `ciphers` case here was proving
  *    nothing. Measured across the family: whistle stays on the origin's default
- *    `TLS_AES_256_GCM_SHA384` whatever the rule says, and whistle-rs negotiates
+ *    `TLS_AES_256_GCM_SHA384` whatever the rule says, and whix negotiates
  *    the suite that was asked for.
  *
  *    Narrow on purpose — it excuses a difference only where whistle sat on the
@@ -354,7 +354,7 @@ async function main() {
   // **whistle does not decrypt HTTPS until it is told to.** `Enable HTTPS` in
   // its console is off in a fresh data directory, and with it off
   // `isEnableIntercept` only intercepts hosts that already have a custom
-  // certificate (`_original/lib/tunnel.js:187-199`). whistle-rs intercepts by
+  // certificate (`_original/lib/tunnel.js:187-199`). whix intercepts by
   // default — a deliberate difference of posture, and `--no-intercept-https` is
   // its opt-out — so without this line every case below would be comparing
   // "whistle passed the connection through" against "this port read it".
@@ -441,7 +441,7 @@ async function main() {
   {
     await setRules('');
     const [w, rs] = [await throughTunnel(W, wCa), await throughTunnel(RS, rsCa)];
-    for (const [who, r] of [['whistle', w], ['whistle-rs', rs]]) {
+    for (const [who, r] of [['whistle', w], ['whix', rs]]) {
       if (r.status !== 200 || !r.body || !r.body.includes('"url"')) {
         console.error(`baseline failed for ${who}: ${JSON.stringify(r).slice(0, 200)}`);
         process.exit(1);
@@ -639,7 +639,7 @@ async function main() {
   //
   // **One-sided, and it has to be.** Everything above compares two proxies, and
   // upstream applies none of this — so a `ciphers` case can only ever report
-  // "whistle-rs pinned something and whistle did not", which is excused and
+  // "whix pinned something and whistle did not", which is excused and
   // says nothing about whether the suite was the *right* one. These ask that
   // directly: name a suite, read back what the origin negotiated.
   //
@@ -655,7 +655,7 @@ async function main() {
     if (negotiated !== suite) {
       differing++;
       report.push({
-        name: `whistle-rs negotiates the suite it was told to`,
+        name: `whix negotiates the suite it was told to`,
         rules: `${O} tlsOptions://{"ciphers":"${suite}",…}`,
         problems: [`suite: asked for ${suite}, got ${negotiated}`],
       });

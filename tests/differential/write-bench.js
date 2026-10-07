@@ -8,7 +8,7 @@
 // between, and compares what each wrote.
 //
 //   PORT_BASE=19600 node write-bench.js
-//     19600 whistle · 19601 whistle-rs · 19602 the origin
+//     19600 whistle · 19601 whix · 19602 the origin
 //
 // Sequential rather than side by side on purpose: the rules text has to be
 // identical for both, so both name the same file, and a parallel run would have
@@ -268,7 +268,7 @@ async function main() {
   // at all. "No file on either side" is what a broken bench and a broken rule
   // look like, identically.
   {
-    for (const [who, port] of [['whistle', W], ['whistle-rs', RS]]) {
+    for (const [who, port] of [['whistle', W], ['whix', RS]]) {
       const r = await run(port, { rules: `${P} resWrite://${F('probe')}` });
       if (r.answers[0].status !== 200 || !Object.keys(r.files).length) {
         console.error(`baseline failed for ${who}: ${JSON.stringify(r).slice(0, 300)}`);

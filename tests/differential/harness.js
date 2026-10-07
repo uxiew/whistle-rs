@@ -1,5 +1,5 @@
 // A differential test bench: the same rule and the same request, put through
-// real whistle and through whistle-rs, with both answers compared.
+// real whistle and through whix, with both answers compared.
 //
 // Reading upstream's source finds what it *says*. This finds what it *does* —
 // including the places our reading of it was wrong, which has already happened
@@ -21,7 +21,7 @@ const { forVersion, MEASURED } = require('./whistle-pkg');
 //   PORT_BASE=19100 CASES=./cases-filters.js node harness.js
 const BASE = Number(process.env.PORT_BASE || 18700);
 const W = BASE;          // upstream whistle
-const RS = BASE + 1;     // whistle-rs
+const RS = BASE + 1;     // whix
 const ORIGIN = BASE + 2; // the echo origin
 const CASES_FILE = process.env.CASES || './cases.js';
 
@@ -107,13 +107,13 @@ const EXPECTED = [
     // stamps the responses it built in memory — `wrapResponse` is where the
     // header is set, and a file streamed off disk never goes through it, so
     // upstream's most common mock is the one response it leaves unmarked.
-    // whistle-rs marks every response it made itself, which is the whole point
+    // whix marks every response it made itself, which is the whole point
     // of the header.
     id: 'x-server',
     upstream: MEASURED,
     fields: /^res\.header\.x-server$/,
     anyCase: 'every answer this port makes itself carries the header, whatever the rule',
-    match: (p) => /res\.header\.x-server: whistle=("Whistle"|undefined) rs="whistle-rs"/.test(p),
+    match: (p) => /res\.header\.x-server: whistle=("Whistle"|undefined) rs="whix"/.test(p),
     why: 'x-server names the proxy that actually answered, on every answer',
   },
   {
@@ -124,9 +124,9 @@ const EXPECTED = [
     // Only ever on this port's side, and only on a failed request.
     id: 'failure-headers',
     upstream: MEASURED,
-    fields: /^res\.header\.x-whistle-rs-(error|session)$/,
+    fields: /^res\.header\.x-whix-(error|session)$/,
     anyCase: 'every request that fails here gets them, in whichever corpus it fails',
-    match: (p) => /res\.header\.x-whistle-rs-(error|session): whistle=undefined rs="/.test(p),
+    match: (p) => /res\.header\.x-whix-(error|session): whistle=undefined rs="/.test(p),
     why: 'a failed request\'s 502 names the phase it failed in and its session',
   },
   {
@@ -136,7 +136,7 @@ const EXPECTED = [
     upstream: MEASURED,
     fields: /^res\.header\.server$/,
     anyCase: 'any case that serves a local file',
-    match: (p) => /res\.header\.server: whistle="Whistle" rs="whistle-rs"/.test(p),
+    match: (p) => /res\.header\.server: whistle="Whistle" rs="whix"/.test(p),
     why: 'a mocked file names the proxy that served it',
   },
   {
@@ -241,7 +241,7 @@ const EXPECTED = [
   {
     // `rawfile://` whose head has no status line: upstream assigns the second
     // word of the first line as the status code and throws while writing it,
-    // which reaches the client as a reset connection. whistle-rs falls back to
+    // which reaches the client as a reset connection. whix falls back to
     // 200 and serves the body.
     //
     // Scoped to rules that use `rawfile://`. It used to match the shape alone,
@@ -272,7 +272,7 @@ const EXPECTED = [
   {
     // whistle files a `host` filter condition under `hostFilter`, which only
     // `util.checkProxyHost` reads: it decides which hosts a `proxy://` engages
-    // for, never whether a rule applies. whistle-rs matches the request's host
+    // for, never whether a rule applies. whix matches the request's host
     // with it. Declared in `docs/RULES.md`; the cases that exercise it carry
     // this header and no other case uses it.
     id: 'host-filter',

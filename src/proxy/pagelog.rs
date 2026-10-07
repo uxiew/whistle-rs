@@ -44,7 +44,7 @@ use super::{AppState, now_ms};
 ///
 /// A path no site has a use for. A request for it through this proxy is the
 /// script's, whatever host it names; it is answered here and goes no further.
-pub const PATH: &str = "/.whistle-rs/log";
+pub const PATH: &str = "/.whix/log";
 
 /// How many entries are kept before the oldest goes.
 const MAX_ENTRIES: usize = 2000;
@@ -182,8 +182,8 @@ pub fn id_and_script(
 /// Written for the browsers this exists for — an old WebView on a phone — so
 /// no arrow functions, no `let`, nothing newer than ES5 outside a `try`.
 const SCRIPT: &str = r#";(function () {
-  if (typeof window === 'undefined' || window.__whistleRsLog) { return; }
-  window.__whistleRsLog = true;
+  if (typeof window === 'undefined' || window.__whixLog) { return; }
+  window.__whixLog = true;
   var ID = '$LOG_ID';
   var URL = '$LOG_PATH';
   var INTERCEPT = $INTERCEPT_CONSOLE;
@@ -601,7 +601,7 @@ mod tests {
         let out = inject_into(
             "<!doctype html><html><HEAD lang=x><script>first()</script></head><body>hi</body></html>",
         );
-        let at = out.find("__whistleRsLog").expect("injected");
+        let at = out.find("__whixLog").expect("injected");
         assert!(
             out.starts_with("<!doctype html><html><HEAD lang=x><script>;(function"),
             "{}",
@@ -722,7 +722,7 @@ mod tests {
         )
         .unwrap();
         let out = String::from_utf8(out.to_vec()).unwrap();
-        let collector = out.find("__whistleRsLog").unwrap();
+        let collector = out.find("__whixLog").unwrap();
         let user = out.find("onBeforeWhistleLogSend = f").unwrap();
         assert!(
             collector < user,

@@ -944,7 +944,7 @@ mod tests {
     /// on the next pass.
     #[tokio::test]
     async fn a_rules_text_set_at_runtime_pulls_its_include_in() {
-        let dir = std::env::temp_dir().join("whistle-rs-test-include-runtime");
+        let dir = std::env::temp_dir().join("whix-test-include-runtime");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("team.rules");
         std::fs::write(&file, "b.com host://10.0.0.2\n").unwrap();
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_include_larger_than_the_ceiling_is_refused_rather_than_truncated() {
-        let dir = std::env::temp_dir().join("whistle-rs-test-include-oversized");
+        let dir = std::env::temp_dir().join("whix-test-include-oversized");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("huge.rules");
         let line = "a.com host://10.0.0.2\n";
@@ -1044,7 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_include_of_a_file_that_is_not_there_leaves_the_rules_alone() {
-        let missing = std::env::temp_dir().join("whistle-rs-test-include-absent.rules");
+        let missing = std::env::temp_dir().join("whix-test-include-absent.rules");
         std::fs::remove_file(&missing).ok();
 
         let rules = RwLock::new(RuleManager::with_includes());

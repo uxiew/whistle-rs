@@ -1,7 +1,7 @@
-// A whistle-rs *WebSocket frame* plugin: it sees every data frame of a
+// A whix *WebSocket frame* plugin: it sees every data frame of a
 // tunnelled WebSocket, in both directions, and may rewrite or drop it.
 //
-//   whistle-rs --node-plugin wschat=examples/plugins/ws-frames.js
+//   whix --node-plugin wschat=examples/plugins/ws-frames.js
 //   # rule:  ws.example.com  pipe://wschat
 //   #        ws.example.com  pipe://wschat(demo)     <- ctx.pipeValue === 'demo'
 //
@@ -11,7 +11,7 @@
 // The frame waits for whatever this function does, in both directions, so keep
 // it cheap. See docs/PLUGINS.md for the measured cost.
 
-const { start } = require('../../sdk/whistle-rs-plugin');
+const { start } = require('../../sdk/whix-plugin');
 
 start({
   name: 'wschat',

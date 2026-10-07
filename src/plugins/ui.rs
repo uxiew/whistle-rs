@@ -31,7 +31,7 @@
 //! not part of anyone's proxied traffic, and handing it a request context would
 //! invent an association that does not exist.
 //!
-//! whistle-rs follows that: the plugin receives the browser's own request and
+//! whix follows that: the plugin receives the browser's own request and
 //! nothing else. A plugin that wants to show captured traffic accumulates it in
 //! the hooks that *do* see traffic (`onRequest`, `resStats`) and serves it from
 //! its own state — which is exactly how upstream plugins do it too.

@@ -9,7 +9,7 @@
 // rule.
 //
 //   PORT_BASE=19600 node timing-bench.js
-//     19600 whistle · 19601 whistle-rs · 19602 the origin
+//     19600 whistle · 19601 whix · 19602 the origin
 //
 // Timing is noisy, so every case is run REPEATS times and the **minimum** is
 // kept: a delay is a floor, and the fastest of several runs is the closest look
@@ -181,7 +181,7 @@ async function main() {
   // A hard baseline. Two proxies that are both dead agree perfectly, and this
   // bench would report it as a clean run.
   await setRules('');
-  for (const [who, port] of [['whistle', W], ['whistle-rs', RS]]) {
+  for (const [who, port] of [['whistle', W], ['whix', RS]]) {
     const r = await timed(port, {});
     if (r.status !== 200) {
       console.error(`baseline failed for ${who}: ${JSON.stringify(r)}`);

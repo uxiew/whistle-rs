@@ -1711,7 +1711,7 @@ pub(super) mod local_response_tests {
         let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         let config = Config {
             storage_dir: std::env::temp_dir().join(format!(
-                "whistle-rs-local-res-tests-{}-{unique}",
+                "whix-local-res-tests-{}-{unique}",
                 std::process::id()
             )),
             persist_sessions: false,
@@ -2033,7 +2033,7 @@ pub(super) mod local_response_tests {
                 .headers
                 .get("x-stamped-by")
                 .map(|v| v.to_str().unwrap()),
-            Some("whistle-rs"),
+            Some("whix"),
             "the response hook of a matched plugin must see a local answer"
         );
         assert_eq!(body, Bytes::from_static(b"answered"));

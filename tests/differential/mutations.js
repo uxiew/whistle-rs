@@ -8,7 +8,7 @@
 // Each mutation below is a small, plausible semantic regression — the kind a
 // refactor makes by accident — written as one exact text replacement in one
 // source file, together with the gate that is supposed to catch it. For each,
-// this builds whistle-rs with the mutation in and runs that gate (`run.js`,
+// this builds whix with the mutation in and runs that gate (`run.js`,
 // restricted to the named steps). The gate must **fail**. A mutation it passes
 // has *survived*: the gate is blind to that regression, and that is a finding
 // about the gate.
@@ -108,7 +108,7 @@ if (git('status', '--porcelain', '--', 'src', 'Cargo.toml', 'Cargo.lock', 'tests
   console.error('note: uncommitted changes under src/ or tests/differential/ are not measured — this runs on HEAD.');
 }
 
-const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'whistle-rs-mutations-'));
+const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'whix-mutations-'));
 let added = false;
 function cleanup() {
   if (added) {
@@ -165,7 +165,7 @@ function gate(suite, only, label) {
     '--out', path.join(TARGET, 'runs', label),
   ], {
     cwd: path.join(WORK, 'tests', 'differential'),
-    env: { ...process.env, RS_BIN: path.join(TARGET, 'debug', 'whistle-rs') },
+    env: { ...process.env, RS_BIN: path.join(TARGET, 'debug', 'whix') },
   });
 }
 

@@ -84,12 +84,12 @@ async fn console(
     serde_json::from_str(body).unwrap_or_else(|e| panic!("{path} answered {text:?}: {e}"))
 }
 
-async fn proxy_with(rules: String) -> whistle_rs::embed::Proxy {
-    whistle_rs::embed::Proxy::builder()
+async fn proxy_with(rules: String) -> whix::embed::Proxy {
+    whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
         .storage_dir(std::env::temp_dir().join(format!(
-            "whistle-rs-page-log-e2e-{}-{:?}",
+            "whix-page-log-e2e-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         )))
@@ -139,7 +139,7 @@ async fn a_page_under_a_log_rule_reports_to_the_console() {
         ],
     })
     .to_string();
-    let answer = through_proxy(at, "POST", "http://origin.test/.whistle-rs/log", &report).await;
+    let answer = through_proxy(at, "POST", "http://origin.test/.whix/log", &report).await;
     assert!(answer.starts_with("HTTP/1.1 204"), "{answer}");
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -213,9 +213,7 @@ async fn a_named_value_is_the_group_and_a_second_script() {
     let page = through_proxy(proxy.addr(), "GET", "http://origin.test/", "").await;
     let body = page.split_once("\r\n\r\n").expect("a response").1;
     assert!(body.contains("var ID = 'strip';"), "{body}");
-    let collector = body
-        .find("window.__whistleRsLog = true")
-        .expect("collector");
+    let collector = body.find("window.__whixLog = true").expect("collector");
     let user = body
         .find("<script>window.onBeforeWhistleLogSend = function () { return false; };\n</script>")
         .unwrap_or_else(|| panic!("the value's script is not in the page: {body}"));
@@ -243,7 +241,7 @@ async fn without_the_rule_nothing_is_injected() {
     let answer = through_proxy(
         proxy.addr(),
         "POST",
-        "http://origin.test/.whistle-rs/log",
+        "http://origin.test/.whix/log",
         "not json",
     )
     .await;

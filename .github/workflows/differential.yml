@@ -1,7 +1,7 @@
-# The whole differential: real whistle and whistle-rs side by side, every
+# The whole differential: real whistle and whix side by side, every
 # hand-written corpus, the HTTPS/frames/timing/write/ws/dns/auth benches, the
 # benches that start one proxy per mode, and upstream's own suite — run twice,
-# against the baseline whistle 2.10.8 and against 2.10.10, with one whistle-rs
+# against the baseline whistle 2.10.8 and against 2.10.10, with one whix
 # binary. About eighteen minutes each on a laptop, so not on every pull request
 # (ci.yml runs the fast half there): by hand, and weekly, so a regression is at
 # most a week old when it is found.

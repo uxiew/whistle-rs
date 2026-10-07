@@ -21,7 +21,7 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
     let requested = SocketAddr::new(state.config.bind_ip(), state.config.port);
     let listener = TcpListener::bind(requested).await?;
     let addr = listener.local_addr().unwrap_or(requested);
-    tracing::info!("whistle-rs listening on http://{addr}");
+    tracing::info!("whix listening on http://{addr}");
 
     // Teach the forwarding layer which addresses are *us*, so a `proxy://` rule
     // naming this proxy is refused instead of recursing into it. Registered
@@ -243,7 +243,7 @@ pub async fn accept_loop(
             Some(stop) => tokio::select! {
                 biased;
                 _ = &mut *stop => {
-                    tracing::info!("whistle-rs shutting down");
+                    tracing::info!("whix shutting down");
                     return Ok(());
                 }
                 accepted = listener.accept() => accepted,
@@ -335,7 +335,7 @@ pub(super) mod console_port_tests {
         let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         let config = Config {
             storage_dir: std::env::temp_dir().join(format!(
-                "whistle-rs-console-tests-{}-{unique}",
+                "whix-console-tests-{}-{unique}",
                 std::process::id()
             )),
             persist_sessions: false,
@@ -353,7 +353,7 @@ pub(super) mod console_port_tests {
         let config = Config {
             port: 0,
             storage_dir: std::env::temp_dir()
-                .join(format!("whistle-rs-bind-default-{}", std::process::id())),
+                .join(format!("whix-bind-default-{}", std::process::id())),
             persist_sessions: false,
             ..Config::default()
         };

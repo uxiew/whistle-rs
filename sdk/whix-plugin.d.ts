@@ -1,8 +1,8 @@
 /**
- * whistle-rs plugin SDK — TypeScript definitions.
+ * whix plugin SDK — TypeScript definitions.
  *
  * ```ts
- * import { start, type Plugin, type RequestCtx, type ResponseCtx } from 'whistle-rs-plugin';
+ * import { start, type Plugin, type RequestCtx, type ResponseCtx } from 'whix-plugin';
  *
  * const plugin = {
  *   name: 'my-plugin',
@@ -14,7 +14,7 @@
  *   },
  *
  *   async onResponse(ctx: ResponseCtx) {
- *     ctx.setHeader('x-powered-by', 'whistle-rs');
+ *     ctx.setHeader('x-powered-by', 'whix');
  *   },
  * } satisfies Plugin;
  *
@@ -294,13 +294,13 @@ export interface SniCtx {
   /** The client's IP, when known. */
   readonly clientIp?: string;
   /**
-   * Set when whistle-rs is holding a certificate **this plugin** supplied for
+   * Set when whix is holding a certificate **this plugin** supplied for
    * `servername` — its value is this plugin's own name. Undefined otherwise.
    */
   readonly certCacheName?: string;
   /** The `mtime` that cached certificate carried, or `0`. */
   readonly certCacheTime: number;
-  /** Whether whistle-rs holds a certificate of ours for this name. */
+  /** Whether whix holds a certificate of ours for this name. */
   readonly hasCachedCert: boolean;
   /** Return this to keep serving the certificate we supplied last time. */
   reuse(): SniReuse;
@@ -327,9 +327,9 @@ export interface SniReuse {
 /**
  * What `sniCallback` may return.
  *
- * * `true` — intercept, with the certificate whistle-rs would have generated.
+ * * `true` — intercept, with the certificate whix would have generated.
  * * `false` — **do not intercept**: the connection is relayed to the origin
- *   encrypted, and whistle-rs never sees inside it.
+ *   encrypted, and whix never sees inside it.
  * * `SniCert` — intercept, presenting this certificate.
  * * `ctx.reuse()` — intercept, with the certificate this plugin supplied last
  *   time for this name.
@@ -363,11 +363,11 @@ export type UiHook = (
 ) => BodyInit | undefined | Promise<BodyInit | undefined>;
 
 /**
- * A whistle-rs plugin. Define at least one hook, or `rules` — which hooks you
+ * A whix plugin. Define at least one hook, or `rules` — which hooks you
  * define is what the capability manifest advertises to the proxy.
  */
 export interface Plugin {
-  /** Defaults to `$WHISTLE_RS_PLUGIN_NAME`. Matched by `plugin://<name>`. */
+  /** Defaults to `$WHIX_PLUGIN_NAME`. Matched by `plugin://<name>`. */
   name?: string;
   version?: string;
   /**
@@ -445,7 +445,7 @@ export interface Plugin {
 }
 
 export interface StartOptions {
-  /** Override the port. Defaults to `$WHISTLE_RS_PLUGIN_PORT`, else an ephemeral port. */
+  /** Override the port. Defaults to `$WHIX_PLUGIN_PORT`, else an ephemeral port. */
   port?: number;
 }
 

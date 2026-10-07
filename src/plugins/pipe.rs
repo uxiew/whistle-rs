@@ -8,7 +8,7 @@
 //! ack byte, and then exchanging bodies over a bespoke length-prefixed framing
 //! (`'\n' <len> '\n' <payload>`, EOF `'\n0\n'` — `lib/util/transproto.js`).
 //!
-//! We deliberately do **not** port that. whistle-rs already speaks its own
+//! We deliberately do **not** port that. whix already speaks its own
 //! plugin protocol (JSON over HTTP, capability-gated by `GET /manifest`), and
 //! plugins are written against *our* SDK, so upstream wire compatibility buys
 //! nothing here. Meanwhile HTTP/1.1 already frames a stream — chunked transfer
@@ -26,7 +26,7 @@
 //!
 //! ```text
 //! proxy → plugin   POST /pipe/{request,response} HTTP/1.1
-//!                  x-whistle-rs-pipe: <base64 JSON metadata>
+//!                  x-whix-pipe: <base64 JSON metadata>
 //!                  transfer-encoding: chunked
 //! plugin → proxy   HTTP/1.1 200 OK           (head only — sent immediately)
 //! proxy → plugin   <body bytes, as they arrive>
@@ -59,7 +59,7 @@ use crate::proxy::body::{self, BodyError, DynBody};
 ///
 /// Metadata travels as one opaque header rather than a field per item so that
 /// URLs, header values and rule text never have to survive header escaping.
-pub const META_HEADER: &str = "x-whistle-rs-pipe";
+pub const META_HEADER: &str = "x-whix-pipe";
 
 /// How long to wait for the plugin to accept the stream before giving up and
 /// forwarding the body untouched. Generous: it only bounds a local handshake.

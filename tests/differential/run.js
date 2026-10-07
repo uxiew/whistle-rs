@@ -14,7 +14,7 @@
 //   --port-base N     first port of the block it claims (default 18700)
 //   --out DIR         where the archive goes (default target/differential/<stamp>-<suite>)
 //   --keep            keep the scratch directory (proxy state, CAs) for debugging
-//   --allow-stale     run even if the whistle-rs binary is older than its source
+//   --allow-stale     run even if the whix binary is older than its source
 //   --whistle V       measure against whistle V instead of the baseline in
 //                     package.json; V needs a lockfile of its own under
 //                     versions/V (see the README, "Which whistle, though")
@@ -50,7 +50,7 @@ const REPO = path.resolve(HERE, '..', '..');
 // Absolute, because the proxies are started in directories of their own: a
 // relative `RS_BIN` passed the existence check here and then failed to spawn
 // with an unhandled ENOENT.
-const RS_BIN = path.resolve(process.env.RS_BIN || path.join(REPO, 'target', 'debug', 'whistle-rs'));
+const RS_BIN = path.resolve(process.env.RS_BIN || path.join(REPO, 'target', 'debug', 'whix'));
 const HOST = '127.0.0.1';
 
 // ── arguments ─────────────────────────────────────────────────────────────
@@ -96,7 +96,7 @@ const CORPORA = [
   'cases-proxy.js', 'cases-values.js',
 ];
 
-// Ports beyond the pair (PB whistle, PB+1 whistle-rs) and the origin (PB+2):
+// Ports beyond the pair (PB whistle, PB+1 whix) and the origin (PB+2):
 // https-bench and forwarded-bench want a second origin at PB+3, cases-includes
 // a rules server at PB+10, and cases-proxy (and so `--from-cases`, which
 // requires every corpus) its eight servers at PB+10…PB+17.
@@ -112,7 +112,7 @@ const FAST = [
 
 // `standard` is one pair shared by every corpus, the way they have always
 // been run: `WHISTLE_DIFF_ENV=Alpha` on both (cases-filters asks
-// `env:`), `--insecure-upstream` on whistle-rs (cases-proxy's TLS hop and the
+// `env:`), `--insecure-upstream` on whix (cases-proxy's TLS hop and the
 // HTTPS bench's self-signed origin). https-bench goes last, because it turns on
 // whistle's persisted `Enable HTTPS` switch for everything after it.
 const NETWORK = [
@@ -296,7 +296,7 @@ const stamp = started.toISOString().replace(/[:.]/g, '-');
 const versionTag = (WHISTLE_VERSION === BASELINE ? '' : `-whistle-${WHISTLE_VERSION}`)
   + (ASSUME_BASELINE ? '-assume-baseline' : '');
 const OUT = path.resolve(option('--out') || path.join(REPO, 'target', 'differential', `${stamp}-${suite}${versionTag}`));
-const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'whistle-rs-diff-'));
+const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'whix-diff-'));
 const dirs = {
   state: path.join(SCRATCH, 'state'),
   tmp: path.join(SCRATCH, 'tmp'),
@@ -339,7 +339,7 @@ async function startPair(name) {
     out: open(`${name}-whistle.log`),
     err: open(`${name}-whistle.log`),
   });
-  const rs = startGroup(`${name}:whistle-rs`, RS_BIN, [
+  const rs = startGroup(`${name}:whix`, RS_BIN, [
     '--port', String(PB + 1), '--host', HOST, '--no-persist',
     '--dir', path.join(dirs.state, `rs-${name}`), ...pair.rsArgs,
   ], {
@@ -349,7 +349,7 @@ async function startPair(name) {
     err: open(`${name}-rs.log`),
   });
   await waitForPort(PB, whistle, `whistle (${name} pair)`, 60 * 1000);
-  await waitForPort(PB + 1, rs, `whistle-rs (${name} pair)`, 30 * 1000);
+  await waitForPort(PB + 1, rs, `whix (${name} pair)`, 30 * 1000);
   return { name, whistle, rs };
 }
 
@@ -459,7 +459,7 @@ function newestSource() {
 
 function preflight() {
   if (!fs.existsSync(RS_BIN)) {
-    throw new SetupError(`no whistle-rs binary at ${RS_BIN}. Build it first: cargo build --locked`);
+    throw new SetupError(`no whix binary at ${RS_BIN}. Build it first: cargo build --locked`);
   }
   const src = newestSource();
   if (!flag('--allow-stale') && !process.env.RS_BIN && src.mtime > fs.statSync(RS_BIN).mtimeMs) {
@@ -501,7 +501,7 @@ function manifest(exitCode) {
     interrupted,
     git: { commit: git('rev-parse', 'HEAD'), dirty: dirty ? dirty.split('\n') : [] },
     host: { platform: process.platform, arch: process.arch, release: os.release(), node: process.version },
-    whistleRs: {
+    whix: {
       binary: path.relative(REPO, RS_BIN),
       version: rsVersion,
       sha256: fs.existsSync(RS_BIN) ? sha256(RS_BIN) : null,

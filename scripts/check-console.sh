@@ -1,8 +1,8 @@
 #!/bin/sh
-# Start a whistle-rs binary, fetch its console page, and check which page it is.
+# Start a whix binary, fetch its console page, and check which page it is.
 #
-#   scripts/check-console.sh target/release/whistle-rs built
-#   scripts/check-console.sh target/debug/whistle-rs placeholder
+#   scripts/check-console.sh target/release/whix built
+#   scripts/check-console.sh target/debug/whix placeholder
 #
 # built:       the page must be ui-src/dist/index.html byte for byte, after the
 #              three stamps the server fills in (__VERSION__, __HOST__, __PORT__).
@@ -19,7 +19,7 @@ set -eu
 bin=${1:-}
 want=${2:-}
 if [ -z "$bin" ] || { [ "$want" != built ] && [ "$want" != placeholder ]; }; then
-  echo "usage: $0 <whistle-rs binary> built|placeholder" >&2
+  echo "usage: $0 <whix binary> built|placeholder" >&2
   exit 2
 fi
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -41,7 +41,7 @@ tries=0
 until curl -fsS --noproxy '*' --max-time 5 -o "$work/served.html" "http://127.0.0.1:$port/" 2>/dev/null; do
   tries=$((tries + 1))
   if [ "$tries" -gt 100 ] || ! kill -0 "$pid" 2>/dev/null; then
-    echo "whistle-rs did not answer on 127.0.0.1:$port; its log:" >&2
+    echo "whix did not answer on 127.0.0.1:$port; its log:" >&2
     cat "$work/log" >&2
     exit 2
   fi

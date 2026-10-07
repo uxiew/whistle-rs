@@ -10,7 +10,7 @@
 //! if (ctx.req.url.indexOf('/admin') >= 0) ctx.res.statusCode = 403;
 //! ```
 //!
-//! After the script runs, whistle-rs reads `ctx.res` back and applies any
+//! After the script runs, whix reads `ctx.res` back and applies any
 //! changed status / headers / body.
 //!
 //! # PAC
@@ -1730,7 +1730,7 @@ fn register_pac_natives(ctx: &mut Context) -> Result<()> {
     )
     .map_err(|e| anyhow!("registering alert: {e}"))?;
     // `myIpAddress` cannot fail and takes no arguments, so it is a value rather
-    // than a call. whistle-rs falls back to the loopback address when the
+    // than a call. whix falls back to the loopback address when the
     // routing table cannot say, which is what a PAC file expects to see when a
     // machine has no route out.
     let ip = super::upstream::primary_local_ip()
@@ -2963,7 +2963,7 @@ mod tests {
     #[test]
     fn a_local_pac_file_is_read() {
         rt().block_on(async {
-            let dir = std::env::temp_dir().join("whistle-rs-pac-test");
+            let dir = std::env::temp_dir().join("whix-pac-test");
             std::fs::create_dir_all(&dir).expect("mkdir");
             let path = dir.join("corp.pac");
             let src = wrap("return 'SOCKS5 127.0.0.1:1080';");

@@ -14,7 +14,7 @@
 //   npm ci                                 # brings in qrcode@1.2.0, whistle's own version
 //   npm run qr
 //
-// Nothing is started and no port is claimed: `whistle-rs qr` prints the matrix
+// Nothing is started and no port is claimed: `whix qr` prints the matrix
 // as rows of `0`/`1`, and the reference runs in this process.
 //
 // **A clean run is `differing: 0`.** A single wrong module is a symbol a phone
@@ -24,7 +24,7 @@
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whix');
 
 let QRCode;
 try {
@@ -57,7 +57,7 @@ function reference(text) {
   return { version: qr.version, rows };
 }
 
-/** This port's matrix, printed by `whistle-rs qr --matrix`. */
+/** This port's matrix, printed by `whix qr --matrix`. */
 function ours(text) {
   const out = execFileSync(RS_BIN, ['qr', '--matrix', text], { encoding: 'utf8' });
   const rows = out.trim().split('\n').filter((l) => /^[01]+$/.test(l));
@@ -148,7 +148,7 @@ function main() {
     }
     try { got = ours(text); } catch (e) {
       differing++;
-      report.push({ group, text: text.slice(0, 40), why: `whistle-rs qr failed: ${e.message}` });
+      report.push({ group, text: text.slice(0, 40), why: `whix qr failed: ${e.message}` });
       continue;
     }
     if (got.rows.length !== want.rows.length) {

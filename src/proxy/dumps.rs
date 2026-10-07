@@ -99,7 +99,7 @@ pub(super) mod writer_tests {
     fn scratch(name: &str) -> std::path::PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "whistle-rs-writer-tests-{}-{}",
+            "whix-writer-tests-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

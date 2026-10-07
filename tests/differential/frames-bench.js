@@ -13,13 +13,13 @@
 //
 //   whistle     POST /cgi-bin/sessions {latest:true}   → the capture
 //               POST /cgi-bin/frames   {reqId}         → its frames (base64)
-//   whistle-rs  GET  /sessions.json                    → the capture
+//   whix  GET  /sessions.json                    → the capture
 //               GET  /frames.json?id=                  → its frames (previews)
 //
 //   PORT_BASE=19300 node oracle.js &
 //   cargo run -- --port 19301 --no-persist --dir /tmp/rs-frames &
 //   PORT_BASE=19300 node frames-bench.js
-//     19300 whistle · 19301 whistle-rs · 19302 the origin
+//     19300 whistle · 19301 whix · 19302 the origin
 //
 // **Two things this bench had to learn the hard way**, both about state it did
 // not own. An oracle is meant to be left running between runs, so its capture

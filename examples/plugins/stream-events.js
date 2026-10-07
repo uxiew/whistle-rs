@@ -1,7 +1,7 @@
-// A whistle-rs *streaming* plugin: it transforms the response body as it flows,
+// A whix *streaming* plugin: it transforms the response body as it flows,
 // event by event, instead of waiting for the whole thing.
 //
-//   whistle-rs --node-plugin events=examples/plugins/stream-events.js
+//   whix --node-plugin events=examples/plugins/stream-events.js
 //   # rule:  example.com pipe://events
 //   #        example.com pipe://events(SHOUT)      <- ctx.pipeValue === 'SHOUT'
 //
@@ -10,7 +10,7 @@
 // a pipe hook never asks the proxy to hold a body in memory. Point it at an SSE
 // endpoint and the events still arrive one at a time, transformed on the way.
 
-const { start, transform } = require('../../sdk/whistle-rs-plugin');
+const { start, transform } = require('../../sdk/whix-plugin');
 
 start({
   name: 'events',

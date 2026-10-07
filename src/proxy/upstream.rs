@@ -449,7 +449,7 @@ pub async fn direct_self_loop(target: &Target) -> Option<SocketAddr> {
 /// forwarded to itself until the sockets ran out. Seeing its own nonce come
 /// back is proof, whatever the address. Only on requests to our port number:
 /// an origin elsewhere never sees it.
-pub const LOOP_HEADER: &str = "x-whistle-rs-loop";
+pub const LOOP_HEADER: &str = "x-whix-loop";
 
 static LOOP_NONCE: Lazy<String> = Lazy::new(|| {
     use std::hash::{BuildHasher, Hasher};
@@ -486,7 +486,7 @@ async fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
 /// Whether to skip verification of the **origin's** certificate.
 ///
 /// whistle sets `rejectUnauthorized = false` by default and only verifies with
-/// `--safe` (`_original/lib/config.js:74`). whistle-rs inverts that: verifying
+/// `--safe` (`_original/lib/config.js:74`). whix inverts that: verifying
 /// is the default and this opts out, because a debugging proxy that silently
 /// accepts any upstream certificate cannot tell its user when the connection it
 /// is inspecting has itself been intercepted. See `--insecure-upstream`.
@@ -648,7 +648,7 @@ pub(crate) mod test_tls {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "whistle-rs test CA");
+            .push(rcgen::DnType::CommonName, "whix test CA");
         let cert = params.self_signed(&key).expect("CA certificate");
         Ca { cert, key }
     });

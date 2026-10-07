@@ -31,7 +31,7 @@ use std::path::PathBuf;
 const PLACEHOLDER: &str = r#"<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>whistle-rs __VERSION__ — console not built</title>
+<title>whix __VERSION__ — console not built</title>
 <style>
   :root { color-scheme: light dark; }
   body { margin: 0; padding: 2.5rem 1.5rem; font: 15px/1.65 ui-sans-serif, system-ui, sans-serif; }
@@ -46,7 +46,7 @@ const PLACEHOLDER: &str = r#"<!doctype html>
 </style>
 <main>
   <h1>The console was not built</h1>
-  <p class="sub">whistle-rs __VERSION__ is running and proxying on __HOST__:__PORT__. This page is
+  <p class="sub">whix __VERSION__ is running and proxying on __HOST__:__PORT__. This page is
      a placeholder: the web console is a separate Vite build, and its output was
      not present when this binary was compiled.</p>
   <p>Build it, then rebuild the proxy:</p>

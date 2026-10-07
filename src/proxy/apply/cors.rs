@@ -47,7 +47,7 @@ pub(super) fn apply_req_cors(headers: &mut HeaderMap, resolved: &Resolved) {
 /// echoed and a preflight cannot be recognised.
 pub(super) fn apply_res_cors(headers: &mut HeaderMap, resolved: &Resolved, info: Option<&ReqInfo>) {
     let mut spec = merge_cors_ops(resolved, "resCors");
-    // whistle has no `enable://cors`; whistle-rs keeps it as an alias for
+    // whistle has no `enable://cors`; whix keeps it as an alias for
     // `resCors://enable` so existing rule files still mean something, rather
     // than blasting `*` at every header as it used to.
     if spec.is_empty() && enabled_flags(resolved).contains("cors") {

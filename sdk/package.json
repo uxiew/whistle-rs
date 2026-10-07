@@ -1,12 +1,12 @@
 {
-  "name": "whistle-rs-plugin",
+  "name": "whix-plugin",
   "version": "1.0.0",
-  "description": "Zero-dependency SDK for writing whistle-rs plugins in JavaScript or TypeScript",
-  "main": "whistle-rs-plugin.js",
-  "types": "whistle-rs-plugin.d.ts",
+  "description": "Zero-dependency SDK for writing whix plugins in JavaScript or TypeScript",
+  "main": "whix-plugin.js",
+  "types": "whix-plugin.d.ts",
   "files": [
-    "whistle-rs-plugin.js",
-    "whistle-rs-plugin.d.ts"
+    "whix-plugin.js",
+    "whix-plugin.d.ts"
   ],
   "engines": {
     "node": ">=16"

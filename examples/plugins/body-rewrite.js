@@ -1,14 +1,14 @@
-// A whistle-rs plugin that reads the request body and rewrites the response
+// A whix plugin that reads the request body and rewrites the response
 // body — the two cases that need an explicit opt-in.
 //
-//   whistle-rs --node-plugin rewrite=examples/plugins/body-rewrite.js
+//   whix --node-plugin rewrite=examples/plugins/body-rewrite.js
 //   # rule:  example.com plugin://rewrite
 //
 // `requestBody` / `responseBody` are what make the bodies show up on `ctx.body`.
 // Without them the proxy streams both bodies straight through and never buffers
 // — so only ask for what you actually read.
 
-const { start } = require('../../sdk/whistle-rs-plugin');
+const { start } = require('../../sdk/whix-plugin');
 
 start({
   name: 'rewrite',
@@ -33,10 +33,10 @@ start({
     // Rewrite JSON responses by adding a field; leave everything else alone.
     const data = ctx.json();
     if (data && typeof data === 'object') {
-      ctx.setBody({ ...data, rewrittenBy: 'whistle-rs' });
+      ctx.setBody({ ...data, rewrittenBy: 'whix' });
       ctx.setHeader('x-rewritten', 'json');
     } else {
-      ctx.setBody(text.replace(/whistle/gi, 'whistle-rs'));
+      ctx.setBody(text.replace(/whistle/gi, 'whix'));
       ctx.setHeader('x-rewritten', 'text');
     }
   },

@@ -3272,7 +3272,7 @@ mod body_filter_tests {
     #[test]
     fn env_reads_the_process_environment() {
         // Scoped to this test's own variable name so nothing else can collide.
-        let key = "WHISTLE_RS_ENV_FILTER_TEST";
+        let key = "WHIX_ENV_FILTER_TEST";
         unsafe { std::env::set_var(key, "production") };
         let m = mgr(&format!(
             "example.com resBody://hit includeFilter://env:{key}=produc\n"
@@ -3285,13 +3285,13 @@ mod body_filter_tests {
         );
 
         // An unset variable is a *known* false, so `!` flips it.
-        let m = mgr("example.com resBody://hit includeFilter://env:WHISTLE_RS_UNSET_XYZ=v\n");
+        let m = mgr("example.com resBody://hit includeFilter://env:WHIX_UNSET_XYZ=v\n");
         assert!(
             m.resolve(&post("http://example.com/", None))
                 .value("resBody")
                 .is_none()
         );
-        let m = mgr("example.com resBody://hit includeFilter://env:WHISTLE_RS_UNSET_XYZ!=v\n");
+        let m = mgr("example.com resBody://hit includeFilter://env:WHIX_UNSET_XYZ!=v\n");
         assert_eq!(
             m.resolve(&post("http://example.com/", None))
                 .value("resBody"),

@@ -1,4 +1,4 @@
-//! Run whistle-rs inside your own program.
+//! Run whix inside your own program.
 //!
 //! ```sh
 //! cargo run --example embedded
@@ -12,8 +12,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use whistle_rs::embed::Proxy;
-use whistle_rs::plugins::{PluginReq, PluginResp, PluginResult, RustPlugin};
+use whix::embed::Proxy;
+use whix::plugins::{PluginReq, PluginResp, PluginResult, RustPlugin};
 
 /// An in-process interceptor. Anything a plugin can do, your own code can do
 /// here — rewrite headers, inject rules, gate the request, or, as below, answer
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
         // Port 0: the OS picks, and `proxy.addr()` reports what it picked.
         .port(0)
         .host("127.0.0.1".parse()?)
-        .storage_dir(std::env::temp_dir().join("whistle-rs-example"))
+        .storage_dir(std::env::temp_dir().join("whix-example"))
         .rules(
             "\
             # An endpoint your own code answers.\n\

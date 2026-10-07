@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// Use a whistle-rs binary the way a person does, on whatever machine this runs
+// Use a whix binary the way a person does, on whatever machine this runs
 // on, and say what worked.
 //
-//   node scripts/smoke.mjs target/release/whistle-rs
-//   node scripts/smoke.mjs target\release\whistle-rs.exe --console built --json smoke.json
+//   node scripts/smoke.mjs target/release/whix
+//   node scripts/smoke.mjs target\release\whix.exe --console built --json smoke.json
 //
 // One run starts the binary on a fresh storage directory with a Node plugin
-// (sdk/whistle-rs-plugin.js), edits its rules and values over the API, sends
+// (sdk/whix-plugin.js), edits its rules and values over the API, sends
 // HTTP, HTTPS (intercepted, checked against the CA the binary just generated),
 // WebSocket, WebSocket-over-TLS and a plugin request through it, kills the
 // plugin and checks the next request starts it again, checks a second plugin
@@ -14,7 +14,7 @@
 // checks the port is free and the plugin gone, starts it a second time on the
 // same directory and checks that the CA, rules, values and history came back
 // and still work, then stops it again. On Unix a third start ends in SIGKILL,
-// which runs none of whistle-rs's shutdown, to check the plugin still goes.
+// which runs none of whix's shutdown, to check the plugin still goes.
 // Everything it talks to is a server this script runs on 127.0.0.1, so no step
 // needs the internet or a DNS answer; `node` has to be on PATH for the plugin.
 //
@@ -68,7 +68,7 @@ if (!existsSync(binary)) usage(`no binary at ${binary}`);
 
 function usage(why) {
   if (why) console.error(why);
-  console.error('usage: node scripts/smoke.mjs <whistle-rs binary> [--console built|placeholder|any] [--json FILE] [--keep]');
+  console.error('usage: node scripts/smoke.mjs <whix binary> [--console built|placeholder|any] [--json FILE] [--keep]');
   process.exit(2);
 }
 
@@ -318,7 +318,7 @@ const connectToProxy = () =>
 
 // ---- the binary ------------------------------------------------------------------
 
-const work = mkdtempSync(path.join(os.tmpdir(), 'whistle-rs-smoke-'));
+const work = mkdtempSync(path.join(os.tmpdir(), 'whix-smoke-'));
 const dataDir = path.join(work, 'data');
 let child = null;
 let childExit = null;
@@ -329,7 +329,7 @@ let logFile = null;
 const pluginFile = path.join(work, 'smoke-plugin.cjs');
 writeFileSync(
   pluginFile,
-  `const { start } = require(${JSON.stringify(path.join(root, 'sdk', 'whistle-rs-plugin.js'))});
+  `const { start } = require(${JSON.stringify(path.join(root, 'sdk', 'whix-plugin.js'))});
 start({
   name: 'smoke',
   onRequest(ctx) {
@@ -453,7 +453,7 @@ async function run() {
     p.on('close', () => resolve(out.trim()));
     p.on('error', () => resolve(''));
   });
-  console.log(`${version || 'whistle-rs (no --version)'} on ${os.platform()} ${os.release()} ${os.arch()}, Node ${process.version}`);
+  console.log(`${version || 'whix (no --version)'} on ${os.platform()} ${os.release()} ${os.arch()}, Node ${process.version}`);
   console.log(`storage ${dataDir}, proxy port ${proxyPort}, origin port ${originPort}\n`);
 
   // -- first run: a fresh directory --

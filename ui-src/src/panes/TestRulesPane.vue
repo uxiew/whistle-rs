@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Test Rules: which operators a request *would* hit, without making one.
 //
-// The same question `whistle-rs explain` answers on the command line, and the
+// The same question `whix explain` answers on the command line, and the
 // same one whistle's console answers in its own Test Rules dialog. It exists
 // because a rule that never matches reports nothing — a working rule and a
 // silently inert one look identical from the client side, and the only way to

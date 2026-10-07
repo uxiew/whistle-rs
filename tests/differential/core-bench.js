@@ -2,7 +2,7 @@
 //
 //   PORT_BASE=21900 node core-bench.js            # starts both proxies itself
 //   PORT_BASE=21900 CASES=regexp,script node core-bench.js
-//     21900 whistle · 21901 whistle-rs · 21902 http+ws origin · 21903 raw TCP
+//     21900 whistle · 21901 whix · 21902 http+ws origin · 21903 raw TCP
 //     echo · 21904 an origin that demands a client certificate · 21905 a plugin
 //
 // The parse oracle asks "which rule matched", and the network harness asks
@@ -22,7 +22,7 @@
 // proxy answered 200.
 //
 // The plugin cases are one-sided: upstream has no `--plugin name=host:port`, so
-// there is nothing to compare, and they assert what whistle-rs must do on its
+// there is nothing to compare, and they assert what whix must do on its
 // own (see `ONE_SIDED`).
 //
 // A difference is excused only when `declared.js` names the case (under
@@ -45,7 +45,7 @@ const WebSocket = require('ws');
 
 const BASE = Number(process.env.PORT_BASE || 21900);
 const [W, RS, ORIGIN, TCP, MTLS, PLUGIN] = [BASE, BASE + 1, BASE + 2, BASE + 3, BASE + 4, BASE + 5];
-const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whix');
 const WHISTLE = require('./whistle-pkg');
 const { judge } = require('./declared');
 const STATE = process.env.DIFF_STATE || fs.mkdtempSync(path.join(os.tmpdir(), 'wrs-core-'));
@@ -588,11 +588,11 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
   return list;
 }
 
-// ── one-sided: what whistle-rs must do with a plugin it cannot describe ──
+// ── one-sided: what whix must do with a plugin it cannot describe ──
 
 /**
  * Upstream has no remote plugins, so these are assertions rather than
- * comparisons. Each starts a whistle-rs of its own: what is under test is what
+ * comparisons. Each starts a whix of its own: what is under test is what
  * the **first** manifest fetch leaves behind.
  */
 async function oneSided() {

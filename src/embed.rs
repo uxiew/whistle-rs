@@ -1,4 +1,4 @@
-//! Run whistle-rs **inside another program**.
+//! Run whix **inside another program**.
 //!
 //! The binary is one consumer of this crate; this module is the other. It exists
 //! because a proxy embedded in an application needs three things the binary
@@ -20,7 +20,7 @@
 //! the request outright, gate it, or choose its TLS certificate.
 //!
 //! ```no_run
-//! use whistle_rs::embed::Proxy;
+//! use whix::embed::Proxy;
 //!
 //! # async fn run() -> anyhow::Result<()> {
 //! let proxy = Proxy::builder()
@@ -385,7 +385,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("whistle-rs-embed-{tag}-{}", std::process::id()))
+        std::env::temp_dir().join(format!("whix-embed-{tag}-{}", std::process::id()))
     }
 
     /// The three things a binary never needs and an embedder always does: the

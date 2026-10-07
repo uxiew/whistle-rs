@@ -489,7 +489,7 @@ export function mockApi(): Plugin {
         return reply({
           log: {
             version: '1.2',
-            creator: { name: 'whistle-rs-mock' },
+            creator: { name: 'whix-mock' },
             entries: picked.map((s) => ({ request: { url: s.url }, response: { status: s.status } })),
           },
         });
@@ -602,7 +602,7 @@ export function mockApi(): Plugin {
       case '/api/export':
         // Everything the console can edit, in the shape `bundle_of` writes it.
         return reply({
-          whistle_rs: '0.1.0-mock',
+          whix: '0.1.0-mock',
           rules: [
             { name: 'default', enabled: true, text: rules },
             ...groups.map((g) => ({ name: g.name, enabled: g.enabled, text: g.text })),
@@ -611,7 +611,7 @@ export function mockApi(): Plugin {
         });
       case '/api/import': {
         const bundle = JSON.parse((await readBody(req)) || '{}');
-        if (!('whistle_rs' in bundle)) {
+        if (!('whix' in bundle)) {
           return reply({ ok: false, error: 'not an exported bundle' });
         }
         let count = 0;
@@ -713,8 +713,8 @@ export function mockApi(): Plugin {
           listening_on_lan: true,
           lan_addresses: ['192.168.1.42', '10.0.0.7'],
           insecure_upstream: false,
-          storage_dir: '/Users/you/.whistle-rs',
-          root_ca: '/Users/you/.whistle-rs/rootCA.crt',
+          storage_dir: '/Users/you/.whix',
+          root_ca: '/Users/you/.whix/rootCA.crt',
           body_preview_cap: 262144,
           persist_sessions: true,
           persist_days: 7,

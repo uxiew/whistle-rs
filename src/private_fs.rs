@@ -117,10 +117,8 @@ mod tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "whistle-rs-private-fs-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("whix-private-fs-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }

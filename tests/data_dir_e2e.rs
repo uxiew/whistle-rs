@@ -1,4 +1,4 @@
-//! A storage directory belongs to one whistle-rs at a time (`whistle_rs::dir_lock`).
+//! A storage directory belongs to one whix at a time (`whix::dir_lock`).
 //!
 //! Every instance holds the whole of its rule groups and values in memory and
 //! writes the whole back on each save, so two on one directory silently undid
@@ -50,11 +50,11 @@ fn a_second_instance_on_the_same_directory_is_refused() {
 fn separate_directories_share_a_root_through_the_certificate_directory() {
     // A root made the way the binary makes one, then handed to both by `-z`.
     let made = scratch("made");
-    let config = whistle_rs::config::Config {
+    let config = whix::config::Config {
         storage_dir: made.clone(),
-        ..whistle_rs::config::Config::default()
+        ..whix::config::Config::default()
     };
-    whistle_rs::ca::CertAuthority::load_or_create(&config).expect("root CA");
+    whix::ca::CertAuthority::load_or_create(&config).expect("root CA");
     let certs = scratch("certs");
     for name in ["root.key", "root.crt"] {
         std::fs::copy(made.join("certs").join(name), certs.join(name)).expect("copy");
@@ -97,7 +97,7 @@ fn kept_by_the_binary(name: &str) -> PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_embedded_console_leaves_the_kept_rules_and_values_alone() {
     let dir = kept_by_the_binary("embedded-edits");
-    let proxy = whistle_rs::embed::Proxy::builder()
+    let proxy = whix::embed::Proxy::builder()
         .port(0)
         .storage_dir(&dir)
         .rules("embedded.test 3.3.3.3")
@@ -154,7 +154,7 @@ async fn an_embedded_proxy_keeping_history_needs_the_directory_to_itself() {
     let dir = scratch("embedded-history");
     let binary = start(&dir, &[]);
 
-    let refused = whistle_rs::embed::Proxy::builder()
+    let refused = whix::embed::Proxy::builder()
         .port(0)
         .storage_dir(&dir)
         .persist_sessions(true)
@@ -172,7 +172,7 @@ async fn an_embedded_proxy_keeping_history_needs_the_directory_to_itself() {
         "advice in the embedder's terms, not the command line's: {text}"
     );
 
-    let sharing = whistle_rs::embed::Proxy::builder()
+    let sharing = whix::embed::Proxy::builder()
         .port(0)
         .storage_dir(&dir)
         .start()

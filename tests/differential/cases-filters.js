@@ -217,7 +217,7 @@ module.exports = [
   // A **declared deviation**, and the only one this corpus expects to differ.
   // Upstream files a `host` condition under `hostFilter`, which only
   // `util.checkProxyHost` reads — deciding which hosts a `proxy://` engages
-  // for, never whether a rule applies. whistle-rs matches the request's host
+  // for, never whether a rule applies. whix matches the request's host
   // with it (`docs/RULES.md`, deliberate deviations). All five carry their own
   // probe header so the harness can name the difference and let it pass; see
   // `EXPECTED` in `harness.js`.

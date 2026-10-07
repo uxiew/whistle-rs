@@ -19,7 +19,7 @@
 // rules match, and what does each operator end up holding**. No socket is
 // opened on either side. whistle's `Rules` is driven in-process (its
 // `lib/rules/rules.js`, the same code the real proxy runs), and this port
-// answers through `whistle-rs explain --batch`, which runs the ordinary
+// answers through `whix explain --batch`, which runs the ordinary
 // resolver. So the corpus can be anything at all: `/Users/john/mock.json`,
 // `www.test.com`, a line that is not a rule. Nothing is sent anywhere.
 //
@@ -61,7 +61,7 @@ const { forVersion } = WHISTLE;
 const WHISTLE_RULES = path.join(WHISTLE.dir, 'lib', 'rules');
 // `RS_BIN` as in the benches that start a proxy, so every tool here can be
 // pointed at the same binary — a release build, or one under test elsewhere.
-const BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+const BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whix');
 
 // `rules.js` requires `util.js`, which requires `index.js`, which requires
 // `rules.js` back — and `index.js` also builds the singletons a running proxy

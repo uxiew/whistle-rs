@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn switches_round_trip_and_default_to_on() {
-        let dir = std::env::temp_dir().join(format!("whistle-rs-switches-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("whix-switches-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(load_switches(&dir), Switches::default(), "no file: all on");
         let saved = Switches {
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn roundtrip_groups() {
-        let dir = std::env::temp_dir().join("whistle-rs-test-groups");
+        let dir = std::env::temp_dir().join("whix-test-groups");
         let _ = fs::remove_dir_all(&dir);
 
         let mut mgr = RuleManager::new();
@@ -267,8 +267,7 @@ mod tests {
     /// read as empty and then overwritten by the next save.
     #[test]
     fn an_unreadable_store_is_moved_aside_not_emptied() {
-        let dir =
-            std::env::temp_dir().join(format!("whistle-rs-test-unreadable-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("whix-test-unreadable-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("dir");
         // Cut short mid-write, as a crash left it before writes were atomic.

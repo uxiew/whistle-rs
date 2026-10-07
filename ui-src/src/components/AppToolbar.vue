@@ -78,7 +78,7 @@ defineExpose({ focusFilter });
 <template>
   <div class="toolbar">
     <span class="brand">
-      whistle-rs
+      whix
       <span class="ver">
         <template v-if="version">v{{ version }} · </template>{{ address }}
       </span>

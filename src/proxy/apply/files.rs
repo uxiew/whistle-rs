@@ -32,7 +32,7 @@ pub(super) const INVALID_PATH: &str = "(Path contains parent directory notation 
 /// The paths a file rule may resolve to, in the order whistle tries them.
 ///
 /// A rule value is not simply a path: it can list several with `|`, name a
-/// directory, start at the home directory, and — in whistle-rs — omit the
+/// directory, start at the home directory, and — in whix — omit the
 /// leading slash. Building the whole list up front keeps the "first one that is
 /// a file wins" rule (`readFiles`, `file-proxy.js:38-58`) a single loop, and
 /// keeps the 404 able to name what was actually tried.
@@ -168,7 +168,7 @@ impl FileCandidates {
                 continue;
             }
             for candidate in expand_index(&entry) {
-                // whistle-rs also accepts a value whose leading slash the rule
+                // whix also accepts a value whose leading slash the rule
                 // parser dropped (`file://tmp/x`), which upstream resolves
                 // against the rule file's root instead. It is a fallback, so it
                 // is tried after the path as written and never blamed in a 404.
@@ -203,7 +203,7 @@ impl FileCandidates {
 ///
 /// whistle only splits when the protocol matches `FILE_PROTO_RE`
 /// (`rules.js:96`), whose `x?` prefix admits a *single* `x` — so `xsfile://` and
-/// its siblings are never split. whistle-rs reproduces the quirk rather than
+/// its siblings are never split. whix reproduces the quirk rather than
 /// tidying it up: `|` is a legal character in a POSIX filename, so "fixing" it
 /// would change what an existing rule file resolves to.
 pub(super) fn split_paths<'a>(proto: &str, value: &'a str) -> Vec<&'a str> {

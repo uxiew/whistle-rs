@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Upstream's own test suite — the `test/` directory of the whistle release being
 // measured (82 unit files, 280 calls that assert something, in 2.10.8 and
-// 2.10.10 alike) — run against whistle-rs.
+// 2.10.10 alike) — run against whix.
 //
 //   node upstream-suite.js                          # the gate: three runs, one verdict
 //   node upstream-suite.js --target rs --only file,reqHeaders --verbose
@@ -13,7 +13,7 @@
 // (`--fixture flat`, see `flattenPlugins`), asks whistle first — twice, once
 // with the network and once with every name it looks up failing — and keeps
 // the calls that pass both times: the ones the suite's own rules and servers
-// decide, whatever the network does today. whistle-rs must pass each of those,
+// decide, whatever the network does today. whix must pass each of those,
 // or the call is declared in `DECLARED` below with its reason; a declared call
 // that passes is stale and fails the gate as well.
 //
@@ -85,7 +85,7 @@ const { parse: parseUrl } = require('url');
 
 const HERE = __dirname;
 const REPO = path.resolve(HERE, '..', '..');
-const RS_BIN = process.env.RS_BIN || path.join(REPO, 'target', 'debug', 'whistle-rs');
+const RS_BIN = process.env.RS_BIN || path.join(REPO, 'target', 'debug', 'whix');
 
 const UPSTREAM_REPO = 'https://github.com/avwo/whistle';
 /**
@@ -619,7 +619,7 @@ async function startWhistle(W, config, util) {
 }
 
 /**
- * whistle-rs with the nearest equivalent of those options:
+ * whix with the nearest equivalent of those options:
  *   port, certDir, localUIHost, mode, rules and values have one each;
  *   `--insecure-upstream` because whistle does not verify an origin's
  *   certificate unless told to, and the HTTPS origin here is self-signed;
@@ -650,7 +650,7 @@ async function startRs(W, config, util) {
   child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-4000); });
   child.on('exit', (code, signal) => {
     if (!stopping) {
-      console.error(`whistle-rs exited (${code ?? signal}) during the run:\n${stderr}`);
+      console.error(`whix exited (${code ?? signal}) during the run:\n${stderr}`);
       process.exit(1);
     }
   });
@@ -857,7 +857,7 @@ const CGI_BIN_CALLS = [
 ];
 
 /**
- * Calls the gate judges and whistle-rs fails, each for a stated reason — named
+ * Calls the gate judges and whix fails, each for a stated reason — named
  * one by one, as `indexCalls` keys them, because a category is too wide: some
  * calls in these same families pass here on assertions loose enough not to
  * need the feature. Every one must still fail (or, made from a failed call's
@@ -960,7 +960,7 @@ async function gate() {
   const runs = [
     { name: 'whistle, no network', args: ['--target', 'whistle', '--fixture', 'flat', '--no-network'] },
     { name: 'whistle', args: ['--target', 'whistle', '--fixture', 'flat'] },
-    { name: 'whistle-rs', args: ['--target', 'rs', '--fixture', 'flat'] },
+    { name: 'whix', args: ['--target', 'rs', '--fixture', 'flat'] },
   ];
   if (argv.includes('--control')) {
     runs.unshift({ name: 'whistle with its plugins', args: ['--target', 'whistle', '--fixture', 'plugins'], control: true });
@@ -1011,7 +1011,7 @@ async function gate() {
 
   const control = runs.find((r) => r.control);
   console.log(`\njudged ${verdict.judged} calls — the ones whistle passes under the flattened rules, with and without the network`);
-  console.log(`  ${verdict.passed} pass on whistle-rs`);
+  console.log(`  ${verdict.passed} pass on whix`);
   const byReason = new Map();
   for (const row of verdict.declared) byReason.set(row.why, (byReason.get(row.why) || 0) + 1);
   for (const [why, n] of byReason) console.log(`  ${n} declared: ${why}`);

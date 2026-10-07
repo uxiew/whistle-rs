@@ -78,7 +78,7 @@ impl Regexp {
     ///
     /// Carrying on is upstream's behaviour; doing it *silently* was this
     /// port's. The failure is [`report`]ed: once in the log, and to whoever is
-    /// [`collect`]ing, which is how `whistle-rs explain` names the expression.
+    /// [`collect`]ing, which is how `whix explain` names the expression.
     /// `role` says where it was written — "pattern", "includeFilter" — and
     /// what happens without it.
     pub fn parsed(source: &str, flags: &str, role: &str) -> Option<Regexp> {

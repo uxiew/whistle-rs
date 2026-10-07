@@ -51,7 +51,7 @@
 //! | `req.setRedirect` | `* ignore://!redirect redirect://<url>` | [`DenyPage::Redirect`] |
 //! | `req.setHtml` / nothing | `* status://<code> resBody://{msg} resType://html` | [`DenyPage::Html`] |
 //!
-//! whistle-rs renders them directly instead of routing them back through the
+//! whix renders them directly instead of routing them back through the
 //! rule engine. The synthetic rules exist upstream because a refusal has to
 //! re-enter a pipeline that only speaks rules; every one of them is pinned with
 //! `ignore://` so that nothing else can touch the result. Rendering the response
@@ -86,7 +86,7 @@ const DEFAULT_BODY: &str = "Forbidden";
 
 /// Marks a blocked response, so a refusal is recognisable in the Network panel
 /// without reading the body.
-pub const AUTH_HEADER: &str = "x-whistle-rs-auth";
+pub const AUTH_HEADER: &str = "x-whix-auth";
 
 /// What an auth plugin decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,9 +302,9 @@ pub async fn deny_response(plugin: &str, denial: &Denial) -> PluginResp {
     // (`lib/util/index.js:398-403`); without it a browser never shows the box.
     if denial.login || status == 401 || status == 407 {
         let (name, value) = if status == 407 {
-            ("proxy-authenticate", "Basic realm=\"whistle-rs\"")
+            ("proxy-authenticate", "Basic realm=\"whix\"")
         } else {
-            ("www-authenticate", "Basic realm=\"whistle-rs\"")
+            ("www-authenticate", "Basic realm=\"whix\"")
         };
         headers.push((name.to_string(), value.to_string()));
     }
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn fetch_page_from_disk_and_failure() {
         rt().block_on(async {
-            let dir = std::env::temp_dir().join(format!("whistle-rs-auth-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("whix-auth-{}", std::process::id()));
             tokio::fs::create_dir_all(&dir).await.expect("mkdir");
             let path = dir.join("blocked.html");
             tokio::fs::write(&path, b"<h1>nope</h1>")
@@ -559,8 +559,12 @@ mod tests {
     #[test]
     fn header_allow_list() {
         assert!(allowed_request_header("X-Whistle-User"));
-        assert!(allowed_request_header("x-whistle-rs-anything"));
+        assert!(allowed_request_header("x-whistle-anything"));
         assert!(allowed_request_header("Proxy-Authorization"));
+        // This port's own headers are not upstream's `x-whistle-*`. Named
+        // `x-whistle-rs-*` they got through by their spelling alone, the loop
+        // marker among them, which no gate should be able to forge.
+        assert!(!allowed_request_header("x-whix-loop"));
         assert!(!allowed_request_header("authorization"));
         assert!(!allowed_request_header("cookie"));
         assert!(!allowed_request_header("x-whistle"));

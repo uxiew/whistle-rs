@@ -47,7 +47,7 @@ impl std::fmt::Display for LockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LockError::Held { dir, owner } => {
-                write!(f, "{} is in use by another whistle-rs", dir.display())?;
+                write!(f, "{} is in use by another whix", dir.display())?;
                 if let Some(owner) = owner {
                     write!(f, " ({owner})")?;
                 }
@@ -61,7 +61,7 @@ impl std::fmt::Display for LockError {
             }
             LockError::Unavailable { dir, error } => write!(
                 f,
-                "cannot lock {} ({error}); nothing stops a second whistle-rs from \
+                "cannot lock {} ({error}); nothing stops a second whix from \
                  using it at the same time",
                 dir.display()
             ),
@@ -130,8 +130,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("whistle-rs-dir-lock-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("whix-dir-lock-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir

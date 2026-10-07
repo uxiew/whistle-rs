@@ -114,7 +114,7 @@ impl RustPlugin for StampPlugin {
 
     fn on_response(&self, res: &PluginRes) -> PluginResResult {
         let stamp = if res.param.is_empty() {
-            "whistle-rs"
+            "whix"
         } else {
             res.param.as_str()
         };
@@ -345,7 +345,7 @@ impl RustPlugin for GatePlugin {
 ///
 /// The one certificate answer that needs no certificate, and the one nothing
 /// else in this proxy can express: the connection stays encrypted between the
-/// client and the origin, and whistle-rs relays the bytes without looking. Use
+/// client and the origin, and whix relays the bytes without looking. Use
 /// it for the hosts that pin their certificates, or that no one is debugging.
 ///
 /// ```text

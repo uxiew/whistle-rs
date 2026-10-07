@@ -78,16 +78,15 @@ async fn api(
     )
 }
 
-async fn proxy(rules: String, mode: Option<&str>) -> whistle_rs::embed::Proxy {
+async fn proxy(rules: String, mode: Option<&str>) -> whix::embed::Proxy {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut builder = whistle_rs::embed::Proxy::builder()
+    let mut builder = whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
-        .storage_dir(std::env::temp_dir().join(format!(
-            "whistle-rs-switches-e2e-{}-{n}",
-            std::process::id()
-        )))
+        .storage_dir(
+            std::env::temp_dir().join(format!("whix-switches-e2e-{}-{n}", std::process::id())),
+        )
         .rules(rules);
     if let Some(mode) = mode {
         builder = builder.mode(mode);
@@ -248,19 +247,16 @@ async fn a_plugin_name_is_a_protocol_of_its_own() {
 /// `{rules, values}` — the way a mock plugin carries its bodies.
 struct Mocks;
 
-impl whistle_rs::plugins::RustPlugin for Mocks {
+impl whix::plugins::RustPlugin for Mocks {
     fn name(&self) -> &str {
         "mocks"
     }
 
-    fn on_request(
-        &self,
-        _req: &whistle_rs::plugins::PluginReq,
-    ) -> whistle_rs::plugins::PluginResult {
+    fn on_request(&self, _req: &whix::plugins::PluginReq) -> whix::plugins::PluginResult {
         let mut values = std::collections::HashMap::new();
         values.insert("who".to_string(), "the plugin".to_string());
         values.insert("body".to_string(), "mocked by the plugin".to_string());
-        whistle_rs::plugins::PluginResult {
+        whix::plugins::PluginResult {
             // The two `includeFilter://s:` lines are decided once the response
             // is in — PLUGINS.md offers that in place of `resRulesServer`.
             rules: Some(
@@ -281,13 +277,12 @@ impl whistle_rs::plugins::RustPlugin for Mocks {
 #[tokio::test]
 async fn a_plugins_rules_read_the_values_it_sent_with_them() {
     let at = origin().await;
-    let p = whistle_rs::embed::Proxy::builder()
+    let p = whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
-        .storage_dir(std::env::temp_dir().join(format!(
-            "whistle-rs-switches-e2e-values-{}",
-            std::process::id()
-        )))
+        .storage_dir(
+            std::env::temp_dir().join(format!("whix-switches-e2e-values-{}", std::process::id())),
+        )
         .rules(format!(
             "{at} plugin://mocks reqHeaders://x-store=${{who}}\n"
         ))
@@ -322,14 +317,14 @@ async fn a_plugins_rules_read_the_values_it_sent_with_them() {
 /// A plugin that is nothing but the rules it brings — upstream's `rules.txt`.
 struct Brings(std::net::SocketAddr);
 
-impl whistle_rs::plugins::RustPlugin for Brings {
+impl whix::plugins::RustPlugin for Brings {
     fn name(&self) -> &str {
         "brings"
     }
 
-    fn manifest(&self) -> whistle_rs::plugins::PluginManifest {
+    fn manifest(&self) -> whix::plugins::PluginManifest {
         let at = self.0;
-        whistle_rs::plugins::PluginManifest {
+        whix::plugins::PluginManifest {
             rules: Some(
                 format!(
                     "* resHeaders://x-brought=1\n\
@@ -339,14 +334,11 @@ impl whistle_rs::plugins::RustPlugin for Brings {
                 )
                 .into(),
             ),
-            ..whistle_rs::plugins::PluginManifest::none("brings")
+            ..whix::plugins::PluginManifest::none("brings")
         }
     }
 
-    fn on_request(
-        &self,
-        _req: &whistle_rs::plugins::PluginReq,
-    ) -> whistle_rs::plugins::PluginResult {
+    fn on_request(&self, _req: &whix::plugins::PluginReq) -> whix::plugins::PluginResult {
         Default::default()
     }
 }
@@ -357,13 +349,12 @@ impl whistle_rs::plugins::RustPlugin for Brings {
 #[tokio::test]
 async fn a_plugins_own_rules_apply_below_the_consoles() {
     let at = origin().await;
-    let p = whistle_rs::embed::Proxy::builder()
+    let p = whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
-        .storage_dir(std::env::temp_dir().join(format!(
-            "whistle-rs-switches-e2e-brings-{}",
-            std::process::id()
-        )))
+        .storage_dir(
+            std::env::temp_dir().join(format!("whix-switches-e2e-brings-{}", std::process::id())),
+        )
         .rules(format!(
             "{at}/slot file://(from-the-console)\n{at}/imp file://(plain-in-the-console)\n"
         ))

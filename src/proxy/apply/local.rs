@@ -31,7 +31,7 @@ pub fn short_circuit(
 /// not say `Whistle`. A tool keying off the exact upstream value will not see
 /// it, which is the correct outcome — it is not talking to whistle.
 pub(crate) fn mark_self_generated(headers: &mut HeaderMap) {
-    set_header(headers, "x-server", "whistle-rs");
+    set_header(headers, "x-server", "whix");
 }
 
 pub(super) fn short_circuit_inner(
@@ -386,7 +386,7 @@ pub(super) fn serve_file_family(
                 .status(StatusCode::NOT_FOUND)
                 .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
                 .body(body::full(Bytes::from(format!(
-                    "whistle-rs: file not found <strong>{}</strong>",
+                    "whix: file not found <strong>{}</strong>",
                     encode_html(&candidates.blame)
                 ))))
                 .unwrap(),
@@ -442,7 +442,7 @@ pub(super) fn serve_file_bytes(data: &[u8], path: &str, info: &ReqInfo) -> Respo
 /// whistle. It is a *response* header the mock carries, not proxy bookkeeping,
 /// which is why it is set here and not on everything the proxy answers.
 pub(super) fn with_server(mut resp: Response<DynBody>) -> Response<DynBody> {
-    set_header(resp.headers_mut(), "server", "whistle-rs");
+    set_header(resp.headers_mut(), "server", "whix");
     resp
 }
 

@@ -51,7 +51,7 @@ fn includes_that_hang_do_not_keep_the_proxy_from_answering() {
     let origin = serve(|sock| reply(sock, "origin"));
     // The include that does answer, at once: its rule applies from the start.
     let rules_server = serve(|sock| {
-        let origin = std::env::var("WHISTLE_RS_TEST_ORIGIN").unwrap_or_default();
+        let origin = std::env::var("WHIX_TEST_ORIGIN").unwrap_or_default();
         reply(
             sock,
             &format!("127.0.0.1:{origin}/inc resHeaders://x-included=1\n"),
@@ -59,7 +59,7 @@ fn includes_that_hang_do_not_keep_the_proxy_from_answering() {
     });
     // SAFETY: set before any thread of this test reads it, and nothing else in
     // this test binary reads or writes the environment.
-    unsafe { std::env::set_var("WHISTLE_RS_TEST_ORIGIN", origin.to_string()) };
+    unsafe { std::env::set_var("WHIX_TEST_ORIGIN", origin.to_string()) };
 
     let dir = scratch("includes-hang");
     let rules = dir.join("rules.txt");

@@ -1,4 +1,4 @@
-# whistle-rs example rules — see README.md
+# whix example rules — see README.md
 # serve a site from a local dev server; the request's remaining path follows
 www.example.dev       http://localhost:5173
 # map a domain to another address, keeping its Host header (hosts shorthand)

@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     /// Server state backed by a throwaway storage dir, so the tests never touch
-    /// the developer's real `~/.whistle-rs`.
+    /// the developer's real `~/.whix`.
     ///
     /// One dir per state, not one per run: these tests execute in parallel and
     /// would otherwise race to write the same root CA, now and then reading a
@@ -1318,7 +1318,7 @@ mod tests {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = Config {
             storage_dir: std::env::temp_dir()
-                .join(format!("whistle-rs-ws-tests-{}-{n}", std::process::id())),
+                .join(format!("whix-ws-tests-{}-{n}", std::process::id())),
             persist_sessions: false,
             ..Config::default()
         };

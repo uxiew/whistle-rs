@@ -16,7 +16,7 @@ use super::*;
 /// again the moment the proxy sees it (`checkPluginReqOnce`,
 /// `_original/lib/util/index.js:3414-3425`). This port uses a fixed, documented
 /// name rather than a secret one: it has no privileged internal service to
-/// protect, and a stable name is what lets a client — or whistle-rs's own
+/// protect, and a stable name is what lets a client — or whix's own
 /// tooling — deliberately exercise an `internal` rule.
 ///
 /// Any non-empty value marks the request. The header is removed before the

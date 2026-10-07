@@ -1,6 +1,6 @@
 // The servers `cases-proxy.js` needs, beyond the harness's own echo origin.
 //
-// The one that matters is the **recording proxy**. Both whistle and whistle-rs
+// The one that matters is the **recording proxy**. Both whistle and whix
 // are pointed at the same one, and what each of them *says* to it — absolute
 // form or CONNECT, which hop headers, which credential — is the finding. A
 // response alone cannot show any of that: two proxies that reach the same origin
@@ -334,10 +334,10 @@ const pacServer = background(
 //
 // `https-proxy://` puts TLS on the hop itself, which needs a certificate. It is
 // self-signed and both proxies have to be told to accept it: whistle does by
-// default (`rejectUnauthorized` is off unless `--safe`), whistle-rs needs
+// default (`rejectUnauthorized` is off unless `--safe`), whix needs
 // `--insecure-upstream`. The corpus header says so.
 function selfSigned() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whistle-rs-hop-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whix-hop-'));
   const key = path.join(dir, 'key.pem');
   const cert = path.join(dir, 'cert.pem');
   execFileSync('openssl', [

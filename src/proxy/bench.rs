@@ -559,7 +559,7 @@ fn proxied_request_latency() {
         .enable_all()
         .build()
         .expect("runtime");
-    let dir = std::env::temp_dir().join(format!("whistle-rs-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("whix-bench-{}", std::process::id()));
 
     rt.block_on(async {
         // One proxy per configuration, all live at once, so a client can send
@@ -783,7 +783,7 @@ fn tls_handshake_latency() {
         .enable_all()
         .build()
         .expect("runtime");
-    let dir = std::env::temp_dir().join(format!("whistle-rs-sni-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("whix-sni-bench-{}", std::process::id()));
 
     rt.block_on(async {
         let setups = [

@@ -66,13 +66,12 @@ async fn a_script_that_will_not_stop_holds_its_own_request_and_nothing_else() {
         "slow.test host://{addr}\nslow.test reqScript://{{s.js}}\nquick.test host://{addr}\n\n\
          ``` s.js\n{RUNAWAY}\n```\n"
     );
-    let proxy = whistle_rs::embed::Proxy::builder()
+    let proxy = whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
-        .storage_dir(std::env::temp_dir().join(format!(
-            "whistle-rs-script-limit-e2e-{}",
-            std::process::id()
-        )))
+        .storage_dir(
+            std::env::temp_dir().join(format!("whix-script-limit-e2e-{}", std::process::id())),
+        )
         .rules(rules)
         .start()
         .await

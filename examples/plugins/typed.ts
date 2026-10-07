@@ -1,4 +1,4 @@
-// A whistle-rs plugin written in TypeScript.
+// A whix plugin written in TypeScript.
 //
 // The SDK ships its own .d.ts, so hooks, contexts and the capability flags are
 // all typed. `satisfies Plugin` checks the shape without widening it, so
@@ -6,10 +6,10 @@
 //
 // Build, then run the emitted JS:
 //   npx tsc examples/plugins/typed.ts --outDir /tmp/p --module commonjs --target es2020
-//   whistle-rs --node-plugin typed=/tmp/p/typed.js
+//   whix --node-plugin typed=/tmp/p/typed.js
 //
 // Or run it directly with a TS-aware loader:
-//   whistle-rs --node-plugin typed=examples/plugins/typed.ts   # needs NODE_OPTIONS=--import=tsx
+//   whix --node-plugin typed=examples/plugins/typed.ts   # needs NODE_OPTIONS=--import=tsx
 
 import {
   start,
@@ -18,7 +18,7 @@ import {
   type PipeCtx,
   type RequestCtx,
   type ResponseCtx,
-} from '../../sdk/whistle-rs-plugin';
+} from '../../sdk/whix-plugin';
 
 interface ApiPayload {
   userId?: number;

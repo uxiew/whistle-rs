@@ -120,14 +120,14 @@ where
     panic!("the console never showed it");
 }
 
-fn proxy_with(rules: &str) -> impl std::future::Future<Output = whistle_rs::embed::Proxy> {
+fn proxy_with(rules: &str) -> impl std::future::Future<Output = whix::embed::Proxy> {
     let rules = rules.to_string();
     async move {
-        whistle_rs::embed::Proxy::builder()
+        whix::embed::Proxy::builder()
             .port(0)
             .persist_sessions(false)
             .storage_dir(std::env::temp_dir().join(format!(
-                "whistle-rs-console-e2e-{}-{:?}",
+                "whix-console-e2e-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             )))
@@ -139,7 +139,7 @@ fn proxy_with(rules: &str) -> impl std::future::Future<Output = whistle_rs::embe
 }
 
 /// Every frame the console has for a session, as `(direction, preview)`.
-fn frames_of(state: &Arc<whistle_rs::proxy::AppState>) -> Vec<(String, String)> {
+fn frames_of(state: &Arc<whix::proxy::AppState>) -> Vec<(String, String)> {
     state
         .ws_frames
         .lock()
@@ -443,8 +443,8 @@ async fn a_request_that_comes_back_is_refused() {
         proxy.addr(),
         &format!(
             "GET /x HTTP/1.1\r\nHost: came-back.test\r\n{}: {}\r\n",
-            whistle_rs::proxy::upstream::LOOP_HEADER,
-            whistle_rs::proxy::upstream::loop_nonce()
+            whix::proxy::upstream::LOOP_HEADER,
+            whix::proxy::upstream::loop_nonce()
         ),
         "",
     )
@@ -461,7 +461,7 @@ async fn a_request_that_comes_back_is_refused() {
 async fn an_oversized_body_is_refused_and_changes_nothing() {
     let proxy = proxy_with("keep.test statusCode://204\n").await;
     let addr = proxy.addr();
-    let huge = "x".repeat(whistle_rs::config::CONSOLE_BODY_LIMIT + 1);
+    let huge = "x".repeat(whix::config::CONSOLE_BODY_LIMIT + 1);
     let (status, body) = raw(
         addr,
         &format!("POST /api/rules HTTP/1.1\r\nHost: {addr}\r\ncontent-type: text/plain\r\n"),
@@ -490,7 +490,7 @@ async fn an_oversized_body_is_refused_and_changes_nothing() {
 /// the admin password off its first request.
 #[tokio::test]
 async fn a_plugin_page_does_not_receive_the_console_login() {
-    use whistle_rs::plugins::{PluginManifest, PluginReq, PluginResult, RustPlugin, ui};
+    use whix::plugins::{PluginManifest, PluginReq, PluginResult, RustPlugin, ui};
 
     struct Echo;
     impl RustPlugin for Echo {
@@ -511,11 +511,11 @@ async fn a_plugin_page_does_not_receive_the_console_login() {
         }
     }
 
-    let proxy = whistle_rs::embed::Proxy::builder()
+    let proxy = whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
         .storage_dir(
-            std::env::temp_dir().join(format!("whistle-rs-plugin-ui-login-{}", std::process::id())),
+            std::env::temp_dir().join(format!("whix-plugin-ui-login-{}", std::process::id())),
         )
         .plugin(Echo)
         .start()
@@ -753,12 +753,10 @@ async fn the_session_list_can_be_polled_as_a_cursor() {
 /// an embedder can set it and read it back like the preview limit.
 #[tokio::test]
 async fn the_rewrite_limit_can_be_set_and_read_back() {
-    let proxy = whistle_rs::embed::Proxy::builder()
+    let proxy = whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
-        .storage_dir(
-            std::env::temp_dir().join(format!("whistle-rs-rewrite-cap-{}", std::process::id())),
-        )
+        .storage_dir(std::env::temp_dir().join(format!("whix-rewrite-cap-{}", std::process::id())))
         .body_rewrite_cap(64)
         .start()
         .await

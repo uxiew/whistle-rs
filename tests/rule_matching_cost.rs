@@ -15,8 +15,8 @@
 use std::time::{Duration, Instant};
 
 use hyper::HeaderMap;
-use whistle_rs::proxy::apply::build_req_info;
-use whistle_rs::rules::RuleManager;
+use whix::proxy::apply::build_req_info;
+use whix::rules::RuleManager;
 
 /// A rules file of `lines` rules, `regexps` of them `/…/` patterns spread
 /// through it, the rest host and wildcard patterns — the mix a file kept by

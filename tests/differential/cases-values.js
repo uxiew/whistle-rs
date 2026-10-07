@@ -27,7 +27,7 @@
 //
 // Most of these cases change something on the real-whistle side; of the ones
 // that do not, the majority are the point: "upstream does nothing here" is the fact, and
-// whistle-rs doing something is the difference.
+// whix doing something is the difference.
 //
 // ── Cases expected to differ ───────────────────────────────────────────────
 //
@@ -44,7 +44,7 @@
 //     Upstream has no shape test: for a text operator *every* non-inline value
 //     is a path (`readRuleValue`, `_original/lib/util/index.js:1189-1213`), so
 //     `resBody://hello` opens a file called `hello`, fails, and the operator
-//     does nothing. whistle-rs keeps a bare value as the literal it already is —
+//     does nothing. whix keeps a bare value as the literal it already is —
 //     declared in `value_source` (`src/proxy/apply/value_sources.rs`). A
 //     `{name}` that names nothing used to be on this list too (`a value that
 //     names nothing …`, `an unterminated fence …`), written into the traffic as

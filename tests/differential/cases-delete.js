@@ -24,7 +24,7 @@
 //     discards the body *injections* and forwards the real body untouched
 //     (`util/index.js:3591-3598`). That is neither what upstream's own code
 //     means nor what <https://wproxy.org/docs/rules/delete.html> promises, and
-//     `delete://body` is an explicit request for an empty body, so whistle-rs
+//     `delete://body` is an explicit request for an empty body, so whix
 //     empties it.
 //
 //     `reqBody with an empty value` and `resBody with an empty value` were on

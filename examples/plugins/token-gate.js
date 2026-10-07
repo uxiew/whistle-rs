@@ -1,7 +1,7 @@
-// A whistle-rs *gate*: it decides whether a request may proceed, keeps a tally
+// A whix *gate*: it decides whether a request may proceed, keeps a tally
 // of what it saw, and serves that tally as its own page.
 //
-//   whistle-rs --node-plugin gate=examples/plugins/token-gate.js
+//   whix --node-plugin gate=examples/plugins/token-gate.js
 //   # rule:  example.com  plugin://gate/s3cret
 //   # page:  http://127.0.0.1:<proxy port>/plugin/gate/
 //
@@ -12,12 +12,12 @@
 //   onUi        — an ordinary HTTP handler for the plugin's own pages.
 //
 // The gate is the one hook in this SDK that **fails closed**: if it throws, or
-// this process is not reachable, whistle-rs blocks the matched requests with a
+// this process is not reachable, whix blocks the matched requests with a
 // 502 rather than letting them through. A gate that admits everything when it
 // breaks is not a gate. Everything else here degrades the other way — a stats
 // hook that dies costs the request nothing at all.
 
-const { start } = require('../../sdk/whistle-rs-plugin');
+const { start } = require('../../sdk/whix-plugin');
 
 const seen = { admitted: 0, blocked: 0, byStatus: {} };
 

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 /// Package defaults taken verbatim from `_original/package.json`.
 pub const DEFAULT_PORT: u16 = 8899;
 pub const DEFAULT_TIMEOUT_MS: u64 = 360_000;
-pub const DATA_DIRNAME: &str = ".whistle-rs";
-pub const NAME: &str = "whistle-rs";
+pub const DATA_DIRNAME: &str = ".whix";
+pub const NAME: &str = "whix";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The whole running configuration. In the original this is a giant mutable
@@ -472,7 +472,7 @@ fn expand_mode(token: &str) -> Option<&'static [&'static str]> {
 /// Every mode token upstream recognises and this port has nothing to do with.
 ///
 /// Written out rather than left to fall through to `unknown`, because the two
-/// answers are different advice: "whistle has this and whistle-rs does not" is
+/// answers are different advice: "whistle has this and whix does not" is
 /// something to look up, and "no such mode" is a typo to fix. Grouped by why.
 const INERT_MODES: &[&str] = &[
     // Console options: which switches the web UI offers, and how it looks.

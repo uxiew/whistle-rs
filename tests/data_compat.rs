@@ -15,7 +15,7 @@
 //! If a change means old data cannot be read as it was, that is a migration to
 //! write and to document, not this test to edit.
 //!
-//! `0.1.0/` was made by driving whistle-rs 0.1.0 through the kinds of request
+//! `0.1.0/` was made by driving whix 0.1.0 through the kinds of request
 //! it records (plain, binary, truncated, gzip, event stream, GBK, a body that
 //! would not decompress, a refused connection, a POST, a Composer request),
 //! with the root CA left out: a private key does not belong in a repository.
@@ -23,10 +23,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use whistle_rs::proxy::outcome::Phase;
-use whistle_rs::proxy::persist::{PersistedSession, SessionStore};
-use whistle_rs::rules::RuleManager;
-use whistle_rs::rules::storage::{load_groups, load_values};
+use whix::proxy::outcome::Phase;
+use whix::proxy::persist::{PersistedSession, SessionStore};
+use whix::rules::RuleManager;
+use whix::rules::storage::{load_groups, load_values};
 
 /// History files are dated; this keeps any date as within retention.
 const FOREVER_DAYS: u32 = 36_500;
@@ -35,10 +35,7 @@ fn copy_of(version: &str, name: &str) -> PathBuf {
     let from = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
         .join(version);
-    let to = std::env::temp_dir().join(format!(
-        "whistle-rs-data-compat-{name}-{}",
-        std::process::id()
-    ));
+    let to = std::env::temp_dir().join(format!("whix-data-compat-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&to);
     copy_dir(&from, &to);
     to

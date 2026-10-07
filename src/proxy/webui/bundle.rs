@@ -6,7 +6,7 @@ use super::*;
 
 /// The marker that identifies an exported bundle, so a file that merely happens
 /// to be JSON is never applied as one.
-pub(super) const BUNDLE_MARKER: &str = "whistle_rs";
+pub(super) const BUNDLE_MARKER: &str = "whix";
 
 /// Everything the console can edit, as one object: every rule group with the
 /// text and the enabled state it has, and the whole values store.
@@ -108,7 +108,7 @@ pub(super) fn bundle_export(state: &Arc<AppState>) -> Response<DynBody> {
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .header(
             hyper::header::CONTENT_DISPOSITION,
-            "attachment; filename=\"whistle-rs-rules-and-values.json\"",
+            "attachment; filename=\"whix-rules-and-values.json\"",
         )
         .body(body::full(Bytes::from(body)))
         .unwrap()

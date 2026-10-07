@@ -83,12 +83,12 @@ async fn through(
 }
 
 /// A proxy with one stored rule and one named group, under a mode.
-async fn proxy(origin: std::net::SocketAddr, mode: &str) -> whistle_rs::embed::Proxy {
-    let mut builder = whistle_rs::embed::Proxy::builder()
+async fn proxy(origin: std::net::SocketAddr, mode: &str) -> whix::embed::Proxy {
+    let mut builder = whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
         .storage_dir(std::env::temp_dir().join(format!(
-            "whistle-rs-header-rules-e2e-{}-{:?}",
+            "whix-header-rules-e2e-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         )))

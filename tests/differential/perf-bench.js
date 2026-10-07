@@ -13,7 +13,7 @@
 //   RTT_MS=20 node perf-bench.js         # 20 ms round trip between proxy and origin
 //   ONLY=h2,cancel-h2 node perf-bench.js # some scenarios; --json FILE writes the raw figures
 //
-//   PORT_BASE (20400) whistle · +1 whistle-rs · +2 http origin · +3 https origin
+//   PORT_BASE (20400) whistle · +1 whix · +2 http origin · +3 https origin
 //   · +4/+5 the delay relays in front of them when RTT_MS is set
 //
 // **Why a relay.** On loopback a TCP or TLS handshake costs well under a
@@ -42,7 +42,7 @@ const PORTS = { whistle: BASE, rs: BASE + 1 };
 const [ORIGIN_HTTP, ORIGIN_TLS, RELAY_HTTP, RELAY_TLS] = [BASE + 2, BASE + 3, BASE + 4, BASE + 5];
 const RTT = Number(process.env.RTT_MS || 0);
 const ROUNDS = Number(process.env.ROUNDS || 3);
-const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'release', 'whistle-rs');
+const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'release', 'whix');
 const ONLY = process.env.ONLY ? new Set(process.env.ONLY.split(',')) : null;
 const PROXIES = (process.env.PROXIES || 'whistle,rs').split(',');
 const JSON_OUT = (() => {
@@ -197,7 +197,7 @@ function startProxy(which) {
   // whistle with `capture`, because it does not decrypt HTTPS by default and
   // this port does: without it the https scenarios would measure a tunnel on
   // one side and an interception on the other. Its origin certificate check is
-  // off by default; whistle-rs's is on, hence `--insecure-upstream`.
+  // off by default; whix's is on, hence `--insecure-upstream`.
   const child = which === 'whistle'
     ? spawn(process.execPath, ['-e', `
         require(${JSON.stringify(WHISTLE.dir)})(

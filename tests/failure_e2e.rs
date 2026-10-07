@@ -39,16 +39,16 @@ fn body(response: &str) -> &str {
 
 #[tokio::test]
 async fn a_failed_request_tells_the_same_story_everywhere() {
-    let dir = std::env::temp_dir().join(format!("whistle-rs-failure-e2e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("whix-failure-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let dead = {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap()
     };
 
-    let observed: Arc<Mutex<Vec<whistle_rs::proxy::Session>>> = Arc::default();
+    let observed: Arc<Mutex<Vec<whix::proxy::Session>>> = Arc::default();
     let sink = observed.clone();
-    let proxy = whistle_rs::embed::Proxy::builder()
+    let proxy = whix::embed::Proxy::builder()
         .host("127.0.0.1".parse().unwrap())
         .storage_dir(&dir)
         .persist_sessions(true)
@@ -62,12 +62,12 @@ async fn a_failed_request_tells_the_same_story_everywhere() {
     // which session to look up.
     let answer = get(addr, &format!("http://{dead}/gone"), &dead.to_string()).await;
     assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
-    assert_eq!(header(&answer, "x-whistle-rs-error"), Some("connect"));
-    let id: u64 = header(&answer, "x-whistle-rs-session")
+    assert_eq!(header(&answer, "x-whix-error"), Some("connect"));
+    let id: u64 = header(&answer, "x-whix-session")
         .expect("names its session")
         .parse()
         .unwrap();
-    let reason = body(&answer).trim_start_matches("whistle-rs: ").to_string();
+    let reason = body(&answer).trim_start_matches("whix: ").to_string();
 
     // The console's API: the list and the detail agree with the client.
     let list = get(addr, "/sessions.json", &addr.to_string()).await;
@@ -118,7 +118,7 @@ async fn a_failed_request_tells_the_same_story_everywhere() {
     proxy.shutdown().await;
 
     // A restart: the history comes back with the reason still on it.
-    let loaded = whistle_rs::proxy::persist::SessionStore::load(&sessions_dir, 600, 7);
+    let loaded = whix::proxy::persist::SessionStore::load(&sessions_dir, 600, 7);
     let back = loaded
         .iter()
         .find(|s| s.id == id)

@@ -49,7 +49,7 @@
 //!
 //! ```text
 //! proxy → plugin   POST /ws/frames HTTP/1.1
-//!                  x-whistle-rs-ws: <base64 JSON metadata, direction included>
+//!                  x-whix-ws: <base64 JSON metadata, direction included>
 //!                  transfer-encoding: chunked
 //! plugin → proxy   HTTP/1.1 200 OK          (head only — sent immediately)
 //! proxy → plugin   <record>                 (one data frame)
@@ -97,7 +97,7 @@ use super::RustPlugin;
 use crate::proxy::body::{self, BodyError, DynBody};
 
 /// Header carrying the base64-encoded JSON metadata of a hooked session.
-pub const WS_META_HEADER: &str = "x-whistle-rs-ws";
+pub const WS_META_HEADER: &str = "x-whix-ws";
 
 /// The plugin endpoint serving the frame hook.
 const FRAMES_PATH: &str = "/ws/frames";

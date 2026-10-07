@@ -68,12 +68,12 @@ async fn through(
     }
 }
 
-async fn proxy(rules: String, mode: &str) -> whistle_rs::embed::Proxy {
-    let mut b = whistle_rs::embed::Proxy::builder()
+async fn proxy(rules: String, mode: &str) -> whix::embed::Proxy {
+    let mut b = whix::embed::Proxy::builder()
         .port(0)
         .persist_sessions(false)
         .storage_dir(std::env::temp_dir().join(format!(
-            "whistle-rs-forwarded-e2e-{}-{:?}",
+            "whix-forwarded-e2e-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         )))

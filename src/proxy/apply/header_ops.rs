@@ -141,7 +141,7 @@ pub(super) fn merge_header_ops(resolved: &Resolved, protocol: &str) -> Vec<(Stri
 
 /// Parse one header operator value into `name` → `value` pairs: `{json}`, or a
 /// query string of `name=value` pairs (`resHeaders://x-a=1&x-b=2` is two
-/// headers, as `parseQuery` has it). The `name:value` spelling is a whistle-rs
+/// headers, as `parseQuery` has it). The `name:value` spelling is a whix
 /// convenience, not upstream syntax.
 ///
 /// A value is a *list* because the JSON spelling may give one: upstream assigns

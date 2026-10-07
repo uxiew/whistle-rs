@@ -354,7 +354,7 @@ pub const MULTI_MATCH: &[&str] = &[
     "cssPrepend",
     "rulesFile",
     "resScript",
-    // ── whistle-rs additions ──
+    // ── whix additions ──
     // Upstream resolves both of these to a single rule (`log` is absent from
     // `multiMatchs`; `pipe` is resolved by `resolveSingleRule`,
     // `_original/lib/rules/rules.js:2384`). This port lets them accumulate

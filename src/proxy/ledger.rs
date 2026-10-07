@@ -1,6 +1,6 @@
 //! Every request becomes exactly one session, however it ends. The [`Ledger`]
 //! is that promise: it records a request that failed — at which phase, with
-//! the `x-whistle-rs-error` and `x-whistle-rs-session` headers on the 502 this
+//! the `x-whix-error` and `x-whix-session` headers on the 502 this
 //! proxy answers — and one the client walked away from.
 
 use super::*;
@@ -29,11 +29,11 @@ impl std::error::Error for Destroyed {}
 /// The header on a response this proxy made up because the request failed,
 /// naming the [`outcome::Phase`] it failed in. Its presence is what tells a
 /// `502` from here apart from a `502` the origin sent.
-pub const ERROR_HEADER: &str = "x-whistle-rs-error";
+pub const ERROR_HEADER: &str = "x-whix-error";
 
 /// The header carrying the id of the session a failed request was recorded
 /// as, so the client that got the error can find it in the console.
-pub const SESSION_HEADER: &str = "x-whistle-rs-session";
+pub const SESSION_HEADER: &str = "x-whix-session";
 
 /// A request on its way to becoming a session.
 ///

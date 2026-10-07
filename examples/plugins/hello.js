@@ -1,12 +1,12 @@
-// A minimal whistle-rs plugin: inject a rule, and mock one path.
+// A minimal whix plugin: inject a rule, and mock one path.
 //
-//   whistle-rs --node-plugin hello=examples/plugins/hello.js
+//   whix --node-plugin hello=examples/plugins/hello.js
 //   # then add a rule:  example.com plugin://hello
 //
 // Replaces the older example that hand-rolled the HTTP/JSON protocol — the SDK
 // handles the wire format, the manifest, and error isolation.
 
-const { start } = require('../../sdk/whistle-rs-plugin');
+const { start } = require('../../sdk/whix-plugin');
 
 start({
   name: 'hello',
@@ -17,7 +17,7 @@ start({
       return ctx.respond({
         statusCode: 200,
         headers: { 'content-type': 'application/json; charset=utf-8' },
-        body: { hello: 'from whistle-rs', url: ctx.url, method: ctx.method },
+        body: { hello: 'from whix', url: ctx.url, method: ctx.method },
       });
     }
 

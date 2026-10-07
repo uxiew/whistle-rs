@@ -1899,7 +1899,7 @@ fn url_replace_sees_what_params_wrote() {
 /// specifically to override something lost to the thing it was overriding.
 #[test]
 fn a_merged_rule_wins_the_contest() {
-    let dir = std::env::temp_dir().join(format!("whistle-rs-merge-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("whix-merge-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let inc = dir.join("inc.txt");
     std::fs::write(&inc, "example.com resHeaders://x-src=inc host://9.9.9.9\n").expect("write");
@@ -2718,7 +2718,7 @@ fn loaded(text: &str) -> Resolved {
 
 /// A scratch directory for the value files these tests read.
 fn value_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("whistle-rs-values-{name}"));
+    let dir = std::env::temp_dir().join(format!("whix-values-{name}"));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -2815,7 +2815,7 @@ fn several_paths_in_one_value_join_rather_than_race() {
 /// never reach an origin as a request body.
 #[test]
 fn a_value_that_cannot_be_read_never_reaches_the_origin_as_a_path() {
-    let missing = "/nonexistent-whistle-rs/value.json";
+    let missing = "/nonexistent-whix/value.json";
     let resolved = loaded(&format!(
         "a.com reqHeaders://{missing}\na.com reqBody://{missing}\na.com resBody://{missing}\n"
     ));
@@ -3142,7 +3142,7 @@ fn a_merged_operator_outranks_even_the_first_important_line() {
     assert!(order_key(u32::MAX as usize - 1, true) < order_key(0, false));
 
     // And it decides the shared slot the same way.
-    let dir = std::env::temp_dir().join(format!("whistle-rs-order-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("whix-order-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let inc = dir.join("inc.txt");
     std::fs::write(&inc, "a.com statusCode://204\n").expect("write");
@@ -3360,7 +3360,7 @@ fn a_self_made_response_says_who_made_it() {
         let resp = short_circuit(&info, &resolved, test_env(), None).expect("an answer");
         assert_eq!(
             resp.headers().get("x-server").map(|v| v.to_str().unwrap()),
-            Some("whistle-rs"),
+            Some("whix"),
             "{rule}"
         );
     }
@@ -3671,7 +3671,7 @@ struct Fixtures(PathBuf);
 
 impl Fixtures {
     fn new(tag: &str) -> Fixtures {
-        let dir = std::env::temp_dir().join(format!("whistle-rs-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("whix-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create fixture dir");
         Fixtures(dir)
@@ -4566,15 +4566,15 @@ fn only_a_file_read_from_disk_names_the_proxy_in_server() {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
     };
-    assert_eq!(served("file", &path).as_deref(), Some("whistle-rs"));
-    assert_eq!(served("tpl", &path).as_deref(), Some("whistle-rs"));
+    assert_eq!(served("file", &path).as_deref(), Some("whix"));
+    assert_eq!(served("tpl", &path).as_deref(), Some("whix"));
     assert_eq!(served("file", "(inline)"), None);
     assert_eq!(served("file", &fx.path("nope.txt")), None);
     // A parsed raw response brings its own headers and replaces the block
     // `Server` lives in; one with no blank line falls back to it.
     let raw = fx.write("r.http", b"HTTP/1.1 200 OK\r\nX-A: 1\r\n\r\nb");
     assert_eq!(served("rawfile", &raw), None);
-    assert_eq!(served("rawfile", &path).as_deref(), Some("whistle-rs"));
+    assert_eq!(served("rawfile", &path).as_deref(), Some("whix"));
 }
 
 /// The name a body was stored under is the only place its extension is
@@ -6868,7 +6868,7 @@ fn res_cors_negotiates() {
     );
 }
 
-/// `enable://cors` is not an upstream flag; whistle-rs keeps it as an alias
+/// `enable://cors` is not an upstream flag; whix keeps it as an alias
 /// for `resCors://enable` rather than as a blanket `*`.
 #[test]
 fn enable_cors_is_an_alias_for_res_cors_enable() {
@@ -7950,8 +7950,8 @@ fn a_response_body_operator_busts_the_request_cache() {
         "jsPrepend://x",
         "cssBody://x",
         "attachment://f.txt",
-        "resWrite:///tmp/whistle-rs-test-write",
-        "resWriteRaw:///tmp/whistle-rs-test-write-raw",
+        "resWrite:///tmp/whix-test-write",
+        "resWriteRaw:///tmp/whix-test-write-raw",
     ] {
         assert!(!survives(rule), "{rule} must bust the cache");
     }

@@ -35,7 +35,7 @@
 //! authority only when the client sent no SNI at all. That is upstream's
 //! `useSNI || socket.tunnelHostname` (`lib/https/index.js:1281-1296`).
 //!
-//! Before this module existed, whistle-rs signed for the CONNECT authority
+//! Before this module existed, whix signed for the CONNECT authority
 //! unconditionally. Where the two agree — nearly always — nothing changes.
 //! Where they differ the old behaviour was a broken handshake, because the
 //! client checks the name it asked for: a SOCKS5 client that resolves DNS itself
@@ -224,7 +224,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 
 /// What to do with an intercepted TLS connection.
 pub enum Decision {
-    /// Intercept with whistle-rs's own generated certificate — what happens with
+    /// Intercept with whix's own generated certificate — what happens with
     /// no `sniCallback://` rule, and what every plugin failure falls back to.
     Generated,
     /// Intercept, presenting a certificate a plugin chose.
@@ -848,7 +848,7 @@ mod tests {
         rt().block_on(async {
             let config = crate::config::Config {
                 storage_dir: std::env::temp_dir()
-                    .join(format!("whistle-rs-sni-peek-{}", std::process::id())),
+                    .join(format!("whix-sni-peek-{}", std::process::id())),
                 ..crate::config::Config::default()
             };
             let ca = crate::ca::CertAuthority::load_or_create(&config).unwrap();
@@ -984,8 +984,7 @@ mod tests {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = crate::config::Config {
-            storage_dir: std::env::temp_dir()
-                .join(format!("whistle-rs-sni-{}-{n}", std::process::id())),
+            storage_dir: std::env::temp_dir().join(format!("whix-sni-{}-{n}", std::process::id())),
             persist_sessions: false,
             ..crate::config::Config::default()
         };
@@ -1437,7 +1436,7 @@ mod tests {
         });
     }
 
-    /// `{"intercept": true}` — intercept with the certificate whistle-rs would
+    /// `{"intercept": true}` — intercept with the certificate whix would
     /// have generated anyway.
     #[test]
     fn intercept_true_means_the_generated_certificate() {

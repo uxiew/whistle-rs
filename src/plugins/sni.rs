@@ -36,7 +36,7 @@
 //!
 //! | reply | meaning |
 //! |-------|---------|
-//! | `{"intercept": true}` | intercept, with whistle-rs's own generated certificate |
+//! | `{"intercept": true}` | intercept, with whix's own generated certificate |
 //! | `{"intercept": false}` | **do not intercept** — relay the connection opaquely |
 //! | `{"key": "…", "cert": "…", "mtime": 0}` | intercept, presenting this certificate |
 //! | `{"reuse": true}` | intercept, with the certificate this plugin last supplied |
@@ -55,7 +55,7 @@
 //! with no `sniCallback://` rule at all, and a `WARN` names the plugin and the
 //! server name.
 //!
-//! This is the one place in whistle-rs where the failure policy is a **policy
+//! This is the one place in whix where the failure policy is a **policy
 //! call rather than an implementation detail**, and it is worth being explicit
 //! about why, because the project's settled posture elsewhere is to fail closed
 //! (a broken gate blocks, a failing PAC is a `502`, origin TLS verification is
@@ -70,7 +70,7 @@
 //!   failure should keep intercepting with the certificate the proxy would have
 //!   generated anyway.
 //!
-//! whistle-rs takes the second, for two reasons. The certificate it falls back
+//! whix takes the second, for two reasons. The certificate it falls back
 //! to is its own, signed by the root the user deliberately installed — it is not
 //! a third party's identity, and presenting it is precisely what this proxy does
 //! for every other host. And a plugin restart would otherwise punch a silent
@@ -143,7 +143,7 @@ pub struct PluginCert {
 /// What an `sni` hook decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SniVerdict {
-    /// No opinion: intercept with whistle-rs's own generated certificate, which
+    /// No opinion: intercept with whix's own generated certificate, which
     /// is what would have happened had no rule matched. Also the answer for
     /// every failure — see the module docs.
     Generated,

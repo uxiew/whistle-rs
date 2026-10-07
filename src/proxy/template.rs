@@ -27,7 +27,7 @@
 //! `{callback}({ec: 0})` and a request of `?callback=test`.
 //!
 //! See `docs/TEMPLATES.md` for the user-facing reference, including the
-//! variables whistle-rs cannot yet resolve.
+//! variables whix cannot yet resolve.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -223,7 +223,7 @@ fn interpolate_vars(body: &str, info: &ReqInfo, query: &Query, env: ProxyEnv<'_>
 
 /// Resolve one whitelisted variable.
 ///
-/// `None` means "leave the placeholder in the output": whistle-rs has no data
+/// `None` means "leave the placeholder in the output": whix has no data
 /// source for the name (client identity, `${whistle.*}` plugin values).
 fn resolve_var(
     info: &ReqInfo,
@@ -327,7 +327,7 @@ fn resolve_var(
         "clientport" => info.client_port.map(|p| p.to_string()).unwrap_or_default(),
 
         // -- known to whistle, unavailable here ------------------------------
-        // whistle-rs has no request-id or client-identity bookkeeping, and
+        // whix has no request-id or client-identity bookkeeping, and
         // nothing records the accepted socket's peer address separately from
         // `${clientIp}`. Upstream's own answer for each of these is `''` when
         // the field is unset, so "" is the same non-answer rather than a
@@ -1000,7 +1000,7 @@ fn random_uuid() -> String {
 }
 
 /// The machine's hostname, for `${hostname}`. Falls back to "" when the OS
-/// provides no answer; whistle-rs never fails a render over this.
+/// provides no answer; whix never fails a render over this.
 fn os_hostname() -> String {
     std::process::Command::new("hostname")
         .output()

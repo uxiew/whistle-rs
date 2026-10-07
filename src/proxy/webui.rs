@@ -155,7 +155,7 @@ fn root_ca(state: &Arc<AppState>) -> Response<DynBody> {
         .header(hyper::header::CONTENT_TYPE, "application/x-x509-ca-cert")
         .header(
             hyper::header::CONTENT_DISPOSITION,
-            "attachment; filename=\"whistle-rs-rootCA.crt\"",
+            "attachment; filename=\"whix-rootCA.crt\"",
         )
         .body(body::full(Bytes::from(
             state.ca.root_cert_pem().to_string(),

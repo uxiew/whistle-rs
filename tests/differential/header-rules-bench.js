@@ -39,7 +39,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const BASE = Number(process.env.PORT_BASE || 20500);
-const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whistle-rs');
+const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whix');
 /** The whistle this run measures — `WHISTLE_PKG`, or the baseline. */
 const WHISTLE = require('./whistle-pkg');
 // Set by `run.js`; see mode-bench.js.

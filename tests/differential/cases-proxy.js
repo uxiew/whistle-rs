@@ -12,7 +12,7 @@
 // `forward-servers.js`):
 //
 //   +0  real whistle          +10  the recording proxy
-//   +1  whistle-rs            +11  a second echo origin
+//   +1  whix            +11  a second echo origin
 //   +2  the echo origin       +12  a proxy that always answers 407
 //                             +13  a proxy that accepts and never answers
 //                             +14  nothing, ever: connection refused

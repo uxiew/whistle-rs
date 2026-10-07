@@ -71,7 +71,7 @@ pub(super) async fn plugin_index(state: &Arc<AppState>) -> Response<DynBody> {
         format!("<ul>{items}</ul>")
     };
     html_ok(format!(
-        "<!doctype html><meta charset=utf-8><title>whistle-rs plugins</title>\
+        "<!doctype html><meta charset=utf-8><title>whix plugins</title>\
          <style>body{{font:14px/1.6 system-ui;margin:2rem}}</style>\
          <h1>Plugin pages</h1>{list}"
     ))

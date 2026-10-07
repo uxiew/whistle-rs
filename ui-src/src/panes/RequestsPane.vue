@@ -23,7 +23,7 @@ import {
  */
 const showCapture = ref(captureFiltering.value);
 
-const HEIGHT_KEY = 'whistle-rs-detail-h';
+const HEIGHT_KEY = 'whix-detail-h';
 
 /**
  * The detail panel's height is remembered, because the useful split depends on

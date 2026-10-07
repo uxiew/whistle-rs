@@ -1,4 +1,4 @@
-// Differences between whistle and whistle-rs that were measured, understood and
+// Differences between whistle and whix that were measured, understood and
 // accepted — one entry per **case** and **field**, with the upstream version it
 // was measured against and the reason.
 //

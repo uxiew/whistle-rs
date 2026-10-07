@@ -56,11 +56,11 @@ export const DETAIL_TABS: { key: DetailTab; label: string }[] = [
   { key: 'frames', label: 'Frames' },
 ];
 
-const THEME_KEY = 'whistle-rs-theme';
-const COMPOSE_KEY = 'whistle-rs-composer';
-const TEST_KEY = 'whistle-rs-test-rules';
-const COMPOSE_HISTORY_KEY = 'whistle-rs-composer-history';
-const CAPTURE_KEY = 'whistle-rs-capture-filter';
+const THEME_KEY = 'whix-theme';
+const COMPOSE_KEY = 'whix-composer';
+const TEST_KEY = 'whix-test-rules';
+const COMPOSE_HISTORY_KEY = 'whix-composer-history';
+const CAPTURE_KEY = 'whix-capture-filter';
 
 /** How many sent compositions the source list keeps. Upstream keeps 100. */
 const COMPOSE_HISTORY_MAX = 20;
@@ -1159,7 +1159,7 @@ export async function deleteValue(name: string): Promise<void> {
 // ── import / export ────────────────────────────────────────────────────────
 
 /** The marker the proxy writes into a bundle, and the only way one is known. */
-const BUNDLE_MARKER = 'whistle_rs';
+const BUNDLE_MARKER = 'whix';
 
 /** Hand `text` to the browser as a file, without leaving the page. */
 export function downloadText(name: string, text: string, type = 'text/plain'): void {

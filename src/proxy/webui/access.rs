@@ -438,10 +438,8 @@ pub(super) mod login_tests {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         let config = crate::config::Config {
-            storage_dir: std::env::temp_dir().join(format!(
-                "whistle-rs-login-tests-{}-{unique}",
-                std::process::id()
-            )),
+            storage_dir: std::env::temp_dir()
+                .join(format!("whix-login-tests-{}-{unique}", std::process::id())),
             persist_sessions: false,
             ui_username: users.0.map(str::to_string),
             ui_password: users.1.map(str::to_string),
@@ -532,7 +530,7 @@ pub(super) mod login_tests {
         let with = |list: &str| {
             let mut c = crate::config::Config {
                 storage_dir: std::env::temp_dir().join(format!(
-                    "whistle-rs-cors-{}-{:?}",
+                    "whix-cors-{}-{:?}",
                     std::process::id(),
                     std::thread::current().id()
                 )),
@@ -624,7 +622,7 @@ pub(super) mod login_tests {
         let with = |list: &str| {
             let mut c = crate::config::Config {
                 storage_dir: std::env::temp_dir().join(format!(
-                    "whistle-rs-status-{}-{:?}",
+                    "whix-status-{}-{:?}",
                     std::process::id(),
                     std::thread::current().id()
                 )),
@@ -731,7 +729,7 @@ pub(super) mod login_tests {
     fn extra_console_hostnames_are_added_not_substituted() {
         let mut config = crate::config::Config {
             storage_dir: std::env::temp_dir().join(format!(
-                "whistle-rs-uihost-{}-{:?}",
+                "whix-uihost-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             )),
@@ -889,10 +887,8 @@ pub(super) mod cross_site_tests {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         let mut c = crate::config::Config {
-            storage_dir: std::env::temp_dir().join(format!(
-                "whistle-rs-cross-site-{}-{unique}",
-                std::process::id()
-            )),
+            storage_dir: std::env::temp_dir()
+                .join(format!("whix-cross-site-{}-{unique}", std::process::id())),
             persist_sessions: false,
             local_ui_hosts: extra_hosts.iter().map(|h| h.to_string()).collect(),
             ..crate::config::Config::default()

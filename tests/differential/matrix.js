@@ -6,7 +6,7 @@
 //   node matrix.js target/differential/<a> target/differential/<b> [--json FILE]
 //
 // What it answers: **which of whistle's answers moved between the two
-// releases**, and whether each move brought upstream closer to whistle-rs or
+// releases**, and whether each move brought upstream closer to whix or
 // further from it. It is the question a single run cannot ask — every number
 // in this directory is agreement with one release — and it is asked by case
 // and field, not by count: two runs that both report three differences are not
@@ -17,7 +17,7 @@
 // about this port and are scoped to a version (`whistle-pkg.js`); what moved
 // between releases is the measurement those verdicts are made on.
 //
-// Both runs have to be of the same whistle-rs binary, or a move could be this
+// Both runs have to be of the same whix binary, or a move could be this
 // port's and not upstream's. It says so, and exits 2, when the manifests'
 // SHA-256 disagree. Same for the port block: several answers carry a port.
 //
@@ -110,7 +110,7 @@ function fromJson(j) {
 
 /**
  * `upstream-suite.js`'s verdict: which calls were judged (upstream passes them
- * with and without the network) and which of those whistle-rs does not pass. A
+ * with and without the network) and which of those whix does not pass. A
  * call judged in one release and not the other is upstream's own answer moving.
  */
 function fromSuite(v) {
@@ -227,8 +227,8 @@ function main() {
   const [a, b] = dirs.map((d) => load(path.resolve(d)));
   for (const r of [a, b]) r.version = r.manifest.whistle.version;
   const problems = [];
-  if (a.manifest.whistleRs.sha256 !== b.manifest.whistleRs.sha256) {
-    problems.push(`whistle-rs differs: ${a.manifest.whistleRs.sha256.slice(0, 12)} vs ${b.manifest.whistleRs.sha256.slice(0, 12)}`);
+  if (a.manifest.whix.sha256 !== b.manifest.whix.sha256) {
+    problems.push(`whix differs: ${a.manifest.whix.sha256.slice(0, 12)} vs ${b.manifest.whix.sha256.slice(0, 12)}`);
   }
   if (a.manifest.portBase !== b.manifest.portBase) {
     problems.push(`port block differs: ${a.manifest.portBase} vs ${b.manifest.portBase}`);
@@ -238,9 +238,9 @@ function main() {
   const result = compare(a, b);
   result.a = { dir: a.dir, whistle: a.version, commit: a.manifest.git.commit, node: a.manifest.host.node };
   result.b = { dir: b.dir, whistle: b.version, commit: b.manifest.git.commit, node: b.manifest.host.node };
-  result.whistleRs = a.manifest.whistleRs.sha256;
+  result.whix = a.manifest.whix.sha256;
 
-  console.log(`whistle ${a.version} → ${b.version}, whistle-rs ${String(result.whistleRs).slice(0, 12)}`);
+  console.log(`whistle ${a.version} → ${b.version}, whix ${String(result.whix).slice(0, 12)}`);
   for (const p of problems) console.log(`  NOT COMPARABLE: ${p}`);
   const show = (label, items) => {
     for (const it of items) {
@@ -256,7 +256,7 @@ function main() {
       continue;
     }
     const moved = s.closer.length + s.away.length + s.changed.length + s.rsMoved.length;
-    console.log(`  ${s.name}: ${s.same} same, ${s.closer.length} closer, ${s.away.length} away, ${s.changed.length} changed${s.rsMoved.length ? `, ${s.rsMoved.length} where whistle-rs's side moved` : ''}`);
+    console.log(`  ${s.name}: ${s.same} same, ${s.closer.length} closer, ${s.away.length} away, ${s.changed.length} changed${s.rsMoved.length ? `, ${s.rsMoved.length} where whix's side moved` : ''}`);
     if (moved) {
       show('closer', s.closer);
       show('away', s.away);
