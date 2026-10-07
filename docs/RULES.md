@@ -139,7 +139,7 @@ example.com          host://10.0.0.1
 
 **所有**规则文本都支持这个写法：`-r`/`--rule`、控制台的编辑器、`POST /api/rules`、
 命名的规则组、导入的规则包，以及重启后从磁盘读回来的内容。
-它的实现方式带来四点后果，在依赖它之前，每一点都值得先弄清楚：
+它的实现方式带来五点后果，在依赖它之前，每一点都值得先弄清楚：
 
 - **就地拼接。** 引入进来的行，就是它所在那份文本里的普通行，所以[优先级](#优先级)
   就是你眼睛看到的顺序：写在 `@` 上面的行优先于它引入的内容，写在下面的行则不然；
@@ -522,7 +522,7 @@ example.com   resBody://~/mock/a.html|~/mock/b.html     # 两个都读，用 CRL
 
 **什么算位置**。`http://` 或 `https://` 开头的 URL；或者一个路径，以根目录（`/tmp/x`）、用户主目录（`~/x`，全角的 `～/x` 也算）、Windows 盘符（`C:\x`）开头，或者明确写了 `./` / `../`。
 
-> **`temp/…` 在这里不算位置，在上游算**。whistle 的控制台允许你在规则编辑器里 Cmd+点击一个 `protocol://temp.json`，在弹出的对话框里填好内容并保存——它会把这一行改写成 `protocol://temp/<64 hex>.json`，然后在自己的 `temp_files` 目录下解析这个路径（`TEMP_PATH_RE`，`_original/lib/util/common.js:167`；`getTempFilePath`，`util/index.js:1180-1187`，它会去掉扩展名，扩展名只留着用来猜类型）。本项目既没有这个目录，也没有这个编辑器，所以这个值就是它看上去的那段字面文本，文本类算子会原样写出它：实测 `resBody://temp/blank.json` 在 whistle 里返回源站的页面，在这里返回 `temp/blank.json` 这六个字符。这里只记下差异，不做半吊子实现——没有编辑器的话，这个路径是一个没人造得出来的文件名，因为它是个哈希。`auth://temp/…` 不受影响：反正带斜杠就算位置，两个代理也都不会为它发送凭据。
+> **`temp/…` 在这里不算位置，在上游算**。whistle 的控制台允许你在规则编辑器里 Cmd+点击一个 `protocol://temp.json`，在弹出的对话框里填好内容并保存——它会把这一行改写成 `protocol://temp/<64 hex>.json`，然后在自己的 `temp_files` 目录下解析这个路径（`TEMP_PATH_RE`，`_original/lib/util/common.js:167`；`getTempFilePath`，`util/index.js:1180-1187`，它会去掉扩展名，扩展名只留着用来猜类型）。本项目既没有这个目录，也没有这个编辑器，所以这个值就是它看上去的那段字面文本，文本类算子会原样写出它：实测 `resBody://temp/blank.json` 在 whistle 里返回源站的页面，在这里返回 `temp/blank.json` 这串文本。这里只记下差异，不做半吊子实现——没有编辑器的话，这个路径是一个没人造得出来的文件名，因为它是个哈希。`auth://temp/…` 不受影响：反正带斜杠就算位置，两个代理也都不会为它发送凭据。
 
 有一个例外，也是上游的行为：`reqCors://` / `resCors://` 上的 URL 表示允许的 **origin**，在读取之前就被折成 `{"origin":…}`（`isCors`，`_original/lib/util/index.js:1344,:1361-1370`）。`resCors://https://app.test` 是一条 CORS 规则，不会去取这个 URL。不过这里写*路径*的话，照样会读。
 
@@ -1840,7 +1840,7 @@ example.com/old    locationHref://replace:/new
 
 #### 前置代理声称的内容
 
-一个代理如果躲在另一个代理后面，客户端的地址、协议（scheme）和 host 是通过请求头告诉它的。whistle 读四个这样的头（`handleForwardedProps`，`_original/lib/util/index.js:3697-3728`；`getFullUrl`，`lib/util/common.js:1231-1266`）：
+一个代理如果躲在另一个代理后面，客户端的地址、协议（scheme）和 host 是通过请求头告诉它的。whistle 读下面这几个头（`handleForwardedProps`，`_original/lib/util/index.js:3697-3728`；`getFullUrl`，`lib/util/common.js:1231-1266`）：
 
 | 头 | 声称的是什么 | 什么时候采信 |
 |---|---|---|
@@ -1902,7 +1902,7 @@ whistle 的 Frames 面板不只给 WebSocket 用：普通的 body 如果是事�
 * 这个请求命中了某条 `host://` 规则，不管它指向哪里；
 * 连到的地址是**本地**的（回环地址、本机自己的地址，或者带了 host 覆盖的代理这一跳）。
 
-这里有两处不同，收窄的都是重试在什么时候发生，而不是重试做什么：
+这里有两处不同，都只关乎重试在什么时候发生，不改变重试做什么：
 
 * **地址按写的来判断，而不是按解析结果。** whistle 拿刚查到的 IP 来判断，所以解析到 `127.0.0.1` 的 `dev.local` 在那边算本地，在这里不算。写在 `host://` 规则里的 IP、`localhost`，或者任何带了 `host://` 规则的请求——也就是那篇文档讲的这几种写法——两边都会走到重试。
 * **重试来得更早。** whistle 只在错误看起来像 TLS 错误时（`checkTlsError`）才在第一次失败后就降级，否则会先再试一次 https。这里只要这一段没建立起来，不管什么原因，立刻降级。
@@ -1975,7 +1975,7 @@ HTTP trailer 部分不允许携带的名字会被丢掉，不管来自哪一边�
 
 `resSpeed://` 和 trailer 可以同时生效，两者不是二选一。
 
-`headerReplace` 的 scope 有 `req.` / `reqH.`（请求）、`res.` / `resH.`（响应）和 `trailer.`；写成 `resHeaders.` 的键一个都匹配不上，什么也不做。有两处细节继承自上游，很容易踩坑：
+`headerReplace` 的 scope 有 `req.` / `reqH.`（请求）、`res.` / `resH.`（响应）和 `trailer.`；写成 `resHeaders.` 的键一个都匹配不上，什么也不做。有三处细节继承自上游，很容易踩坑：
 
 - **没写 scope 前缀**的键会沿用前一个键的 scope *和头名*，只用它自己的匹配模式——所以 `{"resH.location:/^http:/":"https:","x:/y/":"z"}` 两次替换都作用在 `location` 上，而不是 `x`。排在最前面、没有 scope 的键会被丢掉。
 - 替换串里，`$&` 和 `$1`…`$9` 插入匹配到的整段和各个分组；把其中任意一种写成**双** `$`（`$$1`），插入的就是**百分号编码后**的内容。反斜杠用来转义引用（`\$1` 就是字面量 `$1`）；写两个反斜杠，则保留一个反斜杠，并且照常替换。
@@ -2238,7 +2238,7 @@ key 只按一组固定的写法匹配；**其他写法一律悄悄忽略**，和
 | `headers.x` | 请求和响应两边的这个头（这种写法**区分**大小写，而且必须是复数） |
 | `reqCookies.x` / `cookies.x` | 请求 `Cookie` 头里的这个 cookie |
 | `resCookies.x` / `cookies.x` | **客户端里**的这个 cookie——见下文 |
-| `trailer.x` | 这个尾部头（trailer）（这个 key 不带 `req`/`res` 作用域，而且是唯一一个**区分**大小写的 key） |
+| `trailer.x` | 这个尾部头（trailer）（这个 key 不带 `req`/`res` 作用域；和 `headers.x` 一样，`trailer` 这个词**区分**大小写，必须小写） |
 | `query.x` / `params.x` / `urlParams.x` / `url.Param.x` | 这个查询参数，重复出现几次就删几次 |
 | `query` / `params` / `urlParams`（单独写） | 整个查询串，连 `?` 一起 |
 | `pathname` | 整个路径，查询串保留 |
@@ -2820,7 +2820,7 @@ staging.example.com    tlsOptions://rejectUnauthorized=false
 
 `ca` 和 `rejectUnauthorized` 在这里比在 whistle 里更要紧，因为 whistle 除非用 `--safe` 启动，否则根本不校验源站。有了这两个选项，你可以只用一条规则去连一个由私有 CA 签发证书的源站，而不必用 `--insecure-upstream` 把所有源站的校验都关掉。
 
-2026-09-30 之前，前五行的选项一个都没被读取：选项能解析，但每条连源站的连接都不带客户端证书。`tests/differential/core-bench.js` 用九种方式去问两边的代理 —— PEM 按路径和内联、一个 PFX、一张源站不信任的证书、一个和证书不配对的私钥、错误的密码、一个不存在的文件 —— 九种结果两边全部一致。
+2026-09-30 之前，前五行的选项一个都没被读取：选项能解析，但每条连源站的连接都不带客户端证书。`tests/differential/core-bench.js` 用九种方式去问两边的代理 —— 不带客户端证书、PEM 按路径和内联、一个 PFX、一张源站不信任的证书、一个和证书不配对的私钥、错误的密码、证书和版本分两行写、一个不存在的文件 —— 九种结果两边全部一致。
 
 别和 `enable://clientCert` / `requestCert` 搞混：那两个是让*代理伪造的服务端*反过来向**客户端**要证书，这个仍然 [没有实现](#开关引入与-values)。
 
