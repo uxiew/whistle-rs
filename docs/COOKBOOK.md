@@ -755,7 +755,7 @@ TLS 会话是客户端与源站之间的，代理只搬字节。
 | `GET /api/sessions/search?c=b:…` | 由代理在手里的全部事务里查请求/响应头（`h:`）或 body（`b:`），返回匹配的 id |
 | `GET /frames.json?id=N` | 第 `N` 条连接的 WebSocket 帧，双向 |
 | `GET /sessions.har` | 全部导出为 HAR 1.2 文件 |
-| `GET /api/status` | 端口、TLS 姿态、根证书路径、规则数、已注册插件。跨域调用时，若来源不在 `--allow-origin` 列表里，只返回 `version` 与 `port` —— 见 [`CLI.md`](CLI.md#calling-the-console-from-another-page) |
+| `GET /api/status` | 端口、TLS 姿态、根证书路径、规则数、已注册插件。跨域调用时，若来源不在 `--allow-origin` 列表里，只返回 `version` 与 `port` —— 见 [`CLI.md`](CLI.md#从别的页面调用控制台) |
 | `POST /api/sessions/clear` | 清空列表（只清内存，落盘的历史重启后会回来） |
 | `POST /api/sessions/purge` | 清空列表并删除落盘的历史 |
 

@@ -319,7 +319,7 @@
 
 **验收：** 用环境变量给口令启动，`ps -A -o args=` 里没有口令，登录照常（错误口令 401，正确口令 200）；只读账户同样。命令行的旧写法照常可用。
 
-**完成记录：** `WHIX_PASSWORD` 对应 `-w`，`WHIX_GUEST_PASSWORD` 对应 `-W`；命令行优先，空变量当没设，`--node-plugin` 拉起的进程拿不到这两个变量。用环境变量启动后 `ps -A -o args=` 里只有 `-n admin`，不登录 401、登录 200，日志里没有口令。`tests/console_password_e2e.rs` 6 个测试起真实二进制：两个账户各自的 200/401、命令行的写法照常并有警告、两处都给时命令行优先、只给只读口令仍拒绝启动、空变量不要求登录、日志和 `/api/status` 里都没有口令。所有文档示例改成 `export WHIX_PASSWORD`，原因只在 [CLI](CLI.md#listening-beyond-this-machine) 写一处（`72b9f48` `d5eb948` `009a53d`）。
+**完成记录：** `WHIX_PASSWORD` 对应 `-w`，`WHIX_GUEST_PASSWORD` 对应 `-W`；命令行优先，空变量当没设，`--node-plugin` 拉起的进程拿不到这两个变量。用环境变量启动后 `ps -A -o args=` 里只有 `-n admin`，不登录 401、登录 200，日志里没有口令。`tests/console_password_e2e.rs` 6 个测试起真实二进制：两个账户各自的 200/401、命令行的写法照常并有警告、两处都给时命令行优先、只给只读口令仍拒绝启动、空变量不要求登录、日志和 `/api/status` 里都没有口令。所有文档示例改成 `export WHIX_PASSWORD`，原因只在 [CLI](CLI.md#对本机以外开放) 写一处（`72b9f48` `d5eb948` `009a53d`）。
 
 ### R4-03 — 没有注入就不改响应头（P3）
 

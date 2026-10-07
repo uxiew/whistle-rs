@@ -162,7 +162,7 @@ curl -x http://127.0.0.1:8899 \
 whix -z ./certs      # 目录里放着 api.example.com.key 和 api.example.com.crt
 ```
 
-每一对 `<name>.key` 加 `<name>.crt`（或 `.cer`、`.pem`），会用在**证书里带的每一个名字**上——看的是证书的 `subjectAltName`，不是文件名。在同一个目录里放 `root.key` 加 `root.crt`，会替换掉根证书本身，这也是自己提供根证书的唯一办法。完整规则见 [`docs/CLI.md`](CLI.md#hand-supplied-certificates)。
+每一对 `<name>.key` 加 `<name>.crt`（或 `.cer`、`.pem`），会用在**证书里带的每一个名字**上——看的是证书的 `subjectAltName`，不是文件名。在同一个目录里放 `root.key` 加 `root.crt`，会替换掉根证书本身，这也是自己提供根证书的唯一办法。完整规则见 [`docs/CLI.md`](CLI.md#手动提供证书)。
 
 也可以让插件按连接逐个决定，包括决定完全不拦截——见 [`RULES.md`](RULES.md) 里的 `sniCallback://`。
 
