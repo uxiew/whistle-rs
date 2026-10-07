@@ -71,10 +71,7 @@ URL 里**没有** `?` 时第一遍整个跳过，但**第二遍照常执行**。
 
 变量名是一个**封闭白名单**，不在表内的名字原样保留。
 
-> 这一遍就是上游的 `resolveTplVar`（`rules.js:715-758`），它还有第二个调用点：
-> 整值加反引号的**算子取值**（`renderTpl`，`rules.js:762-772`）。那条路径**只跑第二遍**
-> —— 没有第一遍的查询串插值，也没有上面那个 `{…}` 开关，两者都属于文件处理器而不属于
-> 变量层。写法见 [`RULES.md` 的反引号模板](RULES.md#反引号模板)。
+> 这一遍就是上游的 `resolveTplVar`（`rules.js:715-758`），它还有第二个调用点：整值加反引号的**算子取值**（`renderTpl`，`rules.js:762-772`）。那条路径**只跑第二遍**—— 没有第一遍的查询串插值，也没有上面那个 `{…}` 开关，两者都属于文件处理器而不属于变量层。写法见 [`RULES.md` 的反引号模板](RULES.md#反引号模板)。
 
 | 写法 | 含义 |
 |------|------|
@@ -90,9 +87,7 @@ URL 里**没有** `?` 时第一遍整个跳过，但**第二遍照常执行**。
 
 ## `.replace(pattern,replacement)` 修饰符
 
-变量名（或子路径）末尾可以跟一个 `.replace(...)`，对**解析出来的值**再做一次替换
-（`resolveTplVar`，`_original/lib/rules/rules.js:725-752`）。它在 `${{...}}` 的
-URI 编码**之前**生效。
+变量名（或子路径）末尾可以跟一个 `.replace(...)`，对**解析出来的值**再做一次替换（`resolveTplVar`，`_original/lib/rules/rules.js:725-752`）。它在 `${{...}}` 的URI 编码**之前**生效。
 
 | 写法 | 结果 |
 |------|------|
@@ -105,22 +100,17 @@ URI 编码**之前**生效。
 | `${v.replace(/x/g)}` | 没有第二个参数 = 删除 |
 | **`${query.absent.replace(,默认值)}`** | **pattern 为空时不做替换，而是给空值兜底** |
 
-最后一行容易漏掉：上游是 `val = pattern ? val : val || replacement`
-（`rules.js:744-746`）。所以
+最后一行容易漏掉：上游是 `val = pattern ? val : val || replacement`（`rules.js:744-746`）。所以
 
 - pattern 为空 + 值为空 → 输出 `replacement`
 - pattern 为空 + 值非空 → 输出原值
 - pattern **非**空 + 值为空 → 输出空串（**不会**兜底）
 
-反向引用只有在 pattern 是正则时才展开：字符串 pattern 没有捕获组，JS 会把 `$1`
-原样留下（`$&` 仍然生效）。
+反向引用只有在 pattern 是正则时才展开：字符串 pattern 没有捕获组，JS 会把 `$1`原样留下（`$&` 仍然生效）。
 
-> **正则就是 JavaScript 的正则。** 断言 `(?=…)`、`(?<=…)` 和反向引用 `\1` 都能用，
-> 例如 `${url.replace(/a(?=1)/,b)}`。2026-09-30 之前这类写法编译不了，整个 `${...}`
-> 会原样留在输出里。
+> **正则就是 JavaScript 的正则。** 断言 `(?=…)`、`(?<=…)` 和反向引用 `\1` 都能用，例如 `${url.replace(/a(?=1)/,b)}`。2026-09-30 之前这类写法编译不了，整个 `${...}`会原样留在输出里。
 >
-> 连 JavaScript 也编译不了的写法（比如 `/a(/`）按上游处理：把 `/a(/` 这几个字符当普通
-> 文本去找、去替换，日志里记一行说明。
+> 连 JavaScript 也编译不了的写法（比如 `/a(/`）按上游处理：把 `/a(/` 这几个字符当普通文本去找、去替换，日志里记一行说明。
 
 ---
 
@@ -148,29 +138,21 @@ URI 编码**之前**生效。
 | `${randomInt(n)}` / `${randomInt(a-b)}` | 随机整数 |
 | `${randomUUID}` | 随机 UUID |
 
-> `${host}` / `${port}` 的语义容易误解：原版读的是 whistle 自己的配置
-> （`resolveVarValue`，`_original/lib/rules/rules.js:657-668`），
-> 想要请求的主机名请用 `${url.hostname}`。
+> `${host}` / `${port}` 的语义容易误解：原版读的是 whistle 自己的配置（`resolveVarValue`，`_original/lib/rules/rules.js:657-668`），想要请求的主机名请用 `${url.hostname}`。
 
 ### 响应侧变量：`tpl://` 里为空，反引号算子里不为空
 
-`${statusCode}`、`${serverIp}`、`${serverPort}`、`${resHeaders.*}`（别名 `resH`）、
-`${resCookies.*}`、`${clientPort}`
+`${statusCode}`、`${serverIp}`、`${serverPort}`、`${resHeaders.*}`（别名 `resH`）、`${resCookies.*}`、`${clientPort}`
 
-这几个读的是**响应头**（上游在响应规则求值前把它们盖到 request 对象上，
-`_original/lib/inspectors/res.js:802-806`）。`tpl://` 在上游响应产生之前就短路了，
-所以在模板文件里它们必然为空 —— 返回空串而非留下占位符，与上游一致。
+这几个读的是**响应头**（上游在响应规则求值前把它们盖到 request 对象上，`_original/lib/inspectors/res.js:802-806`）。`tpl://` 在上游响应产生之前就短路了，所以在模板文件里它们必然为空 —— 返回空串而非留下占位符，与上游一致。
 
-但同一套变量还有第二个调用点：[反引号算子取值](RULES.md#反引号模板)。
-写在响应期算子上时响应头已经在手，于是它们**会**求出值：
+但同一套变量还有第二个调用点：[反引号算子取值](RULES.md#反引号模板)。写在响应期算子上时响应头已经在手，于是它们**会**求出值：
 
 ```
 example.com   resHeaders://`x-upstream=${serverIp}:${serverPort}&x-code=${statusCode}`
 ```
 
-`${resCookies.<名>}` 给出该 cookie 的**值**；属性（`domain`、`path`、`max-age` …）
-一律为空 —— 上游为它们建了对象却从不存入（`rules.js:504-538`），只有 `.value` 是
-存下来的那个属性。名字叫 `path` 的 cookie 同样取不到，上游也取不到。
+`${resCookies.<名>}` 给出该 cookie 的**值**；属性（`domain`、`path`、`max-age` …）一律为空 —— 上游为它们建了对象却从不存入（`rules.js:504-538`），只有 `.value` 是存下来的那个属性。名字叫 `path` 的 cookie 同样取不到，上游也取不到。
 
 **仍然恒为空**（本移植没有对应的数据源，与上游字段未设置时的 `''` 同值）：
 
@@ -217,36 +199,25 @@ GET http://example.com/api?callback=cb123
 
 第 2 步是为什么 `example.com/a.json file:///tmp/mock` 能返回 JSON —— 即使 mock 文件没有扩展名。
 
-值来自 [values 存储](#与-values-存储的关系)时，「命中的文件」就是**存储条目的名字**
-（`rule.key`，`file-proxy.js:270-272`）—— `file://{mock.json}` 返回 `application/json`，
-因为那个 `.json` 只写在名字里。内联 `(text)` 没有名字，直接走第 2 步。
+值来自 [values 存储](#与-values-存储的关系)时，「命中的文件」就是**存储条目的名字**（`rule.key`，`file-proxy.js:270-272`）—— `file://{mock.json}` 返回 `application/json`，因为那个 `.json` 只写在名字里。内联 `(text)` 没有名字，直接走第 2 步。
 
-`; charset=utf-8` 后缀跟着上游的 `util.isText`（`util/index.js:1494-1531`），那是个**子串判断**：
-类型里出现 `javascript`/`css`/`html`/`json`/`xml`，或以 `text/` 开头，都算文本。
-所以 `image/svg+xml` **带** charset，而 `image/png` 不带。
+`; charset=utf-8` 后缀跟着上游的 `util.isText`（`util/index.js:1494-1531`），那是个**子串判断**：类型里出现 `javascript`/`css`/`html`/`json`/`xml`，或以 `text/` 开头，都算文本。所以 `image/svg+xml` **带** charset，而 `image/png` 不带。
 
-扩展名表是上游 `mime` 那几百条的一个子集，覆盖 mock 目录里会出现的类型；
-表外的扩展名按「没有扩展名」处理，回落到第 2 步。
+扩展名表是上游 `mime` 那几百条的一个子集，覆盖 mock 目录里会出现的类型；表外的扩展名按「没有扩展名」处理，回落到第 2 步。
 
-模板响应的状态码**恒为 200**，`content-length` 在渲染**之后**重新计算，且**不支持 Range 请求** ——
-`getRawResByPath` 才会求 range，而模板分支根本不走那里（`file-proxy.js:100-102`）。
+模板响应的状态码**恒为 200**，`content-length` 在渲染**之后**重新计算，且**不支持 Range 请求** ——`getRawResByPath` 才会求 range，而模板分支根本不走那里（`file-proxy.js:100-102`）。
 
 ### `Server`
 
-从磁盘读到的文件会带一个 `Server` 响应头（上游是 `server: config.appName`，`file-proxy.js:315-318`；
-whix 如实写自己的名字）。**只有真正读了文件的响应**有这个头 —— 内联值、values 存储的
-内容、以及 404 都是在别处拼出来的，都没有；解析成功的 `rawfile://` 用的是文件自带的响应头，
-也没有。换句话说，这个头等于「这些字节来自文件系统」。
+从磁盘读到的文件会带一个 `Server` 响应头（上游是 `server: config.appName`，`file-proxy.js:315-318`；whix 如实写自己的名字）。**只有真正读了文件的响应**有这个头 —— 内联值、values 存储的内容、以及 404 都是在别处拼出来的，都没有；解析成功的 `rawfile://` 用的是文件自带的响应头，也没有。换句话说，这个头等于「这些字节来自文件系统」。
 
-响应侧算子（`resHeaders://`、`resType://`、`resCors://` 等）**对模板/文件响应同样生效** ——
-和上游一样，短路产生的响应也会走一遍响应侧规则：
+响应侧算子（`resHeaders://`、`resType://`、`resCors://` 等）**对模板/文件响应同样生效** ——和上游一样，短路产生的响应也会走一遍响应侧规则：
 
 ```
 example.com/api   tpl:///tmp/mock.json  resHeaders://x-mock=1
 ```
 
-但插件的 `onResponse` **不会**对短路响应触发：那个钩子的语义是「上游响应到达之后」，
-而短路时根本没有上游。插件想影响这类响应，请用 `onRequest` 里的 `ctx.setRules(...)`。
+但插件的 `onResponse` **不会**对短路响应触发：那个钩子的语义是「上游响应到达之后」，而短路时根本没有上游。插件想影响这类响应，请用 `onRequest` 里的 `ctx.setRules(...)`。
 
 ---
 
@@ -271,19 +242,15 @@ Content-Type: application/json
 {"error":"nope"}
 ```
 
-分隔头和 body 的空行**接受任意 CR/LF 组合**（`HEADERS_SEP_RE`，`file-proxy.js:12`）：
-`\r\n\r\n`、`\n\n`、`\r\r`、`\n\r` 等八种写法都算，手写的 `.http` fixture 不必纠结换行符。
+分隔头和 body 的空行**接受任意 CR/LF 组合**（`HEADERS_SEP_RE`，`file-proxy.js:12`）：`\r\n\r\n`、`\n\n`、`\r\r`、`\n\r` 等八种写法都算，手写的 `.http` fixture 不必纠结换行符。
 
 响应头之间的换行同样是**任意 CR/LF**（`CRLF_RE`，`file-proxy.js:10`）—— 单独一个 `\r` 也算行尾。
 
 几个边界行为：
 
-- **前 256 KB 内找不到空行就不当作 raw 响应**（`MAX_HEADERS_SIZE`，`file-proxy.js:13,151-158`），
-  整个文件按普通文件返回，而不是把第一行误当成状态行。
+- **前 256 KB 内找不到空行就不当作 raw 响应**（`MAX_HEADERS_SIZE`，`file-proxy.js:13,151-158`），整个文件按普通文件返回，而不是把第一行误当成状态行。
 - body 按**字节**切分并原样返回，二进制内容（图片等）不会被 UTF-8 转换损坏。
-- **状态行缺失时按 200 处理**。这是一处**刻意的偏离**：上游把首行的第二个词直接当状态码赋值
-  （`statusLine[1]`，`file-proxy.js:75`），写响应时抛异常，客户端拿到的是连接被重置 ——
-  那里没有值得忠实复刻的行为。
+- **状态行缺失时按 200 处理**。这是一处**刻意的偏离**：上游把首行的第二个词直接当状态码赋值（`statusLine[1]`，`file-proxy.js:75`），写响应时抛异常，客户端拿到的是连接被重置 ——那里没有值得忠实复刻的行为。
 
 **值形式与路径形式不一样**（`getRawResByValue` vs `getRawResByPath`）：
 
@@ -292,15 +259,13 @@ Content-Type: application/json
 | 找不到空行 | 整个文件按普通文件返回，带 Content-Type 和 `Server` | 整段按 body 返回，**没有 Content-Type** |
 | `content-encoding` | 保留 —— 文件里真的可能是 gzip | **删除**（`fromValue`，`file-proxy.js:71-73`）—— 值是规则文件里敲出来的文本，不可能是压缩字节 |
 
-> 内联 `(...)` 值是**一个不含空白的 token**：规则行先按空白切分，`file://(a b)` 会变成两个
-> token，谁都不是值。要写多行内容请用 [``` 围栏值](#与-values-存储的关系)。
+> 内联 `(...)` 值是**一个不含空白的 token**：规则行先按空白切分，`file://(a b)` 会变成两个token，谁都不是值。要写多行内容请用 [``` 围栏值](#与-values-存储的关系)。
 
 ---
 
 ## 文件查找
 
-规则的值不是一个路径，而是一串候选：按下面的顺序展开成列表，**第一个 `stat()` 结果是普通文件的候选生效**
-（`getRuleFiles`，`_original/lib/util/index.js:1420-1444`；`readFiles`，`file-proxy.js:38-58`）。
+规则的值不是一个路径，而是一串候选：按下面的顺序展开成列表，**第一个 `stat()` 结果是普通文件的候选生效**（`getRuleFiles`，`_original/lib/util/index.js:1420-1444`；`readFiles`，`file-proxy.js:38-58`）。
 
 | 写法 | 展开成 |
 |------|--------|
@@ -310,37 +275,28 @@ Content-Type: application/json
 | `tmp/x`（缺少前导 `/`） | `tmp/x`，然后 `/tmp/x` —— whix 自己的兜底 |
 | `/tmp/a%20b.json` | `/tmp/a b.json` —— 先截掉 `?`/`#` 之后的部分再百分号解码（`decodePath`，`util/index.js:1403-1418`） |
 
-最后一行是目录规则能用的前提：请求路径会被拼到值后面，所以 `/static/a%20b.json?v=2`
-要还原成文件名 `a b.json`。
+最后一行是目录规则能用的前提：请求路径会被拼到值后面，所以 `/static/a%20b.json?v=2`要还原成文件名 `a b.json`。
 
-含 `..` 路径段的候选会被**拒绝**（`UP_PATH_REGEXP`，`_original/lib/util/common.js:29`），
-不参与查找；如果整条规则最终没找到文件，404 的正文里显示的就是这个标记：
+含 `..` 路径段的候选会被**拒绝**（`UP_PATH_REGEXP`，`_original/lib/util/common.js:29`），不参与查找；如果整条规则最终没找到文件，404 的正文里显示的就是这个标记：
 
 ```
 $ curl -x http://127.0.0.1:8899 'http://mock.test/up'
 whix: file not found <strong>(Path contains parent directory notation &#39;..&#39;)</strong>
 ```
 
-被拒绝的候选不会中断整条规则 —— `file://../escape|/tmp/ok.txt` 仍然会服务 `/tmp/ok.txt`。
-`x` / `xs` 规则则照旧回落到真实服务器。
+被拒绝的候选不会中断整条规则 —— `file://../escape|/tmp/ok.txt` 仍然会服务 `/tmp/ok.txt`。`x` / `xs` 规则则照旧回落到真实服务器。
 
 `a..b` 这样的文件名不受影响：只有**独立成段**的 `..` 才算越级。
 
-> **上游怪癖：`xs` 前缀不拆 `|`。** 拆分用的正则（`rules.js:96`）写的是 `^x?(...)`，
-> 只允许**单个** `x`，所以 `xsfile://a|b` 在原版里就不会被拆开，整串会被当成一个文件名。
-> whix **刻意复刻**了这个行为：`|` 在 POSIX 文件名里是合法字符，"修好"它会让同一份规则文件在两边解析出不同的路径。
+> **上游怪癖：`xs` 前缀不拆 `|`。** 拆分用的正则（`rules.js:96`）写的是 `^x?(...)`，只允许**单个** `x`，所以 `xsfile://a|b` 在原版里就不会被拆开，整串会被当成一个文件名。whix **刻意复刻**了这个行为：`|` 在 POSIX 文件名里是合法字符，"修好"它会让同一份规则文件在两边解析出不同的路径。
 
-Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写的值 ——
-所以 `file:///tmp/site/` 命中 `index.html` 时会返回 `text/html`。
+Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写的值 ——所以 `file:///tmp/site/` 命中 `index.html` 时会返回 `text/html`。
 
-`file://` 的定位是在开发机上服务任意本地路径，因此除了上面的 `..` 校验**不做沙箱限制** ——
-上游对绝对路径同样不加限制。
+`file://` 的定位是在开发机上服务任意本地路径，因此除了上面的 `..` 校验**不做沙箱限制** ——上游对绝对路径同样不加限制。
 
 ### Range 请求
 
-`file://` 支持 Range（206 + `content-range` + `accept-ranges`）；`rawfile://` 和 `tpl://` 不支持 ——
-上游只在非 `rawfile` 时求 range，而模板分支根本不走那段代码（`file-proxy.js:100-102`）。
-内联值和 values 存储的内容与真实文件一样可以被 range 切分（`file-proxy.js:280-289`）。
+`file://` 支持 Range（206 + `content-range` + `accept-ranges`）；`rawfile://` 和 `tpl://` 不支持 ——上游只在非 `rawfile` 时求 range，而模板分支根本不走那段代码（`file-proxy.js:100-102`）。内联值和 values 存储的内容与真实文件一样可以被 range 切分（`file-proxy.js:280-289`）。
 
 区间算术**照抄上游的 `parseRange`**（`util/index.js:3346-3382`），包括两处会让人意外的结果：
 
@@ -378,8 +334,7 @@ Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写
 example.com   tpl://{mock}
 ```
 
-条目的**内容**同样可以直接当 body —— 这时候值不是路径，而是要返回的字节本身，
-文件系统根本不会被碰到。规则文件里的 ``` 围栏块就是这么用的：
+条目的**内容**同样可以直接当 body —— 这时候值不是路径，而是要返回的字节本身，文件系统根本不会被碰到。规则文件里的 ``` 围栏块就是这么用的：
 
 ````
 ``` mock.json
@@ -393,13 +348,8 @@ example.com/api   file://{mock.json}
 - Content-Type 从**条目名**猜（`mock.json` → `application/json`），见 [Content-Type](#content-type)；
 - 请求路径**不会**拼上去 —— 内容不是位置，没有可延长的东西；
 - 没有 `Server` 响应头，因为没有读文件；
-- 取回来的是**内容，不是规则文本**。上游对一条规则的 matcher 只展开一次
-  （`resolveVar`，`_original/lib/rules/rules.js:774-783`），所以 mock 内容里的
-  `${…}`、`{…}`、`${port}`、乃至一段 ``` 围栏，都是 mock 自己要输出的字符。
+- 取回来的是**内容，不是规则文本**。上游对一条规则的 matcher 只展开一次（`resolveVar`，`_original/lib/rules/rules.js:774-783`），所以 mock 内容里的`${…}`、`{…}`、`${port}`、乃至一段 ``` 围栏，都是 mock 自己要输出的字符。
 
-  唯一的例外是规则行整值加了反引号：那时候条目内容**会**被渲染一遍，捕获组也会
-  按 `${RegExp.$1}` 这个写法代入 —— 见 [`RULES.md` 的反引号模板](RULES.md#反引号模板)。
+  唯一的例外是规则行整值加了反引号：那时候条目内容**会**被渲染一遍，捕获组也会按 `${RegExp.$1}` 这个写法代入 —— 见 [`RULES.md` 的反引号模板](RULES.md#反引号模板)。
 
-> **围栏值与 values 存储同名时，用围栏块**，与上游一致（`getValueFor` 先查内嵌表，
-> `rules.js:785-796`）；控制台里编辑的值就是存储。唯一能盖住围栏块的是命令行的
-> `--value`：它是这一次运行的指令。详见 [`RULES.md`](RULES.md#在规则文本里声明的值)。
+> **围栏值与 values 存储同名时，用围栏块**，与上游一致（`getValueFor` 先查内嵌表，`rules.js:785-796`）；控制台里编辑的值就是存储。唯一能盖住围栏块的是命令行的`--value`：它是这一次运行的指令。详见 [`RULES.md`](RULES.md#在规则文本里声明的值)。
