@@ -576,26 +576,21 @@ async fn main() -> Result<()> {
             .spawn()
             .with_context(|| format!("spawning node plugin '{name}' ({path})"))?;
         let keeper = whistle_rs::plugins::Keeper::new();
-        registry.register_kept(name, &format!("127.0.0.1:{port}"), keeper.clone());
+        registry.register_kept(name, keeper.clone());
         tracing::info!("spawned node plugin '{name}' -> node {path} on 127.0.0.1:{port}");
         let plugin = NodePlugin {
             name: name.to_string(),
             path: path.to_string(),
-            port,
             keeper,
         };
-        node_plugins.push((plugin, child));
+        node_plugins.push((plugin, child, port));
     }
     // Wait for spawned plugins to start listening so early requests don't miss
     // them (best-effort, ~5s cap per plugin).
-    for (plugin, _) in &node_plugins {
-        if wait_for_port(plugin.port, std::time::Duration::from_secs(5)).await {
-            tracing::info!(
-                "node plugin '{}' ready on 127.0.0.1:{}",
-                plugin.name,
-                plugin.port
-            );
-            plugin.keeper.set_up(true);
+    for (plugin, _, port) in &node_plugins {
+        if wait_for_port(*port, std::time::Duration::from_secs(5)).await {
+            tracing::info!("node plugin '{}' ready on 127.0.0.1:{port}", plugin.name);
+            plugin.keeper.set_up(*port);
         } else {
             tracing::warn!(
                 "node plugin '{}' not ready after 5s (continuing)",
@@ -605,8 +600,8 @@ async fn main() -> Result<()> {
     }
     // Owned by their keepers from here, which hold them until the runtime
     // ends with `main`; `kill_on_drop` then stops them.
-    for (plugin, child) in node_plugins {
-        tokio::spawn(keep_node_plugin(plugin, child));
+    for (plugin, child, port) in node_plugins {
+        tokio::spawn(keep_node_plugin(plugin, child, port));
     }
     tracing::info!("plugins: {}", registry.names().join(", "));
 
@@ -887,7 +882,6 @@ fn console_password(flag_value: Option<String>, flag: &str, env: &str) -> Option
 struct NodePlugin {
     name: String,
     path: String,
-    port: u16,
     keeper: whistle_rs::plugins::Keeper,
 }
 
@@ -907,11 +901,16 @@ const RESTART_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 ///
 /// Started on demand rather than at once, which is upstream's way too: a
 /// plugin that crashes on start costs nothing while nothing needs it.
-async fn keep_node_plugin(plugin: NodePlugin, child: tokio::process::Child) {
-    let mut child = Some(child);
+///
+/// Each start is on a port free at that moment, never the last one: once the
+/// process is gone its port is anybody's, and a new process that cannot bind
+/// it leaves "the port answers" true of whoever took it. See
+/// [`whistle_rs::plugins::Keeper`].
+async fn keep_node_plugin(plugin: NodePlugin, child: tokio::process::Child, port: u16) {
+    let mut child = Some((child, port));
     let mut started = tokio::time::Instant::now();
     loop {
-        if let Some(mut running) = child.take() {
+        if let Some((mut running, port)) = child.take() {
             // Held while it runs: `wait` closes the child's stdin first, and
             // that pipe is the plugin's lifeline — the SDK exits when it closes.
             let _lifeline = running.stdin.take();
@@ -921,15 +920,15 @@ async fn keep_node_plugin(plugin: NodePlugin, child: tokio::process::Child) {
                 tokio::select! {
                     status = &mut exit => status,
                     // A start that main did not wait out, or a start again.
-                    listening = wait_for_port(plugin.port, std::time::Duration::from_secs(60)) => {
+                    listening = wait_for_port(port, std::time::Duration::from_secs(60)) => {
                         if listening {
-                            plugin.keeper.set_up(true);
+                            plugin.keeper.set_up(port);
                         }
                         exit.await
                     }
                 }
             };
-            plugin.keeper.set_up(false);
+            plugin.keeper.set_down();
             if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
@@ -947,14 +946,15 @@ async fn keep_node_plugin(plugin: NodePlugin, child: tokio::process::Child) {
             return;
         }
         started = tokio::time::Instant::now();
-        match node_plugin(&plugin.path, &plugin.name, plugin.port).spawn() {
-            Ok(again) => {
+        let again = free_port()
+            .and_then(|port| Ok((node_plugin(&plugin.path, &plugin.name, port).spawn()?, port)));
+        match again {
+            Ok((again, port)) => {
                 tracing::info!(
-                    "node plugin '{}' started again on 127.0.0.1:{}",
-                    plugin.name,
-                    plugin.port
+                    "node plugin '{}' started again on 127.0.0.1:{port}",
+                    plugin.name
                 );
-                child = Some(again);
+                child = Some((again, port));
             }
             Err(e) => tracing::warn!("node plugin '{}' did not start again: {e}", plugin.name),
         }
