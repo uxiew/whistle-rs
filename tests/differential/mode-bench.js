@@ -94,7 +94,11 @@ function issuer(port, authority) {
       const s = tls.connect(opts, () => {
         const c = s.getPeerCertificate();
         s.destroy();
-        res((c && c.issuer && c.issuer.CN || '?').startsWith('whistle') ? 'intercepted' : 'passed-through');
+        // Each proxy signs with its own root: whistle's name starts "whistle",
+        // whix's is "whix Root CA". The check named only the first, which the
+        // root here matched while it was called "whistle-rs Root CA".
+        const cn = (c && c.issuer && c.issuer.CN) || '?';
+        res(/^(whistle|whix)/.test(cn) ? 'intercepted' : 'passed-through');
       });
       s.on('error', (e) => res('tls ' + e.code));
     });
