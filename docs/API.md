@@ -117,7 +117,7 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
   "error": { "phase": "connect", "message": "connecting to 127.0.0.1:9: Connection refused (os error 61)" } }
 ```
 
-`phase` 是请求停在哪一步，取值和各自的意思见 [Cookbook 的排查一节](COOKBOOK.zh-CN.md#规则不生效时)；`message` 是完整的错误链，和客户端收到的 502 正文是同一段。`error` 出现在 `/sessions.json` 的行上（没有失败的行不带这个字段）、`/session.json` 详情里、磁盘历史里；HAR 导出写成 Chrome 导出用的 `_error` 字符串，形如 `"connect: connecting to …"`。
+`phase` 是请求停在哪一步，取值和各自的意思见 [Cookbook 的排查一节](COOKBOOK.md#规则不生效时)；`message` 是完整的错误链，和客户端收到的 502 正文是同一段。`error` 出现在 `/sessions.json` 的行上（没有失败的行不带这个字段）、`/session.json` 详情里、磁盘历史里；HAR 导出写成 Chrome 导出用的 `_error` 字符串，形如 `"connect: connecting to …"`。
 
 本代理替失败的请求生成的响应是 `502`，带两个头：
 

@@ -7,7 +7,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [INSTALL.md](INSTALL.md) | 下载哪个包、怎么校验、数据目录里有什么、升级和卸载要做什么 |
-| [COOKBOOK.zh-CN.md](COOKBOOK.zh-CN.md) / [English](COOKBOOK.md) | 域名转发、Mock、改写、限速、手机抓包、HAR 与嵌入场景 |
+| [COOKBOOK.md](COOKBOOK.md) | 域名转发、Mock、改写、限速、手机抓包、HAR 与嵌入场景 |
 | [CLI.md](CLI.md) | 本项目命令行参数及与上游的差别 |
 | [API.md](API.md) | 自有控制接口、读写参数、认证与副作用边界 |
 | [RULES.md](RULES.md) | 规则语法、优先级、算子与已知偏离 |

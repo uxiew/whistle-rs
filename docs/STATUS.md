@@ -327,7 +327,7 @@ S1 记录里"`Host: evil.example` 得 403"指的是控制台本身，仍然成�
 
 **修之前：** 名字解析不了、连接被拒、源站 TLS 握手失败、客户端等不及走了——这些请求给客户端一个 502、日志里一行 `debug`，控制台里什么都没有。排查时要找的恰恰是这一条。
 
-**现在：** 每个经过代理的请求落成一条会话，只落一次，失败的也落。没完成的带 `error: {phase, message}`，`phase` 说停在哪一步（`client-tls`、`request`、`rules`、`plugin`、`dns`、`connect`、`proxy`、`tls`、`response`、`client`、`abort`）。本代理生成的 502 带 `x-whix-error`（阶段）和 `x-whix-session`（会话号），源站自己回的 502 两个都没有。字段、各入口的范围写在 [API 的「失败的请求」](API.md#失败的请求)，排查顺序写在 [Cookbook](COOKBOOK.zh-CN.md#规则不生效时)。
+**现在：** 每个经过代理的请求落成一条会话，只落一次，失败的也落。没完成的带 `error: {phase, message}`，`phase` 说停在哪一步（`client-tls`、`request`、`rules`、`plugin`、`dns`、`connect`、`proxy`、`tls`、`response`、`client`、`abort`）。本代理生成的 502 带 `x-whix-error`（阶段）和 `x-whix-session`（会话号），源站自己回的 502 两个都没有。字段、各入口的范围写在 [API 的「失败的请求」](API.md#失败的请求)，排查顺序写在 [Cookbook](COOKBOOK.md#规则不生效时)。
 
 | 改动 | 提交 | 怎么验证的 |
 | --- | --- | --- |

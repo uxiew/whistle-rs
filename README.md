@@ -43,7 +43,7 @@ whix -p 8899
    example.com resHeaders://x-debug=1
    ```
 
-   第一行让 `/mock` 直接回 503，第二行把 `api.example.com` 其余请求转到本机 3000 端口，第三行给 `example.com` 的响应加一个头。具体的写在宽泛的前面：转发、本地文件、重定向和 `statusCode` 共用一个位置，先匹配到的那条生效。规则写了却没效果，先看控制台里那条请求的 Rules 标签页，写法见[规则手册](docs/RULES.md)和[使用手册](docs/COOKBOOK.zh-CN.md)。
+   第一行让 `/mock` 直接回 503，第二行把 `api.example.com` 其余请求转到本机 3000 端口，第三行给 `example.com` 的响应加一个头。具体的写在宽泛的前面：转发、本地文件、重定向和 `statusCode` 共用一个位置，先匹配到的那条生效。规则写了却没效果，先看控制台里那条请求的 Rules 标签页，写法见[规则手册](docs/RULES.md)和[使用手册](docs/COOKBOOK.md)。
 
 停止：Ctrl+C。它会先把已完成的请求记录写完再退出。
 
@@ -70,7 +70,7 @@ whix -p 8899
 
 ## 文档
 
-[文档导航](docs/README.md) · [安装](docs/INSTALL.md) · [使用手册](docs/COOKBOOK.zh-CN.md) · [规则](docs/RULES.md) · [命令行](docs/CLI.md) · [证书](docs/CERTIFICATES.md) · [插件](docs/PLUGINS.md) · [API](docs/API.md) · [开发](docs/DEVELOPMENT.md)
+[文档导航](docs/README.md) · [安装](docs/INSTALL.md) · [使用手册](docs/COOKBOOK.md) · [规则](docs/RULES.md) · [命令行](docs/CLI.md) · [证书](docs/CERTIFICATES.md) · [插件](docs/PLUGINS.md) · [API](docs/API.md) · [开发](docs/DEVELOPMENT.md)
 
 ## 许可
 
