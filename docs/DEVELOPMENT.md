@@ -110,7 +110,7 @@ node run.js all --whistle 2.10.10                    # 对 2.10.10 的门禁
 node matrix.js ../../target/differential/<基线那次> ../../target/differential/<2.10.10 那次>   # 两版之间谁变了
 ```
 
-两次要用同一个二进制（先复制一份，用 `RS_BIN=` 指过去），否则 `matrix.js` 会拒绝比较（退出码 2）：它分不清一个变化是上游的还是本项目的。`--assume-baseline`、加新版本的步骤只写在[差分 README](../tests/differential/README.md#which-whistle-though)，两版的实测差别见 [STATUS 的 U1 记录](STATUS.md#2026-09-29-u1-上游版本矩阵)。
+两次要用同一个二进制（先复制一份，用 `RS_BIN=` 指过去），否则 `matrix.js` 会拒绝比较（退出码 2）：它分不清一个变化是上游的还是本项目的。`--assume-baseline`、加新版本的步骤只写在[差分 README](../tests/differential/README.md#到底对照的是哪个-whistle)，两版的实测差别见 [STATUS 的 U1 记录](STATUS.md#2026-09-29-u1-上游版本矩阵)。
 
 `run.js` 自己起停需要的代理，数据目录、根证书和会话都放在用完即删的临时目录里，只监听 127.0.0.1；开跑前逐个检查要用的端口，被占用就直接退出并报端口号和占用者；每个子进程单独一个进程组，结束或 Ctrl-C 时整组杀掉，不会留下还在监听的代理。退出码：0 全部通过，1 有步骤失败，2 没法开始（端口被占、二进制缺失或比源码旧、没跑 `npm ci`）。归档在 `target/differential/<时间>-<套件>/`：`manifest.json` 记录提交与未提交文件、whix 版本和 SHA-256、whistle 版本和锁文件哈希、每个脚本和语料的哈希、Node 版本、每一步的命令和结果，外加每一步的输出和每个代理的日志。
 
@@ -118,7 +118,7 @@ node matrix.js ../../target/differential/<基线那次> ../../target/differentia
 
 新增例外时照这个格式写进 `declared.js`，别加宽 `EXPECTED` 的匹配范围，也别往 `IGNORE` 里加头。门禁到底能不能抓到回归，用 `node mutations.js` 验证：它在 HEAD 的临时 worktree 里逐条注入几个预设的语义回归，每条都必须让对应门禁失败（所以跑之前先提交）。
 
-**上游自带的测试**也是 `network` 里的一步（`upstream-suite`，约 4 分钟）：拿所测上游版本那个 tag 的 `test/` 原样跑 whix（2.10.8 与 2.10.10 的 `test/` 完全相同），第一次运行会从 GitHub 按提交号取到 `target/upstream-suite/`。它用上游固定的端口（6666、18080、5566、1080 等），跟 `--port-base` 无关，端口被占会直接报出来。单独跑：`node upstream-suite.js`；某个单元挂了，用 `node upstream-suite.js --target rs --only <单元名> --verbose` 看每条调用的状态和错误页。它评判哪些调用、怎么声明例外，只写在[差分 README](../tests/differential/README.md#upstreams-own-test-suite)。
+**上游自带的测试**也是 `network` 里的一步（`upstream-suite`，约 4 分钟）：拿所测上游版本那个 tag 的 `test/` 原样跑 whix（2.10.8 与 2.10.10 的 `test/` 完全相同），第一次运行会从 GitHub 按提交号取到 `target/upstream-suite/`。它用上游固定的端口（6666、18080、5566、1080 等），跟 `--port-base` 无关，端口被占会直接报出来。单独跑：`node upstream-suite.js`；某个单元挂了，用 `node upstream-suite.js --target rs --only <单元名> --verbose` 看每条调用的状态和错误页。它评判哪些调用、怎么声明例外，只写在[差分 README](../tests/differential/README.md#上游自带的测试)。
 
 **性能对比**不是门禁，`run.js` 不跑它，要手动跑。它测的是 release 二进制，改了连接或数据通路之后跑一次，和 [STATUS 的 PERF1 记录](STATUS.md#2026-09-29-perf1-源站连接复用与源站-h2)里的数字比较：
 
@@ -128,7 +128,7 @@ node perf-bench.js                   # 在 tests/differential 里；回环，约
 RTT_MS=20 node perf-bench.js         # 源站前面加 20 ms 往返时延
 ```
 
-每个场景报告源站连接数、TLS 握手数、延迟、吞吐、峰值内存和取消后的释放时间；参数和它模拟不了什么，只写在[差分 README](../tests/differential/README.md#what-a-request-costs-the-network)。
+每个场景报告源站连接数、TLS 握手数、延迟、吞吐、峰值内存和取消后的释放时间；参数和它模拟不了什么，只写在[差分 README](../tests/differential/README.md#一个请求花掉多少网络开销)。
 
 **Node 版本会影响结果。** 对照组是跑在 Node 上的 whistle，有些答案随 Node 版本变（`cases-compose.js` 记录过 gzip 头的一个字节）。当前声明是在 Node 26 上测的，CI 的差分任务也用 26；换版本要重新测量。
 

@@ -1,194 +1,91 @@
-# The differential bench
+# 差分测试
 
-The same rule and the same request, put through **real whistle** and through
-whix, with both answers compared.
+同一条规则、同一个请求，分别交给**真 whistle** 和 whix 处理，再比较两边的答案。
 
-Reading upstream's source finds what it *says*. This finds what it *does* — and
-the two are not always the same. Everything below was found by running it, and
-none of it by reading:
+读上游源码，看到的是它*说*自己做什么；这里测的是它*实际*做了什么——两者并不总是一回事。下面这几处都是跑出来的，没有一处是读源码读出来的：
 
-* `headerReplace://` was read only in its JSON spelling, so the shorter
-  `headerReplace://resH.x-a:/yes/=no` parsed, matched and rewrote nothing;
-* `x-server` was missing, so a mocked response was indistinguishable from a
-  forwarded one;
-* the cache-busting entry in `docs/RULES.md` claimed to be an alignment with
-  `notAllowCache`, when upstream never reaches that code and its own `resBody://`
-  therefore vanishes on a browser reload.
+* `headerReplace://` 以前只认 JSON 写法，所以更短的 `headerReplace://resH.x-a:/yes/=no` 能解析、能命中，却什么也没改；
+* 缺了 `x-server` 头，所以 mock 出来的响应和转发回来的响应分不出来；
+* `docs/RULES.md` 里讲防缓存（cache-busting）的那一条，声称是对齐了 `notAllowCache`，可上游根本走不到那段代码，所以上游自己的 `resBody://` 在浏览器刷新时就没了。
 
-It is **not** part of `cargo test`: it needs real whistle from npm, and most of
-it needs both proxies live. It is a gate all the same — `run.js` below is what CI
-runs, and it fails on any difference nobody has explained.
+它**不在** `cargo test` 里：它要从 npm 装真 whistle，大部分还要两边代理都跑着。但它照样是门禁——CI 跑的就是下面的 `run.js`，只要有一处差异没人解释过，它就失败。
 
-## Running it
+## 怎么跑
 
 ```sh
-cargo build --locked            # from the repo root; run.js refuses a binary older than src/
+cargo build --locked            # 在仓库根目录跑；二进制比 src/ 旧，run.js 会拒绝
 cd tests/differential
-npm ci                          # once — real whistle, from the lockfile
-node run.js fast                # ~5 s: the rules oracle over both corpora, the QR encoder
-node run.js network             # ~21 min (1240 s measured for `all`, 2026-10-01): both proxies, every corpus and bench, upstream's own suite
-node run.js network --only cases-delete,https   # a few steps; --list names them
+npm ci                          # 只需一次——按锁文件装真 whistle
+node run.js fast                # 约 5 秒：规则对照组跑两份语料，外加二维码编码器
+node run.js network             # 约 21 分钟（2026-10-01 实测 `all` 用了 1240 秒）：两边代理都起来，所有语料和测试台，以及上游自带的测试
+node run.js network --only cases-delete,https   # 只跑几步；--list 列出所有步骤名
 ```
 
-`run.js` starts whatever the steps need — the oracle and whix with the
-flags each corpus expects, a separate pair with a console login for
-`auth-bench.js` — and stops it again. Every proxy listens on `127.0.0.1` and
-keeps its data directory, root CA and sessions in a scratch directory that is
-deleted afterwards (`--keep` keeps it). Every port a step needs is checked
-before it starts; one that is already taken stops the run with the port number
-and, where `lsof` can tell, what holds it. Every child runs in its own process
-group and the whole group is killed afterwards, including when you press
-Ctrl-C, so a bench that starts its own proxies cannot leave one listening.
+`run.js` 会把各步骤需要的东西起起来，跑完再停掉：对照组（也就是真 whistle）和 whix，带上每份语料要求的启动参数；另外给 `auth-bench.js` 单独起一对带控制台登录的代理。每个代理都只监听 `127.0.0.1`，数据目录、根证书和会话都放在一个临时目录里，跑完就删（加 `--keep` 保留）。每一步开始前都会检查它要用的端口；有一个被占了就停止运行，报出端口号，`lsof` 查得到的话还会报出是谁占着。每个子进程都在自己的进程组里，结束后整组杀掉，按 Ctrl-C 中断时也一样，所以自己起代理的测试台不会留下还在监听的代理。
 
-It exits **0** when every step passed, **1** when a step failed, **2** when it
-could not start (a port taken, no binary or one older than `src/`, `npm ci`
-not run). The archive — `target/differential/<time>-<suite>/`, or `--out` —
-holds `manifest.json` (commit and dirty files, whix version and SHA-256,
-whistle version and lockfile hash, the SHA-256 of every script and corpus here,
-Node and platform, port block, and each step's command, exit status and
-numbers), each step's output, and each proxy's log.
+退出码：全部步骤通过是 **0**，有步骤失败是 **1**，根本没法开始是 **2**（端口被占、没有二进制或二进制比 `src/` 旧、没跑 `npm ci`）。归档放在 `target/differential/<time>-<suite>/`（或 `--out` 指定的目录），里面有 `manifest.json`（提交和有未提交改动的文件、whix 版本和 SHA-256、whistle 版本和锁文件哈希、本目录每个脚本和语料的 SHA-256、Node 版本和平台、端口段，以及每一步的命令、退出状态和计数），每一步的输出，以及每个代理的日志。
 
-**A step fails on anything unexplained.** Each bench exits 1 on a difference
-nothing declares. The differences that are known and accepted are listed case by
-case in [`declared.js`](declared.js) — the case, the fields, the whistle versions
-it was measured against, and the reason — and a declaration that no longer
-matches anything fails the run too, so it cannot linger and excuse that field
-later. Patterns that recur across corpora stay in `harness.js`'s `EXPECTED`,
-each scoped to the fields and cases it may excuse. Every corpus step is followed
-by `triage-inert.js`, which fails on an inert case with no reason
-([below](#inert-which-cases-prove-nothing)).
+**有任何没解释过的东西，这一步就失败。** 每个测试台只要碰到一处没有任何声明覆盖的差异，就退出 1。已知且接受的差异逐个用例列在 [`declared.js`](declared.js) 里——哪个用例、哪些字段、在哪些 whistle 版本上测过、理由是什么。一条声明如果已经对不上任何差异，同样算运行失败，这样它就没法一直留着，等以后替那个字段上的新问题打掩护。跨语料反复出现的模式留在 `harness.js` 的 `EXPECTED` 里，每条都限定了它能豁免哪些字段和用例。每个语料步骤后面都跟着跑 `triage-inert.js`：有 inert 用例（拿掉规则答案也不变）却没写原因，就失败（见[下文](#inert哪些用例什么也没证明)）。
 
-**Does the gate catch anything?** `node mutations.js` builds whix with each
-of a few preset regressions put in — the important-rule order reversed, a
-`{name}` value gaining a space, `$1` off by one, `statusCode://404` answering 405,
-a QR mask inverted — and runs the gate that should catch each. Every one has to
-fail it; the unmutated build has to pass it first. It works in a scratch git
-worktree of HEAD, so commit before measuring.
+**门禁真能抓到问题吗？** `node mutations.js` 会把几个预设的回归逐个植入 whix 再构建——important 规则的先后顺序反过来、`{name}` 的值多出一个空格、`$1` 错一位、`statusCode://404` 回成 405、二维码掩码取反——然后跑本该抓到它的那个门禁。每一个都必须让门禁失败；在此之前，没植入回归的构建必须先通过。它在 HEAD 的一个临时 git worktree 里干活，所以测之前先提交。
 
-**The Node version matters.** Real whistle runs on whatever Node runs the
-oracle, and some of its answers depend on it — `cases-compose.js` records a gzip
-header byte that changed between Node releases. The manifest records the
-version; compare runs made on the same one.
+**Node 版本有影响。** 跑对照组用的是哪个 Node，真 whistle 就跑在哪个 Node 上，它有些答案取决于 Node 版本——`cases-compose.js` 记录过一个 gzip 头字节，在不同 Node 版本之间变了。manifest 里记着版本；要比较，就比在同一个版本上跑出来的结果。
 
-To drive one bench by hand instead, start the pair yourself:
+想手动只跑一个测试台，就自己把这一对代理起起来：
 
 ```sh
-PORT_BASE=18700 node oracle.js &             # real whistle on :18700
-cargo run -- --port 18701 --no-persist --dir /tmp/rs-diff &   # from the repo root
+PORT_BASE=18700 node oracle.js &             # 真 whistle，监听 :18700
+cargo run -- --port 18701 --no-persist --dir /tmp/rs-diff &   # 在仓库根目录跑
 PORT_BASE=18700 npm run bench
 ```
 
-### The oracle's dependencies
+### 对照组的依赖
 
-`package-lock.json` pins the whole tree, not just `whistle@2.10.8`: every number
-in this directory was measured against one particular set of transitive
-dependencies, and `express`, `iconv-lite` or `node-forge` moving underneath
-whistle would change the oracle without anyone touching it. Use `npm ci`, never
-`npm install`, which may re-resolve and rewrite the lock.
+`package-lock.json` 钉住的是整棵依赖树，不只是 `whistle@2.10.8`：这个目录里的每个数字都是对着某一套特定的传递依赖测出来的，`express`、`iconv-lite` 或 `node-forge` 在 whistle 底下换了版本，对照组就跟着变了，而谁都没碰过它。用 `npm ci`，绝不要用 `npm install`——后者可能重新解析依赖、改写锁文件。
 
-How the lock was made and checked (2026-09-28): the versions are exactly the
-tree every earlier measurement ran on — 196 packages, none moved. Each entry's
-`resolved` and `integrity` come from registry.npmjs.org, and each integrity was
-compared with registry.npmmirror.com's for the same version: all 196 agree, all
-are sha512, none has an install script. A fresh `npm ci` from the lock produced
-a `node_modules` byte-identical to the one it was taken from. npm replaces the
-registry.npmjs.org host with whatever registry you have configured, so a mirror
-works unchanged and the integrity check still applies.
+锁文件是怎么做出来、怎么核对的（2026-09-28）：里面的版本和之前所有测量用的那棵树完全一样——196 个包，一个都没变。每一项的 `resolved` 和 `integrity` 都来自 registry.npmjs.org，每个 integrity 都和 registry.npmmirror.com 上同一版本的对比过：196 个全部一致，全是 sha512，没有一个带安装脚本。用这份锁文件重新 `npm ci`，得到的 `node_modules` 和生成锁文件时用的那份逐字节相同。npm 会把 registry.npmjs.org 这个主机名换成你配置的 registry，所以用镜像不用改任何东西，integrity 校验照样生效。
 
-`npm audit` reports 16 advisories (2 critical, 5 high, 9 moderate): `adm-zip`,
-`qs` via `express`/`body-parser`, and `cross-spawn`/`mem`/`yargs-parser` via
-`qrcode@1.2.0`; and, since 2026-09-29, `request` with its `form-data`,
-`tough-cookie` and `uuid`, and `ws@1` — the libraries upstream's own test suite
-is written against ([below](#upstreams-own-test-suite)). They are **accepted,
-not fixed**: the oracle has to be the whistle upstream shipped, with the
-dependencies it shipped with, `qrcode` is held at the version whistle itself
-uses, and the suite's libraries at the versions its code calls. None of it is
-distributed, and it only ever handles this bench's own requests on loopback. Do
-not run `npm audit fix` here — it would silently swap the reference being
-measured against.
+`npm audit` 报 16 条安全公告（2 条 critical、5 条 high、9 条 moderate）：`adm-zip`；经 `express`/`body-parser` 引入的 `qs`；经 `qrcode@1.2.0` 引入的 `cross-spawn`/`mem`/`yargs-parser`；以及从 2026-09-29 起加进来的 `request` 连同它的 `form-data`、`tough-cookie` 和 `uuid`，还有 `ws@1`——上游自带的测试就是基于这几个库写的（见[下文](#上游自带的测试)）。这些**接受，不修**：对照组必须是上游发布的那个 whistle，带着它发布时的依赖；`qrcode` 停在 whistle 自己用的版本；测试用到的库停在测试代码调用的版本。这些东西都不对外分发，也只处理差分测试自己在回环地址上发的请求。别在这里跑 `npm audit fix`——它会悄悄换掉被对照的基准。
 
-The 52 packages the suite brought (2026-09-29) were checked the same way:
-`resolved` from registry.npmjs.org, sha512, no install script.
+上游测试带进来的 52 个包（2026-09-29）用同样的方法核对过：`resolved` 来自 registry.npmjs.org，sha512，没有安装脚本。
 
-A second whistle does not replace this one: it gets a directory and a lockfile
-of its own — see [Which whistle, though](#which-whistle-though). Moving the
-**baseline** is a separate decision: change the version in `package.json`, run
-`npm install --package-lock-only --registry=https://registry.npmjs.org/` (a
-mirror's own URLs must not end up in the lock), and review the lock diff the
-same way before committing it.
+加第二个 whistle 版本不会替换这一个：它有自己的目录和锁文件——见[到底对照哪个 whistle](#到底对照的是哪个-whistle)。挪动**基线**是另一回事，要单独决定：改 `package.json` 里的版本，跑 `npm install --package-lock-only --registry=https://registry.npmjs.org/`（镜像自己的 URL 不能写进锁文件），提交前按同样的方法审一遍锁文件的 diff。
 
-`PORT_BASE` claims three consecutive ports — whistle, whix, and the echo
-origin — so several benches can run at once, one per area under audit:
+`PORT_BASE` 占用连续三个端口——whistle、whix 和回显源站——所以可以同时跑几个测试台，每个审一块：
 
 ```sh
 PORT_BASE=19100 CASES=./cases-filters.js npm run bench
 ```
 
-One corpus claims more than three. `cases-proxy.js` is about **where a request is
-sent and through what**, which a response cannot show, so it stands up eight more
-servers at `PORT_BASE+10`…`+17` — a proxy that records the request line and
-headers it was given, a second echo origin, a proxy that answers 407, one that
-never answers, a SOCKS5 proxy, PAC files, and a TLS hop. Both proxies are pointed
-at the same recording proxy and their two recordings are compared. It needs
-`--insecure-upstream` for the TLS hop's self-signed certificate; the corpus header
-says which port is which.
+有一份语料要的不止三个。`cases-proxy.js` 测的是**请求发到哪、经过什么发出去**，这从响应上看不出来，所以它在 `PORT_BASE+10`…`+17` 上另起八个服务：一个记下收到的请求行和头的代理、第二个回显源站、一个回 407 的代理、一个永远不回的代理、一个 SOCKS5 代理、几个 PAC 文件，以及一个 TLS 中转。两边代理都指向同一个记录代理，再比较两份记录。TLS 中转用的是自签名证书，所以要加 `--insecure-upstream`；哪个端口是干什么的，写在语料文件开头。
 
-It prints the cases it ran and every difference it could not explain, and a
-clean run says `differing: 0` for every corpus. The corpora whose cases differ
-on purpose — delete, values, compose, docs, groups, file, flags, proxy, frames
-and paths — carry those cases in `declared.js`, where they count as `declared`;
-each corpus header explains its own.
+它会打印跑过的用例和每一处解释不了的差异；干净的一次运行，每份语料都显示 `differing: 0`。有些语料的用例是故意不同的——delete、values、compose、docs、groups、file、flags、proxy、frames 和 paths——这些用例记在 `declared.js` 里，计入 `declared`；每份语料文件开头解释了自己的那些。
 
-**`cases-generated.js` is not for this harness.** It is the cross product — 2270
-questions — and it is answered by `rules-oracle.js`, which resolves rather than
-runs. Putting it through `npm run bench` sends two thousand real requests to
-hosts like `example.com`, and the differences that come back are about the
-network rather than about either proxy. (Measured the hard way: 125 of them,
-none real.) See [The rules oracle](#the-rules-oracle).
+**`cases-generated.js` 不是给 `harness.js` 跑的。** 它是交叉组合出来的——2270 个问题——由 `rules-oracle.js` 来回答，后者只解析规则、算出会命中什么，不真的发请求。拿它去跑 `npm run bench`，会向 `example.com` 这类主机发两千个真实请求，回来的差异反映的是网络，而不是哪一边代理。（吃过亏才知道：125 处差异，没有一处是真的。）见[规则对照组](#规则对照组)。
 
-`forward-servers.js` is not a corpus at all — it is the scenery
-`cases-proxy.js` requires, and it starts itself.
+`forward-servers.js` 根本不是语料——它是 `cases-proxy.js` 需要的那一圈配套服务，会自己启动。
 
-Two more run clean and need nothing said about them here:
-`cases-lineprops.js` (one case per property in `docs/LINE_PROPS.md` this bench
-can reach) and `timing-bench.js` (`reqDelay`, `resDelay`, `reqSpeed`, `resSpeed`
-— the rules that are only visible on a clock, and which the main harness passes
-without noticing because the response is byte-identical, just sooner).
+还有两个跑出来是干净的，这里不用多说：`cases-lineprops.js`（`docs/LINE_PROPS.md` 里本测试够得着的每个行属性各一个用例）和 `timing-bench.js`（`reqDelay`、`resDelay`、`reqSpeed`、`resSpeed`——这几条规则只有看时钟才看得出效果；主测试台 `harness.js` 察觉不到它们，照样判通过，因为响应逐字节相同，只是来得早一些）。
 
-Every run also reports `inert` — the cases that would answer the same with no
-rules loaded at all, and therefore prove nothing. See [below](#inert-which-cases-prove-nothing).
+每次运行还会报一个 `inert`：完全不加载规则、答案也一样的用例，所以它们什么也证明不了。见[下文](#inert哪些用例什么也没证明)。
 
-One corpus claims a fourth port. `cases-includes.js` is about `@` includes, and
-half of them name a **URL**, so it stands up a rules-serving HTTP server at
-`PORT_BASE+10`. It runs clean at `differing: 0`.
+有一份语料要第四个端口。`cases-includes.js` 测 `@` 引入，其中一半引入的是一个 **URL**，所以它在 `PORT_BASE+10` 上起一个提供规则文本的 HTTP 服务。它跑出来是干净的，`differing: 0`。
 
-`cases-filters.js` asks about `env:`, which reads the **proxy's** environment, so
-both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle *and*
-whix. `run.js` does; by hand, starting only the oracle that way reports
-five differences that are the launch, not the port.
+`cases-filters.js` 会测 `env:`，它读的是**代理进程**的环境变量，所以两边代理都得带着 `WHISTLE_DIFF_ENV=Alpha` 启动——对照组*和* whix 都要。`run.js` 会这么做；手动跑时如果只给对照组这样启动，会报出五处差异，那是启动方式造成的，不是 whix 的问题。
 
-The numbers these corpora used to be summed up by here disagreed with the
-corpora and with each other — one place said compose ends at 7, its header 9, and
-a run says 9; paths listed two `urlReplace://` cases the corpus no longer has
-and missed the emoji header and the non-UTF-8 body that do differ. That is why the
-declarations are per case now: a count cannot say *which* differences it means.
+这里以前用几个数字概括这些语料，可那些数字跟语料对不上，彼此之间也对不上——一处说 compose 最后是 7，它的语料文件开头写 9，实际一跑是 9；paths 列了两个语料里已经没有的 `urlReplace://` 用例，却漏了确实有差异的 emoji 头和非 UTF-8 body。所以现在的声明是逐个用例写的：一个计数说不出它指的是*哪几处*差异。
 
-## Upstream's own test suite
+## 上游自带的测试
 
 ```sh
-node upstream-suite.js                 # ~4 min: the gate — 180 calls judged
-node upstream-suite.js --control       # + whistle running its own suite (280/280)
-node upstream-suite.js --target rs --only file,reqHeaders --verbose   # one run, a few units
+node upstream-suite.js                 # 约 4 分钟：门禁，评判 180 个调用
+node upstream-suite.js --control       # 另外让 whistle 跑它自己的测试（280/280）
+node upstream-suite.js --target rs --only file,reqHeaders --verbose   # 只跑一遍，只跑几个单元
 ```
 
-It takes whistle's **own** tests — `test/` of the v2.10.8 commit, 82 unit files,
-280 calls that assert something — fetched once by commit id into
-`target/upstream-suite/`, and runs them against whix. The assertions are
-upstream's, unchanged; only the driver is new, because upstream's reports one
-thing — the first assertion that throws ends the process — and here each call is
-a row: passed, failed at which line of which unit, or no answer.
+它拿的是 whistle **自己的**测试——v2.10.8 那个提交的 `test/`，82 个单元文件，280 个带断言的调用——按提交号取一次，放进 `target/upstream-suite/`，然后拿来跑 whix。断言是上游的，一字未改；新写的只有驱动程序。原因是上游的驱动只报一件事——第一个抛出的断言就让进程结束；而这里每个调用一行：通过、在哪个单元的哪一行失败，或者没有回应。
 
-A clean run ends:
+干净的一次运行，结尾是这样：
 
 ```
 judged 180 calls — the ones whistle passes under the flattened rules, with and without the network
@@ -201,73 +98,40 @@ judged 180 calls — the ones whistle passes under the flattened rules, with and
 upstream suite: judged 180, passed 152, declared 28, differing 0, stale 0 — passed
 ```
 
-(Measured 2026-10-01, against 2.10.8 and 2.10.10 alike.)
+（2026-10-01 实测，对 2.10.8 和 2.10.10 结果相同。）
 
-**A pass on an error status is not a pass.** The units that call
-`/cgi-bin/values/add` and `rename` check only that the answer is JSON, and this
-port's 404 for a route it does not have is `{ok:false, error}` — JSON. For a
-while that counted as six calls passing. The gate now fails any call this port
-answered with a 4xx/5xx where whistle did not, whatever the unit asserted, and
-names it `answered 404 where whistle answered 200; the unit did not check`.
-Those six are declared, because `/cgi-bin/*` is a stated non-goal.
+**回了错误状态码的“通过”不算通过。** 调用 `/cgi-bin/values/add` 和 `rename` 的那几个单元只检查回来的是不是 JSON，而本项目对不存在的路由回的 404 是 `{ok:false, error}`——也是 JSON。有一阵子，这被算成了六个调用通过。现在只要本项目回了 4xx/5xx 而 whistle 没有，不管单元断言了什么，门禁都判这个调用失败，并标成 `answered 404 where whistle answered 200; the unit did not check`。这六个已经声明过，因为 `/cgi-bin/*` 是明确写了不做的（non-goal）。
 
-**Why 180 and not 280.** Two thirds of the calls go through the suite's eight
-Node plugins (`test/plugins/`): most of the rules live in their `rules.txt` and
-`_rules.txt`, and many answers come from their servers. Running upstream's plugin
-API is a stated non-goal here, and without the plugins **whistle itself** passes
-74 of 280. So the gate hands both proxies the rules those plugins ship, as plain
-rules (`--print-fixture` shows the translation), and asks whistle first — twice,
-once with every DNS lookup failing — and judges whix on the calls whistle
-passed both times. What is left out needs the plugins' own code, or the network.
+**为什么是 180 而不是 280。** 三分之二的调用要经过测试里的八个 Node 插件（`test/plugins/`）：大部分规则写在它们的 `rules.txt` 和 `_rules.txt` 里，很多答案也是它们的服务器给的。本项目明确不做上游的插件 API，而去掉这些插件，**whistle 自己**也只能通过 280 个里的 74 个。所以门禁把这些插件自带的规则改写成普通规则交给两边代理（`--print-fixture` 能看到改写结果），先问 whistle——问两遍，其中一遍让所有 DNS 查询都失败——只拿 whistle 两遍都通过的调用来评判 whix。剩下没算进来的，要么需要插件自己的代码，要么需要联网。
 
-**Reading a failure.** `FAIL <unit> <METHOD url> #n [<unit>.test.js:<line>]` and
-the assertion's message. `--target rs --only <unit> --verbose` runs that unit
-alone and prints the status, a transport error or the start of an error page for
-each call. The same with `--target whistle --fixture flat` shows what upstream
-does with the same rules. A call that is meant to fail goes in `DECLARED` in
-`upstream-suite.js`, by its exact key and with the reason; one that starts passing
-fails the gate as `STALE` until the declaration goes.
+**怎么看失败。** 失败会打印 `FAIL <unit> <METHOD url> #n [<unit>.test.js:<line>]` 和断言的消息。`--target rs --only <unit> --verbose` 单独跑那个单元，对每个调用打印状态码、传输错误或错误页的开头。同样的命令换成 `--target whistle --fixture flat`，能看到上游拿同样的规则做了什么。本来就该失败的调用写进 `upstream-suite.js` 的 `DECLARED`，用它的完整键名，附上理由；这样的调用一旦开始通过，门禁就以 `STALE` 判失败，直到删掉那条声明。
 
-**Its ports are fixed** — 6666, 18080, 18081, 5566, 1080, 1118, 7788, 2080, 2081,
-and 19999/37621 unused on purpose — because the units spell them out in their
-URLs. Something already on one of them stops the run with its number.
+**它的端口是写死的**——6666、18080、18081、5566、1080、1118、7788、2080、2081，以及故意不监听的 19999/37621——因为各单元在 URL 里直接写了这些端口。其中任何一个已经被占，运行就会停下并报出端口号。
 
-Three things in how it runs differ from `index.test.js`, and are why its numbers
-can be trusted:
+它的跑法有三处和 `index.test.js` 不同，正是这三处让它的数字靠得住：
 
-* upstream's client runs in the same process as upstream, which switches
-  certificate checks off process-wide (`lib/util/patch.js:20`); against
-  whix the driver does the same, or every HTTPS call fails on the proxy's
-  certificate;
-* the two SOCKS fixtures raced their clients — they reported success before the
-  onward connection existed, dropping what arrived meanwhile, and wrote their
-  answer before the request came. Node happens to lose those races; whix
-  lost half the SOCKS calls at random. The fixtures now wait. Their answers are
-  unchanged;
-* every fixture listens on `127.0.0.1` only.
+* 上游的客户端和上游跑在同一个进程里，而上游会在整个进程范围内关掉证书校验（`lib/util/patch.js:20`）；对 whix 跑时，驱动程序也这么做，不然每个 HTTPS 调用都会卡在代理的证书上失败；
+* 两个 SOCKS 夹具和各自的客户端之间有竞态：往下一跳的连接还没建好，它们就报告成功，期间到达的数据被丢掉；请求还没来，它们就把应答写出去了。Node 在这些竞态里恰好总是慢的那一方；whix 却随机丢了一半的 SOCKS 调用。现在夹具会等。它们的应答内容没变；
+* 每个夹具都只监听 `127.0.0.1`。
 
-**What it found**, all fixed on 2026-09-29, each with a test of its own:
+**它找出来的问题**，2026-09-29 全部修好，每个都配了自己的测试：
 
-| Unit | What was wrong in whix |
+| 单元 | whix 错在哪 |
 |---|---|
-| `keys` | a values-store entry beat the rules text's own ``` block of the same name, and a block inside rules a request carried was dropped |
-| `script` | what a `reqScript` set on `values` did not reach the rules it pushed, and `reqScriptData` did not last from the request script to the response script |
-| `tps` | a rules text under `resScript://` was run as JavaScript and applied nothing |
-| `ws` | a request for another name sent to the proxy port origin-form got the console's 403 instead of being forwarded; `statusCode://101` sent a 101 no client accepts |
-| `connect` | a server that compresses WebSocket frames delivered noise: the relay dropped the "compressed" bit |
-| `insertFile` | the body operators decoded file contents as UTF-8, so a character split across two files — or a GBK page — was mangled |
-| `plugin` | `headerReplace` on two `set-cookie` headers left one |
-| `params` | an object param in a multipart body became an empty field instead of a file |
+| `keys` | Values 存储里的条目压过了规则文本里同名的 ``` 块；请求自带的规则里的块被丢掉了 |
+| `script` | `reqScript` 在 `values` 上设的东西，到不了它推出来的规则里；`reqScriptData` 没能从请求脚本保留到响应脚本 |
+| `tps` | `resScript://` 下的一段规则文本被当成 JavaScript 执行，结果什么也没应用 |
+| `ws` | 以 origin-form（请求行里只写路径）发到代理端口、要访问别的域名的请求，拿到的是控制台的 403，而没有被转发；`statusCode://101` 发出的 101 没有任何客户端会接受 |
+| `connect` | 服务器压缩了 WebSocket 帧时，收到的是乱码：中继把“已压缩”标志位丢了 |
+| `insertFile` | body 类算子把文件内容按 UTF-8 解码，所以一个字符被拆在两个文件里时——或者遇到 GBK 页面——就乱了 |
+| `plugin` | 对两个 `set-cookie` 头做 `headerReplace`，结果只剩一个 |
+| `params` | multipart body 里一个对象类型的参数变成了空字段，而不是文件 |
 
-## The console's front door
+## 控制台的前门
 
-`auth-bench.js` is the one bench that never installs a rule, because its subject
-is the way in to the console every *other* bench installs its rules through —
-the login, and the hostnames that open it.
+`auth-bench.js` 是唯一一个从不装规则的测试台，因为它测的就是进控制台的那道门——*其他*每个测试台都要从这道门进去装规则：也就是登录，和能打开控制台的那些域名。
 
-`-n`/`-w` name the account that may do anything and `-N`/`-W` one that may only
-read; a corpus that locked itself out would have nothing left to say, so this
-stands alone and both proxies are launched with the credentials.
+`-n`/`-w` 指定一个什么都能做的账号，`-N`/`-W` 指定一个只读账号；一份语料要是把自己锁在了门外，就什么也测不了了，所以它单独成一个测试台，两边代理启动时都带上凭据。
 
 ```sh
 W2_USER=admin W2_PASS=s3cret W2_GUEST=guest W2_GUEST_PASS=look \
@@ -277,52 +141,16 @@ cargo run -- --port 19801 --no-persist --dir /tmp/rs-auth \
 PORT_BASE=19800 node auth-bench.js
 ```
 
-The two consoles are different programs with different route tables, so what it
-compares is not what a path *answers* but whether the request got past the gate:
-the status, and whether a `WWW-Authenticate` came back. A path that exists in
-neither (`/no-such-route`) isolates that exactly — 401 when the credentials are
-wrong and 404 when they are right, and the difference between those two is the
-gate and nothing else. The prose and content type of the 401 body are each
-proxy's own words and are not compared.
+两边的控制台是不同的程序，路由表也不同，所以它比较的不是某个路径*回了什么*，而是请求有没有过这道门：状态码，以及有没有带回 `WWW-Authenticate`。一个两边都不存在的路径（`/no-such-route`）正好能把这一点单独拎出来：凭据错了回 401，对了回 404，两者之差就是这道门，别的什么都没有。401 body 的文字和 content type 是各代理自己的说法，不比较。
 
-54 cases: every spelling of a credential (`Basic`, `basic`, no scheme at all,
-padding trimmed, no colon, a password containing one), each of the three places
-upstream reads them from, the read-only account against five methods, the
-`.js`/`.css`/`.ico`/`.png` exemption, the root certificate answering before the
-login does, and — the case that would matter most if it ever broke — that a
-console login **does not gate proxied traffic**. A clean run is
-`differing: 0, declared: 6`, the six being upstream's static-suffix exemption,
-which a console that is one self-contained page has nothing to use and would only
-be a hole.
+54 个用例：凭据的每种写法（`Basic`、`basic`、完全不写 scheme、去掉了 padding、没有冒号、密码里带冒号），上游读取凭据的三个位置各一遍，只读账号对五种方法，`.js`/`.css`/`.ico`/`.png` 的豁免，根证书在登录之前就能拿到，以及——万一坏了后果最严重的那个——控制台登录**不拦代理流量**。干净的一次运行是 `differing: 0, declared: 6`，这六个是上游按静态资源后缀放行的豁免：本项目的控制台是一个自包含的单页，用不上它，加上只会多一个漏洞。
 
-It also carries the **hostnames that are the console**. `w2 status` tells people
-to open `http://local.whistlejs.com/` through the proxy, and `rootca.pro` is how
-a phone gets the certificate — set the proxy, open the name, install what it
-hands you. Both resolve to `127.0.0.1`, where nothing is listening on port 80, so
-a proxy that does not know them answers `502`, which is what this port did.
-Compared on status and content type: two different consoles serve two different
-pages and two different roots are two different certificates, so the bytes were
-never going to match. They are asked **logged in**, because this bench runs both
-consoles gated and an anonymous request for a console hostname is a 401 on both
-sides with only the prose of the refusal left to differ; two more ask them
-anonymously, to say that the login still stands in front of the console and that
-the certificate still answers anyway. `https-bench.js` asks the same questions
-inside a tunnel.
+它还测**本身就是控制台的那些域名**。`w2 status` 让人通过代理打开 `http://local.whistlejs.com/`；手机拿证书靠的是 `rootca.pro`——设好代理，打开这个域名，把它给你的东西装上。这两个域名都解析到 `127.0.0.1`，那里的 80 端口没人监听，所以不认识它们的代理会回 `502`，本项目以前就是这样。比较的是状态码和 content type：两个不同的控制台给出两个不同的页面，两个不同的根证书就是两张不同的证书，字节本来就不可能一样。这些请求是**登录后**发的，因为这个测试台跑的两个控制台都开着登录，匿名请求控制台域名在两边都是 401，剩下能不同的只有拒绝时的文字；另有两个用例匿名去问，用来确认登录仍然挡在控制台前面，而证书照样拿得到。`https-bench.js` 在隧道里问同样的问题。
 
-It found two things this port had wrong, both now fixed and both pinned in
-`login_tests`: `parseAuth` decodes a value with **no scheme** and does not
-insist on the padding, and a header and a query parameter are **two
-candidates** — either satisfies the login on its own, where this port took the
-first source that carried anything, so a browser holding a stale `Authorization`
-masked the `?authorization=…` the user had just pasted and no reload could get
-past it.
+它找出了本项目的两处错误，现在都已修好，并都在 `login_tests` 里钉住了：`parseAuth` 会解码**不带 scheme** 的值，也不强求 padding；请求头和查询参数是**两个候选**——任何一个单独满足就算登录成功，而本项目以前只取第一个有内容的来源，于是浏览器里存着一个过期的 `Authorization` 时，会盖住用户刚粘贴进来的 `?authorization=…`，怎么刷新都过不去。
+## HTTPS 测试台
 
-## The HTTPS bench
-
-`https-bench.js` is the same idea over a **TLS** origin: it opens a real CONNECT
-tunnel through each proxy, trusting that proxy's own root CA, and compares the
-decrypted exchange. Nothing the plain bench runs touches CONNECT, certificate
-forging, SNI, or the `https://` half of pattern matching.
+`https-bench.js` 是同一个思路，只是源站换成了 **TLS**：它通过每个代理各开一条真正的 CONNECT 隧道（信任该代理自己的根证书），然后比较解密后的往来内容。明文测试台跑的用例，没有一条碰得到 CONNECT、代理签发站点证书、SNI，也碰不到匹配串里 `https://` 的那一半。
 
 ```sh
 PORT_BASE=19600 node oracle.js &
@@ -330,180 +158,77 @@ cargo run -- --port 19601 --no-persist --insecure-upstream --dir /tmp/rs-tls &
 PORT_BASE=19600 node https-bench.js
 ```
 
-Its origin also echoes the **TLS version and the cipher suite it negotiated with
-the proxy**, which is the only place `cipher://` / `tlsOptions://` is observable
-at all: nothing about a pin reaches the client. Without the version, a case that
-pins a version and a case that pins nothing compare equal — and the suite was
-missing for just as long, so a rule naming one suite and a rule naming another
-negotiated the same version and compared equal too. Every `ciphers` case here was
-inert until the origin started reporting `getCipher().name`.
+它的源站还会回显**它和代理协商出来的 TLS 版本与加密套件**。`cipher://` / `tlsOptions://` 的效果只有在这里才看得到：钉住（pin，即限定只用某个 TLS 版本或套件）了什么，客户端那头一点也收不到。没有版本这一项时，钉了版本的用例和什么都没钉的用例比出来一样；套件这一项缺了同样久，所以一条规则指定这个套件、另一条指定那个套件，只要协商出同一个版本，也比出来一样。在源站开始报告 `getCipher().name` 之前，这里每一条 `ciphers` 用例都是 inert 的。
 
-Three cases at the end are **one-sided**, and have to be. `cipher://` turns out to
-do nothing at all in whistle 2.10.8 — it builds the options and then merges them
-into the socket only while *retrying a ciphers error*, so the first, successful
-handshake never sees them — which means a two-proxy comparison can only ever say
-"whix pinned something and whistle did not". Those three ask the question
-that matters instead: name a suite, and read back what the origin actually
-negotiated. Four more ask that a string selecting **nothing** leaves the
-connection unpinned and alive rather than failing it, which is what it used to
-do; see `src/proxy/ciphers.rs` for why that changed.
+最后三条用例是**单边的**，也只能是单边的。`cipher://` 在 whistle 2.10.8 里其实完全不起作用——它把选项构造好了，却只在*重试一次套件错误*的时候才把它们合并进 socket，所以第一次、也就是成功的那次握手根本看不到这些选项。这意味着两个代理对比，最多只能得出「whix 钉住了点什么，whistle 没有」。所以这三条改问真正要紧的问题：指定一个套件，再读回源站实际协商出来的是什么。另外四条要求：一个**一个套件都选不中**的字符串，应当让连接不钉任何东西、照常活着，而不是让连接失败——以前就是让它失败的；为什么改了，见 `src/proxy/ciphers.rs`。
 
-**It turns whistle's `Enable HTTPS` switch on before it starts, and that is not a
-convenience.** whistle does not decrypt HTTPS in a fresh data directory; with the
-switch off it only intercepts hosts that already have a custom certificate
-(`_original/lib/tunnel.js:187-199`), while whix intercepts by default. For
-a long time this file did not know that, and passed anyway — because its origin
-is `localhost`, which whistle intercepts whatever the rules say. Under any other
-name every case here would have been comparing "whistle passed the connection
-through" against "this port read it", which is a fact about a switch and not
-about a rule.
+**它在开始之前会先打开 whistle 的 `Enable HTTPS` 开关，这一步不是图省事。** whistle 在一个全新的数据目录里不会解密 HTTPS；开关关着时，它只拦截那些已经配了自定义证书的主机（`_original/lib/tunnel.js:187-199`），而 whix 默认就拦截。这个文件很长一段时间都不知道这一点，却照样通过了——因为它的源站是 `localhost`，而不管规则怎么写，whistle 都会拦截 `localhost`。换成任何别的名字，这里的每条用例比的都会是「whistle 把连接原样放过去了」对「本项目把它解开读了」，这说明的是一个开关的状态，跟规则无关。
 
-Two sections at the end look at the tunnel itself rather than at what travels
-inside it, and neither can be written with `throughTunnel`, which verifies
-against the proxy's own root and so turns every un-intercepted connection into
-the same TLS error:
+最后两节看的是隧道本身，而不是隧道里传的东西。这两节都没法用 `throughTunnel` 来写：它用代理自己的根证书做验证，于是每一条没被拦截的连接都会变成同一个 TLS 错误：
 
-* **who signed the certificate** (12 cases) — the only way to see the difference
-  between a connection that was read and one that was passed through. It is
-  where the bare-IP default lives: a `CONNECT` to an address whose ClientHello
-  named nothing is not decrypted by either proxy. These run under `probe.test`
-  and a `host://` line rather than under `localhost`, for the reason above;
-* **what the tunnel is carrying** (8 cases) — cleartext HTTP, an unknown method,
-  cleartext HTTP/2, and bytes that are neither HTTP nor TLS, which both proxies
-  relay. These compare through `sameTunnelAnswer`, which drops the same
-  hop-by-hop and framing headers `compare` does: the origin echoes the request
-  headers it was given, so a raw compare would fail on `connection` (whistle
-  stamps it, hyper does not) and on `host` (whistle rewrites it to the tunnel's
-  authority, this port forwards the `:authority` the client sent).
+* **证书是谁签的**（12 条用例）——想分清一条连接是被解开读了还是被原样放过去，只有这一个办法。纯 IP 地址的默认行为也在这里测：对一个 ClientHello 里没写任何名字的地址发 `CONNECT`，两个代理都不解密。出于上面说的原因，这些用例跑在 `probe.test` 加一行 `host://` 下，而不是 `localhost` 下；
+* **隧道里装的是什么**（8 条用例）——明文 HTTP、一个不认识的方法、明文 HTTP/2，以及既不是 HTTP 也不是 TLS 的字节，这些两个代理都会原样转发。它们用 `sameTunnelAnswer` 来比较，它丢掉的逐跳头和分帧相关的头跟 `compare` 丢掉的是同一批：源站会回显它收到的请求头，所以直接比原始内容会在 `connection` 上失败（whistle 会加上这个头，hyper 不会），也会在 `host` 上失败（whistle 把它改写成隧道的 authority，也就是 CONNECT 的目标地址；本项目转发的是客户端发来的 `:authority`）。
 
-It refuses to run its cases until a plain request really works through both —
-because it once reported "18 cases, 0 differences" while **every tunnel was
-dying of `EPROTO`**. Two proxies that fail identically compare equal. The cause
-was in the bench: the tunnel's socket is already decrypted, so what travels
-inside it is plain HTTP, and using an HTTPS client on it negotiated TLS a second
-time.
+在一个普通请求确实能穿过两个代理之前，它拒绝跑用例——因为它曾经报出「18 条用例，0 处差异」，而当时**每一条隧道都死于 `EPROTO`**。两个代理以同样的方式失败，比出来就是一样的。问题出在测试台自己身上：隧道的 socket 已经是解密过的，里面传的是明文 HTTP，可它在上面用了 HTTPS 客户端，又协商了一遍 TLS。
 
-## The rules oracle
+## 规则对照组
 
-`rules-oracle.js` asks a narrower question than everything above, and pays
-almost nothing for it: **which rules match this request, and what does each
-operator end up holding**. It needs no proxy, no origin and no port — whistle's
-own `Rules` (`lib/rules/rules.js`) is driven in-process, this port answers
-through `whix explain --batch`, and the two answers are compared.
+`rules-oracle.js` 问的问题比上面所有测试台都窄，代价也几乎为零：**这个请求命中了哪些规则，每个算子最后拿到了什么值**。它不需要代理、不需要源站，也不占端口——whistle 自己的 `Rules`（`lib/rules/rules.js`）直接在进程里跑，充当对照组（oracle，说白了就是拿来当标准答案的那一方）；本项目通过 `whix explain --batch` 作答，再把两边的答案拿来比。
 
 ```sh
-cargo build                     # the bench runs target/debug/whix
-node rules-oracle.js            # which operators matched
-node rules-oracle.js --values   # …and what each one resolved to
+cargo build                     # 测试台跑的是 target/debug/whix
+node rules-oracle.js            # 命中了哪些算子
+node rules-oracle.js --values   # ……以及每个算子解析成了什么
 node rules-oracle.js --grep host --limit 5
 ```
 
-Its corpus is `cases-rulelines.js`, written by `gen-rulelines.js` from a
-checkout of the docs: **every concrete rule line the whistle documentation
-prints**, kept verbatim — `docs/docs/**/*.md` from the upstream
-repository, the rule pages and the pages beside them. `cases-docs.js` had to
-repoint each pattern at a live origin and drop every line that would make a
-proxy dial a stranger; this one resolves rather than runs, so
-`/Users/john/mock.json`, `www.test.com` and `10.1.0.1:8080` all stay as written.
-Each line is asked about a fixed set of URLs plus URLs derived from its own
-pattern — 17k questions in under a second, which is cheap enough to run on every
-change.
+它的语料是 `cases-rulelines.js`，由 `gen-rulelines.js` 从一份文档的本地 checkout 生成：**whistle 文档里印出来的每一条具体规则行**，原样保留——来源是上游仓库的 `docs/docs/**/*.md`，包括规则页面和它们旁边的页面。`cases-docs.js` 得把每个匹配串改指到一个活着的源站，还得删掉每一条会让代理去连陌生主机的行；这份语料只做解析、不真跑，所以 `/Users/john/mock.json`、`www.test.com` 和 `10.1.0.1:8080` 都可以原样保留。每一行都会拿一组固定的 URL，加上从它自己的匹配串推出来的 URL 去问——17k 个问题不到一秒问完，便宜到每次改动都可以跑一遍。
 
-It has a second corpus: `--from-cases` reads the fourteen **hand-written**
-corpora as *rules* instead of running them as requests. Each of those cases
-already carries its own request — a method, a path, headers, sometimes a body —
-so it can be asked exactly, and they are the awkward lines somebody sat down and
-thought of rather than the ones a website prints (1842 questions, and they need
-`PORT_BASE` set to the same value the corpora were written against).
+它还有第二份语料：`--from-cases` 把十四份**手写**语料当成*规则*来读，而不是当成请求去跑。那些用例每一条本来就带着自己的请求——方法、路径、头，有时还有 body——所以可以原样提问。它们是有人坐下来专门想出来的刁钻写法，而不是网站上印出来的那些（1842 个问题；跑的时候要把 `PORT_BASE` 设成编写这些语料时用的那个值）。
 
-It is the layer most of this port's bugs have lived in, and the first run found
-six: a bare `~/mock.json` read as a file where whistle reads a destination; a
-`file://` rule answering a WebSocket upgrade; a domain pattern appending `/` to
-its value at the root, so `file:///srv/mock.json` opened `/srv/mock.json/`; a `|`
-in a destination's query string split in half; a backtick template joined to the
-request's path *before* it was rendered, which left the template unrendered; and
-a ``` block's `\r\n` rewritten to `\n`, which is the framing of the raw HTTP
-response such a block is usually written to hold.
+本项目的 bug 大多出在这一层，第一次运行就找出了六个：一个单独的 `~/mock.json`，whistle 读成目标地址，这里读成了文件；一条 `file://` 规则去应答了 WebSocket 升级请求；域名匹配串在请求根路径时给值的末尾多加了 `/`，于是 `file:///srv/mock.json` 打开的是 `/srv/mock.json/`；目标地址查询串里的一个 `|` 把它劈成了两半；反引号模板在渲染*之前*就被拼上了请求路径，结果模板根本没被渲染；还有一个 ``` 块里的 `\r\n` 被改写成了 `\n`——而这种块通常就是用来装原始 HTTP 响应的，`\r\n` 正是那种响应的分帧方式。
 
-**What it cannot see.** Resolution is not application: two proxies that resolve
-a rule identically can still apply it differently, and that is the live bench's
-subject. Neither does it see the response phase, plugins, or anything an
-`@`-include pulls in mid-request.
+**它看不见什么。** 解析不等于应用：两个代理对一条规则解析得一模一样，应用起来仍可能不同，那是真跑请求的测试台要管的事。它也看不到响应阶段、插件，以及请求进行到一半时被 `@` 引入拉进来的任何东西。
 
-A clean run is `differing: 0, value differences: 0`. It also reports
-**`declared`** — differences this port has declared, each with its reason and a
-matcher narrow enough that it cannot excuse anything else, the same discipline
-`EXPECTED` keeps below — and **`host-case folds`** — questions whose only difference is that a domain pattern
-matches `Host: EXAMPLE.COM` here and not upstream, which `docs/RULES.md` declares
-and the bench proves case by case by re-asking upstream with the host lowered.
+跑干净的结果是 `differing: 0, value differences: 0`。它还会报告 **`declared`**——本项目已声明的差异，每一条都带着理由，和一个窄到不能顺带豁免别的东西的匹配器，跟下文 `EXPECTED` 守的是同一条纪律——以及 **`host-case folds`**——那些唯一的差别是「域名匹配串在这里能匹配 `Host: EXAMPLE.COM`、在上游不能」的问题。这一点 `docs/RULES.md` 已经声明，测试台也逐条证明：把 host 转成小写，再去问一遍上游。
 
-### Why a case proves nothing
+### 为什么一条用例什么也证明不了
 
-`inert` is a number; `triage-inert.js` is the reason behind it.
+`inert` 是一个数字；`triage-inert.js` 给出这个数字背后的原因。
 
 ```sh
 PORT_BASE=19500 CASES=./cases-bodies.js npm run bench \
   | PORT_BASE=19500 node triage-inert.js ./cases-bodies.js
 ```
 
-It takes the inert list out of the bench's own JSON and resolves each of those
-cases' rules against its own request — through the oracle's machinery, so the
-answer is the resolver's — and sorts them into four:
+它从测试台自己输出的 JSON 里取出 inert 列表，把其中每条用例的规则拿这条用例自己的请求去解析——走的是规则对照组那套机制，所以答案出自解析器本身——然后分成四类：
 
-* **baselines**, which carry no rules and whose whole claim is what the origin
-  does;
-* **matched and did nothing**, which is most of them and usually correct:
-  `jsAppend://` on a CSS response is *supposed* to do nothing, and the case
-  says so by being inert. It prints the operators, so a family that should have
-  had an effect stands out;
-* **never matched, and the line says why** — a filter, an `ignore://`, a
-  `skip://`, a negated pattern, an `@` source that is not one;
-* **never matched, with nothing to explain it.** That is the bug: the case has
-  been passing in the shape of a rule that fires and does nothing, which is the
-  shape a *missing feature* has too.
+* **基线用例**：不带任何规则，它要证明的全部就是源站自己的行为；
+* **命中了但什么也没做**：大部分属于这一类，而且通常没问题：CSS 响应上的 `jsAppend://` *本来就*不该做任何事，用例正是用 inert 来表明这一点。它会把算子打印出来，所以如果某一族本该起作用的算子出现在这里，一眼就能看出来；
+* **从没命中，而且规则行本身说明了原因**——一个筛选器、一个 `ignore://`、一个 `skip://`、一个取反的匹配串，或者一个其实不成立的 `@` 来源；
+* **从没命中，又没有任何东西能解释。** 这就是 bug：这条用例一直以「规则触发了、但什么也没做」的样子在通过，而一个*缺失的功能*长得也是这个样子。
 
-A case that means to miss says so with `inert: true`, and the tool checks that
-claim both ways — a case that declares itself inert and turns out to
-discriminate is a stale marker, and is reported too.
+一条有意不命中的用例要用 `inert: true` 说明，工具会双向检查这个声明——声明自己 inert、结果却有判别力的用例，说明这个标记过时了，同样会被报出来。
 
-It found four cases that had fallen into the same trap: **a token cannot
-contain a space**, so `resBody://(NEW BODY)` parses as `resBody://(NEW` plus a
-second *pattern* `BODY)`, and the line then matches nothing at all. One case in
-the same corpus documents that trap on purpose; two others had walked into it,
-along with two `resCookies://` values carrying a `; ` and a date. All fourteen
-corpora now report zero unexplained.
+它找出了四条掉进同一个坑的用例：**一个 token（规则里用空白隔开的一段）不能含空格**，所以 `resBody://(NEW BODY)` 会被解析成 `resBody://(NEW` 加上第二个*匹配串* `BODY)`，于是整行什么也匹配不上。同一份语料里有一条用例是故意记录这个坑的；另外两条是不小心踩进去的，还有两条是带着 `; ` 和日期的 `resCookies://` 值。现在十四份语料报出的「无法解释」都是零。
 
-### Which operators the bench proves anything about
+### 测试台到底证明了哪些算子
 
-`every_documented_rule_has_a_differential_case` (a Rust test) says every
-documented rule name appears in a corpus. It says so in the weakest possible
-terms, and admits it: a case exists, not that the case has any force.
-`coverage-ops.js` asks the stronger question.
+`every_documented_rule_has_a_differential_case`（一个 Rust 测试）说的是每个有文档的规则名都出现在某份语料里。它用的是最弱的说法，而且自己也承认：只说明用例存在，不说明这条用例有任何判别力。`coverage-ops.js` 问的是更强的问题。
 
 ```sh
-PORT_BASE=19500 node coverage-ops.js     # runs all fourteen benches, a few minutes
+PORT_BASE=19500 node coverage-ops.js     # 跑全部十四个测试台，要几分钟
 ```
 
-For each operator: is there at least one case that resolves it **and** whose
-answer would change if the rule were removed? The universe is `operators.js` —
-one spelling of everything this port parses — so an operator nobody wrote a case
-for cannot hide by being absent from both the corpus and the list.
+对每个算子，它问：是否至少有一条用例会解析到它，**并且**拿掉这条规则后答案会变？要检查的全集是 `operators.js`——本项目能解析的每样东西各列一种写法——所以一个没人写用例的算子，不会因为在语料和清单里同时缺席就藏起来。
 
-It found two things on its first run. `xsfile://` had exactly one case and that
-case was inert by design (an unsplit path that does not exist falls through to
-the origin), so nothing had ever proved the operator does anything at all.
-And `location://`, which no case asked about, turned out not to be a protocol:
-it is in neither upstream's registry nor its alias table, so whistle answers
-`502 Unsupported protocol location:` where this port answered a `302`.
+它第一次运行就发现了两件事。`xsfile://` 只有一条用例，而那条用例被有意设计成 inert（一个没拆分、又不存在的路径会落空，交给源站处理），所以从来没有任何东西证明过这个算子真的起作用。还有 `location://`，从来没有用例问过它，结果它根本不是一个协议：上游的注册表和别名表里都没有它，所以 whistle 回答的是 `502 Unsupported protocol location:`，而本项目回答的是 `302`。
 
-What is left is eight operators the corpora here cannot reach — dumps, ciphers,
-delays, frames, plugins — each named with the bench or the test that does reach
-it.
+剩下的是八个这里的语料够不着的算子——dump、cipher、延迟、帧、插件——每一个都写明了由哪个测试台或测试来覆盖。
 
-## The frames bench
+## 帧测试台
 
-`frames-bench.js` compares **the frames themselves** — how many a request
-produced, carrying what, in which direction.
+`frames-bench.js` 比较的是**帧本身**——一个请求产生了几帧、每帧带的是什么、朝哪个方向。
 
 ```sh
 PORT_BASE=19300 node oracle.js &
@@ -511,456 +236,222 @@ cargo run -- --port 19301 --no-persist --dir /tmp/rs-frames &
 PORT_BASE=19300 node frames-bench.js
 ```
 
-For a long time this file did not exist, on the reasoning that the two consoles
-are different programs with different data models and there is nothing to
-compare. The models do differ. The *question* does not, and both answer it over
-HTTP — `POST /cgi-bin/sessions` then `POST /cgi-bin/frames` there, `/sessions.json`
-then `/frames.json?id=` here. Believing otherwise cost a real divergence: this
-port framed a body on a separator header alone, where upstream also wants
-`enable://captureStream`, and nothing on the wire could tell.
+这个文件很长一段时间都不存在，理由是两边的控制台是不同的程序、数据模型也不同，没什么可比的。数据模型确实不同。但*问题*是同一个，而且两边都通过 HTTP 回答——上游是先 `POST /cgi-bin/sessions` 再 `POST /cgi-bin/frames`，本项目是先 `/sessions.json` 再 `/frames.json?id=`。当初那么想，代价是漏掉了一处真实的分歧：本项目只凭一个分隔符头就把 body 拆成帧，而上游还要求有 `enable://captureStream`，线路上什么也看不出来。
 
-It compares the payloads in order, each tagged with its direction, and nothing
-else: ids, timestamps and lengths are each console's own bookkeeping. It polls
-rather than sleeping — upstream emits the tail of a body only when the body ends
-(`if (end) emitFrame(buf)`, `data.js:126-129`), so a case whose separator never
-matches has nothing to show until then, and a fixed wait made it pass on a quiet
-machine and fail on a busy one.
+它按顺序比较各帧的内容，每一帧标上方向，别的一概不比：id、时间戳和长度都是各家控制台自己的记账。它靠轮询而不是 sleep 来等——上游只有在 body 结束时才把 body 的尾巴作为一帧发出来（`if (end) emitFrame(buf)`，`data.js:126-129`），所以一条分隔符永远匹配不上的用例，在那之前什么都看不到；用固定的等待时间，它在空闲的机器上能过，在繁忙的机器上就挂。
 
-Two more things it had to learn, both about state it did not own — and both of
-which produced a false finding that looked exactly like news.
+它还得学会另外两件事，都跟不归它管的状态有关——而且两件事都制造过一个假发现，看上去跟真的新发现一模一样。
 
-* **It refuses to run against an origin it did not start.** A leftover server on
-  the origin's port makes the bench report numbers about somebody else's server.
-  It now fails loudly if the port is held, and checks that what answers is really
-  its own origin before running a case.
-* **Its per-case tags carry the run.** An oracle is meant to be left running
-  between runs, so its capture holds every earlier run's sessions too. A tag that
-  repeated across runs made the session lookup land on an answer recorded hours
-  before — from a build that predated the very gate under test — and one case
-  read as a failure for most of an afternoon. The lookup also takes the *newest*
-  match now rather than the first, since upstream lists sessions oldest first.
+* **它拒绝对着一个不是它自己启动的源站跑。** 源站端口上残留的服务器，会让测试台报出关于别人服务器的数字。现在如果端口被占，它会直接报错失败，并且在跑用例之前先确认应答的真是它自己的源站。
+* **它每条用例的标签里带着这次运行的标识。** 对照组本来就是要在多次运行之间一直开着的，所以它抓到的会话里也有之前每一次运行留下的。标签在多次运行之间重复，会让会话查找落到几个小时前记下的答案上——那次的构建甚至早于正在被测的那道门禁本身——结果有一条用例大半个下午都被当成失败。现在查找也改成取*最新*的匹配，而不是第一个，因为上游列会话是从旧到新排的。
 
-The general lesson, and it is the third time today: **a bench that reads state it
-did not create is not measuring what it says it is**, and the failure looks like
-a finding rather than like a bug. 15 cases —
-the event stream with and without a `charset`, the flag on both sides of the
-exchange, the leading slash that keeps the separator, a separator that appears
-nowhere, and the FAQ's own example including its typo (`%A0` where it means
-`%0A`, which frames the whole body as one). A clean run is `differing: 0`; two
-of the cases are declared for one release each, because upstream changed its
-answer between 2.10.8 and 2.10.10 (`declared.js`).
+普遍的教训——今天已经是第三次了：**测试台读了不是自己创建的状态，量的就不是它声称在量的东西**，而且这种失败看起来像一个发现，而不像一个 bug。15 条用例——带和不带 `charset` 的事件流、开关分别放在交换的两侧、保留分隔符的那个前导斜杠、一个哪里都不出现的分隔符，以及 FAQ 自己的示例连同它的笔误（写的是 `%A0`，本意是 `%0A`，结果整个 body 成了一帧）。跑干净是 `differing: 0`；其中两条用例各在一个版本上做了声明，因为上游在 2.10.8 和 2.10.10 之间改了答案（`declared.js`）。
 
-`cases-frames.js` is the other half: what the framing does to the wire, where
-the risk is a splitter that eats a boundary or holds the tail.
+`cases-frames.js` 是另一半：分帧对线路上的数据做了什么，风险在于拆分器吃掉了边界，或者扣着尾巴不放。
 
-## Frame scripts on a WebSocket
+## WebSocket 上的帧脚本
 
-`ws-bench.js` sends one text frame through each proxy to an echo origin under
-four `frameScript://` rules — none, a handler for each direction, one for the
-client's frames only, one for the server's only — and compares what the
-**origin** received and what the **client** got back. Neither end can be seen
-from the other, so both are asked. Runs on the standard pair (`run.js` step
-`ws`); by hand, `PORT_BASE=… node ws-bench.js` with a pair up.
+`ws-bench.js` 在四种 `frameScript://` 规则下，通过每个代理向一个回显源站发一个文本帧——没有处理函数、两个方向各一个处理函数、只处理客户端的帧、只处理服务端的帧——然后比较**源站**收到了什么、**客户端**收回了什么。两端互相看不到对方，所以两头都要问。它跑在标准的那一对代理上（`run.js` 的 `ws` 步骤）；手动跑的话，先把一对代理起好，再 `PORT_BASE=… node ws-bench.js`。
 
-It exists because upstream changed: up to 2.10.9 a client's frame on a plain
-WebSocket went to `handleSendToClientFrame`, the other direction's handler
-(avwo/whistle#1358). Against 2.10.8 two of the four cases differ and are
-declared for that release; against 2.10.10 none do.
+它之所以存在，是因为上游改过：到 2.10.9 为止，普通 WebSocket 上客户端发的帧会交给 `handleSendToClientFrame`，也就是另一个方向的处理函数（avwo/whistle#1358）。对着 2.10.8，四条用例里有两条不同，已针对那个版本做了声明；对着 2.10.10，一条都没有不同。
 
-## Which address `localhost` is dialled at
+## `localhost` 连的是哪个地址
 
-`dns-bench.js` stands up three origins — IPv4 only, IPv6 only, one socket for
-both — and asks each proxy for `http://localhost:<port>/`; each origin answers
-with the address it was reached at. Both whistle releases dial IPv4 first for
-`localhost`, and so does this port since U1; started with `-M verbatim` (the
-resolver's order, `::1` first on macOS) it reaches the dual-stack origin over
-IPv6 and the bench fails. Where `::1` cannot be bound it prints `skipped` and
-compares nothing — a container with no IPv6 is not a finding.
+`dns-bench.js` 起三个源站——只有 IPv4、只有 IPv6、一个 socket 同时听两者——然后向每个代理请求 `http://localhost:<port>/`；每个源站会回答它是从哪个地址被连到的。两个 whistle 版本对 `localhost` 都先连 IPv4，本项目从 U1 起也一样；如果用 `-M verbatim` 启动（按解析器给的顺序，macOS 上 `::1` 排第一），它会经 IPv6 连到双栈源站，测试台就会失败。在绑不了 `::1` 的环境里，它打印 `skipped`，什么也不比——一个没有 IPv6 的容器不算发现。
 
-## Which HTTP version reaches an HTTPS origin
+## 到达 HTTPS 源站的是哪个 HTTP 版本
 
-`h2-bench.js` stands up one TLS origin that offers both h2 and HTTP/1.1, as most
-do, and asks it through each proxy from an h2 client and an HTTP/1.1 client, with
-and without `enable://h2`/`disable://h2`/`disable://httpsH2`/`disable://http2`, and
-with ten h2 requests at once. It compares the protocol the proxy spoke to the
-client, the version and headers the origin received (`:authority` and `Host`
-included), and how many connections the origin accepted. Runs on the standard
-pair after `https` (`run.js` step `h2`).
+`h2-bench.js` 起一个 TLS 源站，像大多数源站一样同时提供 h2 和 HTTP/1.1，然后分别用 h2 客户端和 HTTP/1.1 客户端通过每个代理去访问它：带和不带 `enable://h2`/`disable://h2`/`disable://httpsH2`/`disable://http2` 各问一遍，还有一次同时发十个 h2 请求。它比较代理对客户端说的是什么协议、源站收到的版本和头（包括 `:authority` 和 `Host`），以及源站接受了几条连接。它跑在标准的那一对代理上，排在 `https` 之后（`run.js` 的 `h2` 步骤）。
 
-https-bench's origin speaks HTTP/1.1 only, so before this nothing could see which
-protocol reached an origin. Against the build before PERF1, five of the eight
-cases differ — the origin got HTTP/1.1 with a `Host` header where whistle sent
-h2, and ten requests arrived as ten connections instead of one. Now one differs,
-on 2.10.8 and 2.10.10 alike, and is declared: whistle's `disable://http2` also
-stops offering h2 to the client.
+https-bench 的源站只说 HTTP/1.1，所以在这之前，没有任何东西能看到到达源站的是哪种协议。对着 PERF1 之前的构建，八条用例里有五条不同——whistle 发的是 h2，源站在本项目这边收到的却是带 `Host` 头的 HTTP/1.1；十个请求到达时是十条连接，而不是一条。现在只有一条不同，2.10.8 和 2.10.10 上都一样，已经声明：whistle 的 `disable://http2` 还会让它不再向客户端提供 h2。
 
-## What a request costs the network
+## 一个请求花掉多少网络开销
 
-`perf-bench.js` is a measurement, not a gate: nothing in it passes or fails,
-and `run.js` does not run it. It starts both proxies itself, puts the same
-origins behind them, and reports per scenario how many connections and TLS
-handshakes the origin saw, request latency, throughput, the proxy's peak
-resident memory, and — for a response the client abandons — how long the origin
-connection stays open afterwards.
+`perf-bench.js` 是测量，不是门禁：里面没有任何东西会通过或失败，`run.js` 也不跑它。它自己启动两个代理，在它们后面放同样的源站，然后按场景报告：源站看到了多少条连接、多少次 TLS 握手，请求延迟，吞吐量，代理的峰值常驻内存，以及——对于客户端中途放弃的响应——源站那条连接在那之后还开着多久。
 
 ```sh
-cargo build --release                # it measures target/release, not debug
-node perf-bench.js                   # loopback, about two minutes
-RTT_MS=20 node perf-bench.js         # 20 ms round trip between proxy and origin
+cargo build --release                # 它测的是 target/release，不是 debug
+node perf-bench.js                   # 本机回环，大约两分钟
+RTT_MS=20 node perf-bench.js         # 代理和源站之间 20 ms 往返
 ONLY=h2,cancel-h2 ROUNDS=5 node perf-bench.js --json /tmp/perf.json
 ```
 
-On loopback a handshake costs well under a millisecond, so a proxy that opens a
-connection per request looks as fast as one that reuses them. `RTT_MS` puts a
-relay in front of each origin that delays every chunk by half the round trip
-each way, and the first bytes of a new connection by one more round trip (the
-TCP handshake). It does not model loss, bandwidth or slow start, and the
-32 MiB download scenarios are skipped under it. Each figure is the median of
-`ROUNDS` (3) rounds; the proxies alternate who goes first.
+在本机回环上，一次握手远不到一毫秒，所以每个请求都新开连接的代理，看起来和复用连接的一样快。`RTT_MS` 会在每个源站前面放一个中继：每个数据块在每个方向上延迟半个往返时间，新连接的头几个字节再多延迟一个往返（相当于 TCP 握手）。它不模拟丢包、带宽或慢启动，设了它之后，32 MiB 下载的那几个场景会被跳过。每个数字取 `ROUNDS`（默认 3）轮的中位数；两个代理轮流先跑。
 
-## The mode bench
+## 模式测试台
 
-`mode-bench.js` asks a different shape of question from everything else here:
-not "what does this rule do" but "**which of these fifty-six words mean
-anything**". whistle's `-M/--mode` takes a list out of a large vocabulary, of
-which its own documentation prints nine. So this starts one proxy per token —
-whistle and whix, in turn — and runs the same nine probes through each.
+`mode-bench.js` 问的问题和这里其他脚本都不一样：不是"这条规则做了什么"，而是"**这 56 个词里哪些真有作用**"。whistle 的 `-M/--mode` 接受一个列表，可选的词很多，它自己的文档只列了九个。所以这个脚本每个词起一个代理（whistle 和 whix 轮流），每个都跑同样的九个探测。
 
 ```sh
-PORT_BASE=20100 node mode-bench.js                          # every token
-PORT_BASE=20100 MODES=pureProxy,headless node mode-bench.js  # a few
+PORT_BASE=20100 node mode-bench.js                          # 所有模式词
+PORT_BASE=20100 MODES=pureProxy,headless node mode-bench.js  # 只跑几个
 ```
 
-It needs no oracle left running: it starts and kills every proxy itself, which is
-also why it is slow (two process starts per token, a few minutes for the lot) and
-not part of a normal bench run. Reach for it when the vocabulary changes.
+它不需要事先开着对照组：所有代理都是它自己起、自己杀。这也是它慢的原因（每个词要起两次进程，全部跑完要几分钟），所以它不在普通的测试台运行里。词表变了再用它。
 
-**Fifteen of the fifty-six move anything a client can see**, and they collapse
-into six behaviours — turn the console hostnames off, turn the console off,
-intercept HTTPS from startup, keep the client's `x-forwarded-for`, read rules out
-of a request header, trust a front proxy's forwarded headers. **This port
-honours all six.**
+**56 个词里只有 15 个会改变客户端能看到的东西**，归下来是六种行为：关掉控制台的主机名、关掉控制台、启动时就拦截（解密）HTTPS、保留客户端的 `x-forwarded-for`、从请求头读规则、信任前置代理转发过来的头。**本项目六种都支持。**
 
-The last full run reports **`ran: 57, differing: 0, declared: 0`**: every token
-in the vocabulary, and nothing left for a declaration to excuse. The two
-subjects that outgrew a single probe have benches of their own — see below.
+最近一次完整运行的结果是 **`ran: 57, differing: 0, declared: 0`**：词表里每个词都跑了，没有一处需要靠声明来豁免。有两个话题一个探测装不下，各自有了专门的测试台，见下文。
 
-## What a front proxy claims
+## 前置代理声称了什么
 
-`forwarded-bench.js` is the other half of the same subject: a proxy behind
-another one is told the client's address, scheme and host in headers, and has to
-decide what to believe.
+`forwarded-bench.js` 是同一个话题的另一半：一个代理躲在另一个代理后面时，前面那个会用请求头告诉它客户端的地址、协议和 host，它得决定信哪些。
 
 ```sh
 PORT_BASE=20900 node forwarded-bench.js
 ```
 
-Two origins, because the interesting claim is a **destination** — a request
-addressed to A that arrives at B is a redirect a header performed. A rule pair
-(`https://…` and `http://…`) makes the scheme claim visible in the same answer.
+起两个源站，因为最值得看的声明是**目标地址**：发给 A 的请求到了 B，就等于一个头完成了一次重定向。一对规则（`https://…` 和 `http://…`）让协议上的声明在同一个答案里就能看出来。
 
-**It also counts ClientHellos**, and that counter exists because of a bug this
-bench had already passed over. A claimed `x-forwarded-proto: https` changes
-*which pattern matches*; this port promoted the outbound **connection** to TLS
-as well. Every probe still passed, because a failed handshake retries in plain
-and the answer comes out identical — every request simply paid for a doomed
-handshake first. It surfaced only against an origin that *read* the handshake
-instead of rejecting it, and then hung forever. Upstream, measured afterwards,
-sends no ClientHello at all.
+**它还数 ClientHello**。加这个计数，是因为这个测试台曾经放过一个 bug。声称 `x-forwarded-proto: https` 会改变*哪个匹配串命中*；本项目却连出站**连接**也一起升级成了 TLS。所有探测照样通过：握手失败后会退回明文重试，答案一模一样——只是每个请求都先白白付出了一次注定失败的握手。直到遇上一个*读*握手、而不是拒绝握手的源站才暴露出来，那次直接永远卡住。事后实测上游，它根本不发 ClientHello。
 
-The lesson is worth more than the fix: **when two proxies can reach the same
-answer by different routes, the route has to become an observable of its own.**
-`tests/forwarded_e2e.rs` pins the same invariant by reading the first byte the
-origin receives — `0x16` is TLS.
+这次的教训比修复本身更值钱：**两个代理能走不同的路得到同一个答案时，走的是哪条路本身就得变成一个能观测的量。** `tests/forwarded_e2e.rs` 用读取源站收到的第一个字节的办法钉住同一个不变量：`0x16` 就是 TLS。
 
-**A clean run is `differing: 0`** with declared rows for the one divergence:
-upstream lets a *request* open the gates a mode is otherwise required to open
-(`x-whistle-real-host`, `x-whistle-forwarded-props`). The reasoning is in
-`src/proxy/forwarded.rs`.
+**跑干净的结果是 `differing: 0`**，外加几行已声明的差异，对应唯一一处偏离：本来要开某个模式才能打开的口子，上游允许一个*请求*自己打开（`x-whistle-real-host`、`x-whistle-forwarded-props`）。理由写在 `src/proxy/forwarded.rs` 里。
 
-## The QR code
+## 二维码
 
-`qr-bench.js` is the odd one out: no proxy, no origin, no port. `gui/mobile.md`
-is a page about typing a proxy address into a phone, and both consoles shorten
-it by drawing a QR code per LAN address. whistle gets that from `qrcode@1.2.0`;
-this port has its own encoder, so the encoder is what gets compared.
+`qr-bench.js` 是个异类：没有代理，没有源站，不占端口。`gui/mobile.md` 讲的是怎么在手机上填代理地址，两边的控制台都给每个局域网地址画一个二维码，省掉这一步。whistle 的二维码来自 `qrcode@1.2.0`；本项目有自己的编码器，所以比的就是编码器。
 
 ```sh
-npm ci                                 # brings in qrcode@1.2.0, whistle's own version
+npm ci                                 # 装上 qrcode@1.2.0，也就是 whistle 自己用的版本
 npm run qr
 ```
 
-194 symbols, **every module of every one**, plus the SVG parsed back into
-modules so that "the matrix is right" and "the image is right" are two separate
-claims. **A clean run is `differing: 0`** — there is nothing to declare, because
-a single wrong module is a symbol some cameras read and others do not.
+一共 194 个码，**每个码的每个模块都比**（模块就是二维码里的一个黑白小方格）；还会把 SVG 解析回模块，让"矩阵是对的"和"图是对的"成为两个分开的结论。**跑干净的结果是 `differing: 0`**，没有任何东西可声明：错一个模块，就是一个有的摄像头能扫、有的扫不出来的码。
 
-The reference is held to byte mode, since `qrcode` splits a URL across numeric
-and alphanumeric segments and this port does not; what that costs is reported
-rather than assumed (one of the twelve addresses the console draws comes out one
-version larger).
+参照方固定用字节模式，因为 `qrcode` 会把 URL 拆成数字段和字母数字段，本项目不拆；这样做的代价是实测报出来的，不是想当然（控制台画的十二个地址里，有一个因此大了一个版本）。
 
-It found three bugs, and they have the same shape: **each produced a QR code
-that looked right and scanned.**
+它找到过三个 bug，形状都一样：**每个都生成了看上去没毛病、扫码器也认的二维码。**
 
-* a separator reserved too few modules, so the data was shifted — three finders,
-  correct size, unreadable content. Found by reading the codewords back out;
-* the mask was scored without the format information written, which is 31
-  modules the penalty rules count. A third of the payloads picked a different
-  mask than upstream — all readable, none the same;
-* version information (version 7 and up) was written after the mask was picked
-  rather than before. Only reachable by a payload longer than any URL the
-  console draws, which is why the corpus walks every length from 1 to 120.
+* 一个分隔符少留了模块，数据整体错了位——三个定位图案、尺寸都对，内容却读不出来。是把码字读回来才发现的；
+* 给掩码打分时还没写入格式信息，而罚分规则要把这 31 个模块算进去。三分之一的内容选了和上游不同的掩码——全都能读，但没有一个相同；
+* 版本信息（版本 7 及以上才有）是在选完掩码之后才写的，本该在之前写。只有比控制台画的任何 URL 都长的内容才会触发，所以语料把长度从 1 到 120 每一个都走了一遍。
 
-## Rules a request brings with it
+## 请求自带的规则
 
-`header-rules-bench.js` is what `mode-bench.js`'s one `proxy.headerRules` probe
-grew into. A request can carry its own rules in five headers, and one probe
-could say whether they were honoured but not *how*:
+`header-rules-bench.js` 是从 `mode-bench.js` 里那一个 `proxy.headerRules` 探测长出来的。一个请求可以在五个头里自带规则，一个探测只能说出这些规则有没有生效，说不出*怎么*生效的：
 
 ```sh
 PORT_BASE=20500 node header-rules-bench.js
 ```
 
-It starts and kills its own proxies like the mode bench, seeds each through that
-proxy's own console API (one Default rules text, one named group, one values
-entry), and then sends ten requests per mode across five modes. Each answer is
-two things: the marker headers the rules set — which says **which rules applied
-and which won** — and which `x-whistle-*` headers survived, which says **what a
-client can hand the origin**.
+它和模式测试台一样自己起停代理，通过每个代理自己的控制台 API 预置数据（一份 Default 规则文本、一个具名规则组、一条 Values），然后在五个模式下各发十个请求。每个答案看两样：规则设置的标记头，说明**哪些规则生效了、哪条胜出**；以及哪些 `x-whistle-*` 头活了下来，说明**客户端能把什么递给源站**。
 
-The second half is the part worth keeping even if the feature is never switched
-on. `getValue`'s delete is unconditional and only the reading is gated, so four
-of the five must never reach the origin whatever the mode. The fifth,
-`x-whistle-rule-name`, is the exception upstream forwards — and the corner where
-`-M strict|multiEnv` consumes it while reading nothing is a real two-row
-difference this bench found.
+后一半即使这个功能永远不开，也值得留着。`getValue` 删头是无条件的，只有读取受开关控制，所以五个头里有四个无论什么模式都绝不能到达源站。第五个 `x-whistle-rule-name` 是上游会转发的例外——而在 `-M strict|multiEnv` 下它被拿掉、却什么也没读的那个角落，是这个测试台找到的一处真实差异，占两行。
 
-**A clean run is `probes: 50, differing: 0`.** `tests/header_rules_e2e.rs` pins
-the same facts under `cargo test`, without node.
+**跑干净的结果是 `probes: 50, differing: 0`。** `tests/header_rules_e2e.rs` 在 `cargo test` 下钉住同样的事实，不需要 node。
 
-Three things about how it compares, each of which it got wrong first:
+关于它怎么比，有三点，每一点它一开始都做错过：
 
-* **each console is asked for its own path.** `/cgi-bin/rules/list` and
-  `/api/rules` are the same question to two different route tables, and asking
-  both proxies the first one was asking one of them for a page it has never had.
-* **console answers are compared on status alone.** The two consoles return
-  different content types for the same question, so comparing those was comparing
-  the tables.
-* **the answers are compared, not the change from each baseline.** The two
-  baselines differ on purpose — whistle does not decrypt HTTPS in a fresh data
-  directory and this port does — so a delta compare reported `disableCapture` as
-  a difference while both proxies were ending in the same state. The default
-  difference is declared once instead, against the exact list of tokens that
-  touch the switch. A substring test there is not good enough: `captureData`
-  contains "capture" and touches nothing.
+* **每个控制台按它自己的路径问。** `/cgi-bin/rules/list` 和 `/api/rules` 是向两张不同的路由表问同一个问题；拿前一个去问两个代理，等于向其中一个要一个它从来没有过的页面。
+* **控制台的回答只比状态码。** 同一个问题，两边控制台返回的 content type 不一样，比这些等于在比两张路由表。
+* **比的是答案本身，不是各自相对起点的变化。** 两边的起点本来就故意不同——全新数据目录下 whistle 不解密 HTTPS，本项目解密——所以按变化量比的时候，两个代理明明落在同一个状态，`disableCapture` 却被报成了差异。现在改成把这个默认值上的差异声明一次，范围是会碰到这个开关的那几个模式词的确切列表。这里用子串匹配不够：`captureData` 里有 "capture"，却什么也不碰。
 
-A clean run is `differing: 0`.
+跑干净的结果是 `differing: 0`。
 
-## What a rule does
+## 规则实际做了什么
 
-`core-bench.js` asks what the corpora above cannot: not "which rule matched" or
-"what reached the origin for one request", but what the rule then **did**.
+`core-bench.js` 问的是上面那些语料问不了的：不是"哪条规则命中了"，也不是"一个请求到达源站时是什么样"，而是规则接下来到底**做了**什么。
 
 ```sh
 WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-bench.js
-PORT_BASE=21900 CASES=frame,tcp node core-bench.js     # some groups only
-node run.js network --only core                        # as the gate runs it
+PORT_BASE=21900 CASES=frame,tcp node core-bench.js     # 只跑部分组
+node run.js network --only core                        # 门禁里就是这么跑的
 ```
 
-It starts its own whistle and whix and four servers of its own, on
-`PORT_BASE` … `PORT_BASE+5` (an HTTP and WebSocket origin, a raw TCP echo, an
-origin that demands a client certificate, a plugin). About three minutes.
+它自己起 whistle、whix 和自己的四个服务，占用 `PORT_BASE` … `PORT_BASE+5`（一个 HTTP 兼 WebSocket 源站、一个裸 TCP 回显、一个要求客户端证书的源站、一个插件）。大约三分钟。
 
-| Group | What it asks | Cases |
+| 组 | 问什么 | 用例数 |
 |---|---|---|
-| `regexp` | a pattern, filter or replace written with what only JavaScript's regexps read — lookahead, lookbehind, backreferences, named groups — matches the same, and its negative control does not | 19 |
-| `script` | what `reqScript`/`resScript` helpers *return*: `parseQuery`, `parseUrl`, `Buffer`, `iconv`, `RegExp.$1` | 55 |
-| `frame` | a `frameScript` on a WebSocket: state between frames, binary frames, handlers that drop, throw, send | 21 |
-| `tcp` | a `frameScript` on a plain TCP tunnel | 7 |
-| `log` | `log://` puts a collector into a page, and nothing into a page without the rule or into plain text | 3 |
-| `mtls` | `tlsOptions://` hands the origin a client certificate (PEM, PFX); wrong key, wrong CA and wrong passphrase are refused | 9 |
-| `plugin` | one-sided — upstream has no `--plugin` — a plugin whose manifest cannot be read blocks rather than lets through | 4 |
+| `regexp` | 用只有 JavaScript 正则才认的写法（先行断言、后行断言、反向引用、命名分组）写的匹配串、筛选器或替换，两边匹配结果一样，它的反例两边都不匹配 | 19 |
+| `script` | `reqScript`/`resScript` 里的辅助函数*返回*什么：`parseQuery`、`parseUrl`、`Buffer`、`iconv`、`RegExp.$1` | 55 |
+| `frame` | WebSocket 上的 `frameScript`：帧与帧之间的状态、二进制帧、会丢弃、抛异常、发送的处理函数 | 21 |
+| `tcp` | 普通 TCP 隧道上的 `frameScript` | 7 |
+| `log` | `log://` 往页面里放一个收集器；没有这条规则的页面、纯文本里什么也不放 | 3 |
+| `mtls` | `tlsOptions://` 把客户端证书（PEM、PFX）交给源站；私钥错、CA 错、口令错都会被拒 | 9 |
+| `plugin` | 单边测试（上游没有 `--plugin`）：清单读不出来的插件会拦住请求，而不是放行 | 4 |
 
-Every case has a negative control next to it, and a case counts only when the
-**origin** saw the effect — a `200` from the proxy proves nothing. The
-differences are declared under `core-bench.js` in `declared.js`: six that this
-port means (a binary frame stays binary, `Buffer` and `ctx` exist inside a
-handler, …), and ten more on 2.10.8 only, all one upstream bug fixed in 2.10.10.
-A clean run ends:
+每个用例旁边都有一个反例；只有**源站**看到了效果，用例才算数——代理回一个 `200` 什么也证明不了。差异声明在 `declared.js` 的 `core-bench.js` 名下：六条是本项目有意为之（二进制帧保持二进制、处理函数里有 `Buffer` 和 `ctx`……），另有十条只出现在 2.10.8 上，全是上游同一个 bug，2.10.10 已经修了。跑干净时最后一行是：
 
 ```
 whistle 2.10.10 — ran: 114  differing: 0  declared: 6  stale: 0  one-sided: 4 (0 failed)
 ```
 
-`DIFF` in its output is a difference nothing declares, `decl` one that is
-declared, `STALE` a declaration whose difference no longer happens. A `CASES=`
-run never reports stale, because the cases it skipped are not there to check.
+输出里 `DIFF` 是没有任何声明的差异，`decl` 是已声明的差异，`STALE` 是对应差异已经不再出现的声明。带 `CASES=` 跑时永远不报 stale，因为跳过的用例根本没跑，没法检查。
 
-## Which whistle, though
+## 到底对照的是哪个 whistle
 
-"Agrees with 2.10.8" is not the same claim as "agrees with whistle". Some
-alignment somewhere is bound to be with behaviour one release happened to have,
-and a corpus cannot ask that question about itself. So every declaration says
-which whistle it was measured against, and a run can be pointed at another.
+"和 2.10.8 一致"跟"和 whistle 一致"不是一回事。总会有某处对齐的，其实只是某个版本碰巧有的行为，而语料自己问不出这个问题。所以每条声明都写明是对哪个 whistle 测的，跑的时候也可以指向别的版本。
 
-The baseline is the version `package.json` locks, installed by `npm ci` here.
-Any other version has a directory of its own under `versions/`, with its own
-lockfile, so measuring it never disturbs the baseline:
+基线是 `package.json` 锁定的那个版本，在这个目录下用 `npm ci` 安装。其他版本在 `versions/` 下各有自己的目录和锁文件，所以测它们永远不会动到基线：
 
 ```sh
-(cd versions/2.10.10 && npm ci)                        # once
-node run.js all --whistle 2.10.10                      # the gate, against 2.10.10
-node run.js all --whistle 2.10.10 --assume-baseline    # what moved since the baseline
+(cd versions/2.10.10 && npm ci)                        # 只需一次
+node run.js all --whistle 2.10.10                      # 门禁，对 2.10.10 跑
+node run.js all --whistle 2.10.10 --assume-baseline    # 相对基线变了什么
 node matrix.js ../../target/differential/<baseline run> ../../target/differential/<2.10.10 run>
 ```
 
-* **`--whistle V`** — every script loads that whistle, through `whistle-pkg.js`:
-  the pair, the benches that start their own, the rules oracle, and upstream's
-  own suite (taken from V's tag). The archive's name and manifest say which
-  version it was. Only declarations measured against V are in force, so against
-  a version nobody has measured yet, **every** difference is reported — dozens
-  per corpus, most of them this port's own deliberate ones. That is the raw
-  measurement, not a verdict.
-* **`--assume-baseline`** — hold V to the baseline's declarations. What fails is
-  what moved: a difference nothing explains is one the baseline did not have,
-  and a stale declaration is a difference the baseline had and V does not.
-* **`matrix.js A B`** — two archives, compared case by case and field by field
-  on the differences **before** any declaration excused them (each bench prints
-  them as `raw`). It says, per step, which differences are the same, which
-  appeared (`away`: upstream moved away from this port, or B has something
-  new), which disappeared (`closer`) and which changed value. It refuses, with
-  exit 2, two runs of different whix binaries or port blocks: a move
-  could then be this port's rather than upstream's.
+* **`--whistle V`**：每个脚本都通过 `whistle-pkg.js` 加载这个版本的 whistle——成对启动的对照组、自己起代理的各个测试台、规则对照组，以及上游自带的测试（取自 V 的 tag）。归档的名字和 manifest 会写明是哪个版本。只有对 V 测过的声明才生效，所以对一个还没人测过的版本，**所有**差异都会报出来——每个语料几十条，大部分是本项目自己有意为之的。那是原始测量，不是结论。
+* **`--assume-baseline`**：拿基线的声明来要求 V。失败的就是变了的：没有任何解释的差异，是基线没有的；过期的声明，是基线有而 V 没有的差异。
+* **`matrix.js A B`**：两份归档，逐个用例、逐个字段地比较**还没被任何声明豁免之前**的差异（每个测试台都会以 `raw` 打印出来）。它按步骤列出哪些差异没变、哪些新出现了（`away`：上游离本项目更远了，或者 B 里有新东西）、哪些消失了（`closer`）、哪些值变了。如果两次运行用的 whix 二进制或端口段不同，它拒绝比较，退出码 2：那样一个变化可能来自本项目，而不是上游。
 
-Pin the binary for the pair of runs (`RS_BIN=…`, a copy outside `target/debug`)
-so a rebuild between them cannot slip in; the manifests record its SHA-256.
+两次运行要钉住同一个二进制（`RS_BIN=…`，指向 `target/debug` 之外的一份副本），免得中间重新构建混进来；manifest 里记着它的 SHA-256。
 
-**Adding a version.** Make `versions/V/package.json` depending on `whistle: V`
-alone, run `npm install --package-lock-only --registry=https://registry.npmjs.org/`
-there, and review the lock the way [the baseline's](#the-oracles-dependencies)
-was: every `resolved` on registry.npmjs.org, sha512, no install scripts, the
-moved packages' integrity cross-checked. Compare the package's `lib/` with the
-release's git tag. Add the tag's commit to `SUITE_COMMITS` in
-`upstream-suite.js`. Then the three runs above. When the `--assume-baseline`
-run has shown which declarations still hold, add the release to `MEASURED` in
-`whistle-pkg.js` — every entry that names no version means that list — and give
-the ones that did not hold, and the differences only one release has, an
-`upstream` list of their own (`only(…)` in `declared.js`).
+**加一个版本。** 新建 `versions/V/package.json`，只依赖 `whistle: V`，在那个目录下跑 `npm install --package-lock-only --registry=https://registry.npmjs.org/`，然后像审[基线的锁文件](#对照组的依赖)那样审一遍：每个 `resolved` 都在 registry.npmjs.org 上、用 sha512、没有安装脚本、变动过的包交叉核对 integrity。拿包里的 `lib/` 和这个版本的 git tag 对比。把 tag 对应的提交加进 `upstream-suite.js` 的 `SUITE_COMMITS`。然后跑上面那三条。等 `--assume-baseline` 那次运行说明了哪些声明仍然成立，就把这个版本加进 `whistle-pkg.js` 的 `MEASURED`——所有没写版本的声明条目，指的都是这个列表——不再成立的那些，以及只有某一个版本才有的差异，给它们单独写一个 `upstream` 列表（`declared.js` 里的 `only(…)`）。
 
-What 2.10.8 and 2.10.10 disagree on, and what this port did about each, is in
-[STATUS, U1](../../docs/STATUS.md#2026-09-29-u1-上游版本矩阵).
+2.10.8 和 2.10.10 哪里不一样、本项目对每一处怎么处理的，见 [STATUS 的 U1 记录](../../docs/STATUS.md#2026-09-29-u1-上游版本矩阵)。
 
-An earlier tool, `bench-versions.js`, ran the corpora (only) against an oracle
-started by hand. Its one finding stands: **2.10.8 against 2.9.109, 60
-differences, every one additive** — header filter conditions, `*://`
-wildcards, body framing, `resCors` preflight, escaped separators in `delete://`
-keys and the refusal of a `..` path segment were all new in 2.10, and nothing
-here agreed with 2.9.109 alone. Eight corpora were byte-identical between the
-two.
+早先有个工具 `bench-versions.js`，（只）拿语料去跑一个手动启动的对照组。它唯一的发现至今成立：**2.10.8 对比 2.9.109，60 处差异，全是新增**——头的筛选条件、`*://` 通配、body 分帧、`resCors` 的预检、`delete://` 键里的转义分隔符、拒绝 `..` 路径段，都是 2.10 才有的，这里没有任何东西只和 2.9.109 一致。有八个语料在两个版本之间逐字节相同。
 
-## Reading a difference
+## 怎么解读一处差异
 
-Two divergences are **deliberate** and declared in `EXPECTED` at the top of
-`harness.js`, with the reason. Anything else is news, and the first question to
-ask is whether the *bench* is right — it has been wrong twice:
+有两处偏离是**有意的**，连同理由声明在 `harness.js` 顶部的 `EXPECTED` 里。其他任何差异都是新情况，第一个要问的是 *测试台本身*对不对——它错过两次：
 
-* a case whose rule rewrote the origin's JSON echo made the echo unparseable,
-  which the bench read as "the header was dropped";
-* the header allow-list has to exclude things neither proxy could agree on
-  (`Date`, hop-by-hop headers, framing) without excluding so much that a real
-  difference hides.
+* 有个用例的规则改写了源站的 JSON 回显，回显解析不了，测试台把这读成了"头被丢了"；
+* 头的允许列表得排除两边代理不可能一致的东西（`Date`、逐跳头、分帧），又不能排除太多，把真正的差异藏起来。
 
-`repro`-style debugging is easiest by cutting the corpus down to one case in
-`cases.js` and printing both answers whole.
+要做 `repro` 式的调试，最省事的办法是把 `cases.js` 里的语料删到只剩一个用例，把两边的答案完整打印出来。
 
-**The flake that used to be here is identified and declared.** Roughly one run
-in six reported exactly one difference and the next run was clean. It was an
-HTTP date rendered from the clock — an injection strips the cache and stamps
-`Expires` — with the two proxies asked one after the other, so a run crossing a
-second boundary saw them a second apart. `EXPECTED`'s `oneSecondApart` now names
-it, scoped to `expires`/`set-cookie`, to two dates that both parse, to a delta of
-at most 1000 ms, and only when the rest of the value is identical.
+**以前这里那个偶发差异已经查明并声明了。** 大约每六次运行有一次恰好报一处差异，下一次又干净了。原因是一个按时钟生成的 HTTP 日期（注入内容时会去掉缓存并打上 `Expires`），而两个代理是先后被问的，所以一次运行跨过秒的边界时，两边就差了一秒。现在 `EXPECTED` 里的 `oneSecondApart` 专门点名它，范围限定为：只在 `expires`/`set-cookie` 上，两个日期都能解析，相差不超过 1000 ms，而且值的其余部分完全相同。
 
-It took four rounds to catch by name, which is worth remembering: a difference
-that vanishes on a re-run is not thereby explained. Re-running tells you it is
-intermittent; it does not tell you what it was, and "intermittent" is where a
-real race would also hide.
+前后四轮才把它点名抓住，这一点值得记住：重跑一次就消失的差异，并不因此就算解释了。重跑只告诉你它是偶发的，不告诉你它是什么；而真正的竞态，也会藏在"偶发"里。
 
-And the third thing to suspect is whether the case exercises the rule at all.
-`cases-file.js` opened with eleven cases where `127.0.0.1:PORT file:///tmp/x.txt`
-was asked for `/echo` — the unmatched path is concatenated onto the value, so
-both proxies looked for `/tmp/x.txt/echo`, both 404'd, and eleven cases agreed on
-nothing. A rule that fires and a rule that misses look identical in the output.
+第三个要怀疑的，是用例到底有没有用上那条规则。`cases-file.js` 最初有十一个用例，规则是 `127.0.0.1:PORT file:///tmp/x.txt`，请求的却是 `/echo`——没匹配上的那段路径会拼到值后面，所以两个代理找的都是 `/tmp/x.txt/echo`，都回了 404，十一个用例一致地什么也没证明。规则生效和没生效，在输出里看起来一模一样。
 
-The sharper version of that: a case can exercise *a* rule and not the one it
-names, because an earlier layer claimed the token. `cases-patterns.js` has five
-cases asking whether `/echo/g` is a regexp — it is not, and both proxies agree —
-but not for that reason: a `/`-led token that is not a valid regexp is a **file
-path**, and `formatShorthand` rewrites it to `file:///echo/g` before the line is
-even split into pattern and operators. The five agree on the shorthand's flag
-test, and say nothing about the pattern parser's. Only two `//`-led cases
-(`////` and `///host`) reach that parser at all, and one of them is what caught
-the bug.
+更隐蔽的情况是：用例确实用上了*某条*规则，却不是它名字里说的那条，因为更早的一层已经把那个 token 认领走了。`cases-patterns.js` 有五个用例问 `/echo/g` 是不是正则——不是，两个代理也都这么认为——但理由不对：以 `/` 开头、又不是合法正则的 token 会被当成**文件路径**，`formatShorthand` 在这一行还没拆成匹配串和算子之前，就把它改写成了 `file:///echo/g`。这五个用例一致的是简写那一层对标志位的判断，对匹配串解析器的判断什么也没说明。只有两个以 `//` 开头的用例（`////` 和 `///host`）真正走到了那个解析器，其中一个正是抓到那个 bug 的用例。
 
-No amount of reading the parser shows this; the layer above it has to be run.
-When a case is inert on both sides, the question to answer before believing it
-is *which* layer made it inert.
+解析器的代码读多少遍也看不出这一点，必须把它上面那一层跑起来。一个用例在两边都 inert 时，相信它之前先要回答：是*哪一层*让它 inert 的。
 
-## `inert`: which cases prove nothing
+## `inert`：哪些用例什么也没证明
 
-`differing: 0` says the two proxies agree. It does not say the case was *about*
-anything. A case whose rule never matched, or whose operator has no effect the
-bench can see, agrees with upstream perfectly — and would go on agreeing if the
-operator were deleted from this port's source. In the output the two are
-indistinguishable, which is this bench's oldest blind spot and the reason the
-notes above already name eleven cases in `cases-file.js` that 404 on both sides.
+`differing: 0` 说的是两个代理一致，并不说明这个用例真的*测到了*什么。规则从没命中的用例，或者算子的效果测试台看不见的用例，会和上游完美一致——就算把这个算子从本项目源码里删掉，它也照样一致。在输出里两者没法区分，这是这个测试台最老的盲区，也是上面已经点名 `cases-file.js` 里十一个两边都 404 的用例的原因。
 
-So every run also asks a third question: **would the answer change if the rules
-were not there?** Before the corpus starts, with nothing loaded, each distinct
-request shape is put through whix once and the answer kept. A case whose
-answer is byte-identical to that one is reported as `inert`.
+所以每次运行还会问第三个问题：**没有这些规则，答案会变吗？** 语料开跑前，在什么都没加载的情况下，每种不同的请求形态都过一遍 whix，把答案存下来。答案和它逐字节相同的用例，报为 `inert`。
 
 ```
 ran 152  differing 0  inert 33
 ```
 
-Inert is not the same as wrong. A case pinning that a filter correctly excludes
-a line, or that a malformed rule is ignored, *should* be inert; so should one
-about an effect this bench cannot see — `resWrite://` goes to disk, and
-`write-bench.js` is where that is measured. What the number is for is that each
-of those needs a reason, and until it existed none of them were even listed.
+inert 不等于错。一个用例要钉住"筛选器正确地排除了某一行"或者"格式错的规则被忽略"，它*就应该* inert；测这个测试台看不见的效果的用例也一样——`resWrite://` 写的是磁盘，那是 `write-bench.js` 测的。这个数字的用处在于：每一个 inert 都得有个理由，而在有这个数字之前，它们连清单都没有。
 
-It found four kinds of dead case on its first run, all in the oldest corpus:
+第一次跑就找出四类死用例，全在最老的那个语料里：
 
-* **seven pinned to port `18800`**, which no `PORT_BASE` has produced for a long
-  time — including the only cases here for wildcard patterns, regexp submatches
-  and port-only patterns. They had been passing as misses;
-* **six the bench itself could not see**, because `user-agent` and `accept` were
-  on the ignore list while the rules under test were `ua://`, `disable://ua` and
-  both `headerReplace://` doc forms;
-* **three whose names described something they do not measure** — `127.0.0.1:P
-  http://…` reads as *pattern = the URL*, so the line does nothing at all;
-* **one that needed a `content-type`** to make the body it rewrote count as text.
+* **七个写死了端口 `18800`**，而 `PORT_BASE` 已经很久没产生过这个端口了——其中包括这里仅有的几个测通配匹配串、正则子匹配和只写端口的匹配串的用例。它们一直以"没命中"的方式通过着；
+* **六个是测试台自己看不见的**，因为 `user-agent` 和 `accept` 在忽略列表上，而被测的规则偏偏是 `ua://`、`disable://ua` 和文档里 `headerReplace://` 的两种写法；
+* **三个名字里说的东西它们根本没测**——`127.0.0.1:P http://…` 会被读成*匹配串 = 这个 URL*，所以这一行什么也不做；
+* **一个需要加上 `content-type`**，它改写的 body 才会被当成文本。
 
-## Adding cases
+## 添加用例
 
-`cases.js` is a list of `{ name, rules, request? }`. `rules` is the text both
-proxies are given; `request` defaults to a `GET /echo`, which the origin answers
-with a JSON echo of everything that reached it — so a rule that rewrites the
-*request* is visible too. A rule that rewrites the response body will make that
-echo unparseable, which is fine: the bench falls back to comparing the body.
+`cases.js` 是一个 `{ name, rules, request? }` 列表。`rules` 是两个代理都会拿到的规则文本；`request` 默认是 `GET /echo`，源站会把收到的一切以 JSON 回显回来——所以改写*请求*的规则也能看到效果。改写响应 body 的规则会让回显解析不了，这没关系：测试台会退而直接比较 body。
 
-`request.url` names a whole absolute URL instead of a path under the echo origin.
-That is how `cases-patterns.js` asks about a **hostname** and about the **default
-port**, neither of which the origin's own `127.0.0.1:<port>` address can express:
-it points every host at the origin with a `* host://…` line and then asks which
-patterns match `http://a.example.test/echo`.
+`request.url` 可以写一个完整的绝对 URL，而不是回显源站下的一个路径。`cases-patterns.js` 就是这样测**主机名**和**默认端口**的，源站自己的地址 `127.0.0.1:<port>` 这两样都表达不了：它用一行 `* host://…` 把所有主机都指向源站，再问哪些匹配串能匹配 `http://a.example.test/echo`。
 
-## Several rule groups at once
+## 同时启用多个规则组
 
-`rules` is one text and it is the **Default** group. A case may say `groups`
-instead — or as well — and get several:
+`rules` 是一段文本，对应 **Default** 规则组。用例也可以改用 `groups`（或者两个都写），得到多个规则组：
 
 ```js
 { name: 'a named group overrides Default',
@@ -968,25 +459,13 @@ instead — or as well — and get several:
   groups: [{ name: 'A', value: `${P} method://DELETE` }] }
 ```
 
-Each entry is `{ name, value, selected? }`, in the order the console would list
-them, and `selected: false` adds the group without switching it on. `Default` is
-a name like any other here, except that both proxies resolve it **last**. A
-third key, `remove: ['A']`, deletes named groups again *after* they were
-installed, which is the only way to ask what a deletion mid-session does as
-opposed to what never adding the group would have done.
+每一项是 `{ name, value, selected? }`，顺序就是控制台列出它们的顺序；`selected: false` 表示加上这个组但不开启。`Default` 在这里和别的名字一样，只是两个代理都**最后**解析它。第三个键 `remove: ['A']` 会在具名规则组装好*之后*再把它们删掉——想知道"运行中途删掉一个组"会怎样（而不是"从来没加过这个组"会怎样），只有这一个办法。
 
-Two things the harness does for this, and they matter for every corpus:
+`harness.js` 为此做了两件事，对每个语料都有影响：
 
-* **It pins `allowMultipleChoice` on.** Upstream selects one rule file at a time
-  otherwise, so selecting the second group silently unselects the first
-  (`selectRulesFile`, `_original/lib/rules/util.js:148-161`).
-* **It clears named groups** before the corpus and after any case that installed
-  one, and puts Default's switch back on. Both proxies persist their groups, so
-  a corpus that did not do this would inherit whatever the last run left in the
-  same data directory — and a probe leaking group state between cases is how a
-  single divergence gets reported as five.
+* **把 `allowMultipleChoice` 固定为开。** 不然上游一次只选中一个规则文件，选中第二个组会悄悄取消第一个（`selectRulesFile`，`_original/lib/rules/util.js:148-161`）。
+* **清掉具名规则组**：语料开跑前清一次，每个装过规则组的用例跑完后再清一次，并把 Default 的开关重新打开。两个代理都会把规则组持久化，不这么做的话，语料会继承上次运行留在同一个数据目录里的东西——而一个在用例之间泄漏规则组状态的探测，正是一处偏离被报成五处的原因。
 
-A case that says only `rules` issues exactly the two calls it always issued.
+只写了 `rules` 的用例，发出的调用和以前完全一样，就那两个。
 
-`cases-groups.js` is the corpus for all of this and ends at `differing: 3`, for
-the two reasons its header names.
+`cases-groups.js` 是专门测这些的语料，结果是 `differing: 3`，原因有两个，写在它的文件头注释里。

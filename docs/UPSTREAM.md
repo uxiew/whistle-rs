@@ -24,7 +24,7 @@
 
 来源：[官方仓库](https://github.com/avwo/whistle)、[package.json](https://github.com/avwo/whistle/blob/master/package.json)、[更新日志](https://github.com/avwo/whistle/blob/master/CHANGELOG.md)、[官网文档](https://wproxy.org/docs/)。
 
-**2.10.10 已按同一批语料复验（U1）。** 两版答案不同的地方、本项目各跟了哪一边、为什么，只写在 [STATUS 的 U1 记录](STATUS.md#2026-09-29-u1-上游版本矩阵)。基线仍是 2.10.8：文档里"measured against 2.10.8"的说法照旧成立，除 U1 表里列出的几处外，在 2.10.10 上也一样。以后再加版本，照[差分 README](../tests/differential/README.md#which-whistle-though)做，不要直接把旧报告里的版本号替换掉。
+**2.10.10 已按同一批语料复验（U1）。** 两版答案不同的地方、本项目各跟了哪一边、为什么，只写在 [STATUS 的 U1 记录](STATUS.md#2026-09-29-u1-上游版本矩阵)。基线仍是 2.10.8：文档里"measured against 2.10.8"的说法照旧成立，除 U1 表里列出的几处外，在 2.10.10 上也一样。以后再加版本，照[差分 README](../tests/differential/README.md#到底对照的是哪个-whistle)做，不要直接把旧报告里的版本号替换掉。
 
 ## 源码复核
 

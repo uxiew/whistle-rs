@@ -86,7 +86,7 @@
 - [x] 依赖上游 Node 插件和外网的调用不能直接判：把插件自带的规则翻译成普通规则交给两边，只评判上游在联网、断网两种情况下都能过的调用；whix 必须全过或逐条声明原因。
 - [x] 发现的缺陷修掉，每个有自己的测试；门禁接进 `run.js network` 和每周的差分 workflow。
 
-**完成记录：** 评判 180 条，whix 通过 154 条，26 条逐条声明（上游嵌入 API 18、`/cgi-bin` 6、非法状态码 2），没有未声明的失败。途中修了 11 个真缺陷，涉及 Values 优先级、脚本、`resScript`、WebSocket、二进制 body、`headerReplace`、multipart 参数和只带路径的请求。详见 [STATUS 的 U0 记录](STATUS.md#2026-09-29-u0-上游自带测试)，用法见 [差分 README](../tests/differential/README.md#upstreams-own-test-suite)。依赖插件代码本身的约 100 条仍不评判。
+**完成记录：** 评判 180 条，whix 通过 154 条，26 条逐条声明（上游嵌入 API 18、`/cgi-bin` 6、非法状态码 2），没有未声明的失败。途中修了 11 个真缺陷，涉及 Values 优先级、脚本、`resScript`、WebSocket、二进制 body、`headerReplace`、multipart 参数和只带路径的请求。详见 [STATUS 的 U0 记录](STATUS.md#2026-09-29-u0-上游自带测试)，用法见 [差分 README](../tests/differential/README.md#上游自带的测试)。依赖插件代码本身的约 100 条仍不评判。
 
 ### U1 — 补做上游版本矩阵 ✓（2026-09-29）
 
