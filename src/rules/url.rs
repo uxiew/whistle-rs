@@ -248,7 +248,7 @@ pub fn is_values_key(value: &str) -> bool {
 /// operator of a line to ask decides for the rest of it — `file:///srv/x.json
 /// resBody://{"a":1}` leaves the JSON *not* content. That correlation is not
 /// reproduced: it is a cache, not a rule, and this port already declares the
-/// wider divergence it feeds (`docs/RULES.md`, a bare value stays literal).
+/// wider divergence it feeds (`docs/RULES.md`, "光秃秃的值就保持为字面文本").
 pub fn is_json_value(value: &str) -> bool {
     let value = value.trim();
     if value == "{}" {

@@ -903,7 +903,7 @@ const DECLARED = forVersion([
   {
     why: 'this port contains no weinre server, so a bare `weinre://id` injects nothing unless '
       + '`--weinre` names one — it used to inject a link to its own port, which answered 404. '
-      + 'docs/RULES.md, "weinre"',
+      + 'docs/RULES.md, "weinre（HTML 调试注入）"',
     calls: [
       'weinre GET http://weinre1.test.whistlejs.com/index.html?resBody=_ #1',
       'weinre GET https://weinre1.test.whistlejs.com:1234/index.html?resBody=_ #1',
@@ -911,8 +911,7 @@ const DECLARED = forVersion([
   },
   {
     why: 'an interim (`100`) or out-of-range (`1000`) status: upstream breaks the '
-      + 'connection, this port answers — docs/RULES.md, "A status value that is '
-      + 'not a status"',
+      + 'connection, this port answers — docs/RULES.md, "不是合法状态码的状态值"',
     calls: [
       'statusCode POST http://statuscode4.test.whistlejs.com/index.html?resBody= #1',
       'statusCode GET https://statuscode5.test.whistlejs.com/index.html?resBody= #1',

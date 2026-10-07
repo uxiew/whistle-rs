@@ -60,8 +60,7 @@
 //   2. **`resPrepend://(…)` shows the cache-busting headers.** A response-body
 //      operator makes this port strip the request's conditional headers so the
 //      origin cannot answer `304` — a *deliberate improvement* on whistle, which
-//      has the code and never reaches it (`docs/RULES.md`, "A response-body
-//      operator busts the request cache on its own"). It is visible here and
+//      has the code and never reaches it (`docs/RULES.md`, "响应 body 类算子会自动让请求绕过缓存"). It is visible here and
 //      nowhere else because `resPrepend` keeps the origin's echo of the request
 //      it was given, whereas every other body operator overwrites it.
 //   3. **`resBody://temp/blank.json` writes the six words rather than nothing.**

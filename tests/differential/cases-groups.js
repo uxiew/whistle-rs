@@ -66,7 +66,7 @@
 //     finds nothing, and leaves the response alone. So whistle answers with the
 //     origin's page and this port answers `{v}` plus the cache headers that come
 //     with a body rewrite. That is the "a bare value stays the literal" choice
-//     `docs/RULES.md` declared under *Values read from a file or a URL*, reached
+//     `docs/RULES.md` declared under *从文件或 URL 读取的值*, reached
 //     from a new direction — not a group-scoping difference. It is why these two
 //     did not go clean when the third did. Since 2026-10-02 an unanswered
 //     `{name}` on a body operator is not applied here either (ROADMAP R3-02),

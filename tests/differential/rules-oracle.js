@@ -263,7 +263,7 @@ function upstreamResolve(rulesText, values, req, response) {
         path: item.path,
         // A `{name}` reference upstream recognised. When the store had no
         // answer, upstream leaves the literal in the matcher and this port
-        // keeps it too — see `docs/RULES.md`, "a bare value stays literal".
+        // keeps it too — see `docs/RULES.md`, "光秃秃的值就保持为字面文本".
         key: item.key,
         pattern: item.rawPattern,
       });
@@ -980,7 +980,7 @@ const DECLARED = forVersion([
   {
     // Two pattern shapes upstream can only get wrong, because it compares the
     // pattern with the URL **as text** — both are in `docs/RULES.md` under
-    // "Where patterns differ from upstream", and each turns a rule somebody
+    // "匹配串与上游不同的地方", and each turns a rule somebody
     // wrote into one that fires never, so no rules file can be relying on the
     // upstream answer.
     //
