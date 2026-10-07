@@ -329,7 +329,7 @@ body 正常结束，也包括客户端半路挂断。`bench::capture_retained_by
 
 ## 上级代理是怎么接入的
 
-规则里的 `proxy://`、`http-proxy://`、`https-proxy://`、`socks://`、`pac://` 等让请求经另一个代理转出去（写法和行为见[规则手册](RULES.md#upstream-proxy)）。代码里分两步：
+规则里的 `proxy://`、`http-proxy://`、`https-proxy://`、`socks://`、`pac://` 等让请求经另一个代理转出去（写法和行为见[规则手册](RULES.md#上级代理)）。代码里分两步：
 
 1. **选哪个代理**：`src/proxy/apply/route.rs` 的 `find_proxy`。几种写法都命中时，按规则行的先后取第一条；`pac://` 则运行 PAC 脚本的 `FindProxyForURL` 来决定。结果是一个 `upstream::ProxyConfig`。地址用不了、PAC 取不到或抛异常时，请求直接失败，不会悄悄改成直连源站——规则说了要走代理，直连恰恰是它排除的那条路。
 2. **怎么连过去**：`src/proxy/upstream.rs`。设了代理就不直接连源站：HTTP 代理（`ProxyKind::Http`）对 http 源站发完整 URL 形式（absolute-form）的请求，对 https 源站先发 `CONNECT` 打通隧道再做 TLS；`ProxyKind::Https` 先和代理本身做一次 TLS；SOCKS5 走 `socks5_connect`。

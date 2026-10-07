@@ -242,7 +242,7 @@ curl -s -X POST http://127.0.0.1:8899/api/switches -d '{"rules":true}'
 
 ## 页面日志
 
-`log://id` 规则会往命中的页面里注入一段脚本，把页面的 `console.log`、未捕获的异常等发回代理（怎么用见 [RULES 的 log 一节](RULES.md#log--a-pages-console-in-this-one)）。这两个接口读和清这些日志。
+`log://id` 规则会往命中的页面里注入一段脚本，把页面的 `console.log`、未捕获的异常等发回代理（怎么用见 [RULES 的 log 一节](RULES.md#log--页面的控制台搬到这里)）。这两个接口读和清这些日志。
 
 | 方法 / 路径 | 含义 |
 | --- | --- |

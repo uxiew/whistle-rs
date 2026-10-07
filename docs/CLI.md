@@ -44,7 +44,7 @@ whix -H 127.0.0.1 -p 8899 -r rules.txt --no-persist
 | `--init` / `--config` / `--rcPath` / `--no-prev-options` | — | ➖ 属于 `w2` 的后台守护进程，本项目没有对应的东西 |
 | `-C, --copy` / `--no-global-plugins` | — | ➖ 同上 |
 
-whistle 的列表之外还有：`--rule`（直接在命令行里写规则）、`--value`、`--plugin` / `--node-plugin`、`--insecure-upstream`、`--no-intercept-https`、`--no-persist`、`--persist-days`、`--persist-max-mb`、`--body-preview-limit`、`--body-rewrite-limit`、`--weinre <URL>`（weinre 服务器跑在哪，给 `weinre://id` 规则用——[为什么需要它](RULES.md#weinre-html-debug-injection)）、`-v/--verbose`（每个请求打一行，带完整 URL——默认日志里没有这些行；两种日志里各有什么，见 [OPERATIONS](OPERATIONS.md#默认值与共享访问)）。`whix --help` 会列出全部参数；`whix explain` 不发请求，就能回答"这个 URL 会命中哪些规则"。
+whistle 的列表之外还有：`--rule`（直接在命令行里写规则）、`--value`、`--plugin` / `--node-plugin`、`--insecure-upstream`、`--no-intercept-https`、`--no-persist`、`--persist-days`、`--persist-max-mb`、`--body-preview-limit`、`--body-rewrite-limit`、`--weinre <URL>`（weinre 服务器跑在哪，给 `weinre://id` 规则用——[为什么需要它](RULES.md#weinrehtml-调试注入)）、`-v/--verbose`（每个请求打一行，带完整 URL——默认日志里没有这些行；两种日志里各有什么，见 [OPERATIONS](OPERATIONS.md#默认值与共享访问)）。`whix --help` 会列出全部参数；`whix explain` 不发请求，就能回答"这个 URL 会命中哪些规则"。
 
 ### 唯一一个含义不同的参数
 
@@ -74,7 +74,7 @@ whistle 的 `--mode` 接受一个用 `|`、`,` 或 `&` 分隔的列表，列表�
 
 这几个 DNS 顺序开关不改变请求里带的任何东西，所以 mode bench 看不到它们；`src/proxy/upstream.rs` 测它们的办法是：IPv4 和 IPv6 上各开一个监听，再去连 `localhost`。它们针对的症状是：一个网站在浏览器里直接能打开，走代理却在 16 秒后报连接超时——在 IPv6 路由会丢包的网络上，以前先试的是 IPv6 地址，它把整个连接时限都耗光了。在这种网络上，`-M ipv6first` 或 `-M verbatim` 会把这个问题带回来。`ipv6Only` 不支持。
 
-> **`-M multiEnv` 让发请求的人决定请求去哪。** 请求头里写明目标地址、一段规则文本，以及要展开进规则的 Values。这个模式*本来就是干这个的*——一个代理服务多套环境，每个请求自己指定——这也是两个代理都默认关掉它的原因。只要网络上还有别的东西能连到这个代理，就不要打开它。[请求头里的规则](RULES.md#rules-in-a-request-header) 讲了完整格式，包括五个头里哪一个会传到源站。
+> **`-M multiEnv` 让发请求的人决定请求去哪。** 请求头里写明目标地址、一段规则文本，以及要展开进规则的 Values。这个模式*本来就是干这个的*——一个代理服务多套环境，每个请求自己指定——这也是两个代理都默认关掉它的原因。只要网络上还有别的东西能连到这个代理，就不要打开它。[请求头里的规则](RULES.md#写在请求头里的规则) 讲了完整格式，包括五个头里哪一个会传到源站。
 
 还有两个头也属于这一类，**在上游完全不设门槛就会被读取**，本项目没有跟着这么做：
 

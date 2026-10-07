@@ -74,7 +74,7 @@ URL 里**没有** `?` 时第一遍整个跳过，但**第二遍照常执行**。
 > 这一遍就是上游的 `resolveTplVar`（`rules.js:715-758`），它还有第二个调用点：
 > 整值加反引号的**算子取值**（`renderTpl`，`rules.js:762-772`）。那条路径**只跑第二遍**
 > —— 没有第一遍的查询串插值，也没有上面那个 `{…}` 开关，两者都属于文件处理器而不属于
-> 变量层。写法见 [`RULES.md` 的反引号模板](RULES.md#backtick-templates)。
+> 变量层。写法见 [`RULES.md` 的反引号模板](RULES.md#反引号模板)。
 
 | 写法 | 含义 |
 |------|------|
@@ -161,7 +161,7 @@ URI 编码**之前**生效。
 `_original/lib/inspectors/res.js:802-806`）。`tpl://` 在上游响应产生之前就短路了，
 所以在模板文件里它们必然为空 —— 返回空串而非留下占位符，与上游一致。
 
-但同一套变量还有第二个调用点：[反引号算子取值](RULES.md#backtick-templates)。
+但同一套变量还有第二个调用点：[反引号算子取值](RULES.md#反引号模板)。
 写在响应期算子上时响应头已经在手，于是它们**会**求出值：
 
 ```
@@ -359,7 +359,7 @@ Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写
 
 | 上游行为 | 现状 |
 |----------|------|
-| 文件族的值从**远程 URL** / 插件 key 解析 | 未实现。**算子取值**这一侧已支持（见 [`RULES.md`](RULES.md#values-read-from-a-file-or-a-url)），但 `file://` 一族走的是上游另一条路（`getRuleFiles`，`util/index.js:1420-1444`），仍只认本地路径。values 存储引用（`file://{name}`）一直是支持的，见本文末尾 |
+| 文件族的值从**远程 URL** / 插件 key 解析 | 未实现。**算子取值**这一侧已支持（见 [`RULES.md`](RULES.md#从文件或-url-读取的值)），但 `file://` 一族走的是上游另一条路（`getRuleFiles`，`util/index.js:1420-1444`），仍只认本地路径。values 存储引用（`file://{name}`）一直是支持的，见本文末尾 |
 
 ### 文件缓存
 
@@ -398,8 +398,8 @@ example.com/api   file://{mock.json}
   `${…}`、`{…}`、`${port}`、乃至一段 ``` 围栏，都是 mock 自己要输出的字符。
 
   唯一的例外是规则行整值加了反引号：那时候条目内容**会**被渲染一遍，捕获组也会
-  按 `${RegExp.$1}` 这个写法代入 —— 见 [`RULES.md` 的反引号模板](RULES.md#backtick-templates)。
+  按 `${RegExp.$1}` 这个写法代入 —— 见 [`RULES.md` 的反引号模板](RULES.md#反引号模板)。
 
 > **围栏值与 values 存储同名时，用围栏块**，与上游一致（`getValueFor` 先查内嵌表，
 > `rules.js:785-796`）；控制台里编辑的值就是存储。唯一能盖住围栏块的是命令行的
-> `--value`：它是这一次运行的指令。详见 [`RULES.md`](RULES.md#values-declared-in-the-rules-text)。
+> `--value`：它是这一次运行的指令。详见 [`RULES.md`](RULES.md#在规则文本里声明的值)。

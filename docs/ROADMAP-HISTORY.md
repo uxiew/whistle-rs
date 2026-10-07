@@ -651,7 +651,7 @@ socket —— 上游的 `Rules`（`lib/rules/rules.js`，真代理跑的同一�
   由它自己的 pattern 派生出来的 URL —— **17462 个问题**，跑完 0.7 秒。
 - **结果**（两份语料都是）：`differing: 0`、`value differences: 0`。另报一个
   **`host-case folds`（51）**：唯一一条**已声明**的偏离（域名 pattern 在这里对
-  `Host: EXAMPLE.COM` 大小写不敏感，上游敏感，见 [`RULES.md`](RULES.md#where-patterns-differ-from-upstream)）。
+  `Host: EXAMPLE.COM` 大小写不敏感，上游敏感，见 [`RULES.md`](RULES.md#匹配串与上游不同的地方)）。
   它不是被放过的 —— 基准会把同一个问题**把 host 改小写再问上游一次**，只有两边这时
   一致才算这一类，否则仍是差异。
 - **`whix explain`**：新增的子命令，就是 whistle 控制台的 *Test Rules*
@@ -1688,7 +1688,7 @@ H2 会话复用）。
 上游对每个请求解析两次规则：发出前 `resolveReqRules`，响应头到达后 `resolveResRules`
 （`rules.js:2302-2308`、`plugins/index.js:1322`）。本移植此前只解析一次，因此所有关于
 响应的条件都恒为「未知」而**惰性失效**。现在两遍都做，细节见
-[`RULES.md`](RULES.md#the-response-phase)：
+[`RULES.md`](RULES.md#响应阶段)：
 
 - 响应阶段拥有上游的 `pureResProtocols`（`protocols.js:82-111`）；`host://` 一类请求期
   算子不会被响应事实打开 —— 请求早已发出，这与上游一致。

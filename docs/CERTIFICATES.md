@@ -221,7 +221,7 @@ $ curl --socks5 127.0.0.1:1080 https://localhost:9443/     # curl 自己解析�
 
 ### 让插件决定
 
-`sniCallback://` 规则把第 3 步交给插件：插件可以提供自己的证书，也可以干脆不拦截（让连接保持端到端加密）。见 [`RULES.md`](RULES.md#choosing-the-mitm-certificate) 和 [`PLUGINS.md`](PLUGINS.md#证书钩子--snicallback)。
+`sniCallback://` 规则把第 3 步交给插件：插件可以提供自己的证书，也可以干脆不拦截（让连接保持端到端加密）。见 [`RULES.md`](RULES.md#选择中间人证书) 和 [`PLUGINS.md`](PLUGINS.md#证书钩子--snicallback)。
 
 ---
 
