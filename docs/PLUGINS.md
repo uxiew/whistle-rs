@@ -1325,7 +1325,7 @@ whistle-rs --node-plugin name=./path/to/plugin.js
 whistle-rs --plugin name=127.0.0.1:9000
 ```
 
-`--node-plugin` 会以环境变量 `WHISTLE_RS_PLUGIN_PORT` 和 `WHISTLE_RS_PLUGIN_NAME` 启动 `node <path>`，并等待端口就绪（最多 5 秒）后才开始服务。`node` 须在 `PATH` 上，找不到时 whistle-rs 直接报错退出。
+`--node-plugin` 会以环境变量 `WHISTLE_RS_PLUGIN_PORT` 和 `WHISTLE_RS_PLUGIN_NAME` 启动 `node <path>`，并等插件开始监听后才开始服务，几个插件一起最多等 5 秒。插件进程在监听之前就退出了（比如加载时抛异常），就不再等它，日志写 `WARN node plugin 'name' not ready (exited (exit status: 1) before it was listening); continuing`，代理照常启动。以前这种插件也要等满 5 秒（2026-10-07 修，R6-02）。`node` 须在 `PATH` 上，找不到时 whistle-rs 直接报错退出。
 
 **插件进程随 whistle-rs 一起退出：**
 
@@ -1338,9 +1338,10 @@ whistle-rs --plugin name=127.0.0.1:9000
 
 **插件进程自己退出了（崩溃、被杀、`process.exit`）：** 下一个要用它的请求会重新拉起它，并等它起来再发过去，和上游一样。日志里先有一条 `WARN node plugin 'name' exited (exit status: 1)…`，再有一条 `started again`。具体是：
 
-- 没有请求要用它时不拉起。一个一启动就崩的插件，没人用就不花任何代价；启动时后台预取 `/manifest` 只等它，不会去拉它。
+- 没有请求要用它时不拉起。一个一启动就崩的插件，没人用就不花任何代价；启动时后台预取 `/manifest`、控制台的状态页和插件页面目录都只看已知的清单，不会去拉它，也不等它。以前状态页每打开一次就拉起它一次（2026-10-07 修）。
 - 同一个插件最多每秒拉起一次。
 - 请求最多等 5 秒。等不到就按[错误处理](#错误处理)里"插件连不上"算：钩子跳过、会话记 `plugin-failed`，还没取到 `/manifest` 的插件和认证插件则 `502`。
+- 拉起的进程在监听之前就退出了，等它的请求立刻按"插件连不上"处理，原因写明退出码，比如 `the plugin's process is not running: it exited (exit status: 1) before it was listening`；之后 1 秒内来的请求直接拿到这个原因，不再拉起。一个加载就抛异常的插件，复核时每 200 ms 一个请求、持续 12 秒，最长 68 ms 就拿到 502；以前中位 5 秒（2026-10-07 修，R6-02）。
 - 每次拉起都换一个当时空着的端口，`WHISTLE_RS_PLUGIN_PORT` 跟着变，日志的 `started again on 127.0.0.1:<端口>` 写明是哪个。SDK 每次启动都读这个变量，不用改什么。为什么换：进程没了以后，旧端口谁都能占；以前沿用旧端口时，新进程绑不上、马上退出，可"端口能连上"已经成立，请求连同 URL 和 `Authorization` 被发给了占端口的那个程序，然后照常去了源站（2026-10-07 修，R6-01）。插件不在的时候，代理也不会再往旧端口发任何东西，统计钩子的调用那段时间直接丢掉。
 - 只管 `--node-plugin`。`--plugin name=host:port` 指向的进程不归 whistle-rs 管，它退出了就是连不上。
 
