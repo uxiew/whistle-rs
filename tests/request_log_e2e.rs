@@ -89,6 +89,35 @@ fn by_default_no_request_url_is_logged_and_a_failure_has_no_query() {
     );
 }
 
+/// An error that quotes the request's URL loses its query in that line too: a
+/// PAC file that throws is reported as `FindProxyForURL(<url>) threw`, which
+/// put the token back after the URL in front of it had dropped it.
+#[test]
+fn a_failure_that_quotes_the_url_has_no_query_either() {
+    let dir = scratch("log-pac");
+    let pac = dir.join("throws.pac");
+    std::fs::write(
+        &pac,
+        "function FindProxyForURL(url, host) { throw new Error('pac broke'); }",
+    )
+    .expect("pac");
+    // Forward slashes, which a path on Windows takes as well as its own.
+    let pac = pac.display().to_string().replace('\\', "/");
+    let rules = dir.join("rules.txt");
+    std::fs::write(&rules, format!("pac.test pac://{pac}\n")).expect("rules");
+    let proxy = start(&dir, &["-r", rules.to_str().expect("utf-8 path")]);
+    assert_eq!(
+        through(&proxy.addr, "http://pac.test/api?token=secret"),
+        502
+    );
+    let log = log_after(&proxy);
+    assert!(
+        log.contains("pac broke"),
+        "the failure is still told: {log}"
+    );
+    assert!(!log.contains("token=secret"), "{log}");
+}
+
 #[test]
 fn with_v_every_request_is_logged_in_full() {
     let ok = origin();

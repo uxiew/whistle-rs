@@ -189,7 +189,7 @@ pub(super) fn log_failure(id: Option<u64>, method: &str, url: &str, failure: &ou
         "{id} {method} {} -> failed at {}: {}",
         without_query(url),
         failure.phase,
-        failure.message
+        without_query_of(url, &failure.message)
     );
 }
 
@@ -199,6 +199,20 @@ pub(super) fn log_failure(id: Option<u64>, method: &str, url: &str, failure: &ou
 /// read it. The session in the console keeps the whole URL.
 pub(crate) fn without_query(url: &str) -> &str {
     url.find(['?', '#']).map_or(url, |end| &url[..end])
+}
+
+/// `message` without `url`'s query and fragment, wherever it quotes them.
+///
+/// An error may name the request: a PAC file that throws is reported as
+/// `FindProxyForURL(<url>) threw`, and the failure line put back the token
+/// [`without_query`] had just taken off the URL in front of it.
+fn without_query_of<'a>(url: &str, message: &'a str) -> std::borrow::Cow<'a, str> {
+    let query = &url[without_query(url).len()..];
+    if query.len() > 1 && message.contains(query) {
+        message.replace(query, "").into()
+    } else {
+        message.into()
+    }
 }
 
 impl Drop for Ledger {
@@ -250,7 +264,29 @@ pub(super) fn aborted(how: &str) -> outcome::Outcome {
 
 #[cfg(test)]
 mod tests {
-    use super::without_query;
+    use super::{without_query, without_query_of};
+
+    #[test]
+    fn a_failure_that_quotes_the_url_loses_its_query_too() {
+        let url = "http://a.test/pac?token=secret#frag";
+        assert_eq!(
+            without_query_of(
+                url,
+                "pac:///p.pac: FindProxyForURL(http://a.test/pac?token=secret#frag) threw"
+            ),
+            "pac:///p.pac: FindProxyForURL(http://a.test/pac) threw"
+        );
+        assert_eq!(
+            without_query_of(url, "connecting to a.test:80: refused"),
+            "connecting to a.test:80: refused"
+        );
+        // Nothing to take out: a URL with no query, or only a bare `?`.
+        assert_eq!(without_query_of("http://a.test/p", "what?"), "what?");
+        assert_eq!(
+            without_query_of("http://a.test/p?", "at http://a.test/p? here"),
+            "at http://a.test/p? here"
+        );
+    }
 
     #[test]
     fn the_logged_url_stops_before_its_query_and_fragment() {
