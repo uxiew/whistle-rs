@@ -4286,7 +4286,7 @@ difference between a connection that was read and one that was passed through.
 
 > whistle intercepts a **local** hostname whatever the rules say, so
 > `disable://intercept` on `localhost` is ignored there and honoured here. See
-> [`CERTIFICATES.md`](CERTIFICATES.md#which-connections-are-read-at-all).
+> [`CERTIFICATES.md`](CERTIFICATES.md#哪些连接会被解密).
 
 
 ### Shaping the CONNECT to an upstream proxy

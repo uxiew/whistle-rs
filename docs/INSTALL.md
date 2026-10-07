@@ -53,7 +53,7 @@ Windows 上把 `whix.exe` 放进一个目录（比如 `%LOCALAPPDATA%\Programs\w
 - **macOS 拒绝运行**（提示无法验证开发者，或者进程直接被杀）：浏览器下载的文件带隔离属性，而这个二进制只有链接器自动加的 ad-hoc 签名。确认来源后去掉隔离属性：`xattr -d com.apple.quarantine whix`。
 - **Windows**：从资源管理器双击未签名的 exe 可能弹 SmartScreen；监听本机以外的地址（`-H 0.0.0.0`）时防火墙可能询问是否放行。这两处本项目都没有在 Windows 上实际点过，CI 的 Windows 虚拟机只从命令行启动、只监听 127.0.0.1。
 
-第一次启动（`whix -p 8899`）会建数据目录、生成根证书。要解密 HTTPS，再按 [CERTIFICATES](CERTIFICATES.md#install-it) 让客户端信任根证书。
+第一次启动（`whix -p 8899`）会建数据目录、生成根证书。要解密 HTTPS，再按 [CERTIFICATES](CERTIFICATES.md#安装根证书) 让客户端信任根证书。
 
 ## 数据目录
 
@@ -115,7 +115,7 @@ mv ~/.whistle-rs ~/.whix          # Windows：move %USERPROFILE%\.whistle-rs %US
 ## 卸载
 
 1. **停掉它**，确认没有留下插件进程：用 `kill -9` 或任务管理器强杀、而插件又没用 SDK 时，插件可能还在（见 [PLUGINS](PLUGINS.md#注册插件)）。
-2. **撤销对根证书的信任**，每个信任过它的客户端都要做，命令见 [CERTIFICATES 的 Remove it](CERTIFICATES.md#remove-it)。只删私钥不够：备份或别的拷贝里可能还有它。
+2. **撤销对根证书的信任**，每个信任过它的客户端都要做，命令见 [CERTIFICATES 的 Remove it](CERTIFICATES.md#移除根证书)。只删私钥不够：备份或别的拷贝里可能还有它。
 3. **把客户端的代理设置改回去。** whix 从不改系统代理，改过的是你自己。
 4. **删数据目录**：
 
