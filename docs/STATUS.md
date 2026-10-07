@@ -65,7 +65,7 @@
 
 | 维度 | 当前实现与边界 | 核验入口 |
 | --- | --- | --- |
-| 代理核心 | HTTP 正向代理、CONNECT、HTTPS MITM、入站 SOCKS5、HTTP/HTTPS/SOCKS 上游代理与 PAC 已有实现 | `src/proxy/{tunnel,serve,upstream,socks,sni}.rs` |
+| 代理核心 | HTTP 正向代理、CONNECT、HTTPS MITM、入站 SOCKS5、HTTP/HTTPS/SOCKS 上级代理与 PAC 已有实现 | `src/proxy/{tunnel,serve,upstream,socks,sni}.rs` |
 | HTTP/2 / 连接 | 客户端到 MITM 侧支持 h2；客户端走 h2 时对 HTTPS 源站也用 h2（与 whistle 默认一致，`enable://h2`/`disable://h2` 可改），明文源站（`httpH2`）不支持。源站连接按客户端连接复用，不跨客户端 | `src/proxy/{pool,upstream}.rs`；`tests/differential/{h2,perf}-bench.js` |
 | CA / TLS | 动态 CA、自备证书和 SNI 插件钩子已实现；`tlsOptions://` 能给源站出示客户端证书（PEM、PFX）、指定信任的 CA（2026-10-01）；默认验证源站证书是有意的安全差异。证书安装仍由用户完成 | `src/ca.rs`、`src/proxy/{sni,tls_options}.rs`、`src/main.rs` |
 | 规则语义 | 模式、优先级、Values、includes、改写与响应阶段等有广泛实现；规则里的 `/…/` 按 JavaScript 正则解释，脚本环境的 `parseUrl`/`parseQuery`/`Buffer` 与 Node 一致（2026-10-01）；特定语料的差分通过，不代表所有输入和上游版本一致 | `src/rules/`、`src/proxy/apply/`、`src/proxy/script.rs`、`tests/differential/` |
@@ -263,7 +263,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 | 控制台请求体没有上限 | 16 MiB，超过 `413`；插件页面同样 | `65a8f0e` | 端到端：16 MiB+1 的 POST 得 413 且规则未变 |
 | "保留 7 天"只在进程跨过 UTC 午夜时生效；加载会读任意年份的旧文件 | 启动时和加载前就删除超期文件 | `b0d232c` | 放一个 2000 年的会话文件，启动后被删 |
 | "清空"只清内存，重启后回来，且没有真正删除的办法 | 清空保持只清内存（界面明说）；新增"删除历史"（`/api/sessions/purge`）连磁盘一起删 | `b0d232c` `c34c19b` | 3 个会话：清空后重启回来 3 个；删除历史后重启为 0 |
-| 客户端给本代理的 `Proxy-Authorization` 原样发给源站（上游 2.10.8 也这样，实测） | 进来时取下，只交给上游代理；规则主动设置的照常发送 | `d3d731e` `311fd9a` | 端到端三种情况；差分新增用例并声明为偏离 |
+| 客户端给本代理的 `Proxy-Authorization` 原样发给源站（上游 2.10.8 也这样，实测） | 进来时取下，只交给上级代理；规则主动设置的照常发送 | `d3d731e` `311fd9a` | 端到端三种情况；差分新增用例并声明为偏离 |
 | 只给 `-N/-W` 不给 `-n/-w` 时控制台完全敞开 | 拒绝启动并说明原因 | `a79bf07` | 直接启动看报错 |
 | 插件页面收到控制台的 `Authorization` | 转交前去掉 | `4d0b746` | 端到端：回显头的插件看不到凭据；去掉过滤后测试失败 |
 | `-P` 的帮助说它让控制台离开代理端口（实际没有） | 帮助文字改正 | `174f9eb` | 实测两个端口都返回控制台 |
@@ -311,7 +311,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 
 S1 记录里"`Host: evil.example` 得 403"指的是控制台本身，仍然成立；在代理端口上，这类请求现在按上游转发，被重绑到本机的域名拿到的是跳到 IP 地址的 302，读不到控制台数据（端到端测试 `a_rebound_hostname_cannot_read_the_console`）。`-P` 单独的控制台端口仍回 403。
 
-**测试夹具上的三处改动**（断言没动，都写在驱动里）：上游测试客户端和上游代理同进程，证书校验被全局关掉，测 whix 时照做；两个 SOCKS 夹具与客户端存在竞态（先报成功、后接管道，未等请求就回响应），改成等待；所有夹具只监听 `127.0.0.1`。
+**测试夹具上的三处改动**（断言没动，都写在驱动里）：上游的测试客户端和 Whistle 代理在同一个进程里，证书校验被全局关掉，测 whix 时照做；两个 SOCKS 夹具与客户端存在竞态（先报成功、后接管道，未等请求就回响应），改成等待；所有夹具只监听 `127.0.0.1`。
 
 **实测：** 本地 `cargo fmt --check`、Clippy `-D warnings` 通过；`cargo test` 966 单元 + 28 集成 + 2 doc 全过；差分 `run.js all` 28 步全过（1093 秒，代码 `870bed5`，其后只改了文档），原有语料没有新差异、没有过期声明，新的 `upstream-suite` 一步 239 秒。
 
@@ -1063,7 +1063,7 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 INFO #13 GET http://127.0.0.1:19700/pac -> failed at rules: pac:///…/throw.pac: FindProxyForURL(http://127.0.0.1:19700/pac?token=secretpac) threw: Error: pac broke
 ```
 
-`FindProxyForURL` 的错误信息里带着传给它的 URL。另外试了五种失败（源站连不上、上游代理连不上、源站中途断开、改了 `host` 的连不上、插件不在），错误信息里都只有主机和端口。
+`FindProxyForURL` 的错误信息里带着传给它的 URL。另外试了五种失败（源站连不上、上级代理连不上、源站中途断开、改了 `host` 的连不上、插件不在），错误信息里都只有主机和端口。
 
 **不立项的四条：**
 

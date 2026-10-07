@@ -1417,7 +1417,7 @@ whix --plugin name=127.0.0.1:9000
   有效（与原版隧道路径的 `retryXHost` 同源）。
   代理规则**无法兑现**时连接直接关闭，不会悄悄改成直连 —— 否则字节就走上了那条规则
   明确要绕开的线路。
-- **中继到上游代理的 CONNECT 不带客户端的 UA 与 `Proxy-Authorization`** —— 这条路径上
+- **中继到上级代理的 CONNECT 不带客户端的 UA 与 `Proxy-Authorization`** —— 这条路径上
   没有请求可供回显（原版在隧道路径上手里还有 CONNECT 的头）。代理 URL 自带的凭据
   （`proxy://user:pass@host`）照常使用，那也是代理规则携带凭据的常规写法。
 - **拿不到 ClientHello 的其余部分** —— 钩子只被告知 servername。ALPN 提议、cipher 列表、
