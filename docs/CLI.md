@@ -2,11 +2,11 @@
 
 [项目说明](../README.md) · [Rules](RULES.md) · [Current status](STATUS.md) · [Roadmap](ROADMAP.md)
 
-whistle-rs is one foreground process. There is no `w2 start`, no daemon to stop,
+whix is one foreground process. There is no `w2 start`, no daemon to stop,
 no instance registry — you run the binary, and you stop it with `Ctrl-C`.
 
 ```sh
-whistle-rs -H 127.0.0.1 -p 8899 -r rules.txt --no-persist
+whix -H 127.0.0.1 -p 8899 -r rules.txt --no-persist
 ```
 
 Some flags intentionally resemble upstream, but commands are not drop-in
@@ -25,12 +25,12 @@ UI credentials do not authenticate proxy forwarding; see [OPERATIONS.md](OPERATI
 `✅` honoured · `⚠️` accepted but not identical · `➖` whistle has it and this has
 nothing to apply it to.
 
-| whistle | whistle-rs | |
+| whistle | whix | |
 | --- | --- | --- |
 | `-p, --port` | `-p, --port` | ✅ |
 | `-H, --host` | `-H, --host` | ⚠️ defaults to `127.0.0.1`, not every interface — [see below](#listening-beyond-this-machine) |
 | `-P, --uiport` | `-P, --uiport` | ✅ a second port that serves only the console (it stays on the proxy port too) |
-| `-n/-w`, `-N/-W` | same | ⚠️ console login and the read-only account; the passwords are better given as `WHISTLE_RS_PASSWORD`/`WHISTLE_RS_GUEST_PASSWORD` ([why](#listening-beyond-this-machine)); `-N/-W` without `-n/-w` is refused rather than left open |
+| `-n/-w`, `-N/-W` | same | ⚠️ console login and the read-only account; the passwords are better given as `WHIX_PASSWORD`/`WHIX_GUEST_PASSWORD` ([why](#listening-beyond-this-machine)); `-N/-W` without `-n/-w` is refused rather than left open |
 | `-l, --localUIHost` | `-l, --local-ui-host` | ✅ adds to the built-in three, as upstream does |
 | `-M, --mode` | `-M, --mode` | ⚠️ support depends on the mode and its combinations — see the mode table below |
 | `-t, --timeout` | `-t, --timeout` | ✅ same default, 360000 ms |
@@ -57,7 +57,7 @@ Beyond whistle's list: `--rule` (inline rules), `--value`, `--plugin` /
 [why it is needed](RULES.md#weinre-html-debug-injection)), `-v/--verbose`
 (a line for every request, its URL in full — the default log has none;
 [OPERATIONS](OPERATIONS.md#默认值与共享访问) says what is in each).
-`whistle-rs --help` prints all of them, and `whistle-rs explain` answers "which
+`whix --help` prints all of them, and `whix explain` answers "which
 rules would this URL hit" without making a request.
 
 ### The one flag that means something different
@@ -76,7 +76,7 @@ should not be able to remove, that property does not survive the copy.
 
 whistle's `--mode` takes a `|`, `,` or `&` separated list out of a vocabulary of
 **fifty-six** tokens. `tests/differential/mode-bench.js` starts one proxy per
-token — whistle and whistle-rs in turn — and runs the same nine probes through
+token — whistle and whix in turn — and runs the same nine probes through
 each. **Sixteen** move anything a client can see (fifteen against whistle's own
 defaults, and a sixteenth that only shows once HTTPS interception is on), and
 they collapse into six behaviours — **all six of which are honoured here**. The
@@ -176,19 +176,19 @@ with it, and `-M admin` brings `strict`.
 
 ## Listening beyond this machine
 
-whistle-rs binds `127.0.0.1` unless `-H` says otherwise, so a fresh start is a
+whix binds `127.0.0.1` unless `-H` says otherwise, so a fresh start is a
 proxy — and a console — for this machine only. Upstream binds every interface
 by default; that made a new instance an open proxy for the whole network, with
 a console anyone on it could rewrite, and rules can read and write files. To let
 a phone or another machine in, ask for it, and set a login first:
 
 ```sh
-export WHISTLE_RS_PASSWORD='…'   # from wherever you keep secrets
-whistle-rs -H 0.0.0.0 -n admin
+export WHIX_PASSWORD='…'   # from wherever you keep secrets
+whix -H 0.0.0.0 -n admin
 ```
 
 **The password goes in the environment, not on the command line.**
-`WHISTLE_RS_PASSWORD` is `-w`, `WHISTLE_RS_GUEST_PASSWORD` is `-W`. The flags
+`WHIX_PASSWORD` is `-w`, `WHIX_GUEST_PASSWORD` is `-W`. The flags
 still work, but `-w "$PASSWORD"` is expanded by the shell into the command line,
 and any user of the machine can read a command line with `ps -A -o args=`; a
 process's environment only its owner can read. Startup warns when a password
@@ -208,9 +208,9 @@ consoles shorten it with a QR code per LAN address (shown when started with
 `-H 0.0.0.0`); this one is also a command:
 
 ```sh
-whistle-rs qr "http://192.168.1.5:8899/rootCA.crt"   # drawn in the terminal
-whistle-rs qr --svg 6 "http://192.168.1.5:8899/"     # an SVG on stdout
-whistle-rs qr --matrix "hello"                       # rows of 0/1
+whix qr "http://192.168.1.5:8899/rootCA.crt"   # drawn in the terminal
+whix qr --svg 6 "http://192.168.1.5:8899/"     # an SVG on stdout
+whix qr --matrix "hello"                       # rows of 0/1
 ```
 
 The console serves the same thing at `GET /api/qr?text=…&scale=…`. The encoder
@@ -265,8 +265,8 @@ refuses, because no `Access-Control-Allow-Origin` comes back. `--allow-origin`
 names the origins that may:
 
 ```sh
-whistle-rs --allow-origin 'dash.example.com|*.internal.test'
-whistle-rs --allow-origin '*'          # anyone
+whix --allow-origin 'dash.example.com|*.internal.test'
+whix --allow-origin '*'          # anyone
 ```
 
 Separated by `|`, `,` or `&`. An entry may carry the same domain stars a rule
@@ -346,7 +346,7 @@ proxy, so the subcommands have no counterpart — here is what to do instead.
 **A plain forward proxy, no console, nothing to poke at.**
 
 ```sh
-whistle-rs -p 8899 -M "headless|pureProxy" -r rules.txt
+whix -p 8899 -M "headless|pureProxy" -r rules.txt
 ```
 
 Proxying works as normal. The certificate, the PAC file and `/api/status` still
@@ -356,8 +356,8 @@ the process is alive — and everything else on the console port is a 404.
 **A shared proxy on the network, read-only for everyone but you.**
 
 ```sh
-export WHISTLE_RS_PASSWORD='…' WHISTLE_RS_GUEST_PASSWORD='…'
-whistle-rs -H 0.0.0.0 -p 8899 -n admin -N guest
+export WHIX_PASSWORD='…' WHIX_GUEST_PASSWORD='…'
+whix -H 0.0.0.0 -p 8899 -n admin -N guest
 ```
 
 The login gates the console and **not** the traffic — proxying keeps working for
@@ -386,13 +386,13 @@ separator header can arrive from the origin rather than from you.
 **Behind another proxy, keeping the real client address.**
 
 ```sh
-whistle-rs -p 8899 -M keepXFF
+whix -p 8899 -M keepXFF
 ```
 
 **Not intercepting HTTPS at all** (tunnel everything through untouched):
 
 ```sh
-whistle-rs -p 8899 --no-intercept-https      # or: -M disableCapture
+whix -p 8899 --no-intercept-https      # or: -M disableCapture
 ```
 
 That is where a run starts. The console's Status page can switch it while
@@ -403,6 +403,6 @@ only, and a restart goes back to the command line.
 put the console somewhere predictable:
 
 ```sh
-whistle-rs -p 8899 -P 9899 --dir ~/.whistle-rs/a
-whistle-rs -p 8900 -P 9900 --dir ~/.whistle-rs/b
+whix -p 8899 -P 9899 --dir ~/.whix/a
+whix -p 8900 -P 9900 --dir ~/.whix/b
 ```

@@ -5,7 +5,7 @@
 > measurement of every later commit. The console is the Vue application in
 > `ui-src/`; `build.rs` embeds its built HTML, or a placeholder when absent.
 
-How whistle-rs is put together, how it maps onto the original whistle source, and how
+How whix is put together, how it maps onto the original whistle source, and how
 to extend it.
 
 - [Module map](#module-map)
@@ -67,13 +67,13 @@ Each Rust module corresponds to part of the original JS under `../_original/lib`
 | `src/plugins/ui.rs` | `biz/webui/lib/index.js:466` | `/plugin/<name>/…` served from the plugin's own pages |
 | `src/plugins/sni.rs` | `plugins/index.js:228`, `load-plugin.js:1841` | `sniCallback` — the certificate a connection is served, or no interception at all |
 | `src/plugins/stats.rs` | `plugins/index.js:1369` | Fire-and-forget per-phase stats |
-| `sdk/whistle-rs-plugin.js` | `lib/plugins/load-plugin.js` | Zero-dependency JS/TS plugin SDK (+ `.d.ts` types) |
+| `sdk/whix-plugin.js` | `lib/plugins/load-plugin.js` | Zero-dependency JS/TS plugin SDK (+ `.d.ts` types) |
 | `src/proxy/restream.rs` | `lib/inspectors/data.js` (`parseFrameSep`) | A body cut into frames: event streams and `x-whistle-custom-frame-separator` |
 | `src/proxy/coding.rs` | `lib/util/index.js` (`getZipType`, transforms) | gzip / deflate / brotli / zstd, decoded to inspect and re-encoded to forward |
 | `src/proxy/ciphers.rs` | `lib/rules/index.js` (`getTlsOptions`) | `cipher://` and the TLS options a rule may pin |
 | `src/proxy/timing.rs` | `lib/inspectors` (timings) | Per-phase timings, as the console's waterfall reads them |
 | `src/proxy/bench.rs` | — | An in-process load harness, kept out of the normal suite |
-| `src/explain.rs` | `biz/webui/cgi-bin/rules/test.js` | `whistle-rs explain` — which rules a request would hit, without making one |
+| `src/explain.rs` | `biz/webui/cgi-bin/rules/test.js` | `whix explain` — which rules a request would hit, without making one |
 | `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
 | `src/embed.rs` | — | The library facade: bind on port 0, observe sessions, swap rules, shut down |
 | `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
@@ -135,8 +135,8 @@ and settles it three ways:
 - **A path that answers records its own** through `Ledger::record`: a local
   answer, a plugin's, an abort, the response head from the origin.
 - **An error that escapes `serve()`** reaches `guard`, which records the draft
-  with the error's phase and answers `502` with `x-whistle-rs-error` and
-  `x-whistle-rs-session`. The phase is not guessed from the message: `upstream`
+  with the error's phase and answers `502` with `x-whix-error` and
+  `x-whix-session`. The phase is not guessed from the message: `upstream`
   wraps each failure in an `outcome::Stopped` where it happens (`dial` tags DNS
   and connect separately, the proxy handshake, the TLS handshake, the send), and
   `outcome::phase_of` finds the innermost tag under any `.context()` added on
@@ -428,13 +428,13 @@ cargo run --release -- -p 8899 -r /tmp/r.txt &
 
 # 3. drive it
 curl -x http://127.0.0.1:8899 http://test.local/       # host override → origin
-curl -x http://127.0.0.1:8899 --cacert ~/.whistle-rs/certs/root.crt https://example.com/
+curl -x http://127.0.0.1:8899 --cacert ~/.whix/certs/root.crt https://example.com/
 ```
 
 ## Project layout
 
 ```
-whistle-rs/
+whix/
 ├── Cargo.toml
 ├── build.rs               # inlines the built console into the binary
 ├── .cargo/config.toml     # Windows: link the C runtime in (no VCRUNTIME140.dll)
@@ -478,7 +478,7 @@ whistle-rs/
     ├── config.rs
     ├── ca.rs
     ├── embed.rs           # the library facade
-    ├── explain.rs         # `whistle-rs explain`
+    ├── explain.rs         # `whix explain`
     ├── qr.rs              # the console's QR encoder
     ├── private_fs.rs      # owner-only files, replaced whole on save
     ├── rules/
@@ -523,7 +523,7 @@ whistle-rs/
 |---|---|
 | add a rule operator | `src/rules/protocols.rs` (register), then its family's file in `src/proxy/apply/` (act on it) |
 | change how rules match | `src/rules/matcher.rs` |
-| write a plugin | [`PLUGINS.md`](PLUGINS.md), then `sdk/whistle-rs-plugin.d.ts` |
+| write a plugin | [`PLUGINS.md`](PLUGINS.md), then `sdk/whix-plugin.d.ts` |
 | add a plugin hook | `src/plugins/mod.rs` (manifest + trait), then the call site — but check first whether the existing dispatch already suffices, as `auth` did |
 | touch the request pipeline | `serve()` in `src/proxy/serve.rs` — the one place every request flows through |
 | add an endpoint | the route match in `handle`, `src/proxy/webui.rs`, and the handler in the `webui/` file for its area |

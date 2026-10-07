@@ -1,8 +1,8 @@
 # HTTPS interception & the root CA
 
-To read (and rewrite) HTTPS traffic, whistle-rs performs a **man-in-the-middle**: it
+To read (and rewrite) HTTPS traffic, whix performs a **man-in-the-middle**: it
 presents your client a certificate it generates on the fly for each host, signed by a
-**root CA** that whistle-rs creates on first run. Your client will only trust those
+**root CA** that whix creates on first run. Your client will only trust those
 certificates after you install and trust that root CA.
 
 - [Where the CA lives](#where-the-ca-lives)
@@ -23,12 +23,12 @@ certificates after you install and trust that root CA.
 
 ## Where the CA lives
 
-On first start whistle-rs generates and persists the root CA under the storage dir
-(default `~/.whistle-rs`, override with `--dir`):
+On first start whix generates and persists the root CA under the storage dir
+(default `~/.whix`, override with `--dir`):
 
 ```
-~/.whistle-rs/certs/root.crt   # the root certificate (install this)
-~/.whistle-rs/certs/root.key   # its private key (keep secret; created 0600 on Unix)
+~/.whix/certs/root.crt   # the root certificate (install this)
+~/.whix/certs/root.key   # its private key (keep secret; created 0600 on Unix)
 ```
 
 Delete both files to regenerate a fresh CA on the next start (you'll need to
@@ -36,7 +36,7 @@ re-install it everywhere).
 
 ## Download it
 
-With whistle-rs running, open the built-in page and download the certificate:
+With whix running, open the built-in page and download the certificate:
 
 ```
 http://127.0.0.1:8899/           # status page with a download link
@@ -49,15 +49,15 @@ the certificate whatever the path is — so there is no address and no port to t
 on a phone keyboard. It is whistle's own arrangement, kept here. `-M pureProxy`
 turns it off, if you would rather that name were forwarded like any other.
 
-Or copy it straight from disk: `~/.whistle-rs/certs/root.crt`.
+Or copy it straight from disk: `~/.whix/certs/root.crt`.
 
 ```bash
 # e.g. save it locally without a browser
-curl -o whistle-rs-rootCA.crt http://127.0.0.1:8899/rootCA.crt
+curl -o whix-rootCA.crt http://127.0.0.1:8899/rootCA.crt
 ```
 
 > If your shell exports `http_proxy`/`https_proxy`, add `--noproxy '*'` so curl talks
-> to whistle-rs directly instead of through another proxy.
+> to whix directly instead of through another proxy.
 
 ## Install it
 
@@ -65,18 +65,18 @@ curl -o whistle-rs-rootCA.crt http://127.0.0.1:8899/rootCA.crt
 
 ```bash
 sudo security add-trusted-cert -d -r trustRoot \
-  -k /Library/Keychains/System.keychain ~/.whistle-rs/certs/root.crt
+  -k /Library/Keychains/System.keychain ~/.whix/certs/root.crt
 ```
 
 Or via the GUI: double-click `root.crt` → it opens Keychain Access → find
-**whistle-rs Root CA** under *System* → *Get Info* → *Trust* → set **When using this
+**whix Root CA** under *System* → *Get Info* → *Trust* → set **When using this
 certificate: Always Trust**.
 
 ### Windows
 
 ```powershell
 # Run as Administrator
-Import-Certificate -FilePath "$env:USERPROFILE\.whistle-rs\certs\root.crt" `
+Import-Certificate -FilePath "$env:USERPROFILE\.whix\certs\root.crt" `
   -CertStoreLocation Cert:\LocalMachine\Root
 ```
 
@@ -87,17 +87,17 @@ certificates in the following store* → **Trusted Root Certification Authoritie
 
 ```bash
 # Debian / Ubuntu
-sudo cp ~/.whistle-rs/certs/root.crt /usr/local/share/ca-certificates/whistle-rs.crt
+sudo cp ~/.whix/certs/root.crt /usr/local/share/ca-certificates/whix.crt
 sudo update-ca-certificates
 
 # Fedora / RHEL
-sudo cp ~/.whistle-rs/certs/root.crt /etc/pki/ca-trust/source/anchors/whistle-rs.crt
+sudo cp ~/.whix/certs/root.crt /etc/pki/ca-trust/source/anchors/whix.crt
 sudo update-ca-trust
 ```
 
 > **Which IP?** A phone can reach the proxy only if it was started with
 > `-H 0.0.0.0` (or a LAN address) — the default is `127.0.0.1`, this machine
-> only. Then whistle-rs prints the addresses a device on the same network can
+> only. Then whix prints the addresses a device on the same network can
 > reach it at, at startup and in `GET /api/status`. `0.0.0.0` in the listen line
 > is not one of them — it means "every interface", and a phone needs a specific
 > one. If nothing is printed, this machine has no private address the kernel will
@@ -110,7 +110,7 @@ sudo update-ca-trust
    and allow the profile download.
 3. **Settings → General → VPN & Device Management** → install the profile.
 4. **Settings → General → About → Certificate Trust Settings** → enable full trust
-   for **whistle-rs Root CA**. (This last step is required on iOS.)
+   for **whix Root CA**. (This last step is required on iOS.)
 
 ### Android
 
@@ -124,7 +124,7 @@ sudo update-ca-trust
 4. With the root in the **system** store, Chrome and WebViews check the leaf
    certificates the way they check a public one, and refuse any valid for longer
    than the CA/Browser Forum allows (200 days for one issued from 2026-03-15):
-   the page fails with `ERR_CERT_VALIDITY_TOO_LONG`. The leaves whistle-rs signs
+   the page fails with `ERR_CERT_VALIDITY_TOO_LONG`. The leaves whix signs
    are valid for 43 days — 7 back, 36 ahead, as whistle 2.10.10's — and are
    signed again before they run out, so this does not happen. A version before
    that signed them for a year and a bit; if you see the error, update.
@@ -142,35 +142,35 @@ Import** → select `root.crt` → check *Trust this CA to identify websites*.
 
 When you stop debugging, or before deleting the storage directory: a trusted root
 whose private key is still on disk lets whoever reads `root.key` impersonate any
-site to this client. Remove the trust first, then the files. Every whistle-rs CA
-is named **whistle-rs Root CA**, so if you ever regenerated it, more than one may
+site to this client. Remove the trust first, then the files. Every whix CA
+is named **whix Root CA**, so if you ever regenerated it, more than one may
 be installed; the commands below remove all of them.
 
 ```bash
 # macOS — repeat until it answers "Unable to delete certificate matching"
-sudo security delete-certificate -c "whistle-rs Root CA" /Library/Keychains/System.keychain
+sudo security delete-certificate -c "whix Root CA" /Library/Keychains/System.keychain
 
 # Debian / Ubuntu
-sudo rm /usr/local/share/ca-certificates/whistle-rs.crt
+sudo rm /usr/local/share/ca-certificates/whix.crt
 sudo update-ca-certificates --fresh
 
 # Fedora / RHEL
-sudo rm /etc/pki/ca-trust/source/anchors/whistle-rs.crt
+sudo rm /etc/pki/ca-trust/source/anchors/whix.crt
 sudo update-ca-trust
 ```
 
 ```powershell
 # Windows, as Administrator
 Get-ChildItem Cert:\LocalMachine\Root |
-  Where-Object Subject -like '*CN=whistle-rs Root CA*' | Remove-Item
+  Where-Object Subject -like '*CN=whix Root CA*' | Remove-Item
 ```
 
-- **iOS:** Settings → General → VPN & Device Management → the whistle-rs profile →
+- **iOS:** Settings → General → VPN & Device Management → the whix profile →
   Remove Profile.
 - **Android:** Settings → Security → Encryption & credentials → Trusted credentials →
-  User → whistle-rs Root CA → Remove.
+  User → whix Root CA → Remove.
 - **Firefox:** Settings → Privacy & Security → Certificates → View Certificates →
-  Authorities → whistle-rs Root CA → Delete or Distrust.
+  Authorities → whix Root CA → Delete or Distrust.
 
 Also set the client's proxy back. None of these commands were run by this
 project's tests, which never touch a trust store.
@@ -183,7 +183,7 @@ Point a client at the proxy and fetch an HTTPS URL, trusting the CA:
 
 ```bash
 curl -x http://127.0.0.1:8899 \
-     --cacert ~/.whistle-rs/certs/root.crt \
+     --cacert ~/.whix/certs/root.crt \
      https://example.com/ -D - -o /dev/null
 ```
 
@@ -194,7 +194,7 @@ and you'll see the injected header appear — proof the tunnel was decrypted.
 problem: self signed certificate in certificate chain` (macOS's curl, measured;
 other TLS libraries word it differently, and a browser shows its own warning page),
 and the console gets a `CONNECT` row tagged `client-tls` whose reason reads "the
-client refused this proxy's certificate … it does not trust the whistle-rs root
+client refused this proxy's certificate … it does not trust the whix root
 certificate, or it pins the server's own". The first half is fixed by installing
 the CA on that client; the second — an app that pins — by not intercepting that
 host at all (next section). A client that hangs up mid-handshake without saying
@@ -210,7 +210,7 @@ your way out of; the proxy has to present the certificate the client is looking
 for, which means you have to have it.
 
 ```sh
-whistle-rs -z ./certs      # api.example.com.key + api.example.com.crt inside
+whix -z ./certs      # api.example.com.key + api.example.com.crt inside
 ```
 
 Each `<name>.key` paired with `<name>.crt` (or `.cer`, `.pem`) is served for
@@ -225,7 +225,7 @@ at all — see `sniCallback://` in [`RULES.md`](RULES.md).
 ## How it works
 
 1. The client sends `CONNECT example.com:443` to the proxy.
-2. whistle-rs replies `200`, upgrades the socket, and reads the client's
+2. whix replies `200`, upgrades the socket, and reads the client's
    **ClientHello** — without consuming it, so the same bytes can still start a
    handshake afterwards.
 3. It **TLS-accepts** the connection using a leaf certificate for the name the
@@ -272,7 +272,7 @@ whistle sniffs them (`_original/lib/https/index.js:1176-1221`):
 
 The last row is the one that matters most and it needs no flag: a tunnel
 carrying SSH, or a game protocol, or a binary nobody has named, is passed
-through. whistle-rs used to assume every tunnel was TLS and hand it to the
+through. whix used to assume every tunnel was TLS and hand it to the
 acceptor, so those clients got a TLS alert where whistle gave them their
 connection.
 
@@ -301,7 +301,7 @@ The last row is a default rather than a rule, and it is upstream's:
 nothing named inside it — and neither proxy forges a certificate for it. A client
 that pins an IP therefore keeps its end-to-end connection without being asked.
 
-> **whistle-rs reads by default; whistle does not.** whistle's console has an
+> **whix reads by default; whistle does not.** whistle's console has an
 > `Enable HTTPS` switch that starts **off**, and with it off `isEnableIntercept`
 > only touches hosts that already have a custom certificate
 > (`_original/lib/tunnel.js:187-199`). This port reads unless told not to, and
@@ -331,6 +331,6 @@ end to end). See [`RULES.md`](RULES.md#choosing-the-mitm-certificate) and
   that machine. Only install it on devices you control, and keep `root.key` private.
 - The CA is generated locally and never leaves your machine.
 - Uninstall when you're done: remove the certificate from the trust store and delete
-  `~/.whistle-rs/certs/`.
-- whistle-rs verifies **upstream** server certificates against the system webpki root
+  `~/.whix/certs/`.
+- whix verifies **upstream** server certificates against the system webpki root
   store, so it won't silently accept a forged upstream cert.

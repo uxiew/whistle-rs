@@ -7,7 +7,7 @@
 
 [项目说明](../README.md)
 
-本文件诚实记录 **whistle-rs 相对原版 whistle 的对齐进度**：已完成的工作，以及仍
+本文件诚实记录 **whix 相对原版 whistle 的对齐进度**：已完成的工作，以及仍
 **有意简化 / 尚未移植 / 架构受限**的更大子系统与少数边缘算子。
 
 > 现状快照：注册算子中只有 `G` 与 `style` **有意不产生流量效果**（二者都不是逐请求的
@@ -128,7 +128,7 @@
 一致」不是同一句话。总会有某处对齐其实只是对上了某一版的偶然行为，而一份语料没法
 自己问自己这个问题。
 
-`bench-versions.js` 来问：同一个 whistle-rs 二进制，换一个 whistle 跑一遍全部语料，
+`bench-versions.js` 来问：同一个 whix 二进制，换一个 whistle 跑一遍全部语料，
 **按用例名**比对两次结果。不是按条数——两次都报三条差异，不等于是同样的三条；一份
 语料多一条少一条，在计数上看起来纹丝不动。
 
@@ -159,7 +159,7 @@
 用例，在输出里长得一模一样。**这一轮把它变成了一个数**。
 
 每次复跑现在多问一句：**把规则整段拿掉，答案会变吗**？语料开跑前、什么规则都没有的
-那一刻，每一种不同的请求形状先穿过 whistle-rs 一次，答案存下来；一条用例的答案若与
+那一刻，每一种不同的请求形状先穿过 whix 一次，答案存下来；一条用例的答案若与
 它逐字节相同，就记为 `inert` —— 它分不出「实现了这条规则」和「根本没实现」。
 代价是每种请求形状一次请求，不是每条用例一次。
 
@@ -346,7 +346,7 @@
   - **顺带把这一族变成可观测的**：源站现在回显 `getCipher().name`。在此之前
     `https-bench.js` 只比协商版本，于是「钉 A 套件」和「钉 B 套件」协商出同一个版本、
     比较相等 —— 整族 `ciphers` 用例一直在空转。补完后 53 → 66 例，其中三条是**单边
-    断言**：直接问 whistle-rs 有没有协商出它被要求的那个套件（这是全文件唯一一条
+    断言**：直接问 whix 有没有协商出它被要求的那个套件（这是全文件唯一一条
     「whistle 消失了也还成立」的主张），另四条问选不中的值有没有把请求留住。
     单边断言故意验证过会失败：换一个 rustls 没有的套件名，它当场报出来。
 
@@ -641,7 +641,7 @@ pauseReceive|pauseSend`）四个都在；`extensions/api.md` 整页是 Local Age
 
 本轮换了一个问法，便宜得多：**哪些规则命中，每个算子最后拿到什么**。两边都不开
 socket —— 上游的 `Rules`（`lib/rules/rules.js`，真代理跑的同一份代码）**在本进程里**
-被直接驱动，本移植这边走新增的 `whistle-rs explain --batch`（就是普通的解析器）。
+被直接驱动，本移植这边走新增的 `whix explain --batch`（就是普通的解析器）。
 于是语料可以是任何东西：`/Users/john/mock.json`、`www.test.com`、一行根本不是规则的
 字。谁也不会被发请求。
 
@@ -654,7 +654,7 @@ socket —— 上游的 `Rules`（`lib/rules/rules.js`，真代理跑的同一�
   `Host: EXAMPLE.COM` 大小写不敏感，上游敏感，见 [`RULES.md`](RULES.md#where-patterns-differ-from-upstream)）。
   它不是被放过的 —— 基准会把同一个问题**把 host 改小写再问上游一次**，只有两边这时
   一致才算这一类，否则仍是差异。
-- **`whistle-rs explain`**：新增的子命令，就是 whistle 控制台的 *Test Rules*
+- **`whix explain`**：新增的子命令，就是 whistle 控制台的 *Test Rules*
   （`docs/docs/gui/test-rules.md`）离线版：给一份规则、一个 URL、方法、请求头和请求体，
   它说出这次请求会命中什么。它解决的是规则文件最常见的那个问题 —— **一条不命中的
   规则什么也不报**，命中和落空长得一模一样。输出有人读的文本、`--json`，以及给程序读的
@@ -1389,7 +1389,7 @@ H2 会话复用）。
       （`PROXY_RE` → `protocol = 'proxy'`，`lib/rules/rules.js:1286`），因此**先写的行胜出**。
       本移植按算子的解析顺序（`RuleOp::order`）取最小者。
 - [x] ~~`internal-*` 未走 whistle 间的 `x-whistle-https-request` 握手~~ → 该项**记录有误**：
-      握手早已实现（`mark_stripped_tls` / `take_https_marker`），本轮实测两个 whistle-rs
+      握手早已实现（`mark_stripped_tls` / `take_https_marker`），本轮实测两个 whix
       串联，far 端确实按 `https://` 解析规则。握手中其余部分依赖本移植没有的机制：
       `x-whistle-client-id`（无 client-id 概念）、`x-whistle-policy: intercept`（本移植
       对 CONNECT 一律 MITM，无需协商，仅 `proxyTunnel` 内层发送）、`x-forwarded-from-whistle-<uid>`
@@ -1830,7 +1830,7 @@ H2 会话复用）。
 
 - **现成 npm `whistle.*` 包的兼容运行** —— 原版插件 API 建立在对 Node `req`/`res` 对象的
   装饰之上（约 2600 行加载器、位置式 CSV 头协议、单端口多钩子分发）。与其被这套历史包袱
-  绑定，whistle-rs 选择了一套显式、有类型、语言无关的自研协议，配 JS/TS SDK。
+  绑定，whix 选择了一套显式、有类型、语言无关的自研协议，配 JS/TS SDK。
   见 [`PLUGINS.md`](PLUGINS.md)。
 
 - **逐字节复刻 React 前端** —— 内建控制台已覆盖核心检查/编辑需求（三栏布局、可排序表格、

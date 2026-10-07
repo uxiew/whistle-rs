@@ -7,7 +7,7 @@
 | 用途 | 版本 | 定义在 | 版本不对会怎样 |
 | --- | --- | --- | --- |
 | Rust，跑门禁和日常开发 | **1.98.1**，含 clippy、rustfmt | `rust-toolchain.toml` | 装了 rustup 的机器，在仓库里第一次执行 `cargo` 时自动下载，无需手动切换 |
-| Rust 最低可编译版本（MSRV） | **1.95** | `Cargo.toml` 的 `rust-version` | 1.94 及更早立刻报 `rustc 1.94.0 is not supported by the following packages: whistle-rs@0.1.0 requires rustc 1.95`，不会先编译一堆依赖 |
+| Rust 最低可编译版本（MSRV） | **1.95** | `Cargo.toml` 的 `rust-version` | 1.94 及更早立刻报 `rustc 1.94.0 is not supported by the following packages: whix@0.1.0 requires rustc 1.95`，不会先编译一堆依赖 |
 | Node.js，只在构建控制台时需要 | **`^20.19.0 \|\| >=22.12.0`** | `ui-src/package.json` 的 `engines`，由 `ui-src/.npmrc` 的 `engine-strict` 强制 | `npm ci` 直接以 `EBADENGINE` 失败。运行代理本身不需要 Node |
 
 两个 Rust 版本是两件事：`rust-toolchain.toml` 决定**用哪个版本做检查**，`rust-version` 声明**最老能用哪个版本编译**。门禁版本必须钉死，因为 Clippy 每个版本都会加新检查：同一份代码在 1.96.1 上 `clippy -D warnings` 通过，在 1.98.1 上报两处错误。不钉版本，"门禁通过"就取决于谁的电脑跑的。升级门禁版本要单独提交，并在同一提交里修掉新 lint。
@@ -65,8 +65,8 @@ git diff --check
 
 ```sh
 node scripts/check-links.mjs                                  # 所有受版本控制的 Markdown 的相对链接和 #锚点
-scripts/check-console.sh target/release/whistle-rs built      # 二进制嵌入的就是 ui-src/dist 这一版控制台
-scripts/check-console.sh target/debug/whistle-rs placeholder  # 没有前端产物时，二进制能跑且给出占位页
+scripts/check-console.sh target/release/whix built      # 二进制嵌入的就是 ui-src/dist 这一版控制台
+scripts/check-console.sh target/debug/whix placeholder  # 没有前端产物时，二进制能跑且给出占位页
 ```
 
 链接检查只认 git 跟踪的文件：`_original/` 在本机存在，但在 GitHub 上是 404，指向它的链接会被报出来。外链不联网检查。`check-console.sh` 只用 sh 和 curl，所以也能在没装 Node 的环境里跑；它对 curl 加了 `--noproxy '*'`——本机设了 `http_proxy` 又没设 `no_proxy` 时，curl 连 127.0.0.1 也会走代理，检查会一直卡住。
@@ -74,8 +74,8 @@ scripts/check-console.sh target/debug/whistle-rs placeholder  # 没有前端产�
 ## 在一台机器上实际用一遍
 
 ```sh
-node scripts/smoke.mjs target/release/whistle-rs --console built          # macOS、Linux
-node scripts\smoke.mjs target\release\whistle-rs.exe --console built      # Windows
+node scripts/smoke.mjs target/release/whix --console built          # macOS、Linux
+node scripts\smoke.mjs target\release\whix.exe --console built      # Windows
 node scripts/smoke.mjs <二进制> --json smoke.json --keep                    # 另存报告，留下数据目录
 ```
 
@@ -112,13 +112,13 @@ node matrix.js ../../target/differential/<基线那次> ../../target/differentia
 
 两次要用同一个二进制（先复制一份，用 `RS_BIN=` 指过去），否则 `matrix.js` 会拒绝比较（退出码 2）：它分不清一个变化是上游的还是本项目的。`--assume-baseline`、加新版本的步骤只写在[差分 README](../tests/differential/README.md#which-whistle-though)，两版的实测差别见 [STATUS 的 U1 记录](STATUS.md#2026-09-29-u1-上游版本矩阵)。
 
-`run.js` 自己起停需要的代理，数据目录、根证书和会话都放在用完即删的临时目录里，只监听 127.0.0.1；开跑前逐个检查要用的端口，被占用就直接退出并报端口号和占用者；每个子进程单独一个进程组，结束或 Ctrl-C 时整组杀掉，不会留下还在监听的代理。退出码：0 全部通过，1 有步骤失败，2 没法开始（端口被占、二进制缺失或比源码旧、没跑 `npm ci`）。归档在 `target/differential/<时间>-<套件>/`：`manifest.json` 记录提交与未提交文件、whistle-rs 版本和 SHA-256、whistle 版本和锁文件哈希、每个脚本和语料的哈希、Node 版本、每一步的命令和结果，外加每一步的输出和每个代理的日志。
+`run.js` 自己起停需要的代理，数据目录、根证书和会话都放在用完即删的临时目录里，只监听 127.0.0.1；开跑前逐个检查要用的端口，被占用就直接退出并报端口号和占用者；每个子进程单独一个进程组，结束或 Ctrl-C 时整组杀掉，不会留下还在监听的代理。退出码：0 全部通过，1 有步骤失败，2 没法开始（端口被占、二进制缺失或比源码旧、没跑 `npm ci`）。归档在 `target/differential/<时间>-<套件>/`：`manifest.json` 记录提交与未提交文件、whix 版本和 SHA-256、whistle 版本和锁文件哈希、每个脚本和语料的哈希、Node 版本、每一步的命令和结果，外加每一步的输出和每个代理的日志。
 
 判定规则只有一条：**没人解释过的差异就失败。** 已知且接受的差异逐条写在 `tests/differential/declared.js`（用例、字段、在哪些上游版本上测过、理由；只对列出的版本生效）；跨语料反复出现的模式在 `harness.js` 的 `EXPECTED`，每条都限定了能豁免的字段和用例范围。声明了却不再出现的差异同样算失败——留着它，以后这个字段在这个用例上出什么问题都会被放过。每个语料跑完还会跑 `triage-inert.js`：规则一条都没命中、又没说明原因的用例算失败。
 
 新增例外时照这个格式写进 `declared.js`，别加宽 `EXPECTED` 的匹配范围，也别往 `IGNORE` 里加头。门禁到底能不能抓到回归，用 `node mutations.js` 验证：它在 HEAD 的临时 worktree 里逐条注入几个预设的语义回归，每条都必须让对应门禁失败（所以跑之前先提交）。
 
-**上游自带的测试**也是 `network` 里的一步（`upstream-suite`，约 4 分钟）：拿所测上游版本那个 tag 的 `test/` 原样跑 whistle-rs（2.10.8 与 2.10.10 的 `test/` 完全相同），第一次运行会从 GitHub 按提交号取到 `target/upstream-suite/`。它用上游固定的端口（6666、18080、5566、1080 等），跟 `--port-base` 无关，端口被占会直接报出来。单独跑：`node upstream-suite.js`；某个单元挂了，用 `node upstream-suite.js --target rs --only <单元名> --verbose` 看每条调用的状态和错误页。它评判哪些调用、怎么声明例外，只写在[差分 README](../tests/differential/README.md#upstreams-own-test-suite)。
+**上游自带的测试**也是 `network` 里的一步（`upstream-suite`，约 4 分钟）：拿所测上游版本那个 tag 的 `test/` 原样跑 whix（2.10.8 与 2.10.10 的 `test/` 完全相同），第一次运行会从 GitHub 按提交号取到 `target/upstream-suite/`。它用上游固定的端口（6666、18080、5566、1080 等），跟 `--port-base` 无关，端口被占会直接报出来。单独跑：`node upstream-suite.js`；某个单元挂了，用 `node upstream-suite.js --target rs --only <单元名> --verbose` 看每条调用的状态和错误页。它评判哪些调用、怎么声明例外，只写在[差分 README](../tests/differential/README.md#upstreams-own-test-suite)。
 
 **性能对比**不是门禁，`run.js` 不跑它，要手动跑。它测的是 release 二进制，改了连接或数据通路之后跑一次，和 [STATUS 的 PERF1 记录](STATUS.md#2026-09-29-perf1-源站连接复用与源站-h2)里的数字比较：
 
@@ -138,7 +138,7 @@ RTT_MS=20 node perf-bench.js         # 源站前面加 20 ms 往返时延
 
 `.github/workflows/ci.yml` 在每个 PR 和推到 main 时运行：钉住工具链上的 fmt/Clippy/全部测试、MSRV 版本上的全部测试、在不含 Node 的 `rust:1.98.1-trixie` 容器里构建纯代理并检查占位页、Node 20.19.0 和 24 两个版本下的前端 typecheck/build、文档链接检查、`run.js fast`，以及五个平台的发布构建（`platforms`）。`.github/workflows/differential.yml` 跑全量网络差分，同一个二进制先对 2.10.8、再对 2.10.10 各跑一遍 `run.js all`，最后用 `matrix.js` 比较两版，手动触发或每周一凌晨，结果归档上传。所有 action 都按提交哈希钉住版本，注释里写了对应的 tag。
 
-`platforms` 在 Linux x86_64、Linux arm64、macOS arm64、macOS x86_64、Windows x86_64 各做一遍：先构建控制台再构建 release；除 Linux x86_64（`rust` 任务已测过）外跑全部测试；记下二进制对系统的最低要求（Linux 看链接的最高 glibc 符号版本，macOS 看 `minos`，Windows 确认不依赖 `VCRUNTIME140.dll`）；跑 `scripts/smoke.mjs --console built`；最后打包成 `whistle-rs-<版本>-<target>.tar.gz`（Windows 是 `.zip`），里面是二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md`、`BUILD-INFO.txt`（版本、提交、编译器、最低系统要求、嵌入的控制台哈希）和 `SHA256SUMS`，旁边是压缩包自己的 `.sha256` 和冒烟测试报告。构件在 Actions 页面保留 14 天；不会自动发布到 Releases。
+`platforms` 在 Linux x86_64、Linux arm64、macOS arm64、macOS x86_64、Windows x86_64 各做一遍：先构建控制台再构建 release；除 Linux x86_64（`rust` 任务已测过）外跑全部测试；记下二进制对系统的最低要求（Linux 看链接的最高 glibc 符号版本，macOS 看 `minos`，Windows 确认不依赖 `VCRUNTIME140.dll`）；跑 `scripts/smoke.mjs --console built`；最后打包成 `whix-<版本>-<target>.tar.gz`（Windows 是 `.zip`），里面是二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md`、`BUILD-INFO.txt`（版本、提交、编译器、最低系统要求、嵌入的控制台哈希）和 `SHA256SUMS`，旁边是压缩包自己的 `.sha256` 和冒烟测试报告。构件在 Actions 页面保留 14 天；不会自动发布到 Releases。
 
 这些 runner 是 GitHub 的虚拟机，不是物理机；冒烟测试不碰系统代理设置和系统信任库，所以"在这台机器上设为系统代理、浏览器信任根证书后能用"这一步不在 CI 里，要在真机上按 [CERTIFICATES](CERTIFICATES.md) 做。Windows 的 `.cargo/config.toml` 把 C 运行库静态链接进去，否则没装 Visual C++ 运行库的机器上启动就报找不到 `VCRUNTIME140.dll`。性能基准与长连接稳定性另行记录配置、硬件、制品和资源曲线。
 

@@ -29,7 +29,7 @@ var TPL_RE = /(?:dust|tpl|jsonp):$/;
 - **没有** `{.}`、嵌套 block、自定义 helper
 - `dust://` 和 `jsonp://` 是未文档化的历史别名，whistle 自己的 WebUI 协议列表里都没有它们
 
-whistle-rs 忠实对齐了这个行为。
+whix 忠实对齐了这个行为。
 
 > **`jsonp://` 不会自动包裹 callback。** 上游没有任何 callback 嗅探逻辑 —— JSONP 是靠模板自己写出来的，见下文。
 
@@ -140,7 +140,7 @@ URI 编码**之前**生效。
 | `${ip}` / `${clientIp}` | 客户端 IP |
 | `${host}` / `${realHost}` | **代理自身的绑定地址**（绑定全部接口时为空），不是请求的 Host |
 | `${port}` / `${realPort}` | 代理监听端口 |
-| `${version}` | whistle-rs 版本 |
+| `${version}` | whix 版本 |
 | `${hostname}` | 本机主机名 |
 | `${env.<名>}` | 环境变量 |
 | `${now}` | 毫秒时间戳 |
@@ -234,7 +234,7 @@ GET http://example.com/api?callback=cb123
 ### `Server`
 
 从磁盘读到的文件会带一个 `Server` 响应头（上游是 `server: config.appName`，`file-proxy.js:315-318`；
-whistle-rs 如实写自己的名字）。**只有真正读了文件的响应**有这个头 —— 内联值、values 存储的
+whix 如实写自己的名字）。**只有真正读了文件的响应**有这个头 —— 内联值、values 存储的
 内容、以及 404 都是在别处拼出来的，都没有；解析成功的 `rawfile://` 用的是文件自带的响应头，
 也没有。换句话说，这个头等于「这些字节来自文件系统」。
 
@@ -307,7 +307,7 @@ Content-Type: application/json
 | `a\|b\|c` | `a`、`b`、`c` —— 多路径回退 |
 | `~/mock.json` | `$HOME/mock.json`（全角 `～/` 同样生效；单独一个 `~` 不展开） |
 | `/tmp/site/` | `/tmp/site`，然后 `/tmp/site/index.html` |
-| `tmp/x`（缺少前导 `/`） | `tmp/x`，然后 `/tmp/x` —— whistle-rs 自己的兜底 |
+| `tmp/x`（缺少前导 `/`） | `tmp/x`，然后 `/tmp/x` —— whix 自己的兜底 |
 | `/tmp/a%20b.json` | `/tmp/a b.json` —— 先截掉 `?`/`#` 之后的部分再百分号解码（`decodePath`，`util/index.js:1403-1418`） |
 
 最后一行是目录规则能用的前提：请求路径会被拼到值后面，所以 `/static/a%20b.json?v=2`
@@ -318,7 +318,7 @@ Content-Type: application/json
 
 ```
 $ curl -x http://127.0.0.1:8899 'http://mock.test/up'
-whistle-rs: file not found <strong>(Path contains parent directory notation &#39;..&#39;)</strong>
+whix: file not found <strong>(Path contains parent directory notation &#39;..&#39;)</strong>
 ```
 
 被拒绝的候选不会中断整条规则 —— `file://../escape|/tmp/ok.txt` 仍然会服务 `/tmp/ok.txt`。
@@ -328,7 +328,7 @@ whistle-rs: file not found <strong>(Path contains parent directory notation &#39
 
 > **上游怪癖：`xs` 前缀不拆 `|`。** 拆分用的正则（`rules.js:96`）写的是 `^x?(...)`，
 > 只允许**单个** `x`，所以 `xsfile://a|b` 在原版里就不会被拆开，整串会被当成一个文件名。
-> whistle-rs **刻意复刻**了这个行为：`|` 在 POSIX 文件名里是合法字符，"修好"它会让同一份规则文件在两边解析出不同的路径。
+> whix **刻意复刻**了这个行为：`|` 在 POSIX 文件名里是合法字符，"修好"它会让同一份规则文件在两边解析出不同的路径。
 
 Content-Type 取的是**命中的那个候选**的扩展名，不是规则里写的值 ——
 所以 `file:///tmp/site/` 命中 `index.html` 时会返回 `text/html`。

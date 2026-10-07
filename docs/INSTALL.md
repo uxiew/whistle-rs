@@ -2,15 +2,15 @@
 
 [快速开始](../README.md) · [证书](CERTIFICATES.md) · [安全运行与数据边界](OPERATIONS.md) · [当前状态](STATUS.md)
 
-whistle-rs 是单个可执行文件：没有安装程序，不注册服务，不改系统代理，不装证书。"安装"就是把它放进 `PATH`，"卸载"就是把下面列出的东西删掉。
+whix 是单个可执行文件：没有安装程序，不注册服务，不改系统代理，不装证书。"安装"就是把它放进 `PATH`，"卸载"就是把下面列出的东西删掉。
 
 ## 下载
 
-还没有正式发布（GitHub Releases 是空的）。每次推到 main，CI 会给五个平台各打一个包：在仓库的 **Actions → CI → 那次运行 → Artifacts** 里，名字是 `whistle-rs-<target>`，保留 14 天，要登录 GitHub 才能下载。下载到的是 GitHub 包的一层 zip，解开才是下面这三样：
+还没有正式发布（GitHub Releases 是空的）。每次推到 main，CI 会给五个平台各打一个包：在仓库的 **Actions → CI → 那次运行 → Artifacts** 里，名字是 `whix-<target>`，保留 14 天，要登录 GitHub 才能下载。下载到的是 GitHub 包的一层 zip，解开才是下面这三样：
 
 | 文件 | 是什么 |
 | --- | --- |
-| `whistle-rs-<版本>-<target>.tar.gz`（Windows 是 `.zip`） | 二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md`、`BUILD-INFO.txt`、`SHA256SUMS` |
+| `whix-<版本>-<target>.tar.gz`（Windows 是 `.zip`） | 二进制、`LICENSE`、`NOTICE.md`、`THIRD-PARTY-LICENSES.md`、`BUILD-INFO.txt`、`SHA256SUMS` |
 | 同名加 `.sha256` | 压缩包本身的 SHA-256 |
 | `smoke-<target>.json` | 这个二进制在 CI 那台机器上跑冒烟测试的逐步结果（见 [DEVELOPMENT](DEVELOPMENT.md#在一台机器上实际用一遍)） |
 
@@ -29,14 +29,14 @@ whistle-rs 是单个可执行文件：没有安装程序，不注册服务，不
 ## 校验
 
 ```sh
-sha256sum -c whistle-rs-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256    # macOS 用 shasum -a 256 -c
-tar -xzf whistle-rs-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd whistle-rs-0.1.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS
+sha256sum -c whix-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256    # macOS 用 shasum -a 256 -c
+tar -xzf whix-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd whix-0.1.0-x86_64-unknown-linux-gnu && sha256sum -c SHA256SUMS
 ```
 
 ```powershell
-Get-FileHash .\whistle-rs-0.1.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256   # 和 .sha256 文件里的比，不分大小写
-Expand-Archive .\whistle-rs-0.1.0-x86_64-pc-windows-msvc.zip -DestinationPath .
+Get-FileHash .\whix-0.1.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256   # 和 .sha256 文件里的比，不分大小写
+Expand-Archive .\whix-0.1.0-x86_64-pc-windows-msvc.zip -DestinationPath .
 ```
 
 校验和只能证明下载没坏、和 CI 当时产出的一致；它不是签名，能替换压缩包的人也能替换 `.sha256`。二进制没有代码签名，macOS 版也没有公证。
@@ -44,20 +44,20 @@ Expand-Archive .\whistle-rs-0.1.0-x86_64-pc-windows-msvc.zip -DestinationPath .
 ## 安装
 
 ```sh
-install -m 755 whistle-rs ~/.local/bin/      # 或任何在 PATH 里的目录
-whistle-rs --version
+install -m 755 whix ~/.local/bin/      # 或任何在 PATH 里的目录
+whix --version
 ```
 
-Windows 上把 `whistle-rs.exe` 放进一个目录（比如 `%LOCALAPPDATA%\Programs\whistle-rs`），再把这个目录加进用户的 `Path` 环境变量。
+Windows 上把 `whix.exe` 放进一个目录（比如 `%LOCALAPPDATA%\Programs\whix`），再把这个目录加进用户的 `Path` 环境变量。
 
-- **macOS 拒绝运行**（提示无法验证开发者，或者进程直接被杀）：浏览器下载的文件带隔离属性，而这个二进制只有链接器自动加的 ad-hoc 签名。确认来源后去掉隔离属性：`xattr -d com.apple.quarantine whistle-rs`。
+- **macOS 拒绝运行**（提示无法验证开发者，或者进程直接被杀）：浏览器下载的文件带隔离属性，而这个二进制只有链接器自动加的 ad-hoc 签名。确认来源后去掉隔离属性：`xattr -d com.apple.quarantine whix`。
 - **Windows**：从资源管理器双击未签名的 exe 可能弹 SmartScreen；监听本机以外的地址（`-H 0.0.0.0`）时防火墙可能询问是否放行。这两处本项目都没有在 Windows 上实际点过，CI 的 Windows 虚拟机只从命令行启动、只监听 127.0.0.1。
 
-第一次启动（`whistle-rs -p 8899`）会建数据目录、生成根证书。要解密 HTTPS，再按 [CERTIFICATES](CERTIFICATES.md#install-it) 让客户端信任根证书。
+第一次启动（`whix -p 8899`）会建数据目录、生成根证书。要解密 HTTPS，再按 [CERTIFICATES](CERTIFICATES.md#install-it) 让客户端信任根证书。
 
 ## 数据目录
 
-默认 `~/.whistle-rs`，即 macOS/Linux 的 `$HOME/.whistle-rs`、Windows 的 `%USERPROFILE%\.whistle-rs`；`--dir` 可以换地方。里面是：
+默认 `~/.whix`，即 macOS/Linux 的 `$HOME/.whix`、Windows 的 `%USERPROFILE%\.whix`；`--dir` 可以换地方。里面是：
 
 | 路径 | 内容 | 什么时候写 |
 | --- | --- | --- |
@@ -77,7 +77,7 @@ Windows 上把 `whistle-rs.exe` 放进一个目录（比如 `%LOCALAPPDATA%\Prog
 **一个目录同时只能有一个实例。** 第二个会直接退出（退出码 1），报错写明是哪个目录、被哪个实例占着：
 
 ```
-Error: /Users/you/.whistle-rs is in use by another whistle-rs (pid 4242, listening on http://127.0.0.1:8899). ...
+Error: /Users/you/.whix is in use by another whix (pid 4242, listening on http://127.0.0.1:8899). ...
 ```
 
 不拦的话，两个实例都把整份规则组和 Values 留在内存里、保存时整份写回，后保存的会把先保存的整个盖掉，什么提示都没有。要同时跑两个，各给一个 `--dir`；想让两个用同一张根证书（客户端只信任一次），把 `root.key` 和 `root.crt` 放进一个目录，两个都用 `-z` 指向它。
@@ -104,15 +104,15 @@ Error: /Users/you/.whistle-rs is in use by another whistle-rs (pid 4242, listeni
 
 1. **停掉它**，确认没有留下插件进程：用 `kill -9` 或任务管理器强杀、而插件又没用 SDK 时，插件可能还在（见 [PLUGINS](PLUGINS.md#注册插件)）。
 2. **撤销对根证书的信任**，每个信任过它的客户端都要做，命令见 [CERTIFICATES 的 Remove it](CERTIFICATES.md#remove-it)。只删私钥不够：备份或别的拷贝里可能还有它。
-3. **把客户端的代理设置改回去。** whistle-rs 从不改系统代理，改过的是你自己。
+3. **把客户端的代理设置改回去。** whix 从不改系统代理，改过的是你自己。
 4. **删数据目录**：
 
    ```sh
-   rm -rf ~/.whistle-rs                                         # 用过 --dir 的，删那个目录
+   rm -rf ~/.whix                                         # 用过 --dir 的，删那个目录
    ```
 
    ```powershell
-   Remove-Item -Recurse -Force "$env:USERPROFILE\.whistle-rs"
+   Remove-Item -Recurse -Force "$env:USERPROFILE\.whix"
    ```
 
    规则写出的文件在规则指定的地方，不在这里。

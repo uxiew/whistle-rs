@@ -1,7 +1,7 @@
 # The differential bench
 
 The same rule and the same request, put through **real whistle** and through
-whistle-rs, with both answers compared.
+whix, with both answers compared.
 
 Reading upstream's source finds what it *says*. This finds what it *does* — and
 the two are not always the same. Everything below was found by running it, and
@@ -30,7 +30,7 @@ node run.js network             # ~21 min (1240 s measured for `all`, 2026-10-01
 node run.js network --only cases-delete,https   # a few steps; --list names them
 ```
 
-`run.js` starts whatever the steps need — the oracle and whistle-rs with the
+`run.js` starts whatever the steps need — the oracle and whix with the
 flags each corpus expects, a separate pair with a console login for
 `auth-bench.js` — and stops it again. Every proxy listens on `127.0.0.1` and
 keeps its data directory, root CA and sessions in a scratch directory that is
@@ -43,7 +43,7 @@ Ctrl-C, so a bench that starts its own proxies cannot leave one listening.
 It exits **0** when every step passed, **1** when a step failed, **2** when it
 could not start (a port taken, no binary or one older than `src/`, `npm ci`
 not run). The archive — `target/differential/<time>-<suite>/`, or `--out` —
-holds `manifest.json` (commit and dirty files, whistle-rs version and SHA-256,
+holds `manifest.json` (commit and dirty files, whix version and SHA-256,
 whistle version and lockfile hash, the SHA-256 of every script and corpus here,
 Node and platform, port block, and each step's command, exit status and
 numbers), each step's output, and each proxy's log.
@@ -58,7 +58,7 @@ each scoped to the fields and cases it may excuse. Every corpus step is followed
 by `triage-inert.js`, which fails on an inert case with no reason
 ([below](#inert-which-cases-prove-nothing)).
 
-**Does the gate catch anything?** `node mutations.js` builds whistle-rs with each
+**Does the gate catch anything?** `node mutations.js` builds whix with each
 of a few preset regressions put in — the important-rule order reversed, a
 `{name}` value gaining a space, `$1` off by one, `statusCode://404` answering 405,
 a QR mask inverted — and runs the gate that should catch each. Every one has to
@@ -117,7 +117,7 @@ of its own — see [Which whistle, though](#which-whistle-though). Moving the
 mirror's own URLs must not end up in the lock), and review the lock diff the
 same way before committing it.
 
-`PORT_BASE` claims three consecutive ports — whistle, whistle-rs, and the echo
+`PORT_BASE` claims three consecutive ports — whistle, whix, and the echo
 origin — so several benches can run at once, one per area under audit:
 
 ```sh
@@ -164,7 +164,7 @@ half of them name a **URL**, so it stands up a rules-serving HTTP server at
 
 `cases-filters.js` asks about `env:`, which reads the **proxy's** environment, so
 both proxies have to be started with `WHISTLE_DIFF_ENV=Alpha` — the oracle *and*
-whistle-rs. `run.js` does; by hand, starting only the oracle that way reports
+whix. `run.js` does; by hand, starting only the oracle that way reports
 five differences that are the launch, not the port.
 
 The numbers these corpora used to be summed up by here disagreed with the
@@ -183,7 +183,7 @@ node upstream-suite.js --target rs --only file,reqHeaders --verbose   # one run,
 
 It takes whistle's **own** tests — `test/` of the v2.10.8 commit, 82 unit files,
 280 calls that assert something — fetched once by commit id into
-`target/upstream-suite/`, and runs them against whistle-rs. The assertions are
+`target/upstream-suite/`, and runs them against whix. The assertions are
 upstream's, unchanged; only the driver is new, because upstream's reports one
 thing — the first assertion that throws ends the process — and here each call is
 a row: passed, failed at which line of which unit, or no answer.
@@ -192,7 +192,7 @@ A clean run ends:
 
 ```
 judged 180 calls — the ones whistle passes under the flattened rules, with and without the network
-  152 pass on whistle-rs
+  152 pass on whix
   18 declared: rules set through upstream's embedding API …
   2 declared: an interim (`100`) or out-of-range (`1000`) status …
   2 declared: this port contains no weinre server …
@@ -217,7 +217,7 @@ Node plugins (`test/plugins/`): most of the rules live in their `rules.txt` and
 API is a stated non-goal here, and without the plugins **whistle itself** passes
 74 of 280. So the gate hands both proxies the rules those plugins ship, as plain
 rules (`--print-fixture` shows the translation), and asks whistle first — twice,
-once with every DNS lookup failing — and judges whistle-rs on the calls whistle
+once with every DNS lookup failing — and judges whix on the calls whistle
 passed both times. What is left out needs the plugins' own code, or the network.
 
 **Reading a failure.** `FAIL <unit> <METHOD url> #n [<unit>.test.js:<line>]` and
@@ -237,18 +237,18 @@ can be trusted:
 
 * upstream's client runs in the same process as upstream, which switches
   certificate checks off process-wide (`lib/util/patch.js:20`); against
-  whistle-rs the driver does the same, or every HTTPS call fails on the proxy's
+  whix the driver does the same, or every HTTPS call fails on the proxy's
   certificate;
 * the two SOCKS fixtures raced their clients — they reported success before the
   onward connection existed, dropping what arrived meanwhile, and wrote their
-  answer before the request came. Node happens to lose those races; whistle-rs
+  answer before the request came. Node happens to lose those races; whix
   lost half the SOCKS calls at random. The fixtures now wait. Their answers are
   unchanged;
 * every fixture listens on `127.0.0.1` only.
 
 **What it found**, all fixed on 2026-09-29, each with a test of its own:
 
-| Unit | What was wrong in whistle-rs |
+| Unit | What was wrong in whix |
 |---|---|
 | `keys` | a values-store entry beat the rules text's own ``` block of the same name, and a block inside rules a request carried was dropped |
 | `script` | what a `reqScript` set on `values` did not reach the rules it pushed, and `reqScriptData` did not last from the request script to the response script |
@@ -342,7 +342,7 @@ Three cases at the end are **one-sided**, and have to be. `cipher://` turns out 
 do nothing at all in whistle 2.10.8 — it builds the options and then merges them
 into the socket only while *retrying a ciphers error*, so the first, successful
 handshake never sees them — which means a two-proxy comparison can only ever say
-"whistle-rs pinned something and whistle did not". Those three ask the question
+"whix pinned something and whistle did not". Those three ask the question
 that matters instead: name a suite, and read back what the origin actually
 negotiated. Four more ask that a string selecting **nothing** leaves the
 connection unpinned and alive rather than failing it, which is what it used to
@@ -351,7 +351,7 @@ do; see `src/proxy/ciphers.rs` for why that changed.
 **It turns whistle's `Enable HTTPS` switch on before it starts, and that is not a
 convenience.** whistle does not decrypt HTTPS in a fresh data directory; with the
 switch off it only intercepts hosts that already have a custom certificate
-(`_original/lib/tunnel.js:187-199`), while whistle-rs intercepts by default. For
+(`_original/lib/tunnel.js:187-199`), while whix intercepts by default. For
 a long time this file did not know that, and passed anyway — because its origin
 is `localhost`, which whistle intercepts whatever the rules say. Under any other
 name every case here would have been comparing "whistle passed the connection
@@ -389,10 +389,10 @@ time.
 almost nothing for it: **which rules match this request, and what does each
 operator end up holding**. It needs no proxy, no origin and no port — whistle's
 own `Rules` (`lib/rules/rules.js`) is driven in-process, this port answers
-through `whistle-rs explain --batch`, and the two answers are compared.
+through `whix explain --batch`, and the two answers are compared.
 
 ```sh
-cargo build                     # the bench runs target/debug/whistle-rs
+cargo build                     # the bench runs target/debug/whix
 node rules-oracle.js            # which operators matched
 node rules-oracle.js --values   # …and what each one resolved to
 node rules-oracle.js --grep host --limit 5
@@ -624,7 +624,7 @@ TCP handshake). It does not model loss, bandwidth or slow start, and the
 not "what does this rule do" but "**which of these fifty-six words mean
 anything**". whistle's `-M/--mode` takes a list out of a large vocabulary, of
 which its own documentation prints nine. So this starts one proxy per token —
-whistle and whistle-rs, in turn — and runs the same nine probes through each.
+whistle and whix, in turn — and runs the same nine probes through each.
 
 ```sh
 PORT_BASE=20100 node mode-bench.js                          # every token
@@ -768,7 +768,7 @@ PORT_BASE=21900 CASES=frame,tcp node core-bench.js     # some groups only
 node run.js network --only core                        # as the gate runs it
 ```
 
-It starts its own whistle and whistle-rs and four servers of its own, on
+It starts its own whistle and whix and four servers of its own, on
 `PORT_BASE` … `PORT_BASE+5` (an HTTP and WebSocket origin, a raw TCP echo, an
 origin that demands a client certificate, a plugin). About three minutes.
 
@@ -830,7 +830,7 @@ node matrix.js ../../target/differential/<baseline run> ../../target/differentia
   them as `raw`). It says, per step, which differences are the same, which
   appeared (`away`: upstream moved away from this port, or B has something
   new), which disappeared (`closer`) and which changed value. It refuses, with
-  exit 2, two runs of different whistle-rs binaries or port blocks: a move
+  exit 2, two runs of different whix binaries or port blocks: a move
   could then be this port's rather than upstream's.
 
 Pin the binary for the pair of runs (`RS_BIN=…`, a copy outside `target/debug`)
@@ -918,7 +918,7 @@ notes above already name eleven cases in `cases-file.js` that 404 on both sides.
 
 So every run also asks a third question: **would the answer change if the rules
 were not there?** Before the corpus starts, with nothing loaded, each distinct
-request shape is put through whistle-rs once and the answer kept. A case whose
+request shape is put through whix once and the answer kept. A case whose
 answer is byte-identical to that one is reported as `inert`.
 
 ```

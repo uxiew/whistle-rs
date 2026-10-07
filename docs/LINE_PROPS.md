@@ -114,7 +114,7 @@ manager.resolve_scoped(&req, is_internal);  // is_internal = true 时反转
 由 `setInternalOptions` 写入、`checkPluginReqOnce` 在入口删除）。
 
 本移植改用固定且公开的头名 —— **`x-whistle-internal-req`**（任意非空值即可）：
-这里没有需要保护的内部服务，而固定名字才让 whistle-rs 自己的工具（以及开发者本人）
+这里没有需要保护的内部服务，而固定名字才让 whix 自己的工具（以及开发者本人）
 能主动触发一条 `internal` 规则。该头在规则匹配**之前**就被摘掉，因此既不会被
 `includeFilter://reqH.` 看到，也不会写进抓包记录或发到源站。
 
@@ -127,7 +127,7 @@ $ curl -x 127.0.0.1:8899 -H 'x-whistle-internal-req: 1' \
 > **注意**：普通行对内部请求是不可见的（原版同样如此）。一旦给某个请求打上标记，
 > 想让它命中的每一行都必须写 `lineProps://internal` 或 `lineProps://internalOnly`。
 
-目前 whistle-rs 自身还没有任何走完整代理管线的出站请求：`responseFor` 预取与
+目前 whix 自身还没有任何走完整代理管线的出站请求：`responseFor` 预取与
 `rulesFile://` 读取都绕开了管线，而 `/api/replay` 的自回环刻意不打标记 —— 原版的
 composer/replay 同样不是内部请求。等到有了这类调用方（例如插件回环），
 只需在发请求时带上该头即可。

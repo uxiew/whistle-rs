@@ -1,11 +1,11 @@
 # Notices
 
-whistle-rs is released under the MIT license — see [LICENSE](LICENSE). This
+whix is released under the MIT license — see [LICENSE](LICENSE). This
 file says what in it comes from elsewhere, and under which terms.
 
 ## whistle
 
-whistle-rs reimplements the proxy and rules core of
+whix reimplements the proxy and rules core of
 [whistle](https://github.com/avwo/whistle) by avwo and contributors, which is
 under the MIT license reproduced at the end of this section.
 
@@ -29,7 +29,7 @@ What does not come from it: the web console (`ui-src/`) is a separate Vue
 application written for this project, the plugin protocol and its SDK
 (`sdk/`) are this project's own, and no whistle source file is included.
 
-whistle itself is **not distributed** with whistle-rs. The differential tests
+whistle itself is **not distributed** with whix. The differential tests
 install whistle 2.10.8 from npm to compare against; that is a test dependency,
 pinned by `tests/differential/package-lock.json`, and never part of a release.
 

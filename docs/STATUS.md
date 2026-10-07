@@ -2,7 +2,7 @@
 
 这份文档记录每项任务实际测了什么、结果是多少、还有什么没验证。计划本身在 [ROADMAP](ROADMAP.md)；任务编号（Q1、D1……）也指那里。
 
-它从 2026-09-25 的一次审查开始（代码基线 `702486d`，`whistle-rs 0.1.0`），之后每做完一项任务在后面追加一节。"结论"和"能力对齐矩阵"写于审查时，后来的变化在各节和下表里。
+它从 2026-09-25 的一次审查开始（代码基线 `702486d`，`whix 0.1.0`），之后每做完一项任务在后面追加一节。"结论"和"能力对齐矩阵"写于审查时，后来的变化在各节和下表里。
 
 ## 各项任务
 
@@ -133,7 +133,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 | `cargo test --locked --all-targets` | **通过：939 单元 + 20 集成，8 ignored** | 集成为 console 6、forwarded 7、header-rules 7；ignored 是基准，未执行 |
 | `cargo test --locked --doc` | **通过：2** | |
 | `cargo +1.95.0 test --locked --all-targets` 与 `--doc` | **通过**，计数同上 | MSRV 实测 |
-| `cargo +1.94.0 check --locked` | **按预期拒绝** | `whistle-rs@0.1.0 requires rustc 1.95`；去掉 `rust-version` 时报 E0658（`if let` 守卫） |
+| `cargo +1.94.0 check --locked` | **按预期拒绝** | `whix@0.1.0 requires rustc 1.95`；去掉 `rust-version` 时报 E0658（`if let` 守卫） |
 | 全新目录 `npm ci` → `typecheck` → `build` | **通过** | 在不含 `node_modules`/`dist` 的副本里；`dist/index.html` sha256 `6d02b4be…c47c516`，与仓库内现有依赖构建的字节一致 |
 | `engine-strict` 反向验证 | **生效** | 把 `engines` 改成不可能满足：`npm ci` 以 `EBADENGINE` 退出 1；去掉 `.npmrc` 同一安装退出 0、只有警告 |
 | 前端构建后 `cargo build --locked` | **通过** | 嵌入的 `console.html` 哈希同上，二进制中不含占位页文案 |
@@ -176,7 +176,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 | 命令 | 结果 | 说明 |
 | --- | --- | --- |
 | 全新目录按锁文件 `npm ci` | **通过** | 装出的 `node_modules` 与原树逐文件一致（`diff -rq` 无输出） |
-| `node run.js all` | **27 步全过，851 秒** | 归档 `second-all`：whistle-rs SHA-256 `7101639b…`；跑完无残留进程、无残留临时目录（代码 ≈ `9a9832f`，差别见该提交说明） |
+| `node run.js all` | **27 步全过，851 秒** | 归档 `second-all`：whix SHA-256 `7101639b…`；跑完无残留进程、无残留临时目录（代码 ≈ `9a9832f`，差别见该提交说明） |
 | 同上，在写 `declared.js` 之前 | **按预期失败** | 恰好是有已知差异的 10 个语料，加 cases-paths 的 inert 分诊 |
 | `node mutations.js` | **5/5 被抓住**，5 个基线先通过 | `3608371`（4 条）与 `77c2bc9`（改过的 1 条）；见下表 |
 | 全新 `git clone` → `npm ci` → `cargo build` → `run.js fast` | **通过** | `77c2bc9`；clone 里除 `node_modules` 外没有多出任何文件，包括被忽略的 |
@@ -237,7 +237,7 @@ Q1 做了什么（每项一个提交，可单独回退）：
 
 | 事项 | 结果 | 怎么核实的 |
 | --- | --- | --- |
-| 根 `LICENSE` | MIT，版权人写"whistle-rs contributors"，不虚构个人作者 | 许可正文与上游 LICENSE 逐字相同 |
+| 根 `LICENSE` | MIT，版权人写"whix contributors"，不虚构个人作者 | 许可正文与上游 LICENSE 逐字相同 |
 | `NOTICE.md` | 写明来自上游的内容（规则语言与设计、按上游翻译的逻辑——`src/` 下 866 处 `_original/…:行号` 注释、测试语料里逐字取自上游文档的规则行）和不来自上游的内容；附上游 MIT 原文 | 上游 LICENSE 在 v2.10.4、v2.10.8 与 npm 包里完全相同 |
 | 上游 tag / 提交 / npm 包 | `v2.10.8` 是指向 `1df0805` 的轻量 tag；npm 包 228 个文件中 227 个与该提交逐字节相同，唯一多出的是上游控制台的构建产物 | `git ls-remote`；部分克隆上游后逐文件比对 |
 | Cargo 元数据 | `description`、`license = "MIT"`、`repository`；不写 `authors` | `cargo metadata` |
@@ -283,13 +283,13 @@ Q1 做了什么（每项一个提交，可单独回退）：
 
 ## 2026-09-29 U0 上游自带测试
 
-用上游 v2.10.8 提交（`1df0805`）自己的 `test/` 测 whistle-rs：82 个单元文件、280 条带断言的调用，断言一行不改，只换了驱动（`tests/differential/upstream-suite.js`，用法见[差分 README](../tests/differential/README.md#upstreams-own-test-suite)）。
+用上游 v2.10.8 提交（`1df0805`）自己的 `test/` 测 whix：82 个单元文件、280 条带断言的调用，断言一行不改，只换了驱动（`tests/differential/upstream-suite.js`，用法见[差分 README](../tests/differential/README.md#upstreams-own-test-suite)）。
 
 **先确认驱动没把测试改坏：** 上游装上自己的插件跑这套测试，280/280 全过（`--control`）。
 
 **为什么只评判 180 条：** 206 条依赖测试自带的 8 个 Node 插件（规则写在插件的 `rules.txt`/`_rules.txt` 里，不少响应是插件服务器回的）。不装插件，上游自己也只过 74 条；而跑上游 npm 插件是写明的非目标。所以把插件自带的规则翻译成普通规则，同时交给两边，只评判上游在"联网"和"所有 DNS 查询都失败"两种情况下都能过的调用，共 180 条。剩下 100 条需要插件代码本身或外网，不评判。
 
-**结果：** whistle-rs 通过 154 条；26 条逐条写进 `DECLARED` 并注明原因：上游嵌入 API（mock/service/shadow 规则）18 条，`/cgi-bin` 控制台接口 6 条，非法/中间状态码 2 条（有意偏离）。没有未声明的失败。门禁接进 `run.js network`，每周的 `Differential` workflow 会跑。
+**结果：** whix 通过 154 条；26 条逐条写进 `DECLARED` 并注明原因：上游嵌入 API（mock/service/shadow 规则）18 条，`/cgi-bin` 控制台接口 6 条，非法/中间状态码 2 条（有意偏离）。没有未声明的失败。门禁接进 `run.js network`，每周的 `Differential` workflow 会跑。
 
 **途中修掉的缺陷**（每个有自己的测试，删掉修复测试就失败）：
 
@@ -309,15 +309,15 @@ Q1 做了什么（每项一个提交，可单独回退）：
 
 S1 记录里"`Host: evil.example` 得 403"指的是控制台本身，仍然成立；在代理端口上，这类请求现在按上游转发，被重绑到本机的域名拿到的是跳到 IP 地址的 302，读不到控制台数据（端到端测试 `a_rebound_hostname_cannot_read_the_console`）。`-P` 单独的控制台端口仍回 403。
 
-**测试夹具上的三处改动**（断言没动，都写在驱动里）：上游测试客户端和上游代理同进程，证书校验被全局关掉，测 whistle-rs 时照做；两个 SOCKS 夹具与客户端存在竞态（先报成功、后接管道，未等请求就回响应），改成等待；所有夹具只监听 `127.0.0.1`。
+**测试夹具上的三处改动**（断言没动，都写在驱动里）：上游测试客户端和上游代理同进程，证书校验被全局关掉，测 whix 时照做；两个 SOCKS 夹具与客户端存在竞态（先报成功、后接管道，未等请求就回响应），改成等待；所有夹具只监听 `127.0.0.1`。
 
 **实测：** 本地 `cargo fmt --check`、Clippy `-D warnings` 通过；`cargo test` 966 单元 + 28 集成 + 2 doc 全过；差分 `run.js all` 28 步全过（1093 秒，代码 `870bed5`，其后只改了文档），原有语料没有新差异、没有过期声明，新的 `upstream-suite` 一步 239 秒。
 
 **剩余风险 / 没做的：**
 
 - 100 条调用需要上游插件代码或外网，没有评判；它们测的规则行为只部分被差分语料覆盖。
-- `jsAppend` 这类操作符的 `{name}` 查不到时，上游什么都不追加，whistle-rs 追加字面量 `{name}`（顺带发现，未修）。
-- 上游 2.10.8 不认 `rule://名字` 这种引入写法（报 Unsupported protocol），whistle-rs 认，属于既有差异，未处理。
+- `jsAppend` 这类操作符的 `{name}` 查不到时，上游什么都不追加，whix 追加字面量 `{name}`（顺带发现，未修）。
+- 上游 2.10.8 不认 `rule://名字` 这种引入写法（报 Unsupported protocol），whix 认，属于既有差异，未处理。
 - 驱动在上游一侧有一条 WebSocket 调用偶发超时（`proxy` 单元 `ws3.w2.org`，本地 3 次里出现 1 次）；门禁取两次上游都通过的调用，这类偶发只会让那一次少评判一条，不会误报。
 - ~~这批改动还没在 GitHub CI 上跑过~~ 2026-09-29 推送后 CI 8 个 job 全过（`502c153`）；每周的 `Differential` workflow 2026-09-29 第一次跑，修了两个隧道问题后通过。
 
@@ -325,7 +325,7 @@ S1 记录里"`Host: evil.example` 得 403"指的是控制台本身，仍然成�
 
 **修之前：** 名字解析不了、连接被拒、源站 TLS 握手失败、客户端等不及走了——这些请求给客户端一个 502、日志里一行 `debug`，控制台里什么都没有。排查时要找的恰恰是这一条。
 
-**现在：** 每个经过代理的请求落成一条会话，只落一次，失败的也落。没完成的带 `error: {phase, message}`，`phase` 说停在哪一步（`client-tls`、`request`、`rules`、`plugin`、`dns`、`connect`、`proxy`、`tls`、`response`、`client`、`abort`）。本代理生成的 502 带 `x-whistle-rs-error`（阶段）和 `x-whistle-rs-session`（会话号），源站自己回的 502 两个都没有。字段、各入口的范围写在 [API 的「失败的请求」](API.md#失败的请求)，排查顺序写在 [Cookbook](COOKBOOK.zh-CN.md#规则不生效时)。
+**现在：** 每个经过代理的请求落成一条会话，只落一次，失败的也落。没完成的带 `error: {phase, message}`，`phase` 说停在哪一步（`client-tls`、`request`、`rules`、`plugin`、`dns`、`connect`、`proxy`、`tls`、`response`、`client`、`abort`）。本代理生成的 502 带 `x-whix-error`（阶段）和 `x-whix-session`（会话号），源站自己回的 502 两个都没有。字段、各入口的范围写在 [API 的「失败的请求」](API.md#失败的请求)，排查顺序写在 [Cookbook](COOKBOOK.zh-CN.md#规则不生效时)。
 
 | 改动 | 提交 | 怎么验证的 |
 | --- | --- | --- |
@@ -433,19 +433,19 @@ S1 记录里"`Host: evil.example` 得 403"指的是控制台本身，仍然成�
 
 ## 2026-09-29 U1 上游版本矩阵
 
-**结论：** 用同一个 whistle-rs 二进制，分别对照 whistle 2.10.8（基线）和 2.10.10 跑全量差分，按用例、按字段比较。差分里两版答案不同的一共 6 个用例，出自 4 处上游改动：SVG 归类（2 个用例）、带 charset 的 SSE 切帧（1）、不开开关也切帧（1）、`frameScript` 的方向（2）。原有语料只问到其中 2 个用例，另外 4 个是这次对着上游的改动补的。还有 3 处上游改动靠读代码、实测和单测核查：DNS 顺序（差分只测得到 `localhost` 这一面，两版在这点上本来一致，whistle-rs 原先和两版都不一致，新增的 `dns-bench.js` 测的就是它）、证书有效期、pipe 插件。逐条归类见下表；其余用例两版答案完全相同，2.10.8 上的已声明差异在 2.10.10 上一条不少地照旧成立。两个版本的门禁都通过。这是**这批语料**上的结论：语料没问到的地方，不能据此说"与 2.10.10 全量兼容"。
+**结论：** 用同一个 whix 二进制，分别对照 whistle 2.10.8（基线）和 2.10.10 跑全量差分，按用例、按字段比较。差分里两版答案不同的一共 6 个用例，出自 4 处上游改动：SVG 归类（2 个用例）、带 charset 的 SSE 切帧（1）、不开开关也切帧（1）、`frameScript` 的方向（2）。原有语料只问到其中 2 个用例，另外 4 个是这次对着上游的改动补的。还有 3 处上游改动靠读代码、实测和单测核查：DNS 顺序（差分只测得到 `localhost` 这一面，两版在这点上本来一致，whix 原先和两版都不一致，新增的 `dns-bench.js` 测的就是它）、证书有效期、pipe 插件。逐条归类见下表；其余用例两版答案完全相同，2.10.8 上的已声明差异在 2.10.10 上一条不少地照旧成立。两个版本的门禁都通过。这是**这批语料**上的结论：语料没问到的地方，不能据此说"与 2.10.10 全量兼容"。
 
 **怎么做的：** 2.10.10 有自己的目录和锁文件（`tests/differential/versions/2.10.10/`，`14f725f`），不动 2.10.8 基线。所有脚本通过 `whistle-pkg.js` 找 whistle，`run.js --whistle 2.10.10` 切换版本。以前只有 `oracle.js` 认这个开关：自己起 whistle 的三个 bench、规则解析差分和上游自带测试都直接读 `node_modules`，"对 2.10.10 跑"会有一半步骤其实在测 2.10.8，而且不会有任何提示。每条已声明差异写明在哪些版本上测过，只对这些版本生效。对一个没人测过的版本，所有差异都会被报出来（`9f95d85`）。`--assume-baseline` 用基线的声明去卡新版本，失败的就是两版之间变了的（`8b52229`）。`matrix.js` 在同一个二进制的两次运行之间逐条比较声明之前的原始差异（`feb752c`）。每周的差分 workflow 用同一个二进制先后跑两个版本，再比较（`c9d605f`）。用法只写在[差分 README](../tests/differential/README.md#which-whistle-though)。
 
 先读了上游 `v2.10.8..v2.10.10` 的全部 21 个提交和 lib/ 的代码差异，再对照 changelog 和相关 issue（#1331、#1351、#1358、#1360 等）逐条核查，最后用差分验证。
 
-| 上游改了什么 | 2.10.8 | 2.10.10 | whistle-rs | 归类 | 证据 |
+| 上游改了什么 | 2.10.8 | 2.10.10 | whix | 归类 | 证据 |
 | --- | --- | --- | --- | --- | --- |
 | 带 `charset` 的 SSE 是否切帧（2.10.9 changelog） | 不切，当普通 body | 切 | 原来不切，**现在切**（`5717a68`） | 上游改进，跟进 | frames-bench 新用例（`706c9fb`），在 2.10.8 上声明为只属于该版的差异 |
 | `frameScript` 把客户端的帧交给哪个处理函数（#1358） | 交给 `handleSendToClientFrame`，方向反了 | 按方向 | 本来就按方向 | 上游修 bug，向本项目靠拢 | 新增 `ws-bench.js`（`db9f71e`）：2.10.8 上 2 个用例不同，2.10.10 上 0 个 |
 | 没开 `enable://captureStream`、只有分隔头时，GET 的响应是否切帧 | 不切 | 切 | 不切（保留） | 上游副作用，主动偏离 | 插桩实测原因：2.10.10 里没有请求体的请求在响应到达前没记下"请求已发完"，抓包代码把它当成还在上传的流。changelog、FAQ 都没提，FAQ 仍要求开关 |
 | `image/svg+xml` 算图片还是文本（`getContentType` 改为先判 `image/`） | 文本（XML） | 图片 | 文本（保留） | 主动偏离 | `cases-file` 的 `file://*.svg` 在 2.10.10 上不再带 `charset`；`cases-bodies` 新用例（`ae2f1d9`）：`resReplace` 在 SVG 上 2.10.10 不执行。SVG 是 XML 文本，给图标换色是真实用法，跟进会让规则命中却静默不生效 |
-| DNS 顺序默认 IPv4 优先（2.10.10 changelog） | 解析器顺序；`localhost` 两版都 IPv4 优先 | IPv4 优先 | 原来按解析器顺序（本机 `localhost` 先连 `::1`），**现在 IPv4 优先**，并支持 `-M ipv4first/ipv6first/verbatim`（`8cf181c`） | 上游改进，跟进；原先 `localhost` 与两版都不一致是本项目缺陷 | 新增 `dns-bench.js`（`a7057d4`）：`localhost` 只有 IPv4、只有 IPv6、双栈三种源站，两版和 whistle-rs 都连到同一地址；用 `-M verbatim`（旧行为）起 whistle-rs 时双栈那一项失败。单测覆盖其他名字的排序。IPv6 路由吞包的网络上，原来第一个地址会耗光 16 秒连接预算 |
+| DNS 顺序默认 IPv4 优先（2.10.10 changelog） | 解析器顺序；`localhost` 两版都 IPv4 优先 | IPv4 优先 | 原来按解析器顺序（本机 `localhost` 先连 `::1`），**现在 IPv4 优先**，并支持 `-M ipv4first/ipv6first/verbatim`（`8cf181c`） | 上游改进，跟进；原先 `localhost` 与两版都不一致是本项目缺陷 | 新增 `dns-bench.js`（`a7057d4`）：`localhost` 只有 IPv4、只有 IPv6、双栈三种源站，两版和 whix 都连到同一地址；用 `-M verbatim`（旧行为）起 whix 时双栈那一项失败。单测覆盖其他名字的排序。IPv6 路由吞包的网络上，原来第一个地址会耗光 16 秒连接预算 |
 | 叶子证书有效期（#1360） | 往前 20 天、往后 1 年 | 往前 7 天、往后 36 天 | 原来同 2.10.8，**现在同 2.10.10**，缓存的证书 34 天后重签（`b48921b`） | 上游修 bug，跟进 | Chromium 在它认为公开信任的根下拒绝有效期超限的证书（2026-03-15 起 200 天），Android 上装进系统证书库的根就算。差分不看证书有效期，靠单测 |
 | pipe 插件挂起、内存泄漏（#1351） | 有 | 修了 | 协议不同，没有 RST 截断；但有同类泄漏：插件答完后仍在读输入时，代理一直往里喂，SSE 源站连接永不释放。**已修**（`034b6e7`） | 本项目缺陷 | 单测先失败后通过 |
 | `log://` 注入脚本里的 id 解析 | — | 改了 | 不注入日志脚本 | 不适用 | — |
@@ -456,14 +456,14 @@ S1 记录里"`Host: evil.example` 得 403"指的是控制台本身，仍然成�
 
 **实测：** `cargo fmt --check`、Clippy `-D warnings` 通过；`cargo test` 1031 单元 + 35 集成 + 2 doc 全过；链接检查通过。前端这次没改，没有重跑。
 
-差分用同一个二进制（`target/u2/whistle-rs`，SHA-256 `d80e6708…`，由 `5717a68` 的源码构建；此后 `src/` 只有 `fa76e48` 调整了一个测试的排版）：
+差分用同一个二进制（`target/u2/whix`，SHA-256 `d80e6708…`，由 `5717a68` 的源码构建；此后 `src/` 只有 `fa76e48` 调整了一个测试的排版）：
 
 | 运行 | 结果 | 归档 |
 | --- | --- | --- |
 | `run.js all`（2.10.8） | 29 步全过，1091 秒 | `target/differential/u1-2.10.8` |
 | `run.js all --whistle 2.10.10` | 前 28 步全过，853 秒；最后一步 upstream-suite 没能启动：跑到一半时本机起了一个 Android 模拟器，占了上游测试写死的 5566 端口，`run.js` 按设计拒绝开始 | `target/differential/u1-2.10.10` |
 | 上面那一步单独补跑（模拟器关了之后） | 通过：评判 180、通过 160、声明 20，评判的调用和声明的调用与 2.10.8 逐条相同 | `target/differential/u1-2.10.10-suite` |
-| `matrix.js` 比较两版 | 字段层面 1010 处相同（不含上游自带测试，它单独比，200 处相同），8 处变了，就是上表 6 个用例；没有一处是 whistle-rs 这边变的 | — |
+| `matrix.js` 比较两版 | 字段层面 1010 处相同（不含上游自带测试，它单独比，200 处相同），8 处变了，就是上表 6 个用例；没有一处是 whix 这边变的 | — |
 | `dns` 这一步（定稿后才加进 `run.js`）单独对两版跑 | 两版各 3 个用例全过，`matrix.js` 比较无变化 | `target/differential/u1-dns-2.10.8`、`u1-dns-2.10.10` |
 
 之前的两轮探索（旧二进制，不作为结论）：声明全关对 2.10.10 跑一遍，看原始差异；`--assume-baseline` 跑一遍，只有 cases-file（SVG）和 frames 失败，没有一条声明过期。上游自带测试在三个二进制、两个版本上都是 180/160/20。
@@ -477,7 +477,7 @@ S1 记录里"`Host: evil.example` 得 403"指的是控制台本身，仍然成�
 
 ## 2026-09-29 PERF1 源站连接复用与源站 h2
 
-**结论：** 先测再改。改前 whistle-rs 对每个请求都新建一条源站连接，HTTPS 还要再握一次 TLS。20 ms 往返时延下：
+**结论：** 先测再改。改前 whix 对每个请求都新建一条源站连接，HTTPS 还要再握一次 TLS。20 ms 往返时延下：
 - 经 TLS 的 HTTP/1.1 请求 p50 为 67.7 ms；
 - 浏览器（h2）一次加载 50 个资源要 90.7 ms，对源站开 50 条连接；whistle 2.10.8 同场景只用 1 条 h2 连接，49.9 ms。
 
@@ -635,7 +635,7 @@ whistle 一列取自最后一轮，三轮之间它自己在 h2 页面加载上�
 
 第一次失败的原因，这台 Mac 上一直测不出来：本机的系统代理用 fake-ip DNS，任何名字都解析得到，而 CI 上 `probe.test`、`break.whistlejs.com` 解析不了。
 
-- `modes`：`multiEnv`、`nohost`、`disableCapture`、`notAllowedEnableHTTPS`、`multiple` 五个模式里，whistle 报 `connect ECONNRESET`，whistle-rs 报 `tls ECONNRESET`。不解密的隧道，whistle 连上目标之后才回 CONNECT、连不上就不回；本项目先回 `200` 再去连，客户端以为隧道通了，到 TLS 握手才断。修复 `95f7c6f`：只凭 CONNECT 就能决定不解密的隧道，先连再回。
+- `modes`：`multiEnv`、`nohost`、`disableCapture`、`notAllowedEnableHTTPS`、`multiple` 五个模式里，whistle 报 `connect ECONNRESET`，whix 报 `tls ECONNRESET`。不解密的隧道，whistle 连上目标之后才回 CONNECT、连不上就不回；本项目先回 `200` 再去连，客户端以为隧道通了，到 TLS 握手才断。修复 `95f7c6f`：只凭 CONNECT 就能决定不解密的隧道，先连再回。
 - `upstream-suite`：`CONNECT+GET http://break.whistlejs.com` 一条。上游的测试辅助函数发 `CONNECT /`、目标只写在 `Host` 里，本项目回 `400`，辅助函数没挂错误监听，一直挂到超时（`05feda1`，改为和 whistle 一样从 `Host` 取目标）；它还带着 `x-whistle-policy: tunnel` 要求只转发不解密，本项目以前不认（`b2ee118`，认 `tunnel`/`connect`/`weakTunnel`）。
 
 本机能评判的上游自带测试是 180 条，CI 上是 181 条，多出的就是这一条：本机 whistle 自己也过不了它（名字解析得到），不计入评判。
@@ -662,14 +662,14 @@ whistle 一列取自最后一轮，三轮之间它自己在 h2 页面加载上�
 
 **冒烟测试发现并修掉的：**
 
-- **`kill` 停下 whistle-rs 后，`--node-plugin` 拉起的插件进程继续占着端口**（`abe4f86`）。原来没有信号处理，SIGTERM/SIGINT 的默认动作当场结束进程；只有终端里的 Ctrl+C 能带走插件，因为它发给整个进程组。现在收到 SIGINT/SIGTERM（Windows 上 Ctrl+C、Ctrl+Break、关窗口、关机）先把已完成的会话写完盘，再结束插件，退出码 0。没处理 SIGHUP，否则 `nohup` 就失效了。
-- **`kill -9`、`taskkill /F`、崩溃之后插件还在**（`4c0534e`）。这几种 whistle-rs 一行代码都跑不到。现在插件的 stdin 是一根只有 whistle-rs 握着的管道，它一没操作系统就关管道，SDK 读到结尾就退出。Windows 上从外面停进程只有强杀这一种，所以这条在 Windows 上是常规路径。
+- **`kill` 停下 whix 后，`--node-plugin` 拉起的插件进程继续占着端口**（`abe4f86`）。原来没有信号处理，SIGTERM/SIGINT 的默认动作当场结束进程；只有终端里的 Ctrl+C 能带走插件，因为它发给整个进程组。现在收到 SIGINT/SIGTERM（Windows 上 Ctrl+C、Ctrl+Break、关窗口、关机）先把已完成的会话写完盘，再结束插件，退出码 0。没处理 SIGHUP，否则 `nohup` 就失效了。
+- **`kill -9`、`taskkill /F`、崩溃之后插件还在**（`4c0534e`）。这几种 whix 一行代码都跑不到。现在插件的 stdin 是一根只有 whix 握着的管道，它一没操作系统就关管道，SDK 读到结尾就退出。Windows 上从外面停进程只有强杀这一种，所以这条在 Windows 上是常规路径。
 
 | 实测 | 结果 |
 | --- | --- |
 | `smoke.mjs`，debug 与 release，`--console built` | **29/29**，约 3.8 秒 |
 | 同上，对 `abe4f86` 之前构建的 release 二进制 | **26/29**：三个"插件随之退出"的步骤失败，事后确实留下 3 个插件进程（已手动结束） |
-| 插件存活，改前 → 改后 | SIGTERM、SIGINT：插件留下 → whistle-rs 退出码 0、插件没了。SIGKILL：用 SDK 的插件没了；不用 SDK 也不读 stdin 的插件仍会留下，文档写明了 |
+| 插件存活，改前 → 改后 | SIGTERM、SIGINT：插件留下 → whix 退出码 0、插件没了。SIGKILL：用 SDK 的插件没了；不用 SDK 也不读 stdin 的插件仍会留下，文档写明了 |
 | `cargo check`/`clippy --all-targets -D warnings`，`x86_64-pc-windows-msvc` | **通过，0 警告**。ring 的 C 代码换成了只生成空文件的假编译器，所以这只是类型检查，什么都没运行 |
 | CI 新任务的三段脚本，本机按 macOS 模拟 | 生成的包两层 `shasum -c` 都通过，解开的二进制能跑；`BUILD-INFO.txt` 写 `runs on: macOS 11.0 or later` |
 | `data_compat.rs` 的变异检查 | 给会话记录改一个字段名、加 `deny_unknown_fields`，三个测试挂两个；复原后全过 |
@@ -703,11 +703,11 @@ whistle 一列取自最后一轮，三轮之间它自己在 h2 页面加载上�
 
 | 平台 | 用时 | 构件 |
 | --- | --- | --- |
-| Linux x86_64 | 1.1 分钟（缓存命中） | `whistle-rs-x86_64-unknown-linux-gnu`，10.4 MB |
-| Linux arm64 | 4.2 分钟 | `whistle-rs-aarch64-unknown-linux-gnu`，10.5 MB |
-| macOS arm64 | 6.8 分钟 | `whistle-rs-aarch64-apple-darwin`，9.5 MB |
-| macOS x86_64 | 15.7 分钟 | `whistle-rs-x86_64-apple-darwin`，9.9 MB |
-| Windows x86_64 | 16.4 分钟 | `whistle-rs-x86_64-pc-windows-msvc`，9.6 MB |
+| Linux x86_64 | 1.1 分钟（缓存命中） | `whix-x86_64-unknown-linux-gnu`，10.4 MB |
+| Linux arm64 | 4.2 分钟 | `whix-aarch64-unknown-linux-gnu`，10.5 MB |
+| macOS arm64 | 6.8 分钟 | `whix-aarch64-apple-darwin`，9.5 MB |
+| macOS x86_64 | 15.7 分钟 | `whix-x86_64-apple-darwin`，9.9 MB |
+| Windows x86_64 | 16.4 分钟 | `whix-x86_64-pc-windows-msvc`，9.6 MB |
 
 Windows 上这次单元测试全过，集成测试（`tests/*.rs`）第一次跑到也全过（`--no-fail-fast`，任何一个失败都会让这一步失败）。构件保留到 2026-10-14。构件里 `BUILD-INFO.txt` 写的最低系统版本要登录下载才能看，本文还没核对。
 
@@ -730,11 +730,11 @@ cd tests/differential
 WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-bench.js
 ```
 
-它自己起上游 whistle 2.10.10、whistle-rs、一个 HTTP/WebSocket 源站、一个 TCP 回显、一个强制要求客户端证书的 HTTPS 源站和一个假插件，同一条规则问两边，比较**源站收到的东西**。证书是当场用 `openssl` 生成的一次性 CA，不装进系统。
+它自己起上游 whistle 2.10.10、whix、一个 HTTP/WebSocket 源站、一个 TCP 回显、一个强制要求客户端证书的 HTTPS 源站和一个假插件，同一条规则问两边，比较**源站收到的东西**。证书是当场用 `openssl` 生成的一次性 CA，不装进系统。
 
 **结论：六条全部属实。** 环境 macOS arm64、Node v26.4.0、Rust 1.98.1。修之前 61 个对照里 38 个不一致，4 个插件断言里 3 个不过：
 
-| 编号 | 复审说的 | 复现结果（上游 → whistle-rs） |
+| 编号 | 复审说的 | 复现结果（上游 → whix） |
 | --- | --- | --- |
 | A01 | 插件 `/manifest` 第一次失败后，认证永久失效 | 首次 503：请求 200 到达源站；插件恢复后仍然 200，`/auth` 调用 0 次 |
 | A02 | `tlsOptions://` 不带客户端证书 | `key=…&cert=…`：200 且源站 `authorized=true` → 502。pfx、内联 PEM 同样 |
@@ -745,8 +745,8 @@ WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-benc
 
 **复审没说、复现时顺带看到的：**
 
-- 带前瞻的 `excludeFilter` 是**反向失效**：上游排除了这条规则，whistle-rs 照样应用。正则编译不了就当成字面量，字面量当然匹配不上，于是排除条件永远不成立。
-- 上游自己有两处怪行为，对照时要知道：脚本跑完后上游会清空全局变量，所以处理函数里直接写 `ctx.sendToClient(...)` 或 `Buffer.from(...)` 会报 `ctx is not defined`，要先 `var c = ctx` 存下来；处理函数只要存在，上游就把二进制帧当文本帧重发（收到的帧选项里没有 `binary`，发送时按 `opts.binary ? 2 : 1` 取操作码）。这两处 whistle-rs 不照抄，见 CORE-04 的记录。
+- 带前瞻的 `excludeFilter` 是**反向失效**：上游排除了这条规则，whix 照样应用。正则编译不了就当成字面量，字面量当然匹配不上，于是排除条件永远不成立。
+- 上游自己有两处怪行为，对照时要知道：脚本跑完后上游会清空全局变量，所以处理函数里直接写 `ctx.sendToClient(...)` 或 `Buffer.from(...)` 会报 `ctx is not defined`，要先 `var c = ctx` 存下来；处理函数只要存在，上游就把二进制帧当文本帧重发（收到的帧选项里没有 `binary`，发送时按 `opts.binary ? 2 : 1` 取操作码）。这两处 whix 不照抄，见 CORE-04 的记录。
 - 上游把规则里的主机当 TLS 的 server name 发出去，Node 26 不接受 IP 地址当 server name，所以 `http://x https://127.0.0.1:端口` 这种映射在上游握手前就失败。对照 mTLS 要用 `localhost`。
 
 **复审里没有逐条复现的部分：** 第 4 节的插件能力矩阵和第 5 节的控制接口，按源码抽查了 `@whistle.xxx` 引入（`src/rules/include.rs`）、短协议（`src/rules/mod.rs` 的 `plugin_package`）、控制台路由表（`src/proxy/webui.rs`），描述与代码一致。它们是"自有插件协议"这个既定方向的边界，不是缺陷，归 ROADMAP 的 EXT-01 / CTRL-01。
@@ -788,7 +788,7 @@ WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-benc
 
 - frameScript：处理函数里 `ctx`、`Buffer` 照样可用（上游脚本跑完就清空全局变量，处理函数里直接写 `ctx.sendToClient` 是 `ReferenceError`）；处理函数没改的二进制帧保持二进制（上游当文本重发，非 UTF-8 的字节被写坏）；同一方向装了处理函数时，脚本顶层先发的帧照样送达（上游丢掉）；隧道脚本自己发的数据排在 CONNECT 的 200 之后（上游排在前面，客户端拿不到 200，隧道建不起来）；保留了本项目原有的 `ctx.frame` / `ctx.direction`。
 - 脚本的执行上限按循环次数算（300 万次），上游按 60 ms 墙钟时间：这个引擎不能从外面打断。
-- `log://` 的采集脚本是本项目自己的：发回页面自己源站上的 `/.whistle-rs/log`（上游发到它内部的 `cgi-bin`），参数显示成文本（上游是可展开的对象树），注入在 `<head>` 里（上游在文档最前面）。
+- `log://` 的采集脚本是本项目自己的：发回页面自己源站上的 `/.whix/log`（上游发到它内部的 `cgi-bin`），参数显示成文本（上游是可展开的对象树），注入在 `<head>` 里（上游在文档最前面）。
 - `weinre://` 不带服务，只写 id 又没给 `--weinre` 时什么都不注入。
 - 插件的 `/cgi-bin/*` 控制接口仍然不做，6 条上游测试调用声明。
 
@@ -827,7 +827,7 @@ WHISTLE_PKG=versions/2.10.10/node_modules/whistle PORT_BASE=21900 node core-benc
 - ~~脚本上限只数单个循环的次数，嵌套循环每层都在上限以内时拦不住。~~ 不准确：拦不住的是循环里调用带循环的函数，而且后果是整个代理停止响应。2026-10-02 加了 1 秒的墙钟上限，脚本不再占 tokio 工作线程（R3-01）。
 - frameScript：分片的 WebSocket 消息不交给脚本；`pause`/`ignore` 类开关在 TCP 隧道上只表示"要检查"。
 - tlsOptions：`dhparam`、`secureOptions`、`ecdhCurve` 等 rustls 没有对应的选项丢弃并记 `cipher-unusable`。
-- log：日志只在内存里（2000 条 / 8 MiB），重启就没；`/.whistle-rs/log` 这个路径被代理占用；写在 HTML `<meta>` 里的 CSP 不会被去掉；~~只写 id、没有 `--weinre` 的 `weinre://` 仍会让响应去掉 CSP 和缓存头（虽然最后没注入）~~ 2026-10-03 不再改头（R4-03）。
+- log：日志只在内存里（2000 条 / 8 MiB），重启就没；`/.whix/log` 这个路径被代理占用；写在 HTML `<meta>` 里的 CSP 不会被去掉；~~只写 id、没有 `--weinre` 的 `weinre://` 仍会让响应去掉 CSP 和缓存头（虽然最后没注入）~~ 2026-10-03 不再改头（R4-03）。
 - 插件静态规则管不到隧道拦不拦的决定和 Test Rules；改了要重启代理；远程插件拿到 manifest 之前不生效。
 - HTTPS 运行时开关不存盘，这是有意的，但和上游（存盘）不同。
 - ~~控制台停在 Console 或 Requests 面板时，代理关掉后它还会每 2 秒请求一次（这次测试时一个标签页 15 小时攒了 2.7 万条失败请求），没有退避。这不是这一轮引入的，没改。~~ 2026-10-02 加了退避（R3-03）。
@@ -843,7 +843,7 @@ function f() { for (var i = 0; i < 2000000; i++) {} }
 for (var j = 0; j < 2000000; j++) f();
 ```
 
-| | 上游 2.10.8 | whistle-rs |
+| | 上游 2.10.8 | whix |
 | --- | --- | --- |
 | 一个请求 | 71 ms 后照常转发，脚本推的规则全部丢弃（上游给脚本 60 ms） | 30 秒内没有回答，一个核占满 |
 | 同时 12 个请求 | — | 控制台和不命中规则的请求都没有回答（10 秒超时），CPU 955%；`kill` 停不下来，只能 `kill -9` |
@@ -857,7 +857,7 @@ for (var j = 0; j < 2000000; j++) f();
 
 **引用了不存在的值时，改 body 的算子写进字面量。** 规则写 `resBody://{nope}` 而没有 `nope` 这个值时：
 
-| 算子 | 上游 2.10.8 | whistle-rs |
+| 算子 | 上游 2.10.8 | whix |
 | --- | --- | --- |
 | `resBody`、`reqBody`、`jsBody` | body 不变 | body 变成 `{nope}` |
 | `resPrepend`/`resAppend`、`reqPrepend`/`reqAppend`、`jsPrepend`/`jsAppend`、`htmlAppend`、`cssAppend` | body 不变 | 在前面或后面加上 `{nope}` |
@@ -889,7 +889,7 @@ for (var j = 0; j < 2000000; j++) f();
 
 2026-10-06 补充，同一个 10 万次 `n++` 循环（上游按它的方式在 Node `vm` 里跑，Node v26.10.0；本项目 M 系列 Mac）：
 
-| | 上游 `vm` | whistle-rs release | whistle-rs debug |
+| | 上游 `vm` | whix release | whix debug |
 | --- | --- | --- | --- |
 | 写在顶层（全局变量） | 83 ms，超过上游自己的 60 ms，会被丢弃 | 34 ms | 660 ms |
 | 写在函数里 | 0.2 ms | 6 ms | 120 ms |
@@ -926,11 +926,11 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 
 上游：`w2 start` 按存储目录记 pid，同一个存储目录起第二个会被拒绝（`_original/bin/use.js`、`bin/util.js` 的 `isRunning`）；前台的 `w2 run` 不查。本项目没有任何检查。
 
-**控制台口令只能写在命令行上。** `whistle-rs -n admin -w hunter2-secret` 启动后，`ps -A -o user=,args=` 能看到完整的 `-w hunter2-secret`，本机任何用户都能看。上游有 `--config` 和 `~/.whistlerc` 两种从文件读启动参数的办法，本项目 CLI.md 把它们归为"`w2` 守护进程的东西"没做，于是口令没有命令行以外的给法。
+**控制台口令只能写在命令行上。** `whix -n admin -w hunter2-secret` 启动后，`ps -A -o user=,args=` 能看到完整的 `-w hunter2-secret`，本机任何用户都能看。上游有 `--config` 和 `~/.whistlerc` 两种从文件读启动参数的办法，本项目 CLI.md 把它们归为"`w2` 守护进程的东西"没做，于是口令没有命令行以外的给法。
 
 **`weinre://` 没有服务可连时，什么都没注入，却照样改了响应头。** 源站返回一个带 `content-security-policy: default-src 'self'`、`cache-control: max-age=600` 的 HTML 页面：
 
-| 规则 | 上游 2.10.8 | whistle-rs（没有 `--weinre`） |
+| 规则 | 上游 2.10.8 | whix（没有 `--weinre`） |
 | --- | --- | --- |
 | 无 | CSP 在，`max-age=600` | 同左 |
 | `weinre://probe` | 去掉 CSP，`no-store`，`pragma: no-cache`，**注入了脚本** | 去掉 CSP，`no-store`，`pragma: no-cache`，**没注入** |
@@ -949,9 +949,9 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 | 编号 | 修之前 | 现在 | 提交 | 怎么验证的 |
 | --- | --- | --- | --- | --- |
 | R4-01 一个目录一个实例 | 两个实例共用 `--dir`，后保存的把先保存的规则组、Values 整份盖掉，历史里会话号重复，同时首次启动时下发的根证书和磁盘上的不是同一张；都没有提示 | 启动时用操作系统的文件锁占住 `<目录>/lock`，第二个实例在读写目录之前退出（退出码 1），报出目录、对方的 pid 和地址，以及 `--dir`、`-z` 两种办法。锁随进程结束释放，`kill -9` 也一样。嵌入 API 只在开了会话持久化时占用，没开时只读根证书、可以共用 | `a355d87` | 复核场景重跑（debug 构建）：第二个实例 0.3 秒退出，目录里 5 个文件的大小和修改时间都没变，第一个照常回答；`kill -9` 第一个之后新实例马上能起。`tests/data_dir_e2e.rs` 起真实二进制测：被拒、报出 pid 和地址、目录没动、`kill` 后能重新启动、两个目录用同一个 `-z` 下发同一张根证书、命令行版的修改重启后还在；把"拒绝"改成只打警告，第一条测试失败（第二个实例 10 秒后还在跑） |
-| ↳ 嵌入时的控制台 | 嵌入的代理启动时不读磁盘上的规则组、Values、开关，控制台一保存却整份写进数据目录；默认目录就是命令行版的 `~/.whistle-rs`，存一次就盖掉命令行版存下的 | 嵌入时这些修改只留在内存（`Config::persist_edits`，嵌入时关） | `d2796bd` | 测试：目录里预先放好命令行版的组和值，嵌入的控制台调遍 11 个会保存的接口（规则、组的增改删和开关、值的增改删和整份替换、开关、导入），目录里的文件一个字节都没变；修之前 `default.rules`、`groups.json`、`values.json` 被改写、多出 `beta.rules` 和 `switches.json`。开了历史的嵌入代理在命令行版占着目录时 `start()` 返回错误，没开的照常启动、拿到同一张根证书。`switches_e2e` 原来用嵌入代理检查开关存盘，改到二进制的重启测试里 |
+| ↳ 嵌入时的控制台 | 嵌入的代理启动时不读磁盘上的规则组、Values、开关，控制台一保存却整份写进数据目录；默认目录就是命令行版的 `~/.whix`，存一次就盖掉命令行版存下的 | 嵌入时这些修改只留在内存（`Config::persist_edits`，嵌入时关） | `d2796bd` | 测试：目录里预先放好命令行版的组和值，嵌入的控制台调遍 11 个会保存的接口（规则、组的增改删和开关、值的增改删和整份替换、开关、导入），目录里的文件一个字节都没变；修之前 `default.rules`、`groups.json`、`values.json` 被改写、多出 `beta.rules` 和 `switches.json`。开了历史的嵌入代理在命令行版占着目录时 `start()` 返回错误，没开的照常启动、拿到同一张根证书。`switches_e2e` 原来用嵌入代理检查开关存盘，改到二进制的重启测试里 |
 | ↳ 并发生成根证书 | 几个进程同时对空目录启动，各生成一张根证书，后写的盖掉先写的；先写的那些继续用自己的私钥签证书，磁盘上还可能是一个进程的证书配另一个进程的私钥 | 生成前锁住 `certs/root.lock`，第一个生成，其余等它写完再读 | `4b41b2a` | 单元测试：8 个线程同时对空目录 `load_or_create`，修之前得到 8 张不同的根证书，修之后 1 张，就是磁盘上那张，`root.key` 的公钥在 `root.crt` 里 |
-| R4-02 口令不上命令行 | `-w`/`-W` 是给口令的唯一办法，命令行在进程列表里，本机任何用户 `ps -A -o args=` 都能看到 | 环境变量 `WHISTLE_RS_PASSWORD`、`WHISTLE_RS_GUEST_PASSWORD`；命令行照旧可用并警告一次，两处都给时命令行优先，空变量当没设。Node 插件进程拿不到这两个变量 | `72b9f48` `d5eb948` `009a53d` | 用环境变量启动，`ps` 里那个进程的参数只有 `-n admin`；不登录 401，登录 200；日志里没有口令。`tests/console_password_e2e.rs` 6 个测试起真实二进制（改之前 3 个失败：环境变量的口令不生效、命令行没有警告）。Node 插件那条是对拉起命令的单元测试（`get_envs` 里这两个变量被移除），没有真的起 Node |
+| R4-02 口令不上命令行 | `-w`/`-W` 是给口令的唯一办法，命令行在进程列表里，本机任何用户 `ps -A -o args=` 都能看到 | 环境变量 `WHIX_PASSWORD`、`WHIX_GUEST_PASSWORD`；命令行照旧可用并警告一次，两处都给时命令行优先，空变量当没设。Node 插件进程拿不到这两个变量 | `72b9f48` `d5eb948` `009a53d` | 用环境变量启动，`ps` 里那个进程的参数只有 `-n admin`；不登录 401，登录 200；日志里没有口令。`tests/console_password_e2e.rs` 6 个测试起真实二进制（改之前 3 个失败：环境变量的口令不生效、命令行没有警告）。Node 插件那条是对拉起命令的单元测试（`get_envs` 里这两个变量被移除），没有真的起 Node |
 | R4-03 白改的头 | 只写 id、没给 `--weinre` 的 `weinre://` 什么都不注入，却照样去掉页面的 CSP、把缓存改成 `no-store`：页面平白丢了自己的安全策略 | 这样的 `weinre://` 在响应阶段结束时挪进 `Resolved::inert`，头和 body 都不动，会话仍记 `no-weinre-server`。同一请求另有真会注入的 `log://` 时照它改头；有 `--weinre` 时照旧 | `19c7530` `91b86b4` | 单元测试，源站页面带 CSP、`max-age=600`、`etag`：单独 `weinre://` 时客户端收到的这几个头与没有规则时相同（改之前 CSP 没了、变成 `no-store`）；加上 `log://` 时与单独 `log://` 相同；给了 `--weinre` 时照旧去掉。差分 `cases-compose` 里只写 id 的 4 个对照，原来只有 body 与上游不同，现在 `cache-control`、`expires`、`pragma` 也不同（上游自带 weinre，总会注入），逐个声明；2.10.8、2.10.10 都通过 |
 
 **全量差分（代码 `2e8dc07`，同一个 debug 二进制，`run.js all` 对两版各一遍，再 `matrix.js`）：** 两版都是 32 步全过；`core` 116 个对照，未声明差异 0，声明 2.10.8 上 16 个、2.10.10 上 6 个；上游自带测试评判 180、通过 152、声明 28；`cases-compose` 声明从 13 处变成 25 处，多出的 12 处就是 R4-03 那 4 个对照的 3 个缓存头；`matrix.js` 退出码 0。
@@ -975,7 +975,7 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 
 **`--node-plugin` 的进程崩了，之后的请求悄悄绕过它，直到整个代理重启。** 一个插件给所有请求自己应答，第一次处理时在定时器里抛异常（在 SDK 的 try/catch 之外，插件自己回调里的 bug 就是这样），进程退出：
 
-| | 上游 2.10.8 | whistle-rs |
+| | 上游 2.10.8 | whix |
 | --- | --- | --- |
 | 第 1 个请求 | 插件应答 | 插件应答 |
 | 之后的请求（1 秒、5 秒、10 秒后） | 每次都由一个新拉起的插件进程应答（pid 每次不同） | 直达源站，拿到源站的真实数据，一直不恢复 |
@@ -984,7 +984,7 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 
 **规则里的 `@` 引入在启动时一个个取，取完之前什么都不回应。** 规则文件里三个 `@http://…`，指向一个只接受连接、从不回应的服务（相当于卡住的内网服务器），外加一条本地规则：
 
-| | 上游 2.10.8 | whistle-rs |
+| | 上游 2.10.8 | whix |
 | --- | --- | --- |
 | 控制台第一次回应 | 启动后 0.3 秒 | 启动后 48 秒 |
 | 本地那条规则 | 立刻生效 | 48 秒后才生效 |
@@ -1035,7 +1035,7 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 
 **插件崩掉以后，它原来的端口要是被别的程序占了，请求就发给那个程序。** 每个 `--node-plugin` 启动时分到一个端口；进程崩了，下一个要用它的请求把它重新拉起，用的还是那个端口。判断"起来了没有"的办法是看这个端口能不能连上。从崩掉到重新拉起，端口一直空着，没有请求就一直不拉起，这段时间谁都能占。复现：一个应答一次就崩的插件，崩掉后在它的端口上起一个普通的 HTTP 服务，再代理 `…/next?token=t2`，带 `authorization: Bearer secret-2`：
 
-| | whistle-rs |
+| | whix |
 | --- | --- |
 | 那个 HTTP 服务收到的 | `POST /request`，body 里是完整 URL（含 `token=t2`）和 `authorization: Bearer secret-2` |
 | 客户端拿到的 | 源站的 200。这个插件本来是自己应答的，请求不该到源站 |
@@ -1047,7 +1047,7 @@ B 一保存，`alpha` 就从组列表里消失了（`alpha.rules` 还在磁盘�
 
 **一启动就崩的插件，让请求和代理的启动各等满 5 秒。** 插件在加载时 `throw`（比如改坏了一行）：
 
-| | 上游 2.10.8 | whistle-rs |
+| | 上游 2.10.8 | whix |
 | --- | --- | --- |
 | 代理开始监听 | 不等插件 | 启动后 5.1 秒 |
 | 第一个请求 | 0.21 秒，跳过插件，源站应答 | 5.0 秒，502 |

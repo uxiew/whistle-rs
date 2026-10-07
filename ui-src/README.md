@@ -1,4 +1,4 @@
-# The whistle-rs console
+# The whix console
 
 The web console served on the proxy port: a Vue 3 app that builds to **one
 self-contained HTML file**, `dist/index.html`.

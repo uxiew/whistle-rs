@@ -30,7 +30,7 @@ Every recipe here was run against the proxy before it was written down.
 
 ```bash
 cargo build --release
-./target/release/whistle-rs -p 8899 -r rules.txt
+./target/release/whix -p 8899 -r rules.txt
 ```
 
 Two different things are listening on that one port, and confusing them is the
@@ -50,11 +50,11 @@ detail panel, and a rules editor that highlights **which token the proxy will
 match on**.
 
 While you are iterating, `--no-persist` keeps captured traffic out of
-`~/.whistle-rs`, and `--dir` puts the root CA and rule groups somewhere
+`~/.whix`, and `--dir` puts the root CA and rule groups somewhere
 disposable:
 
 ```bash
-./target/release/whistle-rs -p 8899 -r rules.txt --no-persist --dir /tmp/w
+./target/release/whix -p 8899 -r rules.txt --no-persist --dir /tmp/w
 ```
 
 ---
@@ -227,7 +227,7 @@ whose body contains a shorter fence survives if you open with a longer one.
 api.example.com/users    file:///Users/me/mock/users.json
 ```
 
-This is the one that gets the `Content-Type` right for free: whistle-rs guesses
+This is the one that gets the `Content-Type` right for free: whix guesses
 it from the file extension. The other two have no filename to guess from and
 default to `text/html; charset=utf-8`, so add `resType://json` when the client
 is fussy — a `fetch().then(r => r.json())` will not care, but a strict client
@@ -358,7 +358,7 @@ Bearer eyJhbGciOi...
 or from the command line:
 
 ```bash
-whistle-rs --value 'bearer=Bearer eyJhbGciOi...' -r rules.txt
+whix --value 'bearer=Bearer eyJhbGciOi...' -r rules.txt
 ```
 
 `--value` beats a fenced block of the same name in the rules file, which is what
@@ -426,7 +426,7 @@ api.thirdparty.com   resCors://*
 sends cookies.
 
 Preflights need a little more care. On an `OPTIONS` with `*` or `enable`,
-whistle-rs echoes the requested method back as **`Access-Control-Allow-Method`** —
+whix echoes the requested method back as **`Access-Control-Allow-Method`** —
 singular, which is not a real CORS header. That is upstream's typo, reproduced
 so the two implementations emit the same bytes; browsers ignore it. Name the
 methods yourself, on a second line:
@@ -519,7 +519,7 @@ as long as the operating system's TCP timeout, which is over a minute. `-t` caps
 the wait:
 
 ```bash
-whistle-rs -t 3000 -r rules.txt      # give up on a connection after 3s
+whix -t 3000 -r rules.txt      # give up on a connection after 3s
 ```
 
 Two things about it are not obvious from the flag:
@@ -697,13 +697,13 @@ example.com   rule://{teamRules}
 
 ### 1. Make the proxy reachable
 
-whistle-rs listens on `127.0.0.1` by default — this machine only — so a phone
+whix listens on `127.0.0.1` by default — this machine only — so a phone
 has to be let in. Set a console login first: anyone who can reach the port can
 open the console, and the rules it edits read and write files on this machine.
 
 ```bash
-export WHISTLE_RS_PASSWORD='…'   # not -w: see CLI.md, "Listening beyond this machine"
-whistle-rs -H 0.0.0.0 -n admin
+export WHIX_PASSWORD='…'   # not -w: see CLI.md, "Listening beyond this machine"
+whix -H 0.0.0.0 -n admin
 ```
 
 Then find your LAN address:
@@ -736,7 +736,7 @@ reliable way to get it right.
 
 ### 3. Install the root CA, or you will only see `CONNECT`
 
-Without a trusted CA the device refuses the certificate whistle-rs shows it,
+Without a trusted CA the device refuses the certificate whix shows it,
 and all you get is a `CONNECT` row tagged `client-tls` — "the client refused
 this proxy's certificate" — with nothing inside it. Open this on the device:
 
@@ -753,7 +753,7 @@ system one.
 Verify from your laptop first, where the failure modes are easier to read:
 
 ```bash
-curl -x http://127.0.0.1:8899 --cacert ~/.whistle-rs/certs/root.crt \
+curl -x http://127.0.0.1:8899 --cacert ~/.whix/certs/root.crt \
      https://example.com/ -D - -o /dev/null
 ```
 
@@ -767,7 +767,7 @@ www.example.com     http://192.168.1.5:5173
 ```
 
 Note the LAN address, not `localhost` — the destination is dialled by the
-**proxy**, so `localhost` would be the machine running whistle-rs. That happens
+**proxy**, so `localhost` would be the machine running whix. That happens
 to be right when the dev server is on the same laptop, and wrong the moment it
 is not.
 
@@ -793,7 +793,7 @@ app talks to, does not require a MITM, and not requiring one means there is no
 certificate to install on the device at all:
 
 ```bash
-whistle-rs -p 8899 --no-intercept-https -r rules.txt
+whix -p 8899 --no-intercept-https -r rules.txt
 ```
 
 ```
@@ -805,14 +805,14 @@ What you keep and what you give up, both measured against a self-signed origin:
 | | with interception | `--no-intercept-https` |
 |---|---|---|
 | `host://` and the proxy family | routed | **routed** |
-| certificate the client sees | whistle-rs's, signed by its root CA | **the origin's own** |
+| certificate the client sees | whix's, signed by its root CA | **the origin's own** |
 | root CA must be installed | yes | **no** |
 | `resHeaders://` and every other content operator | applied | **not applied** |
 | appears in the capture | every request | **one `CONNECT` row per connection**: the host, where it was routed, how long it stayed open — nothing inside it |
 | a self-signed origin | `502` unless `--insecure-upstream` | fine — the *client* decides whether to trust it |
 
 The last row is the one that catches people out in the other direction. With
-interception on, whistle-rs verifies the origin's certificate itself and a
+interception on, whix verifies the origin's certificate itself and a
 self-signed origin is a `502`; with interception off there is nothing for the
 proxy to verify, because the TLS session is between the client and the origin
 and the proxy only moves bytes.
@@ -968,7 +968,7 @@ curl -s -X POST http://127.0.0.1:8899/api/explain -H 'Content-Type: application/
 ```
 
 An empty `ops` means the pattern did not match — the answer a silent rule never
-gives you. The same engine runs offline as `whistle-rs explain`, and
+gives you. The same engine runs offline as `whix explain`, and
 `--batch` reads one JSON query per line and writes one answer per line, which is
 how you check a hundred candidate rules without starting a proxy at all.
 
@@ -981,13 +981,13 @@ how you check a hundred candidate rules without starting a proxy at all.
 
 ## Embed the proxy in your own program
 
-whistle-rs is a library with a binary on top. If your own program needs traffic
+whix is a library with a binary on top. If your own program needs traffic
 interception — a test harness that must assert on outbound calls, a desktop app
 with a built-in inspector, a proxy of your own — embed it rather than shelling
 out:
 
 ```rust
-use whistle_rs::embed::Proxy;
+use whix::embed::Proxy;
 
 let proxy = Proxy::builder()
     .port(0)                          // the OS picks; addr() reports which
@@ -1096,14 +1096,14 @@ the step, and a "Did not complete" card with the reason — and `error` in
 
 ```
 HTTP/1.1 502 Bad Gateway
-x-whistle-rs-error: connect
-x-whistle-rs-session: 12
-x-server: whistle-rs
+x-whix-error: connect
+x-whix-session: 12
+x-server: whix
 
-whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
+whix: connecting to 127.0.0.1:9: Connection refused (os error 61)
 ```
 
-**A `502` without `x-whistle-rs-error` came from the server**, not from here.
+**A `502` without `x-whix-error` came from the server**, not from here.
 The steps, in the order a request meets them:
 
 | `error.phase` | Where it stopped |
@@ -1131,7 +1131,7 @@ Then work down this list:
 | a `*` in the path matches nothing | `*` is a wildcard **in the host only**. In a path it is a literal, because `*` is a legal URL character. `example.com/old/*` matches a URL containing an actual `*`; write `^http://example.com/old/**` for a path wildcard. Filter patterns are the exception — they always read as if `^`-prefixed, which is why `excludeFilter://*/health` works |
 | a mock, redirect or forward is ignored | another line of the [shared slot](#a-mock-has-to-be-written-above-the-forward) was written first. Move it up, or mark it `$` |
 | an operator value arrives truncated | it contained a space. Use `${name}` and a value — see [Headers](#headers) |
-| `502` on a self-signed or private-CA origin | whistle-rs **verifies** origin certificates, unlike upstream. `--insecure-upstream` opts out |
+| `502` on a self-signed or private-CA origin | whix **verifies** origin certificates, unlike upstream. `--insecure-upstream` opts out |
 | a delay of `1s` is instant | delays require a numeric millisecond value; a suffix makes the delay invalid. Write `1000` |
 | a throttle is 8× faster than expected | `resSpeed://` is **kilobits**, not kilobytes |
 | a body rewrite works sometimes | it does not, any more — a response-body operator now busts the request cache, so a `304` cannot swallow it. If you are on an older build, add `disable://cache` |
@@ -1147,7 +1147,7 @@ Then work down this list:
 | with `--no-intercept-https` or `disable://intercept`, the browser shows `ERR_TUNNEL_CONNECTION_FAILED` and the console has a `CONNECT` row at status 0 | the proxy could not reach the site: the row says whether it stopped at `dns` or `connect`. A tunnel that is not decrypted is only answered once the far end is reached, as in whistle, so the failure lands on the `CONNECT` itself. See [`RULES.md`](RULES.md#not-decrypting-a-connection) |
 | a direct request to the console returns `502` with `Proxy-Connection` | your shell has `http_proxy` set. `curl --noproxy '*'` |
 | a rule does not fire and the capture is empty | first check whether curl bypassed the proxy: use `--noproxy '' -x http://127.0.0.1:8899` to force this route. A request that reached the proxy is in the capture even when it failed, so an empty one means it did not arrive — or that `enable://hide` kept it out of the record. The console's search box and Capture filter only hide rows from the list: `/sessions.json` still has them |
-| a `502` and you cannot tell who sent it | look for `x-whistle-rs-error` on it: present, this proxy made it up and names the step (`dns`, `connect`, `tls`, …); absent, the server answered `502` itself |
+| a `502` and you cannot tell who sent it | look for `x-whix-error` on it: present, this proxy made it up and names the step (`dns`, `connect`, `tls`, …); absent, the server answered `502` itself |
 | the editor highlights the wrong token as the pattern | it is telling you the truth. `example.com http://localhost:5173` is pattern + destination; `http://a.com/x host://1.2.3.4` is pattern + operator. Whichever token it marks is what the proxy will match on |
 
 More failure modes, and the ones that are structural rather than fixable, are in

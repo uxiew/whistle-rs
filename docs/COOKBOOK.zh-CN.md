@@ -28,7 +28,7 @@
 
 ```bash
 cargo build --release
-./target/release/whistle-rs -p 8899 -r rules.txt
+./target/release/whix -p 8899 -r rules.txt
 ```
 
 同一个端口上听着**两样不同的东西**，把它们搞混是最常见的入门错误：
@@ -45,11 +45,11 @@ cargo build --release
 浏览器打开 <http://127.0.0.1:8899/> 就是控制台：请求表格、详情面板，以及一个会标出
 **代理将拿哪个 token 去匹配**的规则编辑器。
 
-调试期间，`--no-persist` 让抓到的流量不落到 `~/.whistle-rs`，`--dir` 把根证书与规则分组
+调试期间，`--no-persist` 让抓到的流量不落到 `~/.whix`，`--dir` 把根证书与规则分组
 放到一个用完即弃的目录：
 
 ```bash
-./target/release/whistle-rs -p 8899 -r rules.txt --no-persist --dir /tmp/w
+./target/release/whix -p 8899 -r rules.txt --no-persist --dir /tmp/w
 ```
 
 ---
@@ -206,7 +206,7 @@ api.example.com/users    file://{users.json}
 api.example.com/users    file:///Users/me/mock/users.json
 ```
 
-只有这一种能**白拿正确的 `Content-Type`**：whistle-rs 从文件扩展名猜。另外两种没有文件名可猜，
+只有这一种能**白拿正确的 `Content-Type`**：whix 从文件扩展名猜。另外两种没有文件名可猜，
 默认是 `text/html; charset=utf-8`，所以客户端挑剔时要加 `resType://json` ——
 `fetch().then(r => r.json())` 不在乎，严格的客户端在乎。
 
@@ -323,7 +323,7 @@ Bearer eyJhbGciOi...
 或者从命令行给：
 
 ```bash
-whistle-rs --value 'bearer=Bearer eyJhbGciOi...' -r rules.txt
+whix --value 'bearer=Bearer eyJhbGciOi...' -r rules.txt
 ```
 
 命令行的 `--value` 会盖过规则文件里同名的围栏块，适合临时换一个值；在控制台 Values 里存的同名值
@@ -391,7 +391,7 @@ api.thirdparty.com   resCors://*
 `resCors://enable` 会回显请求自己的 `Origin` 并加上
 `Access-Control-Allow-Credentials: true` —— 调用要带 cookie 时用这个。
 
-预检要多留意一步。在 `OPTIONS` 上配 `*` 或 `enable` 时，whistle-rs 把请求的方法
+预检要多留意一步。在 `OPTIONS` 上配 `*` 或 `enable` 时，whix 把请求的方法
 回写成 **`Access-Control-Allow-Method`** —— 单数，而这**不是**一个真实的 CORS 头。
 这是上游的笔误，本移植照抄以保证两边发出同样的字节；浏览器会忽略它。
 自己把方法写清楚，写在第二行：
@@ -477,7 +477,7 @@ api.example.com      statusCode://500  includeFilter://chance:5%   # 5% 的请�
 `-t` 给这个等待封顶：
 
 ```bash
-whistle-rs -t 3000 -r rules.txt      # 连接 3 秒还建立不起来就放弃
+whix -t 3000 -r rules.txt      # 连接 3 秒还建立不起来就放弃
 ```
 
 关于它有两件事从参数名上看不出来：
@@ -630,12 +630,12 @@ example.com   rule://{teamRules}
 
 ### 1. 让代理可达
 
-whistle-rs 默认只监听 `127.0.0.1`，也就是只有本机能用，所以要显式放手机进来。先设控制台口令：
+whix 默认只监听 `127.0.0.1`，也就是只有本机能用，所以要显式放手机进来。先设控制台口令：
 能连上端口的人都能打开控制台，而它编辑的规则能读写本机文件。
 
 ```bash
-export WHISTLE_RS_PASSWORD='…'   # 别用 -w：见 CLI.md 的 "Listening beyond this machine"
-whistle-rs -H 0.0.0.0 -n admin
+export WHIX_PASSWORD='…'   # 别用 -w：见 CLI.md 的 "Listening beyond this machine"
+whix -H 0.0.0.0 -n admin
 ```
 
 然后找出局域网地址：
@@ -664,7 +664,7 @@ PAC 是**按取回它的那个请求的 `Host` 头**生成的 —— 设备用�
 
 ### 3. 装根证书，否则你只能看到 `CONNECT`
 
-没有被信任的 CA，设备会拒绝 whistle-rs 出示的证书：你只会看到一行带 `client-tls` 标签的
+没有被信任的 CA，设备会拒绝 whix 出示的证书：你只会看到一行带 `client-tls` 标签的
 `CONNECT`（原因写着 "the client refused this proxy's certificate"），里面什么都没有。
 在设备上打开：
 
@@ -679,7 +679,7 @@ http://192.168.1.5:8899/rootCA.crt
 先在笔记本上验证一遍，那里的失败信息更好读：
 
 ```bash
-curl -x http://127.0.0.1:8899 --cacert ~/.whistle-rs/certs/root.crt \
+curl -x http://127.0.0.1:8899 --cacert ~/.whix/certs/root.crt \
      https://example.com/ -D - -o /dev/null
 ```
 
@@ -692,7 +692,7 @@ www.example.com     http://192.168.1.5:5173
 ```
 
 注意写的是**局域网地址**而不是 `localhost` —— 目标是由**代理**去连的，所以 `localhost`
-指的是跑 whistle-rs 的那台机器。开发服务恰好在同一台笔记本上时它碰巧是对的，
+指的是跑 whix 的那台机器。开发服务恰好在同一台笔记本上时它碰巧是对的，
 一旦不在，就错了。
 
 ### 放过某一个域名
@@ -715,7 +715,7 @@ Policy 列带 `(tunnel)`，没有里面的请求。
 就意味着设备上**根本不用装证书**：
 
 ```bash
-whistle-rs -p 8899 --no-intercept-https -r rules.txt
+whix -p 8899 --no-intercept-https -r rules.txt
 ```
 
 ```
@@ -727,13 +727,13 @@ secure.example.com   host://10.0.0.9
 | | 开启拦截 | `--no-intercept-https` |
 |---|---|---|
 | `host://` 与代理家族 | 照常路由 | **照常路由** |
-| 客户端看到的证书 | whistle-rs 用自己根 CA 签的 | **源站自己的** |
+| 客户端看到的证书 | whix 用自己根 CA 签的 | **源站自己的** |
 | 必须安装根证书 | 是 | **否** |
 | `resHeaders://` 等所有内容算子 | 生效 | **不生效** |
 | 出现在抓包里 | 每个请求一条 | **每条连接一行 `CONNECT`**：连的哪个域名、转到了哪、连了多久 —— 里面的内容没有 |
 | 自签名源站 | `502`，除非加 `--insecure-upstream` | 没问题 —— 由**客户端**自己决定信不信 |
 
-最后一行是反方向最容易踩的：开着拦截时，源站证书是由 whistle-rs 自己校验的，
+最后一行是反方向最容易踩的：开着拦截时，源站证书是由 whix 自己校验的，
 自签名源站就是 `502`；关掉拦截后代理**无物可校验** ——
 TLS 会话是客户端与源站之间的，代理只搬字节。
 
@@ -873,7 +873,7 @@ curl -s -X POST http://127.0.0.1:8899/api/explain -H 'Content-Type: application/
 ```
 
 `ops` 为空就是 pattern 没匹上 —— 一条静默失效的规则永远不会告诉你这件事。
-同一套引擎离线跑就是 `whistle-rs explain`，加 `--batch` 时每行读一个 JSON 查询、
+同一套引擎离线跑就是 `whix explain`，加 `--batch` 时每行读一个 JSON 查询、
 每行写一个答案，用来一次性核对上百条候选规则，连代理都不用起。
 
 > **两个会白白耗掉你时间的点。** `POST /api/rules` 回 `{"ok":true,"rules":1}`
@@ -883,12 +883,12 @@ curl -s -X POST http://127.0.0.1:8899/api/explain -H 'Content-Type: application/
 
 ## 把代理嵌进你自己的程序
 
-whistle-rs 是「一个库 + 跑在它上面的二进制」。如果你自己的程序需要流量拦截 ——
+whix 是「一个库 + 跑在它上面的二进制」。如果你自己的程序需要流量拦截 ——
 一个要对出站调用做断言的测试夹具、一个自带检查器的桌面应用、你自己的代理 ——
 把它嵌进去，而不是去 shell 出一个进程：
 
 ```rust
-use whistle_rs::embed::Proxy;
+use whix::embed::Proxy;
 
 let proxy = Proxy::builder()
     .port(0)                          // 0：系统挑端口，addr() 告诉你挑了哪个
@@ -987,14 +987,14 @@ INFO #13 GET https://sec.test/ -> failed at tls: upstream TLS handshake: invalid
 
 ```
 HTTP/1.1 502 Bad Gateway
-x-whistle-rs-error: connect
-x-whistle-rs-session: 12
-x-server: whistle-rs
+x-whix-error: connect
+x-whix-session: 12
+x-server: whix
 
-whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
+whix: connecting to 127.0.0.1:9: Connection refused (os error 61)
 ```
 
-**没有 `x-whistle-rs-error` 的 `502` 是源站自己回的**，不是本代理。各个阶段按请求经过的顺序：
+**没有 `x-whix-error` 的 `502` 是源站自己回的**，不是本代理。各个阶段按请求经过的顺序：
 
 | `error.phase` | 停在哪 |
 |---------------|--------|
@@ -1021,7 +1021,7 @@ whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
 | 路径里的 `*` 什么都匹配不到 | `*` **只在域名部分**是通配符。在路径里它是字面量，因为 `*` 是合法的 URL 字符。`example.com/old/*` 匹配的是真的含有 `*` 的 URL；要路径通配请写 `^http://example.com/old/**`。筛选器是例外 —— 它的 pattern 总按 `^` 解读，所以 `excludeFilter://*/health` 是有效的 |
 | mock / 重定向 / 转发被忽略 | [共用槽位](#mock-必须写在转发上面)里另有一行写在前面。把它往上挪，或标 `$` |
 | 算子取值被截断了 | 里面有空格。改用 `${name}` 加 value —— 见[头](#头) |
-| 自签名 / 私有 CA 源站返回 `502` | 与上游不同，whistle-rs **校验**源站证书。用 `--insecure-upstream` 关掉 |
+| 自签名 / 私有 CA 源站返回 `502` | 与上游不同，whix **校验**源站证书。用 `--insecure-upstream` 关掉 |
 | 写了 `1s` 的延迟瞬间就过去了 | 延迟需要数值毫秒；后缀让延迟值无效。写 `1000` |
 | 限速比预期快 8 倍 | `resSpeed://` 的单位是**千比特**，不是千字节 |
 | body 改写时灵时不灵 | 现在不会了 —— 响应体算子会顺带禁掉请求缓存，`304` 吞不掉它。如果你用的是旧版本，加 `disable://cache` |
@@ -1037,7 +1037,7 @@ whistle-rs: connecting to 127.0.0.1:9: Connection refused (os error 61)
 | 开了 `--no-intercept-https` 或 `disable://intercept`，浏览器报 `ERR_TUNNEL_CONNECTION_FAILED`，控制台有一条状态为 0 的 `CONNECT` | 代理连不上那个网站，这一行写着停在 `dns` 还是 `connect`。不解密的隧道要先连上远端才回复 CONNECT（和 whistle 一样），所以失败直接落在 CONNECT 上。见 [`RULES.md`](RULES.md#not-decrypting-a-connection) |
 | 直连控制台却返回带 `Proxy-Connection` 的 `502` | 你的 shell 设了 `http_proxy`。`curl --noproxy '*'` |
 | `/api/rules` 里有规则却不生效，而且抓包为空 | 先检查 curl 是否绕过代理；用 `--noproxy '' -x http://127.0.0.1:8899` 明确走代理。到过代理的请求哪怕失败了也在抓包里，所以列表为空说明请求没到 —— 或者被 `enable://hide` 挡在记录之外。控制台的检索框和 Capture filter 只是把行从列表里藏起来，`/sessions.json` 里还在 |
-| 拿到一个 `502`，分不清是谁回的 | 看它有没有 `x-whistle-rs-error` 头：有，就是本代理生成的，头的值就是停在哪一步（`dns`、`connect`、`tls`……）；没有，就是源站自己回的 `502` |
+| 拿到一个 `502`，分不清是谁回的 | 看它有没有 `x-whix-error` 头：有，就是本代理生成的，头的值就是停在哪一步（`dns`、`connect`、`tls`……）；没有，就是源站自己回的 `502` |
 | 编辑器把「不该是 pattern 的 token」标成了 pattern | 它说的是实话。`example.com http://localhost:5173` 是 pattern + 目标；`http://a.com/x host://1.2.3.4` 是 pattern + 算子。它标出来的那个，就是代理真正会拿去匹配的 |
 
 更多失败形态、以及哪些是结构性而非可修的，见两份 README 的故障排查段落与

@@ -5,7 +5,7 @@
 > a claim of whole-product compatibility. Historical audits are preserved in
 > [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md).
 
-whistle-rs uses whistle's rule syntax. This document is the complete reference for
+whix uses whistle's rule syntax. This document is the complete reference for
 the subset the Rust core understands. For the original, exhaustive whistle rule
 documentation see <https://wproxy.org>.
 
@@ -126,15 +126,15 @@ pattern  operator1  operator2  …  operatorN
 - A blank line, or a line with fewer than two tokens, is ignored.
 - The first token is normally the **pattern**; the rest are **operators**. If the
   first token is itself an operator (has a known `protocol://` prefix or is a bare
-  `host:port`), whistle-rs falls back to scanning for the first pattern token —
+  `host:port`), whix falls back to scanning for the first pattern token —
   matching whistle's "operators first, then patterns" form for the common case.
 
 You can load rules three ways:
 
 ```bash
-whistle-rs -r rules.txt              # from a file
-whistle-rs --rule "example.com host://127.0.0.1:8080"   # inline
-whistle-rs -r rules.txt --rule "…"   # file first, then inline appended
+whix -r rules.txt              # from a file
+whix --rule "example.com host://127.0.0.1:8080"   # inline
+whix -r rules.txt --rule "…"   # file first, then inline appended
 ```
 
 ### Pulling in another rules text (`@`)
@@ -181,7 +181,7 @@ knowing before you rely on it:
 
 A source is a `/absolute` path, a `~/` path, a Windows drive path, an
 `http(s)://` URL, a `whistle.<plugin>` name, or a `$<key>` plugin-store
-reference. The last two are **not implemented here** — plugins in whistle-rs are
+reference. The last two are **not implemented here** — plugins in whix are
 external HTTP servers with no such endpoint (see [`PLUGINS.md`](PLUGINS.md)) —
 and the line is logged and contributes nothing. Anything else is not an include
 and keeps whatever meaning it already had:
@@ -216,7 +216,7 @@ is available to the text that included it; when both declare the same name, the
 
 ## Patterns
 
-A pattern decides **which requests a rule applies to**. whistle-rs supports four
+A pattern decides **which requests a rule applies to**. whix supports four
 kinds; it picks the kind automatically from the token's shape.
 
 ### 1. Domain / URL prefix (most common)
@@ -393,7 +393,7 @@ What follows from "it is JavaScript's":
   (pattern), is read as literal text (a filter condition's value, a template
   `.replace()`), or replaces nothing (`*Replace`), each as upstream does. It is
   no longer silent: the log says `rules: /a(/ (pattern; the rule is dropped) is
-  not a regular expression: …` once, and `whistle-rs explain` prints the same
+  not a regular expression: …` once, and `whix explain` prints the same
   line under the URL.
 - A pathological expression costs what it costs in Node. `/(a+)+$/` against a
   long run of `a` is exponential in both; the engine backtracks, as V8 does.
@@ -490,7 +490,7 @@ request — so `/API\.example\.com/` matches an upper-case host and
 
 ## Operators
 
-An operator is `protocol://value`. whistle-rs recognises the **full whistle protocol
+An operator is `protocol://value`. whix recognises the **full whistle protocol
 list** at parse time, and applies essentially all of the common operators at runtime
 (see [Operator coverage](#operator-coverage) for the exceptions).
 
@@ -599,7 +599,7 @@ The last row is upstream's own split, not a simplification: `readRuleValue`'s
 `checkUrl` argument is set for exactly the `js*`/`css*` families
 (`util/index.js:1339`), so on an **HTML** response a URL there stays a URL and
 becomes `<script src=…>` / `<link rel=stylesheet>`, while on a JS or CSS response
-the same URL is fetched and inlined. whistle-rs reads values in the request
+the same URL is fetched and inlined. whix reads values in the request
 phase, before there is a response to classify, so it keeps the HTML meaning —
 which is the documented one — and never fetches for those six.
 
@@ -631,7 +631,7 @@ is a CORS rule, not a fetch. A *path* there is still read.
 > `resBody://patched` is a read of `./patched` — relative to the rules file's
 > root (`rule.root`, which only exists for rules a plugin or an `@`-include
 > brought in) or else to whistle's own working directory. It fails, and the
-> operator quietly sets an **empty** body. whistle-rs has no `rule.root`, and a
+> operator quietly sets an **empty** body. whix has no `rule.root`, and a
 > path relative to the proxy's working directory is not something a rules file
 > can rely on, so a bare value stays the literal this document already
 > describes. Every spelling that *works* upstream still loads.
@@ -839,7 +839,7 @@ fenced as ```` ```more ```` still finds it.
 `getValueFor` asks the inline map first and falls back to the store. Values set
 in the console are the store. The one thing that beats a block is `--value` on
 the command line: it is an instruction for this run, so
-`whistle-rs -r team.rules --value mock=local` serves `local` even where
+`whix -r team.rules --value mock=local` serves `local` even where
 `team.rules` declares its own ```` ```mock ````. (Until 2026-09 the store beat
 every block; upstream's own test suite caught it — `test/units/keys.test.js`.)
 
@@ -1036,9 +1036,9 @@ speaks, which is the whole point of their names:
   **plaintext** request — they exist to chain to another whistle, which wants to
   inspect it — and carry the original scheme in the
   `x-whistle-https-request` header so that whistle restores it
-  (`res.js:229-234`, `lib/init.js:190-193`). whistle-rs sets that header when it
+  (`res.js:229-234`, `lib/init.js:190-193`). whix sets that header when it
   is the sending side and honours (and strips) it when it is the receiving one,
-  so two whistle-rs instances chain the way whistle does. Point one at a proxy
+  so two whix instances chain the way whistle does. Point one at a proxy
   you do not control and the request travels in the clear.
 
 `lineProps://internalProxy` says the second of those about an ordinary
@@ -1106,9 +1106,9 @@ example.com   ignore://proxy          # → direct, despite the socks rule
 
 **A proxy that is this proxy.** `proxy://127.0.0.1:8899` — this proxy's own port
 on this machine, `--socks-port` included — would send the request back to
-whistle-rs, which would match the same rule and do it again until the process
+whix, which would match the same rule and do it again until the process
 ran out of sockets. Such a hop is refused: the request is answered with a 302 to
-whistle-rs's own port (whistle's answer on the HTTP path,
+whix's own port (whistle's answer on the HTTP path,
 `_original/lib/inspectors/res.js:302-316`) and the log carries a
 `self loop via <address>` warning. Reaching the origin directly on our own port
 is left alone: it cannot recurse, because the request we send is not a proxy
@@ -1145,7 +1145,7 @@ asked to reach — the request inside the tunnel still carries the original `Hos
 
 **`proxyTunnel`.** With an override in play, `lineProps://proxyTunnel` (or
 `enable://proxyTunnel`, or the property on the `host://` line) says the
-overridden address is *itself* a proxy: whistle-rs `CONNECT`s to it through the
+overridden address is *itself* a proxy: whix `CONNECT`s to it through the
 first proxy, then sends a second `CONNECT` **inside** that tunnel naming the real
 origin, marked `x-whistle-policy: intercept` so a whistle at the far end
 intercepts rather than blindly relays
@@ -1162,7 +1162,7 @@ chained.test       proxy://127.0.0.1:8888?host=10.0.0.9:8899 lineProps://proxyTu
 Both `CONNECT`s carry the same `Proxy-Authorization`, so the **second** proxy is
 shown the credential written for the first — and when the proxy URL carries no
 credential of its own, that is the *client's* own `Proxy-Authorization`, a
-credential the client aimed at whistle-rs travelling one hop further than the
+credential the client aimed at whix travelling one hop further than the
 client can see. This matches whistle (`lib/util/patch.js:120-140`); every address
 involved was named by the rule, and withholding the credential would make an
 authenticated second hop silently unreachable. Point a chain at a proxy you do
@@ -1192,11 +1192,11 @@ and straight out when it cannot, exactly as `xproxy://` does.
 
 Upstream reads the same result with one regexp,
 `/(PROXY|SOCKS)\s+([^;\s]+)/i` (`node-pac/lib/Pac.js:7`), which has two
-consequences whistle-rs does not reproduce: `SOCKS5 host:port` matches nothing
+consequences whix does not reproduce: `SOCKS5 host:port` matches nothing
 there and the request goes direct, and a `PROXY` entry wins even when `DIRECT`
 came first in the list. Order is respected here, and `SOCKS5` is honoured.
 
-The location may be a local file, a `http(s)://` URL, or (whistle-rs only) the
+The location may be a local file, a `http(s)://` URL, or (whix only) the
 script itself inline, which in practice means a script with no whitespace in it,
 since a rule token ends at the first space.
 
@@ -1305,7 +1305,7 @@ example.com   host://10.0.0.1   includeFilter://reqH.x-canary:1
 > ⚠️ **`includeFilter://` is the only spelling that includes.** `filter://` and
 > `ignore://<condition>` are **exclude** filters — whistle decides with
 > `isInclude = matcher[1] === 'n'` (`_original/lib/rules/rules.js:1563`), which is true
-> for i**n**cludeFilter alone. whistle-rs read `filter://` as an include until this was
+> for i**n**cludeFilter alone. whix read `filter://` as an include until this was
 > corrected, so a rules file using it did the *opposite* of what it asked. If you have
 > `filter://` rules written against the old behaviour, they now exclude; rewrite them as
 > `includeFilter://`.
@@ -1379,7 +1379,7 @@ whistle resolves a request's rules **twice**: once before the request is sent
 (`resolveReqRules`) and again once the response head has arrived
 (`resolveResRules` → `pluginMgr.getResRules`, `_original/lib/rules/rules.js:2302-2308`,
 `lib/plugins/index.js:1322`). That second pass is what lets a rule ask about the
-response. whistle-rs does the same.
+response. whix does the same.
 
 **What each pass decides.** Upstream splits the operators between the passes and this
 port follows it: the response phase owns `pureResProtocols`
@@ -1474,7 +1474,7 @@ that never connected at all leaves the condition unanswerable, and it fails clos
 `b:` / `body:` reads the **request body**, which means the body has to be buffered
 before the rules resolve — the one thing on the request path that cannot be undone
 once it is done. Both implementations therefore decide it in two stages, and
-whistle-rs follows upstream's:
+whix follows upstream's:
 
 1. every line carrying a `b:` filter is collected at parse time into a list of its
    own (upstream's `_bodyFilters`, `_original/lib/rules/rules.js:1390-1392`);
@@ -1877,14 +1877,14 @@ know is otherwise a destination URL (`example.com http://localhost:5173`), and s
 `mock://` with no plugin called `mock` — which then fails the request with
 `unsupported protocol mock:`. Upstream decides it the same way, at request time
 (`getPluginByPluginRule`, `_original/lib/plugins/index.js:1406-1421`). The
-console's Test Rules knows the registered names; `whistle-rs explain` runs without a
+console's Test Rules knows the registered names; `whix explain` runs without a
 proxy and knows only the built-in ones.
 
 Register plugins on the command line (repeatable), or start one from a script:
 
 ```bash
-whistle-rs --plugin echo=127.0.0.1:9300 --plugin mock=127.0.0.1:9400
-whistle-rs --node-plugin mock=./mock-plugin.js
+whix --plugin echo=127.0.0.1:9300 --plugin mock=127.0.0.1:9400
+whix --node-plugin mock=./mock-plugin.js
 ```
 
 What a plugin is asked, and how it answers, is [`PLUGINS.md`](PLUGINS.md). A
@@ -1927,7 +1927,7 @@ thing that exists by then — the name in the client's ClientHello, as
 no path, no header and no body, so a filter that asks about any of those never
 matches an `sniCallback` line.
 
-The plugin can answer four ways: present whistle-rs's own generated certificate,
+The plugin can answer four ways: present whix's own generated certificate,
 present one of its own, reuse the one it supplied last time, or **decline the
 interception entirely** — in which case the connection is relayed to the origin
 still encrypted and nothing about it is captured. Writing the plugin is covered
@@ -1945,7 +1945,7 @@ Three consequences worth knowing:
   connection. Its opaque payload is not captured or processed by HTTP body
   operators, because TLS remains between the client and origin.
 - **A failing plugin does not decline.** Unreachable, slow or incomprehensible
-  all mean "the certificate whistle-rs would have generated anyway", with a
+  all mean "the certificate whix would have generated anyway", with a
   `WARN` naming the plugin. See
   [`PLUGINS.md`](PLUGINS.md#证书钩子--snicallback) for why this one hook does not
   fail closed the way `onAuth` does.
@@ -2242,11 +2242,11 @@ are still your source's: `cart.js:41` is line 41 of `cart.js`. Only columns on
 the first line move. (A `log://{name}` script of your own — below — is as many
 lines as you wrote, and moves everything after it down by that many.)
 
-The script reports by `POST`ing to `/.whistle-rs/log` **on the page's own
+The script reports by `POST`ing to `/.whix/log` **on the page's own
 origin**. The page's requests come through this proxy, so the proxy answers that
 path itself (`204`) and the origin never sees it. That is why it works on an
 `https://` page without mixed-content errors and needs no CORS. It also means
-the path is taken: a site that really serves `/.whistle-rs/log` cannot be
+the path is taken: a site that really serves `/.whix/log` cannot be
 reached through this proxy at that path.
 
 Like the `html*`/`js*` operators, injecting removes the response's
@@ -2312,13 +2312,13 @@ The same entries are readable over HTTP: [`GET /api/logs`](API.md#页面日志).
 
 [weinre](https://www.npmjs.com/package/weinre) is a remote
 DOM inspector: a server you run, a script the page loads from it, and an
-inspector page you open on that server. **whistle-rs does not contain weinre**
+inspector page you open on that server. **whix does not contain weinre**
 — whistle bundles the whole of it and serves it from its own port. So here you
 start the server yourself and say where it is:
 
 ```sh
 npx weinre --boundHost -all- --httpPort 8080     # the weinre server
-whistle-rs --weinre http://192.168.1.5:8080      # …and where the proxy finds it
+whix --weinre http://192.168.1.5:8080      # …and where the proxy finds it
 ```
 
 ```
@@ -2362,7 +2362,7 @@ it (`_original/lib/inspectors/weinre.js:37-38`). Only injecting does this — a
 **How this differs from whistle**, measured against 2.10.8 by
 `tests/differential/cases-compose.js`: whistle appends its **own bundled agent**
 — the whole of `assets/js/weinre.js`, inline, at the *end* of the body — pointed
-at a weinre server whistle runs itself. whistle-rs bundles neither, so it emits a
+at a weinre server whistle runs itself. whix bundles neither, so it emits a
 `<script src>` naming the server `--weinre` gave and puts it in the `<head>`. Two
 further consequences: whistle also reaches **JavaScript** responses, appending
 the agent bare (`weinre.js:33-35`), where a `<script src>` tag would mean
@@ -2751,10 +2751,10 @@ with the reason. They parse and do nothing.
 > ```
 >              plain request        with If-None-Match (a browser reload)
 > whistle      200 "REWRITTEN"      304 ""
-> whistle-rs   200 "REWRITTEN"      200 "REWRITTEN"
+> whix   200 "REWRITTEN"      200 "REWRITTEN"
 > ```
 >
-> So the rewrite disappears on reload in whistle. whistle-rs does what
+> So the rewrite disappears on reload in whistle. whix does what
 > whistle's code says rather than what whistle does.
 >
 > `log://` and `weinre://` bust the cache too, and there whistle *does* reach
@@ -2839,7 +2839,7 @@ example.com/health   disable://abort
 `enable://abort disable://abortReq` is the way to say "let it reach the origin,
 then cut the client off" without changing what the origin sees.
 
-> Upstream also arms these from a `filter://abort` line; in whistle-rs `filter://`
+> Upstream also arms these from a `filter://abort` line; in whix `filter://`
 > is only a match condition, so `enable://` is the whole vocabulary here.
 
 #### A flag written on both sides does nothing
@@ -2868,7 +2868,7 @@ simplification: **`userLogin`** lets `enable` win over `disable`
   the request head has already gone, so the origin never sees the header.
 * **`disable://trailers` still announces the trailer upstream.** Asked with
   `TE: trailers`, whistle emits `Trailer: x-t` and then sends no trailer section
-  at all; whistle-rs drops the announcement along with the section. Announcing a
+  at all; whix drops the announcement along with the section. Announcing a
   field that never arrives is a protocol lie, and not one worth reproducing.
 
 #### Aborting a connection rather than a request
@@ -2881,7 +2881,7 @@ destroys the same socket from either gate (`_original/lib/tunnel.js:372-374`,
 `:748-750`) and opens its SOCKS connections by issuing a `CONNECT` against its
 own port, so a refused tunnel denies the SOCKS client (`lib/index.js:174-193`).
 
-The two spellings collapse into one here. whistle-rs acknowledges a `CONNECT`
+The two spellings collapse into one here. whix acknowledges a `CONNECT`
 before it can know where the bytes will go, so `abortRes` cannot let the origin
 be dialled first the way it does on the request path — both spellings produce the
 same silence. Everything else holds, `disable://abort` included.
@@ -2932,7 +2932,7 @@ example.com   rulesFile:///etc/whistle/d.rules    # dropped
 
 > whistle additionally *executes* the surviving candidate when its content looks like
 > JavaScript rather than rules (`isRulesContent`, `_original/lib/rules/index.js:41`),
-> and splices the rules the script emits into the join. whistle-rs has no dynamic-rules
+> and splices the rules the script emits into the join. whix has no dynamic-rules
 > script: every kept file is read as rules text.
 
 The text does not have to be a file. `reqRules://{extra}` names a **value** — from
@@ -3018,7 +3018,7 @@ file — and a request for `/` joins nothing, so it writes `/tmp/dump` itself.
 An **empty** value has no path to join onto, so upstream's becomes relative and
 whistle dumps into whatever directory it was started in — `resWrite://` on a
 request for `/users` writes `./users`. A rule with no path in it writing a file
-somewhere in your tree is not a behaviour worth reproducing: whistle-rs writes
+somewhere in your tree is not a behaviour worth reproducing: whix writes
 nothing. Measured on `tests/differential/write-bench.js`.
 
 ```
@@ -3136,13 +3136,13 @@ matching upstream. Whatever it sets, it also writes `Expires` and `Pragma`.
 `headers` becomes `Access-Control-Expose-Headers` on a normal request and
 `Access-Control-Allow-Headers` on a preflight; on a preflight with `*`/`enable`,
 the request's own `Access-Control-Request-Headers` is echoed back. `enable://cors`
-is **not** an upstream flag — whistle-rs keeps it as an alias for
+is **not** an upstream flag — whix keeps it as an alias for
 `resCors://enable`.
 
 > The official page has that sentence **inverted** — it says "请求方法为 OPTIONS 时，
 > access-control-allow-headers -> access-control-expose-headers"
 > (<https://wproxy.org/docs/rules/resCors.html>), and its worked example lists
-> `access-control-allow-headers` for a plain `GET`. Both whistle and whistle-rs do
+> `access-control-allow-headers` for a plain `GET`. Both whistle and whix do
 > the opposite, which is also the only reading that makes sense: `allow` answers a
 > preflight, `expose` answers a real response. Upstream's own line is
 > `var operate = isOptions ? 'allow' : 'expose'`
@@ -3210,7 +3210,7 @@ The URL keys have edges worth knowing, all inherited
 >
 > A bare `delete://pathname` against a URL that has a query string emits the
 > query **twice** upstream (`/a?x=1` → `/?x=1?x=1`, `util/index.js:1033,1057`).
-> whistle-rs emits it once; the upstream form is a request line no origin
+> whix emits it once; the upstream form is a request line no origin
 > parses.
 >
 > `delete://body` (and `req.body` / `res.body`) does **not** empty the body in
@@ -3218,7 +3218,7 @@ The URL keys have edges worth knowing, all inherited
 > response twins meant to inject. `removeBody` assigns `EMPTY_BUFFER`, and
 > `EMPTY_BUFFER` is `toBuffer('')` — whose first act is `if (!buf) return`
 > (`util/common.js:1630-1632`), so the constant is `undefined` and the
-> assignment leaves the body alone. whistle-rs empties it, which is what the
+> assignment leaves the body alone. whix empties it, which is what the
 > key is documented to do and what upstream's own code means to do.
 
 A response cannot reach into the browser and remove a cookie, so
@@ -3297,7 +3297,7 @@ header has nowhere to put attributes, and upstream drops them here too.
 | `htmlBody`/`htmlPrepend`/`htmlAppend` | markup | Markup to add to an HTML response |
 | `jsBody`/`jsPrepend`/`jsAppend` | JavaScript, or a URL | JS to add to a **JS or HTML** response |
 
-When any body operator applies, whistle-rs buffers that body, transforms it, and
+When any body operator applies, whix buffers that body, transforms it, and
 recomputes `Content-Length` (dropping any `Transfer-Encoding`). Requests and
 responses without a body operator are streamed through untouched.
 
@@ -3344,7 +3344,7 @@ api.example.com/echo   reqBody://{"mocked":true}
 example.com/app.js     resBody://console.log('patched')
 example.com            resReplace://http://=https://
 example.com            resReplace:///v\d+/g=vX         # regex form
-example.com/page       resPrepend://<!-- via whistle-rs -->
+example.com/page       resPrepend://<!-- via whix -->
 example.com/page       jsAppend://https://cdn.test/debug.js
 ```
 
@@ -3641,7 +3641,7 @@ the self-loop guard, which answers `302` — as it does upstream.
 
 ## Precedence
 
-For each request whistle-rs walks the rules and builds a resolved set:
+For each request whix walks the rules and builds a resolved set:
 
 1. **Important first.** Lines carrying `lineProps://important` are considered
    before normal ones. (`$` is *not* an importance marker — it is exact
@@ -3743,7 +3743,7 @@ them, and what to reach for when they do not fire — are in
 | Carve one path out of a broad rule | `example.com/health  ignore://all` |
 | Win against an earlier ordinary line | `example.com  host://2.2.2.2 lineProps://important` (`$` means exact matching, not importance) |
 | Leave a pinned host alone | `pinned.example.com  sniCallback://no-mitm` |
-| Tag every intercepted response (confirms MITM is active) | `/^https:/i  resHeaders://x-via=whistle-rs` |
+| Tag every intercepted response (confirms MITM is active) | `/^https:/i  resHeaders://x-via=whix` |
 
 ---
 
@@ -3852,7 +3852,7 @@ Several lines merge, as for every `cipher://` option, so the certificate can be
 on one line and the version on another.
 
 **A certificate that cannot be used fails the request**, with the reason, before
-anything is dialled: `502`, `x-whistle-rs-error: rules`, and a body such as
+anything is dialled: `502`, `x-whix-error: rules`, and a body such as
 `tlsOptions: cannot read key /certs/client.key: No such file or directory`,
 `tlsOptions: the private key does not belong to the certificate`, or
 `tlsOptions: pfx could not be opened (wrong passphrase, or not PKCS#12)`.
@@ -3907,10 +3907,10 @@ read only the JSON form, off the first line, and quietly ignored the rest.
 > still negotiates TLS 1.3 there. A bare `cipher://TLSv1.2` does not get even
 > that far: `SEP_CIPHER_RE = /[^a-z\d:!-]/i` rejects the dot, so whistle does not
 > read it as a cipher string, and it is not JSON either — the value falls through
-> to being opened as a *file*. whistle-rs applies the pin on the first attempt,
+> to being opened as a *file*. whix applies the pin on the first attempt,
 > which is what the rule says it does.
 
-`ciphers` is an **OpenSSL cipher string**, and whistle-rs evaluates it. Not
+`ciphers` is an **OpenSSL cipher string**, and whix evaluates it. Not
 matches names against a table — evaluates the language: aliases (`HIGH`,
 `DEFAULT`, `ECDHE`, `AESGCM`, `aRSA`, …), the infix `+` as a conjunction
 (`ECDHE+AESGCM`), `!` and `-` exclusions, `+` deprioritisation, `@STRENGTH`
@@ -4094,7 +4094,7 @@ fragment is also treated as a comment, so `example.com/a#b file:///x` loses the
 ### Simplified vs. upstream
 
 whistle's plugin variables (`%name=…`) and its Node-object plugin API are not
-implemented — plugins here are external HTTP servers speaking whistle-rs's own
+implemented — plugins here are external HTTP servers speaking whix's own
 protocol (see [`PLUGINS.md`](PLUGINS.md)). Template variables and `lineProps`
 *are* implemented; see [`TEMPLATES.md`](TEMPLATES.md) and
 [`LINE_PROPS.md`](LINE_PROPS.md) for exactly how far.
@@ -4120,11 +4120,11 @@ Known gaps in the operator layer, deliberately left:
   present the response operators honour it — the body is decoded before the text
   transforms and re-encoded after, and injected values are written in that
   charset, as whistle does. When there is none, whistle reads the first 25 KB and
-  guesses UTF-8 or GB18030; whistle-rs treats the body as UTF-8 and, if it is not,
+  guesses UTF-8 or GB18030; whix treats the body as UTF-8 and, if it is not,
   leaves it alone. So a non-UTF-8 page that never says so is rewritten by whistle
   and passed through here.
 - **A request body's charset is not undone.** whistle wraps `reqReplace://` in the
-  same decode/encode pair it uses for responses; whistle-rs works on the bytes, so
+  same decode/encode pair it uses for responses; whix works on the bytes, so
   the operator is a no-op on a non-UTF-8 request body.
 - **An HTTP/2 request's `:authority` is forwarded as written.** Translating h2 to
   HTTP/1.1 for a plain-HTTP origin, this port sends the `Host` the client asked for; whistle
@@ -4136,7 +4136,7 @@ Known gaps in the operator layer, deliberately left:
 - **A body-less request with a body-permitting method is framed differently.**
   When a client sends `POST` (or any method that may carry a body) with no
   `Content-Length` and no `Transfer-Encoding` at all, whistle forwards
-  `content-length: 0` and whistle-rs forwards neither header. Both spell "no
+  `content-length: 0` and whix forwards neither header. Both spell "no
   body" and every origin reads them the same way; the difference is Node's HTTP
   client against hyper's, not a rule. It is invisible on the ordinary proxy path,
   where the client's own library has already chosen a framing — it shows only
@@ -4150,7 +4150,7 @@ Known gaps in the operator layer, deliberately left:
   Nothing else about the response changes; `curl --raw -H 'TE: trailers'` shows the
   full behaviour.
 - **`params://` into a body is buffered, not streamed.** whistle rewrites a
-  multipart body part by part so an upload never lands in memory; whistle-rs has
+  multipart body part by part so an upload never lands in memory; whix has
   the body in hand already (every other request-body operator buffers) and splits
   on the boundary. Same result on a well-formed body, more memory on a large one.
   The size ceiling *is* implemented — see [Request bodies have a
@@ -4177,18 +4177,18 @@ logs its resolved destination or short-circuit decision.
 Places the official documentation states something whistle 2.10.8 does not do.
 Each was measured against the running program, and **the program wins** — this
 port follows whistle, not the prose. They are recorded because a reader who
-arrived from those pages would otherwise think whistle-rs had the bug.
+arrived from those pages would otherwise think whix had the bug.
 
 | The page says | whistle actually | Where |
 |---|---|---|
 | on an `OPTIONS` request `access-control-allow-headers` becomes `access-control-expose-headers` | exactly the inverse — `allow` on a preflight, `expose` otherwise | [`resCors`](#response-rewriting) above |
-| a line-format value with no `: ` "splits at the first colon" | a value written on the rule line reaches the line parser only when it has an `=` in it, and then it is a query string, not lines. Without one it produces **nothing at all**: `reqHeaders://x-a:1` and `reqHeaders://bare` both set no header, and `urlParams://test1:1` adds no query — while the same words on a line of a `{value}` do become entries, because loaded content takes the other road. Measured five ways; whistle-rs matches | see "The three spellings of a data value, and the two roads" above |
+| a line-format value with no `: ` "splits at the first colon" | a value written on the rule line reaches the line parser only when it has an `=` in it, and then it is a query string, not lines. Without one it produces **nothing at all**: `reqHeaders://x-a:1` and `reqHeaders://bare` both set no header, and `urlParams://test1:1` adds no query — while the same words on a line of a `{value}` do become entries, because loaded content takes the other road. Measured five ways; whix matches | see "The three spellings of a data value, and the two roads" above |
 | `ws://` / `wss://` / `tunnel://` "返回 502" for a plain HTTP request | it does, and the page is right — but only when the line is *read* as a destination. `127.0.0.1:8080 ws://host/x` is not: a bare host is no pattern to `indexOfPattern`, the `ws://` URL is, and the line swaps into "pattern `ws://host/x`, operator `host://127.0.0.1:8080`" (`_original/lib/rules/rules.js:1449-1467,:1774-1789`), which a plain request never matches | `cases.js`, the two "swaps into pattern and host" cases |
 | `delete://pathname` "删除请求路径（不包含请求参数）" | it deletes the path and then **doubles the query** | already recorded under [Deleting](#deleting) |
-| [`socks`](https://wproxy.org/docs/rules/socks.html) gives the default port as **443** | `1080`, from the one line that assigns all three — `isSocks ? 1080 : isHttpsProxy ? 443 : 80` (`_original/lib/inspectors/res.js:284`). The 443 looks copied from the `https-proxy` page | whistle-rs uses 1080; `src/proxy/upstream.rs` |
+| [`socks`](https://wproxy.org/docs/rules/socks.html) gives the default port as **443** | `1080`, from the one line that assigns all three — `isSocks ? 1080 : isHttpsProxy ? 443 : 80` (`_original/lib/inspectors/res.js:284`). The 443 looks copied from the `https-proxy` page | whix uses 1080; `src/proxy/upstream.rs` |
 | [`enable`](https://wproxy.org/docs/rules/enable.html) lists `forceResWrite` beside `forceReqWrite`, one per side | there is no `forceResWrite` in the program. `forceReqWrite` is read on **both** sides — the response dump obeys the request-shaped name (`_original/lib/inspectors/req.js:604`, `res.js:1300`) | the flag table under [Flags](#the-flags-this-port-does-not-implement) |
 | [`socks`](https://wproxy.org/docs/rules/socks.html), [`https-proxy`](https://wproxy.org/docs/rules/https-proxy.html) and others print `enable://captureIp` as the way to decrypt an HTTPS request to an IP | it is, but only once whistle is decrypting at all: `enable://captureIp` alone does not turn interception on, so on a default install the connection is relayed either way. `enable://capture` is the one that does both. Measured on both proxies with the console switch off and on | [Not decrypting a connection](#not-decrypting-a-connection) |
-| [`auth`](https://wproxy.org/docs/rules/auth.html) form 2: a ```` ``` ```` block holding `username: admin` / `password: …`, referenced as `auth://{custom-key}` | the block's content *is* the value by the time `getAuthByRules` sees it, and it has no slash, so the colon splits it: the username becomes the literal `username` and the password the rest of the file. A **file** in that same format works, because a path has a slash and takes the other road. Measured on both proxies; whistle-rs matches | [`auth://`](#auth-in-four-spellings) above; `cases-docs.js` |
+| [`auth`](https://wproxy.org/docs/rules/auth.html) form 2: a ```` ``` ```` block holding `username: admin` / `password: …`, referenced as `auth://{custom-key}` | the block's content *is* the value by the time `getAuthByRules` sees it, and it has no slash, so the colon splits it: the username becomes the literal `username` and the password the rest of the file. A **file** in that same format works, because a path has a slash and takes the other road. Measured on both proxies; whix matches | [`auth://`](#auth-in-four-spellings) above; `cases-docs.js` |
 
 The `ws://` row is the one worth remembering: the page is right, and the obvious
 way to test it is not — a bench case written as `<host:port> ws://…` is inert on
@@ -4209,7 +4209,7 @@ a `redirect://`, a `file://` mock, a preflight it answered. It says what a
 mocked response otherwise leaves open: this came from the proxy, not the
 origin.
 
-whistle-rs does the same and writes `whistle-rs`, because it is not whistle.
+whix does the same and writes `whix`, because it is not whistle.
 Tooling keying off the exact upstream value will not match, which is the right
 outcome — it is not talking to whistle.
 
@@ -4249,7 +4249,7 @@ tunnel is still relayed, where whistle would read it.
 **The far end is reached before the client is told the tunnel is open.** When
 the rule matches the address in the `CONNECT` itself (or interception is off, or
 the header asked),
-whistle-rs dials first and answers `200` only once the far end has answered, as
+whix dials first and answers `200` only once the far end has answered, as
 whistle does (`_original/lib/tunnel.js:637-695`). A name that does not resolve
 or a port that refuses leaves the `CONNECT` with **no reply at all**: the
 browser reports `ERR_TUNNEL_CONNECTION_FAILED`, and the console has a `CONNECT`
@@ -4344,7 +4344,7 @@ and the reason is architectural rather than a preference — see
 
 用 `file://`（以及 `rawfile`/`tpl`/`dust`/`jsonp` 和它们的 `x`/`xs` 变体）mock 一个
 API，而发起请求的页面在**另一个源**上时，whistle 会自己补上 CORS 头 —— 否则浏览器
-在任何代码看到响应之前就把它拒了。whistle-rs 现在同样如此
+在任何代码看到响应之前就把它拒了。whix 现在同样如此
 （`isAutoCors`，`_original/lib/handlers/file-proxy.js:178-191`）。
 
 触发条件就是请求带了 `Origin` 头。补的是 `resCors://enable` 那一套：回显请求自己的
@@ -4373,14 +4373,14 @@ The operators that rewrite a request body need it in memory, and the body is
 whatever the client decided to send. whistle bounds that at **2 MB**, raised to
 **16 MB** by `enable://reqMergeBigData` or by `lineProps://enableBigData` on the
 `reqMerge://` line (`MAX_REQ_SIZE` / `BIG_MAX_REQ_SIZE`,
-`_original/lib/inspectors/req.js:19-20,:163,:564`), and whistle-rs does the same.
+`_original/lib/inspectors/req.js:19-20,:163,:564`), and whix does the same.
 
 Past the ceiling the request is **not** failed and **not** truncated: the body
 streams on to the origin byte for byte, and only the rewriting stops —
 `reqBody`, `reqReplace`, `params`, `reqWrite`/`reqWriteRaw` and `reqSpeed` do not
 apply. That is upstream's `interrupt` (`handleParams`, `req.js:169-185`), and it
 is the right failure for a debugging proxy: traffic must not be damaged by the
-inspection of it. whistle-rs records it on the session — `unapplied`, kind
+inspection of it. whix records it on the session — `unapplied`, kind
 `request-body-over-limit`, naming the operators (`params://` only when it would
 have rewritten a form or JSON body) — and logs a `WARN`, so a rule that stopped
 applying above some size does not look like a rule that never matched. A
@@ -4400,7 +4400,7 @@ SSE is typically never, so the client would receive nothing at all.
 
 `resReplace://` still applies. It is the one body operator that does not need the
 whole body — it needs a window — so it travels with the stream, substituting as
-events arrive. whistle-rs holds back only a tail (just enough that a match
+events arrive. whix holds back only a tail (just enough that a match
 straddling a chunk boundary cannot be missed) and flushes through the end of each
 complete event, which is upstream's own mechanism
 (`_original/lib/util/replace-string-transform.js`,
@@ -4445,11 +4445,11 @@ travel with a stream are not named, because they ran.
 
 whistle does **not** verify the origin server's certificate: `rejectUnauthorized`
 is `false` by default and only `--safe` turns it on
-(`_original/lib/config.js:74`). whistle-rs inverts that default — it verifies,
+(`_original/lib/config.js:74`). whix inverts that default — it verifies,
 and `--insecure-upstream` opts out:
 
 ```bash
-whistle-rs --insecure-upstream      # accept self-signed / private-CA origins
+whix --insecure-upstream      # accept self-signed / private-CA origins
 ```
 
 Without it, a self-signed or private-CA origin returns **502** where whistle

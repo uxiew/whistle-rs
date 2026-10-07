@@ -2,7 +2,7 @@
 
 基线：`702486d` / 2026-09-25，2026-09-28 按 S1 更新访问规则，2026-09-29 按 O1 补上失败会话、按 O2 补上检索、游标、body 与出错的约定。接口来自 `src/proxy/webui.rs`（路由表 `handle`）和 `src/proxy/webui/` 下按领域分开的文件，现有调用与类型见 `ui-src/src/api.ts`。
 
-这是 whistle-rs 的控制接口，**不是官方 `/cgi-bin/*` 或 Node Local Agent API 的兼容层**。以下是现有路由与主要参数，不代表已承诺独立稳定的版本化 API。本文和路由表由测试双向核对（`api_doc_tests`）：加了路由没写进来、或者这里写了路由表里没有，测试都会失败。
+这是 whix 的控制接口，**不是官方 `/cgi-bin/*` 或 Node Local Agent API 的兼容层**。以下是现有路由与主要参数，不代表已承诺独立稳定的版本化 API。本文和路由表由测试双向核对（`api_doc_tests`）：加了路由没写进来、或者这里写了路由表里没有，测试都会失败。
 
 ## 地址与认证
 
@@ -76,7 +76,7 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8899/api/replay -d '{"id": 999999
 
 **导出和重放怎么说明"不完整"：**
 
-- HAR：没存全的 body 在 `content`（或请求的 `postData`）上多两个键：HAR 1.2 标准的 `comment`（如 `whistle-rs kept 10 of 100 bytes; the rest was not captured`），以及 `_truncated: true`。二进制和不是 UTF-8 的文本按 base64 导出（`encoding: "base64"`）。
+- HAR：没存全的 body 在 `content`（或请求的 `postData`）上多两个键：HAR 1.2 标准的 `comment`（如 `whix kept 10 of 100 bytes; the rest was not captured`），以及 `_truncated: true`。二进制和不是 UTF-8 的文本按 base64 导出（`encoding: "base64"`）。
 - Replay：返回里每个会话的 `body` 是 `whole`/`partial`/`empty`/`undecodable`；`partial` 只发存下的那段，`undecodable` 不发 body。
 - 控制台的"Copy as cURL"遇到没存全、二进制或解不开的请求体时不带 body，行尾用 shell 注释写明原因；"Edit & Resend"不把二进制标记当 body 填进去。
 
@@ -102,7 +102,7 @@ curl -s --noproxy '*' 'http://127.0.0.1:8899/api/sessions/search?c=b%3A%22succes
 
 | 做法 | 代理还记不记 | 接口、HAR、磁盘里有没有 |
 | --- | --- | --- |
-| 规则 `enable://hide` | **不记** | 都没有：列表、详情、检索、HAR、嵌入 API 的 `on_session`、磁盘历史里都查不到。失败时的 502 仍带 `x-whistle-rs-error`，但不带会话号 |
+| 规则 `enable://hide` | **不记** | 都没有：列表、详情、检索、HAR、嵌入 API 的 `on_session`、磁盘历史里都查不到。失败时的 502 仍带 `x-whix-error`，但不带会话号 |
 | `--no-persist` | 记在内存里 | 接口和 HAR 里有，磁盘上不写历史（根证书和规则照常写） |
 | 控制台检索框、Capture filter、按客户端筛选、只看标记 | 记 | 都有；只是控制台这一页不显示 |
 
@@ -123,10 +123,10 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 
 | 头 | 值 |
 | --- | --- |
-| `x-whistle-rs-error` | 停在哪一步，同 `error.phase` |
-| `x-whistle-rs-session` | 记成的会话号，拿它查 `/session.json?id=N` |
+| `x-whix-error` | 停在哪一步，同 `error.phase` |
+| `x-whix-session` | 记成的会话号，拿它查 `/session.json?id=N` |
 
-**判断一个 502 是谁回的，看有没有 `x-whistle-rs-error`**：没有就是源站自己回的，那条会话也没有 `error`。`x-server: whistle-rs` 分不出来 —— `statusCode://502` 这类规则回的也带它。规则主动丢弃的请求（`enable://abort` 等）不回任何响应，会话的 `phase` 是 `abort`、`status` 是 `0`。
+**判断一个 502 是谁回的，看有没有 `x-whix-error`**：没有就是源站自己回的，那条会话也没有 `error`。`x-server: whix` 分不出来 —— `statusCode://502` 这类规则回的也带它。规则主动丢弃的请求（`enable://abort` 等）不回任何响应，会话的 `phase` 是 `abort`、`status` 是 `0`。
 
 **一条会话什么时候出现、什么时候算完成：**
 
@@ -255,7 +255,7 @@ curl -s -X POST http://127.0.0.1:8899/api/switches -d '{"rules":true}'
 
 只存在内存里：最多 2000 条、总共 8 MiB，超了丢最旧的；重启就没了。
 
-页面是往自己域名下的 `/.whistle-rs/log` 发 POST 的，代理拦下来直接回 `204`，不转给源站，也不产生会话。这个路径不是给人调的。
+页面是往自己域名下的 `/.whix/log` 发 POST 的，代理拦下来直接回 `204`，不转给源站，也不产生会话。这个路径不是给人调的。
 
 Composer/Replay 的调用会产生网络请求并经过代理规则；不能当作只读查询。Composer 接受任务的响应不是源站已经成功完成的证明：结果看它在列表里的那条会话，失败时那条会话的 `error` 说明原因。重复调用执行接口可能重复产生业务副作用，当前不要假定提供幂等键。
 

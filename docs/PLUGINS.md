@@ -2,7 +2,7 @@
 
 [项目说明](../README.md) · [架构](ARCHITECTURE.md) · [规则](RULES.md)
 
-whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
+whix 的插件是**按请求生效的中间件**。一个插件可以：
 
 - **注入规则** —— 动态产生 whistle 规则，合并进本次请求的规则集
 - **直接应答** —— 短路上游，返回一个 mock 响应
@@ -46,7 +46,7 @@ whistle-rs 的插件是**按请求生效的中间件**。一个插件可以：
 WebSocket 帧钩子**两种协议名都能触发**：一个 WebSocket 没有「缓冲 / 流式」之分可供协议名表达，
 让其中一个悄悄不生效只会变成陷阱。协议名依然决定**握手请求**（它就是个普通 HTTP 请求）跑哪一族。
 
-> 这是 whistle-rs **自研**的插件体系，不是原版 whistle 插件 API 的复刻。现成的
+> 这是 whix **自研**的插件体系，不是原版 whistle 插件 API 的复刻。现成的
 > `npm i whistle.xxx` 包无法直接运行 —— 原版 API 建立在对 Node `req`/`res` 对象的
 > 装饰之上（约 2600 行加载器、位置式 CSV 头协议、单端口多钩子分发）。这里换成了一套
 > 显式、有类型、语言无关的协议。
@@ -57,7 +57,7 @@ WebSocket 帧钩子**两种协议名都能触发**：一个 WebSocket 没有「�
 
 ```js
 // my-plugin.js
-const { start } = require('whistle-rs/sdk/whistle-rs-plugin');
+const { start } = require('whix/sdk/whix-plugin');
 
 start({
   name: 'my-plugin',
@@ -71,7 +71,7 @@ start({
   },
 
   onResponse(ctx) {
-    ctx.setHeader('x-powered-by', 'whistle-rs');
+    ctx.setHeader('x-powered-by', 'whix');
   },
 });
 ```
@@ -79,7 +79,7 @@ start({
 启动：
 
 ```bash
-whistle-rs --node-plugin my-plugin=./my-plugin.js
+whix --node-plugin my-plugin=./my-plugin.js
 ```
 
 规则里引用：
@@ -96,7 +96,7 @@ example.com/mock   plugin://my-plugin/mock
 SDK 自带 `.d.ts`，钩子、上下文、能力开关全部有类型。推荐 `satisfies Plugin` —— 既校验形状，又保留精确的类型：
 
 ```ts
-import { start, type Plugin, type RequestCtx, type ResponseCtx } from 'whistle-rs/sdk/whistle-rs-plugin';
+import { start, type Plugin, type RequestCtx, type ResponseCtx } from 'whix/sdk/whix-plugin';
 
 const plugin = {
   name: 'typed',
@@ -119,7 +119,7 @@ start(plugin);
 
 ```bash
 npx tsc my-plugin.ts --outDir dist --module commonjs --target es2020
-whistle-rs --node-plugin typed=dist/my-plugin.js
+whix --node-plugin typed=dist/my-plugin.js
 ```
 
 完整示例见 [`examples/plugins/typed.ts`](../examples/plugins/typed.ts)。
@@ -128,7 +128,7 @@ whistle-rs --node-plugin typed=dist/my-plugin.js
 
 ## 能力声明与性能（重要）
 
-whistle-rs **默认不缓冲任何 body**：请求体和响应体都是流式穿过代理的，SSE、大文件下载、长轮询都不受影响。
+whix **默认不缓冲任何 body**：请求体和响应体都是流式穿过代理的，SSE、大文件下载、长轮询都不受影响。
 
 只有当插件**显式声明**需要 body 时，代理才会缓冲：
 
@@ -157,7 +157,7 @@ start({
 `onResponse` 想看 body 就得等它收完。流式钩子不用等：body 的每一片到达时就交给插件，插件吐出来的字节直接继续往下走，**代理和插件两端都不缓冲**。
 
 ```js
-const { start, transform } = require('whistle-rs/sdk/whistle-rs-plugin');
+const { start, transform } = require('whix/sdk/whix-plugin');
 
 start({
   name: 'events',
@@ -256,7 +256,7 @@ $ node timestamped-get.js http://127.0.0.1:18081/buffered 127.0.0.1:18913  # plu
 WebSocket 的单位既不是「一个请求」也不是「一条字节流」，而是**一帧**，所以它有自己的钩子：
 
 ```js
-const { start } = require('whistle-rs/sdk/whistle-rs-plugin');
+const { start } = require('whix/sdk/whix-plugin');
 
 start({
   name: 'wschat',
@@ -422,7 +422,7 @@ SERVER  saw cont   fin=true  "ment"
 一个插件决定这个请求**放不放行**。返回 `false` 就是拦下来。
 
 ```js
-const { start } = require('whistle-rs/sdk/whistle-rs-plugin');
+const { start } = require('whix/sdk/whix-plugin');
 
 start({
   name: 'gate',
@@ -462,7 +462,7 @@ Rust 版本见 [`src/plugins/builtin.rs`](../src/plugins/builtin.rs) 里的 `plu
 
 对应原版的 `req.setHtml` / `setRedirect` / `setUrl` / `setFile` / `setLogin`。原版把拦截翻译成
 三条合成规则（`lib/plugins/index.js:936-959`：`method://get <url>`、`redirect://<url>`、
-`status:// + resBody://`），whistle-rs 直接渲染成响应 —— 合成规则在原版存在，是因为拦截结果必须
+`status:// + resBody://`），whix 直接渲染成响应 —— 合成规则在原版存在，是因为拦截结果必须
 重新汇入一条只认规则的管线，所以每条都用 `ignore://` 钉死；这里少一层机器就到同一个地方，而且
 **直接应答会终止插件链**，那才是关键的部分。
 
@@ -493,7 +493,7 @@ Rust 版本见 [`src/plugins/builtin.rs`](../src/plugins/builtin.rs) 里的 `plu
 
 最后一行是 2026-09-30 加的。之前 `/manifest` 第一次失败会被**永久**记成"老协议、没有认证钩子"：
 插件启动慢了半秒、第一次回了 `503`，从此命中它的请求全部直达源站，`/auth` 再也不会被调用，插件
-恢复正常也没用，要重启 whistle-rs 才行。现在失败不记成任何结论，最多每秒重新问一次，问到为止。
+恢复正常也没用，要重启 whix 才行。现在失败不记成任何结论，最多每秒重新问一次，问到为止。
 
 原版从另一个方向落到同一处：它的 `authReq` 把传输错误和主动拒绝一视同仁（`if (err || body)` →
 forbidden，`lib/plugins/index.js:836`），并且给错误 `502`、给主动拒绝 `403`
@@ -504,7 +504,7 @@ forbidden，`lib/plugins/index.js:836`），并且给错误 `502`、给主动拒
 ```
 $ curl -i -x 127.0.0.1:19181 -H 'x-gate-token: s3cret' http://127.0.0.1:19180/open
 HTTP/1.1 502 Bad Gateway
-x-whistle-rs-auth: tokengate
+x-whix-auth: tokengate
 content-type: text/html; charset=utf-8
 
 Plugin auth failed: connecting to 127.0.0.1:61043: Connection refused (os error 61)
@@ -560,7 +560,7 @@ fn auth(&self, req: &PluginReq) -> AuthVerdict {
 在一条被拦截的 TLS 连接的**握手期**，由插件决定这条连接用哪张证书 —— 或者**根本不拦它**。
 
 ```js
-const { start } = require('whistle-rs/sdk/whistle-rs-plugin');
+const { start } = require('whix/sdk/whix-plugin');
 
 start({
   name: 'certs',
@@ -605,7 +605,7 @@ method / 路径 / 头 / body 的筛选器都不会命中一条 `sniCallback` 行
 | 返回 | 结果 |
 |------|------|
 | `false` | **不拦截。** 连接原样中继出去，客户端和源站自己协商 TLS，代理看不见里面。去哪仍由 `host://` / `proxy://` 决定 |
-| `true` | 拦截，用 whistle-rs 自己签的证书（和没有这条规则时一样）；并**作废**你之前给的那张 |
+| `true` | 拦截，用 whix 自己签的证书（和没有这条规则时一样）；并**作废**你之前给的那张 |
 | `{key, cert, mtime?}` | 拦截，用这张证书。两个字段都必须是非空字符串（PEM） |
 | `ctx.reuse()` | 拦截，用**你上次给的那张**。代理没有缓存时退回自签的那张 |
 | 不返回 / 返回别的 | 等同于 `true` |
@@ -637,7 +637,7 @@ method / 路径 / 头 / body 的筛选器都不会命中一条 `sniCallback` 行
 
 ### 出错了会怎样 —— 以及为什么这是一次**政策选择**
 
-**结论先说：任何失败都退回「whistle-rs 自签的那张证书」**，也就是和没有这条规则时一模一样，
+**结论先说：任何失败都退回「whix 自签的那张证书」**，也就是和没有这条规则时一模一样，
 日志里留一行 `WARN` 写清是哪个插件、哪个名字。畸形的证书材料（PEM 解析不了、key 和 cert
 不配对）同样如此 —— rustls 在**采用之前**就会拒绝它，所以一个乱答的插件弄不垮监听器。
 
@@ -648,7 +648,7 @@ method / 路径 / 头 / body 的筛选器都不会命中一条 `sniCallback` 行
 - *不要拿出运维没有批准的证书* → 失败就该**停止拦截**（等同于插件说了 `false`）；
 - *不要悄悄停止抓取运维要求抓的流量* → 失败就该**照常拦截**，用本来就会用的那张证书。
 
-whistle-rs 选了后者，理由有两条：退回去的那张证书是**它自己的**、由用户亲手装进信任库的
+whix 选了后者，理由有两条：退回去的那张证书是**它自己的**、由用户亲手装进信任库的
 根签的 —— 它不是第三方的身份，而且给每一个别的主机拿出来的正是这张；另一条是，选前者会让
 一次插件重启在抓包里凿出一个**看起来完全正常**的洞。原版落在同一处
 （`loadCert` 的错误分支保留缓存、否则落到自签，`lib/plugins/index.js:245-247`）。
@@ -716,8 +716,8 @@ localhost:19444   sniCallback://certs
 --- the three connections ---
 [1] sniCallback://certs(mine)   the plugin supplies a certificate
    SNI sent    localhost
-   subject     CN=localhost,O=whistle-rs sniCallback example
-   issuer      CN=localhost,O=whistle-rs sniCallback example
+   subject     CN=localhost,O=whix sniCallback example
+   issuer      CN=localhost,O=whix sniCallback example
    response    HTTP/1.1 200 OK  {"origin":true,"port":19443,"url":"/hello",…}
 
 [2] sniCallback://certs         the plugin declines interception
@@ -729,7 +729,7 @@ localhost:19444   sniCallback://certs
 [3] no rule                     control, untouched
    SNI sent    localhost
    subject     CN=localhost
-   issuer      CN=whistle-rs Root CA,O=whistle-rs
+   issuer      CN=whix Root CA,O=whix
    response    HTTP/1.1 200 OK  {"origin":true,"port":19445,"url":"/hello",…}
 
 --- what the proxy captured ---
@@ -852,7 +852,7 @@ UI 请求本来就是一个 HTTP 请求配一个 HTTP 应答，所以这个钩�
 （带规则、会话信息、原始请求/响应的完整装饰对象），而 UI 钩子只拿 `setContext(req)` ——
 挂上存储，以及调用方传了会话头时的客户端地址（`load-plugin.js:160-200`、`:2019-2024`）。
 
-whistle-rs 照做：插件收到的就是**浏览器自己那个请求**，别的没有。理由不是省事 —— UI 请求是
+whix 照做：插件收到的就是**浏览器自己那个请求**，别的没有。理由不是省事 —— UI 请求是
 浏览器在向插件要一张页面，它不属于任何人的代理流量，硬塞一个请求上下文进去等于凭空发明一段
 根本不存在的关联。想展示抓到的流量，就在**真的看得见流量**的钩子里（`onRequest`、`onResStats`）
 攒起来，再从自己的状态里渲染 —— 原版插件也正是这么写的。
@@ -956,7 +956,7 @@ start({
 - 规则是随 manifest 一起拿到并缓存的，插件改了规则要**重启代理**才会生效。
 - 插件被关掉（见[被关掉的插件](#被关掉的插件)）时，它的规则也一起失效。
 
-**管不到的地方**（这几处只看控制台的规则）：决定 HTTPS 隧道拦不拦的那一步（`disable://intercept`、`sniCallback://` 写在插件规则里不起作用）、控制台的 Test Rules 和 `whistle-rs explain`。
+**管不到的地方**（这几处只看控制台的规则）：决定 HTTPS 隧道拦不拦的那一步（`disable://intercept`、`sniCallback://` 写在插件规则里不起作用）、控制台的 Test Rules 和 `whix explain`。
 
 ### 上游的 `resRulesServer`，在这里怎么做
 
@@ -1194,7 +1194,7 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 应答 `200`，四种形状：
 
 ```json
-{"intercept": true}                        // 用 whistle-rs 自签的那张
+{"intercept": true}                        // 用 whix 自签的那张
 {"intercept": false}                       // 不拦截，原样中继
 {"key": "…", "cert": "…", "mtime": 0}      // 用这张（PEM，两个字段都必须非空）
 {"reuse": true}                            // 用这个插件上次给的那张
@@ -1229,7 +1229,7 @@ SDK 做了隔离：钩子抛异常会被记录到插件自己的 stderr，并按
 
 ```
 POST /pipe/response HTTP/1.1
-x-whistle-rs-pipe: eyJpZCI6NDIsIm1ldGhvZCI6IkdFVCIsInVybCI6Imh0dHA6Ly8uLi4ifQ==
+x-whix-pipe: eyJpZCI6NDIsIm1ldGhvZCI6IkdFVCIsInVybCI6Imh0dHA6Ly8uLi4ifQ==
 transfer-encoding: chunked
 
 <body 字节，边到边发>
@@ -1259,7 +1259,7 @@ base64 编码的 JSON：
 
 ```
 POST /ws/frames HTTP/1.1
-x-whistle-rs-ws: eyJpZCI6NDIsImRpcmVjdGlvbiI6InNlbmQiLCJ1cmwiOiJ3czovLy4uLiJ9
+x-whix-ws: eyJpZCI6NDIsImRpcmVjdGlvbiI6InNlbmQiLCJ1cmwiOiJ3czovLy4uLiJ9
 transfer-encoding: chunked
 ```
 
@@ -1295,7 +1295,7 @@ JSON/base64 信封则每个二进制帧要涨三分之一，还得走一遍它�
 
 原版 whistle 建立管道的方式是：向插件端口发 `CONNECT`，等 `200 Connection Established`，再写一个 `'1'` 字节做确认，然后用自定义的长度前缀分帧收发 body（`'\n' + 长度 + '\n' + 负载`，EOF 是 `'\n0\n'`，见 `lib/util/transproto.js`）。
 
-whistle-rs **有意不复刻这一套**：
+whix **有意不复刻这一套**：
 
 - 本项目的插件协议本来就是自研的（JSON over HTTP + `/manifest` 能力声明），插件是照着**我们的** SDK 写的，与原版的线上兼容换不来任何东西；
 - HTTP/1.1 的 chunked 编码**就是** transproto 重新发明的那种长度前缀分帧，而且 hyper 和 Node 两端都已经实现好了 —— 不用自己写分帧层，就没有自己写错分帧层的机会；
@@ -1318,23 +1318,23 @@ whistle-rs **有意不复刻这一套**：
 ## 注册插件
 
 ```bash
-# 由 whistle-rs 拉起 Node 进程（自动分配端口）
-whistle-rs --node-plugin name=./path/to/plugin.js
+# 由 whix 拉起 Node 进程（自动分配端口）
+whix --node-plugin name=./path/to/plugin.js
 
 # 指向一个已在运行的插件服务
-whistle-rs --plugin name=127.0.0.1:9000
+whix --plugin name=127.0.0.1:9000
 ```
 
-`--node-plugin` 会以环境变量 `WHISTLE_RS_PLUGIN_PORT` 和 `WHISTLE_RS_PLUGIN_NAME` 启动 `node <path>`，并等插件开始监听后才开始服务，几个插件一起最多等 5 秒。插件进程在监听之前就退出了（比如加载时抛异常），就不再等它，日志写 `WARN node plugin 'name' not ready (exited (exit status: 1) before it was listening); continuing`，代理照常启动。以前这种插件也要等满 5 秒（2026-10-07 修，R6-02）。`node` 须在 `PATH` 上，找不到时 whistle-rs 直接报错退出。
+`--node-plugin` 会以环境变量 `WHIX_PLUGIN_PORT` 和 `WHIX_PLUGIN_NAME` 启动 `node <path>`，并等插件开始监听后才开始服务，几个插件一起最多等 5 秒。插件进程在监听之前就退出了（比如加载时抛异常），就不再等它，日志写 `WARN node plugin 'name' not ready (exited (exit status: 1) before it was listening); continuing`，代理照常启动。以前这种插件也要等满 5 秒（2026-10-07 修，R6-02）。`node` 须在 `PATH` 上，找不到时 whix 直接报错退出。
 
-**插件进程随 whistle-rs 一起退出：**
+**插件进程随 whix 一起退出：**
 
-| whistle-rs 怎么停的 | 插件 |
+| whix 怎么停的 | 插件 |
 | --- | --- |
-| Ctrl+C、`kill`（SIGTERM）；Windows 上 Ctrl+C、Ctrl+Break、关控制台窗口（Windows 这几种没有实测：CI 只能从外面强杀进程） | whistle-rs 先把已完成的会话写完盘，再结束插件进程，自己以退出码 0 退出 |
-| `kill -9`、`taskkill /F`、崩溃（whistle-rs 自己的代码一行都跑不到） | 用 SDK 写的插件自己退出：whistle-rs 给插件的 stdin 是一根只有它握着的管道，它一没，操作系统就关掉管道，SDK 读到结尾就退出（环境变量 `WHISTLE_RS_PLUGIN_STDIN=lifeline` 表示 stdin 是这根管道） |
+| Ctrl+C、`kill`（SIGTERM）；Windows 上 Ctrl+C、Ctrl+Break、关控制台窗口（Windows 这几种没有实测：CI 只能从外面强杀进程） | whix 先把已完成的会话写完盘，再结束插件进程，自己以退出码 0 退出 |
+| `kill -9`、`taskkill /F`、崩溃（whix 自己的代码一行都跑不到） | 用 SDK 写的插件自己退出：whix 给插件的 stdin 是一根只有它握着的管道，它一没，操作系统就关掉管道，SDK 读到结尾就退出（环境变量 `WHIX_PLUGIN_STDIN=lifeline` 表示 stdin 是这根管道） |
 
-不用 SDK 的插件要自己照做：`WHISTLE_RS_PLUGIN_STDIN` 为 `lifeline` 时读 stdin，读到结尾就退出。不这么做，whistle-rs 被强杀后插件还会一直占着端口，下次启动分到的新端口不受影响，但旧进程要手动结束。以前（2026-09-29 之前）连 `kill` 也会留下插件进程，只有终端里的 Ctrl+C 能带走它们，因为 Ctrl+C 发给整个进程组。
+不用 SDK 的插件要自己照做：`WHIX_PLUGIN_STDIN` 为 `lifeline` 时读 stdin，读到结尾就退出。不这么做，whix 被强杀后插件还会一直占着端口，下次启动分到的新端口不受影响，但旧进程要手动结束。以前（2026-09-29 之前）连 `kill` 也会留下插件进程，只有终端里的 Ctrl+C 能带走它们，因为 Ctrl+C 发给整个进程组。
 
 **插件进程自己退出了（崩溃、被杀、`process.exit`）：** 下一个要用它的请求会重新拉起它，并等它起来再发过去，和上游一样。日志里先有一条 `WARN node plugin 'name' exited (exit status: 1)…`，再有一条 `started again`。具体是：
 
@@ -1342,8 +1342,8 @@ whistle-rs --plugin name=127.0.0.1:9000
 - 同一个插件最多每秒拉起一次。
 - 请求最多等 5 秒。等不到就按[错误处理](#错误处理)里"插件连不上"算：钩子跳过、会话记 `plugin-failed`，还没取到 `/manifest` 的插件和认证插件则 `502`。
 - 拉起的进程在监听之前就退出了，等它的请求立刻按"插件连不上"处理，原因写明退出码，比如 `the plugin's process is not running: it exited (exit status: 1) before it was listening`；之后 1 秒内来的请求直接拿到这个原因，不再拉起。一个加载就抛异常的插件，复核时每 200 ms 一个请求、持续 12 秒，最长 68 ms 就拿到 502；以前中位 5 秒（2026-10-07 修，R6-02）。
-- 每次拉起都换一个当时空着的端口，`WHISTLE_RS_PLUGIN_PORT` 跟着变，日志的 `started again on 127.0.0.1:<端口>` 写明是哪个。SDK 每次启动都读这个变量，不用改什么。为什么换：进程没了以后，旧端口谁都能占；以前沿用旧端口时，新进程绑不上、马上退出，可"端口能连上"已经成立，请求连同 URL 和 `Authorization` 被发给了占端口的那个程序，然后照常去了源站（2026-10-07 修，R6-01）。插件不在的时候，代理也不会再往旧端口发任何东西，统计钩子的调用那段时间直接丢掉。
-- 只管 `--node-plugin`。`--plugin name=host:port` 指向的进程不归 whistle-rs 管，它退出了就是连不上。
+- 每次拉起都换一个当时空着的端口，`WHIX_PLUGIN_PORT` 跟着变，日志的 `started again on 127.0.0.1:<端口>` 写明是哪个。SDK 每次启动都读这个变量，不用改什么。为什么换：进程没了以后，旧端口谁都能占；以前沿用旧端口时，新进程绑不上、马上退出，可"端口能连上"已经成立，请求连同 URL 和 `Authorization` 被发给了占端口的那个程序，然后照常去了源站（2026-10-07 修，R6-01）。插件不在的时候，代理也不会再往旧端口发任何东西，统计钩子的调用那段时间直接丢掉。
+- 只管 `--node-plugin`。`--plugin name=host:port` 指向的进程不归 whix 管，它退出了就是连不上。
 
 以前（2026-10-06 之前）插件进程一退出就再也不回来，钩子一直失败，请求不经过插件照常转发。一个自己应答请求的插件崩掉之后，所有请求都直接到了真实源站。
 
