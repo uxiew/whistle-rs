@@ -17,7 +17,7 @@
 //   --allow-stale     run even if the whix binary is older than its source
 //   --whistle V       measure against whistle V instead of the baseline in
 //                     package.json; V needs a lockfile of its own under
-//                     versions/V (see the README, "Which whistle, though")
+//                     versions/V (see the README, "到底对照的是哪个 whistle")
 //   --assume-baseline with --whistle: hold V to the baseline's declarations,
 //                     so what fails is what moved between the two releases
 //

@@ -48,7 +48,7 @@ jobs:
           key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - run: npm ci --prefix tests/differential
       # The second release, from a lockfile of its own — see
-      # tests/differential/README.md, "Which whistle, though".
+      # tests/differential/README.md, "到底对照的是哪个 whistle".
       - run: npm ci --prefix tests/differential/versions/2.10.10
       - run: cargo build --locked
       # Both runs, then the comparison, whatever the first one said: a release
