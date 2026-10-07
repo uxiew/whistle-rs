@@ -94,6 +94,18 @@ Error: /Users/you/.whix is in use by another whix (pid 4242, listening on http:/
 
 新版本读得懂旧版本写的数据：0.1.0 写下的历史、规则组（顺序、开关、文本）、Values，换成之后的版本都要原样读回来，根证书不变，客户端不用重新信任。这一条由测试守着（`tests/data_compat.rs`，用 0.1.0 实际写出的目录 `tests/data/0.1.0/`）：以后哪个版本读不回来，测试就失败，要么写迁移，要么在这里写明哪些数据不再兼容。
 
+**从 whistle-rs 升级。** 2026-10-07 起项目改名为 whix，二进制、默认数据目录、环境变量都换了名字，旧名字一概不再读取。换成 whix 前做两件事：
+
+```sh
+mv ~/.whistle-rs ~/.whix          # Windows：move %USERPROFILE%\.whistle-rs %USERPROFILE%\.whix
+```
+
+然后把启动脚本、服务配置里的 `WHISTLE_RS_PASSWORD`、`WHISTLE_RS_GUEST_PASSWORD` 改成 `WHIX_PASSWORD`、`WHIX_GUEST_PASSWORD`。
+
+- 不挪目录：whix 在 `~/.whix` 生成一张新的根证书，规则、Values、历史都是空的。客户端只信任旧证书，HTTPS 页面会报证书错误，看着像拦截坏了，其实是证书换了。这时停掉 whix，删掉新生成的 `~/.whix`，再照上面挪一次。
+- 不改环境变量：控制台不要求登录。对外监听（`-H 0.0.0.0`）时，启动日志会有一条 `WARN listening on … with no console login`，局域网里谁都能打开控制台、改规则。
+- 自己写的插件里如果 `require` 了 `whistle-rs-plugin`，改成 `sdk/whix-plugin.js`；读 `WHISTLE_RS_PLUGIN_PORT` 的改成 `WHIX_PLUGIN_PORT`。
+
 **降级**（换回旧版本）不保证，但不会悄悄丢数据：
 
 - 旧版本不认识的字段直接跳过（有测试确认新增字段不会让读取失败）；
