@@ -969,6 +969,20 @@ impl RemotePlugin {
         }
     }
 
+    /// What the plugin has said it is, for describing it: the console's list,
+    /// its index of plugin pages. A kept process that is down is neither asked
+    /// for nor waited on, since nothing here needs it to run. Opening the
+    /// status page used to start a broken plugin every time, and wait 5 s for
+    /// it before a failed start could be told.
+    async fn described(&self) -> Option<PluginManifest> {
+        if let Some(keeper) = &self.keeper
+            && !keeper.is_up()
+        {
+            return self.known_manifest().cloned();
+        }
+        self.manifest().await.ok().cloned()
+    }
+
     /// Ask the plugin what it is. `Err` is "could not find out".
     async fn discover(&self) -> Result<PluginManifest, String> {
         let url = format!("{}/manifest", self.address()?);
@@ -1647,7 +1661,7 @@ impl Plugins {
     pub async fn declared(&self, name: &str) -> Option<PluginManifest> {
         match self.map.get(name)? {
             PluginKind::Rust(p) => Some(p.manifest()),
-            PluginKind::Remote(r) => r.manifest().await.ok().cloned(),
+            PluginKind::Remote(r) => r.described().await,
         }
     }
 
@@ -2720,6 +2734,28 @@ mod tests {
             let asked =
                 tokio::time::timeout(std::time::Duration::from_millis(300), keeper.needed()).await;
             assert!(asked.is_err(), "warming up asked for the plugin");
+        });
+    }
+
+    /// Describing a kept plugin that is down (the console's status, its index
+    /// of plugin pages) neither asks for its process nor waits for it.
+    #[test]
+    fn describing_a_kept_plugin_does_not_start_it() {
+        rt().block_on(async {
+            let keeper = Keeper::new();
+            let mut plugins = Plugins::new();
+            plugins.register_kept("p", keeper.clone());
+            let started = std::time::Instant::now();
+            assert!(plugins.declared("p").await.is_none());
+            assert!(!plugins.ui_names().await.iter().any(|n| n == "p"));
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(500),
+                "took {took:?}"
+            );
+            let asked =
+                tokio::time::timeout(std::time::Duration::from_millis(100), keeper.needed()).await;
+            assert!(asked.is_err(), "describing it asked for its process");
         });
     }
 
