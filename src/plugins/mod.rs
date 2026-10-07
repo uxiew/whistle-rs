@@ -585,30 +585,59 @@ const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// "the port answers" sent a request's URL and `Authorization` to that program
 /// and the request on to the origin. Upstream's children report their own
 /// ports, which cannot be mistaken that way.
+///
+/// And it says when a start **failed** — the process exited before it ever
+/// listened — so that the calls waiting on it are told at once. They used to
+/// wait out [`RESTART_WAIT`] for a process that was already gone: a plugin
+/// that threw as it loaded held each request 5 s for its `502`, and under
+/// steady traffic half of them, while upstream knew in 0.1 s.
 #[derive(Clone)]
 pub struct Keeper {
-    /// The port while the process listens on it; `None` while it does not.
-    up: Arc<tokio::sync::watch::Sender<Option<u16>>>,
+    life: Arc<tokio::sync::watch::Sender<Life>>,
     wanted: Arc<tokio::sync::Notify>,
 }
+
+/// What a [`Keeper`] knows of its process.
+#[derive(Clone, Debug)]
+enum Life {
+    /// Not listening: not started yet, starting, or gone after it ran.
+    Down,
+    /// Listening on this port of `127.0.0.1`.
+    Up(u16),
+    /// The last start ended before the process listened: why, and when.
+    Failed(String, std::time::Instant),
+}
+
+/// At most one start of the same kept plugin per this long. A plugin that dies
+/// as soon as it starts is then started once a second while requests keep
+/// asking for it, not once per request — and a call that comes within this
+/// long of a failed start is told that failure instead of asking again.
+pub const RESTART_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Keeper {
     /// Down until [`Keeper::set_up`] says otherwise.
     pub fn new() -> Self {
         Keeper {
-            up: Arc::new(tokio::sync::watch::channel(None).0),
+            life: Arc::new(tokio::sync::watch::channel(Life::Down).0),
             wanted: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     /// The process is listening on `port` of `127.0.0.1`.
     pub fn set_up(&self, port: u16) {
-        self.up.send_replace(Some(port));
+        self.life.send_replace(Life::Up(port));
     }
 
     /// The process has gone. Its port is nobody's now, and nothing dials it.
     pub fn set_down(&self) {
-        self.up.send_replace(None);
+        self.life.send_replace(Life::Down);
+    }
+
+    /// The process exited before it listened, for the reason `why` — its exit
+    /// status, typically. Every call waiting on this start fails with it.
+    pub fn set_failed(&self, why: String) {
+        self.life
+            .send_replace(Life::Failed(why, std::time::Instant::now()));
     }
 
     /// Wait until a call needs the process while it is down. A call made
@@ -617,28 +646,75 @@ impl Keeper {
         self.wanted.notified().await;
     }
 
+    /// Wait up to `limit` for the start under way to settle: the port it
+    /// listens on, or why it will not. For a proxy starting up, which waits
+    /// for its plugins so that the first requests find them, and must not wait
+    /// for one that has already died.
+    pub async fn started(&self, limit: std::time::Duration) -> Result<u16, String> {
+        let settled = settle(&self.life, limit, |l| {
+            matches!(l, Life::Up(_) | Life::Failed(..))
+        })
+        .await;
+        match settled {
+            Some(Life::Up(port)) => Ok(port),
+            Some(Life::Failed(why, _)) => Err(why),
+            _ => Err(format!("not listening after {limit:?}")),
+        }
+    }
+
     fn port(&self) -> Option<u16> {
-        *self.up.borrow()
+        match *self.life.borrow() {
+            Life::Up(port) => Some(port),
+            _ => None,
+        }
     }
 
     fn is_up(&self) -> bool {
         self.port().is_some()
     }
 
-    /// Ask for the process if it is down, and wait up to `limit` for it.
+    /// Ask for the process if it is down, and wait up to `limit` for it — or
+    /// until the start this call asked for fails, which it says at once.
     async fn ready(&self, limit: std::time::Duration) -> Result<(), String> {
-        if self.is_up() {
-            return Ok(());
+        let asked = std::time::Instant::now();
+        match &*self.life.borrow() {
+            Life::Up(_) => return Ok(()),
+            Life::Failed(why, at) if at.elapsed() < RESTART_GAP => return Err(failed_start(why)),
+            _ => {}
         }
         self.wanted.notify_one();
-        let mut up = self.up.subscribe();
-        match tokio::time::timeout(limit, up.wait_for(Option::is_some)).await {
-            Ok(Ok(_)) => Ok(()),
+        // A failure from before this call is an older start's, not the answer.
+        let settled = settle(&self.life, limit, |l| match l {
+            Life::Up(_) => true,
+            Life::Failed(_, at) => *at > asked,
+            Life::Down => false,
+        })
+        .await;
+        match settled {
+            Some(Life::Up(_)) => Ok(()),
+            Some(Life::Failed(why, _)) => Err(failed_start(&why)),
             _ => Err(format!(
                 "the plugin's process is not running, and did not start again within {limit:?}"
             )),
         }
     }
+}
+
+/// Wait up to `limit` for `life` to be something `done` accepts, and say what
+/// it was; `None` if the time ran out first.
+async fn settle(
+    life: &tokio::sync::watch::Sender<Life>,
+    limit: std::time::Duration,
+    done: impl FnMut(&Life) -> bool,
+) -> Option<Life> {
+    let mut life = life.subscribe();
+    let seen = tokio::time::timeout(limit, life.wait_for(done)).await;
+    seen.ok().and_then(Result::ok).map(|l| (*l).clone())
+}
+
+/// What a call is told about a start that failed.
+fn failed_start(why: &str) -> String {
+    format!("the plugin's process is not running: it {why}")
 }
 
 impl Default for Keeper {
@@ -829,8 +905,8 @@ impl RemotePlugin {
     /// Does not ask for it.
     async fn up(&self) {
         if let Some(keeper) = &self.keeper {
-            let mut up = keeper.up.subscribe();
-            let _ = up.wait_for(Option::is_some).await;
+            let mut life = keeper.life.subscribe();
+            let _ = life.wait_for(|l| matches!(l, Life::Up(_))).await;
         }
     }
 
@@ -2530,6 +2606,78 @@ mod tests {
             assert!(started.elapsed() < std::time::Duration::from_secs(5));
             let why = out.failure.expect("blocked, and why");
             assert!(why.contains("not running"), "{why}");
+        });
+    }
+
+    /// A start that fails — the process exits before it listens — is told to
+    /// the calls waiting on it at once, with the exit status. They used to wait
+    /// out the whole [`RESTART_WAIT`] for a process that was already gone.
+    #[test]
+    fn a_failed_start_is_told_to_its_waiters_at_once() {
+        rt().block_on(async {
+            let keeper = Keeper::new();
+            let plugin = RemotePlugin::kept("p", keeper.clone());
+            let starter = keeper.clone();
+            tokio::spawn(async move {
+                starter.needed().await;
+                // Node starting, and throwing as the plugin loads.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                starter.set_failed("exited (exit status: 3) before it was listening".into());
+            });
+            let started = std::time::Instant::now();
+            let out = plugin.on_request(&req()).await;
+            let took = started.elapsed();
+            assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+            let why = out.failure.expect("blocked, and why");
+            assert!(why.contains("exit status: 3"), "{why}");
+        });
+    }
+
+    /// Within [`RESTART_GAP`] of a failed start a call is told that failure
+    /// and does not ask for another start; after it, a call asks again, and an
+    /// older failure is not taken for the answer to the new start.
+    #[test]
+    fn a_failed_start_answers_calls_for_a_second_then_it_is_tried_again() {
+        rt().block_on(async {
+            let keeper = Keeper::new();
+            keeper.set_failed("exited (exit status: 3) before it was listening".into());
+            let mut plugin = RemotePlugin::kept("p", keeper.clone());
+            plugin.manifest_retry = std::time::Duration::ZERO;
+            let started = std::time::Instant::now();
+            let out = plugin.on_request(&req()).await;
+            assert!(started.elapsed() < std::time::Duration::from_millis(500));
+            assert!(out.failure.expect("blocked").contains("exit status: 3"));
+            let asked =
+                tokio::time::timeout(std::time::Duration::from_millis(100), keeper.needed()).await;
+            assert!(asked.is_err(), "a start was asked for within the gap");
+
+            tokio::time::sleep(RESTART_GAP).await;
+            let again = tokio::spawn(start_when_needed(keeper.clone()));
+            let out = plugin.on_request(&req()).await;
+            assert_eq!(out.rules.as_deref(), Some("* resHeaders://x=1"));
+            assert!(again.await.unwrap().paths().iter().any(|p| p == "/request"));
+        });
+    }
+
+    /// What a starting proxy waits on: the port, or why there will not be one
+    /// — at once for a process that has exited, rather than after the limit.
+    #[test]
+    fn a_starting_proxy_is_told_when_a_plugin_will_not_listen() {
+        rt().block_on(async {
+            let keeper = Keeper::new();
+            let ms = std::time::Duration::from_millis;
+            assert!(keeper.started(ms(50)).await.is_err(), "nothing settled yet");
+            let starter = keeper.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(ms(20)).await;
+                starter.set_failed("exited (exit status: 1) before it was listening".into());
+            });
+            let started = std::time::Instant::now();
+            let why = keeper.started(ms(5000)).await.unwrap_err();
+            assert!(started.elapsed() < ms(1000), "{:?}", started.elapsed());
+            assert!(why.contains("exit status: 1"), "{why}");
+            keeper.set_up(4321);
+            assert_eq!(keeper.started(ms(5000)).await, Ok(4321));
         });
     }
 

@@ -9,7 +9,8 @@
 // (sdk/whistle-rs-plugin.js), edits its rules and values over the API, sends
 // HTTP, HTTPS (intercepted, checked against the CA the binary just generated),
 // WebSocket, WebSocket-over-TLS and a plugin request through it, kills the
-// plugin and checks the next request starts it again, stops it,
+// plugin and checks the next request starts it again, checks a second plugin
+// that throws as it loads delays neither startup nor its requests, stops it,
 // checks the port is free and the plugin gone, starts it a second time on the
 // same directory and checks that the CA, rules, values and history came back
 // and still work, then stops it again. On Unix a third start ends in SIGKILL,
@@ -338,6 +339,10 @@ start({
 `,
 );
 
+// And one with a bug in its startup code: it throws as it loads, every time.
+const brokenFile = path.join(work, 'broken-plugin.cjs');
+writeFileSync(brokenFile, "throw new Error('smoke: a plugin that throws as it loads');\n");
+
 /** Start the binary on `dataDir` and wait until its API answers. */
 async function start(run) {
   logFile = path.join(work, `run${run}.log`);
@@ -345,7 +350,8 @@ async function start(run) {
   // The proxy variables this shell may carry mean nothing to the binary, but a
   // run should not depend on what happened to be exported where it was started.
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(https?|all|no)_proxy$/i.test(k)));
-  child = spawn(binary, ['-p', String(proxyPort), '--dir', dataDir, '--node-plugin', `smoke=${pluginFile}`], {
+  const plugins = ['--node-plugin', `smoke=${pluginFile}`, '--node-plugin', `broken=${brokenFile}`];
+  child = spawn(binary, ['-p', String(proxyPort), '--dir', dataDir, ...plugins], {
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -422,6 +428,7 @@ async function pluginGone(pid) {
 
 const RULES = [
   `${HOST}/plugin plugin://smoke`,
+  `${HOST}/broken plugin://broken`,
   `${HOST} http://127.0.0.1:{origin}`,
   `${HOST} resHeaders://x-smoke=rules-applied`,
   `${HOST}/value resBody://{smoke-value}`,
@@ -547,6 +554,26 @@ async function run() {
       return `pid ${was} killed, pid ${plugin} answered`;
     });
   }
+
+  // Its process exits before it listens, and the proxy is told: startup goes
+  // on without it, and a request for it is refused as soon as the new process
+  // has died too. Each used to wait out 5 s for a process already gone.
+  await step('a plugin that dies as it loads holds nothing up', async () => {
+    const said = readFileSync(logFile, 'utf8')
+      .split('\n')
+      .filter((l) => l.includes("'broken'"));
+    check(
+      said.some((l) => /not ready \(exited .* before it was listening\)/.test(l)),
+      `startup did not see it exit: ${said.join(' | ')}`,
+    );
+    const started = Date.now();
+    const res = await viaProxy('/broken');
+    const ms = Date.now() - started;
+    const body = res.body.toString();
+    check(res.status === 502 && body.includes('before it was listening'), `answered ${res.status} ${JSON.stringify(body)}`);
+    check(ms < 3000, `refused after ${ms} ms`);
+    return `refused in ${ms} ms`;
+  });
 
   await step('the console lists those requests', async () => {
     const want = [`http://${HOST}/plain?x=1`, `https://${HOST}/secure`, `ws://${HOST}/ws`, `wss://${HOST}/wss`];
