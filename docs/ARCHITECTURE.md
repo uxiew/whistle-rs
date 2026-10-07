@@ -1,85 +1,84 @@
-# Architecture & development
+# 架构与开发
 
-> Current verification and limits: [STATUS.md](STATUS.md). Build/test commands:
-> [DEVELOPMENT.md](DEVELOPMENT.md). Historical benchmarks below are not a fresh
-> measurement of every later commit. The console is the Vue application in
-> `ui-src/`; `build.rs` embeds its built HTML, or a placeholder when absent.
+> 当前的验证结果和限制见 [STATUS.md](STATUS.md)，构建和测试命令见
+> [DEVELOPMENT.md](DEVELOPMENT.md)。下文的基准数据是历史测量，并没有在之后的每个提交上
+> 重新测过。控制台是 `ui-src/` 里的 Vue 应用；`build.rs` 把它构建出的 HTML 嵌进二进制，
+> 没有构建产物时嵌一个占位页。
 
-How whix is put together, how it maps onto the original whistle source, and how
-to extend it.
+whix 是怎么搭起来的，各部分对应原版 whistle 源码的哪里，以及怎么扩展它。
 
-- [Module map](#module-map)
-- [Request lifecycle](#request-lifecycle)
-- [Dependencies](#dependencies)
-- [Extending: add a rule operator](#extending-add-a-rule-operator)
-- [Extending: add an upstream proxy](#extending-add-an-upstream-proxy)
-- [Testing](#testing)
-- [Project layout](#project-layout)
+- [模块地图](#模块地图)
+- [请求的生命周期](#请求的生命周期)
+- [依赖](#依赖)
+- [扩展：新增一个规则算子](#扩展新增一个规则算子)
+- [上级代理是怎么接入的](#上级代理是怎么接入的)
+- [测试](#测试)
+- [项目目录结构](#项目目录结构)
 
 ---
 
-## Module map
+## 模块地图
 
-Each Rust module corresponds to part of the original JS under `../_original/lib`:
+每个 Rust 模块对应 `../_original/lib` 下原版 JS 的一部分：
 
-> **`Ported from` points at the upstream whistle 2.10.4 tree**, which this
-> repository no longer ships. How to fetch it, and at which commit, is in
-> [`UPSTREAM.md`](UPSTREAM.md) — the line numbers are only valid for that one.
+> **`Ported from`（“移植自”）这一列指向上游 whistle 2.10.4 的源码树**，本仓库已经不再附带
+> 这份源码。怎么取回、取哪个提交，见 [`UPSTREAM.md`](UPSTREAM.md)——表里的行号只对那个
+> 提交有效。
 
-| Rust module | Ported from | Responsibility |
+| Rust 模块 | 移植自 | 职责 |
 |-------------|-------------|----------------|
-| `src/config.rs` | `lib/config.js` | Runtime config, storage paths, defaults |
-| `src/rules/protocols.rs` | `lib/rules/protocols.js` | The protocol registry + multi-match set |
-| `src/rules/mod.rs` | `lib/rules/rules.js` | Line parsing, pattern kinds, operator parsing |
-| `src/rules/matcher.rs` | `lib/rules/rules.js` (`resolveRules`) | Match a request, resolve per-protocol winners |
-| `src/rules/wildcard.rs` | `lib/rules/rules.js` (`parseWildcard`, `isRegUrl`) | The two wildcard pattern kinds, and a filter's own |
-| `src/rules/regexp.rs` | `lib/util/index.js` (`toRegExp`, `toOriginalRegExp`) | One regexp type for every `/…/` a user writes — pattern, filter, `*Replace`, template — compiled by regress as JavaScript; and the report when one does not compile |
-| `src/rules/url.rs` | `lib/rules/rules.js` (`joinUrl`, `setProtocol`) | Where a destination's path comes from, and the bracket forms |
-| `src/rules/replace.rs` | `lib/util/replace-pattern-transform.js` | `$0`–`$9` expansion, for pattern captures and `*Replace` alike |
-| `src/rules/storage.rs` | `lib/rules/util.js` (`rulesStorage`) | Rule groups and values on disk, and which of them were switched on |
-| `src/rules/include.rs` | `lib/rules/util.js` (`getRemoteRulesResolver`) | `@` lines: fetch what they name, keep it fresh, re-parse what changed |
-| `src/ca.rs` | `lib/https/ca.js` | Root CA generation/persistence, per-host leaf signing |
-| `src/proxy/mod.rs` and its siblings | `lib/index.js`, `lib/tunnel.js` | The server, one kind of work per file: `listen` (ports, accept loop), `tunnel` (CONNECT, MITM, h1/h2 inside a tunnel), `serve` (the request pipeline), `response` (response phase and body operators), `upgrade` (WebSocket), `ledger` (one session per request, failures included), `session`/`capture` (what the console shows), `state`, `markers`, `dumps`. `mod.rs` holds the map |
-| `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | Outbound forwarding (host/SNI split), upstream HTTP/SOCKS proxies |
-| `src/proxy/apply.rs`, `src/proxy/apply/` | `lib/inspectors/{req,res}.js` | Translate resolved rules into req/res mutations, one operator family per file (`req_ops`, `res_ops`, `header_ops`, `body_ops`, `route`, `local`, …); `apply.rs` holds the map |
-| `src/proxy/dest.rs` | `lib/inspectors/rules.js:40` | Where the request is addressed once a URL-replacement rule has spoken |
-| `src/proxy/header_rules.rs` | `lib/rules/index.js:558-657` | The five headers a request may carry its own rules in — taken from every request, read only under `-M enableRequestHeaderRules` / `-M multiEnv` |
-| `src/proxy/forwarded.rs` | `lib/util/index.js:3697-3728`, `util/common.js:1231-1266` | What a front proxy claims — `x-forwarded-host`/`-proto` behind their modes, and the two whistle spellings upstream reads with no gate |
-| `src/qr.rs` | `qrcode@1.2.0` (a dependency there) | A QR encoder for the console's LAN addresses: byte mode, level M, versions 1-10. Compared module for module by `tests/differential/qr-bench.js` |
-| `src/proxy/template.rs` | `lib/handlers/file-proxy.js` (`render`) | `tpl`/`dust`/`jsonp` two-pass rendering + `${var}` variables |
-| `src/proxy/persist.rs` | — | Session persistence (JSONL, daily rotation). A body preview is written with its flags (`truncated`, `binary`, `undecodable`) and, when its text is not its bytes, the bytes; it is restored from those rather than re-derived |
-| `src/proxy/search.rs` | `biz/webui/htdocs/src/js/network-modal.js` (`h:`/`b:`) | The search box's `h:` and `b:`, answered over every held session; patterns compiled by regress, so they mean what the browser's `RegExp` means |
-| `src/proxy/outcome.rs` | `lib/inspectors/data.js` (`reqError`/`resError`) | How a request ended when it did not complete: the phase, the reason, the error tag that carries them out of `upstream`, and the body wrapper that notices a response breaking off |
-| `src/proxy/sni.rs` | `lib/https/index.js:1281`, `lib/https/load-cert.js` | The SNI stage: peek the ClientHello, pick the certificate, or relay the connection untouched |
-| `src/proxy/socks.rs` | `lib/index.js` (socks server) | Inbound SOCKS5 server |
-| `src/proxy/script.rs`, `src/proxy/script_prelude.js` | `lib/rules/index.js` (`getScriptContext`, `execRulesScript`), `lib/socket-mgr.js` (`execHandleFrame`) | The JS engine (boa) and what a script sees in it: the rules scripts, a connection's `frameScript` on a thread of its own, PAC. The prelude is Node's `Buffer`, `url.parse`, `querystring.parse` and `iconv` helpers, in JavaScript |
-| `src/proxy/pagelog.rs` | `lib/inspectors/log.js`, `assets/js/log.js` | `log://`: the collector injected into a page or a script, the path on the page's own origin it reports to, and the bounded store the Console pane reads |
-| `src/proxy/tls_options.rs` | `lib/rules/index.js` (`getTlsOptions`) | `tlsOptions://`'s client certificate (PEM or PFX) and trust (`ca`, `rejectUnauthorized`) for the origin connection; part of the pool key |
-| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket frame codec + the capturing tunnel: `frameScript`, then plugin frame hooks. Also `inspected_relay`, the chunk-by-chunk relay an `enable://inspect` tunnel gets |
-| `src/proxy/webui.rs`, `src/proxy/webui/` | `biz/webui` | The console: the route table (`handle`, in `webui.rs`) and its API, one area per file — `access`, `sessions`, `har`, `rules`, `values`, `bundle`, `composer`, `console_hosts`, `plugin_pages`, `logs` (the Console pane's page logs), `switches` (HTTPS, every rule, the plugins) |
-| `ui-src/` | `biz/webui/htdocs` | The console: a Vue 3 / Vite / TypeScript app built to one file and inlined at compile time; `build.rs` substitutes a placeholder when it has not been built, so no Node is needed to build the proxy |
-| `ui-src/src/editor/whistle-classify.js` | — | The rules classifier; shares `index_of_pattern` with the parser, and a Rust test holds the two together |
-| `src/plugins/mod.rs` | `lib/plugins/` | Plugin registry, capability manifests, request/response hooks, remote JSON protocol |
-| `src/plugins/builtin.rs` | (examples) | Built-in Rust plugins (`echo`, `tag`, `stamp`, `upper`, `ws-upper`, `gate`, `no-mitm`) |
-| `src/plugins/pipe.rs` | `lib/util/transproto.js` | Streaming body transport (`pipe://`), chunked HTTP rather than upstream's framing |
-| `src/plugins/wsframe.rs` | `load-plugin.js` (ws hooks) | Per-frame WebSocket transport, one long-lived record-framed connection per direction |
-| `src/plugins/auth.rs` | `load-plugin.js:1746`, `plugins/index.js:831` | Auth gate — fails **closed**: a broken gate is 502, a refusal 403 |
-| `src/plugins/ui.rs` | `biz/webui/lib/index.js:466` | `/plugin/<name>/…` served from the plugin's own pages |
-| `src/plugins/sni.rs` | `plugins/index.js:228`, `load-plugin.js:1841` | `sniCallback` — the certificate a connection is served, or no interception at all |
-| `src/plugins/stats.rs` | `plugins/index.js:1369` | Fire-and-forget per-phase stats |
-| `sdk/whix-plugin.js` | `lib/plugins/load-plugin.js` | Zero-dependency JS/TS plugin SDK (+ `.d.ts` types) |
-| `src/proxy/restream.rs` | `lib/inspectors/data.js` (`parseFrameSep`) | A body cut into frames: event streams and `x-whistle-custom-frame-separator` |
-| `src/proxy/coding.rs` | `lib/util/index.js` (`getZipType`, transforms) | gzip / deflate / brotli / zstd, decoded to inspect and re-encoded to forward |
-| `src/proxy/ciphers.rs` | `lib/rules/index.js` (`getTlsOptions`) | `cipher://` and the TLS options a rule may pin |
-| `src/proxy/timing.rs` | `lib/inspectors` (timings) | Per-phase timings, as the console's waterfall reads them |
-| `src/proxy/bench.rs` | — | An in-process load harness, kept out of the normal suite |
-| `src/explain.rs` | `biz/webui/cgi-bin/rules/test.js` | `whix explain` — which rules a request would hit, without making one |
-| `src/proxy/body.rs` | — | Unified boxed response-body type + throttled body |
-| `src/embed.rs` | — | The library facade: bind on port 0, observe sessions, swap rules, shut down |
-| `src/main.rs` | `bin/whistle.js` | CLI parsing, startup wiring |
-| `src/lib.rs` | — | The module root, and the crate-level documentation |
+| `src/config.rs` | `lib/config.js` | 运行时配置、存储路径、默认值 |
+| `src/rules/protocols.rs` | `lib/rules/protocols.js` | 算子注册表，以及可多次匹配的算子集合 |
+| `src/rules/mod.rs` | `lib/rules/rules.js` | 逐行解析、匹配串的种类、算子解析 |
+| `src/rules/matcher.rs` | `lib/rules/rules.js`（`resolveRules`） | 拿请求去匹配规则，为每个算子选出胜出的那条 |
+| `src/rules/wildcard.rs` | `lib/rules/rules.js`（`parseWildcard`、`isRegUrl`） | 两种通配符匹配串，以及筛选器自己的那种 |
+| `src/rules/regexp.rs` | `lib/util/index.js`（`toRegExp`、`toOriginalRegExp`） | 用户写的每个 `/…/`——匹配串、筛选器、`*Replace`、模板——都用同一个正则类型，由 regress 按 JavaScript 语法编译；编译不过时给出的报告也在这里 |
+| `src/rules/url.rs` | `lib/rules/rules.js`（`joinUrl`、`setProtocol`） | 目标地址的路径从哪来，以及几种括号写法 |
+| `src/rules/replace.rs` | `lib/util/replace-pattern-transform.js` | `$0`–`$9` 展开，匹配串的捕获组和 `*Replace` 都用它 |
+| `src/rules/storage.rs` | `lib/rules/util.js`（`rulesStorage`） | 磁盘上的规则组和 Values，以及其中哪些被启用了 |
+| `src/rules/include.rs` | `lib/rules/util.js`（`getRemoteRulesResolver`） | `@` 行（引入）：拉取它指向的内容，保持更新，内容变了就重新解析 |
+| `src/ca.rs` | `lib/https/ca.js` | 根证书的生成和持久化，按域名签发站点证书 |
+| `src/proxy/mod.rs` 及其同级文件 | `lib/index.js`、`lib/tunnel.js` | 代理服务本体，一个文件管一类事：`listen`（端口、accept 循环）、`tunnel`（CONNECT、中间人解密、隧道里的 h1/h2）、`serve`（请求流水线）、`response`（响应阶段和 body 类算子）、`upgrade`（WebSocket）、`ledger`（每个请求一条会话，失败的也算）、`session`/`capture`（控制台显示的内容）、`state`、`markers`、`dumps`。`mod.rs` 里有总览 |
+| `src/proxy/upstream.rs` | `lib/handlers/http-proxy.js` | 出站转发（连接地址和 Host/SNI 分开处理），HTTP/SOCKS 上级代理 |
+| `src/proxy/apply.rs`、`src/proxy/apply/` | `lib/inspectors/{req,res}.js` | 把解析出的规则落实成对请求/响应的修改，一类算子一个文件（`req_ops`、`res_ops`、`header_ops`、`body_ops`、`route`、`local`……）；`apply.rs` 里有总览 |
+| `src/proxy/dest.rs` | `lib/inspectors/rules.js:40` | URL 替换类规则生效之后，请求最终发往哪里 |
+| `src/proxy/header_rules.rs` | `lib/rules/index.js:558-657` | 请求可以在五个头里自带规则——每个请求上的这五个头都会被摘掉，但只有在 `-M enableRequestHeaderRules` / `-M multiEnv` 下才会读取 |
+| `src/proxy/forwarded.rs` | `lib/util/index.js:3697-3728`、`util/common.js:1231-1266` | 前置代理声称的信息——`x-forwarded-host`/`-proto` 要开对应模式才认；另有两个 whistle 自有写法的头，上游不设任何开关就直接读取 |
+| `src/qr.rs` | `qrcode@1.2.0`（上游的一个依赖） | 二维码编码器，给控制台显示局域网地址用：字节模式、纠错等级 M、版本 1-10。由 `tests/differential/qr-bench.js` 拿它和那个模块逐一对照 |
+| `src/proxy/template.rs` | `lib/handlers/file-proxy.js`（`render`） | `tpl`/`dust`/`jsonp` 的两遍渲染，以及 `${var}` 变量 |
+| `src/proxy/persist.rs` | — | 会话持久化（JSONL，按天轮转）。body 预览连同它的标记（`truncated`、`binary`、`undecodable`）一起写入；预览文本和原始字节对不上时，原始字节也一起写。读回时直接用这些还原，不重新推算 |
+| `src/proxy/search.rs` | `biz/webui/htdocs/src/js/network-modal.js`（`h:`/`b:`） | 搜索框里的 `h:` 和 `b:`，在当前保留的所有会话上查找；其中的正则由 regress 编译，所以含义和浏览器里的 `RegExp` 一致 |
+| `src/proxy/outcome.rs` | `lib/inspectors/data.js`（`reqError`/`resError`） | 请求没走完时是怎么结束的：哪个阶段、什么原因、把这两样从 `upstream` 带出来的错误标签，以及发现响应中途断掉的 body 包装层 |
+| `src/proxy/sni.rs` | `lib/https/index.js:1281`、`lib/https/load-cert.js` | SNI 阶段：预读 ClientHello，选证书，或者原样转发这条连接 |
+| `src/proxy/socks.rs` | `lib/index.js`（socks 服务） | 入站 SOCKS5 服务 |
+| `src/proxy/script.rs`、`src/proxy/script_prelude.js` | `lib/rules/index.js`（`getScriptContext`、`execRulesScript`）、`lib/socket-mgr.js`（`execHandleFrame`） | JS 引擎（boa），以及脚本在里面能用到什么：规则脚本、在每条连接自己的线程上跑的 `frameScript`、PAC。prelude（预置脚本）是用 JavaScript 写的 Node `Buffer`、`url.parse`、`querystring.parse` 和 `iconv` 辅助函数 |
+| `src/proxy/pagelog.rs` | `lib/inspectors/log.js`、`assets/js/log.js` | `log://`：注入页面或脚本的采集器、它上报日志用的那个页面同源路径，以及 Console 面板读取的有界存储 |
+| `src/proxy/tls_options.rs` | `lib/rules/index.js`（`getTlsOptions`） | `tlsOptions://` 给源站连接配的客户端证书（PEM 或 PFX）和信任设置（`ca`、`rejectUnauthorized`）；也是连接池键的一部分 |
+| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket 帧编解码 + 会抓包的隧道：先跑 `frameScript`，再跑插件的帧钩子。另外还有 `inspected_relay`：`enable://inspect` 的隧道用的逐块转发 |
+| `src/proxy/webui.rs`、`src/proxy/webui/` | `biz/webui` | 控制台：路由表（`webui.rs` 里的 `handle`）和它的 API，一个功能区一个文件——`access`、`sessions`、`har`、`rules`、`values`、`bundle`、`composer`、`console_hosts`、`plugin_pages`、`logs`（Console 面板的页面日志）、`switches`（HTTPS、全部规则、插件这几个开关） |
+| `ui-src/` | `biz/webui/htdocs` | 控制台前端：Vue 3 / Vite / TypeScript 应用，构建成单个文件，编译时内联进二进制；没构建时 `build.rs` 换上占位页，所以构建代理本身不需要 Node |
+| `ui-src/src/editor/whistle-classify.js` | — | 规则分类器；和解析器共用 `index_of_pattern`，有一个 Rust 测试保证两边一致 |
+| `src/plugins/mod.rs` | `lib/plugins/` | 插件注册表、能力清单（manifest）、请求/响应钩子、远程 JSON 协议 |
+| `src/plugins/builtin.rs` | （示例） | 内置的 Rust 插件（`echo`、`tag`、`stamp`、`upper`、`ws-upper`、`gate`、`no-mitm`） |
+| `src/plugins/pipe.rs` | `lib/util/transproto.js` | 流式 body 传输（`pipe://`），用 chunked HTTP，而不是上游自己的分帧格式 |
+| `src/plugins/wsframe.rs` | `load-plugin.js`（ws 钩子） | 逐帧的 WebSocket 传输，每个方向一条长连接，按记录分帧 |
+| `src/plugins/auth.rs` | `load-plugin.js:1746`、`plugins/index.js:831` | 认证关卡——出故障时**默认拒绝**（fail closed）：关卡本身坏了返回 502，被拒返回 403 |
+| `src/plugins/ui.rs` | `biz/webui/lib/index.js:466` | `/plugin/<name>/…`，用插件自带的页面响应 |
+| `src/plugins/sni.rs` | `plugins/index.js:228`、`load-plugin.js:1841` | `sniCallback`——决定给连接出示哪张证书，或者干脆不拦截 |
+| `src/plugins/stats.rs` | `plugins/index.js:1369` | 按阶段上报统计，发出去就不管（fire-and-forget） |
+| `sdk/whix-plugin.js` | `lib/plugins/load-plugin.js` | 零依赖的 JS/TS 插件 SDK（附 `.d.ts` 类型） |
+| `src/proxy/restream.rs` | `lib/inspectors/data.js`（`parseFrameSep`） | 切成帧的 body：事件流（event stream）和 `x-whistle-custom-frame-separator` |
+| `src/proxy/coding.rs` | `lib/util/index.js`（`getZipType`、各种 transform） | gzip / deflate / brotli / zstd：解码出来供查看，再编码回去转发 |
+| `src/proxy/ciphers.rs` | `lib/rules/index.js`（`getTlsOptions`） | `cipher://`，以及规则可以钉死的 TLS 选项 |
+| `src/proxy/timing.rs` | `lib/inspectors`（各阶段耗时） | 各阶段耗时，按控制台瀑布图读取的格式记录 |
+| `src/proxy/bench.rs` | — | 进程内的压测工具，不放进常规测试集 |
+| `src/explain.rs` | `biz/webui/cgi-bin/rules/test.js` | `whix explain`——不真的发请求，告诉你一个请求会命中哪些规则 |
+| `src/proxy/body.rs` | — | 统一的 boxed 响应 body 类型 + 限速 body |
+| `src/embed.rs` | — | 作为库使用时的门面：绑定端口 0、观察会话、替换规则、关闭 |
+| `src/main.rs` | `bin/whistle.js` | 命令行解析、启动时把各部分组装起来 |
+| `src/lib.rs` | — | 模块根，以及 crate 级文档 |
 
-## Request lifecycle
+## 请求的生命周期
 
 ```
                        ┌──────────────────────── main port (TcpListener) ─────────────┐
@@ -120,166 +119,132 @@ serve(Mitm) ──────────────────────�
         └─ buffer response body? ── only if a rule or a plugin needs it ──▶ response
 ```
 
-The two entry origins (`Forward`, `Mitm`) converge on the same `serve()` pipeline;
-they differ only in how scheme/host/port are derived. That's why rules apply
-identically to plain HTTP and to intercepted HTTPS.
+两个入口（`Forward`、`Mitm`）汇入同一条 `serve()` 流水线，区别只在 scheme/host/port 是怎么
+得出来的。所以规则对普通 HTTP 和拦截（解密）后的 HTTPS 生效方式完全一样。
 
-### How a request becomes exactly one session
+### 一个请求怎样恰好变成一条会话
 
-Every request `serve()` takes on becomes one session, however it ends. The
-caller is `serve_recorded`, which hands `serve()` a `Ledger` — a draft of the
-session that fills in as the request goes (method and URL, then the matched
-rules, then the target, the outgoing headers and the connection's timings) —
-and settles it three ways:
+`serve()` 接下的每个请求，不管怎么结束，都会变成一条会话。调用方是 `serve_recorded`：它交给
+`serve()` 一个 `Ledger`，也就是这条会话的草稿，随着请求往下走逐步填满（先是方法和 URL，然后是
+命中的规则，再然后是目标地址、发出去的头和这条连接的各项耗时）。草稿最后有三种落账方式：
 
-- **A path that answers records its own** through `Ledger::record`: a local
-  answer, a plugin's, an abort, the response head from the origin.
-- **An error that escapes `serve()`** reaches `guard`, which records the draft
-  with the error's phase and answers `502` with `x-whix-error` and
-  `x-whix-session`. The phase is not guessed from the message: `upstream`
-  wraps each failure in an `outcome::Stopped` where it happens (`dial` tags DNS
-  and connect separately, the proxy handshake, the TLS handshake, the send), and
-  `outcome::phase_of` finds the innermost tag under any `.context()` added on
-  top. An untagged error is `internal` — a gap in the tagging, not a category.
-- **A dropped future** — hyper drops the service future when the client closes
-  the connection or resets the stream — drops the `Ledger`, whose `Drop` records
-  the draft as `client`.
+- **负责应答的那条路径自己记账**，通过 `Ledger::record`：本地应答、插件应答、中止（abort），
+  以及源站返回的响应头部。
+- **从 `serve()` 里漏出来的错误**会落到 `guard`：它把草稿连同错误发生的阶段记下来，并回一个带
+  `x-whix-error` 和 `x-whix-session` 头的 `502`。阶段不是从错误信息里猜的：`upstream` 在每个
+  失败发生的地方就把它包进一个 `outcome::Stopped`（`dial` 把 DNS 和建连分开标，另外还有代理
+  握手、TLS 握手、发送），`outcome::phase_of` 再穿过上层加的各种 `.context()`，找到最里层的
+  那个标签。没打标签的错误算 `internal`——这说明标签漏打了，而不是一种错误类别。
+- **future 被丢弃**——客户端关掉连接或重置流时，hyper 会丢掉 service future——`Ledger` 也跟着
+  被丢弃，它的 `Drop` 把草稿记为 `client`。
 
-`settled` is what keeps the three from doubling up. A forwarded response is
-different in one way: its row appears at the head, but it is not *complete*
-until the body is. `AppState::record_open` shows it, and `outcome::settle`
-wraps the body and calls `AppState::complete` once — when the body ends, fails
-(`response`) or is dropped short (`client`). `complete` is the only place the
-observer is called and the history written, so both see the final session.
-hyper also drops a body it has finished without polling it to the end, once a
-`content-length` is written; `settle` counts the bytes so that is not mistaken
-for a client leaving.
+三条路不会重复记账，靠的是 `settled`。转发出去的响应有一点不同：它那一行在收到响应头时就出现了，
+但要等 body 结束才算*完成*。`AppState::record_open` 先把它显示出来，`outcome::settle` 包住
+body，在 body 正常结束、出错（`response`）或者没收完就被丢弃（`client`）时，调用一次
+`AppState::complete`。只有 `complete` 会调用观察者（observer）、写入历史记录，所以两边看到的
+都是最终的会话。还有一种情况：只要写了 `content-length`，hyper 发完 body 后可能不再把它轮询到底，
+直接丢掉；`settle` 会自己数字节，这样就不会把它误当成客户端中途离开。
 
-A tunnel whose contents are not read has no request inside it to do this, so the
-CONNECT itself is recorded through a `Tunnel`: when it is relayed (shown once
-connected, complete when it closes), when it cannot be routed or its far end
-cannot be reached, and when the client refuses the certificate (`client-tls`).
+不读内容的隧道，里面没有请求来做这件事，所以 CONNECT 本身通过一个 `Tunnel` 记成会话：隧道被
+原样转发时（连上就显示，关闭时完成）；无法路由或连不上另一端时；以及客户端不接受证书时
+（`client-tls`）。
 
-A relay decided on the CONNECT alone — interception off, or `disable://intercept`
-on the address the client asked for — goes through `relay_before_reply`, which
-dials first and answers `200` only once the far end has, as whistle does
-(`_original/lib/tunnel.js:637-695`). A far end that cannot be reached leaves the
-CONNECT unanswered and the row at status 0, so the client's own CONNECT fails
-rather than succeeding and then hanging up. Every other tunnel has to be
-answered before its ClientHello can be read; a relay decided there
-(`serve_tunnel` → `relay_recorded`) dials after the `200`, which is also what
-whistle does on that path.
+只看 CONNECT 就决定直接转发的隧道——拦截关闭，或者客户端请求的地址命中了
+`disable://intercept`——走 `relay_before_reply`：先去连对端，对端连上了才回 `200`，和 whistle
+的做法一样（`_original/lib/tunnel.js:637-695`）。对端连不上时，这个 CONNECT 不会得到应答，会话
+那一行停在状态码 0，于是客户端自己的 CONNECT 直接失败，而不是先成功、再被挂断。其他隧道都必须
+先应答，才能读到 ClientHello；在那一步才决定转发的（`serve_tunnel` → `relay_recorded`），会在
+`200` 之后才去连对端，whistle 在这条路径上也是这么做的。
 
-### Why we open our own upstream connection
+### 为什么要自己建到源站的连接
 
-whistle's defining trick is rewriting **where** a request goes without changing
-**what the server sees**. A pooled high-level client keys connections by hostname and
-would send SNI/Host for the destination IP. Instead `upstream::forward` connects the
-socket to the (possibly overridden) destination itself, but sets the TLS SNI and the
-`Host` header from the **original** hostname. See `src/proxy/upstream.rs`.
+whistle 的看家本领，是改掉请求**发往哪里**，却不改变**服务器看到的内容**。高层的、带连接池的
+HTTP 客户端按主机名区分连接，会按目标 IP 去发 SNI/Host。所以 `upstream::forward` 自己把 socket
+连到（可能已被改写的）目标地址，但 TLS SNI 和 `Host` 头用的是**原始**主机名。见
+`src/proxy/upstream.rs`。
 
-### Reusing origin connections
+### 复用源站连接
 
-An origin connection outlives its request only for the **client connection** that
-opened it: every connection a client makes to the proxy (a keep-alive HTTP
-connection, a CONNECT tunnel, an h2 connection) carries a `ConnPool` in its
-requests' extensions, and a later request on it to the same place reuses what an
-earlier one left open (`src/proxy/pool.rs`). Nothing is shared between clients,
-so a credential bound to a connection rather than to a request (NTLM, Negotiate)
-cannot leak from one client to another — the same line upstream draws for the h2
-sessions it caches.
+源站连接在请求结束后还能留着，但只留给打开它的那条**客户端连接**用：客户端连到代理的每条连接
+（keep-alive 的 HTTP 连接、CONNECT 隧道、h2 连接）都在其请求的 extensions 里带一个
+`ConnPool`，同一条连接上后来发往同一处的请求，会复用前面请求留下的连接（`src/proxy/pool.rs`）。
+不同客户端之间什么都不共享，所以绑在连接上、而不是请求上的凭据（NTLM、Negotiate）不会从一个
+客户端漏到另一个客户端——上游缓存 h2 session 时划的也是这条线。
 
-The key is everything a fresh connection would have been made from: the address,
-the requested host and port, TLS on or off with the `cipher://` versions and
-suites, the stripped-TLS marker, and the whole proxy route — kind, address,
-`?host=`, `proxyTunnel`, the `Proxy-Authorization` presented and the `User-Agent`
-echoed on CONNECT. `pool_tests::every_part_of_the_route_is_in_the_key` changes each
-one and checks the key changes with it.
+池的键包含新建一条连接时会用到的全部信息：地址；请求的主机和端口；TLS 开没开，以及
+`cipher://` 指定的版本和密码套件；TLS 被剥离的标记；还有整条代理路由——类型、地址、`?host=`、
+`proxyTunnel`、出示的 `Proxy-Authorization`，以及 CONNECT 时带上的 `User-Agent`。
+`pool_tests::every_part_of_the_route_is_in_the_key` 逐项改动，检查键是否随之改变。
 
-Not pooled: upgrades, CONNECT, anything whose response did not finish cleanly
-(hyper closes those), and any request that said `Connection: close` or was HTTP/1.0
-without `keep-alive` — hyper only looks at the response for that, so
-`upstream::asks_to_close` does. Idle connections close after 15 s; at most 16 per
-key and 32 per client connection are kept, the oldest going first — one keep-alive
-connection asking for a new host every request would otherwise hold a socket per
-host. A connection the origin closes just as a request goes out is the one
-failure reuse adds: a body-less request with an idempotent method is sent again on
-a fresh connection; any other request only takes a connection idle for under 2 s,
-well inside the shortest common server idle timeout (5 s, Node and Apache).
+不进池的有：协议升级（upgrade）、CONNECT、响应没有干净结束的（hyper 会关掉这些连接），以及
+请求里写了 `Connection: close`、或者是不带 `keep-alive` 的 HTTP/1.0 的——hyper 判断这一点只看
+响应，所以由 `upstream::asks_to_close` 来看请求。空闲连接 15 秒后关闭；每个键最多留 16 条，每条
+客户端连接最多留 32 条，超出时先关最老的——不然一条 keep-alive 连接每次请求都换个新主机，就会
+给每个主机都占着一个 socket。复用只会多出一种失败：请求刚发出去，源站正好把这条连接关了。处理
+办法是：没有 body、方法幂等的请求，换一条新连接重发；其他请求只拿空闲不到 2 秒的连接，远在常见
+服务器最短的空闲超时（5 秒，Node 和 Apache）之内。
 
-Sessions number the origin connection (`timings.connection`, `timings.reused`;
-HAR's `connection`), because a reused one has no DNS, connect or TLS phase and the
-console would otherwise only be able to call those "not measured".
+会话里记下了源站连接的编号（`timings.connection`、`timings.reused`；HAR 里是 `connection`），
+因为复用的连接没有 DNS、建连和 TLS 这几个阶段，不记编号的话，控制台只能把这几段显示成“未测量”。
 
-**HTTP/2 to the origin.** A request that arrived over h2 — which is every request
-a browser sends through an intercepted HTTPS tunnel — offers `h2` in the origin's
-ALPN (`upstream::offers_h2`; `enable://h2`/`disable://h2` override it, as in
-whistle). An h2 connection is not taken from the pool but shared: every request
-the client connection sends to that key goes over it concurrently
-(`ConnPool::session`). The first request of a burst makes the connection while
-the others wait on `ConnPool::opening`, so the first page load is one handshake,
-not one per request in flight; an origin that picks HTTP/1.1 gets HTTP/1.1 on the
-socket it already accepted and is remembered, so nobody waits for it again; and a
-failed attempt lets the waiters connect side by side rather than one connect
-timeout after another. `upstream::for_h2` turns `Host` into `:authority` and drops
-the connection-specific headers, as whistle's `formatH2Headers` does.
+**到源站用 HTTP/2。** 通过 h2 进来的请求——浏览器经由被拦截的 HTTPS 隧道发出的请求全都是——
+在和源站做 ALPN 协商时会提供 `h2`（`upstream::offers_h2`；和 whistle 一样，可以用
+`enable://h2`/`disable://h2` 覆盖）。h2 连接不是从池里取走的，而是共享的：这条客户端连接发往
+同一个键的所有请求，都在它上面并发（`ConnPool::session`）。一批请求同时到来时，第一个请求去建连，
+其他请求在 `ConnPool::opening` 上等，所以首次加载页面只握手一次，而不是在途的每个请求各握一次；
+源站如果选了 HTTP/1.1，就在它已经接受的那个 socket 上走 HTTP/1.1，并且这个选择会被记住，之后谁都
+不用再等它；建连失败时，等着的请求各自并行去连，而不是一个接一个地等连接超时。`upstream::for_h2`
+把 `Host` 换成 `:authority`，并去掉只对单条连接有意义的头，和 whistle 的 `formatH2Headers` 一样。
 
-## What the capture costs
+## 抓取的开销
 
-Every proxied body streams through `body::tee`, which copies a bounded prefix into
-the session capture as the bytes go past (`src/proxy/body.rs`). Whether that is
-affordable for large bodies and under concurrency was measured rather than assumed;
-the harness is `src/proxy/bench.rs` and stays out of the normal suite:
+每个经过代理的 body 都流经 `body::tee`：字节流过时，它把开头一段有上限的内容复制进会话的抓取
+记录（`src/proxy/body.rs`）。大 body、高并发下这笔开销扛不扛得住，是实测出来的，不是假设的；
+测试工具在 `src/proxy/bench.rs`，不放进常规测试集：
 
 ```bash
 cargo test --release -- --ignored --nocapture bench::
 ```
 
-Numbers below are from an Apple M4 (10 cores, 16 GB, Darwin 25.3.0 arm64), rustc
-1.96.1, stock `--release` profile. Each row is 200 iterations (microbenchmarks) or
-150–800 requests (end to end). Configurations are driven **round robin inside one
-loop, with the order rotating each pass**, so a scheduler hiccup or a thermal
-excursion lands on all of them equally instead of on whichever one happened to be
-running — and, since the first slot is the baseline every other row is measured
-against, so that it does not silently absorb per-iteration warm-up.
+下面的数字来自 Apple M4（10 核、16 GB、Darwin 25.3.0 arm64），rustc 1.96.1，默认的
+`--release` 配置。每行是 200 次迭代（微基准）或 150–800 个请求（端到端）。各配置**在同一个循环
+里轮流跑，每一轮都轮换顺序**。这样调度器卡一下、温度波动一下，会平均摊到所有配置上，而不是落在
+当时恰好在跑的那个上；此外，第一个位置是基准，其他各行都拿它来比，轮换顺序也是为了不让它悄悄
+吃掉每轮迭代的预热开销。
 
-### The tee itself
+### tee 本身
 
-Against the same body with no tee at all, delivered in 16 KiB frames:
+和完全不走 tee 的同一个 body 对比，body 按每帧 16 KiB 送出（cap 是预览上限）：
 
-| body (frames) | no tee | tee, cap 0 | tee, cap 16 KiB | tee, uncapped |
+| body（帧数） | 不走 tee | tee，cap 0 | tee，cap 16 KiB | tee，不设上限 |
 |---|---|---|---|---|
 | 4 KiB (1) | 192 ns | 529 ns | 793 ns | 795 ns |
 | 64 KiB (4) | 222 ns | 688 ns | 1.7 µs | 9.0 µs |
 | 1 MiB (64) | 942 ns | 2.3 µs | 3.2 µs | 57.6 µs |
 | 16 MiB (1024) | 5.4 µs | 12.2 µs | 12.9 µs | 2.5 ms |
 
-Two things fall out of that.
+从中能看出两点。
 
-**The cost goes flat past the cap.** `cap 16 KiB` tracks `cap 0` — which copies
-nothing and only counts bytes — to within the single 16 KiB copy that fills the
-preview once. From 1 MiB to 16 MiB the body grows 16× and the gap between those two
-columns stays at 0.7–0.9 µs. What does keep scaling is the frame count: holding the
-body at 1 MiB and shrinking the frames gives 28.2, 11.9, 8.2 and 6.5 ns per frame at
-16, 64, 256 and 2048 frames, converging on **≈6.5 ns per frame** — one uncontended
-mutex acquisition and two additions. Every body owns its own capture, so that lock
-is never contended between concurrent requests.
+**超过上限之后，开销就不再增长。** `cap 16 KiB` 和 `cap 0`（什么都不复制，只数字节）的差距，
+就是填满预览时那一次 16 KiB 的复制。body 从 1 MiB 涨到 16 MiB，涨了 16 倍，这两列的差距始终在
+0.7–0.9 µs。真正还会跟着涨的是帧数：body 固定 1 MiB、帧越切越小，16、64、256、2048 帧时每帧
+分别是 28.2、11.9、8.2、6.5 ns，收敛到**每帧约 6.5 ns**——也就是一次无竞争的 mutex 加锁和
+两次加法。每个 body 都有自己的抓取记录，所以并发请求之间从不争这把锁。
 
-**The cap is the whole story.** Remove it and a 16 MiB body costs 2.5 ms instead of
-12.9 µs, some 200× more, because the preview then copies the entire body.
+**关键全在上限。** 去掉上限，一个 16 MiB 的 body 要花 2.5 ms 而不是 12.9 µs，多了约 200 倍，
+因为这时预览会把整个 body 都复制一遍。
 
-A compressed body is decoded so its preview is readable, and that is the one fixed
-cost worth naming: **≈45 µs per body regardless of size** (44.3 µs for 64 KiB,
-45.4 µs for 1 MiB, and the 55.7 µs at 16 MiB is that plus per-frame cost). Fixed,
-because decoding stops as soon as 16 KiB of *decoded* output exists.
+压缩过的 body 会先解码，好让预览能看懂。这是唯一值得单独说的固定开销：**每个 body 约 45 µs，
+与大小无关**（64 KiB 是 44.3 µs，1 MiB 是 45.4 µs，16 MiB 时的 55.7 µs 是这 45 µs 再加上每帧
+的开销）。之所以固定，是因为*解码后*的输出一凑够 16 KiB，解码就停了。
 
-### Against a socket
+### 走真实 socket
 
-Three proxies, one per preview cap, in front of a canned origin; concurrent clients
-hold keep-alive connections to all three and rotate between them request by request.
-Means, with the delta against `cap 0` in brackets:
+起三个代理，每个用一种预览上限，挡在一个返回固定内容的源站前面；并发客户端和三个代理都保持
+keep-alive 连接，按请求轮流发给它们。下表是平均值，括号里是相对 `cap 0` 的差值（identity 即
+不压缩）：
 
-| body | conns | cap 0 | cap 16 KiB (default) | cap 1 MiB |
+| body | 连接数 | cap 0 | cap 16 KiB（默认） | cap 1 MiB |
 |---|---|---|---|---|
 | 4 KiB identity | 1 | 112.2 µs | 112.2 µs (−0.05 µs) | 112.4 µs (+0.2 µs) |
 | 4 KiB identity | 32 | 807 µs | 816 µs (+8.6 µs) | 812 µs (+4.7 µs) |
@@ -288,243 +253,220 @@ Means, with the delta against `cap 0` in brackets:
 | 1 MiB gzip | 1 | 779 µs | 811 µs (+32 µs) | 2.7 ms (+2.0 ms) |
 | 1 MiB gzip | 32 | 6.0 ms | 6.1 ms (+85 µs) | 9.5 ms (+3.5 ms) |
 
-**The shipping configuration is indistinguishable from not capturing at all.** Over
-two runs the `cap 16 KiB` delta lands anywhere between −24 µs and +85 µs and changes
-sign, while the same rows drift 6% (identity) to 50% (gzip) between runs: the delta
-is inside the noise. Even the ≈45 µs that the microbenchmark cleanly attributes to
-gzip decoding cannot be recovered from end-to-end timings. `cap 1 MiB` is the only
-column that sits outside the noise, and it does so consistently in both runs —
-removing the bound is what would cost something.
+**发布时的默认配置，和完全不抓取分不出差别。** 跑了两次，`cap 16 KiB` 的差值落在 −24 µs 到
++85 µs 之间，正负都有；而同样这些行在两次运行之间本身就会漂移 6%（identity）到 50%（gzip）：
+差值完全在噪声范围内。连微基准里明确算到 gzip 解码头上的约 45 µs，在端到端耗时里也看不出来。
+只有 `cap 1 MiB` 这一列明显高出噪声，而且两次都是如此——真正会带来开销的，是去掉上限。
 
-For scale, the harness counted **1.00 upstream connections per request** when
-these rows were taken, before origin connections were reused (above). A local TCP
-handshake is tens of microseconds and a real one is milliseconds, so the tee is
-orders of magnitude below the cheapest thing a proxied request had to do.
+作为参照：测这些数据时还没有做源站连接复用（见上文），测试工具统计到**每个请求 1.00 条源站
+连接**。本机 TCP 握手要几十微秒，真实网络上要几毫秒，所以 tee 的开销比一个代理请求必须做的最
+便宜的那件事还低几个数量级。
 
-**So: nothing to act on for throughput.** The preview cap — `--body-preview-limit`,
-default 16 KiB — is what keeps it that way, and lifting it is the one change that
-would make the capture expensive.
+**结论：吞吐量方面不需要做任何事。** 保持这一点靠的是预览上限——`--body-preview-limit`，
+默认 16 KiB；唯一会让抓取变贵的改动，就是放开这个上限。
 
-### What the profile did turn up
+### 剖析真正发现了什么
 
-Not throughput, but memory. `flate2`'s write-side decompressors accumulate
-everything they inflate into an internal `Vec` that `drain_decoder` only ever reads
-a bounded prefix of. The preview was capped; the decompressor behind it was not, and
-it was kept alive in `CaptureState` for the life of the capture — and captures live
-in the session ring, `MAX_SESSIONS` (500) deep.
+问题不在吞吐量，而在内存。`flate2` 的写端解压器会把它解压出的所有内容攒进一个内部 `Vec`，而
+`drain_decoder` 只会从中读开头有限的一段。预览有上限，它背后的解压器却没有；而且解压器在整个
+抓取期间都留在 `CaptureState` 里——抓取记录又存放在会话环形缓冲里，深度是 `MAX_SESSIONS`
+（500）。
 
-A 16 MiB response of highly compressible bytes arrives as a single 16 KiB frame,
-`write_all` inflates all of it before anything takes a 16 KiB preview off the front,
-and all 16 MiB then sat in the session until 500 more requests pushed it out. No
-hostile client needed: a large log file or JSON dump over gzip is enough.
+一个 16 MiB、高度可压缩的响应，到达时只是单个 16 KiB 的帧。`write_all` 会先把它整个解压，然后
+才有人从开头取走 16 KiB 预览；于是整整 16 MiB 就留在会话里，直到又来了 500 个请求才把它挤出去。
+不需要什么恶意客户端：一个用 gzip 传输的大日志文件或 JSON 导出就够了。
 
-The decompressor is now released as soon as it can contribute nothing more — when
-the preview fills, and when the tee is dropped, which covers both a body that ended
-and a client that hung up half way through. `bench::capture_retained_bytes` reports
-what a finished capture still holds, and it now reads 0 B for every case it did not
-before. What remains is the transient peak: one frame is still inflated in full
-before its prefix is taken, so a single frame's decompressed size is the high water
-mark. Bounding *that* means driving `flate2::Decompress` with a fixed output buffer
-instead of the write adapter — a larger change, and a much smaller exposure now
-that nothing is retained.
+现在，解压器一旦再也贡献不了什么就会被释放：预览填满时释放，tee 被丢弃时也释放，后者既包括
+body 正常结束，也包括客户端半路挂断。`bench::capture_retained_bytes` 报告一个已完成的抓取还占着
+多少内存，以前不为 0 的情况现在全都是 0 B。剩下的是瞬时峰值：一个帧仍会先被完整解压，再取它的
+开头，所以单个帧解压后的大小就是内存的最高水位。要给*这个*也设上限，就得改成用固定的输出缓冲区
+直接驱动 `flate2::Decompress`，而不是用写适配器——改动更大；而现在既然什么都不会留下，这里的
+风险也小得多。
 
-## Dependencies
+## 依赖
 
-| Crate | Role |
+| Crate | 用途 |
 |-------|------|
-| `tokio` | async runtime |
-| `hyper` 1.x + `hyper-util` | HTTP/1.1 server & client, connection upgrades |
-| `http-body-util`, `bytes` | body types |
-| `rustls` (ring provider) + `tokio-rustls` | TLS accept (MITM) and connect (upstream) |
-| `rcgen` | root CA + leaf certificate generation |
-| `webpki-roots` | trust anchors for verifying upstream servers |
-| `regex` | the patterns this port generates (wildcards, port patterns) and its own internal parsing |
-| `regress` | the regular expressions a user writes — ECMAScript syntax, so a `/…/` means what it means in whistle (`src/rules/regexp.rs`) |
-| `serde` / `serde_json` | JSON header-operator values |
-| `clap` | CLI |
-| `tracing` / `tracing-subscriber` | logging |
+| `tokio` | 异步运行时 |
+| `hyper` 1.x + `hyper-util` | HTTP/1.1 服务端和客户端、连接升级 |
+| `http-body-util`、`bytes` | body 类型 |
+| `rustls`（ring provider）+ `tokio-rustls` | TLS 的接受端（中间人解密）和发起端（连源站） |
+| `rcgen` | 生成根证书和站点证书 |
+| `webpki-roots` | 校验源站服务器证书用的信任锚 |
+| `regex` | 本项目自己生成的正则（通配符、端口匹配串），以及它内部的解析 |
+| `regress` | 用户写的正则——ECMAScript 语法，所以一个 `/…/` 的含义和在 whistle 里一样（`src/rules/regexp.rs`） |
+| `serde` / `serde_json` | 头类算子的 JSON 值 |
+| `clap` | 命令行 |
+| `tracing` / `tracing-subscriber` | 日志 |
 
-The `ring` crypto provider is pinned (`default-features = false`) and installed
-at startup in `main.rs`. This does not remove its native build requirements or
-guarantee fully static binaries on every target; use the platform build toolchain.
+加密后端固定用 `ring`（`default-features = false`），在 `main.rs` 里启动时安装。这并不能免掉
+它对本地编译工具的要求，也不保证在每个目标平台上都能产出完全静态的二进制；请使用对应平台的构建
+工具链。
 
-## Extending: add a rule operator
+## 扩展：新增一个规则算子
 
-Say you want `delete://header-name` to strip a request header.
+假设你想用 `delete://header-name` 删掉一个请求头。
 
-1. **Registry** — the name is likely already in `PROTOCOLS`
-   (`src/rules/protocols.rs`); add it if not. If it can appear multiple times per
-   request, add it to `MULTI_MATCH`.
-2. **Apply** — in the file under `src/proxy/apply/` for its family (the table
-   at the top of `apply.rs` says which; request headers are `req_ops.rs`), read
-   it from the resolved set and act:
+1. **注册**——这个名字很可能已经在 `PROTOCOLS`（`src/rules/protocols.rs`）里了；没有就加上。
+   如果它在一个请求上可以出现多次，再把它加进 `MULTI_MATCH`。
+2. **应用**——在 `src/proxy/apply/` 下它所属那一类的文件里（具体是哪个，看 `apply.rs` 开头的
+   表；请求头类在 `req_ops.rs`），从解析结果里读出它，然后执行：
 
    ```rust
-   // in apply_request(...)
+   // 写在 apply_request(...) 里
    for op in resolved.all("delete") {
        parts.headers.remove(op.value.trim());
    }
    ```
-3. **Test** — add a unit test to `src/rules/matcher.rs` proving the operator resolves,
-   and (optionally) drive it end-to-end as in the README smoke test.
+3. **测试**——在 `src/rules/matcher.rs` 里加一个单元测试，证明这个算子能被解析出来；（可选）
+   再像下面[测试](#测试)一节的冒烟测试那样端到端跑一遍。
 
-`Resolved` gives you three accessors, all of them total over single- and
-multi-match protocols alike: `get(proto)` is the winning `RuleOp` (for a
-multi-match protocol, the head of its list), `value(proto)` its value, and
-`all(proto)` every match in resolution order — important lines first, source
-order within a pass. A single-match protocol yields a one-element `all`, so a
-loop needs no special case. Which protocols accumulate is
-`rules::protocols::MULTI_MATCH`; how several values of one operator combine is
-per family and documented in [`RULES.md`](RULES.md).
+`Resolved` 提供三个访问方法，对单次匹配和多次匹配的算子一律可用：`get(proto)` 返回胜出的那个
+`RuleOp`（多次匹配的算子返回列表里的第一个），`value(proto)` 返回它的值，`all(proto)` 按解析
+顺序返回所有匹配——important 行在前，同一轮内按书写顺序。单次匹配的算子，`all` 只有一个元素，
+所以写循环不用特殊处理。哪些算子会累积，看 `rules::protocols::MULTI_MATCH`；同一个算子的多个值
+怎么合并，每一类各不相同，写在 [`RULES.md`](RULES.md) 里。
 
-## Extending: add an upstream proxy
+## 上级代理是怎么接入的
 
-`proxy://`, `http-proxy://`, `socks://` etc. already parse and resolve; they just
-aren't honoured when forwarding. To wire them up:
+规则里的 `proxy://`、`http-proxy://`、`https-proxy://`、`socks://`、`pac://` 等让请求经另一个代理转出去（写法和行为见[规则手册](RULES.md#upstream-proxy)）。代码里分两步：
 
-1. In `apply::resolve_target`, read `resolved.value("proxy")` (and siblings) and
-   carry the proxy address on the `Target` struct.
-2. In `upstream::forward`, when a proxy is set, either issue an HTTP `CONNECT` to the
-   proxy before the TLS handshake (for HTTPS) or send an absolute-form request to the
-   proxy (for HTTP), instead of connecting to the origin directly.
+1. **选哪个代理**：`src/proxy/apply/route.rs` 的 `find_proxy`。几种写法都命中时，按规则行的先后取第一条；`pac://` 则运行 PAC 脚本的 `FindProxyForURL` 来决定。结果是一个 `upstream::ProxyConfig`。地址用不了、PAC 取不到或抛异常时，请求直接失败，不会悄悄改成直连源站——规则说了要走代理，直连恰恰是它排除的那条路。
+2. **怎么连过去**：`src/proxy/upstream.rs`。设了代理就不直接连源站：HTTP 代理（`ProxyKind::Http`）对 http 源站发完整 URL 形式（absolute-form）的请求，对 https 源站先发 `CONNECT` 打通隧道再做 TLS；`ProxyKind::Https` 先和代理本身做一次 TLS；SOCKS5 走 `socks5_connect`。
 
-This is the single most impactful missing feature and the cleanest next task.
-
-## Testing
+## 测试
 
 ```bash
-cargo test                  # unit tests
-cargo clippy --all-targets  # expected to be silent; `[lints.clippy]` denies the lot
+cargo test                  # 单元测试
+cargo clippy --all-targets  # 应当没有任何输出；`[lints.clippy]` 把所有 lint 都设成了 deny
 cargo build --release
 ```
 
-"Silent" holds on the toolchain `rust-toolchain.toml` pins; a newer Clippy may
-find more. The full gate and the version rules are in
-[DEVELOPMENT.md](DEVELOPMENT.md#工具链).
+“没有输出”只在 `rust-toolchain.toml` 钉住的工具链上成立；更新的 Clippy 可能会查出更多问题。
+完整的门禁和版本规则见 [DEVELOPMENT.md](DEVELOPMENT.md#工具链)。
 
-The capture benchmarks are `#[ignore]`d — they are measurements rather than
-assertions, and mean nothing in a debug build. Run them on their own:
+抓取相关的基准测试标了 `#[ignore]`——它们是测量，不是断言，而且在 debug 构建下没有意义。
+单独跑：
 
 ```bash
 cargo test --release -- --ignored --nocapture bench::
 ```
 
-Unit tests live in `src/rules/matcher.rs` and cover hosts shorthand, explicit
-`host://`, regex and wildcard patterns, multi-match accumulation, `$`-important
-precedence, and leading-dot subdomain matching.
+单元测试在 `src/rules/matcher.rs` 里，覆盖 hosts 简写、显式的 `host://`、正则和通配符匹配串、
+多次匹配的累积、`$` important 的优先级，以及以点开头的子域名匹配。
 
-**End-to-end smoke test** (what was used to validate the proxy):
+**端到端冒烟测试**（当初就是用它验证代理的）：
 
 ```bash
-# 1. a local origin
+# 1. 一个本地源站
 python3 -c "from http.server import *; import sys; \
   HTTPServer(('127.0.0.1',9099), type('H',(BaseHTTPRequestHandler,), {\
   'do_GET': lambda s: (s.send_response(200), s.end_headers(), s.wfile.write(b'origin'))[0],\
   'log_message': lambda *a: None})).serve_forever()" &
 
-# 2. rules + proxy
+# 2. 规则 + 代理
 echo "test.local 127.0.0.1:9099" > /tmp/r.txt
 cargo run --release -- -p 8899 -r /tmp/r.txt &
 
-# 3. drive it
+# 3. 发请求试试
 curl -x http://127.0.0.1:8899 http://test.local/       # host override → origin
 curl -x http://127.0.0.1:8899 --cacert ~/.whix/certs/root.crt https://example.com/
 ```
 
-## Project layout
+## 项目目录结构
 
 ```
 whix/
 ├── Cargo.toml
-├── build.rs               # inlines the built console into the binary
-├── .cargo/config.toml     # Windows: link the C runtime in (no VCRUNTIME140.dll)
-├── .github/workflows/     # ci.yml (every push/PR, five platforms), differential.yml (weekly)
-├── README.md              # README.zh-CN.md is only a redirect to it
-├── rules.txt              # example rules
-├── docs/                  # docs/README.md is the index
-│   ├── INSTALL.md         # packages, checksums, data directory, upgrade, uninstall
-│   ├── COOKBOOK.md        # task-oriented recipes (+ .zh-CN)
-│   ├── RULES.md           # rule syntax reference
-│   ├── CLI.md             # the command line, flag by flag, against whistle's
-│   ├── API.md             # the console's HTTP API
-│   ├── OPERATIONS.md      # safe defaults, what is stored, how long
-│   ├── TEMPLATES.md       # local files + template rendering
-│   ├── PLUGINS.md         # plugin system + wire protocol
-│   ├── LINE_PROPS.md      # per-line rule properties
-│   ├── CERTIFICATES.md    # root CA: install, trust, remove
-│   ├── DEVELOPMENT.md     # toolchain, checks, differential, CI
-│   ├── UPSTREAM.md        # which whistle tree the `_original/…` citations mean
-│   ├── STATUS.md          # what was measured, per task, and what was not
-│   ├── ROADMAP.md         # the task plan (Chinese)
-│   └── ARCHITECTURE.md    # this file
+├── build.rs               # 把构建好的控制台内联进二进制
+├── .cargo/config.toml     # Windows：把 C 运行时链接进二进制（不依赖 VCRUNTIME140.dll）
+├── .github/workflows/     # ci.yml（每次 push/PR，五个平台），differential.yml（每周）
+├── README.md              # 项目首页：是什么、能做什么、怎么上手
+├── rules.txt              # 示例规则
+├── docs/                  # docs/README.md 是文档索引
+│   ├── INSTALL.md         # 安装包、校验和、数据目录、升级、卸载
+│   ├── COOKBOOK.md        # 使用手册：按任务组织的用法示例
+│   ├── RULES.md           # 规则语法参考
+│   ├── CLI.md             # 命令行，逐个参数和 whistle 对照
+│   ├── API.md             # 控制台的 HTTP API
+│   ├── OPERATIONS.md      # 安全的默认值、存了什么、存多久
+│   ├── TEMPLATES.md       # 本地文件 + 模板渲染
+│   ├── PLUGINS.md         # 插件系统 + 通信协议
+│   ├── LINE_PROPS.md      # 规则的行属性
+│   ├── CERTIFICATES.md    # 根证书：安装、信任、移除
+│   ├── DEVELOPMENT.md     # 工具链、检查、差分测试、CI
+│   ├── UPSTREAM.md        # `_original/…` 引用指的是哪份 whistle 源码
+│   ├── STATUS.md          # 按任务列出测了什么、没测什么
+│   ├── ROADMAP.md         # 任务计划
+│   └── ARCHITECTURE.md    # 本文件
 ├── scripts/
-│   ├── smoke.mjs          # use a binary the way a person does, on any OS
-│   ├── check-console.sh   # which console page a binary embeds
-│   ├── check-links.mjs    # relative links and anchors in the Markdown
-│   └── third-party-licenses.mjs # license texts shipped with a release
-├── sdk/                   # JS/TS plugin SDK (zero deps) + .d.ts types
+│   ├── smoke.mjs          # 像真人那样使用二进制，任何操作系统都能跑
+│   ├── check-console.sh   # 查看二进制里嵌的是哪个控制台页面
+│   ├── check-links.mjs    # 检查 Markdown 里的相对链接和锚点
+│   └── third-party-licenses.mjs # 随发布包附带的许可证文本
+├── sdk/                   # JS/TS 插件 SDK（零依赖）+ .d.ts 类型
 ├── examples/plugins/      # hello.js, body-rewrite.js, typed.ts
-├── ui-src/                # the console: Vue 3 + Vite, built to one file
-│   ├── mock/api.ts        # the proxy's API, mocked, for `npm run dev`
+├── ui-src/                # 控制台：Vue 3 + Vite，构建成单个文件
+│   ├── mock/api.ts        # mock 出来的代理 API，给 `npm run dev` 用
 │   └── src/               # panes/, sidebar/, components/, editor/, filter/
 ├── tests/
-│   ├── *_e2e.rs           # end-to-end, over a real socket, no node needed
-│   ├── data_compat.rs     # data an older release wrote must still load
-│   ├── data/<version>/    # …that data, as the release left it
-│   └── differential/      # the benches — see its own README
+│   ├── *_e2e.rs           # 端到端测试，走真实 socket，不需要 node
+│   ├── data_compat.rs     # 旧版本写下的数据必须仍能加载
+│   ├── data/<version>/    # ……就是那些数据，保持该版本留下时的原样
+│   └── differential/      # 各项差分对比（bench）——见目录里自己的 README
 └── src/
-    ├── main.rs            # CLI
-    ├── lib.rs             # module root
+    ├── main.rs            # 命令行入口
+    ├── lib.rs             # 模块根
     ├── config.rs
     ├── ca.rs
-    ├── embed.rs           # the library facade
+    ├── embed.rs           # 作为库使用时的门面
     ├── explain.rs         # `whix explain`
-    ├── qr.rs              # the console's QR encoder
-    ├── private_fs.rs      # owner-only files, replaced whole on save
+    ├── qr.rs              # 控制台的二维码编码器
+    ├── private_fs.rs      # 只有属主能读写的文件，保存时整个替换
     ├── rules/
     │   ├── mod.rs
     │   ├── protocols.rs
     │   ├── matcher.rs
-    │   ├── storage.rs     # rule groups and values, on disk
-    │   ├── include.rs     # `@` sources, fetched and kept fresh
-    │   ├── wildcard.rs    # `*` in a host, and `^…$` everywhere else
-    │   ├── url.rs         # joinUrl/setProtocol + the (inline)/<verbatim> forms
-    │   └── replace.rs     # $0-$9 expansion
-    ├── plugins/           # registry, hooks, `pipe://`, ws frames, auth, sni, ui
+    │   ├── storage.rs     # 磁盘上的规则组和 Values
+    │   ├── include.rs     # `@` 引入的来源，拉取并保持更新
+    │   ├── wildcard.rs    # 主机名里的 `*`，以及其他地方的 `^…$`
+    │   ├── url.rs         # joinUrl/setProtocol + (inline)/<verbatim> 两种写法
+    │   └── replace.rs     # $0-$9 展开
+    ├── plugins/           # 注册表、钩子、`pipe://`、ws 帧、auth、sni、ui
     └── proxy/
-        ├── mod.rs         # the map of the files below
-        ├── serve.rs       # `serve()` — every request flows through it
-        ├── tunnel.rs      # CONNECT, MITM, what arrives before a request
-        ├── response.rs    # response phase and response body operators
-        ├── apply.rs       # resolved rules → mutations; apply/ holds one file per family
-        ├── dest.rs        # the URL a request is forwarded to
-        ├── header_rules.rs # rules a request carries in its own headers
-        ├── forwarded.rs   # what a front proxy claims, and whether to believe it
-        ├── template.rs    # tpl/dust/jsonp rendering + ${var} variables
-        ├── persist.rs     # session persistence (JSONL)
-        ├── search.rs      # the search box's h:/b:, answered here
+        ├── mod.rs         # 下面这些文件的总览
+        ├── serve.rs       # `serve()`——每个请求都经过这里
+        ├── tunnel.rs      # CONNECT、中间人解密，以及请求到来之前的那些事
+        ├── response.rs    # 响应阶段和响应 body 类算子
+        ├── apply.rs       # 解析出的规则 → 具体修改；apply/ 下一类算子一个文件
+        ├── dest.rs        # 请求最终转发到的 URL
+        ├── header_rules.rs # 请求在自己头里携带的规则
+        ├── forwarded.rs   # 前置代理声称的信息，以及信不信
+        ├── template.rs    # tpl/dust/jsonp 渲染 + ${var} 变量
+        ├── persist.rs     # 会话持久化（JSONL）
+        ├── search.rs      # 搜索框的 h:/b: 在这里处理
         ├── upstream.rs
-        ├── sni.rs         # peek the ClientHello, pick a certificate, or relay
-        ├── socks.rs       # inbound SOCKS5 server
-        ├── script.rs      # JS engine (resScript/frameScript/pac)
-        ├── ws.rs          # WebSocket frame codec + capturing tunnel
-        ├── restream.rs    # a body cut into frames (SSE, custom separators)
+        ├── sni.rs         # 预读 ClientHello，选证书，或者直接转发
+        ├── socks.rs       # 入站 SOCKS5 服务
+        ├── script.rs      # JS 引擎（resScript/frameScript/pac）
+        ├── ws.rs          # WebSocket 帧编解码 + 会抓包的隧道
+        ├── restream.rs    # 切成帧的 body（SSE、自定义分隔符）
         ├── coding.rs      # gzip/deflate/brotli/zstd
-        ├── ciphers.rs     # `cipher://` and the TLS options
-        ├── timing.rs      # per-phase timings
-        ├── webui.rs       # console route table; webui/ holds the API, one area per file
+        ├── ciphers.rs     # `cipher://` 和 TLS 选项
+        ├── timing.rs      # 各阶段耗时
+        ├── webui.rs       # 控制台路由表；webui/ 下是 API，一个功能区一个文件
         ├── bench.rs
         └── body.rs
 ```
 
-## Where to look first
+## 从哪里下手
 
-| I want to… | Start at |
+| 我想…… | 从这里开始 |
 |---|---|
-| add a rule operator | `src/rules/protocols.rs` (register), then its family's file in `src/proxy/apply/` (act on it) |
-| change how rules match | `src/rules/matcher.rs` |
-| write a plugin | [`PLUGINS.md`](PLUGINS.md), then `sdk/whix-plugin.d.ts` |
-| add a plugin hook | `src/plugins/mod.rs` (manifest + trait), then the call site — but check first whether the existing dispatch already suffices, as `auth` did |
-| touch the request pipeline | `serve()` in `src/proxy/serve.rs` — the one place every request flows through |
-| add an endpoint | the route match in `handle`, `src/proxy/webui.rs`, and the handler in the `webui/` file for its area |
-| change the console | `ui-src/` — Vue 3 SFCs; `npm run build` writes `dist/index.html`, then `cargo build` inlines it |
+| 新增一个规则算子 | `src/rules/protocols.rs`（注册），然后是 `src/proxy/apply/` 里它所属那一类的文件（执行） |
+| 改规则的匹配方式 | `src/rules/matcher.rs` |
+| 写一个插件 | [`PLUGINS.md`](PLUGINS.md)，然后看 `sdk/whix-plugin.d.ts` |
+| 新增一个插件钩子 | `src/plugins/mod.rs`（manifest + trait），然后是调用处——不过先看看现有的分发机制是不是已经够用，`auth` 当初就是这样 |
+| 改请求流水线 | `src/proxy/serve.rs` 里的 `serve()`——每个请求都经过的唯一入口 |
+| 新增一个接口 | `src/proxy/webui.rs` 里 `handle` 的路由匹配，以及 `webui/` 下对应功能区文件里的处理函数 |
+| 改控制台 | `ui-src/`——Vue 3 单文件组件；`npm run build` 生成 `dist/index.html`，然后 `cargo build` 把它内联进去 |

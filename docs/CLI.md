@@ -35,7 +35,7 @@ whix -H 127.0.0.1 -p 8899 -r rules.txt --no-persist
 | `-D, --baseDir` / `-S, --storage` | `--dir` | ⚠️ 只有一个目录，写完整路径；一个目录同时只能跑一个实例，第二个会被拒绝（[为什么，以及怎么跑两个](INSTALL.md#数据目录)） |
 | `-z, --certDir` | `-z, --cert-dir`（也认 `--certDir`） | ✅ [见下文](#手动提供证书) |
 | `-c, --dnsCache` / `--dnsServer` | — | ➖ DNS 交给操作系统的解析器 |
-| `-s, --sockets` | — | ➖ 没有东西可限：本项目从不限制一个源站能有多少条连接，只把空闲连接留给当初打开它们的那条客户端连接复用（[怎么做的](ARCHITECTURE.md#reusing-origin-connections)）。实测：在上游，这个参数也不改变客户端能看到的任何东西——设 `sockets: 1`，6 个并发请求照样并行完成 |
+| `-s, --sockets` | — | ➖ 没有东西可限：本项目从不限制一个源站能有多少条连接，只把空闲连接留给当初打开它们的那条客户端连接复用（[怎么做的](ARCHITECTURE.md#复用源站连接)）。实测：在上游，这个参数也不改变客户端能看到的任何东西——设 `sockets: 1`，6 个并发请求照样并行完成 |
 | `--httpPort` / `--httpsPort` | — | ➖ 只有一个代理端口；要把控制台挪到别的端口，用 `-P` |
 | `--allowOrigin` | `--allow-origin`（也认 `--allowOrigin`） | ✅ [见下文](#从别的页面调用控制台) |
 | `-A, --addon` / `-L, --pluginHost` / `-e, --extra` | — | ➖ 本项目有自己的插件系统（[`PLUGINS.md`](PLUGINS.md)） |

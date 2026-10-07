@@ -1281,7 +1281,7 @@ H2 会话复用）。
 | 认证拦截不再被规则改写 | ✅ 按上游 `ignore://!…` 语义原样送出（`pin_refusal`），仍记会话 |
 | `xhost://` 直连回退 | ✅ 与 `xproxy://` 同一约束：仅握手无法建立时重试一次 |
 | `from:` 筛选条件 | ✅ `tunnel` / `sni` / `composer` 可判定，其余四个为已知 false；未知标记不满足任何筛选器 |
-| tee 抓取开销剖析 | ✅ 每帧约 6.5 ns、过上限即常数、端到端不可测；见 [`ARCHITECTURE.md`](ARCHITECTURE.md#what-the-capture-costs) |
+| tee 抓取开销剖析 | ✅ 每帧约 6.5 ns、过上限即常数、端到端不可测；见 [`ARCHITECTURE.md`](ARCHITECTURE.md#抓取的开销) |
 | 预览解码器内存修复 | ✅ 剖析查出：解压缓冲随 capture 滞留在 500 条 session 环里，现于预览填满 / tee drop 时释放 |
 | clippy 零告警 + 门禁 | ✅ 54 → 0；`[lints.clippy] all = "deny"` 覆盖全部 target |
 | `sniCallback` 证书钩子 | ✅ 握手期读 ClientHello 并回放；插件可自带证书或**拒绝拦截**；曾被误记为架构不可达 |
@@ -1806,7 +1806,7 @@ H2 会话复用）。
 ### 非功能项
 
 - [x] ~~性能剖析（大响应体、并发连接下 tee 抓取开销）~~ → 结论与数据见
-      [`ARCHITECTURE.md` 的 “What the capture costs”](ARCHITECTURE.md#what-the-capture-costs)，
+      [`ARCHITECTURE.md` 的 “What the capture costs”](ARCHITECTURE.md#抓取的开销)，
       测量代码在 `src/proxy/bench.rs`（`cargo test --release -- --ignored --nocapture bench::`）。
       **吞吐上无需处理**：每帧约 6.5 ns（一次无竞争加锁），过了预览上限即变为常数——
       16 MiB 与 1 MiB 相比只多 0.7–0.9 µs；每个 body 各持有自己的 capture，并发之间不存在锁竞争。
